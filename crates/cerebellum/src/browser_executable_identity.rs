@@ -479,13 +479,27 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_verifier_that_never_answers_times_out_rather_than_hanging() {
-        // A fake verifier sleeps600s (ten HANG_GUARDs), so its natural exit
+        // A fake verifier sleeps 600s (ten HANG_GUARDs), so its natural exit
         // cannot conceal a missing verifier deadline; the test guard only
         // catches a wait that never ends.
+        let pid_file =
+            std::env::temp_dir().join(format!("ckdev-verifier-sleeper-{}.pid", std::process::id()));
+        let sleeper = crate::content_named_fixture::content_named_fixture(
+            "slow-verifier-sleeper",
+            "sleep",
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nexec /bin/sleep 600\n",
+                pid_file.display()
+            )
+            .as_bytes(),
+            0o755,
+        );
+        // Replace the shell, so the timeout kills the sleeper itself rather
+        // than leaving a grandchild alive after killing its waiting parent.
         let verifier = crate::content_named_fixture::content_named_fixture(
             "slow-verifier",
             "codesign",
-            b"#!/bin/sh\nsleep 600\n",
+            format!("#!/bin/sh\nexec '{}'\n", sleeper.display()).as_bytes(),
             0o755,
         );
         let verifier = verifier.to_path_buf();
@@ -503,6 +517,28 @@ mod tests {
         assert_eq!(refusal["outcome"], "identity_unverifiable");
         assert_eq!(refusal["reason"], "verifier_timed_out");
         assert_ne!(refusal["reason"], "verifier_failed");
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("sleeper recorded its pid")
+            .trim()
+            .parse::<u32>()
+            .expect("sleeper pid")
+            .to_string();
+        std::fs::remove_file(pid_file).expect("remove sleeper pid file");
+        // Clean up even when the assertion fails, so a regression run cannot
+        // leave another ten-minute sleeper behind.
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("probe sleeper pid")
+            .success();
+        if alive {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", &pid])
+                .status();
+        }
+        assert!(!alive, "the timed-out verifier left sleep pid {pid} alive");
     }
 
     #[cfg(target_os = "macos")]

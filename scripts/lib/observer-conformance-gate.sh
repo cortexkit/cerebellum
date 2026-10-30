@@ -4,7 +4,7 @@ set -euo pipefail
 
 test_name="${1:-feature_gated_identity_observer_records_resolved_facts}"
 output=
-if output="$(cargo test --locked -p cerebellum --features test-observer --test conformance --quiet -- --exact "$test_name" 2>&1)"; then
+if output="$("$(dirname "${BASH_SOURCE[0]}")/gate-cargo-test.sh" --locked -p cerebellum --features test-observer --test conformance --quiet -- --exact "$test_name" 2>&1)"; then
   printf '%s\n' "$output"
 else
   status=$?

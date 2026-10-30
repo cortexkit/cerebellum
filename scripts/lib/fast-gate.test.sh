@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Exercise the live phase runner without compiling or using operator state.
+# Exercise the live phase runner and lock boundaries with isolated fixtures.
 set -uo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$repo_root/scripts/lib/fast-gate-phases.sh"
@@ -175,6 +175,46 @@ inherited_gate_lock() {
   acquire_gate_lock "$lock"
 }
 
+leaked_test_descendant_lock() {
+  local lock="$scratch/leaked-test.lock" fixture="$scratch/leaked-test" child_pid ready status
+  mkdir -p "$fixture/src" || return 1
+  mkfifo "$fixture/ready" "$fixture/hold" || return 1
+  cat >"$fixture/Cargo.toml" <<'TOML'
+[package]
+name = "gate-lock-fixture"
+version = "0.0.0"
+edition = "2021"
+[workspace]
+[lib]
+doctest = false
+TOML
+  cat >"$fixture/src/lib.rs" <<'RS'
+#[test]
+fn leave_a_descendant() {
+    use std::process::{Command, Stdio};
+    let child = Command::new("bash")
+        .args(["-c", "echo ready >\"$DESCENDANT_READY\"; read -r line <\"$DESCENDANT_HOLD\""])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+        .spawn().unwrap();
+    std::fs::write(std::env::var("DESCENDANT_PID").unwrap(), child.id().to_string()).unwrap();
+}
+RS
+  acquire_gate_lock "$lock" || return 1
+  DESCENDANT_PID="$fixture/pid" DESCENDANT_READY="$fixture/ready" DESCENDANT_HOLD="$fixture/hold" \
+    "$repo_root/scripts/lib/gate-cargo-test.sh" --offline --manifest-path "$fixture/Cargo.toml" \
+      --target-dir "$fixture/target"
+  status=$?
+  child_pid="$(cat "$fixture/pid")" || return 1
+  trap "kill -KILL $child_pid 2>/dev/null || true" EXIT
+  [ "$status" -eq 0 ] || return 1
+  read -r ready <"$fixture/ready"
+  [ "$ready" = ready ] && kill -0 "$child_pid" || return 1
+  exec 9>&-
+  # Cargo has exited, but the deliberately leaked test descendant is alive.
+  # It must not prevent the next gate from acquiring the same lease.
+  acquire_gate_lock "$lock"
+}
+
 failing_concurrent_phase() {
   setup_phases
   fail() { echo 'whole failing output'; return 19; }
@@ -337,11 +377,13 @@ mac_clippy_pipeline() {
   cp "$repo_root/scripts/lib/fast-gate-phases.sh" \
     "$repo_root/scripts/lib/fast-gate-plan.sh" \
     "$repo_root/scripts/lib/gate-lock.sh" \
+    "$repo_root/scripts/lib/gate-cargo-test.sh" \
     "$repo_root/scripts/lib/fast-gate-fingerprint.py" \
     "$repo_root/scripts/lib/process-table-probe.py" "$fixture/scripts/lib/"
   printf '#!/usr/bin/env bash\necho Darwin\n' >"$fixture/bin/uname"
   cat >"$fixture/bin/cargo" <<'SH'
 #!/usr/bin/env bash
+if [ "${1:-}" = --config ]; then shift 2; fi
 printf '%s\n' "$*" >>"$CALL_LOG"
 case "$1" in
   metadata) printf '%s\n' "$FIXTURE_METADATA" ;;
@@ -404,11 +446,13 @@ mac_vm_pipeline() {
   cp "$repo_root/scripts/lib/fast-gate-phases.sh" \
     "$repo_root/scripts/lib/fast-gate-plan.sh" \
     "$repo_root/scripts/lib/gate-lock.sh" \
+    "$repo_root/scripts/lib/gate-cargo-test.sh" \
     "$repo_root/scripts/lib/fast-gate-fingerprint.py" \
     "$repo_root/scripts/lib/process-table-probe.py" "$fixture/scripts/lib/"
   printf '#!/usr/bin/env bash\necho Darwin\n' >"$fixture/bin/uname"
   cat >"$fixture/bin/cargo" <<'SH'
 #!/usr/bin/env bash
+if [ "${1:-}" = --config ]; then shift 2; fi
 printf '%s\n' "$*" >>"$CALL_LOG"
 case "$1" in
   metadata) printf '%s\n' "$FIXTURE_METADATA" ;;
@@ -489,6 +533,7 @@ check 'a stale lock naming a reused live pid is not refused' reused_pid_lock
 check 'a live holder keeps its advisory lock after the helper exits' live_pid_lock
 check 'a concurrent gate is refused until the holder is killed' concurrent_gate_lock
 check 'an inherited descriptor keeps the target locked until the child exits' inherited_gate_lock
+check 'a leaked test descendant does not hold the target lock after Cargo exits' leaked_test_descendant_lock
 check 'a failing concurrent phase still fails the gate' failing_concurrent_phase
 check 'source checks overlap serial work with whole, ordered logs' concurrent_order
 check 'the sandbox skip prints NOT VERIFIED before the verdict' unreadable_process_table

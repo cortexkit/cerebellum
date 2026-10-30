@@ -397,7 +397,7 @@ fi
 # never turns the gate red and is never silent either.
 preview_hide_test=a_preview_is_a_click_through_panel_and_hiding_takes_it_off_the_screen
 run_phase "cargo test --locked --workspace --quiet -- --skip $preview_hide_test" \
-  cargo test --locked --workspace --quiet -- --skip "$preview_hide_test"
+  "$repo_root/scripts/lib/gate-cargo-test.sh" --locked --workspace --quiet -- --skip "$preview_hide_test"
 
 desk_skip_reason() {
   sed -n 's/^test [^ ]* \.\.\. SKIPPED[^:]*: //p' | head -n 1
@@ -413,7 +413,7 @@ run_teed() {
 desk_skips=()
 desk_log="$parallel_phase_dir/desk-preview_hide.log"
 run_phase "CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p cerebellum-macos --test preview_hide" \
-  run_teed "$desk_log" env CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p cerebellum-macos --test preview_hide
+  run_teed "$desk_log" env CEREBELLUM_DESK_TEST_SKIP_OK=1 "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p cerebellum-macos --test preview_hide
 if [ "$(uname -s)" != Darwin ]; then
   # Off macOS the target builds to an empty program that prints nothing.
   desk_reason="AppKit exists only on macOS, so no preview panel was shown"

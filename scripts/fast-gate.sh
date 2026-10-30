@@ -282,7 +282,7 @@ if [ "${#lib_packages[@]}" -gt 0 ]; then
   test_args=(--locked)
   for package in "${lib_packages[@]}"; do test_args+=(-p "$package"); done
   test_args+=(--lib "${lib_test_options[@]+${lib_test_options[@]}}")
-  run_serial_phase "cargo test --locked ${lib_packages[*]} --lib" cargo test "${test_args[@]}"
+  run_serial_phase "cargo test --locked ${lib_packages[*]} --lib" "$repo_root/scripts/lib/gate-cargo-test.sh" "${test_args[@]}"
 else
   echo "==> SKIP: touched-package --lib tests (no changed package with a library target)"
 fi
@@ -321,20 +321,20 @@ if [ "$part" = linux ]; then
 # code which writes runtime output to stdout or stderr. Run it even when the diff
 # is elsewhere; if the touched-suite plan includes it, avoid scheduling it twice.
 if suite_will_run "cerebellum:it"; then
-  run_serial_phase "cargo test --locked -p cerebellum --test it (changed suite)" cargo test --locked -p cerebellum --test it
+  run_serial_phase "cargo test --locked -p cerebellum --test it (changed suite)" "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p cerebellum --test it
   echo "==> RUN COVERAGE: mandatory catalog, launch-secret, and zero-prints checks are included in touched suite cerebellum:it"
 else
-  run_serial_phase "cargo test --locked -p cerebellum --test it tool_catalog::" cargo test --locked -p cerebellum --test it tool_catalog::
-  run_serial_phase "cargo test --locked -p cerebellum --test it one_launch_nonce_reader::" cargo test --locked -p cerebellum --test it one_launch_nonce_reader::
-  run_serial_phase "cargo test --locked -p cerebellum --test it no_runtime_output::" cargo test --locked -p cerebellum --test it no_runtime_output::
+  run_serial_phase "cargo test --locked -p cerebellum --test it tool_catalog::" "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p cerebellum --test it tool_catalog::
+  run_serial_phase "cargo test --locked -p cerebellum --test it one_launch_nonce_reader::" "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p cerebellum --test it one_launch_nonce_reader::
+  run_serial_phase "cargo test --locked -p cerebellum --test it no_runtime_output::" "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p cerebellum --test it no_runtime_output::
   echo "==> SKIP: remaining tests in cerebellum:it (no source/module path changed; the mandatory modules above ran)"
 fi
 
 if suite_will_run "cerebellum:format_floor"; then
-  run_serial_phase "cargo test --locked -p cerebellum --test format_floor (changed suite)" cargo test --locked -p cerebellum --test format_floor
+  run_serial_phase "cargo test --locked -p cerebellum --test format_floor (changed suite)" "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p cerebellum --test format_floor
   echo "==> RUN COVERAGE: mandatory format_floor integration tests are included in touched suite cerebellum:format_floor"
 else
-  run_serial_phase "cargo test --locked -p cerebellum --test format_floor" cargo test --locked -p cerebellum --test format_floor
+  run_serial_phase "cargo test --locked -p cerebellum --test format_floor" "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p cerebellum --test format_floor
 fi
 
 # If cerebellum was not touched, run its schema-contract tests and the frozen
@@ -347,8 +347,8 @@ done
 if [ "$cerebellum_touched" -eq 1 ]; then
   echo "==> RUN COVERAGE: mandatory flat-tools fingerprint tests are included in cerebellum --lib tests"
 else
-  run_serial_phase "cargo test --locked -p cerebellum --lib flat_tools" cargo test --locked -p cerebellum --lib flat_tools
-  run_serial_phase "cargo test --locked -p cerebellum --lib catalog_preserves_flat_definition_bytes" cargo test --locked -p cerebellum --lib catalog_preserves_flat_definition_bytes
+  run_serial_phase "cargo test --locked -p cerebellum --lib flat_tools" "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p cerebellum --lib flat_tools
+  run_serial_phase "cargo test --locked -p cerebellum --lib catalog_preserves_flat_definition_bytes" "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p cerebellum --lib catalog_preserves_flat_definition_bytes
   echo "==> SKIP: remaining cerebellum --lib tests (the package was unchanged)"
 fi
 # If cerebellum-core was not touched, the format_floor and journal filters below
@@ -360,8 +360,8 @@ done
 if [ "$core_touched" -eq 1 ]; then
   echo "==> RUN COVERAGE: format-floor and journal-format unit tests are included in touched cerebellum-core --lib tests"
 else
-  run_serial_phase "cargo test --locked -p cerebellum-core --lib format_floor" cargo test --locked -p cerebellum-core --lib format_floor
-  run_serial_phase "cargo test --locked -p cerebellum-core --lib journal" cargo test --locked -p cerebellum-core --lib journal
+  run_serial_phase "cargo test --locked -p cerebellum-core --lib format_floor" "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p cerebellum-core --lib format_floor
+  run_serial_phase "cargo test --locked -p cerebellum-core --lib journal" "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p cerebellum-core --lib journal
   echo "==> SKIP: remaining cerebellum-core --lib tests (the package was unchanged)"
 fi
 fi
@@ -385,7 +385,7 @@ if [ "${#suites[@]}" -gt 0 ]; then
     if is_desk_suite "$suite"; then
       log="$static_dir/desk-$package-$target.log"
       run_serial_phase "CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p $package --test $target" \
-        run_teed "$log" env CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p "$package" --test "$target"
+        run_teed "$log" env CEREBELLUM_DESK_TEST_SKIP_OK=1 "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p "$package" --test "$target"
       reason="$(desk_skip_reason < "$log")"
       if [ "$(uname -s)" != Darwin ]; then
         # Off macOS the target builds to an empty program that prints nothing.
@@ -395,7 +395,7 @@ if [ "${#suites[@]}" -gt 0 ]; then
         not_verified+=("$target skipped ($reason)")
       fi
     else
-      run_serial_phase "cargo test --locked -p $package --test $target" cargo test --locked -p "$package" --test "$target"
+      run_serial_phase "cargo test --locked -p $package --test $target" "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p "$package" --test "$target"
     fi
   done
 fi
