@@ -6,8 +6,10 @@
 acquire_gate_lock() {
   local lock="$1" holder status
   mkdir -p "$lock" || return 2
-  # Keep fd 9 open in the gate and its children. The kernel releases the lock
-  # only after the last inherited copy closes, even if the gate itself is killed.
+  # Keep fd 9 open in the gate and Cargo. The kernel releases the lock only
+  # after the last inherited copy closes, even if the gate itself is killed.
+  # gate-cargo-test.sh closes it at the test-binary boundary: a leaked test
+  # descendant must not retain ownership after Cargo and the gate have exited.
   exec 9<>"$lock/lease" || return 2
   if python3 - <<'PY'
 import fcntl
