@@ -783,11 +783,7 @@ mod macos_probe {
     }
 
     fn probe_identity() -> BindIdentity {
-        BindIdentity::new(
-            std::env::temp_dir().join("ck-live-synthetic-input"),
-            "probe",
-            CONVERSATION.to_string(),
-        )
+        BindIdentity::new("probe", CONVERSATION.to_string())
     }
 
     struct ProbePage {

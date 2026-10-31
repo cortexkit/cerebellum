@@ -9139,8 +9139,7 @@ pub fn session_caller_principal_for_test() -> Option<subc_protocol::Principal> {
 /// Older fixtures invoke only the data-plane helper, so this lets them exercise
 /// the real bound-route path without weakening the production handler.
 fn install_test_bind(route_bindings: &Arc<RouteBindings>, frame: &Frame) {
-    let identity =
-        subc_protocol::BindIdentity::new("/test/project", "test", "test-session".to_string());
+    let identity = subc_protocol::BindIdentity::new("test", "test-session".to_string());
     route_bindings.insert(
         frame.header.channel,
         frame.header.epoch,
@@ -9171,8 +9170,7 @@ pub fn install_browser_test_bind(
     epoch: u32,
     browser_control_operations: &[&str],
 ) {
-    let identity =
-        subc_protocol::BindIdentity::new("/test/project", "test", "test-session".to_string());
+    let identity = subc_protocol::BindIdentity::new("test", "test-session".to_string());
     route_bindings.insert(
         channel,
         epoch,
@@ -9198,11 +9196,7 @@ pub fn install_browser_unattested_project_test_bind(
     channel: u16,
     epoch: u32,
 ) {
-    let identity = subc_protocol::BindIdentity::new(
-        "/caller/chosen/project",
-        "test",
-        "test-session".to_string(),
-    );
+    let identity = subc_protocol::BindIdentity::new("test", "test-session".to_string());
     route_bindings.insert(
         channel,
         epoch,
@@ -9235,11 +9229,7 @@ pub fn install_browser_direct_test_bind(
     channel: u16,
     epoch: u32,
 ) {
-    let identity = subc_protocol::BindIdentity::new(
-        "/caller/chosen/project",
-        "test",
-        "test-session".to_string(),
-    );
+    let identity = subc_protocol::BindIdentity::new("test", "test-session".to_string());
     route_bindings.insert(
         channel,
         epoch,
@@ -9520,7 +9510,7 @@ mod tests {
         let core = Principal::Reserved {
             module_id: "prefrontal-core".into(),
         };
-        let bind = subc_protocol::BindIdentity::new("/caller/project", "test", "conversation");
+        let bind = subc_protocol::BindIdentity::new("test", "conversation");
         let target = subc_protocol::RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         };
@@ -13046,7 +13036,7 @@ mod tests {
     }
 
     fn bind_identity_for_test() -> subc_protocol::BindIdentity {
-        subc_protocol::BindIdentity::new("/test/project", "test", "test-session".to_string())
+        subc_protocol::BindIdentity::new("test", "test-session".to_string())
     }
 
     /// Planes whose only route is bound to the management surface.
@@ -13336,17 +13326,31 @@ mod tests {
             &BrowserSurface::NotConfigured,
             Some(provenance),
         );
-        // Fixed bytes, not computed by the code under test: the Linux pin was
-        // taken from the builder HELLO used before `--manifest` shared it, with
-        // these inputs. The macOS manifest also includes computer_use's
-        // description, so its pin changes whenever that text changes; when it
-        // does, confirm the old and new builders differ only by that text
-        // before taking the new value.
+        // Fixed bytes, not computed by the code under test. Removing only the
+        // project-free-bind declaration must recover the previous HELLO bytes;
+        // protocol upgrades must not silently change the rest of the manifest.
         #[cfg(target_os = "linux")]
-        let expected = "76dbb08edce1bb7742f5efc2686b7e2ec42ad623586d16d91be1fbd52fa15662";
+        let previous = "76dbb08edce1bb7742f5efc2686b7e2ec42ad623586d16d91be1fbd52fa15662";
         #[cfg(target_os = "macos")]
-        let expected = "33166b72e5c0aefea0f0f6ec91a764a66a83684096d09f39bc21bc0baedee21d";
+        let previous = "33166b72e5c0aefea0f0f6ec91a764a66a83684096d09f39bc21bc0baedee21d";
+        let mut predecessor = value.clone();
+        predecessor["capabilities"]["provides"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|name| name != subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY);
         use sha2::Digest;
+        assert_eq!(
+            format!(
+                "{:x}",
+                sha2::Sha256::digest(predecessor.to_string().as_bytes())
+            ),
+            previous
+        );
+
+        #[cfg(target_os = "linux")]
+        let expected = "f46b5ddc8c5b081adb40a3c2982d27822f9c7400bc62d189d74816a5eaa5d466";
+        #[cfg(target_os = "macos")]
+        let expected = "6c98e57299920c8ee405321aecbd63e4e514a5c23676632df8b971f900f3f436";
         assert_eq!(
             format!("{:x}", sha2::Sha256::digest(value.to_string().as_bytes())),
             expected
@@ -15366,11 +15370,7 @@ mod relayed_computer_call_tests {
             CHANNEL,
             EPOCH,
             AcceptedBindFacts::from_bind(
-                &subc_protocol::BindIdentity::new(
-                    "/test/project",
-                    "test",
-                    "test-session".to_string(),
-                ),
+                &subc_protocol::BindIdentity::new("test", "test-session".to_string()),
                 session_caller_principal_for_test(),
                 Some(&json!({
                     "agentProjectId": "test-project",
@@ -15490,7 +15490,7 @@ mod relayed_computer_call_tests {
             route_channel: CHANNEL,
             epoch: EPOCH,
             target,
-            identity: subc_protocol::BindIdentity::new("/test/project", "test", "test-session"),
+            identity: subc_protocol::BindIdentity::new("test", "test-session"),
             principal: Some(subc_protocol::Principal::Reserved {
                 module_id: "basal".into(),
             }),
@@ -15869,7 +15869,7 @@ mod relayed_computer_call_tests {
                 target: subc_protocol::RouteTarget::ToolProvider {
                     module_id: "cerebellum".into(),
                 },
-                identity: subc_protocol::BindIdentity::new("/test/project", "test", "test-session"),
+                identity: subc_protocol::BindIdentity::new("test", "test-session"),
                 principal: session_caller_principal_for_test(),
                 consumer_capabilities: Some(vec!["elicitation".into()]),
                 admission_facts: Some(
@@ -16020,7 +16020,7 @@ mod browser_login_fact_tests {
             None,
             Some(Arc::clone(&signed_in)),
         );
-        let bind = subc_protocol::BindIdentity::new("/test/project", "test", "import-facts");
+        let bind = subc_protocol::BindIdentity::new("test", "import-facts");
         let identity = RouteIdentity::from_accepted_bind(
             &bind,
             &None,

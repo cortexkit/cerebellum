@@ -113,7 +113,7 @@ fn run_bind(scope: ScopeStamp) -> ModuleControlRequest {
         principal: Some(subc_protocol::Principal::Reserved {
             module_id: "basal".into(),
         }),
-        identity: subc_protocol::BindIdentity::new("/untrusted/run", "run", "misleading-session"),
+        identity: subc_protocol::BindIdentity::new("run", "misleading-session"),
         admission_facts: None,
         consumer_capabilities: Some(vec![
             cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
@@ -155,7 +155,7 @@ async fn bind_head(planes: &Planes) {
         route_channel: 8,
         epoch: 3,
         principal: session_caller_principal_for_test(),
-        identity: subc_protocol::BindIdentity::new("/test/project", "test", "head-conversation"),
+        identity: subc_protocol::BindIdentity::new("test", "head-conversation"),
         admission_facts: None,
         consumer_capabilities: Some(vec!["elicitation".into()]),
         target: subc_protocol::RouteTarget::ToolProvider {

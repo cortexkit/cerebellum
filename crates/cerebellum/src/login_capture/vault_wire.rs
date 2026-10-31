@@ -188,10 +188,7 @@ pub(crate) fn management_route_open_request(
         identity,
         consumer_identity,
     };
-    let identity_bound = encoded_bound(&identity.project_root.to_string_lossy())
-        + encoded_bound(&identity.harness)
-        + encoded_bound(&identity.session)
-        + identity.project_id.as_deref().map_or(0, encoded_bound);
+    let identity_bound = encoded_bound(&identity.harness) + encoded_bound(&identity.session);
     let consumer_bound = request.consumer_identity.as_ref().map_or(0, |consumer| {
         encoded_bound(consumer.module_id) + encoded_bound(consumer.launch_nonce)
     });
@@ -610,7 +607,7 @@ mod tests {
 
     #[test]
     fn the_route_open_names_the_vault_and_carries_the_consumer_identity() {
-        let identity = BindIdentity::new("/tmp", "cerebellum", "browser.capture_login");
+        let identity = BindIdentity::new("cerebellum", "browser.capture_login");
         let body = route_open_request(
             &identity,
             Some(ConsumerIdentity {
@@ -629,11 +626,43 @@ mod tests {
             body["consumer_identity"],
             json!({"module_id": "cerebellum", "launch_nonce": "n0nce"})
         );
-        assert_eq!(body["identity"]["harness"], "cerebellum");
+        assert_eq!(
+            body["identity"],
+            json!({"harness": "cerebellum", "session": "browser.capture_login"})
+        );
 
         let without = route_open_request(&identity, None).unwrap();
         let without: serde_json::Value = serde_json::from_slice(without.as_bytes()).unwrap();
         assert!(without.get("consumer_identity").is_none(), "{without}");
+    }
+
+    #[test]
+    fn route_open_reserves_for_escaped_identity_and_consumer_without_reallocating() {
+        let text = "\0".repeat(1024);
+        let identity = BindIdentity::new(&text, &text);
+        for consumer in [
+            None,
+            Some(ConsumerIdentity {
+                module_id: &text,
+                launch_nonce: &text,
+            }),
+        ] {
+            let string_count = if consumer.is_some() { 5 } else { 3 };
+            let body = management_route_open_request(&identity, consumer, &text).unwrap();
+            // Each NUL needs six JSON bytes; each string also needs two quotes.
+            assert_eq!(body.0.capacity(), string_count * (6 * 1024 + 2) + 256);
+            let value: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
+            assert_eq!(value["identity"], json!({"harness": text, "session": text}));
+            assert_eq!(value["target"]["module_id"], text);
+            if string_count == 5 {
+                assert_eq!(
+                    value["consumer_identity"],
+                    json!({"module_id": text, "launch_nonce": text})
+                );
+            } else {
+                assert!(value.get("consumer_identity").is_none());
+            }
+        }
     }
 
     #[test]

@@ -107,7 +107,7 @@ async fn bind_with_readers(
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        identity: BindIdentity::new("test", "test-session"),
         principal: Some(Principal::Reserved {
             module_id: module.into(),
         }),
@@ -604,7 +604,7 @@ async fn codemode_never_elicits_a_consent_card() {
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        identity: BindIdentity::new("test", "test-session"),
         principal: Some(Principal::Reserved {
             module_id: "prefrontal-core".into(),
         }),
@@ -680,7 +680,7 @@ async fn classic_still_elicits_a_consent_card() {
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        identity: BindIdentity::new("test", "test-session"),
         principal: Some(Principal::Reserved {
             module_id: "prefrontal-core".into(),
         }),

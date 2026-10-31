@@ -174,7 +174,6 @@ mod probe {
         tool: (u16, u32),
         management: (u16, u32),
         next_corr: u64,
-        project_root: String,
         conversation: String,
         impossible_identifier: String,
         elicitation_decision: &'static str,
@@ -212,7 +211,6 @@ mod probe {
                 tool: (0, 0),
                 management: (0, 0),
                 next_corr: 1,
-                project_root: format!("/tmp/ck-live-interrupt-{run_id}"),
                 conversation: format!("live-interrupt-{run_id}"),
                 impossible_identifier: format!("ck-live-interrupt-never-{run_id}"),
                 elicitation_decision: "deny",
@@ -246,16 +244,11 @@ mod probe {
         }
 
         async fn open_route(&mut self, target: RouteTarget) -> Result<(u16, u32), String> {
-            // Use one run-specific project-root identity on both routes so a
-            // later probe run does not intentionally reuse this run's grant.
+            // Keep both routes on this probe run's conversation.
             let request = ClientControlRequest::RouteOpen {
                 role_versions: None,
                 target: target.clone(),
-                identity: BindIdentity::new(
-                    self.project_root.clone(),
-                    "live_interrupt",
-                    self.conversation.clone(),
-                ),
+                identity: BindIdentity::new("live_interrupt", self.conversation.clone()),
                 consumer_identity: None,
                 consumer_capabilities: Some(vec!["elicitation".to_string()]),
                 admission_facts: None,

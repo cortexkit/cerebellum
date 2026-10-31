@@ -96,7 +96,7 @@ async fn bind_with_scope(
         route_channel: CHANNEL,
         epoch: EPOCH,
         target,
-        identity: BindIdentity::new("/test/project", "test", CONVERSATION.to_string()),
+        identity: BindIdentity::new("test", CONVERSATION.to_string()),
         principal,
         consumer_capabilities: Some(vec!["elicitation".to_string()]),
         admission_facts: Some(json!({

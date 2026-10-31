@@ -71,7 +71,7 @@ async fn bind_reader_route(
         target: RouteTarget::ToolProvider {
             module_id: MODULE_ID.into(),
         },
-        identity: BindIdentity::new("/test/project", "conformance", "test-session"),
+        identity: BindIdentity::new("conformance", "test-session"),
         principal: Some(principal(&stamp.principal)),
         consumer_capabilities,
         admission_facts: Some(

@@ -902,7 +902,7 @@ mod tests {
     }
     fn bind(planes: &Planes, channel: u16, session: &str) {
         planes.routes.insert(channel, 1, AcceptedBindFacts::from_bind(
-            &subc_protocol::BindIdentity::new("/serialization", "fixture", session.to_string()),
+            &subc_protocol::BindIdentity::new("fixture", session.to_string()),
             session_caller_principal_for_test(),
             Some(&serde_json::json!({"agentProjectId": "fixture-project", "sessionKind": "primary", "effectiveCapabilityScope": ["*"]})),
             Some(&["elicitation".to_string()]),

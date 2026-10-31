@@ -929,7 +929,7 @@ mod tests {
         )
         .with_owner_authorized(true);
         let accepted = AcceptedBindFacts::from_bind(
-            &bind_identity("/caller/project", "conversation"),
+            &bind_identity("conversation"),
             Some(core),
             None,
             None,
@@ -963,7 +963,7 @@ mod tests {
         )
         .with_owner_authorized(true);
         let accepted = AcceptedBindFacts::from_bind(
-            &bind_identity("/caller/project", "conversation"),
+            &bind_identity("conversation"),
             Some(core),
             None,
             None,
@@ -983,8 +983,8 @@ mod tests {
         }
     }
 
-    fn bind_identity(project_root: &str, session: &str) -> BindIdentity {
-        BindIdentity::new(project_root, "opencode", session)
+    fn bind_identity(session: &str) -> BindIdentity {
+        BindIdentity::new("opencode", session)
     }
 
     fn facts(project: &str, kind: &str) -> Value {
@@ -1029,7 +1029,7 @@ mod tests {
 
     #[test]
     fn primary_resolves_default_durable_profile() {
-        let identity = bind_identity("/tmp/project", "conversation-1");
+        let identity = bind_identity("conversation-1");
         let route = RouteIdentity::from_accepted_bind(
             &identity,
             &Some(Principal::Direct),
@@ -1047,7 +1047,7 @@ mod tests {
 
     #[test]
     fn subagent_resolves_conversation_scoped_disposable_profile() {
-        let identity = bind_identity("/tmp/project", "conversation-1");
+        let identity = bind_identity("conversation-1");
         let route = RouteIdentity::from_accepted_bind(
             &identity,
             &Some(Principal::Direct),
@@ -1065,7 +1065,7 @@ mod tests {
 
     #[test]
     fn ephemeral_resolves_without_profile_name_or_key() {
-        let identity = bind_identity("/tmp/project", "conversation-1");
+        let identity = bind_identity("conversation-1");
         let route = RouteIdentity::from_accepted_bind(
             &identity,
             &Some(Principal::Direct),
@@ -1083,7 +1083,7 @@ mod tests {
 
     #[test]
     fn admitted_project_and_conversation_facts_are_not_request_fields() {
-        let identity = bind_identity("/tmp/request-body-project", "conversation-1");
+        let identity = bind_identity("conversation-1");
         let route = RouteIdentity::from_accepted_bind(
             &identity,
             &Some(Principal::Direct),
@@ -1093,17 +1093,11 @@ mod tests {
         assert_eq!(route.conversation_key, "conversation-1");
     }
 
-    /// `BindIdentity.project_id` (subc-protocol 0.20) is relayed by the daemon
-    /// verbatim from the caller and is not attested. The durable-profile
-    /// authority is the carrier-stamped `agentProjectId` in the admission
-    /// facts; a caller-supplied id on the bind identity must neither become
-    /// the route's project id nor count as attested provenance. A regression
-    /// that read the new field here would let any bound caller name the
-    /// durable profile it wants to open.
+    /// The bind's `harness` and `session` fields identify the caller, not its
+    /// project. Only an attested project fact can authorize a durable profile.
     #[test]
-    fn a_caller_supplied_bind_identity_project_id_is_not_attested_provenance() {
-        let mut bind = bind_identity("/caller/project", "conversation-1");
-        bind.project_id = Some("pj-caller-claimed".to_string());
+    fn bind_identity_alone_is_not_attested_project_provenance() {
+        let bind = bind_identity("conversation-1");
 
         let route = RouteIdentity::from_accepted_bind(&bind, &Some(Principal::Direct), None);
         assert!(route.agent_project_id.is_empty());
@@ -1112,13 +1106,23 @@ mod tests {
             AcceptedBindFacts::from_bind(&bind, Some(Principal::Direct), None, None, &tool_route());
         assert!(
             !accepted.agent_project_id_attested,
-            "a project id on the bind identity is caller-chosen and must not read as attested"
+            "harness and session alone must not attest a project"
         );
+
+        let admitted = AcceptedBindFacts::from_bind(
+            &bind,
+            Some(Principal::Direct),
+            Some(&facts("pj-stamped", "primary")),
+            None,
+            &tool_route(),
+        );
+        assert_eq!(admitted.identity.agent_project_id, "pj-stamped");
+        assert!(admitted.agent_project_id_attested);
     }
 
     #[test]
     fn control_operation_requires_attested_project_kind_and_operation() {
-        let bind = bind_identity("/caller/project", "conversation-1");
+        let bind = bind_identity("conversation-1");
         let accepted = AcceptedBindFacts::from_bind(
             &bind,
             Some(Principal::Direct),
@@ -1166,7 +1170,7 @@ mod tests {
     /// single fact.
     #[test]
     fn a_control_refusal_names_the_fact_that_failed() {
-        let bind = bind_identity("/caller/project", "conversation-1");
+        let bind = bind_identity("conversation-1");
         let refusal = |facts: Option<serde_json::Value>| {
             AcceptedBindFacts::from_bind(
                 &bind,
@@ -1217,7 +1221,7 @@ mod tests {
     /// `browser.launch`, alongside the accepted facts themselves.
     fn launch_refusal(facts: serde_json::Value) -> (AcceptedBindFacts, Option<&'static str>) {
         let accepted = AcceptedBindFacts::from_bind(
-            &bind_identity("/caller/project", "conversation-1"),
+            &bind_identity("conversation-1"),
             Some(Principal::Direct),
             Some(&facts),
             None,
@@ -1381,7 +1385,7 @@ mod tests {
     /// still ignored.
     #[test]
     fn a_capability_scope_in_a_retired_place_refuses_rather_than_widening() {
-        let bind = bind_identity("/tmp/project", "conversation-1");
+        let bind = bind_identity("conversation-1");
         let base = serde_json::json!({
             "agentProjectId": "pj-accepted",
             "sessionKind": "primary",
@@ -1454,7 +1458,7 @@ mod tests {
 
     #[test]
     fn explicit_scope_is_enforced_without_request_body_input() {
-        let bind = bind_identity("/tmp/project", "conversation-1");
+        let bind = bind_identity("conversation-1");
         let accepted = AcceptedBindFacts::from_bind(
             &bind,
             Some(Principal::Direct),
@@ -1475,7 +1479,7 @@ mod tests {
     /// sending the other's shape.
     #[test]
     fn each_route_target_names_its_surface() {
-        let bind = bind_identity("/tmp/project", "conversation-1");
+        let bind = bind_identity("conversation-1");
 
         let tools = AcceptedBindFacts::from_bind(
             &bind,
@@ -1507,7 +1511,7 @@ mod tests {
     /// would serve that surface's callers from a route bound to something else.
     #[test]
     fn an_unadvertised_surface_is_neither_of_the_served_ones() {
-        let bind = bind_identity("/tmp/project", "conversation-1");
+        let bind = bind_identity("conversation-1");
         let internal = AcceptedBindFacts::from_bind(
             &bind,
             Some(Principal::Direct),
@@ -1523,7 +1527,7 @@ mod tests {
 
     #[test]
     fn observer_records_identity_and_logical_key() {
-        let identity = bind_identity("/tmp/project", "conversation-observed");
+        let identity = bind_identity("conversation-observed");
         let route = RouteIdentity::from_accepted_bind(
             &identity,
             &Some(Principal::Direct),
@@ -1545,7 +1549,7 @@ mod tests {
 
     #[test]
     fn legacy_bind_defaults_to_primary() {
-        let identity = bind_identity("/tmp/project", "session-0001");
+        let identity = bind_identity("session-0001");
         let route = RouteIdentity::from_bind(&identity, &None);
         assert_eq!(route.session_kind, SessionKind::Primary);
         assert_eq!(route.profile_disposition, ProfileDisposition::Durable);
@@ -1553,8 +1557,7 @@ mod tests {
 
     #[test]
     fn unattested_bind_has_no_agent_project_or_logical_profile_key() {
-        let mut bind = bind_identity("/caller/project", "conversation-1");
-        bind.project_id = Some("pj-caller-claimed".to_string());
+        let bind = bind_identity("conversation-1");
 
         for admission_facts in [
             None,
@@ -1569,7 +1572,7 @@ mod tests {
             );
             assert!(
                 route.agent_project_id.is_empty(),
-                "a bind without an admitted project must not use caller-chosen metadata"
+                "a bind without an admitted project must have no project identity"
             );
             assert_eq!(route.logical_profile_key(), None);
             assert_eq!(route.resolve_profile().logical_profile_key, None);
@@ -1578,7 +1581,7 @@ mod tests {
 
     #[test]
     fn absent_session_kind_is_not_attested() {
-        let identity = bind_identity("/tmp/project", "session-0001");
+        let identity = bind_identity("session-0001");
         let accepted = AcceptedBindFacts::from_bind(
             &identity,
             Some(Principal::Direct),
@@ -1599,8 +1602,8 @@ mod tests {
 
     #[test]
     fn distinct_projects_and_conversations_have_distinct_keys() {
-        let same_conversation_a = bind_identity("/tmp/project-a", "conversation-shared");
-        let same_conversation_b = bind_identity("/tmp/project-b", "conversation-shared");
+        let same_conversation_a = bind_identity("conversation-shared");
+        let same_conversation_b = bind_identity("conversation-shared");
         let project_a = RouteIdentity::from_accepted_bind(
             &same_conversation_a,
             &Some(Principal::Direct),
@@ -1617,8 +1620,8 @@ mod tests {
             "different projects must not share a durable profile key"
         );
 
-        let same_project_a = bind_identity("/tmp/project", "conversation-a");
-        let same_project_b = bind_identity("/tmp/project", "conversation-b");
+        let same_project_a = bind_identity("conversation-a");
+        let same_project_b = bind_identity("conversation-b");
         let conversation_a = RouteIdentity::from_accepted_bind(
             &same_project_a,
             &Some(Principal::Direct),
@@ -1642,7 +1645,7 @@ mod tests {
     #[test]
     fn outside_session_scope_carries_no_session_identity() {
         let accepted = AcceptedBindFacts::from_bind(
-            &bind_identity("/tmp/project", "conversation-live"),
+            &bind_identity("conversation-live"),
             Some(Principal::Direct),
             Some(&serde_json::json!({
                 "agentProjectId": "pj-live",
@@ -1673,7 +1676,7 @@ mod tests {
     fn only_a_prefrontal_core_bind_admits_session_calls() {
         let bind = |principal| {
             AcceptedBindFacts::from_bind(
-                &bind_identity("/tmp/project", "conversation-live"),
+                &bind_identity("conversation-live"),
                 principal,
                 Some(&facts("pj-live", "primary")),
                 None,

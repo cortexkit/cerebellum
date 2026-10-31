@@ -113,7 +113,7 @@ async fn invoke(planes: &Planes, corr: u64, name: &str, arguments: Value) -> Fra
 
 fn route_identity() -> RouteIdentity {
     RouteIdentity::from_accepted_bind(
-        &BindIdentity::new("/test/project", "test", "test-session".to_string()),
+        &BindIdentity::new("test", "test-session".to_string()),
         &Some(Principal::Direct),
         Some(&json!({"agentProjectId": "test-project", "sessionKind": "primary"})),
     )
@@ -148,7 +148,7 @@ async fn bind_management_route(planes: &Planes) {
         target: RouteTarget::ManagementSurface {
             module_id: "cerebellum".to_string(),
         },
-        identity: BindIdentity::new("/test/project", "test", "test-session".to_string()),
+        identity: BindIdentity::new("test", "test-session".to_string()),
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: Some(vec!["elicitation".to_string()]),
         admission_facts: Some(json!({
@@ -2280,7 +2280,7 @@ async fn send_tool_route_bind(planes: &Planes, admission_facts: Value) -> Frame 
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".to_string(),
         },
-        identity: BindIdentity::new("/caller/chosen/project", "test", "test-session".to_string()),
+        identity: BindIdentity::new("test", "test-session".to_string()),
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: None,
         admission_facts: Some(admission_facts),
@@ -5207,7 +5207,7 @@ async fn blocking_grant_fixture_with_store(
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        identity: BindIdentity::new("test", "test-session"),
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
@@ -5255,7 +5255,7 @@ async fn drain_browser(planes: &Planes) {
         target: RouteTarget::ManagementSurface {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new("/test/project", "test", "drain-conversation"),
+        identity: BindIdentity::new("test", "drain-conversation"),
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: None,
         admission_facts: Some(
@@ -5852,7 +5852,7 @@ async fn bind_second_principal(planes: &Planes) {
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        identity: BindIdentity::new("test", "test-session"),
         principal: Some(Principal::Direct),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
@@ -6353,7 +6353,7 @@ async fn bind_route(
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        identity: BindIdentity::new("test", "test-session"),
         principal: Some(principal),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
@@ -6706,7 +6706,7 @@ async fn bind_other_conversation(planes: &Planes, channel: u16) {
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new("/test/project", "test", "other-session"),
+        identity: BindIdentity::new("test", "other-session"),
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
@@ -7403,7 +7403,7 @@ async fn bind_reply(
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        identity: BindIdentity::new("test", "test-session"),
         principal: Some(reserved("prefrontal-core")),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
@@ -8285,7 +8285,7 @@ mod resource_busy_wire {
             target: RouteTarget::ToolProvider {
                 module_id: "cerebellum".into(),
             },
-            identity: BindIdentity::new("/same/project", "test", conversation),
+            identity: BindIdentity::new("test", conversation),
             principal: cerebellum::session_caller_principal_for_test(),
             consumer_capabilities: None,
             admission_facts: Some(
@@ -8401,7 +8401,7 @@ mod resource_busy_wire {
                 target: RouteTarget::ToolProvider {
                     module_id: "cerebellum".into(),
                 },
-                identity: BindIdentity::new("/same/project", "test", conversation),
+                identity: BindIdentity::new("test", conversation),
                 principal: Some(reserved("basal")),
                 consumer_capabilities: Some(vec!["elicitation".into()]),
                 admission_facts: None,
@@ -8527,7 +8527,7 @@ async fn bind_admission_stamp(
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new("/caller/chosen/project", "test", "test-session"),
+        identity: BindIdentity::new("test", "test-session"),
         principal: Some(principal),
         consumer_capabilities: None,
         admission_facts: facts,
@@ -8765,7 +8765,7 @@ async fn scope_admission_nondelegating_head_has_no_durable_profile_or_standing_a
     assert_eq!(body["profile_disposition"], "none", "{body}");
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
     let accepted = cerebellum_core::identity::AcceptedBindFacts::from_bind(
-        &BindIdentity::new("/caller/project", "test", "test-session"),
+        &BindIdentity::new("test", "test-session"),
         Some(reserved("prefrontal-core")),
         None,
         None,
@@ -8966,7 +8966,7 @@ async fn bind_flow_wire_reply(
         route_channel: 9,
         epoch: 3,
         target,
-        identity: BindIdentity::new("/caller/project", "test", "test-session"),
+        identity: BindIdentity::new("test", "test-session"),
         principal: Some(principal),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: None,

@@ -150,7 +150,7 @@ fn bind_management(planes: &Planes, principal: Option<subc_protocol::Principal>)
         MANAGEMENT.0,
         MANAGEMENT.1,
         AcceptedBindFacts::from_bind(
-            &subc_protocol::BindIdentity::new("/test/project", "test", "test-session".to_string()),
+            &subc_protocol::BindIdentity::new("test", "test-session".to_string()),
             principal,
             None,
             None,

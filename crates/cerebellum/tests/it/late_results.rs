@@ -248,7 +248,7 @@ async fn bind_with_readers(
                 module_id: "cerebellum".into(),
             }
         },
-        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        identity: BindIdentity::new("test", "test-session"),
         principal: Some(principal),
         consumer_capabilities: readers,
         admission_facts: Some(
@@ -1147,7 +1147,7 @@ async fn provider_ops_require_tool_route_and_verified_principal() {
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new("/test/project", "test", "test-session"),
+        identity: BindIdentity::new("test", "test-session"),
         principal: Some(Principal::Unverified),
         consumer_capabilities: None,
         admission_facts: None,

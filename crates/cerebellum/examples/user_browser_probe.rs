@@ -1328,7 +1328,7 @@ mod live {
         )
         .map_err(|e| e.to_string())
     }
-    async fn bind(planes: &Planes, root: &Path) -> Result<(), String> {
+    async fn bind(planes: &Planes) -> Result<(), String> {
         let request = ModuleControlRequest::RouteBind {
             role_versions: None,
             call_mode: None,
@@ -1337,7 +1337,7 @@ mod live {
             target: RouteTarget::ToolProvider {
                 module_id: "cerebellum".into(),
             },
-            identity: BindIdentity::new(root.to_owned(), "probe", "user-browser-probe"),
+            identity: BindIdentity::new("probe", "user-browser-probe"),
             principal: cerebellum::session_caller_principal_for_test(),
             consumer_capabilities: None,
             admission_facts: Some(json!({"agentProjectId":PROBE_AGENT,"sessionKind":"primary",
@@ -1521,7 +1521,7 @@ mod live {
                 cerebellum::agent_grants::AgentGrants::in_memory(Some("user-browser-probe".into())),
             )),
         );
-        bind(&planes, root).await?;
+        bind(&planes).await?;
         let listener =
             BridgeListener::bind(planes.user_browser.clone()).map_err(|e| e.to_string())?;
         let focus = Focus::start()?;

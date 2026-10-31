@@ -28,7 +28,7 @@ async fn bound_planes(declarations: Option<Vec<String>>) -> Planes {
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new("/test/project", "test", "head-conversation"),
+        identity: BindIdentity::new("test", "head-conversation"),
         principal: session_caller_principal_for_test(),
         consumer_capabilities: declarations,
         scope: None,

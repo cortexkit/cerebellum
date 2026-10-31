@@ -384,7 +384,7 @@ impl Fixture {
                 target: RouteTarget::ToolProvider {
                     module_id: "cerebellum".into(),
                 },
-                identity: BindIdentity::new("/tmp", "flow-live", "flow-live-conversation"),
+                identity: BindIdentity::new("flow-live", "flow-live-conversation"),
                 consumer_identity: Some(ConsumerIdentity {
                     module_id: carrier.into(),
                     launch_nonce: self.nonce.clone(),

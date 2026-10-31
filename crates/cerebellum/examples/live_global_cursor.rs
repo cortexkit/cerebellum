@@ -1134,11 +1134,7 @@ mod probe {
             let request = ClientControlRequest::RouteOpen {
                 role_versions: None,
                 target: target.clone(),
-                identity: BindIdentity::new(
-                    "/tmp",
-                    "live_global_cursor",
-                    "live-global-cursor-probe",
-                ),
+                identity: BindIdentity::new("live_global_cursor", "live-global-cursor-probe"),
                 consumer_identity: None,
                 consumer_capabilities: Some(vec!["elicitation".to_string()]),
                 admission_facts: None,

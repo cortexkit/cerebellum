@@ -872,7 +872,7 @@ mod desk {
                     route_channel: channel,
                     epoch: 1,
                     target,
-                    identity: BindIdentity::new("/tmp/ck-v13", "probe", self.conversation.clone()),
+                    identity: BindIdentity::new("probe", self.conversation.clone()),
                     principal: cerebellum::session_caller_principal_for_test(),
                     consumer_capabilities: Some(vec!["elicitation".into()]),
                     admission_facts: Some(

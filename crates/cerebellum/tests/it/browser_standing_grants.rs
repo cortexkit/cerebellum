@@ -616,7 +616,7 @@ impl Fixture {
             facts["agentProjectId"] = json!(agent);
         }
         let identity = cerebellum_core::identity::RouteIdentity::from_accepted_bind(
-            &BindIdentity::new("/test/project", "test", session.conversation.to_string()),
+            &BindIdentity::new("test", session.conversation.to_string()),
             &cerebellum::session_caller_principal_for_test(),
             Some(&facts),
         );
@@ -634,7 +634,7 @@ impl Fixture {
                     module_id: "cerebellum".to_string(),
                 }
             },
-            identity: BindIdentity::new("/test/project", "test", session.conversation.to_string()),
+            identity: BindIdentity::new("test", session.conversation.to_string()),
             principal: cerebellum::session_caller_principal_for_test(),
             consumer_capabilities: session.asks.then(|| vec!["elicitation".to_string()]),
             admission_facts: Some(facts),
@@ -2589,7 +2589,7 @@ async fn basal_run_uses_head_browser_snapshot_and_standing_site_grant() {
         principal: Some(subc_protocol::Principal::Reserved {
             module_id: "basal".into(),
         }),
-        identity: BindIdentity::new("/misleading/run", "run", "wrong-session"),
+        identity: BindIdentity::new("run", "wrong-session"),
         admission_facts: None,
         consumer_capabilities: None,
         target: RouteTarget::ToolProvider {

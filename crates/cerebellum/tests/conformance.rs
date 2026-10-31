@@ -132,7 +132,7 @@ async fn first_party_route_bind_is_acked() {
         target: RouteTarget::ToolProvider {
             module_id: MODULE_ID.to_string(),
         },
-        identity: BindIdentity::new("/tmp/project", "opencode", "session-0001"),
+        identity: BindIdentity::new("opencode", "session-0001"),
         principal: Some(Principal::Direct),
         consumer_capabilities: Some(vec!["elicitation".to_string(), "roots".to_string()]),
         admission_facts: Some(json!({"schema": 1, "verified_class": "member"})),
@@ -177,7 +177,7 @@ async fn ineligible_principal_receives_transport_rejection() {
         target: RouteTarget::ToolProvider {
             module_id: MODULE_ID.to_string(),
         },
-        identity: BindIdentity::new("/tmp/project", "opencode", "session-0001"),
+        identity: BindIdentity::new("opencode", "session-0001"),
         principal: Some(Principal::Reserved {
             module_id: "subc-mcp".to_string(),
         }),
@@ -264,7 +264,7 @@ async fn absent_principal_is_rejected() {
         target: RouteTarget::ToolProvider {
             module_id: MODULE_ID.to_string(),
         },
-        identity: BindIdentity::new("/tmp/project", "opencode", "session-0001"),
+        identity: BindIdentity::new("opencode", "session-0001"),
         principal: None,
         consumer_capabilities: None,
         admission_facts: None,
@@ -622,7 +622,7 @@ async fn session_kind_matrix_resolves_profile_disposition() {
 async fn distinct_agent_project_ids_resolve_to_distinct_profiles() {
     use cerebellum_core::identity::RouteIdentity;
 
-    let identity = BindIdentity::new("/tmp/shared-project", "opencode", "session-1");
+    let identity = BindIdentity::new("opencode", "session-1");
     let route_a = RouteIdentity::from_accepted_bind(
         &identity,
         &None,
@@ -708,11 +708,7 @@ async fn accepted_bind_facts_drive_profile_resolution() {
         target: RouteTarget::ToolProvider {
             module_id: MODULE_ID.to_string(),
         },
-        identity: BindIdentity::new(
-            "/tmp/request-body-project",
-            "opencode",
-            "conversation-subagent",
-        ),
+        identity: BindIdentity::new("opencode", "conversation-subagent"),
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: None,
         admission_facts: Some(json!({
@@ -788,7 +784,7 @@ async fn accepted_effective_scope_is_not_widened_by_request_body() {
         target: RouteTarget::ToolProvider {
             module_id: MODULE_ID.to_string(),
         },
-        identity: BindIdentity::new("/tmp/project", "opencode", "conversation-scoped"),
+        identity: BindIdentity::new("opencode", "conversation-scoped"),
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: None,
         admission_facts: Some(json!({
@@ -1518,7 +1514,7 @@ async fn open_live_route(stream: &mut TcpStream, corr: u64) -> (u16, u32) {
             target: RouteTarget::ToolProvider {
                 module_id: MODULE_ID.to_string(),
             },
-            identity: BindIdentity::new("/tmp", "conformance", "conversation-live"),
+            identity: BindIdentity::new("conformance", "conversation-live"),
             consumer_identity: None,
             consumer_capabilities: None,
             admission_facts: None,
@@ -1579,11 +1575,7 @@ async fn feature_gated_identity_observer_records_resolved_facts() {
 
     let _ = take_test_observations();
     let identity = RouteIdentity::from_accepted_bind(
-        &BindIdentity::new(
-            "/tmp/observer-project",
-            "conformance",
-            "observer-conversation",
-        ),
+        &BindIdentity::new("conformance", "observer-conversation"),
         &Some(Principal::Direct),
         Some(&json!({
             "agentProjectId": "pj-observer",

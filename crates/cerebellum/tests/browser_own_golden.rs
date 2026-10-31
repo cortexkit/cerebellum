@@ -185,7 +185,7 @@ async fn reply(args: Value, ready: bool) -> Vec<u8> {
             principal: Some(subc_protocol::Principal::Reserved {
                 module_id: "broca".into(),
             }),
-            identity: subc_protocol::BindIdentity::new("/fixture", "fixture", "session"),
+            identity: subc_protocol::BindIdentity::new("fixture", "session"),
             admission_facts: None,
             consumer_capabilities: None,
             target: subc_protocol::RouteTarget::ManagementSurface {

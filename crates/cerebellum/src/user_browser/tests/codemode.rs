@@ -45,7 +45,7 @@ async fn bind_run(fixture: &Fixture, held: bool) {
         principal: Some(subc_protocol::Principal::Reserved {
             module_id: "basal".into(),
         }),
-        identity: subc_protocol::BindIdentity::new("/untrusted/run", "run", "misleading-session"),
+        identity: subc_protocol::BindIdentity::new("run", "misleading-session"),
         admission_facts: None,
         consumer_capabilities: Some(capabilities),
         target: subc_protocol::RouteTarget::ToolProvider {

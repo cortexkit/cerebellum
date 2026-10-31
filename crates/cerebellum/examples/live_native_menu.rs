@@ -1291,11 +1291,7 @@ mod macos_probe {
     }
 
     fn probe_identity() -> BindIdentity {
-        BindIdentity::new(
-            std::env::temp_dir().join("ck-live-native-menu"),
-            "probe",
-            CONVERSATION.to_string(),
-        )
+        BindIdentity::new("probe", CONVERSATION.to_string())
     }
 }
 
