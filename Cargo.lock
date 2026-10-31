@@ -359,9 +359,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbe60bbeae8cefacb56ae174d7fdce081efc149c60b52a7c3ea184c38089a9d0"
+checksum = "9817dd4d562b949dd71d58575e85890d8b11dc8ff14caa8644c287437891017f"
 dependencies = [
  "serde",
  "serde_jcs",
@@ -372,9 +372,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider-conformance"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5165507004302a8c8140e4b4ea934b575d372549d63e11856bfadc3fbefccd1c"
+checksum = "2ccac040b098294a2b0dcd368d3326f3e6daa6af571d1a5adf978df2a07dc706"
 dependencies = [
  "async-trait",
  "cortexkit-role-harness",
@@ -1133,6 +1133,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6518fc26bced4d53678a22d6e423e9d8716377def84545fe328236e3af070e7f"
 
 [[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1289,18 +1295,18 @@ dependencies = [
 
 [[package]]
 name = "subc-cgroup"
-version = "0.1.5"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4afcb6c12344b14fb6d840a8f28214d30a2faf6d0260fae206a5bfa1d6475966"
+checksum = "f0094c52c82fe8c340a442519589ef1420985c1085f96ac509630a863250407a"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "subc-control"
-version = "0.33.0"
+version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86c691fc8e35a2d30000801dc27dfbd54f356529f761a97a776bc239e8381808"
+checksum = "d339866d62da0f376dec7f13c897cd764ead24fc93ca6d764cb3e6ab81844d64"
 dependencies = [
  "serde",
  "serde_json",
@@ -1309,9 +1315,9 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.37.0"
+version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb02fa3a1ed363c67e700986e8f94b9f84aec4354f97ddf5173bdb184fc1ba82"
+checksum = "2d16d891b03f3614b5d4a18d2431aa348cf5114ccefefcabcb50098fc8c66632"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -1321,6 +1327,7 @@ dependencies = [
  "memchr",
  "rlimit",
  "rustix",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -1340,9 +1347,9 @@ dependencies = [
 
 [[package]]
 name = "subc-jobobject"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4af7f809884e34da3d67be947fca6855bdb305e4a2474d94d913cb06b2b21d4"
+checksum = "ec194d5f7dcf03361955370edba3cb85f1e211d850ed59b2ed0f714a75212041"
 dependencies = [
  "tokio",
  "windows-sys 0.61.2",
@@ -1359,9 +1366,9 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.17"
+version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "220f78f6f9d641e8695df7f6ef585962416c594f985e3280f765df365bab7597"
+checksum = "54ec6e1e76111fd7ecdeae8701a8cb5cae83b704b0c92e6e8f44164cb50fd07c"
 dependencies = [
  "libc",
  "rustix",
@@ -1386,9 +1393,9 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.33.0"
+version = "0.34.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "587cff68a0d5b98eb85a7231ce00e3a117e3e50314ad6823d42b802afa5461a3"
+checksum = "96eefeafa9c6e179bf1ab06027cb6dd916b2502b99fc99d4a7dbfa9db04e3e58"
 dependencies = [
  "serde",
  "serde_json",
@@ -1396,9 +1403,9 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73fcec900a7105be1071e1d478c74831abe936d9d8e4c825a25f7dd9832797e4"
+checksum = "28d59a2fa34b2a118ed6364e384587405ce5edb6bac65643198764f230cf878f"
 dependencies = [
  "getrandom",
  "hmac",
