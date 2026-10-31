@@ -96,6 +96,27 @@ async fn unrelated_consumer_capabilities_do_not_enable_content() {
     }
 }
 
+fn assert_image_bytes_are_delivered_once(
+    result: &cortexkit_role_tool_provider::result::ToolResult,
+    payload: &Value,
+) {
+    if let Some(image) = payload.get("image") {
+        assert!(result.structured_content.as_ref().unwrap()["image"]
+            .get("data_b64")
+            .is_none());
+        let images: Vec<_> = result
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                cortexkit_role_tool_provider::result::ContentPart::Image(image) => Some(image),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, image["data_b64"].as_str().unwrap());
+    }
+}
+
 #[tokio::test]
 async fn declared_reader_gets_content_with_the_same_structured_reply() {
     let planes = bound_planes(Some(vec![
@@ -108,28 +129,28 @@ async fn declared_reader_gets_content_with_the_same_structured_reply() {
         let result: cortexkit_role_tool_provider::result::ToolResult =
             serde_json::from_slice(&reply.body).unwrap();
         cortexkit_role_tool_provider::result::validate(&result).unwrap();
-        assert_eq!(Value::Object(result.structured_content.unwrap()), payload);
-        if payload.get("image").is_some() {
-            assert!(result.content.iter().any(|part| matches!(
-                part,
-                cortexkit_role_tool_provider::result::ContentPart::Image(_)
-            )));
+        assert_image_bytes_are_delivered_once(&result, &payload);
+        let mut expected = payload;
+        if let Some(image) = expected.get_mut("image").and_then(Value::as_object_mut) {
+            image.remove("data_b64");
         }
+        assert_eq!(Value::Object(result.structured_content.unwrap()), expected);
     }
 }
 
 /// Bodies a route received at cerebellum 60488c67, when the format was still
 /// named `content/v1` and the route declared that name. Captured from the same
-/// `CASES` payloads through `send_tool_response`; see the fixture README.
+/// `CASES` payloads through `send_tool_response`, with duplicate structured
+/// image bytes removed for single delivery; see the fixture README.
 const RETIRED_NAME_BODIES: &[&[u8]] = &[
     include_bytes!("../tests/fixtures/tool_result_v1_bodies/browser_snapshot.json"),
     include_bytes!("../tests/fixtures/tool_result_v1_bodies/browser_screenshot.json"),
     include_bytes!("../tests/fixtures/tool_result_v1_bodies/computer_read_state.json"),
 ];
 
-/// The rename from `content/v1` to `tool-result/v1` changed only the name a
-/// route declares and the catalog lists, never the body: a reader that now
-/// declares `tool-result/v1` gets exactly the bytes a `content/v1` reader got.
+/// The format rename preserved the captured bodies. Apart from removing
+/// duplicate structured image bytes, a `tool-result/v1` reader still gets those
+/// exact bytes, including the original image content part.
 #[tokio::test]
 async fn tool_result_v1_reader_gets_the_bytes_the_retired_name_got() {
     let planes = bound_planes(Some(vec![
@@ -138,13 +159,16 @@ async fn tool_result_v1_reader_gets_the_bytes_the_retired_name_got() {
     .await;
     assert_eq!(CASES.len(), RETIRED_NAME_BODIES.len());
     for ((tool, main_bytes), captured) in CASES.iter().zip(RETIRED_NAME_BODIES) {
-        let reply = response(&planes, tool, serde_json::from_slice(main_bytes).unwrap()).await;
+        let payload: Value = serde_json::from_slice(main_bytes).unwrap();
+        let reply = response(&planes, tool, payload.clone()).await;
         assert_eq!(reply.header.ty, FrameType::Response);
         assert!(
             reply.body.as_slice() == *captured,
-            "{tool}: tool-result/v1 body differs from the content/v1 body:\n{}",
+            "{tool}: tool-result/v1 body differs from the single-delivery fixture:\n{}",
             String::from_utf8_lossy(&reply.body)
         );
+        let result = serde_json::from_slice(&reply.body).unwrap();
+        assert_image_bytes_are_delivered_once(&result, &payload);
     }
 }
 
