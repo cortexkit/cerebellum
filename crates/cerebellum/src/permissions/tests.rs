@@ -158,7 +158,7 @@ fn fixture(
 }
 fn facts(principal: Principal) -> AcceptedBindFacts {
     AcceptedBindFacts::from_bind(
-        &subc_protocol::BindIdentity::new("/fixture/project", "test", "session"),
+        &subc_protocol::BindIdentity::new("test", "session"),
         Some(principal),
         None,
         None,

@@ -949,7 +949,7 @@ async fn bind(planes: &Planes) {
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new("/test/project", "test", CONVERSATION),
+        identity: BindIdentity::new("test", CONVERSATION),
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(json!({
@@ -1660,7 +1660,7 @@ async fn a_login_saved_for_another_origin_is_refused_like_an_unknown_one() {
 
 fn identity() -> cerebellum_core::identity::RouteIdentity {
     cerebellum_core::identity::RouteIdentity::from_bind(
-        &BindIdentity::new("/test/project", "test", CONVERSATION.to_string()),
+        &BindIdentity::new("test", CONVERSATION.to_string()),
         &Some(subc_protocol::Principal::Direct),
     )
 }

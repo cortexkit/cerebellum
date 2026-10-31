@@ -258,7 +258,7 @@ async fn image_resolve_wire_shapes_match_their_goldens() {
         principal: Some(Principal::Reserved {
             module_id: "broca".into(),
         }),
-        identity: BindIdentity::new("/fixture", "fixture", "session"),
+        identity: BindIdentity::new("fixture", "session"),
         admission_facts: None,
         consumer_capabilities: None,
         target: RouteTarget::ManagementSurface {
@@ -494,7 +494,7 @@ async fn bind_management(
         route_channel: 10,
         epoch: 1,
         principal: Some(principal),
-        identity: BindIdentity::new("/fixture", "fixture", conversation.to_string()),
+        identity: BindIdentity::new("fixture", conversation.to_string()),
         admission_facts: None,
         consumer_capabilities: None,
         target: RouteTarget::ManagementSurface {
@@ -655,7 +655,7 @@ async fn a_runs_handle_resolves_through_its_head() {
     });
     // The head's own tool route.
     let head_facts = cerebellum::AcceptedBindFacts::from_bind(
-        &BindIdentity::new("/fixture", "fixture", "head-conversation".to_string()),
+        &BindIdentity::new("fixture", "head-conversation".to_string()),
         Some(core.clone()),
         Some(&admission),
         None,
@@ -691,7 +691,7 @@ async fn a_runs_handle_resolves_through_its_head() {
         )))
         .with_parent_state(Some(subc_protocol::scope::ParentState::Linked));
     let run_facts = cerebellum::AcceptedBindFacts::from_bind(
-        &BindIdentity::new("/fixture", "fixture", "run-conversation".to_string()),
+        &BindIdentity::new("fixture", "run-conversation".to_string()),
         Some(Principal::Reserved {
             module_id: "basal".into(),
         }),

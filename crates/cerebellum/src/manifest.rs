@@ -471,6 +471,7 @@ fn build_with_browser_config_and_provenance(
                 crate::permissions::CAPABILITY.to_string(),
                 crate::private_content::CAPABILITY.to_string(),
                 SCOPE_ADMISSION_CAPABILITY.to_string(),
+                subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.to_string(),
                 subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
                 subc_protocol::call_mode::CALL_MODES_CAPABILITY.to_string(),
                 LATE_RESULTS_CAPABILITY.to_string(),
@@ -1022,6 +1023,22 @@ mod tests {
         assert!(advertised
             .iter()
             .all(|name| crate::dispatchable_management_operation(name)));
+    }
+
+    #[test]
+    fn bind_no_project_is_declared_beside_scope_admission() {
+        for browser_configured in [false, true] {
+            let manifest = build_with_browser_config("cerebellum", browser_configured);
+            let provides = &manifest.capabilities.as_ref().unwrap().provides;
+            let scope = provides
+                .iter()
+                .position(|name| name == SCOPE_ADMISSION_CAPABILITY)
+                .unwrap();
+            assert_eq!(
+                provides[scope + 1],
+                subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY
+            );
+        }
     }
 
     #[test]

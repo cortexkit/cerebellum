@@ -220,7 +220,7 @@ async fn bind(
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new("/test/project", "test", conversation),
+        identity: BindIdentity::new("test", conversation),
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(

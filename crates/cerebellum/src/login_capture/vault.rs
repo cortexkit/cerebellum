@@ -268,14 +268,7 @@ impl ClaustrumVault {
             .await
             .map_err(|_| VaultReachError::Unreachable)?;
 
-        // The connection file sits in the daemon's runtime directory, an
-        // absolute path; the bind identity is attribution, not authority.
-        let project_root = self
-            .connection_file
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        let identity = BindIdentity::new(project_root, BIND_HARNESS, self.bind_session);
+        let identity = BindIdentity::new(BIND_HARNESS, self.bind_session);
         let consumer = self
             .launch_nonce
             .as_deref()

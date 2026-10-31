@@ -1797,7 +1797,7 @@ mod tests {
 
     fn route() -> RouteIdentity {
         RouteIdentity::from_bind(
-            &subc_protocol::BindIdentity::new("/test/project", "test", "fill-hardening"),
+            &subc_protocol::BindIdentity::new("test", "fill-hardening"),
             &Some(subc_protocol::Principal::Direct),
         )
     }

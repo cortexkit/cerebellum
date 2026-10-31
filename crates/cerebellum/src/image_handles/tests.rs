@@ -231,7 +231,7 @@ fn a_capture_reply_carries_a_handle_its_bytes_resolve_by() {
         crate::JournalPersistence::Isolated,
     );
     let facts = crate::AcceptedBindFacts::from_bind(
-        &subc_protocol::BindIdentity::new("/test/project", "test", "conversation".to_string()),
+        &subc_protocol::BindIdentity::new("test", "conversation".to_string()),
         Some(subc_protocol::Principal::Reserved {
             module_id: "cerebellum".to_owned(),
         }),
@@ -273,7 +273,7 @@ fn a_capture_on_an_unstamped_route_mints_no_handle() {
         crate::JournalPersistence::Isolated,
     );
     let facts = crate::AcceptedBindFacts::from_bind(
-        &subc_protocol::BindIdentity::new("/test/project", "test", "conversation".to_string()),
+        &subc_protocol::BindIdentity::new("test", "conversation".to_string()),
         Some(subc_protocol::Principal::Reserved {
             module_id: "cerebellum".to_owned(),
         }),

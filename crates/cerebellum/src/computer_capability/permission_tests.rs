@@ -176,7 +176,7 @@ mod wire {
             7,
             1,
             crate::AcceptedBindFacts::from_bind(
-                &subc_protocol::BindIdentity::new("/test/project", "test", "session".to_string()),
+                &subc_protocol::BindIdentity::new("test", "session".to_string()),
                 crate::session_caller_principal_for_test(),
                 Some(
                     &json!({"agentProjectId":"test-project", "sessionKind":"primary",

@@ -36,7 +36,7 @@ async fn main() {
         target: subc_protocol::RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: subc_protocol::BindIdentity::new("/live/open-app", "desk", "open-app-live"),
+        identity: subc_protocol::BindIdentity::new("desk", "open-app-live"),
         principal: cerebellum::session_caller_principal_for_test(),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(

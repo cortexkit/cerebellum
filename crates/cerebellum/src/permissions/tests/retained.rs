@@ -190,7 +190,7 @@ async fn retained_management_ops_assert_exact_head_and_two_worker_rows() {
 fn worker_facts() -> AcceptedBindFacts {
     let mut stamp = crate::cingulate_client::worker_vectors::worker_stamp();
     stamp.scope_ref = "worker-one".into();
-    AcceptedBindFacts::from_bind(&subc_protocol::BindIdentity::new("/fixture/project", "test", "worker"), crate::session_caller_principal_for_test(), Some(&json!({"agentProjectId":"agent-alf","sessionKind":"subagent","effectiveCapabilityScope":["*"]})), None, &RouteTarget::ManagementSurface { module_id:"cerebellum".into() }).with_scope(Some(stamp))
+    AcceptedBindFacts::from_bind(&subc_protocol::BindIdentity::new("test", "worker"), crate::session_caller_principal_for_test(), Some(&json!({"agentProjectId":"agent-alf","sessionKind":"subagent","effectiveCapabilityScope":["*"]})), None, &RouteTarget::ManagementSurface { module_id:"cerebellum".into() }).with_scope(Some(stamp))
 }
 
 #[tokio::test]

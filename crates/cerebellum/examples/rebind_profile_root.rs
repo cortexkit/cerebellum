@@ -17,7 +17,6 @@
 
 #[cfg(target_os = "macos")]
 mod live {
-    use std::path::PathBuf;
     use std::process::ExitCode;
     use std::sync::Arc;
     use std::time::Duration;
@@ -90,11 +89,7 @@ mod live {
             target: RouteTarget::ManagementSurface {
                 module_id: "cerebellum".to_string(),
             },
-            identity: BindIdentity::new(
-                PathBuf::from("/operator-desk"),
-                "operator".to_string(),
-                "operator-desk".to_string(),
-            ),
+            identity: BindIdentity::new("operator".to_string(), "operator-desk".to_string()),
             principal: Some(Principal::Direct),
             consumer_capabilities: Some(vec!["elicitation".to_string()]),
             admission_facts: None,

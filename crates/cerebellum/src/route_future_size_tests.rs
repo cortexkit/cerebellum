@@ -71,7 +71,7 @@ fn route_future_sizes() -> Vec<(&'static str, usize)> {
     let (tx, _rx) = mpsc::channel(4);
     let call = CallObservation::new();
     let identity = cerebellum_core::identity::RouteIdentity::from_bind(
-        &subc_protocol::BindIdentity::new("/test/project", "test", "test-session".to_string()),
+        &subc_protocol::BindIdentity::new("test", "test-session".to_string()),
         &Some(subc_protocol::Principal::Direct),
     );
     let arguments = json!({});

@@ -275,7 +275,7 @@ mod tests {
 
     fn facts() -> AcceptedBindFacts {
         AcceptedBindFacts::from_bind(
-            &BindIdentity::new("/test/project", "test", "test-session"),
+            &BindIdentity::new("test", "test-session"),
             Some(Principal::Reserved {
                 module_id: "prefrontal-core".into(),
             }),

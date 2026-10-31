@@ -509,7 +509,7 @@ mod tests {
                 Arc::new(FileRegistryStore::new(root.join("registry.json"))),
             );
             let facts = AcceptedBindFacts::from_bind(
-                &BindIdentity::new("/test", "test", "browser-cards"),
+                &BindIdentity::new("test", "browser-cards"),
                 crate::session_caller_principal_for_test(),
                 Some(
                     &json!({"agentProjectId":"browser-tests","sessionKind":"primary","effectiveCapabilityScope":["*"]}),
@@ -1274,7 +1274,7 @@ mod tests {
             .launch_recovery_registry()
             .publish(Arc::new(Clearer(Mutex::new(Vec::new()))));
         let facts = AcceptedBindFacts::from_bind(
-            &BindIdentity::new("/test", "test", "operator"),
+            &BindIdentity::new("test", "operator"),
             Some(subc_protocol::Principal::Direct),
             Some(
                 &json!({"agentProjectId":"browser-tests","sessionKind":"primary","effectiveCapabilityScope":["*"]}),

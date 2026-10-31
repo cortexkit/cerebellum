@@ -34,11 +34,7 @@ pub fn invalid_request(field: &str, reason_code: &str) -> Value {
 
 fn placeholder_identity_for_schema_tests() -> RouteIdentity {
     RouteIdentity::from_accepted_bind(
-        &subc_protocol::BindIdentity::new(
-            std::path::PathBuf::from("/legacy/project"),
-            "legacy".to_string(),
-            "legacy-session".to_string(),
-        ),
+        &subc_protocol::BindIdentity::new("legacy".to_string(), "legacy-session".to_string()),
         &None,
         None,
     )

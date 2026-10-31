@@ -180,7 +180,7 @@ async fn open_scoped_route(
             target: RouteTarget::ToolProvider {
                 module_id: "cerebellum".into(),
             },
-            identity: BindIdentity::new("/tmp", "scope-live", CONVERSATION),
+            identity: BindIdentity::new("scope-live", CONVERSATION),
             consumer_identity: Some(ConsumerIdentity {
                 module_id: OWNER.into(),
                 launch_nonce: nonce.into(),

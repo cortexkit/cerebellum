@@ -13,7 +13,7 @@ fn principal(module: &str) -> Option<Principal> {
 
 fn facts(module: &str) -> AcceptedBindFacts {
     AcceptedBindFacts::from_bind(
-        &subc_protocol::BindIdentity::new("/fixture", "fixture", "conversation"),
+        &subc_protocol::BindIdentity::new("fixture", "conversation"),
         principal(module),
         None,
         None,
@@ -1222,7 +1222,7 @@ async fn broca_bind_is_management_only_and_queries_do_not_wait_for_browser_work(
             route_channel: 8,
             epoch: 1,
             principal: principal("broca"),
-            identity: subc_protocol::BindIdentity::new("/fixture", "test", "session"),
+            identity: subc_protocol::BindIdentity::new("test", "session"),
             admission_facts: None,
             consumer_capabilities: None,
             target,

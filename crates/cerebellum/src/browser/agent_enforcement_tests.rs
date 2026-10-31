@@ -42,7 +42,7 @@ async fn browser_dispatch_commit_refuses_a_row_revoked_after_authorization() {
         .unwrap();
     let plane = BrowserPlane::new();
     let identity = RouteIdentity::from_accepted_bind(
-        &subc_protocol::BindIdentity::new("/tmp/project", "test", "conversation"),
+        &subc_protocol::BindIdentity::new("test", "conversation"),
         &Some(subc_protocol::Principal::Direct),
         Some(&serde_json::json!({"agentProjectId": "test-project", "sessionKind": "primary"})),
     );

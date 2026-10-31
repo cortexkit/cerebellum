@@ -319,7 +319,7 @@ async fn private_content_query_wire_shapes_match_their_goldens() {
         principal: Some(subc_protocol::Principal::Reserved {
             module_id: "broca".into(),
         }),
-        identity: BindIdentity::new("/fixture", "fixture", "session"),
+        identity: BindIdentity::new("fixture", "session"),
         admission_facts: None,
         consumer_capabilities: None,
         target: RouteTarget::ManagementSurface {

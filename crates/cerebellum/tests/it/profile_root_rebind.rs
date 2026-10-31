@@ -762,7 +762,6 @@ async fn bind_management_route_as(
             module_id: "cerebellum".to_string(),
         },
         identity: BindIdentity::new(
-            PathBuf::from("/tmp/profile-root-rebind-project"),
             "opencode".to_string(),
             "profile-root-rebind-conversation".to_string(),
         ),

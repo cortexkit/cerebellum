@@ -144,12 +144,7 @@ impl DaemonCingulate {
     }
 
     fn open_body(&self, scope: &ScopeSelector) -> Vec<u8> {
-        let project_root = self
-            .connection_file
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        let identity = BindIdentity::new(project_root, BIND_HARNESS, BIND_SESSION);
+        let identity = BindIdentity::new(BIND_HARNESS, BIND_SESSION);
         let request = RouteOpenRequest {
             op: "route.open",
             target: RouteTarget::ManagementSurface {

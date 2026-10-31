@@ -32,7 +32,7 @@ async fn bind(planes: &Planes, principal: Principal, target: RouteTarget) -> Fra
         route_channel: CHANNEL,
         epoch: 1,
         target,
-        identity: subc_protocol::BindIdentity::new("/fixture/project", "test", "session"),
+        identity: subc_protocol::BindIdentity::new("test", "session"),
         principal: Some(principal),
         admission_facts: None,
         consumer_capabilities: None,

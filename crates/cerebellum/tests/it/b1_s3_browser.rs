@@ -54,7 +54,7 @@ const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAA
 
 fn identity() -> RouteIdentity {
     RouteIdentity::from_accepted_bind(
-        &subc_protocol::BindIdentity::new("/tmp/b1-s3", "test", "b1-s3-session"),
+        &subc_protocol::BindIdentity::new("test", "b1-s3-session"),
         &Some(subc_protocol::Principal::Direct),
         Some(&json!({"agentProjectId": "b1-s3-agent", "sessionKind": "primary"})),
     )

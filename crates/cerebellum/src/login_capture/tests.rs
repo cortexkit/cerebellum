@@ -23,7 +23,7 @@ use crate::computer_grants::{AlwaysOpenRoute, LoginCapability, QuestionCarrier};
 
 fn accepted() -> AcceptedBindFacts {
     AcceptedBindFacts::from_bind(
-        &subc_protocol::BindIdentity::new("/test/project", "test", "test-session".to_string()),
+        &subc_protocol::BindIdentity::new("test", "test-session".to_string()),
         Some(Principal::Direct),
         None,
         None,

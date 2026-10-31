@@ -41,7 +41,7 @@ async fn bind_probe_head(fixture: &Fixture) {
         target: RouteTarget::ToolProvider {
             module_id: "cerebellum".into(),
         },
-        identity: BindIdentity::new(fixture.registry.clone(), "probe", "user-browser-probe"),
+        identity: BindIdentity::new("probe", "user-browser-probe"),
         principal: crate::session_caller_principal_for_test(),
         consumer_capabilities: None,
         admission_facts: Some(json!({"agentProjectId":PROBE_AGENT,"sessionKind":"primary",

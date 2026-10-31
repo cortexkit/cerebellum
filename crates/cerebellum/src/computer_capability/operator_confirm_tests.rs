@@ -262,7 +262,7 @@ mod daemon {
                 target: RouteTarget::ToolProvider {
                     module_id: "cerebellum".into(),
                 },
-                identity: BindIdentity::new(root.path().to_path_buf(), "unit", "operator-test"),
+                identity: BindIdentity::new("unit", "operator-test"),
                 consumer_identity: None,
                 consumer_capabilities: None,
                 role_versions: None,

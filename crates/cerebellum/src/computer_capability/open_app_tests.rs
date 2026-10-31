@@ -91,7 +91,7 @@ fn rig_with_history(
         ]
         .into(),
     );
-    planes.routes.insert(9,3,crate::AcceptedBindFacts::from_bind(&subc_protocol::BindIdentity::new("/test/project","test","test-session"),crate::session_caller_principal_for_test(),Some(&json!({"agentProjectId":"test-project","sessionKind":"primary","effectiveCapabilityScope":["*"]})),Some(&["elicitation".into()]),&subc_protocol::RouteTarget::ToolProvider { module_id:"cerebellum".into() }));
+    planes.routes.insert(9,3,crate::AcceptedBindFacts::from_bind(&subc_protocol::BindIdentity::new("test", "test-session"),crate::session_caller_principal_for_test(),Some(&json!({"agentProjectId":"test-project","sessionKind":"primary","effectiveCapabilityScope":["*"]})),Some(&["elicitation".into()]),&subc_protocol::RouteTarget::ToolProvider { module_id:"cerebellum".into() }));
     let planes = crate::computer_grants::tests::CardService::install(planes, 9, 3);
     (planes, desk, storage)
 }

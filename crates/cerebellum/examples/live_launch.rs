@@ -578,11 +578,7 @@ fn print_wire_snapshot(label: &str, phase: &str, snapshot: &Value) {
 }
 
 fn probe_identity() -> BindIdentity {
-    BindIdentity::new(
-        std::env::temp_dir().join("ck-live-launch"),
-        "probe",
-        "live-launch-probe",
-    )
+    BindIdentity::new("probe", "live-launch-probe")
 }
 
 /// Read the profile directories themselves. Listing only their parent would
