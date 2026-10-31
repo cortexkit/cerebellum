@@ -131,7 +131,7 @@ fn image_projection(value: &Value) -> (Option<ImageContent>, Option<String>) {
     (image, reason.map(|reason| notice(id.as_deref(), reason)))
 }
 
-fn is_success(code: &str) -> bool {
+pub(crate) fn is_success(code: &str) -> bool {
     matches!(
         code,
         "ok" | "completed"

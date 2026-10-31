@@ -19,6 +19,7 @@ pub(crate) struct ConnectionDeadlines {
     pub(crate) pending:
         std::sync::Mutex<std::collections::BTreeMap<RequestId, tokio::time::Instant>>,
     pub(crate) changed: tokio::sync::Notify,
+    pub(crate) display: Arc<crate::tool_display::Records>,
 }
 
 impl ConnectionDeadlines {
@@ -71,8 +72,10 @@ where
     let mut writer = BufWriter::new(write_half);
     while let Some(frame) = rx.recv().await {
         let mut delivered = Vec::new();
+        let mut displays = Vec::new();
         if matches!(frame.header.ty, FrameType::Response | FrameType::Error) {
             delivered.push(request_id(&frame));
+            displays.extend(deadlines.display.prepare(&frame));
         }
         write_frame(&mut writer, &frame)
             .await
@@ -86,6 +89,7 @@ where
             };
             if matches!(frame.header.ty, FrameType::Response | FrameType::Error) {
                 delivered.push(request_id(&frame));
+                displays.extend(deadlines.display.prepare(&frame));
             }
             write_frame(&mut writer, &frame)
                 .await
@@ -96,6 +100,9 @@ where
             .await
             .map_err(|e| ModuleError::Message(e.to_string()))?;
         deadlines.delivered(&delivered);
+        for display in displays {
+            deadlines.display.delivered(display);
+        }
     }
     writer
         .flush()

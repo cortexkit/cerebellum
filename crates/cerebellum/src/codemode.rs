@@ -100,6 +100,7 @@ pub(crate) fn app(bundle: &str) {
 /// Name the site a held or refused codemode step is about, when the call's
 /// arguments did not (a user-browser read names a tab, not a site).
 pub(crate) fn origin(origin: &str) {
+    crate::tool_display::site(origin);
     let _ = CALL_DETAIL.try_with(|detail| {
         if let Some(detail) = detail.borrow_mut().as_mut() {
             detail["origin"] = json!(origin);
