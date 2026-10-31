@@ -106,7 +106,14 @@ fn image_projection(value: &Value) -> (Option<ImageContent>, Option<String>) {
             width,
             height,
         )
-        .with_alt(notice(id.as_deref(), "image_delivery_unavailable"));
+        // The alt describes the image. Hosts print it beside an attached image
+        // as well as in place of one they could not attach, so it must not
+        // claim the image went missing.
+        .with_alt(format!(
+            "Image {} ({width}x{height} {})",
+            id.as_deref().unwrap_or("unknown id"),
+            mime.unwrap()
+        ));
         candidate.id = id.clone();
         // The contract validates padding and trailing bits as well as the alphabet.
         // A malformed image becomes an explicit notice, never a consumer crash.
@@ -476,7 +483,7 @@ mod tests {
         );
         assert_eq!(
             result["content"][2],
-            json!({"type":"image", "data":"AA==", "mimeType":"image/png", "width":12, "height":8, "id":"image-1", "alt":"Image image-1 was not delivered: image_delivery_unavailable"})
+            json!({"type":"image", "data":"AA==", "mimeType":"image/png", "width":12, "height":8, "id":"image-1", "alt":"Image image-1 (12x8 image/png)"})
         );
         assert_eq!(result["structuredContent"], reply);
     }
