@@ -227,7 +227,14 @@ fn project(reply: Value) -> ToolResult {
             _ => GENERIC_SUCCESS_FALLBACK.to_string(),
         }));
     }
-    let mut result = ToolResult::new(content).with_structured_content(object.clone());
+    let mut structured = object.clone();
+    if image.is_some() {
+        // Send one copy of the bytes in the image part; programs use image_handle.
+        if let Some(image) = structured.get_mut("image").and_then(Value::as_object_mut) {
+            image.remove("data_b64");
+        }
+    }
+    let mut result = ToolResult::new(content).with_structured_content(structured);
     if let Some(code) = code.filter(|code| !is_success(code)) {
         result = result.with_error(code);
     }
@@ -238,12 +245,19 @@ fn project(reply: Value) -> ToolResult {
 }
 
 fn strip_inline_image(result: &mut ToolResult, reason: &str) -> Option<String> {
+    let has_image_part = result
+        .content
+        .iter()
+        .any(|part| matches!(part, ContentPart::Image(_)));
     let image = result
         .structured_content
         .as_mut()?
         .get_mut("image")?
         .as_object_mut()?;
-    image.remove("data_b64")?;
+    // A projected image has no inline bytes, but still needs omission metadata.
+    if image.remove("data_b64").is_none() && !has_image_part {
+        return None;
+    }
     let id = image
         .get("image_id")
         .and_then(Value::as_str)
@@ -270,10 +284,10 @@ pub(crate) fn encode_with_held(
     // Programs use screenshot handles and dimensions; image bytes are for the
     // model's direct view, not a JavaScript round trip through the carrier.
     if crate::codemode::active() {
+        strip_inline_image(&mut result, "codemode");
         result
             .content
             .retain(|part| !matches!(part, ContentPart::Image(_)));
-        strip_inline_image(&mut result, "codemode");
     }
     loop {
         let bytes = serde_json::to_vec(&result).map_err(ModuleError::Json)?;
@@ -283,17 +297,17 @@ pub(crate) fn encode_with_held(
             })?;
             return Ok(bytes);
         }
-        // Drop attachments last-first, including the copy programs would receive.
+        // Drop attachments last-first, marking their descriptors as undelivered.
         // Keep all model-facing text, with an explicit notice for each omission.
         if let Some(index) = result
             .content
             .iter()
             .rposition(|part| matches!(part, ContentPart::Image(_)))
         {
+            strip_inline_image(&mut result, "reply_size_limit");
             let ContentPart::Image(image) = result.content.remove(index) else {
                 unreachable!()
             };
-            strip_inline_image(&mut result, "reply_size_limit");
             result.content.insert(
                 index,
                 ContentPart::text(notice(image.id.as_deref(), "reply_size_limit")),
@@ -471,7 +485,7 @@ mod tests {
 
     #[test]
     fn read_state_image_follows_the_text() {
-        let reply = read_state_reply();
+        let mut reply = read_state_reply();
         let result = decoded(reply.clone());
         assert_eq!(
             result["content"][0],
@@ -485,12 +499,43 @@ mod tests {
             result["content"][2],
             json!({"type":"image", "data":"AA==", "mimeType":"image/png", "width":12, "height":8, "id":"image-1", "alt":"Image image-1 (12x8 image/png)"})
         );
+        reply["image"].as_object_mut().unwrap().remove("data_b64");
         assert_eq!(result["structuredContent"], reply);
     }
 
-    /// A screenshot handle names the very bytes a codemode result must leave
-    /// out, so it has to survive both result formats: the tool-result/v1
-    /// structured content, and the plain reply the codemode path sends.
+    #[test]
+    fn delivered_screenshot_keeps_bytes_only_in_the_image_part() {
+        let reply = json!({
+            "outcome": "ok",
+            "image_handle": "ih0123456789abcdef0123456789abcdef",
+            "image": {
+                "data_b64": "AQIDBA==",
+                "mime": "image/png",
+                "width_px": 12,
+                "height_px": 8,
+                "image_id": "screenshot-1",
+                "delivery_status": "delivered"
+            }
+        });
+        let result = decoded(reply.clone());
+        let mut descriptor = reply;
+        descriptor["image"]
+            .as_object_mut()
+            .unwrap()
+            .remove("data_b64");
+        assert_eq!(result["structuredContent"], descriptor);
+        let images: Vec<_> = result["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|part| part["type"] == "image")
+            .collect();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0]["data"], "AQIDBA==");
+    }
+
+    /// Codemode leaves screenshot bytes out of the reply, so structured content
+    /// must keep the handle and explain why the image part was omitted.
     #[tokio::test]
     async fn a_screenshot_handle_survives_a_codemode_result() {
         let mut reply = read_state_reply();
@@ -511,6 +556,15 @@ mod tests {
         assert_eq!(
             decoded["structuredContent"]["image_handle"], handle,
             "a program reaches its screenshot only through this handle"
+        );
+        assert!(!decoded["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part["type"] == "image"));
+        assert_eq!(
+            decoded["structuredContent"]["image"]["delivery_status"],
+            "not_delivered"
         );
         assert_eq!(
             decoded["structuredContent"]["image"]["delivery_reason"],
@@ -554,7 +608,7 @@ mod tests {
     #[test]
     fn oversized_image_is_dropped_but_text_is_kept() {
         let mut reply = read_state_reply();
-        reply["image"]["data_b64"] = json!("AAAA".repeat(400_000));
+        reply["image"]["data_b64"] = json!("AAAA".repeat(result::MAX_RESULT_BYTES / 4 + 1));
         let result = decoded(reply);
         assert_eq!(result["content"][0]["text"], "app\n  e1 button Save");
         assert_eq!(

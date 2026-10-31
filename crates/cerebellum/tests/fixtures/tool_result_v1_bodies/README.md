@@ -15,12 +15,18 @@ normalization followed.
 `cortexkit-role-tool-provider` 0.13.0 renamed the format to `tool-result/v1`
 and left the body shape unchanged. The test
 `tool_result_v1_reader_gets_the_bytes_the_retired_name_got` checks that a route
-declaring `tool-result/v1` now receives exactly these bytes.
+declaring `tool-result/v1` receives these pinned bytes.
 
-Captured SHA-256 values:
+The screenshot fixture was subsequently edited only to remove
+`structuredContent.image.data_b64`: screenshot bytes are delivered once in the
+image content part, while programs use `image_handle`. All other bytes of the
+capture remain unchanged. Its original captured SHA-256 was
+`c611d44bacff09dbba7e8b5558c53853307ab3ea029edfd4c6d784283f8c7744`.
+
+Current fixture SHA-256 values:
 
 - `browser_snapshot.json`: `d82fbb9a84799bbd4571e8add3d411b00dd4487927efa2dea94c8d8c0b056b10`
-- `browser_screenshot.json`: `c611d44bacff09dbba7e8b5558c53853307ab3ea029edfd4c6d784283f8c7744`
+- `browser_screenshot.json`: `13bad432165da2368969b9f5b4099874c03d9ba5cd1559b48986cd5fdb19659d`
 - `computer_read_state.json`: `939a5e75535f3e4d4ce2fd2589b5d2a86cd877aaa0bc77dc9c4b44c7c1c751d4`
 
 Do not regenerate these from the current projector: regenerating would save
