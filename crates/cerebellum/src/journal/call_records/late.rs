@@ -32,6 +32,7 @@ pub enum HandoffEnding {
     HandoffExpired,
     ClosedByCaller,
     HandoffInterrupted,
+    Unknown,
 }
 
 impl HandoffEnding {
@@ -44,6 +45,7 @@ impl HandoffEnding {
             Self::HandoffExpired => "handoff_expired",
             Self::ClosedByCaller => "closed_by_caller",
             Self::HandoffInterrupted => "handoff_interrupted",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -75,6 +77,13 @@ impl ConsentEnding {
 enum LateOutcome {
     Handoff(HandoffEnding),
     Consent(ConsentEnding),
+    Scope(ScopeEnding),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ScopeEnding {
+    ScopeEnded,
 }
 
 impl LateOutcome {
@@ -82,6 +91,7 @@ impl LateOutcome {
         match self {
             Self::Handoff(ending) => ending.as_str(),
             Self::Consent(ending) => ending.as_str(),
+            Self::Scope(ScopeEnding::ScopeEnded) => late_results::reasons::SCOPE_ENDED,
         }
     }
 }
@@ -122,6 +132,27 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl HeldHandoff {
+    pub(super) fn requires_reader_6(&self) -> bool {
+        self.scope_ended()
+            || matches!(
+                self.phase,
+                Phase::Result {
+                    outcome: LateOutcome::Handoff(HandoffEnding::Unknown),
+                    ..
+                }
+            )
+    }
+
+    pub(super) fn scope_ended(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Result {
+                outcome: LateOutcome::Scope(_),
+                ..
+            }
+        )
+    }
+
     pub(super) fn is_consent(&self) -> bool {
         self.consent.is_some()
     }
@@ -230,7 +261,7 @@ fn wire_entry(record: &CallRecord) -> Option<LateEntry> {
             outcome,
             settled_at,
         } => (
-            if handoff.is_consent() {
+            if handoff.is_consent() || handoff.scope_ended() {
                 late_results::kinds::NOT_STARTED
             } else {
                 late_results::kinds::RESULT
@@ -263,7 +294,10 @@ fn wire_entry(record: &CallRecord) -> Option<LateEntry> {
     if let Some(result) = result {
         entry = entry.with_result(result);
     }
-    if let (Some(ask_id), Phase::Result { outcome, .. }) = (&handoff.consent, &handoff.phase) {
+    if handoff.scope_ended() {
+        entry.reason = Some(late_results::reasons::SCOPE_ENDED.into());
+    } else if let (Some(ask_id), Phase::Result { outcome, .. }) = (&handoff.consent, &handoff.phase)
+    {
         entry.reason = Some("consent".into());
         entry.outcome = Some(outcome.as_str().into());
         entry.extra.insert(
@@ -284,7 +318,9 @@ pub(super) fn settled_result(record: &CallRecord) -> Option<Value> {
 }
 
 fn result_body(held: &HeldHandoff, outcome: &str) -> Value {
-    if let Some(ask_id) = &held.consent {
+    if outcome == late_results::reasons::SCOPE_ENDED {
+        json!({"outcome":"not_started","reason":late_results::reasons::SCOPE_ENDED})
+    } else if let Some(ask_id) = &held.consent {
         json!({"outcome": if outcome == "approved" { "not_started" } else { outcome },
             "detail":{"consent":outcome,"ask_id":ask_id},
             "remedy":if outcome == "approved" { "Approved; call again to run it." } else { "The original action was not run." }})
@@ -324,14 +360,88 @@ impl CallRecords {
             .ok_or_else(|| CallRecordError::Corrupt("held consent has no scope".into()))?;
         record.handoff = Some(HeldHandoff {
             origin: String::new(),
-            scope,
+            scope: scope.clone(),
             phase: Phase::Pending,
             capture: false,
             consent: Some(ask_id.into()),
         });
         self.write(&mut inner, &record, now_ms)?;
         inner.entries.get_mut(&key).unwrap().record = record;
+        if inner.ended_scopes.contains(&scope) {
+            self.finish_held_locked(
+                &mut inner,
+                &key,
+                LateOutcome::Scope(ScopeEnding::ScopeEnded),
+                now_ms,
+            )?;
+        }
         Ok(())
+    }
+
+    /// Only the daemon's exact scope-end signal settles holds. A route close,
+    /// rebind or restart must not manufacture this outcome.
+    pub(crate) fn end_held_scope(
+        &self,
+        scope: &ScopeIdentity,
+        now_ms: u64,
+    ) -> Result<(), CallRecordError> {
+        let mut inner = self.lock();
+        inner.ended_scopes.insert(scope.clone());
+        let keys: Vec<_> = inner
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.held_dispatched
+                    && entry.record.handoff.as_ref().is_some_and(|held| {
+                        &held.scope == scope && matches!(held.phase, Phase::Pending)
+                    })
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            self.finish_held_locked(
+                &mut inner,
+                &key,
+                LateOutcome::Scope(ScopeEnding::ScopeEnded),
+                now_ms,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn held_scope_ended(&self, scope: &ScopeIdentity) -> bool {
+        self.lock().ended_scopes.contains(scope)
+    }
+
+    /// Serialize the deposit boundary with scope end. After this returns true,
+    /// sending may begin and only the observed deposit result can settle it.
+    pub(crate) fn begin_capture_deposit(&self, principal: &str, call_key: &str) -> bool {
+        let mut inner = self.lock();
+        let key = (principal.to_owned(), call_key.to_owned());
+        let Some(entry) = inner.entries.get(&key) else {
+            return false;
+        };
+        let Some(held) = entry.record.handoff.as_ref() else {
+            return false;
+        };
+        if !held.capture
+            || !matches!(held.phase, Phase::Pending)
+            || inner.ended_scopes.contains(&held.scope)
+        {
+            return false;
+        }
+        inner.entries.get_mut(&key).unwrap().held_dispatched = true;
+        true
+    }
+
+    pub(crate) fn has_pending_scope(&self, scope: &ScopeIdentity) -> bool {
+        self.lock().entries.values().any(|entry| {
+            entry
+                .record
+                .handoff
+                .as_ref()
+                .is_some_and(|held| &held.scope == scope && matches!(held.phase, Phase::Pending))
+        })
     }
 
     pub fn has_pending_consents(&self) -> bool {
@@ -466,7 +576,7 @@ impl CallRecords {
             .clone();
         record.handoff = Some(HeldHandoff {
             origin: origin.to_owned(),
-            scope,
+            scope: scope.clone(),
             phase: Phase::Pending,
             capture: conversation.is_none(),
             consent: None,
@@ -479,6 +589,14 @@ impl CallRecords {
             .record = record;
         if let Some(conversation) = conversation {
             inner.handoffs.insert(conversation.to_owned(), key);
+        }
+        if inner.ended_scopes.contains(&scope) {
+            self.finish_held_locked(
+                &mut inner,
+                &(principal.into(), call_key.into()),
+                LateOutcome::Scope(ScopeEnding::ScopeEnded),
+                now_ms,
+            )?;
         }
         Ok(())
     }
@@ -524,12 +642,22 @@ impl CallRecords {
         if !matches!(handoff.phase, Phase::Pending) {
             return Ok(());
         }
+        // Remember the observed end even when its first custody write failed.
+        // A later consent answer or poll retries the same terminal, not its own.
+        let outcome = if !entry.held_dispatched && inner.ended_scopes.contains(&handoff.scope) {
+            LateOutcome::Scope(ScopeEnding::ScopeEnded)
+        } else {
+            outcome
+        };
         handoff.phase = Phase::Result {
             outcome,
             settled_at: now_ms,
         };
         record.outcome = Some(outcome.as_str().into());
-        record.state = if handoff.is_consent() {
+        record.state = if handoff.scope_ended() {
+            record.refusal_reason = Some(late_results::reasons::SCOPE_ENDED.into());
+            CallState::Refused
+        } else if handoff.is_consent() {
             CallState::Asked
         } else {
             CallState::Replied

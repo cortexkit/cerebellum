@@ -949,6 +949,7 @@ pub struct CaptureCall<'a, Cancelled> {
 pub struct CaptureOutcome {
     pub reply: Value,
     pub journal: LoginCapturePayload,
+    pub(crate) deposit_unknown: bool,
 }
 
 /// The window is ready, but observation waits until the caller has durably
@@ -1107,7 +1108,7 @@ impl CaptureModule {
     where
         Cancelled: Fn() -> bool,
     {
-        self.run_notifying(request, call, None).await
+        self.run_notifying(request, call, None, None).await
     }
 
     pub(crate) async fn run_notifying<Cancelled>(
@@ -1115,13 +1116,16 @@ impl CaptureModule {
         request: &CaptureRequest,
         call: CaptureCall<'_, Cancelled>,
         handoff: Option<tokio::sync::oneshot::Sender<CaptureHandoff>>,
+        begin_deposit: Option<Box<dyn Fn() -> bool + Send + Sync>>,
     ) -> CaptureOutcome
     where
         Cancelled: Fn() -> bool,
     {
         let carrier = Arc::clone(&call.consent.carrier);
         let mut taken = None;
-        let outcome = self.run_consented(request, call, &mut taken, handoff).await;
+        let outcome = self
+            .run_consented(request, call, &mut taken, handoff, begin_deposit)
+            .await;
         if let Some(answer) = taken {
             crate::computer_grants::report_login_execution(
                 &carrier,
@@ -1142,6 +1146,7 @@ impl CaptureModule {
         call: CaptureCall<'_, Cancelled>,
         taken: &mut Option<LoginAnswer>,
         handoff: Option<tokio::sync::oneshot::Sender<CaptureHandoff>>,
+        begin_deposit: Option<Box<dyn Fn() -> bool + Send + Sync>>,
     ) -> CaptureOutcome
     where
         Cancelled: Fn() -> bool,
@@ -1506,8 +1511,9 @@ impl CaptureModule {
             request.account_email(),
         );
         // The profile goes before the deposit: once the login is stored, no
-        // second copy of the session may exist. A cancel from here changes
-        // nothing; the deposit is bounded by its own deadline.
+        // second copy of the session may exist. Ordinary request cancellation
+        // from here changes nothing; exact scope end is checked at the deposit
+        // boundary below, and the deposit has its own deadline.
         let disposal = self.dispose(browser, &placement).await;
         let record = record.with_deletion(disposal.deleted);
         let deposit_request = match deposit_request {
@@ -1540,6 +1546,12 @@ impl CaptureModule {
             );
         }
 
+        // Serialize scope end with the first possible send, after disposal.
+        // A refused boundary leaves no profile and sends no credential bytes.
+        if begin_deposit.as_ref().is_some_and(|begin| !begin()) {
+            drop(deposit_request);
+            return record.ended("cancelled", None);
+        }
         let end = vault::deposit(
             vault.as_ref(),
             deposit_request,
@@ -2118,6 +2130,7 @@ impl Record {
         CaptureOutcome {
             reply: detail,
             journal: self.payload(&format!("refused:{code}"), 0),
+            deposit_unknown: false,
         }
     }
 
@@ -2125,6 +2138,11 @@ impl Record {
     /// keeps the vault's outcome or the refusal's reason, and the header's
     /// length; never anything else from the vault's reply.
     fn deposited(self, bytes: u64, end: vault::DepositEnd, deadline: Duration) -> CaptureOutcome {
+        let deposit_unknown = matches!(
+            &end,
+            vault::DepositEnd::CallFailed { .. }
+                | vault::DepositEnd::DeadlineExceeded { sent: true }
+        );
         let seconds = deadline.as_secs_f64();
         let (reason, remedy): (String, String) = match end {
             vault::DepositEnd::Stored(deposited) => {
@@ -2138,6 +2156,7 @@ impl Record {
                 return CaptureOutcome {
                     reply,
                     journal: self.payload(&format!("captured:{vault_outcome}"), bytes),
+                    deposit_unknown: false,
                 };
             }
             vault::DepositEnd::Refused(refusal) => {
@@ -2177,7 +2196,9 @@ impl Record {
                 (VAULT_REPLY_MALFORMED.to_string(), INTERNAL_FAULT.to_string())
             }
         };
-        self.not_stored(bytes, &reason, Some(remedy))
+        let mut outcome = self.not_stored(bytes, &reason, Some(remedy));
+        outcome.deposit_unknown = deposit_unknown;
+        outcome
     }
 
     /// The login was captured but is not in the vault, and nothing else holds
@@ -2192,6 +2213,7 @@ impl Record {
         CaptureOutcome {
             reply,
             journal: self.payload(&format!("refused:capture_not_stored:{reason}"), bytes),
+            deposit_unknown: false,
         }
     }
 
@@ -2228,6 +2250,7 @@ impl Record {
         CaptureOutcome {
             reply,
             journal: self.payload(outcome, 0),
+            deposit_unknown: false,
         }
     }
 }

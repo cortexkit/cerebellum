@@ -964,3 +964,39 @@ async fn handoff_completions_report_the_true_ending_through_durable_and_legacy_p
         }
     }
 }
+
+#[tokio::test]
+async fn scope_ended_completion_is_an_error_written_once_before_or_after_flush() {
+    for settle_first in [false, true] {
+        let planes = planes();
+        let display = DisplayDouble::new(&["display"]);
+        planes.routes.display.connect(display.clone());
+        let facts = install(&planes);
+        planes.routes.display.arm(&frame(request()), &facts);
+        let principal = journal::call_records::principal_label(facts.principal.as_ref());
+        let finish = || {
+            planes.routes.display.completed(
+                &principal,
+                "pf:local",
+                &json!({"outcome":"not_started","reason":"scope_ended"}),
+            )
+        };
+        if settle_first {
+            finish();
+        }
+        deliver(&planes, json!({"outcome":"login_pending"})).await;
+        if !settle_first {
+            finish();
+        }
+        finish();
+        display.count(2).await;
+        let writes = display.writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        let completion = writes
+            .iter()
+            .find(|write| write.kind == DisplayKind::Completion)
+            .unwrap();
+        assert_eq!(completion.body["outcome"], "error");
+        assert_eq!(completion.body["reason"], "scope_ended");
+    }
+}

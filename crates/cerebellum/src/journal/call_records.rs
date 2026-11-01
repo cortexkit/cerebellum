@@ -82,7 +82,10 @@ pub const CALL_RECORD_FILE: &str = "call_records.jsonl";
 /// Only the first capture handoff requires reader 4; `browser.present` handoffs
 /// remain readable by reader 3.
 /// Version 5 adds consent custody. Only a held consent reply requires reader 5.
-pub const CALL_RECORD_VERSION: u64 = 5;
+/// Version 6 adds scope-ended and unobserved-deposit settlements. Only the first
+/// entry of either kind requires reader 6; startup and ordinary late-result pulls
+/// do not raise the file's minimum reader version.
+pub const CALL_RECORD_VERSION: u64 = 6;
 
 const ORDINARY_CALL_RECORD_VERSION: u64 = 2;
 const HANDOFF_CALL_RECORD_VERSION: u64 = 3;
@@ -144,7 +147,7 @@ pub fn principal_label(principal: Option<&Principal>) -> String {
 /// These are identifiers (a principal label, the owner's opaque session ref,
 /// a number), not screen text. The field has been part of this file's format
 /// since its first version, so recording it changes no format version.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeIdentity {
     pub owner: String,
@@ -220,7 +223,8 @@ pub struct CallRecord {
 impl CallRecord {
     fn required_version(&self) -> u64 {
         match &self.handoff {
-            Some(handoff) if handoff.is_consent() => CALL_RECORD_VERSION,
+            Some(handoff) if handoff.requires_reader_6() => CALL_RECORD_VERSION,
+            Some(handoff) if handoff.is_consent() => 5,
             Some(handoff) if handoff.is_capture() => 4,
             Some(_) => HANDOFF_CALL_RECORD_VERSION,
             None => ORDINARY_CALL_RECORD_VERSION,
@@ -681,6 +685,9 @@ type Key = (String, String);
 #[derive(Debug)]
 struct Entry {
     consent_ended: bool,
+    // Capture can start depositing after its held reply. Process-local only:
+    // pending captures restart as handoff_interrupted, without a dispatch mark.
+    held_dispatched: bool,
     record: CallRecord,
     conversation_key: String,
     ask_id: Option<String>,
@@ -719,6 +726,7 @@ struct Inner {
     incarnation: String,
     late_heads: HashMap<String, u64>,
     handoffs: HashMap<String, Key>,
+    ended_scopes: std::collections::HashSet<ScopeIdentity>,
 }
 
 /// The call records of one module process.
@@ -829,6 +837,7 @@ impl CallRecords {
                 incarnation: late::incarnation(),
                 late_heads: HashMap::new(),
                 handoffs: HashMap::new(),
+                ended_scopes: Default::default(),
             }),
         }
     }
@@ -875,6 +884,7 @@ impl CallRecords {
             incarnation: late::incarnation(),
             late_heads: HashMap::new(),
             handoffs: HashMap::new(),
+            ended_scopes: Default::default(),
         };
         let line_count = records.len();
         let mut reconciled = false;
@@ -888,6 +898,7 @@ impl CallRecords {
                 key,
                 Entry {
                     consent_ended: false,
+                    held_dispatched: false,
                     record,
                     conversation_key: String::new(),
                     ask_id: None,
@@ -1120,6 +1131,7 @@ impl CallRecords {
             key.clone(),
             Entry {
                 consent_ended: false,
+                held_dispatched: false,
                 record,
                 conversation_key: conversation_key.to_string(),
                 ask_id: None,
@@ -1149,6 +1161,7 @@ impl CallRecords {
             // Preserve that ending instead of caching an already-obsolete hold.
             settlement.state = entry.record.state;
             settlement.outcome = entry.record.outcome.clone();
+            settlement.refusal_reason = entry.record.refusal_reason.clone();
             settlement.reply.frame.body =
                 serde_json::to_vec(&result).expect("handoff result serializes");
         }
@@ -1191,6 +1204,11 @@ impl CallRecords {
         let Some(entry) = inner.entries.get_mut(&ticket.key) else {
             return;
         };
+        if entry.record.outcome.as_deref()
+            == Some(cortexkit_role_tool_provider::late_results::reasons::SCOPE_ENDED)
+        {
+            return;
+        }
         entry.record.state = CallState::Unknown;
         entry.record.settled_at_ms = Some(now_ms);
         let record = entry.record.clone();

@@ -1614,6 +1614,9 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
     };
     loop {
         let answer = planes.scopes.describe(&writer, &key).await;
+        if held_scope_end(answer.as_ref(), &key) {
+            settle_scope_holds(&planes, &key);
+        }
         if scope_watch::classify(answer.as_ref(), key.scope_epoch)
             == scope_watch::ScopeVerdict::Ended
         {
@@ -1634,7 +1637,9 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
             .consent
             .awaiting_execution_sessions()
             .contains(&session);
-        if (!browser_open && !consent_waiting) || planes.routes.carries_scope(&key) {
+        let held_waiting = planes.calls.has_pending_scope(&held_scope_identity(&key));
+        if (!browser_open && !consent_waiting && !held_waiting) || planes.routes.carries_scope(&key)
+        {
             planes.scopes.finish(&key);
             return;
         }
@@ -1649,6 +1654,58 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
             }
         }
     }
+}
+
+fn held_scope_identity(key: &scope_watch::ScopeKey) -> journal::call_records::ScopeIdentity {
+    journal::call_records::ScopeIdentity {
+        owner: journal::call_records::principal_label(Some(&key.owner)),
+        reference: key.scope_ref.clone(),
+        scope_epoch: key.scope_epoch,
+    }
+}
+
+fn held_scope_end(
+    answer: Option<&scope_watch::DescribeAnswer>,
+    key: &scope_watch::ScopeKey,
+) -> bool {
+    answer.is_some_and(|answer| {
+        answer.status == subc_protocol::scope::ScopeStatus::Ended
+            && answer.scope_epoch == Some(key.scope_epoch)
+    })
+}
+
+/// Settle the held call without withdrawing its card or closing a browser
+/// borrowed from the parent agent conversation. Capture observes the end through
+/// its cancellation predicate; the persistent browser keeps its normal handoff
+/// and teardown policy.
+fn settle_scope_holds(planes: &Planes, key: &scope_watch::ScopeKey) {
+    let _ = planes
+        .calls
+        .end_held_scope(&held_scope_identity(key), wall_clock_ms());
+}
+
+/// A codemode run borrows its parent agent conversation's browser and grants.
+/// Watch only its held calls: ending the run must not revoke that conversation.
+async fn watch_run_scope_holds(
+    planes: Planes,
+    writer: mpsc::Sender<Frame>,
+    key: scope_watch::ScopeKey,
+) {
+    let mut drain = planes.drain_signal.subscribe();
+    let closed_again = planes.scopes.closed_again(&key);
+    while planes.calls.has_pending_scope(&held_scope_identity(&key)) {
+        let answer = planes.scopes.describe(&writer, &key).await;
+        if held_scope_end(answer.as_ref(), &key) {
+            settle_scope_holds(&planes, &key);
+            break;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(planes.scopes.recheck_interval) => {}
+            _ = closed_again.notified() => {}
+            _ = drain.wait_for(|draining| *draining) => break,
+        }
+    }
+    planes.scopes.finish(&key);
 }
 
 fn watch_retained_consent_scopes(planes: &Planes, writer: &mpsc::Sender<Frame>) {
@@ -3685,6 +3742,30 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Push if frame.header.channel == 0 => {
+            if let Ok(subc_control::ClientControlPush::RouteClosed {
+                module_id,
+                reason: subc_protocol::RouteCloseReason::ScopeEnded,
+                channels,
+                ..
+            }) = serde_json::from_slice(&frame.body)
+            {
+                if module_id == "cerebellum" {
+                    let scopes: Vec<_> = planes
+                        .routes
+                        .inner
+                        .read()
+                        .expect("route bindings lock poisoned")
+                        .iter()
+                        .filter(|((channel, _), _)| channels.contains(channel))
+                        .filter_map(|(_, facts)| {
+                            facts.scope.as_ref().map(scope_watch::ScopeKey::from_stamp)
+                        })
+                        .collect();
+                    for scope in scopes {
+                        settle_scope_holds(planes, &scope);
+                    }
+                }
+            }
             if let Ok(subc_protocol::session::ModuleControlCommand::Draining {
                 reason,
                 deadline_ms,
@@ -3737,6 +3818,18 @@ async fn handle_frame(
                     _ if facts.call_mode == subc_protocol::call_mode::CallMode::Codemode => {
                         // A run borrows the head conversation's browser and grants.
                         // Ending the run cancels its calls, not the head session.
+                        if let Some(stamp) = facts.scope.as_ref() {
+                            let key = scope_watch::ScopeKey::from_stamp(stamp);
+                            if planes.calls.has_pending_scope(&held_scope_identity(&key))
+                                && planes.scopes.note_closed(&key, conversation_key)
+                            {
+                                tokio::spawn(watch_run_scope_holds(
+                                    planes.clone(),
+                                    writer.clone(),
+                                    key,
+                                ));
+                            }
+                        }
                     }
                     None => {
                         // A conversation's computer grants end with its last
@@ -5663,6 +5756,11 @@ async fn capture_browser_login(
     let cancel = planes.cancellations.get((channel, epoch, corr));
     let draining = Arc::clone(&planes.draining);
     let cancel_for_capture = cancel.clone();
+    let held_calls = Arc::clone(&planes.calls);
+    let held_scope = facts
+        .scope
+        .as_ref()
+        .map(journal::call_records::ScopeIdentity::from_stamp);
     let detached = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let detached_for_capture = Arc::clone(&detached);
     // The card is raised through the module's computer grants, which hold
@@ -5684,6 +5782,9 @@ async fn capture_browser_login(
     );
     let (ready, handed_over) = tokio::sync::oneshot::channel();
     let mut handed_over = handed_over;
+    let deposit_calls = Arc::clone(&planes.calls);
+    let deposit_principal = journal::call_records::principal_label(facts.principal.as_ref());
+    let deposit_key = call_key.to_owned();
     let mut running = Box::pin(async move {
         capture
             .run_notifying(
@@ -5698,9 +5799,15 @@ async fn capture_browser_login(
                                 .as_ref()
                                 .is_some_and(CancelHandle::is_cancelled))
                             || draining.load(std::sync::atomic::Ordering::Acquire)
+                            || held_scope
+                                .as_ref()
+                                .is_some_and(|scope| held_calls.held_scope_ended(scope))
                     },
                 },
                 Some(ready),
+                Some(Box::new(move || {
+                    deposit_calls.begin_capture_deposit(&deposit_principal, &deposit_key)
+                })),
             )
             .await
     });
@@ -5746,7 +5853,11 @@ async fn capture_browser_login(
     let journal_finalization = planes.capture.take_journal_finalization();
     tokio::spawn(async move {
         let outcome = running.await;
-        let ending = capture_ending(&outcome.reply);
+        let ending = if outcome.deposit_unknown {
+            journal::call_records::HandoffEnding::Unknown
+        } else {
+            capture_ending(&outcome.reply)
+        };
         let _ = tokio::task::spawn_blocking(move || {
             calls.finish_handoff(&principal, &key, ending, wall_clock_ms())
         })
