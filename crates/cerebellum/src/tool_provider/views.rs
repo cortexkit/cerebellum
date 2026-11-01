@@ -1,4 +1,10 @@
-//! Published pins outlive the catalog definitions that first introduced them.
+//! Display views for the apps' tool rows, served by `tool.views`.
+//!
+//! A view is keyed by a schema pin: `tp1:<tool>:<schema digest>:<semantics>`,
+//! which names one version of one tool's definition. Old transcripts keep the
+//! pin their call was made with, so once a pin's view is published it must keep
+//! being served, with the same record schema and reads, even after the tool's
+//! definition changes. `published-v1.json` is that permanent list.
 
 use super::*;
 use cortexkit_role_tool_provider::views::{ViewEntry, ViewManifest, ViewsReply, ViewsRequest};
