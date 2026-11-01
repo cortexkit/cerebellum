@@ -686,13 +686,13 @@ async fn an_empty_array_drops_the_whole_record_or_completion_before_writing() {
 }
 
 #[tokio::test]
-async fn twenty_thousand_ordinary_calls_each_write_a_record_and_release_tracking() {
+async fn seventy_thousand_ordinary_calls_write_records_with_bounded_tombstones() {
     let planes = planes();
     let display = DisplayDouble::new(&["display"]);
     planes.routes.display.connect(display.clone());
     let facts = install(&planes);
     let mut request = request();
-    for index in 0..20_000 {
+    for index in 0..70_000 {
         request["call_key"] = json!(format!("local:{index}"));
         request["origin"]["call_key"] = json!(format!("runner:{index}"));
         assert!(
@@ -704,10 +704,52 @@ async fn twenty_thousand_ordinary_calls_each_write_a_record_and_release_tracking
             "call {index} lost tracking"
         );
         deliver(&planes, json!({"outcome":"ok"})).await;
+        let state = planes.routes.display.state.lock().unwrap();
+        assert!(
+            state.identities.len() <= 65_536,
+            "runner tombstones grew at call {index}"
+        );
+        assert!(
+            state.seen_local_keys.len() <= 65_536,
+            "local tombstones grew at call {index}"
+        );
     }
-    display.count(20_000).await;
-    assert_eq!(display.writes.lock().unwrap().len(), 20_000);
-    assert!(planes.routes.display.state.lock().unwrap().calls.is_empty());
+    display.count(70_000).await;
+    assert_eq!(display.writes.lock().unwrap().len(), 70_000);
+    let state = planes.routes.display.state.lock().unwrap();
+    assert!(state.calls.is_empty());
+    let principal = journal::call_records::principal_label(facts.principal.as_ref());
+    let runner = serde_json::to_string(&Principal::Reserved {
+        module_id: "runner".into(),
+    })
+    .unwrap();
+    assert_eq!(state.identities.len(), 65_536);
+    assert_eq!(state.seen_local_keys.len(), 65_536);
+    assert!(!state
+        .identities
+        .contains(&(runner.clone(), "runner:4463".into())));
+    assert!(state.identities.contains(&(runner, "runner:4464".into())));
+    assert!(!state
+        .seen_local_keys
+        .contains(&(principal.clone(), "local:4463".into())));
+    assert!(state
+        .seen_local_keys
+        .contains(&(principal, "local:4464".into())));
+}
+
+#[tokio::test]
+async fn an_active_call_remains_deduplicated_when_its_recent_tombstone_expires() {
+    let planes = planes();
+    let facts = install(&planes);
+    let request = frame(request());
+    assert!(planes.routes.display.arm(&request, &facts).is_some());
+    {
+        let mut state = planes.routes.display.state.lock().unwrap();
+        state.identities.clear();
+        state.seen_local_keys.clear();
+    }
+    assert!(planes.routes.display.arm(&request, &facts).is_none());
+    assert_eq!(planes.routes.display.state.lock().unwrap().calls.len(), 1);
 }
 
 #[tokio::test]

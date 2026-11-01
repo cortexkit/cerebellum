@@ -39,6 +39,7 @@ pub(crate) trait Backend: Send + Sync {
 const WRITE_WINDOW: Duration = Duration::from_secs(3);
 const MAX_WAITING: usize = 16_384;
 const MAX_RECENT_CONSENTS: usize = 16_384;
+const MAX_RECENT_CALLS: usize = 65_536;
 type Key = (String, String);
 
 #[derive(Default)]
@@ -53,6 +54,7 @@ struct State {
     calls: HashMap<Key, Tracked>,
     identities: std::collections::HashSet<Key>,
     seen_local_keys: std::collections::HashSet<Key>,
+    recent_calls: VecDeque<(Key, Key)>,
     waiting_order: BTreeMap<u64, Key>,
     next_order: u64,
     consent_results: HashMap<String, &'static str>,
@@ -266,11 +268,24 @@ impl Records {
         );
         let identity = (serde_json::to_string(&runner).ok()?, key.clone());
         let mut state = self.state.lock().unwrap();
-        if state.seen_local_keys.contains(&local) || state.identities.contains(&identity) {
+        if state.calls.contains_key(&local)
+            || state.seen_local_keys.contains(&local)
+            || state.identities.contains(&identity)
+        {
             return None;
         }
-        // Keep only identity tombstones after settlement, not the call's fields
-        // and timers. The capacity limit applies solely to calls still waiting.
+        // Bound ID-only duplicate suppression with a recent FIFO window. For a
+        // replay older than this window, display.write idempotency is the backstop:
+        // the same canonical bytes answer already_stored; different bytes are refused.
+        if state.recent_calls.len() >= MAX_RECENT_CALLS {
+            if let Some((identity, local)) = state.recent_calls.pop_front() {
+                state.identities.remove(&identity);
+                state.seen_local_keys.remove(&local);
+            }
+        }
+        state
+            .recent_calls
+            .push_back((identity.clone(), local.clone()));
         state.identities.insert(identity);
         state.seen_local_keys.insert(local.clone());
         while state.calls.len() >= MAX_WAITING {
