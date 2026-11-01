@@ -398,6 +398,9 @@ impl CallRecords {
         for key in keys {
             self.finish_held_locked(&mut inner, &key, LateOutcome::Consent(ending), now_ms)?;
         }
+        if let Some(display) = self.display.get().and_then(std::sync::Weak::upgrade) {
+            display.consent_completed(ask_id, ending.as_str());
+        }
         Ok(())
     }
 
@@ -547,6 +550,9 @@ impl CallRecords {
         inner.handoffs.retain(|_, held_key| held_key != key);
         next_seq(inner, key);
         self.bound_late(inner, now_ms)?;
+        if let Some(display) = self.display.get().and_then(std::sync::Weak::upgrade) {
+            display.completed(&key.0, &key.1, &result);
+        }
         Ok(())
     }
 

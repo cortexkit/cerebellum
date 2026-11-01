@@ -1187,6 +1187,7 @@ impl DeskSession<'_> {
         wait: Duration,
         cancelled: impl Future<Output = C>,
     ) -> Woke<C> {
+        let _person_wait = crate::tool_display::PersonWait::start();
         let live = self.live;
         let route_closed = async {
             while live.is_held() {

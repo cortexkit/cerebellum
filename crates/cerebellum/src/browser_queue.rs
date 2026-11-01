@@ -448,6 +448,7 @@ async fn acquire(
     mut drain: tokio::sync::watch::Receiver<bool>,
     quarantine: Option<QuarantineCheck>,
 ) -> Result<Option<LaneGuard>, QueueRefusal> {
+    let _queue_wait = crate::tool_display::QueueWait::start();
     let deadline = ticket.wait_deadline(QUEUE_WAIT_LIMIT);
     let quarantined = async {
         let Some(mut check) = quarantine else {

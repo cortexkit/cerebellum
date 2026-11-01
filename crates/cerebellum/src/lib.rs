@@ -93,6 +93,7 @@ mod terminal_arbiter;
 mod test_browser;
 #[cfg(test)]
 mod test_support;
+mod tool_display;
 mod tool_provider;
 mod tool_result;
 mod turn_ended;
@@ -1456,6 +1457,7 @@ pub struct RouteBindings {
     /// place. Writers lock `inner` before this; `bind_sequence` locks this
     /// alone or while `inner` is held, never the other way round.
     bind_order: Arc<std::sync::Mutex<BindOrder>>,
+    display: Arc<tool_display::Records>,
 }
 
 #[derive(Default)]
@@ -2285,6 +2287,13 @@ async fn run(
             )),
             registry,
         );
+    planes
+        .routes
+        .display
+        .connect(Arc::new(tool_display::DaemonDisplay::new(
+            config.connection_file_path.clone(),
+            config.module_id.clone(),
+        )));
     // Captures deposit into the vault over a connection of their own, opened
     // with the same connection file as this one. Set before `prepare`, so a
     // test can put its own vault in its place.
@@ -3449,6 +3458,12 @@ impl Planes {
             }
             JournalPersistence::Isolated => journal::call_records::CallRecords::in_memory(),
         });
+        let routes = Arc::new(RouteBindings::new());
+        let _ = calls.display.set(Arc::downgrade(&routes.display));
+        let egress_deadlines = Arc::new(ConnectionDeadlines {
+            display: Arc::clone(&routes.display),
+            ..Default::default()
+        });
         #[cfg(target_os = "macos")]
         let global_dispatch_review_revision =
             compiled_release_inputs().global_dispatch_review_revision;
@@ -3463,7 +3478,7 @@ impl Planes {
             }),
             image_handles: Arc::new(image_handles::ImageHandles::default()),
             signed_in,
-            routes: Arc::new(RouteBindings::new()),
+            routes,
             browser,
             browser_config,
             sessions,
@@ -3558,7 +3573,7 @@ impl Planes {
             capture,
             calls,
             call_record_workers: Arc::new(CallRecordWorkers::default()),
-            egress_deadlines: Arc::new(ConnectionDeadlines::default()),
+            egress_deadlines,
             scopes: Arc::new(scope_watch::ScopeRevocation::default()),
             #[cfg(test)]
             consent_test: None,
@@ -3807,6 +3822,10 @@ async fn handle_frame(
                 return Ok(true);
             }
             let arrived = tokio::time::Instant::now();
+            let display = planes
+                .routes
+                .get(frame.header.channel, frame.header.epoch)
+                .and_then(|facts| planes.routes.display.arm(&frame, &facts));
             let (envelope_ms, reply_ms) = route_limits(&frame, planes);
             let connection_end = arrived + Duration::from_millis(reply_ms);
             planes
@@ -3906,16 +3925,19 @@ async fn handle_frame(
                 let result = dispatch.await;
                 result
             };
-            tokio::spawn(run_arbitrated_route(
-                Box::pin(worker),
-                outgoing,
-                writer,
-                planes,
-                cancellation,
-                guard,
-                terminal,
-                arrived + Duration::from_millis(envelope_ms),
-                connection_end,
+            tokio::spawn(tool_display::ACTIVE.scope(
+                display,
+                run_arbitrated_route(
+                    Box::pin(worker),
+                    outgoing,
+                    writer,
+                    planes,
+                    cancellation,
+                    guard,
+                    terminal,
+                    arrived + Duration::from_millis(envelope_ms),
+                    connection_end,
+                ),
             ));
             Ok(true)
         }
@@ -3934,6 +3956,7 @@ async fn handle_route_request(
     writer: &mpsc::Sender<Frame>,
     planes: &Planes,
 ) -> Result<(), ModuleError> {
+    tool_display::started();
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
     let corr = frame.header.corr;
@@ -3951,6 +3974,31 @@ async fn handle_route_request(
         )
         .await;
     };
+    if facts
+        .scope
+        .as_ref()
+        .is_some_and(|stamp| Some(&stamp.owner) != facts.principal.as_ref())
+        && planes
+            .routes
+            .display
+            .known_display_principal(facts.principal.as_ref())
+    {
+        let object = serde_json::from_slice::<Value>(&frame.body).ok();
+        let name = object
+            .as_ref()
+            .and_then(|body| body["name"].as_str())
+            .unwrap_or("unknown");
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "principal_denied",
+            &format!("the display scope carrier may not call '{name}'; no live reads are declared"),
+        )
+        .await;
+    }
     if private_content::is_broca(&facts.principal) {
         // Broca's privacy decision must not queue behind a browser action or
         // consent drain. Its management route has no other authority.
@@ -5848,15 +5896,18 @@ async fn present_browser_handoff(
         }
     }
 
-    let settle = held.as_ref().map(|(principal, key, _)| {
-        let calls = Arc::clone(&planes.calls);
-        let (principal, key) = (principal.clone(), key.clone());
-        Arc::new(move |ending| {
-            calls
-                .finish_handoff(&principal, &key, ending, wall_clock_ms())
-                .is_ok()
-        }) as HandoffSettle
-    });
+    let settle = held
+        .as_ref()
+        .map(|(principal, key, _)| {
+            let calls = Arc::clone(&planes.calls);
+            let (principal, key) = (principal.clone(), key.clone());
+            Arc::new(move |ending| {
+                calls
+                    .finish_handoff(&principal, &key, ending, wall_clock_ms())
+                    .is_ok()
+            }) as HandoffSettle
+        })
+        .or_else(tool_display::handoff_settle);
     spawn_handoff_poll(
         planes,
         identity.clone(),
@@ -5976,6 +6027,13 @@ async fn handle_control_request(
             // permissions.list/revoke before any grant lookup. Neither needs
             // the unrelated powers that first-party membership would confer.
             let trust = trust_for_principal(&principal);
+            if matches!(principal, Some(subc_protocol::Principal::Reserved { .. }))
+                && scope
+                    .as_ref()
+                    .is_some_and(|stamp| Some(&stamp.owner) != principal.as_ref())
+            {
+                let _ = route_bindings.display.declarers().await;
+            }
             if private_content::is_broca(&principal)
                 && !private_content::bind_admitted(&principal, &target)
             {

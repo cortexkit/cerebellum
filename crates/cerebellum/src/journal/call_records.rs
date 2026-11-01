@@ -723,6 +723,7 @@ struct Inner {
 
 /// The call records of one module process.
 pub struct CallRecords {
+    pub(crate) display: std::sync::OnceLock<crate::tool_display::WeakRecords>,
     storage: Box<dyn CallRecordStorage>,
     inner: Mutex<Inner>,
 }
@@ -815,6 +816,7 @@ impl CallRecords {
 
     fn broken(error: CallRecordError) -> Self {
         Self {
+            display: std::sync::OnceLock::new(),
             storage: Box::new(InMemoryCallRecordStorage::new()),
             inner: Mutex::new(Inner {
                 broken: Some(error),
@@ -897,6 +899,7 @@ impl CallRecords {
             );
         }
         let records = Self {
+            display: std::sync::OnceLock::new(),
             storage,
             inner: Mutex::new(inner),
         };

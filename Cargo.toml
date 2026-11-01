@@ -21,7 +21,7 @@ members = [
 # Fleet crates are exact registry releases; unpublished crates use a full git
 # revision. Cargo.lock records their checksums or commits, with no sibling layout.
 [workspace.dependencies]
-subc-protocol = "=0.34.1"
+subc-protocol = "=0.34.2"
 subc-transport = "=0.15.0"
 subc-os = "=0.1.26"
 # Test-only in-process daemon and client control types.

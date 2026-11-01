@@ -2896,6 +2896,7 @@ where
         hold: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     ) -> Result<String, Value> {
         if looks_like_bundle_identity(target) {
+            crate::tool_display::app(target);
             return Ok(target.to_string());
         }
         let source = self.app_state_source.clone();
@@ -2907,6 +2908,7 @@ where
         .unwrap_or(Err(AppStateReadError::Unreadable));
         match listed {
             Ok(apps) => match_target_name(target, &apps).map(|matched| {
+                crate::tool_display::app(&matched.bundle_identity);
                 // `serve` writes this name on the reply as matched_app, so the
                 // caller learns which application a partial name was taken to
                 // mean. The queueing step that resolves a target before
