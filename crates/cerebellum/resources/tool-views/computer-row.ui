@@ -1,12 +1,16 @@
-export const action = input.action == "read_state" ? "Read app" : input.action == "press_element" || input.action == "press_point" ? "Press" : input.action == "write_text" || input.action == "type" ? "Type" : input.action == "keys" ? "Press keys" : input.action == "takeover_move" ? "Move pointer" : input.action == "takeover_drag" ? "Drag" : input.action == "takeover_scroll" ? "Scroll" : input.action == "wait" ? "Wait" : input.action == "list_apps" ? "List apps" : "Open app"
+export const action = input.action == "read_state" ? "Read app" : input.action == "press_element" || input.action == "press_point" ? "Press" : input.action == "write_text" || input.action == "type" ? "Type" : input.action == "keys" ? "Press keys" : input.action == "takeover_move" ? "Move pointer" : input.action == "takeover_drag" ? "Drag" : input.action == "takeover_scroll" ? "Scroll" : input.action == "wait" ? "Wait" : input.action == "list_apps" ? "List apps" : input.action == "open_app" ? "Open app" : Replace(input.action, "_", " ")
 export const outcome = view.completion.outcome ?? view.record.outcome
 export const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason
+export const target = input.target ?? input.app ?? ""
+export const appName = !Contains(target, " ") && Contains(target, ".") ? Last(Split(target, ".")) : target
 
 <Card appearance="clear" direction="row" gap="s" align="center">
 <TextContent text={action} maxLines={1} />
-<TextContent text={input.target ?? input.app ?? ""} size="small" maxLines={1} />
+<Slot width="fill">
+<TextContent text={appName} size="small" maxLines={1} />
+</Slot>
 <Slot width="short">
-{outcome == "held" ? <Badge text={reason == "login_handoff" ? "Waiting for sign-in" : "Waiting for approval"} tone="neutral" /> : outcome == "error" ? <Badge text="Refused" tone="danger" /> : outcome == "partial" ? <Badge text="Outcome unknown" tone="warning" /> : outcome == "success" ? <Badge text="Done" tone="neutral" /> : null}
+{outcome == "held" ? <Badge text={reason == "login_handoff" ? "Signed out" : "Asked you"} tone="neutral" /> : outcome == "error" ? <Badge text="Refused" tone="danger" /> : outcome == "partial" ? <Badge text="Unknown" tone="warning" /> : outcome == "success" ? <Badge text="Done" tone="neutral" /> : null}
 </Slot>
 <Slot width="short">
 {outcome == null && view.call.phase == "running" ? <Elapsed start={view.call.startedAtMs ?? now} /> : view.completion.durationMs == null && view.record.durationMs == null ? null : <TextContent text={FormatDuration(view.completion.durationMs ?? view.record.durationMs ?? 0)} size="small" maxLines={1} />}
