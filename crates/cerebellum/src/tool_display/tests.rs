@@ -30,7 +30,7 @@ impl DisplayDouble {
         })
     }
     async fn count(&self, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(crate::test_support::HANG_GUARD, async {
             loop {
                 let notified = self.wrote.notified();
                 if self.writes.lock().unwrap().len() >= expected {
@@ -380,8 +380,10 @@ async fn real_relayed_status_call_flushes_its_reply_before_display_work() {
     handle_frame(frame(request()), &writer, &planes)
         .await
         .unwrap();
+    // A hang guard, not a latency bound: the full lib suite can delay this
+    // reply past a few seconds on a loaded machine.
     let response = tokio::time::timeout(
-        Duration::from_secs(2),
+        crate::test_support::HANG_GUARD,
         subc_transport::read_frame(&mut client),
     )
     .await
