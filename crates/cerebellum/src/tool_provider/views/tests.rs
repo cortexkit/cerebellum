@@ -71,7 +71,7 @@ fn views_embed_exact_template_bytes_and_checked_inputs() {
             view.template["page"]["source"].as_str().unwrap().as_bytes(),
             page.as_bytes()
         );
-        assert_eq!(view.template_revision, 1);
+        assert_eq!(view.template_revision, TEMPLATE_REVISION);
         let check: Value = serde_json::from_str(check).unwrap();
         assert_eq!(check["input_schema"], tool.input_schema);
         assert_eq!(check["view"], serde_json::to_value(view).unwrap());
@@ -174,7 +174,7 @@ fn export_checker_inputs() {
             vec![],
             json!({"row":template("tool_row",row),"page":template("tool_page",page)}),
         )
-        .with_template_revision(1);
+        .with_template_revision(TEMPLATE_REVISION);
         let input = if name == "browser" {
             json!({"action":"snapshot","url":"https://example.com/start"})
         } else {

@@ -15,10 +15,21 @@ const BROWSER_PAGE: &str = include_str!("../../resources/tool-views/browser-page
 const COMPUTER_ROW: &str = include_str!("../../resources/tool-views/computer-row.ui");
 const COMPUTER_PAGE: &str = include_str!("../../resources/tool-views/computer-page.ui");
 
+/// The tool catalog the templates are written against, as `occipital-check
+/// --catalog` prints it. Catalog 1.1 changed digest before it shipped (Slots now
+/// take their widths first in a row), and the display server refuses a template
+/// naming the old one.
+const TOOL_CATALOG_DIGEST: &str =
+    "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf";
+
+/// Raised whenever a template changes. A pin's record schema and reads never
+/// change; the display server replaces a kept view only at a higher revision.
+pub(crate) const TEMPLATE_REVISION: u64 = 2;
+
 fn template(profile: &str, source: &str) -> Value {
     json!({
         "schema": "occipital.template/1", "profile": profile, "executionDialect": "1.0",
-        "catalog": {"version": "1.1", "digest": "sha256:de7c9df7a365bf816006c95a6be25ab1df6c725aaa90942ebed2e0a923d18ee6"},
+        "catalog": {"version": "1.1", "digest": TOOL_CATALOG_DIGEST},
         "reads": [], "source": source,
     })
 }
@@ -44,7 +55,8 @@ fn published() -> BTreeMap<String, ViewManifest> {
             });
             (
                 pin,
-                ViewManifest::new(schema, reads, template).with_template_revision(1),
+                ViewManifest::new(schema, reads, template)
+                    .with_template_revision(TEMPLATE_REVISION),
             )
         })
         .collect()

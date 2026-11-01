@@ -174,7 +174,9 @@ async fn tool_views_are_advertised_and_match_catalog_pins() {
             panic!("catalog pin has no view: {pin}");
         };
         assert_eq!(view.record_schema.name, "cerebellum_call");
-        assert_eq!(view.template_revision, 1);
+        // Raised from 1 when catalog 1.1 changed digest; the templates' bytes
+        // otherwise match revision 1.
+        assert_eq!(view.template_revision, 2);
         assert!(view.reads.is_empty());
         assert_eq!(view.template["row"]["profile"], "tool_row");
         assert_eq!(view.template["page"]["profile"], "tool_page");
