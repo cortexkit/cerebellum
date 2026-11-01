@@ -1,0 +1,26 @@
+export const action = input.action == "snapshot" ? "Read page" : input.action == "navigate" ? "Navigate" : input.action == "click" || input.action == "click_point" ? "Click" : input.action == "type" ? "Type" : input.action == "screenshot" ? "Screenshot" : input.action == "open_tab" ? "Open tab" : input.action == "claim_tab" ? "Use tab" : input.action == "fill_login" ? "Fill login" : input.action == "open_grant" ? "Request approval" : input.action == "present" ? "Sign in" : input.action == "resume" ? "Resume" : input.action == "import_login" ? "Import login" : input.action == "capture_login" ? "Save login" : input.action == "revoke_access" ? "Revoke access" : input.action == "launch" ? "Open browser" : input.action == "close" ? "Close browser" : input.action == "scroll" ? "Scroll" : input.action == "status" ? "Status" : Replace(input.action, "_", " ")
+export const authority = Last(Split(First(Split(First(Split(First(Split(Last(Split(view.record.site ?? input.url ?? "", "://")), "/")), "?")), "#")), "@"))
+export const host = StartsWith(authority, "[") ? First(Split(authority, "]")) + "]" : First(Split(authority, ":"))
+export const outcome = view.completion.outcome ?? view.record.outcome
+export const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason
+export const reasonText = reason == "screen_locked" ? "Screen locked" : reason == "element_disabled" ? "Button disabled" : reason == "point_in_another_window" ? "Point in another window" : reason == "consent_declined" ? "Declined" : reason == "consent_expired" ? "Approval expired" : reason == "state_changed_by_person" ? "You were using the app" : reason == "operator_app_blocked" ? "App not allowed" : reason == "consent" ? "Approval asked" : reason == "login_handoff" ? "Not signed in" : reason == "scope_ended" ? "Run ended" : reason == "cancelled" ? "Cancelled" : reason == "outcome_unknown" ? "Outcome unknown" : "Another reason"
+export const status = outcome == "held" ? (reason == "login_handoff" ? "Not signed in" : "Approval asked") : outcome == "error" ? "Refused" : outcome == "partial" ? "Outcome unknown" : outcome == "success" ? "Done" : view.call.phase == "running" ? "Running" : "No outcome kept"
+export const duration = view.completion.durationMs ?? view.record.durationMs
+export const queued = view.completion.queuedMs ?? view.record.queuedMs ?? 0
+export const held = view.completion.heldMs ?? view.record.heldMs ?? 0
+
+<CardHeader title={action} subtitle={host} />
+<Card appearance="clear" gap="xs">
+<TextContent text={"Outcome: " + status} size="small" />
+{reason == null ? null : <TextContent text={"Reason: " + reasonText} size="small" />}
+{reason != null && reasonText == "Another reason" ? <Styled tone="muted">{reason}</Styled> : null}
+{duration == null ? (view.call.phase == "running" ? <Elapsed start={view.call.startedAtMs ?? now} /> : null) : <TextContent text={"Duration: " + FormatDuration(duration)} size="small" />}
+{queued > 0 ? <TextContent text={"Waited in line: " + FormatDuration(queued)} size="small" /> : null}
+{held > 0 ? <TextContent text={"Waited for you: " + FormatDuration(held)} size="small" /> : null}
+</Card>
+
+{input.action == "type" ? <CardHeader title="Typed text" /> : null}
+{input.action == "type" ? <CodeBlock codeString={input.text ?? ""} /> : null}
+{input.action == "fill_login" ? <TextContent text={"Fields: " + (input.username_ref == null ? "" : "Username · ") + "Password" + (input.otp_ref == null ? "" : " · One-time code")} size="small" /> : null}
+
+<TextContent text={view.output ?? "No output was kept."} />

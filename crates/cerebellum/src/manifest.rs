@@ -477,6 +477,7 @@ fn build_with_browser_config_and_provenance(
                 LATE_RESULTS_CAPABILITY.to_string(),
                 SESSION_TURN_ENDED_CAPABILITY.to_string(),
                 cortexkit_role_tool_provider::PROVIDES.to_string(),
+                cortexkit_role_tool_provider::TOOL_VIEWS_CAPABILITY.to_string(),
             ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),

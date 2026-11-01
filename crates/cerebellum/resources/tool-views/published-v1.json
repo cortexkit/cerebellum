@@ -1,0 +1,30 @@
+{
+  "tp1:browser_use:1a91daf0ea738488ff8e10dbc4844f04ab333a5fbcf535823aca083c70aaabfc:1": {
+    "record_schema": {
+      "name": "cerebellum_call",
+      "revision": 1,
+      "fields": {
+        "action": "code",
+        "app": "app_id",
+        "plane": "code",
+        "postsReturned": "integer",
+        "site": "web_origin"
+      }
+    },
+    "reads": []
+  },
+  "tp1:computer_use:9ee42a746247a28d0b25686acd76b0687e8b6c7f439d0776fd5d6fd9cc67b9a2:1": {
+    "record_schema": {
+      "name": "cerebellum_call",
+      "revision": 1,
+      "fields": {
+        "action": "code",
+        "app": "app_id",
+        "plane": "code",
+        "postsReturned": "integer",
+        "site": "web_origin"
+      }
+    },
+    "reads": []
+  }
+}

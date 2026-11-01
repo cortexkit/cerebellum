@@ -15,10 +15,16 @@ use cortexkit_role_tool_provider::{check_capability_tag, errors, PROVIDES};
 use serde_json::Map;
 use subc_protocol::call_mode::CallMode;
 
+mod views;
+
 pub(crate) fn is_operation(name: &str) -> bool {
     matches!(
         name,
-        ops::ROLE_DESCRIBE | ops::TOOL_CATALOG | ops::LATE_RESULTS | ops::LATE_RESULTS_ACK
+        ops::ROLE_DESCRIBE
+            | ops::TOOL_CATALOG
+            | ops::TOOL_VIEWS
+            | ops::LATE_RESULTS
+            | ops::LATE_RESULTS_ACK
     )
 }
 
@@ -350,24 +356,31 @@ pub(crate) async fn serve(
                     "role.describe takes no arguments",
                 ))
             } else {
-                Ok(serde_json::to_value(RoleDescribe::new(
-                    vec![Major {
-                        version: PROVIDES.into(),
-                        ops: vec![
-                            ops::ROLE_DESCRIBE.into(),
-                            ops::TOOL_CATALOG.into(),
-                            ops::TOOL_WITHDRAW.into(),
-                            ops::LATE_RESULTS.into(),
-                            ops::LATE_RESULTS_ACK.into(),
-                        ],
-                        stability: "alpha".into(),
-                    }],
-                    env!("CARGO_PKG_VERSION"),
-                ))
+                Ok(serde_json::to_value(
+                    RoleDescribe::new(
+                        vec![Major {
+                            version: PROVIDES.into(),
+                            ops: vec![
+                                ops::ROLE_DESCRIBE.into(),
+                                ops::TOOL_CATALOG.into(),
+                                ops::TOOL_VIEWS.into(),
+                                ops::TOOL_WITHDRAW.into(),
+                                ops::LATE_RESULTS.into(),
+                                ops::LATE_RESULTS_ACK.into(),
+                            ],
+                            stability: "alpha".into(),
+                        }],
+                        env!("CARGO_PKG_VERSION"),
+                    )
+                    .with_capabilities(vec![
+                        cortexkit_role_tool_provider::TOOL_VIEWS_CAPABILITY.into(),
+                    ]),
+                )
                 .expect("role description serializes"))
             }
         }
         ops::TOOL_CATALOG => catalog(arguments, planes),
+        ops::TOOL_VIEWS => views::answer(arguments),
         ops::LATE_RESULTS | ops::LATE_RESULTS_ACK => {
             let allowed = if name == ops::LATE_RESULTS {
                 &["since", "limit"][..]
@@ -538,6 +551,18 @@ mod tests {
                 frozen,
                 "{} model-visible bytes changed",
                 definition.name
+            );
+            let pin = SchemaPin::new(
+                &definition.name,
+                &definition.schema_digest,
+                definition.semantics,
+            )
+            .encode()
+            .unwrap();
+            let view = views::answer(json!({"pins":[pin.clone()]}).as_object().unwrap()).unwrap();
+            assert_ne!(
+                view["views"][&pin], "unknown",
+                "the frozen definition must have a published view"
             );
         }
     }

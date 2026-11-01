@@ -3999,6 +3999,38 @@ async fn handle_route_request(
         )
         .await;
     }
+    if planes
+        .routes
+        .display
+        .known_display_principal(facts.principal.as_ref())
+    {
+        let request = serde_json::from_slice::<Value>(&frame.body).ok();
+        let name = request
+            .as_ref()
+            .and_then(|body| body["name"].as_str())
+            .unwrap_or("unknown");
+        if facts.surface != RouteSurface::Tools
+            || !matches!(
+                name,
+                cortexkit_role_tool_provider::ops::TOOL_CATALOG
+                    | cortexkit_role_tool_provider::ops::TOOL_VIEWS
+            )
+        {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "principal_denied",
+                &format!(
+                    "the display principal may call only tool.catalog and tool.views, not '{name}'"
+                ),
+            )
+            .await;
+        }
+        return Box::pin(handle_keyed_tool_request_inner(frame, writer, planes)).await;
+    }
     if private_content::is_broca(&facts.principal) {
         // Broca's privacy decision must not queue behind a browser action or
         // consent drain. Its management route has no other authority.
@@ -6027,6 +6059,10 @@ async fn handle_control_request(
             // permissions.list/revoke before any grant lookup. Neither needs
             // the unrelated powers that first-party membership would confer.
             let trust = trust_for_principal(&principal);
+            let view_reader = route_bindings
+                .display
+                .admits_view_reader(principal.as_ref(), &target)
+                .await;
             if matches!(principal, Some(subc_protocol::Principal::Reserved { .. }))
                 && scope
                     .as_ref()
@@ -6058,6 +6094,7 @@ async fn handle_control_request(
                 })
                 && !permissions::bind_admitted(&principal, &target)
                 && !private_content::bind_admitted(&principal, &target)
+                && !view_reader
             {
                 return send_principal_denied(
                     writer,
@@ -13384,14 +13421,27 @@ mod tests {
             &BrowserSurface::NotConfigured,
             Some(provenance),
         );
-        // Fixed bytes, not computed by the code under test. Removing only the
-        // project-free-bind declaration must recover the previous HELLO bytes;
-        // protocol upgrades must not silently change the rest of the manifest.
+        // Removing the views declaration must recover the previous HELLO bytes.
+        // Keep the older subtraction guard too, so neither addition can hide
+        // unrelated changes to the manifest.
+        let mut without_views = value.clone();
+        without_views["capabilities"]["provides"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|name| name != cortexkit_role_tool_provider::TOOL_VIEWS_CAPABILITY);
+        #[cfg(target_os = "linux")]
+        let before_views = "f46b5ddc8c5b081adb40a3c2982d27822f9c7400bc62d189d74816a5eaa5d466";
+        #[cfg(target_os = "macos")]
+        let before_views = "6c98e57299920c8ee405321aecbd63e4e514a5c23676632df8b971f900f3f436";
+        assert_eq!(
+            manifest::sha256_hex(without_views.to_string().as_bytes()),
+            before_views
+        );
         #[cfg(target_os = "linux")]
         let previous = "76dbb08edce1bb7742f5efc2686b7e2ec42ad623586d16d91be1fbd52fa15662";
         #[cfg(target_os = "macos")]
         let previous = "33166b72e5c0aefea0f0f6ec91a764a66a83684096d09f39bc21bc0baedee21d";
-        let mut predecessor = value.clone();
+        let mut predecessor = without_views;
         predecessor["capabilities"]["provides"]
             .as_array_mut()
             .unwrap()
@@ -13406,9 +13456,9 @@ mod tests {
         );
 
         #[cfg(target_os = "linux")]
-        let expected = "f46b5ddc8c5b081adb40a3c2982d27822f9c7400bc62d189d74816a5eaa5d466";
+        let expected = "62fe03bb1a213e8c6d0c73000fca4de891118d5347440e35b96f8534a4c1fd51";
         #[cfg(target_os = "macos")]
-        let expected = "6c98e57299920c8ee405321aecbd63e4e514a5c23676632df8b971f900f3f436";
+        let expected = "129c9cf0b18bcd2f225d4a8aa0189f097991ec4685348e0e3fa294cc495829ff";
         assert_eq!(
             format!("{:x}", sha2::Sha256::digest(value.to_string().as_bytes())),
             expected

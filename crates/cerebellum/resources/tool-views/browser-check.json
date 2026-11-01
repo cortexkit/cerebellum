@@ -1,0 +1,557 @@
+{
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "account": {
+        "description": "Account label; the vault id is cookie:<credential_domain>:<account>. Required for: capture_login.",
+        "minLength": 1,
+        "type": "string"
+      },
+      "action": {
+        "description": "Admitted browser action to perform.",
+        "enum": [
+          "launch",
+          "open_tab",
+          "claim_tab",
+          "status",
+          "close",
+          "navigate",
+          "snapshot",
+          "screenshot",
+          "scroll",
+          "click",
+          "type",
+          "click_point",
+          "fill_login",
+          "open_grant",
+          "present",
+          "resume",
+          "import_login",
+          "capture_login",
+          "revoke_access"
+        ],
+        "type": "string"
+      },
+      "amount": {
+        "default": 600,
+        "description": "CSS pixels; direction only.",
+        "maximum": 10000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "browser": {
+        "description": "Browser target, default own; user selects the person's Chrome.",
+        "enum": [
+          "own",
+          "user"
+        ],
+        "type": "string"
+      },
+      "browser_session_id": {
+        "description": "Own-only session id from launch; user close takes none. Required for: close.",
+        "minLength": 1,
+        "type": "string"
+      },
+      "clear_first": {
+        "default": false,
+        "type": "boolean"
+      },
+      "credential_domain": {
+        "description": "Login-capture site; fetch_url/login_url must be HTTPS on it or a subdomain. Required for: capture_login.",
+        "type": "string"
+      },
+      "direction": {
+        "description": "Use instead of ref.",
+        "enum": [
+          "up",
+          "down",
+          "left",
+          "right"
+        ],
+        "type": "string"
+      },
+      "fetch_url": {
+        "description": "URL of the authorized post-login page. Required for: capture_login.",
+        "type": "string"
+      },
+      "hazards": {
+        "description": "Hazards disclosed to the person before an origin grant is minted. Required for: open_grant.",
+        "items": {
+          "enum": [
+            "credential_form_submit",
+            "financial_form_submit",
+            "unverified_form_contents"
+          ],
+          "type": "string"
+        },
+        "type": "array",
+        "uniqueItems": true
+      },
+      "image_height_px": {
+        "description": "Echoed screenshot dimension; coordinates are meaningful only in the exact frame the model saw. Required for: click_point.",
+        "type": "integer"
+      },
+      "image_width_px": {
+        "description": "Echoed screenshot dimension; coordinates are meaningful only in the exact frame the model saw. Required for: click_point.",
+        "type": "integer"
+      },
+      "intent": {
+        "description": "Short reason for the action, for policy and audit. Required for: navigate, click, click_point.",
+        "type": "string"
+      },
+      "login_url": {
+        "description": "Login page the person is handed; login is observed on its origin. Required for: capture_login.",
+        "type": "string"
+      },
+      "max_bytes": {
+        "default": 5000,
+        "description": "Snapshot: cap on state_text bytes, cutting navigation before main content.",
+        "maximum": 262144,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "mode": {
+        "default": "actionable",
+        "description": "Snapshot: actionable (default; outline or zoom), ax or dom_full.",
+        "enum": [
+          "actionable",
+          "ax",
+          "dom_full"
+        ],
+        "type": "string"
+      },
+      "origin": {
+        "description": "Origin for own login tools or one site to revoke (omit to revoke all); canonical origins only. Required for: present, import_login.",
+        "type": "string"
+      },
+      "origins": {
+        "description": "Canonical HTTP(S) origins to authorize. Required for: open_grant.",
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 256,
+        "minItems": 1,
+        "type": "array"
+      },
+      "otp_ref": {
+        "description": "Ref of the one-time-code field, if the form has one.",
+        "type": "string"
+      },
+      "password_ref": {
+        "description": "Ref of the password field. Required for: fill_login.",
+        "type": "string"
+      },
+      "point": {
+        "additionalProperties": false,
+        "description": "Pixel in the echoed screenshot; it is meaningful only with that image's required width and height. Required for: click_point.",
+        "properties": {
+          "x": {
+            "description": "Horizontal window pixel from the left edge.",
+            "type": "integer"
+          },
+          "y": {
+            "description": "Vertical window pixel from the top edge.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "type": "object"
+      },
+      "read_page": {
+        "default": false,
+        "description": "Return the landing page's outline in state_text, as snapshot does.",
+        "type": "boolean"
+      },
+      "ref": {
+        "description": "Element reference returned by the named snapshot. Required for: click, type.",
+        "type": "string"
+      },
+      "role_filter": {
+        "description": "Keep matching roles, case-insensitively (button; AXButton also works). Default mode only.",
+        "items": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "maxItems": 16,
+        "minItems": 1,
+        "type": "array"
+      },
+      "secret": {
+        "description": "Name of the saved login in the person's vault. Required for: fill_login.",
+        "maxLength": 256,
+        "minLength": 1,
+        "type": "string"
+      },
+      "severity": {
+        "additionalProperties": false,
+        "description": "Declared interaction severity for authorization checks. Required for: navigate, click, click_point.",
+        "properties": {
+          "credential": {
+            "type": "boolean"
+          },
+          "financial": {
+            "type": "boolean"
+          },
+          "tier": {
+            "maximum": 5,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tier",
+          "credential",
+          "financial"
+        ],
+        "type": "object"
+      },
+      "severity_tier": {
+        "description": "Optional ceiling tier 1-4. After hazard_not_disclosed, copy detail.grant_request.severity_tier.",
+        "maximum": 4,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "snapshot_id": {
+        "description": "Snapshot identifier that prevents acting on stale page data. Required for: click, click_point.",
+        "type": "string"
+      },
+      "tab": {
+        "description": "User tab handle. With browser:user, required on every page action. Own calls never accept tab. Required for: claim_tab.",
+        "minLength": 1,
+        "type": "string"
+      },
+      "text": {
+        "description": "Required for: type.",
+        "maxLength": 10000,
+        "type": "string"
+      },
+      "text_filter": {
+        "description": "Keep label/value matches beneath labelled ancestors. Default mode only.",
+        "maxLength": 4096,
+        "type": "string"
+      },
+      "url": {
+        "description": "URL to navigate to. Required for: navigate.",
+        "type": "string"
+      },
+      "username_ref": {
+        "description": "Ref of the username or email field. Required for: fill_login.",
+        "type": "string"
+      },
+      "wait": {
+        "description": "Use settle to wait for page stability before reading, or none to return immediately.",
+        "enum": [
+          "settle",
+          "none"
+        ],
+        "type": "string"
+      },
+      "zoom": {
+        "description": "Snapshot: a printed ref; expands its subtree while it exists on the same page.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "action"
+    ],
+    "type": "object"
+  },
+  "samples": [
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 1200,
+        "heldMs": 500,
+        "outcome": "success",
+        "postsReturned": 0,
+        "queuedMs": 12,
+        "site": "https://example.com:8443"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "held",
+        "reason": "consent"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "held",
+        "reason": "login_handoff"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "screen_locked"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "partial",
+        "reason": "outcome_unknown"
+      }
+    },
+    {
+      "completion": {
+        "durationMs": 1500,
+        "outcome": "success"
+      },
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "held",
+        "reason": "consent"
+      }
+    },
+    {
+      "completion": {
+        "outcome": "error",
+        "reason": "consent_declined"
+      },
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "held",
+        "reason": "consent"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "element_disabled"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "point_in_another_window"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "consent_expired"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "state_changed_by_person"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "operator_app_blocked"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "scope_ended"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "cancelled"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://example.com/start"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "some_future_reason"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://a-long-site-name-for-phone-layout.example.com/page"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "held",
+        "reason": "consent"
+      }
+    },
+    {
+      "input": {
+        "action": "snapshot",
+        "url": "https://a-long-site-name-for-phone-layout.example.com/page"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "held",
+        "reason": "login_handoff"
+      }
+    },
+    {
+      "input": {
+        "action": "status"
+      },
+      "record": {
+        "durationMs": 10,
+        "outcome": "success"
+      }
+    },
+    {
+      "input": {
+        "action": "type",
+        "text": "Text kept only on the page"
+      },
+      "record": {
+        "durationMs": 10,
+        "outcome": "success"
+      }
+    },
+    {
+      "input": {
+        "action": "fill_login",
+        "otp_ref": "otp",
+        "password_ref": "pass",
+        "secret": "must-not-render",
+        "username_ref": "user"
+      },
+      "record": {
+        "durationMs": 10,
+        "outcome": "success"
+      }
+    },
+    {
+      "input": {
+        "action": "navigate",
+        "url": "https://user:password@example.com:8443/path?q=1#fragment"
+      }
+    },
+    {
+      "input": {
+        "action": "navigate",
+        "url": "https://[::1]:8443/path"
+      },
+      "record": {
+        "durationMs": 10,
+        "outcome": "success",
+        "site": "https://[::1]:8443"
+      }
+    }
+  ],
+  "view": {
+    "reads": [],
+    "record_schema": {
+      "fields": {
+        "action": "code",
+        "app": "app_id",
+        "plane": "code",
+        "postsReturned": "integer",
+        "site": "web_origin"
+      },
+      "name": "cerebellum_call",
+      "revision": 1
+    },
+    "template": {
+      "page": {
+        "catalog": {
+          "digest": "sha256:de7c9df7a365bf816006c95a6be25ab1df6c725aaa90942ebed2e0a923d18ee6",
+          "version": "1.1"
+        },
+        "executionDialect": "1.0",
+        "profile": "tool_page",
+        "reads": [],
+        "schema": "occipital.template/1",
+        "source": "export const action = input.action == \"snapshot\" ? \"Read page\" : input.action == \"navigate\" ? \"Navigate\" : input.action == \"click\" || input.action == \"click_point\" ? \"Click\" : input.action == \"type\" ? \"Type\" : input.action == \"screenshot\" ? \"Screenshot\" : input.action == \"open_tab\" ? \"Open tab\" : input.action == \"claim_tab\" ? \"Use tab\" : input.action == \"fill_login\" ? \"Fill login\" : input.action == \"open_grant\" ? \"Request approval\" : input.action == \"present\" ? \"Sign in\" : input.action == \"resume\" ? \"Resume\" : input.action == \"import_login\" ? \"Import login\" : input.action == \"capture_login\" ? \"Save login\" : input.action == \"revoke_access\" ? \"Revoke access\" : input.action == \"launch\" ? \"Open browser\" : input.action == \"close\" ? \"Close browser\" : input.action == \"scroll\" ? \"Scroll\" : input.action == \"status\" ? \"Status\" : Replace(input.action, \"_\", \" \")\nexport const authority = Last(Split(First(Split(First(Split(First(Split(Last(Split(view.record.site ?? input.url ?? \"\", \"://\")), \"/\")), \"?\")), \"#\")), \"@\"))\nexport const host = StartsWith(authority, \"[\") ? First(Split(authority, \"]\")) + \"]\" : First(Split(authority, \":\"))\nexport const outcome = view.completion.outcome ?? view.record.outcome\nexport const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason\nexport const reasonText = reason == \"screen_locked\" ? \"Screen locked\" : reason == \"element_disabled\" ? \"Button disabled\" : reason == \"point_in_another_window\" ? \"Point in another window\" : reason == \"consent_declined\" ? \"Declined\" : reason == \"consent_expired\" ? \"Approval expired\" : reason == \"state_changed_by_person\" ? \"You were using the app\" : reason == \"operator_app_blocked\" ? \"App not allowed\" : reason == \"consent\" ? \"Approval asked\" : reason == \"login_handoff\" ? \"Not signed in\" : reason == \"scope_ended\" ? \"Run ended\" : reason == \"cancelled\" ? \"Cancelled\" : reason == \"outcome_unknown\" ? \"Outcome unknown\" : \"Another reason\"\nexport const status = outcome == \"held\" ? (reason == \"login_handoff\" ? \"Not signed in\" : \"Approval asked\") : outcome == \"error\" ? \"Refused\" : outcome == \"partial\" ? \"Outcome unknown\" : outcome == \"success\" ? \"Done\" : view.call.phase == \"running\" ? \"Running\" : \"No outcome kept\"\nexport const duration = view.completion.durationMs ?? view.record.durationMs\nexport const queued = view.completion.queuedMs ?? view.record.queuedMs ?? 0\nexport const held = view.completion.heldMs ?? view.record.heldMs ?? 0\n\n<CardHeader title={action} subtitle={host} />\n<Card appearance=\"clear\" gap=\"xs\">\n<TextContent text={\"Outcome: \" + status} size=\"small\" />\n{reason == null ? null : <TextContent text={\"Reason: \" + reasonText} size=\"small\" />}\n{reason != null && reasonText == \"Another reason\" ? <Styled tone=\"muted\">{reason}</Styled> : null}\n{duration == null ? (view.call.phase == \"running\" ? <Elapsed start={view.call.startedAtMs ?? now} /> : null) : <TextContent text={\"Duration: \" + FormatDuration(duration)} size=\"small\" />}\n{queued > 0 ? <TextContent text={\"Waited in line: \" + FormatDuration(queued)} size=\"small\" /> : null}\n{held > 0 ? <TextContent text={\"Waited for you: \" + FormatDuration(held)} size=\"small\" /> : null}\n</Card>\n\n{input.action == \"type\" ? <CardHeader title=\"Typed text\" /> : null}\n{input.action == \"type\" ? <CodeBlock codeString={input.text ?? \"\"} /> : null}\n{input.action == \"fill_login\" ? <TextContent text={\"Fields: \" + (input.username_ref == null ? \"\" : \"Username · \") + \"Password\" + (input.otp_ref == null ? \"\" : \" · One-time code\")} size=\"small\" /> : null}\n\n<TextContent text={view.output ?? \"No output was kept.\"} />\n"
+      },
+      "row": {
+        "catalog": {
+          "digest": "sha256:de7c9df7a365bf816006c95a6be25ab1df6c725aaa90942ebed2e0a923d18ee6",
+          "version": "1.1"
+        },
+        "executionDialect": "1.0",
+        "profile": "tool_row",
+        "reads": [],
+        "schema": "occipital.template/1",
+        "source": "export const action = input.action == \"snapshot\" ? \"Read page\" : input.action == \"navigate\" ? \"Navigate\" : input.action == \"click\" || input.action == \"click_point\" ? \"Click\" : input.action == \"type\" ? \"Type\" : input.action == \"screenshot\" ? \"Screenshot\" : input.action == \"open_tab\" ? \"Open tab\" : input.action == \"claim_tab\" ? \"Use tab\" : input.action == \"fill_login\" ? \"Fill login\" : input.action == \"open_grant\" ? \"Request approval\" : input.action == \"present\" ? \"Sign in\" : input.action == \"resume\" ? \"Resume\" : input.action == \"import_login\" ? \"Import login\" : input.action == \"capture_login\" ? \"Save login\" : input.action == \"revoke_access\" ? \"Revoke access\" : input.action == \"launch\" ? \"Open browser\" : input.action == \"close\" ? \"Close browser\" : input.action == \"scroll\" ? \"Scroll\" : input.action == \"status\" ? \"Status\" : Replace(input.action, \"_\", \" \")\nexport const authority = Last(Split(First(Split(First(Split(First(Split(Last(Split(view.record.site ?? input.url ?? \"\", \"://\")), \"/\")), \"?\")), \"#\")), \"@\"))\nexport const host = StartsWith(authority, \"[\") ? First(Split(authority, \"]\")) + \"]\" : First(Split(authority, \":\"))\nexport const outcome = view.completion.outcome ?? view.record.outcome\nexport const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason\n\n<Card appearance=\"clear\" direction=\"row\" gap=\"s\" align=\"center\">\n<TextContent text={action} maxLines={1} />\n<Slot width=\"fill\">\n<TextContent text={host} size=\"small\" maxLines={1} />\n</Slot>\n<Slot width=\"short\">\n{outcome == \"held\" ? <Badge text={reason == \"login_handoff\" ? \"Signed out\" : \"Asked you\"} tone=\"neutral\" /> : outcome == \"error\" ? <Badge text=\"Refused\" tone=\"danger\" /> : outcome == \"partial\" ? <Badge text=\"Unknown\" tone=\"warning\" /> : outcome == \"success\" ? <Badge text=\"Done\" tone=\"neutral\" /> : null}\n</Slot>\n<Slot width=\"short\">\n{outcome == null && view.call.phase == \"running\" ? <Elapsed start={view.call.startedAtMs ?? now} /> : view.completion.durationMs == null && view.record.durationMs == null ? null : <TextContent text={FormatDuration(view.completion.durationMs ?? view.record.durationMs ?? 0)} size=\"small\" maxLines={1} />}\n</Slot>\n</Card>\n"
+      }
+    },
+    "template_revision": 1
+  }
+}

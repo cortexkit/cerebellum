@@ -238,6 +238,21 @@ impl Records {
             if self.state.lock().unwrap().display_principals.contains(module_id))
     }
 
+    pub(crate) async fn admits_view_reader(
+        &self,
+        principal: Option<&Principal>,
+        target: &subc_protocol::RouteTarget,
+    ) -> bool {
+        let Some(Principal::Reserved { module_id }) = principal else {
+            return false;
+        };
+        if !matches!(target, subc_protocol::RouteTarget::ToolProvider { module_id } if module_id == "cerebellum")
+        {
+            return false;
+        }
+        self.declarers().await.as_slice() == [module_id.as_str()]
+    }
+
     pub(crate) fn arm(
         self: &Arc<Self>,
         frame: &Frame,

@@ -446,6 +446,7 @@ async fn a_display_scope_carrier_cannot_call_any_operation() {
     assert_eq!(bind.header.ty, FrameType::Response);
     for name in [
         "tool.catalog",
+        "tool.views",
         "browser_use",
         "computer_use",
         "late_results",
@@ -461,6 +462,114 @@ async fn a_display_scope_carrier_cannot_call_any_operation() {
         assert_eq!(reply.header.ty, FrameType::Error);
         assert!(String::from_utf8_lossy(&reply.body).contains(name));
     }
+}
+
+#[tokio::test]
+async fn only_the_single_attested_display_can_read_catalog_and_views() {
+    use subc_protocol::RouteTarget;
+    let target = || RouteTarget::ToolProvider {
+        module_id: "cerebellum".into(),
+    };
+    for modules in [
+        vec![],
+        vec!["display-vendor", "second-display"],
+        vec!["display-vendor"],
+    ] {
+        for caller in ["display-vendor", "occipital", "unrelated"] {
+            let planes = planes();
+            planes.routes.display.connect(DisplayDouble::new(&modules));
+            let bind = bind_scope_carrier(
+                &planes,
+                Principal::Reserved {
+                    module_id: caller.into(),
+                },
+                target(),
+                None,
+            )
+            .await;
+            let admitted = modules.len() == 1 && modules[0] == caller;
+            assert_eq!(
+                bind.header.ty,
+                if admitted {
+                    FrameType::Response
+                } else {
+                    FrameType::Error
+                },
+                "{modules:?} {caller}"
+            );
+            for (name, arguments) in [
+                ("tool.catalog", json!({})),
+                ("tool.views", json!({"pins":["unpublished"]})),
+            ] {
+                let mut request = frame(json!({"name":name,"arguments":arguments}));
+                request.header.channel = 9;
+                let (writer, mut replies) = mpsc::channel(8);
+                handle_route_request(request, &writer, &planes)
+                    .await
+                    .unwrap();
+                let reply = replies.recv().await.unwrap();
+                assert_eq!(
+                    reply.header.ty,
+                    if admitted {
+                        FrameType::Response
+                    } else {
+                        FrameType::Error
+                    },
+                    "{caller}: {}",
+                    String::from_utf8_lossy(&reply.body)
+                );
+                if admitted {
+                    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                    if name == "tool.views" {
+                        assert_eq!(body, json!({"views":{"unpublished":"unknown"}}));
+                    } else {
+                        assert!(!body["tools"].as_array().unwrap().is_empty());
+                    }
+                }
+            }
+            if admitted {
+                for name in [
+                    "browser_use",
+                    "computer_use",
+                    "role.describe",
+                    "late_results",
+                    "late_results.ack",
+                    "tool.withdraw",
+                    "unknown.operation",
+                ] {
+                    let mut request = frame(json!({"name":name,"arguments":{"action":"status"}}));
+                    request.header.channel = 9;
+                    let (writer, mut replies) = mpsc::channel(8);
+                    handle_route_request(request, &writer, &planes)
+                        .await
+                        .unwrap();
+                    let reply = replies.recv().await.unwrap();
+                    assert_eq!(reply.header.ty, FrameType::Error);
+                    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                    assert_eq!(body["code"], "principal_denied");
+                    assert!(body["message"].as_str().unwrap().contains(name));
+                }
+            }
+        }
+    }
+    let planes = planes();
+    planes
+        .routes
+        .display
+        .connect(DisplayDouble::new(&["display-vendor"]));
+    let reserved = Principal::Reserved {
+        module_id: "display-vendor".into(),
+    };
+    let bind = bind_scope_carrier(
+        &planes,
+        reserved,
+        RouteTarget::ManagementSurface {
+            module_id: "cerebellum".into(),
+        },
+        None,
+    )
+    .await;
+    assert_eq!(bind.header.ty, FrameType::Error);
 }
 
 #[test]
