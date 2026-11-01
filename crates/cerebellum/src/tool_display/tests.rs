@@ -2,6 +2,15 @@ use super::*;
 use crate::*;
 use tokio::sync::{mpsc, Notify};
 
+#[allow(dead_code)]
+mod computer_support {
+    use crate as cerebellum;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/it/support/computer.rs"
+    ));
+}
+
 struct DisplayDouble {
     modules: Vec<String>,
     writes: Mutex<Vec<DisplayWrite>>,
@@ -213,7 +222,7 @@ async fn slow_or_failed_display_never_holds_the_reply() {
 }
 
 #[tokio::test]
-async fn held_record_then_durable_completion_once_even_if_settlement_races_flush() {
+async fn held_consent_decline_completes_once_even_if_settlement_races_flush() {
     use crate::journal::call_records::{Begin, ConsentEnding, ScopeIdentity};
     for settle_first in [false, true] {
         let planes = planes();
@@ -246,19 +255,19 @@ async fn held_record_then_durable_completion_once_even_if_settlement_races_flush
         if settle_first {
             planes
                 .calls
-                .finish_consent("ask", ConsentEnding::Approved, 3)
+                .finish_consent("ask", ConsentEnding::Denied, 3)
                 .unwrap();
         }
         deliver(&planes, json!({"outcome":"consent_pending","ask_id":"ask"})).await;
         if !settle_first {
             planes
                 .calls
-                .finish_consent("ask", ConsentEnding::Approved, 3)
+                .finish_consent("ask", ConsentEnding::Denied, 3)
                 .unwrap();
         }
         planes
             .calls
-            .finish_consent("ask", ConsentEnding::Denied, 4)
+            .finish_consent("ask", ConsentEnding::Approved, 4)
             .unwrap();
         display.count(2).await;
         let writes = display.writes.lock().unwrap();
@@ -273,7 +282,8 @@ async fn held_record_then_durable_completion_once_even_if_settlement_races_flush
             .unwrap();
         assert_eq!(record.body["outcome"], "held");
         assert_eq!(record.body["reason"], "consent");
-        assert_ne!(completion.body["outcome"], "held");
+        assert_eq!(completion.body["outcome"], "error");
+        assert_eq!(completion.body["reason"], "consent_declined");
         assert_eq!(record.call_key, completion.call_key);
         cortexkit_role_tool_display::schema::validate_completion(&completion.body, &schema())
             .unwrap();
@@ -475,50 +485,78 @@ fn catalog_discovery_ignores_readiness_and_non_display_capabilities() {
 }
 
 #[tokio::test]
-async fn consent_without_a_durable_hold_still_completes_after_its_held_reply() {
-    use crate::journal::call_records::ConsentEnding;
-    for settle_first in [false, true] {
-        let planes = planes();
-        let display = DisplayDouble::new(&["display"]);
-        planes.routes.display.connect(display.clone());
-        let facts = install(&planes);
-        planes
-            .routes
-            .display
-            .arm(&frame(request()), &facts)
-            .unwrap();
-        if settle_first {
-            planes
-                .calls
-                .finish_consent("legacy-ask", ConsentEnding::Approved, 1)
-                .unwrap();
+async fn consent_endings_do_not_turn_approval_into_a_failure() {
+    use crate::journal::call_records::{Begin, ConsentEnding, ScopeIdentity};
+    for durable in [false, true] {
+        for settle_first in [false, true] {
+            for (ending, reason) in [
+                (ConsentEnding::Approved, None),
+                (ConsentEnding::Denied, Some("consent_declined")),
+                (ConsentEnding::Expired, Some("consent_expired")),
+                (ConsentEnding::Withdrawn, Some("consent_withdrawn")),
+            ] {
+                let planes = planes();
+                let display = DisplayDouble::new(&["display"]);
+                planes.routes.display.connect(display.clone());
+                let facts = install(&planes);
+                planes
+                    .routes
+                    .display
+                    .arm(&frame(request()), &facts)
+                    .unwrap();
+                if durable {
+                    let principal =
+                        journal::call_records::principal_label(facts.principal.as_ref());
+                    let Begin::Execute(_) = planes.calls.begin_scoped(
+                        &principal,
+                        "pf:local",
+                        "display-test",
+                        Some(ScopeIdentity {
+                            owner: "reserved:owner".into(),
+                            reference: "scope".into(),
+                            scope_epoch: 1,
+                        }),
+                        1,
+                    ) else {
+                        panic!("admitted");
+                    };
+                    planes
+                        .calls
+                        .hold_consent(&principal, "pf:local", "ask", 2)
+                        .unwrap();
+                }
+                if settle_first {
+                    planes.calls.finish_consent("ask", ending, 3).unwrap();
+                }
+                deliver(&planes, json!({"outcome":"consent_pending","ask_id":"ask"})).await;
+                if !settle_first {
+                    planes.calls.finish_consent("ask", ending, 3).unwrap();
+                }
+                display.count(if reason.is_some() { 2 } else { 1 }).await;
+                tokio::task::yield_now().await;
+                let writes = display.writes.lock().unwrap();
+                assert_eq!(
+                    writes.len(),
+                    if reason.is_some() { 2 } else { 1 },
+                    "{ending:?}, durable={durable}, settle_first={settle_first}"
+                );
+                let record = writes
+                    .iter()
+                    .find(|write| write.kind == DisplayKind::Record)
+                    .unwrap();
+                assert_eq!(record.body["outcome"], "held");
+                assert_eq!(record.body["reason"], "consent");
+                if let Some(reason) = reason {
+                    let completion = writes
+                        .iter()
+                        .find(|write| write.kind == DisplayKind::Completion)
+                        .unwrap();
+                    assert_eq!(completion.body["outcome"], "error");
+                    assert_eq!(completion.body["reason"], reason);
+                }
+                assert!(planes.routes.display.state.lock().unwrap().calls.is_empty());
+            }
         }
-        deliver(
-            &planes,
-            json!({"outcome":"consent_pending","ask_id":"legacy-ask"}),
-        )
-        .await;
-        if !settle_first {
-            planes
-                .calls
-                .finish_consent("legacy-ask", ConsentEnding::Approved, 1)
-                .unwrap();
-        }
-        planes
-            .calls
-            .finish_consent("legacy-ask", ConsentEnding::Denied, 2)
-            .unwrap();
-        display.count(2).await;
-        let writes = display.writes.lock().unwrap();
-        assert_eq!(writes.len(), 2);
-        let completion = writes
-            .iter()
-            .find(|w| w.kind == DisplayKind::Completion)
-            .unwrap();
-        assert_eq!(completion.body["reason"], "consent");
-        assert!(!serde_json::to_string(&*writes)
-            .unwrap()
-            .contains("legacy-ask"));
     }
 }
 
@@ -645,4 +683,240 @@ async fn an_empty_array_drops_the_whole_record_or_completion_before_writing() {
     let writes = display.writes.lock().unwrap();
     assert_eq!(writes.len(), 1);
     assert!(writes[0].body.values().all(|field| !field.is_array()));
+}
+
+#[tokio::test]
+async fn twenty_thousand_ordinary_calls_each_write_a_record_and_release_tracking() {
+    let planes = planes();
+    let display = DisplayDouble::new(&["display"]);
+    planes.routes.display.connect(display.clone());
+    let facts = install(&planes);
+    let mut request = request();
+    for index in 0..20_000 {
+        request["call_key"] = json!(format!("local:{index}"));
+        request["origin"]["call_key"] = json!(format!("runner:{index}"));
+        assert!(
+            planes
+                .routes
+                .display
+                .arm(&frame(request.clone()), &facts)
+                .is_some(),
+            "call {index} lost tracking"
+        );
+        deliver(&planes, json!({"outcome":"ok"})).await;
+    }
+    display.count(20_000).await;
+    assert_eq!(display.writes.lock().unwrap().len(), 20_000);
+    assert!(planes.routes.display.state.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
+async fn waiting_capacity_evicts_the_oldest_not_all_future_calls() {
+    let planes = planes();
+    let facts = install(&planes);
+    let principal = journal::call_records::principal_label(facts.principal.as_ref());
+    let mut request = request();
+    for index in 0..16_386 {
+        request["call_key"] = json!(format!("local:{index}"));
+        request["origin"]["call_key"] = json!(format!("runner:{index}"));
+        let mut request = frame(request.clone());
+        request.header.corr = index;
+        assert!(planes.routes.display.arm(&request, &facts).is_some());
+    }
+    let state = planes.routes.display.state.lock().unwrap();
+    assert_eq!(state.calls.len(), 16_384);
+    assert!(!state
+        .calls
+        .contains_key(&(principal.clone(), "local:0".into())));
+    assert!(!state
+        .calls
+        .contains_key(&(principal.clone(), "local:1".into())));
+    assert!(state
+        .calls
+        .contains_key(&(principal.clone(), "local:2".into())));
+    assert!(state.calls.contains_key(&(principal, "local:16385".into())));
+}
+
+#[test]
+fn error_reasons_preserve_real_outcome_codes_and_unknown_dispatch_is_not_success() {
+    for code in [
+        "screen_locked",
+        "element_disabled",
+        "denied",
+        "cancelled",
+        "not_started",
+    ] {
+        let body = json!({"outcome":code});
+        assert_eq!(outcome(&body, false), ("error", Some(code)));
+    }
+    for code in [
+        "dispatch_outcome_unknown",
+        "effect_indeterminate",
+        "delivery_unconfirmed",
+        "indeterminate",
+        "outcome_unknown",
+    ] {
+        let body = json!({"outcome":code});
+        assert_eq!(outcome(&body, false), ("partial", Some("outcome_unknown")));
+        assert_eq!(outcome(&body, true), ("partial", Some("outcome_unknown")));
+        assert_eq!(
+            outcome(&json!({"outcome":code,"isError":true}), false),
+            ("partial", Some("outcome_unknown"))
+        );
+    }
+    for code in ["ok", "completed", "captured", "login_observed", "timeout"] {
+        assert!(crate::tool_result::is_success(code));
+        assert_eq!(outcome(&json!({"outcome":code}), false), ("success", None));
+    }
+    for code in ["clicked", "typed", "read", "dispatched", "unchanged"] {
+        assert!(!crate::tool_result::is_success(code));
+        let body = json!({"outcome":code});
+        assert_eq!(outcome(&body, false), ("error", Some(code)));
+    }
+    assert_eq!(
+        outcome(&json!({"outcome":"private text with spaces"}), false),
+        ("error", None)
+    );
+    assert_eq!(
+        outcome(
+            &json!({"code":"call_mode_unsupported","message":"private label"}),
+            true
+        ),
+        ("error", Some("call_mode_unsupported"))
+    );
+}
+
+#[tokio::test]
+async fn finder_target_records_its_resolved_bundle_id_not_its_display_name() {
+    use cerebellum_computer::app_state::source::RunningApp;
+    use cerebellum_computer::capture::InMemoryCaptureBackend;
+    let desk = computer_support::Desk::new(vec![]);
+    desk.state().running = Some(vec![RunningApp {
+        name: "Finder".into(),
+        bundle_identity: "com.apple.finder".into(),
+        pid: 101,
+        frontmost: true,
+    }]);
+    let computer = computer_capability::ComputerPlane::<InMemoryCaptureBackend, _, _, _>::new(
+        computer_support::audit(),
+    )
+    .with_app_state_source(desk.source());
+    let planes = planes();
+    let display = DisplayDouble::new(&["display"]);
+    planes.routes.display.connect(display.clone());
+    let facts = install(&planes);
+    let mut request = request();
+    request["name"] = json!("computer_use");
+    request["arguments"] = json!({"action":"read_state","target":"Finder"});
+    let target = request["arguments"]["target"].as_str().unwrap().to_owned();
+    let timing = planes.routes.display.arm(&frame(request), &facts);
+    ACTIVE
+        .scope(timing, async {
+            assert_eq!(
+                computer.resolve_target_name(&target).await.unwrap(),
+                "com.apple.finder"
+            );
+            deliver(&planes, json!({"outcome":"completed"})).await;
+        })
+        .await;
+    display.count(1).await;
+    let writes = display.writes.lock().unwrap();
+    assert_eq!(writes[0].body["app"], "com.apple.finder");
+    assert!(!serde_json::to_string(&writes[0].body)
+        .unwrap()
+        .contains("Finder"));
+}
+
+#[tokio::test]
+async fn handoff_completions_report_the_true_ending_through_durable_and_legacy_paths() {
+    use journal::call_records::{Begin, HandoffEnding, ScopeIdentity};
+    for durable in [false, true] {
+        for settle_first in [false, true] {
+            for (ending, reason) in [
+                (HandoffEnding::LoginObserved, None),
+                (HandoffEnding::Captured, None),
+                (HandoffEnding::HandoffExpired, Some("handoff_expired")),
+                (HandoffEnding::Expired, Some("expired")),
+                (HandoffEnding::ClosedByCaller, Some("closed_by_caller")),
+                (HandoffEnding::SessionInvalid, Some("session_invalid")),
+                (
+                    HandoffEnding::HandoffInterrupted,
+                    Some("handoff_interrupted"),
+                ),
+            ] {
+                let planes = planes();
+                let display = DisplayDouble::new(&["display"]);
+                planes.routes.display.connect(display.clone());
+                let facts = install(&planes);
+                let timing = planes.routes.display.arm(&frame(request()), &facts);
+                let principal = journal::call_records::principal_label(facts.principal.as_ref());
+                if durable {
+                    let scope = ScopeIdentity {
+                        owner: "reserved:owner".into(),
+                        reference: "scope".into(),
+                        scope_epoch: 1,
+                    };
+                    let Begin::Execute(_) = planes.calls.begin_scoped(
+                        &principal,
+                        "pf:local",
+                        "display-test",
+                        Some(scope.clone()),
+                        1,
+                    ) else {
+                        panic!("admitted");
+                    };
+                    planes
+                        .calls
+                        .hold_handoff(
+                            &principal,
+                            "pf:local",
+                            "display-test",
+                            scope,
+                            "https://example.com",
+                            2,
+                        )
+                        .unwrap();
+                }
+                let settle = ACTIVE
+                    .scope(timing, async { handoff_settle().unwrap() })
+                    .await;
+                let finish = || {
+                    if durable {
+                        planes
+                            .calls
+                            .finish_handoff(&principal, "pf:local", ending, 3)
+                            .unwrap();
+                    } else {
+                        assert!(settle(ending));
+                    }
+                };
+                if settle_first {
+                    finish();
+                }
+                deliver(&planes, json!({"outcome":"login_pending"})).await;
+                if !settle_first {
+                    finish();
+                }
+                finish();
+                display.count(2).await;
+                let writes = display.writes.lock().unwrap();
+                assert_eq!(writes.len(), 2);
+                let completion = writes
+                    .iter()
+                    .find(|write| write.kind == DisplayKind::Completion)
+                    .unwrap();
+                assert_eq!(
+                    completion.body["outcome"],
+                    if reason.is_some() { "error" } else { "success" },
+                    "{ending:?}"
+                );
+                assert_eq!(
+                    completion.body.get("reason").and_then(Value::as_str),
+                    reason,
+                    "{ending:?}"
+                );
+                assert!(planes.routes.display.state.lock().unwrap().calls.is_empty());
+            }
+        }
+    }
 }

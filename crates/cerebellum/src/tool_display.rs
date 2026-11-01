@@ -1,6 +1,6 @@
 //! Call-time transcript metadata. No argument or reply object is retained here.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -37,9 +37,8 @@ pub(crate) trait Backend: Send + Sync {
 }
 
 const WRITE_WINDOW: Duration = Duration::from_secs(3);
-// Keep first-write tombstones for the process lifetime. If this bounded table
-// fills, drop new display metadata rather than evicting a key and writing it twice.
-const MAX_TRACKED: usize = 16_384;
+const MAX_WAITING: usize = 16_384;
+const MAX_RECENT_CONSENTS: usize = 16_384;
 type Key = (String, String);
 
 #[derive(Default)]
@@ -53,11 +52,16 @@ struct State {
     requests: HashMap<RequestId, Key>,
     calls: HashMap<Key, Tracked>,
     identities: std::collections::HashSet<Key>,
+    seen_local_keys: std::collections::HashSet<Key>,
+    waiting_order: BTreeMap<u64, Key>,
+    next_order: u64,
     consent_results: HashMap<String, &'static str>,
+    consent_order: VecDeque<String>,
     display_principals: std::collections::HashSet<String>,
 }
 
 struct Tracked {
+    order: u64,
     runner: Principal,
     key: String,
     pin: String,
@@ -78,6 +82,30 @@ pub(crate) struct Timing {
     targets: Mutex<Map<String, Value>>,
     records: Weak<Records>,
     local: Key,
+}
+
+impl State {
+    fn remove_call(&mut self, key: &Key) {
+        if let Some(call) = self.calls.remove(key) {
+            self.waiting_order.remove(&call.order);
+            self.requests.retain(|_, local| local != key);
+        }
+    }
+}
+
+impl Timing {
+    fn durations(&self) -> (Duration, Duration, Duration) {
+        let start = self.started.lock().unwrap().unwrap_or(self.arrived);
+        let waits = self.waits.lock().unwrap();
+        let held = waits.0 + waits.1.map_or(Duration::ZERO, |start| start.elapsed());
+        let queued = self.queued.lock().unwrap();
+        let queued = queued.0 + queued.1.map_or(Duration::ZERO, |start| start.elapsed());
+        (
+            start.elapsed().saturating_sub(held).saturating_sub(queued),
+            start.duration_since(self.arrived) + queued,
+            held,
+        )
+    }
 }
 
 tokio::task_local! { pub(crate) static ACTIVE: Option<Arc<Timing>>; }
@@ -238,12 +266,22 @@ impl Records {
         );
         let identity = (serde_json::to_string(&runner).ok()?, key.clone());
         let mut state = self.state.lock().unwrap();
-        if state.calls.contains_key(&local)
-            || state.identities.len() >= MAX_TRACKED
-            || !state.identities.insert(identity)
-        {
+        if state.seen_local_keys.contains(&local) || state.identities.contains(&identity) {
             return None;
         }
+        // Keep only identity tombstones after settlement, not the call's fields
+        // and timers. The capacity limit applies solely to calls still waiting.
+        state.identities.insert(identity);
+        state.seen_local_keys.insert(local.clone());
+        while state.calls.len() >= MAX_WAITING {
+            let Some((_, oldest)) = state.waiting_order.pop_first() else {
+                break;
+            };
+            state.remove_call(&oldest);
+        }
+        let order = state.next_order;
+        state.next_order += 1;
+        state.waiting_order.insert(order, local.clone());
         let timing = Arc::new(Timing {
             arrived: tokio::time::Instant::now(),
             started: Mutex::new(None),
@@ -257,6 +295,7 @@ impl Records {
         state.calls.insert(
             local,
             Tracked {
+                order,
                 runner,
                 key,
                 pin,
@@ -287,7 +326,7 @@ impl Records {
         Some(Prepared {
             key,
             outcome,
-            reason,
+            reason: reason.map(str::to_owned),
             posts: body
                 .get("posts_returned")
                 .and_then(Value::as_i64)
@@ -336,7 +375,7 @@ impl Records {
             }
             if let Some(ending) = consent_result.filter(|_| !call.completed) {
                 call.completed = true;
-                call.completion = Some(completion_body(call, &consent_result_body(ending)));
+                call.completion = completion_body(call, &consent_result_body(ending));
             }
             let mut record = call.fields.clone();
             let (outcome, reason) = (prepared.outcome, prepared.reason);
@@ -345,27 +384,9 @@ impl Records {
             if let Some(reason) = reason {
                 record.insert("reason".into(), json!(reason));
             }
-            let start = call
-                .timing
-                .started
-                .lock()
-                .unwrap()
-                .unwrap_or(call.timing.arrived);
-            let waits = call.timing.waits.lock().unwrap();
-            let held = waits.0 + waits.1.map_or(Duration::ZERO, |start| start.elapsed());
-            let queued = call.timing.queued.lock().unwrap();
-            let queued = queued.0 + queued.1.map_or(Duration::ZERO, |start| start.elapsed());
-            record.insert(
-                "durationMs".into(),
-                json!(ms(start
-                    .elapsed()
-                    .saturating_sub(held)
-                    .saturating_sub(queued))),
-            );
-            record.insert(
-                "queuedMs".into(),
-                json!(ms(start.duration_since(call.timing.arrived) + queued)),
-            );
+            let (duration, queued, held) = call.timing.durations();
+            record.insert("durationMs".into(), json!(ms(duration)));
+            record.insert("queuedMs".into(), json!(ms(queued)));
             if !held.is_zero() {
                 record.insert("heldMs".into(), json!(ms(held)));
             }
@@ -378,6 +399,9 @@ impl Records {
                     writes.push(call.write(DisplayKind::Completion, completion));
                 }
             }
+            if !call.held || call.completed {
+                state.remove_call(&key);
+            }
             writes
         };
         for write in writes {
@@ -388,7 +412,8 @@ impl Records {
     pub(crate) fn completed(self: &Arc<Self>, principal: &str, key: &str, result: &Value) {
         let write = {
             let mut state = self.state.lock().unwrap();
-            let Some(call) = state.calls.get_mut(&(principal.into(), key.into())) else {
+            let key = (principal.into(), key.into());
+            let Some(call) = state.calls.get_mut(&key) else {
                 return;
             };
             if call.completed {
@@ -396,10 +421,14 @@ impl Records {
             }
             call.completed = true;
             let body = completion_body(call, result);
-            if call.replied && call.held {
-                Some(call.write(DisplayKind::Completion, body))
+            if call.replied {
+                let write = body
+                    .filter(|_| call.held)
+                    .map(|body| call.write(DisplayKind::Completion, body));
+                state.remove_call(&key);
+                write
             } else {
-                call.completion = Some(body);
+                call.completion = body;
                 None
             }
         };
@@ -411,8 +440,14 @@ impl Records {
     pub(crate) fn consent_completed(self: &Arc<Self>, ask: &str, ending: &'static str) {
         let keys = {
             let mut state = self.state.lock().unwrap();
-            if state.consent_results.len() < MAX_TRACKED {
-                state.consent_results.entry(ask.into()).or_insert(ending);
+            if !state.consent_results.contains_key(ask) {
+                if state.consent_results.len() >= MAX_RECENT_CONSENTS {
+                    if let Some(oldest) = state.consent_order.pop_front() {
+                        state.consent_results.remove(&oldest);
+                    }
+                }
+                state.consent_results.insert(ask.into(), ending);
+                state.consent_order.push_back(ask.into());
             }
             state
                 .calls
@@ -463,27 +498,51 @@ impl Records {
 pub(crate) struct Prepared {
     key: Key,
     outcome: &'static str,
-    reason: Option<&'static str>,
+    reason: Option<String>,
     posts: Option<i64>,
     ask: Option<String>,
     site: Option<String>,
 }
 
 fn consent_result_body(ending: &str) -> Value {
-    // Approval changes permission, not the old action's context. The original
-    // action remains not_started, and the caller must make a fresh call to run it.
-    json!({"outcome":if ending == "approved" { "not_started" } else { ending }})
+    json!({"outcome":"not_started","detail":{"consent":ending}})
 }
 
-fn completion_body(call: &Tracked, result: &Value) -> Map<String, Value> {
+fn completion_body(call: &Tracked, result: &Value) -> Option<Map<String, Value>> {
     let mut body = call.fields.clone();
     body.extend(call.timing.targets.lock().unwrap().clone());
+    // ConsentDrain::run_recording maps Granted, Declined, NoAnswer and Withdrawn
+    // to CallRecords::finish_consent, the sole caller of consent_completed.
+    // Its durable finish_held_locked path supplies the same detail.consent,
+    // including consent before login/capture. Approval grants permission but
+    // never runs the original action; its held record remains true without a
+    // completion, and a retry gets its own call record.
+    if let Some(ending) = result["detail"]["consent"].as_str() {
+        let reason = match ending {
+            "approved" => return None,
+            "denied" => "consent_declined",
+            "expired" => "consent_expired",
+            "withdrawn" => "consent_withdrawn",
+            _ => return None,
+        };
+        body.insert("outcome".into(), json!("error"));
+        body.insert("reason".into(), json!(reason));
+        return Some(body);
+    }
+    // finish_handoff/resume_handoff and handoff_settle report completed login
+    // work, not permission decisions. Closing that work without observing login
+    // is an error even though closed_by_caller is a normal success reply elsewhere.
+    if result["outcome"] == "closed_by_caller" {
+        body.insert("outcome".into(), json!("error"));
+        body.insert("reason".into(), json!("closed_by_caller"));
+        return Some(body);
+    }
     let (outcome, reason) = outcome(result, false);
     body.insert("outcome".into(), json!(outcome));
     if let Some(reason) = reason {
         body.insert("reason".into(), json!(reason));
     }
-    body
+    Some(body)
 }
 
 impl Tracked {
@@ -551,34 +610,38 @@ fn fields(plane: &str, args: &Value) -> Map<String, Value> {
     fields
 }
 
-fn outcome(body: &Value, error_frame: bool) -> (&'static str, Option<&'static str>) {
-    match body["outcome"].as_str() {
+fn outcome(body: &Value, error_frame: bool) -> (&'static str, Option<&str>) {
+    let code = body["outcome"].as_str();
+    // Emitted by terminal_arbiter, user_browser, and computer_capability:
+    // these codes report uncertainty, never a confirmed partial success.
+    if matches!(
+        code,
+        Some(
+            "dispatch_outcome_unknown"
+                | "outcome_unknown"
+                | "delivery_unconfirmed"
+                | "effect_indeterminate"
+                | "indeterminate"
+        )
+    ) {
+        return ("partial", Some("outcome_unknown"));
+    }
+    if error_frame || body["isError"] == true {
+        return (
+            "error",
+            code.or_else(|| body["code"].as_str())
+                .filter(|code| cortexkit_role_tool_display::schema::validate_code(code)),
+        );
+    }
+    match code {
         Some("consent_pending") => ("held", Some("consent")),
         Some("login_pending" | "presented" | "capture_pending") => ("held", Some("login_handoff")),
-        Some(
-            "partial"
-            | "partially_dispatched"
-            | "dispatch_outcome_unknown"
-            | "outcome_unknown"
-            | "delivery_unconfirmed"
-            | "effect_indeterminate"
-            | "indeterminate",
-        ) => ("partial", None),
-        Some("timed_out" | "timeout" | "deadline_expired") => ("error", Some("timed_out")),
-        Some("cancelled" | "turn_stopped") => ("error", Some("cancelled")),
-        Some("denied" | "permission_denied") => ("error", Some("permission_denied")),
-        Some("not_started") => ("error", Some("consent")),
         Some("installed_list_partial") => ("partial", None),
-        Some(code) if !error_frame && crate::tool_result::is_success(code) => ("success", None),
-        Some(
-            "ok" | "success" | "launched" | "closed" | "navigated" | "clicked" | "typed" | "read"
-            | "captured" | "dispatched" | "changed" | "unchanged" | "login_observed" | "stored"
-            | "imported" | "approved" | "consent_approved" | "resumed" | "done",
-        ) if !error_frame => ("success", None),
-        _ if body["isError"] == true || error_frame || body.get("outcome").is_some() => {
-            ("error", None)
-        }
-        _ => ("success", None),
+        Some(code) if crate::tool_result::is_success(code) => ("success", None),
+        _ => (
+            "error",
+            code.filter(|code| cortexkit_role_tool_display::schema::validate_code(code)),
+        ),
     }
 }
 
