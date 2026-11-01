@@ -4,14 +4,18 @@ Read this before you change code here. Each rule comes from a defect a worker sh
 
 ## Gates
 
-Run cargo on this Mac only for the gate's Mac half and for tests that need macOS. Run check, clippy and every other test on the build server with `runon`. Each fresh test binary run on this Mac costs a system security scan while Ufuk works on it.
+Don't run the fast gate (`scripts/fast-gate.sh`) or the full gate (`scripts/rust-test-gate.sh`). The head runs the fast gate when it merges your delivery, so running it yourself only doubles the wait: on 31 Oct and 1 Nov, workers spent most of each hour watching gate halves the head then ran again.
 
-The fast gate has two halves, chosen from your diff:
+Run only what your change needs, and keep each run to minutes:
 
-- **Linux half:** fmt, clippy for Linux and both Windows targets, the tests that run on Linux, and the protective checks. The build server's copy of the repository carries no branch names, so take the base commit here first with `git rev-parse origin/main`, then run `bash scripts/fast-gate.sh --part linux --base <that commit>` with your bash tool's `runon: "linux,8c"`. A 16-vCPU job waits for a whole free build server, which cost a gate 25 minutes of queueing on 29 Oct.
-- **Mac half:** macOS clippy and the tests that need macOS, for the macOS crates your diff touches. Run it locally on this Mac: `bash scripts/fast-gate.sh --part mac --base <that commit>`. An opt-in remote form exists (`bash scripts/fast-gate.sh --part mac --remote --base <commit>` from a Mac terminal with `ck` access, or `--part mac --vm` with `runon: "macos"`), but don't use it: in the VM, cerebellum-computer's macOS lib tests hang until the job's 60-minute timeout, most likely because the VM has no window-server session (jobs 01a17ec1-843f-7155-8394-8e644365a681 and 01a17ef8-ad0b-712b-a7d2-7dfe9cb9386c on 2026-10-27). Use the local half. The remote form reports the desk-bound phases it cannot check as `NOT VERIFIED` lines, never silent skips.
+- **Tests:** the filtered tests for the files and behaviour you changed, by module path or test name. For a bug fix, also show once that its new test fails without the fix.
+- **Lint:** `cargo clippy --locked -p <crate> --all-targets -- -D warnings` for the crates you changed, on Linux, plus `--target x86_64-pc-windows-msvc` if the change touches code that builds on Windows. Run these on the build server with your bash tool's `runon: "linux,8c"`. A 16-vCPU job waits for a whole free build server.
+- **macOS:** if your change touches code that builds or runs only on macOS, run macOS clippy for that crate and its macOS tests on this Mac. Linux never compiles that code, so the build server can't check it.
+- **Formatting:** `cargo fmt --check`.
 
-Run both before you deliver, as two parallel tool calls, with the same `--base` commit. Each half prints a `FAST GATE FINGERPRINT` line; the two must match, which shows both checked the same tree. On the head's host, `bash scripts/fast-gate.sh` with no `--part` runs both halves at once. The `NOT VERIFIED` phases of a remote run (window-server desk tests, the desk-probe example build) need a real desk: run `bash scripts/fast-gate.sh --part mac --base <commit>` locally on a Mac with an unlocked screen to check those. Don't run `scripts/rust-test-gate.sh`: that full gate takes up to 40 minutes, and the head runs it on main after integrating. If a check can't run in your sandbox, name it in your report rather than skipping it silently.
+Run cargo on this Mac only for macOS-only checks. Each fresh test binary run on this Mac costs a system security scan while Ufuk works on it. Keep the normal build directory; a separate `CARGO_TARGET_DIR` forces a cold build.
+
+If a test you didn't touch fails, rerun that one test by name on the base commit; never rerun a whole suite. A filtered run that takes longer than about 15 minutes means the filter is too broad. If a check can't run in your sandbox, name it in your report rather than skipping it silently.
 
 ## Standing approvals
 
@@ -36,9 +40,9 @@ These still come to the head before you change them:
 
 `crates/cerebellum/src/computer_capability/` compiles on every platform, but many of its tests, and all of `cerebellum-macos`, run only on macOS. The Linux build server runs only the platform-neutral ones. A test that relies on macOS behaviour, such as macOS's own keyboard shortcuts, needs `#[cfg(target_os = "macos")]`, or it fails on Linux.
 
-- For any change there, the gate's Mac half must pass on this Mac; running it with `runon` doesn't count.
+- For any change there, run macOS clippy and the touched macOS tests on this Mac; running them with `runon` doesn't count.
 - The test `computer_consent_wire_tests::stack_tests::a_computer_consent_call_fits_half_a_default_thread_stack` runs a real call on a 1 MiB thread. When a future on the serve path grows too large, the whole test binary aborts with "fatal runtime error: stack overflow" and names no test. To find it, run each test alone with the binary's `--exact` flag. Box the future that grew (`Box::pin`) where it is created. Never raise a stack size.
-- Clippy for Linux and Windows runs in the gate's Linux half. Code used only on macOS is dead code on Linux, and `-D warnings` refuses it.
+- Code used only on macOS is dead code on Linux, and Linux clippy with `-D warnings` refuses it.
 
 ## Verification scope
 
