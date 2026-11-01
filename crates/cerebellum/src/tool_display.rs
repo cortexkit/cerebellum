@@ -541,6 +541,11 @@ fn consent_result_body(ending: &str) -> Value {
 fn completion_body(call: &Tracked, result: &Value) -> Option<Map<String, Value>> {
     let mut body = call.fields.clone();
     body.extend(call.timing.targets.lock().unwrap().clone());
+    if result["reason"] == "scope_ended" {
+        body.insert("outcome".into(), json!("error"));
+        body.insert("reason".into(), json!("scope_ended"));
+        return Some(body);
+    }
     // ConsentDrain::run_recording maps Granted, Declined, NoAnswer and Withdrawn
     // to CallRecords::finish_consent, the sole caller of consent_completed.
     // Its durable finish_held_locked path supplies the same detail.consent,

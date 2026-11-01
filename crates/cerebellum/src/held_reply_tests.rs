@@ -684,6 +684,638 @@ async fn present_holds_login_handoff_and_settles_under_basal_call_key() {
     );
 }
 
+async fn scope_end_fixture(login: bool) -> (Planes, tests::ScriptedConsent) {
+    scope_end_fixture_calls(login, None).await
+}
+
+async fn scope_end_fixture_calls(
+    login: bool,
+    calls: Option<Arc<journal::call_records::CallRecords>>,
+) -> (Planes, tests::ScriptedConsent) {
+    let consent = tests::ScriptedConsent::new();
+    detach(&consent, "scope-card");
+    let mut planes = attach_consent(
+        isolated_test_planes(&Arc::new(HealthState::new())),
+        &consent,
+    );
+    if let Some(calls) = calls {
+        planes.calls = calls;
+    }
+    bind_held(&planes).await;
+    let body = if login {
+        let config = Planes::short_test_browser_config();
+        planes.browser_config = Some(config.clone());
+        assert!(matches!(
+            planes.sessions.acquire_launch_slot("head-conversation"),
+            browser_session::LaunchSlot::Acquired { .. }
+        ));
+        planes
+            .sessions
+            .establish_ready(
+                "head-conversation",
+                ProfileDisposition::Disposable,
+                &config,
+                planes.lease_clock.as_ref(),
+                Box::new(LoginBrowser(Arc::new(std::sync::atomic::AtomicBool::new(
+                    false,
+                )))),
+                Box::new(Cleanup),
+            )
+            .unwrap();
+        json!({"name":"browser_use","call_key":"scope-held","arguments":{"action":"present","origin":"https://example.com"}})
+    } else {
+        grant_request(Some("scope-held"))
+    };
+    assert_held(
+        &decode(exchange(&planes, 9, 3, body).await),
+        if login { "login_handoff" } else { "consent" },
+    );
+    (planes, consent)
+}
+
+fn scope_push(reason: &str) -> Frame {
+    Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Push,
+        control_flags(),
+        0,
+        0,
+        0,
+        serde_json::to_vec(
+            &json!({"op":"route.closed","module_id":"cerebellum","channels":[9],
+            "reason":reason,"drained":false,"abandoned":0,"excluded_subscriptions":0}),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+fn held_scope_entries(planes: &Planes) -> Value {
+    serde_json::to_value(
+        planes
+            .calls
+            .late_results(
+                "reserved:basal",
+                &cortexkit_role_tool_provider::late_results::LateResultsRequest::new(),
+                wall_clock_ms(),
+            )
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn assert_scope_ended(entries: &Value) {
+    assert_eq!(entries["entries"].as_array().unwrap().len(), 1, "{entries}");
+    let entry = &entries["entries"][0];
+    assert_eq!(entry["kind"], "not_started", "{entries}");
+    assert_eq!(entry["reason"], "scope_ended", "{entries}");
+    assert_eq!(entry["custodian"], "reserved:basal");
+    assert_eq!(entry["call_key"], "scope-held");
+}
+
+async fn closed_scope_settles_once(login: bool) {
+    let (planes, consent) = scope_end_fixture(login).await;
+    let (tx, _rx) = mpsc::channel(16);
+    for reason in ["restart", "scope_carrier_removed", "not_live"] {
+        handle_frame_for_test(scope_push(reason), &tx, &planes)
+            .await
+            .unwrap();
+        assert!(held_scope_entries(&planes)["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+    handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
+        .await
+        .unwrap();
+    let first = held_scope_entries(&planes);
+    assert_scope_ended(&first);
+    handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
+        .await
+        .unwrap();
+    if login {
+        assert!(
+            planes
+                .sessions
+                .resume("head-conversation", planes.lease_clock.as_ref())
+                .is_ok(),
+            "the person's window keeps its normal handoff policy"
+        );
+        assert!(planes.sessions.has_open_session("head-conversation"));
+    } else {
+        consent.feed(json!([answered("scope-card", "allow_30m")]));
+        let _ = late(&planes, 9).await;
+        let retry = decode(exchange(&planes, 9, 4, grant_request(Some("scope-fresh"))).await);
+        assert!(
+            retry.get("held").is_none(),
+            "approval still grants on the live head: {retry}"
+        );
+        assert_ne!(
+            retry["isError"], true,
+            "the retry must actually use the grant: {retry}"
+        );
+    }
+    assert_eq!(
+        held_scope_entries(&planes),
+        first,
+        "approval/poll/duplicate end cannot re-settle"
+    );
+    let withdrawn = decode(
+        exchange(
+            &planes,
+            9,
+            6,
+            json!({"name":"tool.withdraw","arguments":{"call_key":"scope-held"}}),
+        )
+        .await,
+    );
+    assert_eq!(
+        withdrawn,
+        json!({"answer":"refused","reason":"scope_ended"})
+    );
+}
+
+#[tokio::test]
+async fn consent_scope_ended_route_closed_settles_once_and_late_approval_never_runs_it() {
+    closed_scope_settles_once(false).await;
+}
+
+#[tokio::test]
+async fn login_scope_ended_route_closed_settles_once_without_revoking_head_browser() {
+    closed_scope_settles_once(true).await;
+}
+
+async fn described_scope_settles_once(login: bool) {
+    let (planes, _consent) = scope_end_fixture(login).await;
+    let key =
+        scope_watch::ScopeKey::from_stamp(planes.routes.get(9, 3).unwrap().scope.as_ref().unwrap());
+    let (tx, mut rx) = mpsc::channel(16);
+    let goodbye = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Goodbye,
+        control_flags(),
+        9,
+        3,
+        0,
+        Vec::new(),
+    )
+    .unwrap();
+    handle_frame_for_test(goodbye, &tx, &planes).await.unwrap();
+    assert!(
+        held_scope_entries(&planes)["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "plain close is not scope end"
+    );
+    for (status, epoch) in [
+        ("not_live", None),
+        ("live", Some(key.scope_epoch + 1)),
+        ("ended", Some(key.scope_epoch + 1)),
+        ("ended", Some(key.scope_epoch)),
+    ] {
+        let question = tokio::time::timeout(HANG_GUARD, rx.recv())
+            .await
+            .expect("closed run with a held call asks scope.describe")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&question.body).unwrap()["op"],
+            "scope.describe"
+        );
+        assert!(
+            held_scope_entries(&planes)["entries"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "only ended at the exact epoch settles a hold"
+        );
+        let answer = json!({"op":"scope.describe","status":status,"scope_epoch":epoch,
+            "daemon_incarnation":"scope-test","owner_synced":true,"owner_configured":true});
+        let response = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Response,
+            control_flags(),
+            0,
+            0,
+            question.header.corr,
+            serde_json::to_vec(&answer).unwrap(),
+        )
+        .unwrap();
+        handle_frame_for_test(response, &tx, &planes).await.unwrap();
+        planes.scopes.closed_again(&key).notify_one();
+    }
+    let first = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let entries = held_scope_entries(&planes);
+            if !entries["entries"].as_array().unwrap().is_empty() {
+                break entries;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("exact ended answer settles the held call");
+    assert_scope_ended(&first);
+    // A later handoff poll or consent decision cannot replace the terminal.
+    planes
+        .calls
+        .finish_consent(
+            "scope-card",
+            journal::call_records::ConsentEnding::Approved,
+            wall_clock_ms(),
+        )
+        .unwrap();
+    planes
+        .calls
+        .finish_handoff(
+            "reserved:basal",
+            "scope-held",
+            journal::call_records::HandoffEnding::LoginObserved,
+            wall_clock_ms(),
+        )
+        .unwrap();
+    assert_eq!(held_scope_entries(&planes), first);
+    let journal::call_records::Lookup::Own(snapshot) =
+        planes.calls.lookup("reserved:basal", "scope-held")
+    else {
+        panic!("call retained")
+    };
+    assert_eq!(
+        journal::call_records::withdraw_answer(&snapshot),
+        json!({"answer":"refused","reason":"scope_ended"})
+    );
+    assert!(
+        planes.sessions.has_open_session("head-conversation") || !login,
+        "ending a run never revokes the head browser"
+    );
+}
+
+#[tokio::test]
+async fn consent_scope_ended_describe_requires_the_exact_epoch() {
+    described_scope_settles_once(false).await;
+}
+
+#[tokio::test]
+async fn login_scope_ended_describe_requires_the_exact_epoch() {
+    described_scope_settles_once(true).await;
+}
+
+#[tokio::test]
+async fn capture_scope_ended_settles_once_and_disposes_without_deposit() {
+    let fixture = login_capture::test_support::fixture_with(|env| {
+        env.poll_interval = Duration::from_millis(10);
+        env.handoff_duration = Duration::from_secs(60);
+    });
+    fixture.launcher.script.lock().unwrap().logs_in = false;
+    let consent = tests::ScriptedConsent::new();
+    detach(&consent, "scope-capture-card");
+    let planes = attach_consent(tests::capture_planes(&fixture), &consent);
+    bind_held(&planes).await;
+    assert_held(
+        &decode(exchange(&planes, 9, 3, capture_request("scope-consent")).await),
+        "consent",
+    );
+    consent.feed(json!([answered("scope-capture-card", "allow")]));
+    let granted = late(&planes, 9).await;
+    decode(
+        exchange(
+            &planes,
+            9,
+            4,
+            json!({"name":"late_results.ack","arguments":{"through":granted["cursor"]}}),
+        )
+        .await,
+    );
+    let finalized = planes.capture.expect_journal_finalization();
+    assert_held(
+        &decode(exchange(&planes, 9, 5, capture_request("scope-held")).await),
+        "login_capture",
+    );
+    let (tx, _rx) = mpsc::channel(16);
+    handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
+        .await
+        .unwrap();
+    let first = held_scope_entries(&planes);
+    assert_scope_ended(&first);
+    tokio::time::timeout(HANG_GUARD, finalized)
+        .await
+        .expect("scope end stops the detached capture")
+        .unwrap();
+    assert_eq!(fixture.vault.calls(), 0);
+    assert!(fixture.fs.files().is_empty());
+    for placement in fixture.launcher.placements.lock().unwrap().iter() {
+        assert!(!fixture.fs.exists(placement.profile_directory()));
+    }
+    handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
+        .await
+        .unwrap();
+    assert_eq!(held_scope_entries(&planes), first);
+    assert_eq!(
+        decode(
+            exchange(
+                &planes,
+                9,
+                6,
+                json!({"name":"tool.withdraw","arguments":{"call_key":"scope-held"}})
+            )
+            .await
+        ),
+        json!({"answer":"refused","reason":"scope_ended"})
+    );
+}
+
+#[tokio::test]
+async fn capture_scope_ended_during_deposit_preserves_the_observed_result_or_unknown() {
+    use login_capture::test_support::FakeReply;
+    use login_capture::vault::VaultReachError;
+    for (reply, expected) in [
+        (
+            FakeReply::Stored {
+                outcome: "created",
+                version: 1,
+            },
+            "captured",
+        ),
+        (
+            FakeReply::refused("permanent", "not_found"),
+            "handoff_interrupted",
+        ),
+        (
+            FakeReply::Fails(VaultReachError::CallFailed { code: None }),
+            "unknown",
+        ),
+        (FakeReply::Hangs, "unknown"),
+    ] {
+        let fixture = login_capture::test_support::fixture_with(|env| {
+            env.poll_interval = Duration::from_millis(10);
+            env.deposit_deadline = Duration::from_secs(20);
+        });
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *fixture.vault.deposit_gate.lock().unwrap() = Some(gate.clone());
+        fixture.vault.script([reply]);
+        let consent = tests::ScriptedConsent::new();
+        detach(&consent, "deposit-card");
+        let planes = attach_consent(tests::capture_planes(&fixture), &consent);
+        bind_held(&planes).await;
+        assert_held(
+            &decode(exchange(&planes, 9, 3, capture_request("deposit-consent")).await),
+            "consent",
+        );
+        consent.feed(json!([answered("deposit-card", "allow")]));
+        let granted = late(&planes, 9).await;
+        decode(
+            exchange(
+                &planes,
+                9,
+                4,
+                json!({"name":"late_results.ack","arguments":{"through":granted["cursor"]}}),
+            )
+            .await,
+        );
+        let finalized = planes.capture.expect_journal_finalization();
+        assert_held(
+            &decode(exchange(&planes, 9, 5, capture_request("scope-held")).await),
+            "login_capture",
+        );
+        tokio::time::timeout(HANG_GUARD, async {
+            while fixture.vault.calls() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the vault holds a sent deposit before replying");
+        assert_eq!(fixture.vault.calls(), 1);
+        let (tx, _rx) = mpsc::channel(16);
+        handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
+            .await
+            .unwrap();
+        assert!(
+            held_scope_entries(&planes)["entries"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "scope end cannot classify an in-flight deposit as not started"
+        );
+        gate.add_permits(1);
+        tokio::time::timeout(HANG_GUARD, finalized)
+            .await
+            .expect("the deposit finishes under its existing deadline")
+            .unwrap();
+        let result = held_scope_entries(&planes);
+        assert_eq!(result["entries"].as_array().unwrap().len(), 1);
+        let entry = &result["entries"][0];
+        assert_eq!(entry["kind"], "result", "{entry}");
+        assert_eq!(entry["result"]["outcome"], expected, "{entry}");
+        assert!(entry.get("reason").is_none(), "{entry}");
+        assert_eq!(
+            fixture.vault.calls(),
+            1,
+            "scope end must not re-send the deposit"
+        );
+        handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
+            .await
+            .unwrap();
+        assert_eq!(held_scope_entries(&planes), result);
+    }
+}
+
+#[tokio::test]
+async fn scope_ended_floor_is_lazy_and_settlement_survives_restart_retention_and_ack() {
+    use cerebellum_core::format_floor::{read_floors, FormatFloor};
+    use journal::call_records::{
+        withdraw_answer, CallRecords, FilesystemCallRecordStorage, Lookup,
+    };
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let scratch = Scratch(std::env::temp_dir().join(format!(
+        "cerebellum-scope-floor-{}-{}",
+        std::process::id(),
+        wall_clock_ms()
+    )));
+    std::fs::create_dir_all(&scratch.0).unwrap();
+    let path = scratch.0.join("calls.jsonl");
+    let floor = scratch.0.join("floor.json");
+    std::fs::write(&path, b"{\"format\":\"call-records\",\"version\":5}\n").unwrap();
+    FormatFloor::at(&floor)
+        .raise(cerebellum_core::format_floor::DurableFormat::new(
+            "call-records",
+            5,
+        ))
+        .unwrap();
+    let open = |now| {
+        Arc::new(CallRecords::open(
+            Box::new(
+                FilesystemCallRecordStorage::new(&path).with_format_floor(FormatFloor::at(&floor)),
+            ),
+            now,
+        ))
+    };
+    let calls = open(wall_clock_ms());
+    let before = std::fs::read(&path).unwrap();
+    let request = cortexkit_role_tool_provider::late_results::LateResultsRequest::new();
+    calls
+        .late_results("reserved:basal", &request, wall_clock_ms())
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "startup and ordinary pull must not rewrite the file"
+    );
+    assert_eq!(read_floors(&floor).unwrap().get("call-records"), Some(&5));
+    let (planes, _consent) = scope_end_fixture_calls(false, Some(calls.clone())).await;
+    assert_eq!(
+        read_floors(&floor).unwrap().get("call-records"),
+        Some(&5),
+        "a consent hold still needs only reader 5"
+    );
+    let (tx, _rx) = mpsc::channel(16);
+    handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
+        .await
+        .unwrap();
+    assert_eq!(read_floors(&floor).unwrap().get("call-records"), Some(&6));
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .starts_with("{\"format\":\"call-records\",\"version\":6}\n"));
+    let first = calls
+        .late_results("reserved:basal", &request, wall_clock_ms())
+        .unwrap();
+    assert_scope_ended(&serde_json::to_value(&first).unwrap());
+    let reopened = open(wall_clock_ms());
+    let replay = reopened
+        .late_results("reserved:basal", &request, wall_clock_ms())
+        .unwrap();
+    assert_eq!(
+        first.entries, replay.entries,
+        "event identity survives restart"
+    );
+    assert!(reopened
+        .late_results("reserved:other", &request, wall_clock_ms())
+        .unwrap()
+        .entries
+        .is_empty());
+    let expired = reopened
+        .late_results(
+            "reserved:basal",
+            &request,
+            wall_clock_ms() + 24 * 60 * 60 * 1000,
+        )
+        .unwrap();
+    assert_eq!(expired.entries[0].kind, "expired");
+    reopened
+        .ack_late_results(
+            "reserved:basal",
+            &cortexkit_role_tool_provider::late_results::AckRequest {
+                through: expired.cursor,
+            },
+            wall_clock_ms(),
+        )
+        .unwrap();
+    let acked = open(wall_clock_ms());
+    assert!(acked
+        .late_results("reserved:basal", &request, wall_clock_ms())
+        .unwrap()
+        .entries
+        .is_empty());
+    let Lookup::Own(snapshot) = acked.lookup("reserved:basal", "scope-held") else {
+        panic!("settled record retained")
+    };
+    assert_eq!(
+        withdraw_answer(&snapshot),
+        json!({"answer":"refused","reason":"scope_ended"})
+    );
+
+    // An unobserved deposit needs reader 6 even if no scope has ended.
+    let unknown_path = scratch.0.join("unknown.jsonl");
+    let unknown_floor = scratch.0.join("unknown-floor.json");
+    std::fs::write(
+        &unknown_path,
+        b"{\"format\":\"call-records\",\"version\":5}\n",
+    )
+    .unwrap();
+    FormatFloor::at(&unknown_floor)
+        .raise(cerebellum_core::format_floor::DurableFormat::new(
+            "call-records",
+            5,
+        ))
+        .unwrap();
+    let unknown_open = || {
+        CallRecords::open(
+            Box::new(
+                FilesystemCallRecordStorage::new(&unknown_path)
+                    .with_format_floor(FormatFloor::at(&unknown_floor)),
+            ),
+            wall_clock_ms(),
+        )
+    };
+    let unknown_calls = unknown_open();
+    unknown_calls
+        .late_results("reserved:basal", &request, wall_clock_ms())
+        .unwrap();
+    assert_eq!(
+        read_floors(&unknown_floor).unwrap().get("call-records"),
+        Some(&5)
+    );
+    let scope = journal::call_records::ScopeIdentity::from_stamp(&run_stamp());
+    assert!(matches!(
+        unknown_calls.begin_scoped(
+            "reserved:basal",
+            "unknown-held",
+            "c",
+            Some(scope.clone()),
+            wall_clock_ms()
+        ),
+        journal::call_records::Begin::Execute(_)
+    ));
+    unknown_calls
+        .hold_capture(
+            "reserved:basal",
+            "unknown-held",
+            scope,
+            "https://example.com",
+            wall_clock_ms(),
+        )
+        .unwrap();
+    assert_eq!(
+        read_floors(&unknown_floor).unwrap().get("call-records"),
+        Some(&5)
+    );
+    assert!(unknown_calls.begin_capture_deposit("reserved:basal", "unknown-held"));
+    unknown_calls
+        .finish_handoff(
+            "reserved:basal",
+            "unknown-held",
+            journal::call_records::HandoffEnding::Unknown,
+            wall_clock_ms(),
+        )
+        .unwrap();
+    assert_eq!(
+        read_floors(&unknown_floor).unwrap().get("call-records"),
+        Some(&6)
+    );
+    assert!(std::fs::read_to_string(&unknown_path)
+        .unwrap()
+        .starts_with("{\"format\":\"call-records\",\"version\":6}\n"));
+    let unknown_entry = unknown_calls
+        .late_results("reserved:basal", &request, wall_clock_ms())
+        .unwrap();
+    assert_eq!(unknown_entry.entries[0].kind, "result");
+    assert_eq!(
+        unknown_entry.entries[0].result.as_ref().unwrap()["outcome"],
+        "unknown"
+    );
+    assert_eq!(
+        unknown_open()
+            .late_results("reserved:basal", &request, wall_clock_ms())
+            .unwrap()
+            .entries,
+        unknown_entry.entries
+    );
+}
+
 #[tokio::test]
 async fn replay_negotiates_held_again_for_the_current_route() {
     let consent = tests::ScriptedConsent::new();

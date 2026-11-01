@@ -321,6 +321,7 @@ pub(crate) struct FakeVault {
     /// is answered as stored with outcome `created`.
     pub(crate) replies: Mutex<VecDeque<FakeReply>>,
     pub(crate) requests: Mutex<Vec<Vec<u8>>>,
+    pub(crate) deposit_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     pub(crate) opens: AtomicUsize,
     pub(crate) events: Events,
 }
@@ -375,6 +376,10 @@ impl VaultRoute for FakeRoute {
             let vault = &self.0;
             vault.events.push("vault_call");
             vault.requests.lock().unwrap().push(request.to_vec());
+            let gate = vault.deposit_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
             let id = serde_json::from_slice::<Value>(request).unwrap()["params"]["id"].clone();
             let next = vault.replies.lock().unwrap().pop_front();
             let reply = match next.unwrap_or(FakeReply::Stored {
@@ -667,6 +672,7 @@ fn fixture_configuring_launcher(
         open_fails: Mutex::new(None),
         replies: Mutex::new(VecDeque::new()),
         requests: Mutex::new(Vec::new()),
+        deposit_gate: Mutex::new(None),
         opens: AtomicUsize::new(0),
         events: events.clone(),
     });
