@@ -1,0 +1,73 @@
+//! Published pins outlive the catalog definitions that first introduced them.
+
+use super::*;
+use cortexkit_role_tool_provider::views::{ViewEntry, ViewManifest, ViewsReply, ViewsRequest};
+
+const PUBLISHED: &str = include_str!("../../resources/tool-views/published-v1.json");
+const BROWSER_ROW: &str = include_str!("../../resources/tool-views/browser-row.ui");
+const BROWSER_PAGE: &str = include_str!("../../resources/tool-views/browser-page.ui");
+const COMPUTER_ROW: &str = include_str!("../../resources/tool-views/computer-row.ui");
+const COMPUTER_PAGE: &str = include_str!("../../resources/tool-views/computer-page.ui");
+
+fn template(profile: &str, source: &str) -> Value {
+    json!({
+        "schema": "occipital.template/1", "profile": profile, "executionDialect": "1.0",
+        "catalog": {"version": "1.1", "digest": "sha256:de7c9df7a365bf816006c95a6be25ab1df6c725aaa90942ebed2e0a923d18ee6"},
+        "reads": [], "source": source,
+    })
+}
+
+fn published() -> BTreeMap<String, ViewManifest> {
+    let entries: BTreeMap<String, Value> =
+        serde_json::from_str(PUBLISHED).expect("published views");
+    entries
+        .into_iter()
+        .map(|(pin, entry)| {
+            let tool = SchemaPin::parse(&pin).expect("published pin").tool;
+            let (row, page) = match tool.as_str() {
+                flat_tools::BROWSER_USE => (BROWSER_ROW, BROWSER_PAGE),
+                flat_tools::COMPUTER_USE => (COMPUTER_ROW, COMPUTER_PAGE),
+                _ => panic!("published pin has no templates"),
+            };
+            let schema =
+                serde_json::from_value(entry["record_schema"].clone()).expect("kept schema");
+            let reads = serde_json::from_value(entry["reads"].clone()).expect("kept reads");
+            let template = json!({
+                "row": template("tool_row", row),
+                "page": template("tool_page", page),
+            });
+            (
+                pin,
+                ViewManifest::new(schema, reads, template).with_template_revision(1),
+            )
+        })
+        .collect()
+}
+
+pub(super) fn answer(arguments: &Map<String, Value>) -> Result<Value, ErrorBody> {
+    if let Some(field) = arguments.keys().find(|field| field.as_str() != "pins") {
+        return Err(errors::invalid_request(field, "unknown views member"));
+    }
+    let request: ViewsRequest = serde_json::from_value(Value::Object(arguments.clone()))
+        .map_err(|_| errors::invalid_request("pins", "expected an array of pins"))?;
+    request.validate()?;
+    let kept = published();
+    let reply = ViewsReply::new(
+        request
+            .pins
+            .iter()
+            .map(|pin| {
+                let view = kept
+                    .get(pin)
+                    .cloned()
+                    .map(ViewEntry::Manifest)
+                    .unwrap_or(ViewEntry::Unknown);
+                (pin.clone(), view)
+            })
+            .collect(),
+    );
+    Ok(serde_json::to_value(reply).expect("views serialize"))
+}
+
+#[cfg(test)]
+mod tests;

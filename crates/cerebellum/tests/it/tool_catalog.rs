@@ -130,6 +130,59 @@ async fn catalog(planes: &Planes, arguments: Value) -> Frame {
 }
 
 #[tokio::test]
+async fn tool_views_are_advertised_and_match_catalog_pins() {
+    use cortexkit_role_tool_provider::{
+        describe::RoleDescribe,
+        ops,
+        views::{ViewEntry, ViewsReply, ViewsRequest},
+        TOOL_VIEWS_CAPABILITY,
+    };
+    let planes = planes(true);
+    bind(&planes, 9, "prefrontal-core").await;
+    let description = exchange(&planes, 9, json!({"name":"role.describe","arguments":{}})).await;
+    let description: RoleDescribe = serde_json::from_value(body(&description)).unwrap();
+    assert!(description
+        .capabilities
+        .iter()
+        .any(|capability| capability == TOOL_VIEWS_CAPABILITY));
+    assert!(description
+        .major(cortexkit_role_tool_provider::PROVIDES)
+        .unwrap()
+        .serves(ops::TOOL_VIEWS));
+    let catalog: CatalogAnswer =
+        serde_json::from_value(body(&catalog(&planes, json!({})).await)).unwrap();
+    let mut pins = catalog
+        .tools
+        .iter()
+        .map(|tool| {
+            SchemaPin::new(&tool.name, &tool.schema_digest, tool.semantics)
+                .encode()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    pins.push("unpublished".into());
+    let request = ViewsRequest::new(pins.clone());
+    let reply = exchange(&planes, 9, json!({"name":"tool.views","arguments":request})).await;
+    assert_eq!(reply.header.ty, FrameType::Response);
+    let reply: ViewsReply = serde_json::from_value(body(&reply)).unwrap();
+    reply.validate_for(&ViewsRequest::new(pins)).unwrap();
+    for tool in catalog.tools {
+        let pin = SchemaPin::new(&tool.name, &tool.schema_digest, tool.semantics)
+            .encode()
+            .unwrap();
+        let ViewEntry::Manifest(view) = &reply.views[&pin] else {
+            panic!("catalog pin has no view: {pin}");
+        };
+        assert_eq!(view.record_schema.name, "cerebellum_call");
+        assert_eq!(view.template_revision, 1);
+        assert!(view.reads.is_empty());
+        assert_eq!(view.template["row"]["profile"], "tool_row");
+        assert_eq!(view.template["page"]["profile"], "tool_page");
+    }
+    assert!(matches!(reply.views["unpublished"], ViewEntry::Unknown));
+}
+
+#[tokio::test]
 async fn catalog_matches_hello_and_digest_is_stable() {
     let planes = planes(true);
     bind(&planes, 9, "prefrontal-core").await;

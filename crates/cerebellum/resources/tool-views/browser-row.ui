@@ -1,0 +1,18 @@
+export const action = input.action == "snapshot" ? "Read page" : input.action == "navigate" ? "Navigate" : input.action == "click" || input.action == "click_point" ? "Click" : input.action == "type" ? "Type" : input.action == "screenshot" ? "Screenshot" : input.action == "open_tab" ? "Open tab" : input.action == "claim_tab" ? "Use tab" : input.action == "fill_login" ? "Fill login" : input.action == "open_grant" ? "Request approval" : input.action == "present" ? "Sign in" : input.action == "resume" ? "Resume" : input.action == "import_login" ? "Import login" : input.action == "capture_login" ? "Save login" : input.action == "revoke_access" ? "Revoke access" : input.action == "launch" ? "Open browser" : input.action == "close" ? "Close browser" : input.action == "scroll" ? "Scroll" : "Browser status"
+export const authority = Last(Split(First(Split(First(Split(First(Split(Last(Split(view.record.site ?? input.url ?? "", "://")), "/")), "?")), "#")), "@"))
+export const host = StartsWith(authority, "[") ? First(Split(authority, "]")) + "]" : First(Split(authority, ":"))
+export const outcome = view.completion.outcome ?? view.record.outcome
+export const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason
+
+<Card appearance="clear" direction="row" gap="s" align="center">
+<TextContent text={action} maxLines={1} />
+<Slot width="fill">
+<TextContent text={host} size="small" maxLines={1} />
+</Slot>
+<Slot width="short">
+{outcome == "held" ? <Badge text={reason == "login_handoff" ? "Waiting for sign-in" : "Waiting for approval"} tone="neutral" /> : outcome == "error" ? <Badge text="Refused" tone="danger" /> : outcome == "partial" ? <Badge text="Outcome unknown" tone="warning" /> : outcome == "success" ? <Badge text="Done" tone="neutral" /> : null}
+</Slot>
+<Slot width="short">
+{outcome == null && view.call.phase == "running" ? <Elapsed start={view.call.startedAtMs ?? now} /> : view.completion.durationMs == null && view.record.durationMs == null ? null : <TextContent text={FormatDuration(view.completion.durationMs ?? view.record.durationMs ?? 0)} size="small" maxLines={1} />}
+</Slot>
+</Card>

@@ -1,0 +1,405 @@
+{
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "action": {
+        "description": "Admitted computer action to perform.",
+        "enum": [
+          "read_state",
+          "press_element",
+          "press_point",
+          "write_text",
+          "type",
+          "keys",
+          "takeover_move",
+          "takeover_drag",
+          "takeover_scroll",
+          "wait",
+          "list_apps",
+          "open_app"
+        ],
+        "type": "string"
+      },
+      "amount_lines": {
+        "description": "Lines to scroll. Vertical: positive scrolls up toward the top, negative scrolls down. takeover_scroll carries no location: it turns the real scroll wheel wherever the pointer already is, in the application target names, which must be frontmost. It is the one takeover action that needs only the conversation's takeover grant and no app grant. Required for: takeover_scroll.",
+        "maximum": 100,
+        "minimum": -100,
+        "type": "integer"
+      },
+      "app": {
+        "description": "App id of the app whose elements the predicate names, such as com.apple.calculator on macOS. Required for: wait.",
+        "minLength": 1,
+        "type": "string"
+      },
+      "axis": {
+        "description": "Scroll direction for takeover_scroll. Required for: takeover_scroll.",
+        "enum": [
+          "vertical",
+          "horizontal"
+        ],
+        "type": "string"
+      },
+      "bring_to_front": {
+        "default": false,
+        "description": "With include_image, front then restore under held mouse/keyboard takeover. Never prompts; else image_needs_takeover.",
+        "type": "boolean"
+      },
+      "element_id": {
+        "description": "An element_id from a read_state tree or action report. For press_element, provide exactly one of element_id or element_ids. Required for: write_text.",
+        "minLength": 1,
+        "type": "string"
+      },
+      "element_ids": {
+        "description": "Alternative to element_id for press_element: 1-8 same-app IDs in order. Stops at first failure; returns steps and one combined report.",
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "maxItems": 8,
+        "minItems": 1,
+        "type": "array"
+      },
+      "from": {
+        "additionalProperties": false,
+        "description": "A point in the pixel space of the image named by image_id, top-left origin. Required for: takeover_drag.",
+        "properties": {
+          "x": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "y": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "type": "object"
+      },
+      "image_id": {
+        "description": "The image_id of an image a read_state call on this application returned. Required for: press_point, takeover_move, takeover_drag.",
+        "minLength": 1,
+        "type": "string"
+      },
+      "include_image": {
+        "description": "Also return one image of the frontmost window. Defaults to false.",
+        "type": "boolean"
+      },
+      "keys": {
+        "description": "Key names for one chord. On macOS the modifiers are command, shift, option and control, for example [\"command\", \"s\"]. Session-ending chords are refused. Required for: keys.",
+        "items": {
+          "type": "string"
+        },
+        "maxItems": 8,
+        "type": "array"
+      },
+      "predicate": {
+        "description": "Condition to poll for before returning. The reply says predicate_satisfied when it held, timeout when it was checked and never held, or indeterminate when the target could not be read at all, which is not evidence that the condition is false. Required for: wait.",
+        "type": "string"
+      },
+      "role_filter": {
+        "description": "Keep returned state roles (button; AXButton on macOS). Filters action readback, not dispatch.",
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "maxItems": 16,
+        "minItems": 1,
+        "type": "array"
+      },
+      "target": {
+        "description": "The app to act in, by name (Calculator) or app id (com.apple.calculator on macOS). On element actions it is optional and only checked against the element's app. Required for: read_state, type, keys, takeover_scroll, open_app.",
+        "type": "string"
+      },
+      "text": {
+        "description": "Text to enter; a secure text field is refused. Required for: write_text, type.",
+        "maxLength": 4096,
+        "type": "string"
+      },
+      "text_filter": {
+        "description": "Keep label/value matches beneath labelled ancestors, including action readback.",
+        "type": "string"
+      },
+      "timeout_ms": {
+        "description": "Maximum wait in milliseconds. Required for: wait.",
+        "maximum": 30000,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "to": {
+        "additionalProperties": false,
+        "description": "A point in the pixel space of the image named by image_id, top-left origin. Required for: takeover_move, takeover_drag.",
+        "properties": {
+          "x": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "y": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "type": "object"
+      },
+      "url": {
+        "description": "Optional page address opened with the target app without activation. Only schemes in that bundle's CFBundleURLTypes are allowed; file, http and https are refused by name.",
+        "minLength": 1,
+        "type": "string"
+      },
+      "write_mode": {
+        "description": "replace_value replaces the element's whole value; insert_at_caret replaces the current selection, which is the caret when nothing is selected. Required for: write_text.",
+        "enum": [
+          "replace_value",
+          "insert_at_caret"
+        ],
+        "type": "string"
+      },
+      "x": {
+        "description": "Horizontal pixel in the named image. Required for: press_point.",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "y": {
+        "description": "Vertical pixel in the named image. Required for: press_point.",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "zoom": {
+        "description": "Expand this element's subtree or (macOS) menubar, including action readback. Closed menus otherwise show titles and child counts.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "action"
+    ],
+    "type": "object"
+  },
+  "samples": [
+    {
+      "input": {
+        "action": "read_state",
+        "target": "Notes"
+      }
+    },
+    {
+      "input": {
+        "action": "read_state",
+        "target": "Notes"
+      },
+      "record": {
+        "durationMs": 1200,
+        "heldMs": 500,
+        "outcome": "success",
+        "postsReturned": 0,
+        "queuedMs": 12,
+        "site": "https://example.com:8443"
+      }
+    },
+    {
+      "input": {
+        "action": "read_state",
+        "target": "Notes"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "held",
+        "reason": "consent"
+      }
+    },
+    {
+      "input": {
+        "action": "read_state",
+        "target": "Notes"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "held",
+        "reason": "login_handoff"
+      }
+    },
+    {
+      "input": {
+        "action": "read_state",
+        "target": "Notes"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "screen_locked"
+      }
+    },
+    {
+      "input": {
+        "action": "read_state",
+        "target": "Notes"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "partial",
+        "reason": "outcome_unknown"
+      }
+    },
+    {
+      "completion": {
+        "durationMs": 1500,
+        "outcome": "success"
+      },
+      "input": {
+        "action": "read_state",
+        "target": "Notes"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "held",
+        "reason": "consent"
+      }
+    },
+    {
+      "completion": {
+        "outcome": "error",
+        "reason": "consent_declined"
+      },
+      "input": {
+        "action": "read_state",
+        "target": "Notes"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "held",
+        "reason": "consent"
+      }
+    },
+    {
+      "input": {
+        "action": "read_state",
+        "target": "Notes"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "element_disabled"
+      }
+    },
+    {
+      "input": {
+        "action": "read_state",
+        "target": "Notes"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "point_in_another_window"
+      }
+    },
+    {
+      "input": {
+        "action": "read_state",
+        "target": "Notes"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "consent_expired"
+      }
+    },
+    {
+      "input": {
+        "action": "read_state",
+        "target": "Notes"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "state_changed_by_person"
+      }
+    },
+    {
+      "input": {
+        "action": "read_state",
+        "target": "Notes"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "operator_app_blocked"
+      }
+    },
+    {
+      "input": {
+        "action": "read_state",
+        "target": "Notes"
+      },
+      "record": {
+        "durationMs": 20,
+        "outcome": "error",
+        "reason": "some_future_reason"
+      }
+    },
+    {
+      "input": {
+        "action": "write_text",
+        "target": "Notes",
+        "text": "Text kept only on the page"
+      },
+      "record": {
+        "durationMs": 10,
+        "outcome": "success"
+      }
+    },
+    {
+      "input": {
+        "action": "wait",
+        "app": "Notes"
+      },
+      "record": {
+        "durationMs": 10,
+        "outcome": "success"
+      }
+    }
+  ],
+  "view": {
+    "reads": [],
+    "record_schema": {
+      "fields": {
+        "action": "code",
+        "app": "app_id",
+        "plane": "code",
+        "postsReturned": "integer",
+        "site": "web_origin"
+      },
+      "name": "cerebellum_call",
+      "revision": 1
+    },
+    "template": {
+      "page": {
+        "catalog": {
+          "digest": "sha256:de7c9df7a365bf816006c95a6be25ab1df6c725aaa90942ebed2e0a923d18ee6",
+          "version": "1.1"
+        },
+        "executionDialect": "1.0",
+        "profile": "tool_page",
+        "reads": [],
+        "schema": "occipital.template/1",
+        "source": "export const action = input.action == \"read_state\" ? \"Read app\" : input.action == \"press_element\" || input.action == \"press_point\" ? \"Press\" : input.action == \"write_text\" || input.action == \"type\" ? \"Type\" : input.action == \"keys\" ? \"Press keys\" : input.action == \"takeover_move\" ? \"Move pointer\" : input.action == \"takeover_drag\" ? \"Drag\" : input.action == \"takeover_scroll\" ? \"Scroll\" : input.action == \"wait\" ? \"Wait\" : input.action == \"list_apps\" ? \"List apps\" : \"Open app\"\nexport const outcome = view.completion.outcome ?? view.record.outcome\nexport const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason\nexport const reasonText = reason == \"screen_locked\" ? \"Screen locked\" : reason == \"element_disabled\" ? \"Button disabled\" : reason == \"point_in_another_window\" ? \"Point in another window\" : reason == \"consent_declined\" ? \"Declined\" : reason == \"consent_expired\" ? \"Approval expired\" : reason == \"state_changed_by_person\" ? \"You were using the app\" : reason == \"operator_app_blocked\" ? \"App not allowed\" : reason == \"consent\" ? \"Waiting for approval\" : reason == \"login_handoff\" ? \"Waiting for sign-in\" : Replace(reason ?? \"\", \"_\", \" \")\nexport const status = outcome == \"held\" ? (reason == \"login_handoff\" ? \"Waiting for sign-in\" : \"Waiting for approval\") : outcome == \"error\" ? \"Refused\" : outcome == \"partial\" ? \"Outcome unknown\" : outcome == \"success\" ? \"Done\" : view.call.phase == \"running\" ? \"Running\" : \"No outcome kept\"\nexport const duration = view.completion.durationMs ?? view.record.durationMs\nexport const queued = view.completion.queuedMs ?? view.record.queuedMs ?? 0\nexport const held = view.completion.heldMs ?? view.record.heldMs ?? 0\nexport const posts = view.completion.postsReturned ?? view.record.postsReturned\n\n<CardHeader title={action} subtitle={input.target ?? input.app ?? \"\"} />\n<Card appearance=\"clear\" gap=\"xs\">\n<TextContent text={\"Outcome: \" + status} size=\"small\" />\n{reason == null ? null : <TextContent text={\"Reason: \" + reasonText} size=\"small\" />}\n{duration == null ? (view.call.phase == \"running\" ? <Elapsed start={view.call.startedAtMs ?? now} /> : null) : <TextContent text={\"Duration: \" + FormatDuration(duration)} size=\"small\" />}\n{queued > 0 ? <TextContent text={\"Queued: \" + FormatDuration(queued)} size=\"small\" /> : null}\n{held > 0 ? <TextContent text={\"Held: \" + FormatDuration(held)} size=\"small\" /> : null}\n{posts == null ? null : <TextContent text={\"Posts returned: \" + Text(posts)} size=\"small\" />}\n</Card>\n\n{input.action == \"type\" || input.action == \"write_text\" ? <CardHeader title=\"Typed text\" /> : null}\n{input.action == \"type\" || input.action == \"write_text\" ? <CodeBlock codeString={input.text ?? \"\"} /> : null}\n\n<TextContent text={view.output ?? \"No output was kept.\"} />\n"
+      },
+      "row": {
+        "catalog": {
+          "digest": "sha256:de7c9df7a365bf816006c95a6be25ab1df6c725aaa90942ebed2e0a923d18ee6",
+          "version": "1.1"
+        },
+        "executionDialect": "1.0",
+        "profile": "tool_row",
+        "reads": [],
+        "schema": "occipital.template/1",
+        "source": "export const action = input.action == \"read_state\" ? \"Read app\" : input.action == \"press_element\" || input.action == \"press_point\" ? \"Press\" : input.action == \"write_text\" || input.action == \"type\" ? \"Type\" : input.action == \"keys\" ? \"Press keys\" : input.action == \"takeover_move\" ? \"Move pointer\" : input.action == \"takeover_drag\" ? \"Drag\" : input.action == \"takeover_scroll\" ? \"Scroll\" : input.action == \"wait\" ? \"Wait\" : input.action == \"list_apps\" ? \"List apps\" : \"Open app\"\nexport const outcome = view.completion.outcome ?? view.record.outcome\nexport const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason\n\n<Card appearance=\"clear\" direction=\"row\" gap=\"s\" align=\"center\">\n<TextContent text={action} maxLines={1} />\n<TextContent text={input.target ?? input.app ?? \"\"} size=\"small\" maxLines={1} />\n<Slot width=\"short\">\n{outcome == \"held\" ? <Badge text={reason == \"login_handoff\" ? \"Waiting for sign-in\" : \"Waiting for approval\"} tone=\"neutral\" /> : outcome == \"error\" ? <Badge text=\"Refused\" tone=\"danger\" /> : outcome == \"partial\" ? <Badge text=\"Outcome unknown\" tone=\"warning\" /> : outcome == \"success\" ? <Badge text=\"Done\" tone=\"neutral\" /> : null}\n</Slot>\n<Slot width=\"short\">\n{outcome == null && view.call.phase == \"running\" ? <Elapsed start={view.call.startedAtMs ?? now} /> : view.completion.durationMs == null && view.record.durationMs == null ? null : <TextContent text={FormatDuration(view.completion.durationMs ?? view.record.durationMs ?? 0)} size=\"small\" maxLines={1} />}\n</Slot>\n</Card>\n"
+      }
+    },
+    "template_revision": 1
+  }
+}

@@ -1,0 +1,24 @@
+export const action = input.action == "read_state" ? "Read app" : input.action == "press_element" || input.action == "press_point" ? "Press" : input.action == "write_text" || input.action == "type" ? "Type" : input.action == "keys" ? "Press keys" : input.action == "takeover_move" ? "Move pointer" : input.action == "takeover_drag" ? "Drag" : input.action == "takeover_scroll" ? "Scroll" : input.action == "wait" ? "Wait" : input.action == "list_apps" ? "List apps" : "Open app"
+export const outcome = view.completion.outcome ?? view.record.outcome
+export const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason
+export const reasonText = reason == "screen_locked" ? "Screen locked" : reason == "element_disabled" ? "Button disabled" : reason == "point_in_another_window" ? "Point in another window" : reason == "consent_declined" ? "Declined" : reason == "consent_expired" ? "Approval expired" : reason == "state_changed_by_person" ? "You were using the app" : reason == "operator_app_blocked" ? "App not allowed" : reason == "consent" ? "Waiting for approval" : reason == "login_handoff" ? "Waiting for sign-in" : Replace(reason ?? "", "_", " ")
+export const status = outcome == "held" ? (reason == "login_handoff" ? "Waiting for sign-in" : "Waiting for approval") : outcome == "error" ? "Refused" : outcome == "partial" ? "Outcome unknown" : outcome == "success" ? "Done" : view.call.phase == "running" ? "Running" : "No outcome kept"
+export const duration = view.completion.durationMs ?? view.record.durationMs
+export const queued = view.completion.queuedMs ?? view.record.queuedMs ?? 0
+export const held = view.completion.heldMs ?? view.record.heldMs ?? 0
+export const posts = view.completion.postsReturned ?? view.record.postsReturned
+
+<CardHeader title={action} subtitle={input.target ?? input.app ?? ""} />
+<Card appearance="clear" gap="xs">
+<TextContent text={"Outcome: " + status} size="small" />
+{reason == null ? null : <TextContent text={"Reason: " + reasonText} size="small" />}
+{duration == null ? (view.call.phase == "running" ? <Elapsed start={view.call.startedAtMs ?? now} /> : null) : <TextContent text={"Duration: " + FormatDuration(duration)} size="small" />}
+{queued > 0 ? <TextContent text={"Queued: " + FormatDuration(queued)} size="small" /> : null}
+{held > 0 ? <TextContent text={"Held: " + FormatDuration(held)} size="small" /> : null}
+{posts == null ? null : <TextContent text={"Posts returned: " + Text(posts)} size="small" />}
+</Card>
+
+{input.action == "type" || input.action == "write_text" ? <CardHeader title="Typed text" /> : null}
+{input.action == "type" || input.action == "write_text" ? <CodeBlock codeString={input.text ?? ""} /> : null}
+
+<TextContent text={view.output ?? "No output was kept."} />
