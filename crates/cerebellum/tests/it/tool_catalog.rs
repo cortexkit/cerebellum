@@ -130,6 +130,116 @@ async fn catalog(planes: &Planes, arguments: Value) -> Frame {
 }
 
 #[tokio::test]
+async fn worker_provider_operations_bypass_unsynced_head() {
+    use cortexkit_role_tool_provider::{describe::RoleDescribe, ops, PROVIDES};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use subc_protocol::scope::{ScopeKind, ScopeParent, ScopeStamp};
+
+    let planes = planes(true);
+    let (tx, mut rx) = mpsc::channel::<Frame>(8);
+    assert!(planes.scopes.control.connect(&tx));
+    let descriptions = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&descriptions);
+    let responder_planes = planes.clone();
+    let responder = tokio::spawn(async move {
+        let _connection = tx;
+        while let Some(frame) = rx.recv().await {
+            let request: Value = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(frame.header.channel, 0);
+            assert_eq!(
+                request,
+                json!({"op":"scope.describe", "owner":{"kind":"reserved","module_id":"prefrontal-core"}, "ref":"sc_head_alf"})
+            );
+            observed.fetch_add(1, Ordering::SeqCst);
+            let reply = Frame::build(
+                FrameType::Response,
+                Flags::new(false, Priority::Passive, false),
+                0,
+                0,
+                frame.header.corr,
+                serde_json::to_vec(&json!({
+                    "op":"scope.describe", "status":"live", "scope_epoch":7,
+                    "daemon_incarnation":"daemon-test", "owner_synced":false, "owner_configured":true,
+                    "scope":{"owner":request["owner"], "owner_authorized":true,
+                        "ref":"sc_head_alf", "scope_epoch":7, "kind":"head", "attributes":{"agent_id":"catalog-test"}}
+                })).unwrap(),
+            ).unwrap();
+            let (writer, _replies) = mpsc::channel(8);
+            cerebellum::handle_frame_for_test(reply, &writer, &responder_planes)
+                .await
+                .unwrap();
+        }
+    });
+    let owner = Principal::Reserved {
+        module_id: "prefrontal-core".into(),
+    };
+    let mut worker = ScopeStamp::new(owner.clone(), "sc_worker_catalog", 3, ScopeKind::Worker)
+        .with_owner_authorized(true);
+    worker.parent = Some(ScopeParent::new(owner, "sc_head_alf", 7));
+    bind_with_scope(&planes, 9, "prefrontal-core", Some(worker)).await;
+
+    // An unsynced owner must still prevent a tool call from using its head's grants.
+    let browser = exchange(
+        &planes,
+        9,
+        json!({"name":"browser_use", "arguments":{"action":"status"}}),
+    )
+    .await;
+    assert_eq!(browser.header.ty, FrameType::Response);
+    assert_eq!(body(&browser)["outcome"], "consent_unavailable");
+    assert_eq!(body(&browser)["reason"], "worker_head_unavailable");
+    assert_eq!(body(&browser)["detail"]["retryable"], true);
+    assert_eq!(descriptions.load(Ordering::SeqCst), 1);
+
+    let description = exchange(&planes, 9, json!({"name":"role.describe", "arguments":{}})).await;
+    assert_eq!(description.header.ty, FrameType::Response);
+    let description: RoleDescribe = serde_json::from_slice(&description.body).unwrap();
+    let major = description.major(PROVIDES).expect("tool-provider major");
+    assert!(major.serves(ops::ROLE_DESCRIBE));
+    assert!(major.serves(ops::TOOL_CATALOG));
+
+    let catalog = catalog(&planes, json!({})).await;
+    assert_eq!(catalog.header.ty, FrameType::Response);
+    let catalog: CatalogAnswer = serde_json::from_slice(&catalog.body).unwrap();
+    assert!(catalog.tools.iter().any(|tool| tool.name == "browser_use"));
+
+    let withdrawal = exchange(
+        &planes,
+        9,
+        json!({"name":"tool.withdraw", "arguments":{"call_key":"unknown-worker-call", "carrier":"reserved:prefrontal-core"}}),
+    )
+    .await;
+    assert_eq!(
+        withdrawal.header.ty,
+        FrameType::Response,
+        "{}",
+        body(&withdrawal)
+    );
+    assert_eq!(body(&withdrawal), json!({"answer":"unknown_call"}));
+
+    // Refused provider requests must be ERRORs, not success-shaped tool refusals.
+    for name in [
+        ops::ROLE_DESCRIBE,
+        ops::TOOL_CATALOG,
+        ops::TOOL_VIEWS,
+        ops::LATE_RESULTS,
+        ops::LATE_RESULTS_ACK,
+        ops::TOOL_WITHDRAW,
+    ] {
+        let refusal = exchange(&planes, 9, json!({"name":name, "arguments":[]})).await;
+        assert_eq!(
+            refusal.header.ty,
+            FrameType::Error,
+            "{name}: {}",
+            body(&refusal)
+        );
+        assert_eq!(body(&refusal)["code"], "invalid_request", "{name}");
+    }
+    assert_eq!(descriptions.load(Ordering::SeqCst), 1);
+    responder.abort();
+}
+
+#[tokio::test]
 async fn tool_views_are_advertised_and_match_catalog_pins() {
     use cortexkit_role_tool_provider::{
         describe::RoleDescribe,
