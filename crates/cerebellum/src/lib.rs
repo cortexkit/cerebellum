@@ -4189,11 +4189,14 @@ async fn handle_route_request(
         .await;
     }
 
+    let mut provider_operation = false;
     // Draining can apply a permission, so reject an unsupported tool mode before
     // reading or settling any consent answers for that call.
     if facts.surface == RouteSurface::Tools {
         if let Ok(request) = serde_json::from_slice::<Value>(&frame.body) {
             if let Some(name) = request.get("name").and_then(Value::as_str) {
+                provider_operation = tool_provider::is_operation(name)
+                    || name == journal::call_records::WITHDRAW_OPERATION;
                 // A run (admitted head) acts in the person's Chrome as its head
                 // does. A codemode route with no admitted head has no head to
                 // act as, so it still cannot.
@@ -4215,7 +4218,10 @@ async fn handle_route_request(
             }
         }
     }
-    let worker = if facts.admits_session_calls() {
+    // Provider operations do not read or mint grants. Resolving their head
+    // would make role discovery depend on consent authority and could return a
+    // tool-call refusal where the caller expects a provider-operation answer.
+    let worker = if facts.admits_session_calls() && !provider_operation {
         match permission_scope::resolve_worker(&facts, &planes.scopes).await {
             Ok(worker) => worker,
             Err(refusal) => {
