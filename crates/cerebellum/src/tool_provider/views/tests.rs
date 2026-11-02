@@ -1,5 +1,9 @@
 use super::*;
 
+// `views.rs` imports the type only where it serves a stored definition; the
+// tests also build one when they regenerate a new pin's check document.
+use cortexkit_role_tool_provider::views::ViewTool;
+
 fn current_definitions() -> Vec<CatalogTool> {
     let browser = browser_tools()
         .into_iter()
@@ -25,7 +29,7 @@ fn published_pins_schemas_and_reads_are_kept_byte_for_byte() {
     // its digest, and adds another table for newly published pins.
     assert_eq!(
         manifest::sha256_hex(PUBLISHED.as_bytes()),
-        "610accc6a37aa873edf9edf5fb8996481aa89a8cf875d813ab63b818ac88c00f"
+        "24c1c1a38f0cdf5dfcddc6346d2cd544d60bfa7df311f53f42fede9bafdbb7e0"
     );
     let kept: BTreeMap<String, Value> = serde_json::from_str(PUBLISHED).unwrap();
     let served = published();
@@ -42,6 +46,117 @@ fn published_pins_schemas_and_reads_are_kept_byte_for_byte() {
     }
     for tool in current_definitions() {
         assert_eq!(served[&pin(&tool)].record_schema, tool_display::schema());
+    }
+}
+
+#[test]
+fn every_published_pin_recomputes_from_its_stored_tool() {
+    // The display server rebuilds a pin from the view's `tool`, so a stored
+    // definition that no longer hashes to its key would turn a working row into
+    // an unknown view.
+    let kept: BTreeMap<String, Value> = serde_json::from_str(PUBLISHED).unwrap();
+    for (pin, entry) in &kept {
+        let tool: ViewTool = serde_json::from_value(entry["tool"].clone()).unwrap();
+        assert_eq!(tool.name, SchemaPin::parse(pin).unwrap().tool, "{pin}");
+        assert_eq!(
+            tool.semantics,
+            SchemaPin::parse(pin).unwrap().semantics,
+            "{pin}"
+        );
+        assert_eq!(
+            cortexkit_role_tool_provider::catalog::schema_digest(
+                &cortexkit_role_tool_provider::catalog::structural_schema(&tool.input_schema)
+            )
+            .unwrap(),
+            SchemaPin::parse(pin).unwrap().schema_digest,
+            "{pin}"
+        );
+        let view = published().remove(pin).unwrap();
+        assert!(view.check_pin(pin).unwrap(), "{pin}");
+    }
+    // Every current catalog definition is still one of the published pins.
+    for tool in current_definitions() {
+        assert!(kept.contains_key(&pin(&tool)));
+    }
+}
+
+#[test]
+fn a_pin_outside_the_current_catalog_is_still_served_with_its_tool() {
+    // A fixture table whose single pin no longer appears in the live catalog,
+    // the situation a browser_use or computer_use definition change creates.
+    let tool = ViewTool::new(
+        flat_tools::BROWSER_USE,
+        json!({"type":"object","properties":{"action":{"type":"string","enum":["retired_action"]}}}),
+        1,
+    );
+    let pin = tool.schema_pin().unwrap();
+    assert!(current_definitions()
+        .iter()
+        .all(|current| self::pin(current) != pin));
+    let table = json!({
+        pin.clone(): {
+            "record_schema": tool_display::schema(),
+            "reads": [],
+            "tool": tool,
+        }
+    });
+    let table: BTreeMap<String, Value> = serde_json::from_value(table).unwrap();
+    let (kept_pin, entry) = table.iter().next().unwrap();
+    let view = view(kept_pin, entry);
+    assert!(view.check_pin(&pin).unwrap());
+    assert_eq!(view.tool.as_ref().unwrap(), &tool);
+    let reply = ViewsReply::new(
+        [(pin.clone(), ViewEntry::Manifest(view))]
+            .into_iter()
+            .collect(),
+    );
+    let request = ViewsRequest::new(vec![pin.clone()]);
+    reply.validate_for(&request).unwrap();
+    let served: Value = serde_json::to_value(&reply).unwrap();
+    assert_eq!(
+        served["views"][&pin]["tool"]["name"],
+        flat_tools::BROWSER_USE
+    );
+    assert_eq!(
+        served["views"][&pin]["tool"]["input_schema"],
+        json!({"type":"object","properties":{"action":{"type":"string","enum":["retired_action"]}}})
+    );
+}
+
+#[test]
+fn provider_view_tool_vectors_agree_with_what_views_serve() {
+    // The provider crate's shared vectors state when a view's `tool` matches its
+    // pin, and what an encoded view's bytes are. Cerebellum serves the matching
+    // shape, so the same checks must hold for every published view.
+    let vectors: Value =
+        serde_json::from_str(cortexkit_role_tool_provider::vectors::VIEW_TOOLS_JSON).unwrap();
+    for case in vectors["cases"].as_array().unwrap() {
+        let view: ViewManifest = serde_json::from_value(case["view"].clone()).unwrap();
+        let pin = case["pin"].as_str().unwrap();
+        match case["check"].as_str().unwrap() {
+            "present" => {
+                assert!(view.check_pin(pin).unwrap(), "{}", case["name"]);
+                assert_eq!(view.tool.as_ref().unwrap().schema_pin().unwrap(), pin);
+            }
+            "mismatch" => {
+                assert!(view.check_pin(pin).is_err(), "{}", case["name"]);
+                let computed = view.tool.as_ref().unwrap().schema_pin().unwrap();
+                assert_eq!(computed, case["computed_pin"].as_str().unwrap());
+            }
+            "absent" => {
+                assert!(!view.check_pin(pin).unwrap(), "{}", case["name"]);
+                assert_eq!(
+                    serde_json::to_string(&view).unwrap(),
+                    case["encoded"].as_str().unwrap(),
+                    "a legacy view keeps its bytes"
+                );
+            }
+            other => panic!("unexpected check {other}"),
+        }
+    }
+    let served = published();
+    for (pin, entry) in &served {
+        assert!(entry.check_pin(pin).unwrap());
     }
 }
 
@@ -74,6 +189,20 @@ fn views_embed_exact_template_bytes_and_checked_inputs() {
         assert_eq!(view.template_revision, TEMPLATE_REVISION);
         let check: Value = serde_json::from_str(check).unwrap();
         assert_eq!(check["input_schema"], tool.input_schema);
+        // The published view carries the shipped definition behind its pin,
+        // stored rather than rebuilt. A pin covers the schema's structure, so
+        // the stored copy is the shipped schema with description text removed.
+        let kept = view.tool.as_ref().expect("published view carries its tool");
+        assert_eq!(kept.name, tool.name);
+        assert_eq!(kept.semantics, tool.semantics);
+        assert_eq!(
+            cortexkit_role_tool_provider::catalog::structural_schema(&check["input_schema"]),
+            kept.input_schema
+        );
+        assert_eq!(
+            cortexkit_role_tool_provider::catalog::schema_digest(&check["input_schema"]).unwrap(),
+            tool.schema_digest
+        );
         assert_eq!(check["view"], serde_json::to_value(view).unwrap());
         assert!(!row.contains("input.text"));
         assert!(!row.contains("input.secret"));
@@ -106,7 +235,10 @@ fn row_badges_fit_short_slots_at_phone_width() {
             .collect::<Vec<_>>();
         for label in &labels {
             let width = label.chars().count() * 8 + 2 * 6;
-            assert!(width <= slot_width, "{label:?} needs {width} units, beyond the {slot_width}-unit short Slot at width 320");
+            assert!(
+                width <= slot_width,
+                "{label:?} needs {width} units, beyond the {slot_width}-unit short Slot at width 320"
+            );
         }
         labels.sort_unstable();
         assert_eq!(
@@ -153,7 +285,10 @@ fn views_validate_requests_and_answer_only_requested_pins() {
 
 /// Regenerate the occipital-check view documents and sample calls from the
 /// same definitions the catalog uses.
-/// Published schemas and reads are deliberately not regenerated here.
+/// Published schemas, reads and stored tool definitions are deliberately not
+/// regenerated here: each pin is served from what was published, never from
+/// today's code. This generator only reprints a new entry's definition: its
+/// pinned schema is the structural form, which a tp1 pin hashes.
 #[test]
 #[ignore = "explicit fixture generator"]
 fn export_checker_inputs() {
@@ -174,7 +309,12 @@ fn export_checker_inputs() {
             vec![],
             json!({"row":template("tool_row",row),"page":template("tool_page",page)}),
         )
-        .with_template_revision(TEMPLATE_REVISION);
+        .with_template_revision(TEMPLATE_REVISION)
+        .with_tool(ViewTool::new(
+            &tool.name,
+            cortexkit_role_tool_provider::catalog::structural_schema(&tool.input_schema),
+            tool.semantics,
+        ));
         let input = if name == "browser" {
             json!({"action":"snapshot","url":"https://example.com/start"})
         } else {
@@ -247,8 +387,16 @@ fn export_checker_inputs() {
         println!(
             "{} {}",
             pin(&tool),
-            serde_json::to_string(&json!({"record_schema":tool_display::schema(),"reads":[]}))
-                .unwrap()
+            serde_json::to_string(&json!({
+                "record_schema": tool_display::schema(),
+                "reads": [],
+                "tool": ViewTool::new(
+                    &tool.name,
+                    cortexkit_role_tool_provider::catalog::structural_schema(&tool.input_schema),
+                    tool.semantics,
+                ),
+            }))
+            .unwrap()
         );
     }
 }

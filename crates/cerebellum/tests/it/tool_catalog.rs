@@ -180,6 +180,24 @@ async fn tool_views_are_advertised_and_match_catalog_pins() {
         assert!(view.reads.is_empty());
         assert_eq!(view.template["row"]["profile"], "tool_row");
         assert_eq!(view.template["page"]["profile"], "tool_page");
+        // The view carries the definition behind its pin, so the display server
+        // can recompute the pin and read the schema even once the tool changes.
+        let kept = view
+            .tool
+            .as_ref()
+            .unwrap_or_else(|| panic!("catalog pin view carries no tool: {pin}"));
+        assert_eq!(kept.name, tool.name);
+        assert_eq!(kept.semantics, tool.semantics);
+        assert_eq!(kept.schema_pin().unwrap(), pin);
+        // A pin hashes the structural form of the argument schema, so the
+        // served definition carries that form of the catalog's schema.
+        assert_eq!(
+            serde_json::to_vec(&cortexkit_role_tool_provider::catalog::structural_schema(
+                &tool.input_schema
+            ))
+            .unwrap(),
+            serde_json::to_vec(&kept.input_schema).unwrap()
+        );
     }
     assert!(matches!(reply.views["unpublished"], ViewEntry::Unknown));
 }
