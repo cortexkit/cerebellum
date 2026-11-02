@@ -204,6 +204,8 @@ pub enum InputEventConstructionError {
     ScrollUnavailable,
     MouseMoveUnavailable,
     HeartbeatMarkerUnavailable,
+    ClickPressUnavailable,
+    ClickReleaseUnavailable,
     DragPressUnavailable,
     DragMoveUnavailable,
     DragReleaseUnavailable,
@@ -235,6 +237,12 @@ impl fmt::Display for InputEventConstructionError {
             }
             Self::HeartbeatMarkerUnavailable => {
                 write!(f, "CoreGraphics could not create the observer heartbeat marker")
+            }
+            Self::ClickPressUnavailable => {
+                write!(f, "CoreGraphics could not create the click press event")
+            }
+            Self::ClickReleaseUnavailable => {
+                write!(f, "CoreGraphics could not create the click release event")
             }
             Self::DragPressUnavailable => {
                 write!(f, "CoreGraphics could not create the drag press event")
@@ -552,6 +560,32 @@ mod framework {
         Ok(event)
     }
 
+    /// Build a left-button click without a dragged event or any posting.
+    pub fn mouse_click_events(
+        point: EventPoint,
+    ) -> Result<[OwnedCgEvent; 2], InputEventConstructionError> {
+        let source = event_source()?;
+        let press = CGEvent::new_mouse_event(
+            Some(&source),
+            CGEventType::LeftMouseDown,
+            CGPoint::new(point.x, point.y),
+            CGMouseButton::Left,
+        )
+        .ok_or(InputEventConstructionError::ClickPressUnavailable)?;
+        let release = CGEvent::new_mouse_event(
+            Some(&source),
+            CGEventType::LeftMouseUp,
+            CGPoint::new(point.x, point.y),
+            CGMouseButton::Left,
+        )
+        .ok_or(InputEventConstructionError::ClickReleaseUnavailable)?;
+        for event in [&press, &release] {
+            CGEvent::set_flags(Some(event), CGEventFlags::empty());
+            CGEvent::set_integer_value_field(Some(event), CGEventField::MouseEventClickState, 1);
+        }
+        Ok([press, release])
+    }
+
     /// Build left-button press, drag, and release events without posting them.
     pub fn mouse_drag_events(
         from: EventPoint,
@@ -589,9 +623,9 @@ mod framework {
 #[cfg(target_os = "macos")]
 pub use framework::{
     event_post_access, heartbeat_marker_event, horizontal_scroll_wheel_event,
-    input_monitoring_access, key_combination_events, mouse_drag_events, mouse_move_event,
-    mouse_move_event_from_private_source, scroll_wheel_event, seconds_since_last_deliberate_input,
-    seconds_since_last_input, text_input_events,
+    input_monitoring_access, key_combination_events, mouse_click_events, mouse_drag_events,
+    mouse_move_event, mouse_move_event_from_private_source, scroll_wheel_event,
+    seconds_since_last_deliberate_input, seconds_since_last_input, text_input_events,
 };
 
 #[cfg(test)]
@@ -645,8 +679,8 @@ mod framework_tests {
     use objc2_core_graphics::{CGEvent, CGEventField, CGEventFlags, CGEventType};
 
     use super::{
-        key_combination_events, mouse_drag_events, mouse_move_event, scroll_wheel_event,
-        text_input_events, EventPoint, KeyModifiers, ScrollUnit, VirtualKey,
+        key_combination_events, mouse_click_events, mouse_drag_events, mouse_move_event,
+        scroll_wheel_event, text_input_events, EventPoint, KeyModifiers, ScrollUnit, VirtualKey,
     };
 
     fn unicode_string(event: &CGEvent) -> String {
@@ -822,6 +856,26 @@ mod framework_tests {
         assert_point(&events[2], to);
         for event in &events {
             assert_eq!(CGEvent::flags(Some(event)), CGEventFlags::empty());
+        }
+    }
+
+    #[test]
+    fn click_carries_only_down_up_at_one_point_with_click_count_one() {
+        let point = EventPoint { x: 10.0, y: 20.0 };
+        let events = mouse_click_events(point).expect("construct click events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            CGEvent::r#type(Some(&events[0])),
+            CGEventType::LeftMouseDown
+        );
+        assert_eq!(CGEvent::r#type(Some(&events[1])), CGEventType::LeftMouseUp);
+        for event in &events {
+            assert_point(event, point);
+            assert_eq!(CGEvent::flags(Some(event)), CGEventFlags::empty());
+            assert_eq!(
+                CGEvent::integer_value_field(Some(event), CGEventField::MouseEventClickState),
+                1
+            );
         }
     }
 }

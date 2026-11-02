@@ -369,6 +369,7 @@ enum Served {
     Type,
     Keys,
     TakeoverMove,
+    TakeoverClick,
     TakeoverDrag,
     TakeoverScroll,
     Wait,
@@ -377,8 +378,8 @@ enum Served {
 }
 
 /// Whether an action can bring its application to the front, so its replies
-/// carry `fronting`. `wait`, `list_apps` and the takeover pointer actions
-/// never front.
+/// carry app-use `fronting`. Pointer actions own their separately reviewed
+/// bracket and reply evidence; they must not run the app-use one-way front.
 fn can_front(served: Served) -> bool {
     match served {
         Served::ReadState
@@ -389,6 +390,7 @@ fn can_front(served: Served) -> bool {
         | Served::Keys
         | Served::OpenApp => true,
         Served::TakeoverMove
+        | Served::TakeoverClick
         | Served::TakeoverDrag
         | Served::TakeoverScroll
         | Served::Wait
@@ -406,6 +408,7 @@ impl Servable {
             Served::Type => ComputerCapability::Type,
             Served::Keys => ComputerCapability::Keys,
             Served::TakeoverMove => ComputerCapability::TakeoverMove,
+            Served::TakeoverClick => ComputerCapability::TakeoverClick,
             Served::TakeoverDrag => ComputerCapability::TakeoverDrag,
             Served::TakeoverScroll => ComputerCapability::TakeoverScroll,
             Served::Wait => ComputerCapability::Wait,
@@ -437,6 +440,7 @@ pub fn servable(name: &str) -> Option<Servable> {
         ComputerCapability::PressPoint => Served::PressPoint,
         ComputerCapability::WriteText => Served::WriteText,
         ComputerCapability::TakeoverMove => Served::TakeoverMove,
+        ComputerCapability::TakeoverClick => Served::TakeoverClick,
         ComputerCapability::TakeoverDrag => Served::TakeoverDrag,
         ComputerCapability::TakeoverScroll => Served::TakeoverScroll,
         ComputerCapability::OpenApp => Served::OpenApp,
@@ -576,6 +580,7 @@ where
     /// it such keystrokes are refused, and the refusal names only what the
     /// build can do instead.
     fronting_bracket_admitted: bool,
+    takeover_pointer_fronting_admitted: bool,
     /// Whether this build's release carries both the takeover review and the
     /// app-use review, which alone admit fronting outside the keystroke
     /// bracket: foreground mode's one-way front, fronting a disabled press or
@@ -703,6 +708,7 @@ where
             ),
             make_synthetic_driver,
             fronting_bracket_admitted: false,
+            takeover_pointer_fronting_admitted: false,
             app_use_fronting_admitted: false,
             fronting_lock: fronting::FrontingLock::process_wide(),
             own_input: Arc::new(OwnInputLedger::new()),
@@ -751,6 +757,12 @@ where
     /// that mechanism sets this; without it such keystrokes are refused.
     pub fn with_fronting_bracket_admitted(mut self, admitted: bool) -> Self {
         self.fronting_bracket_admitted = admitted;
+        self
+    }
+
+    /// Admit the separately reviewed temporary-front pointer path.
+    pub fn with_takeover_pointer_fronting_admitted(mut self, admitted: bool) -> Self {
+        self.takeover_pointer_fronting_admitted = admitted;
         self
     }
 
@@ -1155,27 +1167,35 @@ where
                                         .await,
                                     ),
                                     Served::TakeoverMove => {
-                                        self.serve_takeover(
+                                        Box::pin(self.serve_takeover(
                                             ComputerCapability::TakeoverMove,
                                             arguments,
                                             context,
-                                        )
+                                        ))
+                                        .await
+                                    }
+                                    Served::TakeoverClick => {
+                                        Box::pin(self.serve_takeover(
+                                            ComputerCapability::TakeoverClick,
+                                            arguments,
+                                            context,
+                                        ))
                                         .await
                                     }
                                     Served::TakeoverDrag => {
-                                        self.serve_takeover(
+                                        Box::pin(self.serve_takeover(
                                             ComputerCapability::TakeoverDrag,
                                             arguments,
                                             context,
-                                        )
+                                        ))
                                         .await
                                     }
                                     Served::TakeoverScroll => {
-                                        self.serve_takeover(
+                                        Box::pin(self.serve_takeover(
                                             ComputerCapability::TakeoverScroll,
                                             arguments,
                                             context,
-                                        )
+                                        ))
                                         .await
                                     }
                                 }
@@ -3588,6 +3608,7 @@ pub(crate) fn served_request_fields(
             ))
         }
         ComputerCapability::TakeoverMove
+        | ComputerCapability::TakeoverClick
         | ComputerCapability::TakeoverDrag
         | ComputerCapability::TakeoverScroll => {
             let fields = takeover::request_fields(capability)?;
@@ -3616,6 +3637,7 @@ pub(crate) fn parse_served_request(
         ComputerCapability::PressPoint => element_actions::parse_press_point(arguments).map(|_| ()),
         ComputerCapability::WriteText => element_actions::parse_write_text(arguments).map(|_| ()),
         ComputerCapability::TakeoverMove
+        | ComputerCapability::TakeoverClick
         | ComputerCapability::TakeoverDrag
         | ComputerCapability::TakeoverScroll => {
             takeover::parse_request(capability, arguments).map(|_| ())

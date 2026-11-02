@@ -59,7 +59,7 @@ pub(crate) const TAKEOVER_SCROLL_NOTE: &str = "takeover_scroll carries no locati
 /// A description the flat tool gives a field, where the vocabulary row's own
 /// is absent or written for the row rather than for a model choosing among
 /// actions. Descriptions change nothing a request is held to.
-fn describe_computer_field(name: &str, schema: &mut Value) {
+fn describe_computer_field(name: &str, schema: &mut Value, pointer_fronting: bool) {
     let description = match name {
         "target" => "The app to act in, by name (Calculator) or app id (com.apple.calculator on macOS). On element actions it is optional and only checked against the element's app.",
         "bring_to_front" => "With include_image, front then restore under held mouse/keyboard takeover. Never prompts; else image_needs_takeover.",
@@ -89,7 +89,7 @@ fn describe_computer_field(name: &str, schema: &mut Value) {
         "amount_lines" => {
             return set_description(
                 schema,
-                &format!("Lines to scroll. Vertical: positive scrolls up toward the top, negative scrolls down. {TAKEOVER_SCROLL_NOTE}"),
+                &format!("Lines to scroll. Vertical: positive scrolls up toward the top, negative scrolls down. {}", if pointer_fronting { TAKEOVER_SCROLL_NOTE.replace("which must be frontmost.", "fronted temporarily if needed.") } else { TAKEOVER_SCROLL_NOTE.to_owned() }),
             )
         }
         _ => return,
@@ -300,7 +300,29 @@ pub(crate) fn computer_action_requirements(admitted: &[String]) -> Vec<(String, 
         .collect()
 }
 
+/// The admitted takeover_click row and its pointer-fronting prose follow the
+/// same immutable admission list. Permission liveness never selects prompt text.
+pub(crate) fn pointer_fronting_definition(admitted: &[String]) -> bool {
+    admitted
+        .iter()
+        .any(|name| name == "computer.takeover_click")
+}
+
+fn computer_description(pointer_fronting: bool) -> String {
+    if !pointer_fronting {
+        return COMPUTER_DESCRIPTION.to_owned();
+    }
+    let mut description = COMPUTER_DESCRIPTION.to_owned();
+    for duplicated in [
+        " zoom with an id prints that subtree, zoom menubar (macOS) the menu bar; text_filter and role_filter print each match under its labelled ancestors.",
+        " Presses, writes, keys and type accept read filters for their returned state.",
+        " press_element takes element_id or 1-8 ordered same-app element_ids; stops on failure, returns steps and one report.",
+    ] { description = description.replace(duplicated, ""); }
+    description.replace("Covered images are withheld; see bring_to_front.", "Covered images are withheld; see bring_to_front. Under takeover, pointer actions front the target if needed, then restore unless the person switched apps. takeover_click left-clicks image x/y; press_point uses accessibility.")
+}
+
 pub fn computer_tool(admitted: &[String]) -> Option<Tool> {
+    let pointer_fronting = pointer_fronting_definition(admitted);
     let mut actions = Vec::new();
     let mut requirements = Vec::new();
     let mut properties = Map::new();
@@ -309,7 +331,7 @@ pub fn computer_tool(admitted: &[String]) -> Option<Tool> {
         requirements.push((action, required));
         for (name, original) in source {
             let mut schema = original;
-            describe_computer_field(&name, &mut schema);
+            describe_computer_field(&name, &mut schema, pointer_fronting);
             match properties.get_mut(&name) {
                 Some(existing) if existing != &schema => {
                     if existing.get("oneOf").is_none() {
@@ -345,7 +367,7 @@ pub fn computer_tool(admitted: &[String]) -> Option<Tool> {
     );
     Some(Tool {
         name: COMPUTER_USE.into(),
-        description: Some(COMPUTER_DESCRIPTION.into()),
+        description: Some(computer_description(pointer_fronting)),
         execution_mode: ExecutionMode::Unfenceable,
         // Flat: no root-level union. Which fields each action needs is in
         // the property descriptions (see `annotate_required_actions`).
@@ -930,6 +952,7 @@ mod tests {
                 "type",
                 "keys",
                 "takeover_move",
+                "takeover_click",
                 "takeover_drag",
                 "takeover_scroll",
                 "wait",
@@ -1028,7 +1051,7 @@ mod tests {
                 .map(String::as_str)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(requirements.len(), 12, "{requirements:?}");
+        assert_eq!(requirements.len(), 13, "{requirements:?}");
         for (action, required) in [
             ("read_state", vec!["target"]),
             ("press_element", vec![]),
@@ -1037,6 +1060,7 @@ mod tests {
             ("type", vec!["target", "text"]),
             ("keys", vec!["keys", "target"]),
             ("takeover_move", vec!["image_id", "to"]),
+            ("takeover_click", vec!["image_id", "x", "y"]),
             ("takeover_drag", vec!["image_id", "from", "to"]),
             ("takeover_scroll", vec!["target", "axis", "amount_lines"]),
             ("wait", vec!["app", "predicate", "timeout_ms"]),
@@ -1310,8 +1334,56 @@ mod tests {
     }
 
     #[test]
+    fn pointer_fronting_prose_and_parameters_follow_the_admitted_click() {
+        let names = computer_names();
+        let legacy_names: Vec<_> = names
+            .iter()
+            .filter(|name| name.as_str() != "computer.takeover_click")
+            .cloned()
+            .collect();
+        let legacy = computer_tool(&legacy_names).unwrap();
+        let bound = computer_tool(&names).unwrap();
+        assert_eq!(legacy.description.as_deref(), Some(COMPUTER_DESCRIPTION));
+        assert!(!pointer_fronting_definition(&legacy_names));
+        assert!(pointer_fronting_definition(&names));
+        assert!(bound
+            .description
+            .as_ref()
+            .unwrap()
+            .contains("takeover_click left-clicks image x/y; press_point uses accessibility."));
+        assert!(legacy.schema["properties"]["amount_lines"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("which must be frontmost."));
+        assert!(bound.schema["properties"]["amount_lines"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("fronted temporarily if needed."));
+        for field in ["image_id", "x", "y"] {
+            assert!(!required_actions_named(&legacy.schema, field).contains("takeover_click"));
+            assert!(required_actions_named(&bound.schema, field).contains("takeover_click"));
+        }
+    }
+
+    #[test]
     fn flat_schema_token_budget() {
         let computer = serde_json::to_vec(&computer_tool(&computer_names()).unwrap()).unwrap();
+        let legacy_names: Vec<_> = computer_names()
+            .into_iter()
+            .filter(|name| name != "computer.takeover_click")
+            .collect();
+        let legacy = serde_json::to_vec(&computer_tool(&legacy_names).unwrap()).unwrap();
+        println!(
+            "computer_use legacy={} bytes, pointer-fronting={} bytes",
+            legacy.len(),
+            computer.len()
+        );
+        assert_eq!(
+            legacy.len(),
+            6973,
+            "the unbound definition must remain byte-identical"
+        );
+        assert!(legacy.len() <= 7000);
         let browser_names = [
             "launch",
             "status",

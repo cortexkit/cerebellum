@@ -14,6 +14,7 @@ use subc_protocol::manifest::{ProviderRole, Tool};
 
 fn valid_inputs() -> ComputerReleaseInputs {
     ComputerReleaseInputs {
+        takeover_pointer_fronting_review_revision: None,
         attendance_contract_owner: Some("fixture-attendance-owner".into()),
         attendance_contract_revision: Some("fixture-attendance-contract-v1".into()),
         input_review_revision: Some("fixture-input-review-v1".into()),

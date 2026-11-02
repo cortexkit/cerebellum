@@ -41,7 +41,9 @@ pub(crate) enum HeldRoute {
     Global,
 }
 
-/// One action whose posts may have left a key or button held.
+/// One tracked send. Its route and action identify any paired releases; a
+/// bracketed global send also prevents terminal restoration until its worker
+/// has finished posting to the global stream.
 #[derive(Debug, Clone)]
 pub(crate) struct HeldPress {
     pub(crate) route: HeldRoute,
@@ -65,6 +67,17 @@ impl HeldPress {
 
     pub(crate) fn global(grant: &ProcessGrant, action: &SyntheticAction) -> Option<Self> {
         Self::new(HeldRoute::Global, grant, action)
+    }
+
+    /// Every bracketed global send needs a completion barrier, even a move
+    /// or scroll with no button down. Cleanup must not restore another app
+    /// while that worker could still post into the global stream.
+    pub(crate) fn global_send(grant: &ProcessGrant, action: &SyntheticAction) -> Self {
+        Self {
+            route: HeldRoute::Global,
+            grant: grant.clone(),
+            action: action.clone(),
+        }
     }
 
     fn new(route: HeldRoute, grant: &ProcessGrant, action: &SyntheticAction) -> Option<Self> {
@@ -105,7 +118,7 @@ struct State {
     quarantined: BTreeMap<u64, HeldPress>,
     /// Retained even for an unknown global result: only a confirmed discharge
     /// can make it safe to front another application.
-    fronting_exclusions: BTreeMap<u64, tokio::sync::OwnedMutexGuard<()>>,
+    fronting_exclusions: BTreeMap<u64, Arc<tokio::sync::OwnedMutexGuard<()>>>,
 }
 
 /// The held-input state of one plane's synthetic keyboard and mouse.
@@ -123,8 +136,8 @@ pub(crate) struct PendingRelease {
 impl HeldInput {
     /// Global input and application fronts share one exclusion. Take it before
     /// registration and keep it until the worker has released its input. An
-    /// unknown result retains the exclusion in quarantine. Takeover dispatch
-    /// never fronts, so it cannot recursively acquire this lock.
+    /// unknown result retains the exclusion in quarantine. A temporary-front
+    /// pointer dispatch instead adopts its already-held exclusion below.
     pub(crate) async fn begin_global_send(
         self: &Arc<Self>,
         press: HeldPress,
@@ -133,13 +146,25 @@ impl HeldInput {
         cancel: &crate::CancelHandle,
     ) -> Result<SendTicket, cerebellum_computer::dispatch::FrontingStop> {
         let exclusion = lock.take(cancel).await?;
+        Ok(self.begin_global_send_under_lock(press, terminal, Arc::new(exclusion)))
+    }
+
+    /// Share an already-held exclusion with the restore obligation. Before
+    /// registration, the caller must verify that no global send is in flight
+    /// and no earlier input remains unconfirmed.
+    pub(crate) fn begin_global_send_under_lock(
+        self: &Arc<Self>,
+        press: HeldPress,
+        terminal: Option<Arc<TerminalArbiter>>,
+        exclusion: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> SendTicket {
         let ticket = self.begin_send(press, terminal);
         self.state
             .lock()
             .unwrap()
             .fronting_exclusions
             .insert(ticket.id, exclusion);
-        Ok(ticket)
+        ticket
     }
 
     /// Track a send before it is posted. The ticket must be settled with how

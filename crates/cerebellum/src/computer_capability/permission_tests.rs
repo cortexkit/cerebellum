@@ -27,6 +27,7 @@ fn context(state: PermissionLiveness) -> CapabilityAdvertisementContext {
     let digest = Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string());
     CapabilityAdvertisementContext {
         inputs: ImmutableReleaseInputs {
+            takeover_pointer_fronting_review_revision: None,
             attendance_contract_owner: pin.clone(),
             attendance_contract_revision: pin.clone(),
             input_review_revision: pin.clone(),

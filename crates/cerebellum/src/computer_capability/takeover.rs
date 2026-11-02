@@ -1,4 +1,4 @@
-//! The takeover actions: moving, dragging and scrolling with the one real
+//! The takeover actions: clicking, moving, dragging and scrolling with the one real
 //! pointer the person at the machine also uses.
 //!
 //! Every one of them needs the conversation's takeover grant, because the
@@ -16,14 +16,14 @@
 //!   names and needs no app grant: it is the one takeover action that does
 //!   not.
 //!
-//! A move or drag also needs the app grant of the application under the
+//! A move, click or drag also needs the app grant of the application under the
 //! pointer. That grant is checked, never asked for: the question belongs to a
 //! call that names the application, and `read_state` on it asks.
 //!
-//! Nothing here brings an application forward. The containment target must
-//! already be frontmost, and the dispatch path checks its process generation
-//! and that it is still frontmost before every single post, stopping the
-//! sequence the moment either fails.
+//! The separately reviewed pointer-fronting path temporarily fronts the image's
+//! own application and checks exact-window containment before every post. Builds
+//! without that review retain frontmost-only move, drag and scroll, with no
+//! click action. Both paths check generation and focus at each post.
 
 use std::sync::Arc;
 
@@ -50,6 +50,7 @@ use crate::CancelHandle;
 
 /// Every field `computer.takeover_move` accepts; all are required.
 pub(crate) const MOVE_FIELDS: [&str; 2] = ["image_id", "to"];
+pub(crate) const CLICK_FIELDS: [&str; 3] = ["image_id", "x", "y"];
 /// Every field `computer.takeover_drag` accepts; all are required.
 pub(crate) const DRAG_FIELDS: [&str; 3] = ["image_id", "from", "to"];
 /// Every field `computer.takeover_scroll` accepts; all are required.
@@ -62,6 +63,7 @@ const MAX_SCROLL_LINES: i64 = 100;
 pub(crate) fn request_fields(capability: ComputerCapability) -> Option<&'static [&'static str]> {
     match capability {
         ComputerCapability::TakeoverMove => Some(&MOVE_FIELDS),
+        ComputerCapability::TakeoverClick => Some(&CLICK_FIELDS),
         ComputerCapability::TakeoverDrag => Some(&DRAG_FIELDS),
         ComputerCapability::TakeoverScroll => Some(&SCROLL_FIELDS),
         _ => None,
@@ -71,6 +73,10 @@ pub(crate) fn request_fields(capability: ComputerCapability) -> Option<&'static 
 /// A takeover request as parsed, before anything is resolved.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TakeoverRequest {
+    Click {
+        image_id: String,
+        point: (u64, u64),
+    },
     Move {
         image_id: String,
         to: (u64, u64),
@@ -141,6 +147,19 @@ pub(crate) fn parse_request(
         return Err(invalid(field, "unknown_field"));
     }
     match capability {
+        ComputerCapability::TakeoverClick => {
+            let coordinate = |field: &str| {
+                object
+                    .get(field)
+                    .ok_or_else(|| invalid(field, "missing_field"))?
+                    .as_u64()
+                    .ok_or_else(|| invalid(field, "wrong_type"))
+            };
+            Ok(TakeoverRequest::Click {
+                image_id: required_string(object, "image_id")?,
+                point: (coordinate("x")?, coordinate("y")?),
+            })
+        }
         ComputerCapability::TakeoverMove => Ok(TakeoverRequest::Move {
             image_id: required_string(object, "image_id")?,
             to: required_point(object, "to")?,
@@ -395,6 +414,11 @@ where
         arguments: &Value,
         context: super::ServeContext<'_, C>,
     ) -> Value {
+        if capability == ComputerCapability::TakeoverClick
+            && !self.takeover_pointer_fronting_admitted
+        {
+            return invalid("action", "unknown_value");
+        }
         let mut request = match parse_request(capability, arguments) {
             Ok(request) => request,
             Err(refusal) => return refusal,
@@ -488,6 +512,8 @@ where
                 grantee,
                 cancel,
                 clock,
+                management,
+                &request,
             )
             .await;
         admission.decorate(&mut reply);
@@ -506,13 +532,56 @@ where
             return refusal;
         }
         let claimed = match request {
-            TakeoverRequest::Move { image_id, .. } | TakeoverRequest::Drag { image_id, .. } => {
-                image_id
-            }
+            TakeoverRequest::Move { image_id, .. }
+            | TakeoverRequest::Click { image_id, .. }
+            | TakeoverRequest::Drag { image_id, .. } => image_id,
             TakeoverRequest::Scroll { target, .. } => target,
         };
         self.operator_app_refused(grantee, claimed).await;
         refusal
+    }
+
+    fn pointer_guard(
+        &self,
+        management: &Arc<ManagementPlane>,
+        conversation_key: &str,
+        request: &TakeoverRequest,
+    ) -> cerebellum_computer::platform::GlobalPointerGuard {
+        let (image_id, points) = match request {
+            TakeoverRequest::Move { image_id, to } => (image_id.clone(), vec![*to]),
+            TakeoverRequest::Click { image_id, point } => (image_id.clone(), vec![*point]),
+            TakeoverRequest::Drag { image_id, from, to } => (image_id.clone(), vec![*from, *to]),
+            TakeoverRequest::Scroll { .. } => {
+                return cerebellum_computer::platform::GlobalPointerGuard(Arc::new(|| true))
+            }
+        };
+        let management = Arc::clone(management);
+        let source = Arc::clone(&self.app_state_source);
+        let conversation_key = conversation_key.to_owned();
+        cerebellum_computer::platform::GlobalPointerGuard(Arc::new(move || {
+            let Some(image) = management
+                .app_state_sessions()
+                .resolve_image(&conversation_key, &image_id)
+            else {
+                return false;
+            };
+            let Some(window) = management
+                .app_state_sessions()
+                .image_window(&conversation_key, &image_id)
+            else {
+                return false;
+            };
+            points.iter().all(|point| {
+                let point = desktop(&image, *point);
+                source.topmost_window_at((point.x, point.y)) == Some(window)
+                    && application_under(source.as_ref(), &management, &image, point).is_ok_and(
+                        |owner| {
+                            owner.pid == image.pid
+                                && owner.process_generation_evidence == image.process_generation
+                        },
+                    )
+            })
+        }))
     }
 
     /// The containment target of a request and the pointer action to post.
@@ -524,6 +593,7 @@ where
         request: &TakeoverRequest,
     ) -> Result<(ProcessGrant, SyntheticAction), Value> {
         let (image_id, points) = match request {
+            TakeoverRequest::Click { image_id, point } => (image_id, vec![*point]),
             TakeoverRequest::Scroll {
                 target,
                 axis,
@@ -560,6 +630,32 @@ where
             .image_window(conversation_key, image_id);
         let desktop_points: Vec<SyntheticPoint> =
             points.iter().map(|point| desktop(&image, *point)).collect();
+        if self.takeover_pointer_fronting_admitted {
+            // A covered image is admitted by its own process identity, not
+            // by the covering window. Exact containment is checked after the
+            // front and before every post, including the paired release.
+            let grant = image_grant(&image);
+            if let Some(refusal) = self
+                .operator_lookup(management, caller)
+                .process_refusal(&grant, Vec::new())
+            {
+                return Err(refusal);
+            }
+            require_app_grant(management, &self.process_executable, caller, &grant)?;
+            if window_number.is_none() {
+                return Err(nothing_identifiable_at_point());
+            }
+            let action = match request {
+                TakeoverRequest::Click { .. } => SyntheticAction::ClickPointer {
+                    point: desktop_points[0],
+                },
+                TakeoverRequest::Drag { .. } => {
+                    SyntheticAction::drag_pointer(desktop_points[0], desktop_points[1])
+                }
+                _ => SyntheticAction::move_pointer(desktop_points[0]),
+            };
+            return Ok((grant, action));
+        }
         let source = self.app_state_source.clone();
         let hit_management = Arc::clone(management);
         let hit_image = image.clone();
@@ -655,6 +751,8 @@ where
         grantee: &str,
         cancel: CancelHandle,
         clock: &C,
+        management: &Arc<ManagementPlane>,
+        takeover_request: &TakeoverRequest,
     ) -> Value {
         let Some(row) = FrozenDispatchRow::for_capability(capability.capability_id()) else {
             return json!({
@@ -681,7 +779,12 @@ where
                 element: AccessibilityElementName::Identifier(target.bundle_identity.clone()),
             },
         );
-        let held_press = super::held_input::HeldPress::global(&target, &action);
+        let held_press = if self.takeover_pointer_fronting_admitted {
+            Some(super::held_input::HeldPress::global_send(&target, &action))
+        } else {
+            super::held_input::HeldPress::global(&target, &action)
+        };
+        let target_name = management.application_name(&target);
         let request = DispatchRequest::new(
             row,
             DispatchMode::Observed,
@@ -707,14 +810,64 @@ where
         {
             return refusal_reply(&DispatchError::AuditUnavailable);
         }
+        let mode =
+            super::app_use::call_mode().unwrap_or(cerebellum_core::config::AppUse::Background);
+        let (hooks, exclusion, pointer_guard) = if self.takeover_pointer_fronting_admitted {
+            let stopped = |stop| {
+                super::fronting::not_fronted_reply(super::fronting::Fronting::stopped(
+                    mode,
+                    super::fronting::Purpose::NeedsFront,
+                    stop,
+                ))
+            };
+            let Some(terminal) = work.terminal.clone() else {
+                return stopped(cerebellum_computer::dispatch::FrontingStop::FrontingNotAdmitted);
+            };
+            let lock = match self.fronting_lock.take(&cancel).await {
+                Ok(lock) => Arc::new(lock),
+                Err(stop) => return stopped(stop),
+            };
+            if !super::fronting::held_input_confirmed(&self.held_input) {
+                return stopped(cerebellum_computer::dispatch::FrontingStop::HeldInputUnconfirmed);
+            }
+            let hooks = super::fronting::CellHooks::new(super::fronting::ObligationParts {
+                terminal,
+                lock: Some(Box::new(Arc::clone(&lock))),
+                target_name,
+                mode: match mode {
+                    cerebellum_core::config::AppUse::Background => {
+                        crate::terminal_arbiter::FrontingMode::Background
+                    }
+                    cerebellum_core::config::AppUse::Foreground => {
+                        crate::terminal_arbiter::FrontingMode::Foreground
+                    }
+                },
+                purpose: crate::terminal_arbiter::FrontingPurpose::NeedsFront,
+            });
+            (
+                Some(hooks),
+                Some(lock),
+                Some(self.pointer_guard(management, &identity.conversation_key, takeover_request)),
+            )
+        } else {
+            (None, None, None)
+        };
         let ticket = if let Some(press) = held_press {
-            let ticket = match self
-                .held_input
-                .begin_global_send(press, work.terminal.clone(), &self.fronting_lock, &cancel)
-                .await
-            {
-                Ok(ticket) => ticket,
-                Err(_) => return super::held_input::held_input_unconfirmed_reply("takeover"),
+            let ticket = if let Some(exclusion) = exclusion {
+                self.held_input.begin_global_send_under_lock(
+                    press,
+                    work.terminal.clone(),
+                    exclusion,
+                )
+            } else {
+                match self
+                    .held_input
+                    .begin_global_send(press, work.terminal.clone(), &self.fronting_lock, &cancel)
+                    .await
+                {
+                    Ok(ticket) => ticket,
+                    Err(_) => return super::held_input::held_input_unconfirmed_reply("takeover"),
+                }
             };
             if let Some(terminal) = &work.terminal {
                 let outcome = ticket.outcome();
@@ -737,25 +890,96 @@ where
         // keystroke action from taking them for the person's use.
         let own_input = self.own_input.clone();
         let input_source = self.app_state_source.clone();
+        let worker_hooks = hooks.clone();
+        let record_hooks = hooks.clone();
         let dispatched = tokio::task::spawn_blocking(move || {
             let _ax = work.bound_ax();
+            let _fronting_record = record_hooks.map(|hooks| {
+                cerebellum_computer::audit::FrontingRecordScope::new(move || {
+                    super::fronting::keystroke_row_fronting(mode, &hooks.peek()).row_record()
+                })
+            });
             let cancelled = || cancel.is_cancelled();
-            let mut dispatcher = Dispatcher::new(make_driver(), &cancelled);
+            let mut driver = make_driver();
+            if let (Some(guard), Some(hooks)) = (pointer_guard, &worker_hooks) {
+                if !driver.accept_pointer_fronting(guard)
+                    || !driver.accept_fronted_dispatch_hooks(super::fronting::boxed_hooks(hooks))
+                {
+                    super::settle_held_input(
+                        ticket,
+                        &Err::<(), _>(DispatchError::SyntheticUnavailable),
+                        make_driver.as_ref(),
+                    );
+                    return Err(DispatchError::SyntheticUnavailable);
+                }
+            }
+            let mut dispatcher = Dispatcher::new(driver, &cancelled);
             let posting = own_input.begin_posting(
                 cerebellum_computer::app_state::person::last_input_instant(input_source.as_ref()),
             );
             work.publish_posting(&own_input, &posting);
             let dispatched = dispatcher.dispatch(&mut audit, identity, request);
             own_input.end_posting(posting);
-            super::settle_held_input(ticket, &dispatched, make_driver.as_ref());
+            let held = super::settle_held_input(ticket, &dispatched, make_driver.as_ref());
+            if let Some(hooks) = &worker_hooks {
+                super::fronting::finish_after_release(hooks, held, None);
+            }
             dispatched
         })
         .await
         .unwrap_or(Err(DispatchError::Platform));
-        match dispatched {
+        let mut reply = match dispatched {
             Ok(_) => json!({"outcome": "completed"}),
             Err(refusal) => refusal_reply(&refusal),
+        };
+        if let Some(hooks) = &hooks {
+            if reply["reason"] == "target_focus_mismatch" {
+                reply["remedy"] = json!("the target's focus or the exact imaged window could not be confirmed immediately before the pointer post, so no further action posts were made; read state again before retrying");
+            }
+            let end = hooks.end();
+            let mut fronting = super::fronting::chord_fronting(mode, &end);
+            if let Some(report) = &end.report {
+                if report.posts_returned == 0
+                    && matches!(
+                        report.stop,
+                        Some(
+                            cerebellum_computer::dispatch::BracketStop::FrontFailed
+                                | cerebellum_computer::dispatch::BracketStop::PreviousUnknown
+                                | cerebellum_computer::dispatch::BracketStop::ObserverUnavailable
+                                | cerebellum_computer::dispatch::BracketStop::BoundExceeded
+                        )
+                    )
+                {
+                    let stop = cerebellum_computer::dispatch::FrontingStop::from_bracket_stop(
+                        report.stop.as_ref().unwrap(),
+                    )
+                    .unwrap();
+                    let mut stopped = super::fronting::Fronting::stopped(
+                        mode,
+                        super::fronting::Purpose::NeedsFront,
+                        stop,
+                    );
+                    stopped.restore = fronting.restore;
+                    reply = super::fronting::not_fronted_reply(stopped);
+                    fronting = stopped;
+                }
+            }
+            fronting.apply(&mut reply);
+            if let Some(report) = &end.report {
+                if report.longest_fronted_interval_ms > 300
+                    || matches!(
+                        report.stop,
+                        Some(cerebellum_computer::dispatch::BracketStop::BoundExceeded)
+                    )
+                {
+                    reply["fronting_bound_exceeded"] = json!(true);
+                }
+            }
+            if matches!(fronting.restore, super::fronting::Restore::Failed) {
+                reply["outcome"] = json!("restore_failed");
+            }
         }
+        reply
     }
 }
 
@@ -841,6 +1065,7 @@ mod tests {
             assert_ne!(reply["outcome"], "invalid_request", "{error:?}: {reply}");
             for row in [
                 "computer.takeover_move",
+                "computer.takeover_click",
                 "computer.takeover_drag",
                 "computer.takeover_scroll",
             ] {
@@ -874,5 +1099,28 @@ mod tests {
             "unknown_field"
         );
         assert_eq!(moved(json!("1,7")).unwrap_err()["field"], "to");
+    }
+
+    #[test]
+    fn a_click_requires_only_an_image_and_two_whole_pixel_coordinates() {
+        let capability = ComputerCapability::TakeoverClick;
+        assert_eq!(
+            parse_request(capability, &json!({"image_id":"image","x":10,"y":20})).unwrap(),
+            TakeoverRequest::Click {
+                image_id: "image".into(),
+                point: (10, 20)
+            }
+        );
+        for request in [
+            json!({"image_id":"image","x":10}),
+            json!({"image_id":"image","x":-1,"y":20}),
+            json!({"image_id":"image","x":1.5,"y":20}),
+            json!({"image_id":"image","x":10,"y":20,"to":{"x":10,"y":20}}),
+        ] {
+            assert_eq!(
+                parse_request(capability, &request).unwrap_err()["outcome"],
+                "invalid_request"
+            );
+        }
     }
 }

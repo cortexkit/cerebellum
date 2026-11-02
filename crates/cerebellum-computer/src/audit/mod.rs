@@ -50,6 +50,7 @@ pub enum ComputerCapability {
     Type,
     Keys,
     TakeoverMove,
+    TakeoverClick,
     TakeoverDrag,
     TakeoverScroll,
     Wait,
@@ -69,7 +70,7 @@ pub enum ComputerCapability {
 
 impl ComputerCapability {
     /// The capabilities the current vocabulary carries, in artifact order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::ReadState,
         Self::PressElement,
         Self::PressPoint,
@@ -77,6 +78,7 @@ impl ComputerCapability {
         Self::Type,
         Self::Keys,
         Self::TakeoverMove,
+        Self::TakeoverClick,
         Self::TakeoverDrag,
         Self::TakeoverScroll,
         Self::Wait,
@@ -103,6 +105,7 @@ impl ComputerCapability {
             Self::Type => "computer.type",
             Self::Keys => "computer.keys",
             Self::TakeoverMove => "computer.takeover_move",
+            Self::TakeoverClick => "computer.takeover_click",
             Self::TakeoverDrag => "computer.takeover_drag",
             Self::TakeoverScroll => "computer.takeover_scroll",
             Self::Wait => "computer.wait",
@@ -145,6 +148,7 @@ impl ComputerCapability {
             | Self::PressPoint
             | Self::WriteText
             | Self::TakeoverMove
+            | Self::TakeoverClick
             | Self::TakeoverScroll => ActionKind::Compose,
         }
     }
@@ -1009,7 +1013,7 @@ thread_local! {
 type FrontingRecordSource = Box<dyn Fn() -> Option<FrontingRecord>>;
 
 /// Tells the actuation rows finalized on this thread how the action used the
-/// front of the screen. The keystroke worker installs one around its dispatch,
+/// front of the screen. A synthetic worker installs one around its dispatch,
 /// because the dispatcher, not the worker, finalizes the row; the source is
 /// asked at the moment the row is finalized, so a front and restore that the
 /// dispatch itself ran are already decided. Construct and drop on the same
@@ -1079,6 +1083,7 @@ impl AuditCapabilityGate {
             | ComputerCapability::Type
             | ComputerCapability::Keys
             | ComputerCapability::TakeoverMove
+            | ComputerCapability::TakeoverClick
             | ComputerCapability::TakeoverDrag
             | ComputerCapability::TakeoverScroll => {
                 self.journal_available && self.severity_available
@@ -1351,6 +1356,7 @@ pub const fn recovery_entry_class(capability: ComputerCapability) -> ComputerRec
         | ComputerCapability::PressPoint
         | ComputerCapability::WriteText
         | ComputerCapability::TakeoverMove
+        | ComputerCapability::TakeoverClick
         | ComputerCapability::TakeoverDrag
         | ComputerCapability::TakeoverScroll => ComputerRecoveryEntryClass::Actuation,
     }

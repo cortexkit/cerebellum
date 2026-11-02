@@ -245,6 +245,9 @@ pub struct ImmutableReleaseInputs {
     /// takeover pointer rows and the fronting bracket that brings a
     /// background application forward for keystrokes.
     pub takeover_dispatch_review_revision: Option<String>,
+    /// The review of temporary target fronting for global pointer gestures,
+    /// including a dedicated left-button click. Absent until that review binds.
+    pub takeover_pointer_fronting_review_revision: Option<String>,
     /// The review of background app use: bringing an application forward
     /// outside the keystroke bracket (one-way fronting in foreground mode, and
     /// fronting a press or a modifier chord under the app grant alone, with
@@ -436,6 +439,7 @@ fn capability_declaration(
     } else if matches!(
         capability,
         ComputerCapability::TakeoverMove
+            | ComputerCapability::TakeoverClick
             | ComputerCapability::TakeoverDrag
             | ComputerCapability::TakeoverScroll
     ) {
@@ -449,6 +453,19 @@ fn capability_declaration(
             Some("global dispatch review revision is not bound".to_string())
         } else if context.inputs.takeover_dispatch_review_revision.is_none() {
             Some("takeover dispatch review revision is not bound".to_string())
+        } else if capability == ComputerCapability::TakeoverClick
+            && !context
+                .inputs
+                .takeover_pointer_fronting_review_revision
+                .as_deref()
+                .is_some_and(|value| {
+                    !value.trim().is_empty()
+                        && !["placeholder", "tbd", "unknown"]
+                            .iter()
+                            .any(|stand_in| value.eq_ignore_ascii_case(stand_in))
+                })
+        {
+            Some("takeover pointer fronting review revision is not bound".to_string())
         } else if !context.inputs.takeover_dispatch_ready() {
             Some("release signing topology revision is not bound".to_string())
         } else {
@@ -465,6 +482,7 @@ fn capability_declaration(
     // application; wait dispatches nothing.
     let dispatch_modes = match capability {
         ComputerCapability::TakeoverMove
+        | ComputerCapability::TakeoverClick
         | ComputerCapability::TakeoverDrag
         | ComputerCapability::TakeoverScroll => vec![DispatchMode::Observed],
         ComputerCapability::ReadState
@@ -1058,6 +1076,17 @@ pub struct GlobalDispatchRequest {
     pub minimum_inter_post_interval_ms: u32,
 }
 
+/// Revalidate coordinate containment immediately before each pointer post.
+/// The callback owns its image/session data and may not post input itself.
+#[derive(Clone)]
+pub struct GlobalPointerGuard(pub std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl std::fmt::Debug for GlobalPointerGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GlobalPointerGuard")
+    }
+}
+
 /// A per-process delivery to a target that is not frontmost, posted inside a
 /// fronting bracket: the target is brought forward for at most
 /// `maximum_interval_ms` at a time, under the idle gate and the seize
@@ -1354,6 +1383,12 @@ pub enum DriverError {
     AccessibilityUnreadable(AccessibilityReadFailure),
     /// Observed dispatch stopped before all of its events could be posted.
     ObservedDispatchAborted(crate::dispatch::AbortDecision),
+    /// An observed stop whose paired release could not be confirmed. Keep
+    /// both the stop evidence and held-state disposition for audit and cleanup.
+    ObservedSequenceFailed {
+        abort: crate::dispatch::AbortDecision,
+        failure: Box<SequencePostFailure>,
+    },
     /// The current Windows session cannot inspect the interactive desktop.
     SessionNotInspectable(SessionProvenanceRefusal),
     /// Windows cannot distinguish an unenumerated app from a hidden window.
@@ -1392,6 +1427,11 @@ impl fmt::Display for DriverError {
             Self::ObservedDispatchAborted(abort) => {
                 write!(f, "observed dispatch aborted: {:?}", abort.reason)
             }
+            Self::ObservedSequenceFailed { abort, failure } => write!(
+                f,
+                "observed dispatch aborted after {} post call(s): {:?}; held state {:?}",
+                failure.posts_returned, abort.reason, failure.held_state
+            ),
             Self::SessionNotInspectable(session) => {
                 write!(
                     f,
@@ -1412,6 +1452,11 @@ impl std::error::Error for DriverError {}
 /// The complete bounded surface shared by future Windows, X11, and Wayland
 /// backends. Implementations may refuse an operation, but may not broaden it.
 pub trait PlatformDriver {
+    /// Install one separately admitted pointer-fronting unit. Unsupported
+    /// drivers must refuse rather than dispatch without containment checks.
+    fn accept_pointer_fronting(&mut self, _guard: GlobalPointerGuard) -> bool {
+        false
+    }
     fn capability_declarations(
         &self,
         context: &CapabilityAdvertisementContext,
@@ -1819,14 +1864,34 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
         self.returned();
         self.inner.post_unit(index)
     }
+    fn post_observed_unit(
+        &mut self,
+        index: usize,
+        observation: crate::dispatch::ObservedUnit<'_, Self::Tap>,
+    ) -> Result<crate::dispatch::UnitPosted, SequencePostFailure> {
+        self.returned();
+        self.inner.post_observed_unit(index, observation)
+    }
+    fn finish_observation(
+        &mut self,
+        tap: &Self::Tap,
+        estimator: &mut crate::dispatch::UserIdleEstimator,
+        user_idle: IdleReading,
+        idle_read_at: std::time::Instant,
+    ) {
+        self.inner
+            .finish_observation(tap, estimator, user_idle, idle_read_at);
+    }
     fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot> {
         self.returned();
         self.inner.hardware_input_snapshot()
     }
 }
 
-/// Run a fronted dispatch (`read` is `None`) or a fronted image read under
-/// app-use fronting admission, with `hooks` owning the restore obligation.
+/// Run a fronted dispatch (`read` is `None`) or a fronted image read, with
+/// `hooks` owning the restore obligation. The caller must separately admit its
+/// grant and review: app-use fronting and takeover pointer fronting share this
+/// restore mechanism, not each other's permission.
 ///
 /// The bracket runs as it does for any admitted caller, with two changes the
 /// hooks make: the obligation is registered, and the front attempt started,

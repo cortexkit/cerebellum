@@ -876,7 +876,10 @@ where
                     }
                 }
             }
-            Served::PressPoint | Served::TakeoverMove | Served::TakeoverDrag => {
+            Served::PressPoint
+            | Served::TakeoverMove
+            | Served::TakeoverClick
+            | Served::TakeoverDrag => {
                 named.extend(text("target"));
                 if let Some(id) = text("image_id") {
                     if let Some(image) = sessions.resolve_image(conversation, &id) {

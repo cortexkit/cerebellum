@@ -455,6 +455,7 @@ const THIRD: u32 = 300;
 const OUR_PID: i64 = 7;
 
 struct ScreenState {
+    pointer: pointer_tests::Script,
     now: u64,
     idle_ms: u64,
     observer: bool,
@@ -505,6 +506,7 @@ impl Screen {
         desk.state().frontmost = Some(PREVIOUS);
         Self {
             state: Arc::new(StdMutex::new(ScreenState {
+                pointer: pointer_tests::Script::default(),
                 now: 0,
                 idle_ms: OBSERVED_DISPATCH_IDLE_MS + 500,
                 observer: true,
@@ -745,6 +747,7 @@ impl FrontingBracketHost for FakeBracket {
 struct FakeDriver {
     screen: Screen,
     hooks: Option<Box<dyn FrontedDispatchHooks>>,
+    pointer_guard: Option<cerebellum_computer::platform::GlobalPointerGuard>,
 }
 
 impl PlatformDriver for FakeDriver {
@@ -788,10 +791,17 @@ impl PlatformDriver for FakeDriver {
     }
     fn dispatch_global(
         &mut self,
-        _request: GlobalDispatchRequest,
-        _cancelled: &dyn Fn() -> bool,
+        request: GlobalDispatchRequest,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
-        Err(DriverError::Unsupported("the fake posts nothing globally"))
+        pointer_tests::dispatch(self, request, cancelled)
+    }
+    fn accept_pointer_fronting(
+        &mut self,
+        guard: cerebellum_computer::platform::GlobalPointerGuard,
+    ) -> bool {
+        self.pointer_guard = Some(guard);
+        true
     }
     fn release_held(
         &mut self,
@@ -1070,6 +1080,7 @@ fn rig_admitting(
         move || FakeDriver {
             screen: driver_screen.clone(),
             hooks: None,
+            pointer_guard: None,
         },
     )
     .with_permission_liveness(support::live_permissions())
@@ -3167,3 +3178,6 @@ mod settle_read_budget {
         );
     }
 }
+
+#[path = "pointer_fronting_tests.rs"]
+mod pointer_tests;

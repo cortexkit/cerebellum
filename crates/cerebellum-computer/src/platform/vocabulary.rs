@@ -25,9 +25,9 @@ use std::sync::OnceLock;
 // the format to /v2. A reviewer read the mismatch as a mistake before finding
 // both fields in the artifact, so it is stated here rather than re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v2";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v33";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v34";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v33.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v34.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "bec5b6cad004606960c684bafea3c7b219fc780cec9630158c29ff935833c849";
+    "7c36bfd082d83e1dd24db1fcf9110eb58c1ad2059aeea7b9b4068f7c9c0ab4bd";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -116,7 +116,7 @@ pub struct ValidatedVocabulary {
 /// The one list other closed per-id tables are checked against: the
 /// declaration set, the dispatch rows and the grounding policy each name these
 /// ids and no others.
-pub const COMPUTER_CAPABILITY_ROW_IDS: [&str; 12] = [
+pub const COMPUTER_CAPABILITY_ROW_IDS: [&str; 13] = [
     "computer.read_state",
     "computer.press_element",
     "computer.press_point",
@@ -124,6 +124,7 @@ pub const COMPUTER_CAPABILITY_ROW_IDS: [&str; 12] = [
     "computer.type",
     "computer.keys",
     "computer.takeover_move",
+    "computer.takeover_click",
     "computer.takeover_drag",
     "computer.takeover_scroll",
     "computer.wait",
@@ -145,8 +146,9 @@ const ELEMENT_ADDRESSED_ROW_IDS: [&str; 4] = [
 
 /// Rows that drive the one real system pointer, which only the global event
 /// stream carries.
-const TAKEOVER_ROW_IDS: [&str; 3] = [
+const TAKEOVER_ROW_IDS: [&str; 4] = [
     "computer.takeover_move",
+    "computer.takeover_click",
     "computer.takeover_drag",
     "computer.takeover_scroll",
 ];
@@ -373,6 +375,7 @@ fn validate_row(row: &Value) -> Result<(), VocabularyValidationError> {
         | "computer.type"
         | "computer.keys"
         | "computer.takeover_move"
+        | "computer.takeover_click"
         | "computer.takeover_drag"
         | "computer.takeover_scroll" => "never_automatic_retry",
         _ => {
@@ -1328,6 +1331,13 @@ mod tests {
                 vec![PermissionService::InputMonitoring],
             ),
             (
+                "computer.takeover_click",
+                vec![
+                    PermissionService::PostEvent,
+                    PermissionService::InputMonitoring,
+                ],
+            ),
+            (
                 "computer.takeover_drag",
                 vec![
                     PermissionService::PostEvent,
@@ -1373,8 +1383,8 @@ mod tests {
         );
     }
 
-    /// The rows whose action can bring its application to the front.
-    const FRONTING_ROWS: [&str; 7] = [
+    /// The rows whose replies can report preview synchronization.
+    const PREVIEW_ROWS: [&str; 7] = [
         "computer.read_state",
         "computer.press_element",
         "computer.press_point",
@@ -1382,6 +1392,21 @@ mod tests {
         "computer.type",
         "computer.keys",
         "computer.open_app",
+    ];
+
+    /// The rows whose action can bring its application to the front.
+    const FRONTING_ROWS: [&str; 11] = [
+        "computer.read_state",
+        "computer.press_element",
+        "computer.press_point",
+        "computer.write_text",
+        "computer.type",
+        "computer.keys",
+        "computer.open_app",
+        "computer.takeover_move",
+        "computer.takeover_click",
+        "computer.takeover_drag",
+        "computer.takeover_scroll",
     ];
 
     /// What withholding mode would object to in `reply`: it withholds any
@@ -1422,7 +1447,7 @@ mod tests {
     #[test]
     fn a_config_invalid_refusal_passes_on_every_row() {
         let ids = artifact_row_ids();
-        assert_eq!(ids.len(), 12);
+        assert_eq!(ids.len(), 13);
         for id in &ids {
             let reply = with_keystroke_envelope(
                 id,
@@ -1557,8 +1582,8 @@ mod tests {
         assert_eq!(withheld("computer.open_app", &reply), Vec::new());
     }
 
-    /// Every value the `fronting` object, `preview` and
-    /// `fronting_bound_exceeded` can take is declared on every fronting row.
+    /// Fronting values and bounds are accepted on every fronting row. Preview
+    /// synchronization is accepted only on the rows that declare it.
     #[test]
     fn every_fronting_value_passes_on_every_fronting_row() {
         let reasons = [
@@ -1612,12 +1637,16 @@ mod tests {
                 ("bring_to_front", "background"),
                 ("needs_front", "background"),
             ]) {
-                for preview in ["not_synchronized", "not_shown_capacity"] {
-                    let reply = with_keystroke_envelope(
+                let previews = if PREVIEW_ROWS.contains(&id) {
+                    vec![Some("not_synchronized"), Some("not_shown_capacity")]
+                } else {
+                    vec![None]
+                };
+                for preview in previews {
+                    let mut reply = with_keystroke_envelope(
                         id,
                         serde_json::json!({
                             "outcome": success,
-                            "preview": preview,
                             "fronting_bound_exceeded": true,
                             "fronting": {
                                 "mode": mode,
@@ -1628,7 +1657,14 @@ mod tests {
                             },
                         }),
                     );
-                    assert_eq!(withheld(id, &reply), Vec::new(), "{id} {restore} {preview}");
+                    if let Some(preview) = preview {
+                        reply["preview"] = preview.into();
+                    }
+                    assert_eq!(
+                        withheld(id, &reply),
+                        Vec::new(),
+                        "{id} {restore} {preview:?}"
+                    );
                 }
             }
         }
@@ -1693,6 +1729,21 @@ mod tests {
                         path: "$.preview".into(),
                     },
                 ],
+                "{id}"
+            );
+        }
+        for id in FRONTING_ROWS
+            .into_iter()
+            .filter(|id| !PREVIEW_ROWS.contains(id))
+        {
+            assert_eq!(
+                withheld(
+                    id,
+                    &serde_json::json!({"outcome":"config_invalid", "preview":"not_synchronized"})
+                ),
+                vec![CapabilityResultViolation::UndeclaredProperty {
+                    path: "$.preview".into()
+                }],
                 "{id}"
             );
         }

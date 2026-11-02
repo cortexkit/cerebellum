@@ -1158,6 +1158,7 @@ mod tests {
             semantic_actuation_review_revision: Some("fixture-macos-semantic".to_owned()),
             app_state_review_revision: Some("fixture-app-state-review".to_owned()),
             element_addressed_review_revision: Some("fixture-element-addressed-review".to_owned()),
+            takeover_pointer_fronting_review_revision: Some("fixture-pointer-review".into()),
             takeover_dispatch_review_revision: Some("fixture-takeover-dispatch-review".to_owned()),
             app_use_fronting_review_revision: Some("fixture-app-use-fronting-review".to_owned()),
             windows_actuation_review_revision: Some("fixture-windows-actuation".to_owned()),

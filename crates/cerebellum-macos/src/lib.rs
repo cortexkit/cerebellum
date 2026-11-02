@@ -195,9 +195,9 @@ pub use event_tap::{SessionEvent, SessionEventTapError};
 #[cfg(target_os = "macos")]
 pub use input::{
     event_post_access, heartbeat_marker_event, horizontal_scroll_wheel_event,
-    input_monitoring_access, key_combination_events, mouse_drag_events, mouse_move_event,
-    mouse_move_event_from_private_source, scroll_wheel_event, seconds_since_last_deliberate_input,
-    seconds_since_last_input, text_input_events,
+    input_monitoring_access, key_combination_events, mouse_click_events, mouse_drag_events,
+    mouse_move_event, mouse_move_event_from_private_source, scroll_wheel_event,
+    seconds_since_last_deliberate_input, seconds_since_last_input, text_input_events,
 };
 #[cfg(any(target_os = "macos", test))]
 pub use input::{

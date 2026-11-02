@@ -514,56 +514,67 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
-        let computer_names = cerebellum_computer::audit::ComputerCapability::ALL
-            .into_iter()
-            .map(|capability| capability.capability_id().to_string())
-            .filter(|name| crate::computer_capability::servable(name).is_some())
-            .collect::<Vec<_>>();
-        let flat = [
-            flat_tools::computer_tool(&computer_names).unwrap(),
-            flat_tools::browser_tool(&browser_names).unwrap(),
-        ];
-        for (definition, flat) in definitions(&browser_names, &computer_names)
-            .iter()
-            .zip(flat)
-        {
-            assert_eq!(definition.name.as_bytes(), flat.name.as_bytes());
-            assert_eq!(
-                definition.description.as_ref().unwrap().as_bytes(),
-                flat.description.as_ref().unwrap().as_bytes()
-            );
-            assert_eq!(
-                serde_json::to_vec(&definition.input_schema).unwrap(),
-                serde_json::to_vec(&flat.schema).unwrap()
-            );
-            // Freeze the entire model-visible definition separately from the
-            // shared builder, so editing both advertisement paths cannot hide drift.
-            let bytes = serde_json::to_vec(&json!({"name":definition.name,"description":definition.description,"input_schema":definition.input_schema})).unwrap();
-            let frozen = match definition.name.as_str() {
-                "browser_use" => "b2d46d21d47cfd4ff91322813afd724de226af271eb06f5f4bce179e6e156bdd",
-                "computer_use" => {
-                    "fbef38d68cd09cb42c8283f195871cb13c88180570f989314bc89a833258ac1c"
-                }
-                _ => unreachable!("only the two flat model tools are served"),
-            };
-            assert_eq!(
-                manifest::sha256_hex(&bytes),
-                frozen,
-                "{} model-visible bytes changed",
-                definition.name
-            );
-            let pin = SchemaPin::new(
-                &definition.name,
-                &definition.schema_digest,
-                definition.semantics,
-            )
-            .encode()
-            .unwrap();
-            let view = views::answer(json!({"pins":[pin.clone()]}).as_object().unwrap()).unwrap();
-            assert_ne!(
-                view["views"][&pin], "unknown",
-                "the frozen definition must have a published view"
-            );
+        for pointer_fronting in [false, true] {
+            let computer_names = cerebellum_computer::audit::ComputerCapability::ALL
+                .into_iter()
+                .map(|capability| capability.capability_id().to_string())
+                .filter(|name| crate::computer_capability::servable(name).is_some())
+                .filter(|name| pointer_fronting || name != "computer.takeover_click")
+                .collect::<Vec<_>>();
+            let pointer_fronting = flat_tools::pointer_fronting_definition(&computer_names);
+            let flat = [
+                flat_tools::computer_tool(&computer_names).unwrap(),
+                flat_tools::browser_tool(&browser_names).unwrap(),
+            ];
+            for (definition, flat) in definitions(&browser_names, &computer_names)
+                .iter()
+                .zip(flat)
+            {
+                assert_eq!(definition.name.as_bytes(), flat.name.as_bytes());
+                assert_eq!(
+                    definition.description.as_ref().unwrap().as_bytes(),
+                    flat.description.as_ref().unwrap().as_bytes()
+                );
+                assert_eq!(
+                    serde_json::to_vec(&definition.input_schema).unwrap(),
+                    serde_json::to_vec(&flat.schema).unwrap()
+                );
+                // Freeze the entire model-visible definition separately from the
+                // shared builder, so editing both advertisement paths cannot hide drift.
+                let bytes = serde_json::to_vec(&json!({"name":definition.name,"description":definition.description,"input_schema":definition.input_schema})).unwrap();
+                let frozen = match definition.name.as_str() {
+                    "browser_use" => {
+                        "b2d46d21d47cfd4ff91322813afd724de226af271eb06f5f4bce179e6e156bdd"
+                    }
+                    "computer_use" if !pointer_fronting => {
+                        "fbef38d68cd09cb42c8283f195871cb13c88180570f989314bc89a833258ac1c"
+                    }
+                    "computer_use" => {
+                        "86edb7dbb2d49e3f5e206807968c4be2ca31adae0b4e1ef6b38ed6b32c82577b"
+                    }
+                    _ => unreachable!("only the two flat model tools are served"),
+                };
+                assert_eq!(
+                    manifest::sha256_hex(&bytes),
+                    frozen,
+                    "{} model-visible bytes changed",
+                    definition.name
+                );
+
+                let pin = SchemaPin::new(
+                    &definition.name,
+                    &definition.schema_digest,
+                    definition.semantics,
+                )
+                .encode()
+                .unwrap();
+                let view =
+                    views::answer(json!({"pins":[pin.clone()]}).as_object().unwrap()).unwrap();
+                assert_ne!(
+                    view["views"][&pin], "unknown",
+                    "the frozen definition must have a published view"
+                );
+            }
         }
     }
 

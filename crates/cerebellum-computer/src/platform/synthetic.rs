@@ -200,6 +200,8 @@ pub enum SyntheticAction {
     },
     /// Move the pointer to a point without pressing any button.
     MovePointer { point: SyntheticPoint },
+    /// Press and release the left button at a point, without dragging.
+    ClickPointer { point: SyntheticPoint },
     /// Press the left button at `from`, drag to `to`, and release there.
     DragPointer {
         from: SyntheticPoint,
@@ -236,7 +238,10 @@ impl SyntheticAction {
     /// Whether this action is addressed by coordinates rather than delivered
     /// to whatever has focus inside the target process.
     pub fn is_coordinate_addressed(&self) -> bool {
-        matches!(self, Self::MovePointer { .. } | Self::DragPointer { .. })
+        matches!(
+            self,
+            Self::MovePointer { .. } | Self::DragPointer { .. } | Self::ClickPointer { .. }
+        )
     }
 
     /// The role of every event this action expands into, in posting order.
@@ -250,7 +255,7 @@ impl SyntheticAction {
             Self::TypeText { text } => (0..text.chars().count())
                 .flat_map(|_| [Press, Release])
                 .collect(),
-            Self::KeyCombination { .. } => vec![Press, Release],
+            Self::KeyCombination { .. } | Self::ClickPointer { .. } => vec![Press, Release],
             Self::Scroll { .. } | Self::MovePointer { .. } => vec![SelfContained],
             Self::DragPointer { .. } => vec![Press, SelfContained, Release],
         }
@@ -336,5 +341,21 @@ mod tests {
         assert_eq!(plans[2], vec![SelfContained]);
         assert_eq!(plans[3], vec![SelfContained]);
         assert_eq!(plans[4], vec![Press, SelfContained, Release]);
+    }
+}
+
+#[cfg(test)]
+mod click_tests {
+    use super::*;
+
+    #[test]
+    fn a_click_has_only_a_paired_press_and_release() {
+        let click = SyntheticAction::ClickPointer {
+            point: SyntheticPoint { x: 12.0, y: 34.0 },
+        };
+        assert_eq!(
+            click.step_roles(),
+            [SyntheticStepRole::Press, SyntheticStepRole::Release]
+        );
     }
 }

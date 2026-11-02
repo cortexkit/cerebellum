@@ -115,6 +115,8 @@ pub struct MacOs26PlatformDriver {
     /// forward can take the person's keystrokes, so the driver refuses the
     /// bracket itself without it, whatever its caller decided.
     takeover_dispatch_review_revision: Option<String>,
+    takeover_pointer_fronting_review_revision: Option<String>,
+    pointer_fronting: Option<super::GlobalPointerGuard>,
     input_route_evidence: super::input_route::InputRouteEvidence,
     /// Shared across every driver the plane builds. The plane builds a driver
     /// per dispatch (its accessibility cache must not outlive a process
@@ -124,7 +126,7 @@ pub struct MacOs26PlatformDriver {
     /// drag is refused as not_idle on the age of the move's own last post.
     /// Measured on the VM: user_idle == hid_idle on every second action.
     user_idle: Arc<Mutex<UserIdleEstimator>>,
-    /// Set for one fronted dispatch or read admitted to app-use fronting.
+    /// Set for one admitted fronted dispatch or read with a restore obligation.
     fronted_hooks: FrontedHookSlot,
 }
 
@@ -418,6 +420,15 @@ struct MacBracketHost {
     target: ProcessEventTarget,
     units: Vec<Option<Vec<SyntheticStep<cerebellum_macos::OwnedCgEvent>>>>,
     transport: MacOsPerProcessEventTransport,
+    pointer: Option<MacPointerUnit>,
+}
+
+struct MacPointerUnit {
+    guard: super::GlobalPointerGuard,
+    interval_ms: u32,
+    last_post_at: Option<Instant>,
+    error: Option<DriverError>,
+    observed_abort: Option<crate::dispatch::AbortDecision>,
 }
 
 impl crate::dispatch::FrontingBracketHost for MacBracketHost {
@@ -436,6 +447,16 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
     }
 
     fn request_front(&mut self, pid: u32) -> bool {
+        if self.pointer.is_some()
+            && pid == self.target.pid
+            && super::process_event::require_exact_generation(
+                self.target,
+                self.transport.process_generation(pid),
+            )
+            .is_err()
+        {
+            return false;
+        }
         cerebellum_macos::request_frontmost(pid).is_ok()
     }
 
@@ -492,6 +513,200 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
             posts_returned: report.posts_returned,
             generation_verifications: report.generation_verifications,
         })
+    }
+
+    fn post_observed_unit(
+        &mut self,
+        index: usize,
+        observation: crate::dispatch::ObservedUnit<'_, Self::Tap>,
+    ) -> Result<crate::dispatch::UnitPosted, SequencePostFailure> {
+        let Some(pointer) = self.pointer.as_mut() else {
+            return self.post_unit(index);
+        };
+        let steps = self
+            .units
+            .get_mut(index)
+            .and_then(Option::take)
+            .unwrap_or_default();
+        let mut last_post_at = Instant::now();
+        let our_pid = self.heartbeat.our_pid;
+        let releases: Vec<_> = steps
+            .iter()
+            .map(|step| step.role == super::process_event::SyntheticStepRole::Release)
+            .collect();
+        for _ in 1..steps.len() {
+            observation.watcher.queue_post();
+        }
+        let event_count = steps.len();
+        let result = super::process_event::post_guarded_event_sequence(
+            steps,
+            observation.cancelled,
+            |index, event, recovery| {
+                if event.is_none() {
+                    if index > 0 {
+                        let next =
+                            last_post_at + Duration::from_millis(u64::from(pointer.interval_ms));
+                        while Instant::now() < next {
+                            if (observation.cancelled)() {
+                                break;
+                            }
+                            match observation.tap.events().recv_timeout(
+                                next.saturating_duration_since(Instant::now())
+                                    .min(Duration::from_millis(2)),
+                            ) {
+                                Ok(event) => observe_session_event(
+                                    observation.watcher,
+                                    event,
+                                    our_pid,
+                                    index,
+                                ),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(_) => {
+                                    return Err(DriverError::Unsupported(
+                                        "session observer disconnected",
+                                    ))
+                                }
+                            }
+                            if observation.watcher.abort_decision().is_some() {
+                                return Err(observed_abort_error(observation.watcher));
+                            }
+                        }
+                    }
+                    drain_session_events(observation.tap, observation.watcher, our_pid, index);
+                    if observation.watcher.abort_decision().is_some() {
+                        return Err(observed_abort_error(observation.watcher));
+                    }
+                    if elapsed_millis(self.started) >= observation.deadline_ms {
+                        return Err(DriverError::Unsupported(
+                            "pointer fronting interval exceeded",
+                        ));
+                    }
+                    return Ok(0);
+                }
+                // Containment may change while fronting, or between the down and
+                // up. A release is not exempt from identity/window containment.
+                let contained = (pointer.guard.0)();
+                drain_session_events(observation.tap, observation.watcher, our_pid, index);
+                super::process_event::require_exact_generation(
+                    self.target,
+                    self.transport.process_generation(self.target.pid),
+                )
+                .map_err(|_| DriverError::Unsupported("global target generation changed"))?;
+                let focused = contained
+                    && cerebellum_macos::frontmost_process_id()
+                        == i32::try_from(self.target.pid).ok();
+                let stopped = (observation.cancelled)()
+                    || observation.watcher.abort_decision().is_some()
+                    || elapsed_millis(self.started) >= observation.deadline_ms;
+                // A release already removed from the sequence cannot be handed
+                // back to its recovery scan. If input/cancel arrived during
+                // containment reads, deliver that release as recovery instead.
+                if recovery || (releases[index] && stopped) {
+                    if !focused {
+                        return Err(DriverError::Unsupported(
+                            "global release target is no longer frontmost",
+                        ));
+                    }
+                } else {
+                    if elapsed_millis(self.started) >= observation.deadline_ms {
+                        return Err(DriverError::Unsupported(
+                            "pointer fronting interval exceeded",
+                        ));
+                    }
+                    dispatch_observed_post_in_order(
+                        observation.watcher,
+                        index,
+                        observation.probe,
+                        |_| observation.heartbeat,
+                        || focused,
+                        || (),
+                    )
+                    .map_err(|_| observed_abort_error(observation.watcher))?;
+                    if stopped {
+                        return Err(DriverError::SyntheticDispatchFailed(SequencePostFailure {
+                            posts_returned: 0,
+                            refusal: super::process_event::ProcessEventRefusal::Cancelled,
+                            held_state: super::HeldStateDisposition::NoneHeld,
+                        }));
+                    }
+                }
+                let _ = cerebellum_macos::post_event_globally(event.unwrap());
+                last_post_at = Instant::now();
+                pointer.last_post_at = Some(last_post_at);
+                if index + 1 < event_count {
+                    observation.watcher.take_post_slot();
+                }
+                Ok(1)
+            },
+        );
+        pointer.observed_abort = observation.watcher.abort_decision();
+        match result {
+            Ok(report) => Ok(crate::dispatch::UnitPosted {
+                posts_returned: report.posts_returned,
+                generation_verifications: report.generation_verifications,
+            }),
+            Err(failure) => {
+                pointer.error = failure.refusal;
+                let refusal = match &pointer.error {
+                    None => super::process_event::ProcessEventRefusal::Cancelled,
+                    Some(DriverError::SyntheticDispatchFailed(failure)) => failure.refusal.clone(),
+                    Some(error) => super::process_event::ProcessEventRefusal::PostCallFailed(
+                        super::process_event::PostCallFailure::new(error.to_string()),
+                    ),
+                };
+                Err(SequencePostFailure {
+                    posts_returned: failure.posts_returned,
+                    held_state: failure.held_state,
+                    refusal,
+                })
+            }
+        }
+    }
+
+    fn finish_observation(
+        &mut self,
+        tap: &Self::Tap,
+        estimator: &mut UserIdleEstimator,
+        user_idle: IdleReading,
+        idle_read_at: Instant,
+    ) {
+        let Some(pointer) = &self.pointer else {
+            return;
+        };
+        let Some(last_post_at) = pointer.last_post_at else {
+            return;
+        };
+        if pointer.error.is_some() || pointer.observed_abort.is_some() {
+            estimator.clear_carry();
+            return;
+        }
+        let deadline = observed_tail_deadline(last_post_at);
+        while Instant::now() < deadline {
+            match tap
+                .events()
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(event) if event_is_ours(sourced_event(&event), self.heartbeat.our_pid) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                _ => {
+                    estimator.clear_carry();
+                    return;
+                }
+            }
+        }
+        // Also drain events accumulated while restoration was in flight.
+        if sourced_from_tap(tap)
+            .into_iter()
+            .any(|event| !event_is_ours(event, self.heartbeat.our_pid))
+        {
+            estimator.clear_carry();
+        } else {
+            estimator.sequence_finished(
+                last_post_at,
+                user_idle,
+                last_post_at.saturating_duration_since(idle_read_at),
+            );
+        }
     }
 }
 
@@ -1231,6 +1446,22 @@ fn verify_cached_tree_owner(target: &ProcessGrant) -> Result<(), DriverError> {
 }
 
 impl MacOs26PlatformDriver {
+    fn pointer_fronting_review_bound(&self) -> bool {
+        [
+            &self.takeover_pointer_fronting_review_revision,
+            &self.takeover_dispatch_review_revision,
+            &self.global_dispatch_review_revision,
+        ]
+        .into_iter()
+        .all(|revision| {
+            revision.as_deref().is_some_and(|value| {
+                !value.trim().is_empty()
+                    && !["placeholder", "tbd", "unknown"]
+                        .iter()
+                        .any(|stand_in| value.eq_ignore_ascii_case(stand_in))
+            })
+        })
+    }
     pub fn new(input: &StartupProbeInput) -> Self {
         Self {
             startup: StartupCapabilityProbe::run(input),
@@ -1238,6 +1469,8 @@ impl MacOs26PlatformDriver {
             expected_post_condition_available: true,
             global_dispatch_review_revision: None,
             takeover_dispatch_review_revision: None,
+            takeover_pointer_fronting_review_revision: None,
+            pointer_fronting: None,
             input_route_evidence: Default::default(),
             user_idle: Arc::new(Mutex::new(UserIdleEstimator::new())),
             fronted_hooks: FrontedHookSlot::default(),
@@ -1248,6 +1481,19 @@ impl MacOs26PlatformDriver {
     /// unavailable unless this revision is supplied.
     pub fn with_takeover_dispatch_review_revision(mut self, revision: Option<String>) -> Self {
         self.takeover_dispatch_review_revision = revision;
+        self
+    }
+
+    pub fn with_takeover_pointer_fronting_review_revision(
+        mut self,
+        revision: Option<String>,
+    ) -> Self {
+        self.takeover_pointer_fronting_review_revision = revision.filter(|value| {
+            !value.trim().is_empty()
+                && !["placeholder", "tbd", "unknown"]
+                    .iter()
+                    .any(|word| value.eq_ignore_ascii_case(word))
+        });
         self
     }
 
@@ -1317,6 +1563,13 @@ impl Default for MacOs26PlatformDriver {
 }
 
 impl PlatformDriver for MacOs26PlatformDriver {
+    fn accept_pointer_fronting(&mut self, guard: super::GlobalPointerGuard) -> bool {
+        if !self.pointer_fronting_review_bound() {
+            return false;
+        }
+        self.pointer_fronting = Some(guard);
+        true
+    }
     fn capability_declarations(
         &self,
         context: &CapabilityAdvertisementContext,
@@ -1591,6 +1844,117 @@ impl PlatformDriver for MacOs26PlatformDriver {
             ));
         }
         request.synthetic.target.validate()?;
+        if let Some(guard) = self.pointer_fronting.take() {
+            if !self.pointer_fronting_review_bound() {
+                return Err(DriverError::StartupRefused(
+                    "pointer fronting review is not bound",
+                ));
+            }
+            let Some(mut hooks) = self.fronted_hooks.0.take() else {
+                return Err(DriverError::StartupRefused(
+                    "pointer restore obligation unavailable",
+                ));
+            };
+            if request.minimum_inter_post_interval_ms < request.maximum_seize_detection_latency_ms {
+                return Err(DriverError::InvalidRequest(
+                    "observed inter-post interval is shorter than the seize-detection bound",
+                ));
+            }
+            let target = &request.synthetic.target;
+            let generation = target
+                .process_generation_evidence
+                .parse::<u64>()
+                .map_err(|_| {
+                    DriverError::InvalidRequest(
+                        "process generation evidence is not a kernel start time",
+                    )
+                })?;
+            if cerebellum_macos::process_start_time_micros(target.pid) != Some(generation) {
+                return Err(DriverError::Unsupported(
+                    "target process generation changed",
+                ));
+            }
+            let started = Instant::now();
+            let (tap, heartbeat) = open_session_observation(started)?;
+            let mut host = MacBracketHost {
+                started,
+                tap: Some(tap),
+                heartbeat,
+                target: ProcessEventTarget {
+                    pid: target.pid,
+                    start_time_micros: generation,
+                },
+                units: vec![Some(super::macos_synthetic::synthetic_event_steps(
+                    &request.synthetic.action,
+                )?)],
+                transport: MacOsPerProcessEventTransport::new(WINDOW_LIST_READ_TIMEOUT),
+                pointer: Some(MacPointerUnit {
+                    guard,
+                    interval_ms: request.minimum_inter_post_interval_ms,
+                    last_post_at: None,
+                    error: None,
+                    observed_abort: None,
+                }),
+            };
+            let plan = crate::dispatch::BracketPlan {
+                target_pid: target.pid,
+                units: 1,
+                maximum_interval_ms: 300,
+                maximum_seize_detection_latency_ms: request.maximum_seize_detection_latency_ms,
+            };
+            let mut estimator = self.user_idle.lock().unwrap_or_else(|p| p.into_inner());
+            let outcome = crate::platform::run_hooked_fronted(
+                &mut host,
+                &mut estimator,
+                plan,
+                cancelled,
+                hooks.as_mut(),
+                None,
+            );
+            if let Some(crate::dispatch::BracketStop::PostFailed(failure)) = &outcome.report.stop {
+                if failure.held_state == super::HeldStateDisposition::Unknown {
+                    if let Some(abort) = host
+                        .pointer
+                        .as_ref()
+                        .and_then(|pointer| pointer.observed_abort)
+                    {
+                        return Err(DriverError::ObservedSequenceFailed {
+                            abort,
+                            failure: Box::new(failure.clone()),
+                        });
+                    }
+                    return Err(DriverError::SyntheticDispatchFailed(failure.clone()));
+                }
+            }
+            if let Some(error) = host.pointer.and_then(|pointer| pointer.error) {
+                return Err(error);
+            }
+            if let Some(crate::dispatch::BracketStop::Aborted(abort)) = outcome.report.stop {
+                return Err(DriverError::ObservedDispatchAborted(abort));
+            }
+            if outcome.report.stop.is_some() || outcome.report.units_posted == 0 {
+                return Err(DriverError::SyntheticDispatchFailed(SequencePostFailure {
+                    posts_returned: outcome.report.posts_returned,
+                    refusal: super::process_event::ProcessEventRefusal::Cancelled,
+                    held_state: super::HeldStateDisposition::NoneHeld,
+                }));
+            }
+            return Ok(DispatchResult {
+                accepted_by_platform: true,
+                effect_status: EffectStatus::EffectIndeterminate,
+                unreadable_subtrees: 0,
+                delivery_posts_returned: outcome.report.posts_returned,
+                delivery_generation_verifications: outcome.report.generation_verifications,
+            });
+        }
+        if matches!(
+            request.synthetic.action,
+            SyntheticAction::ClickPointer { .. }
+        ) {
+            return Err(DriverError::StartupRefused(
+                "pointer fronting review is not bound",
+            ));
+        }
         let mut user_idle = self
             .user_idle
             .lock()
@@ -1641,6 +2005,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
             },
             units,
             transport: MacOsPerProcessEventTransport::for_keyboard(WINDOW_LIST_READ_TIMEOUT),
+            pointer: None,
         };
         let mut user_idle = self
             .user_idle
@@ -1707,6 +2072,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
             },
             units: Vec::new(),
             transport: MacOsPerProcessEventTransport::for_keyboard(WINDOW_LIST_READ_TIMEOUT),
+            pointer: None,
         };
         let mut user_idle = self.user_idle.lock().unwrap_or_else(|p| p.into_inner());
         let plan = crate::dispatch::BracketPlan {
@@ -1932,6 +2298,41 @@ impl PlatformDriver for MacOs26PlatformDriver {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pointer_fronting_requires_its_new_review_and_both_existing_reviews() {
+        let guard = || super::super::GlobalPointerGuard(Arc::new(|| true));
+        for revision in [
+            None,
+            Some(""),
+            Some("placeholder"),
+            Some("tbd"),
+            Some("unknown"),
+            Some("fixture-pointer-review"),
+        ] {
+            let mut driver = MacOs26PlatformDriver::default()
+                .with_global_dispatch_review_revision(Some("fixture-global-review".into()))
+                .with_takeover_dispatch_review_revision(Some("fixture-takeover-review".into()))
+                .with_takeover_pointer_fronting_review_revision(revision.map(str::to_owned));
+            assert_eq!(
+                driver.accept_pointer_fronting(guard()),
+                revision == Some("fixture-pointer-review")
+            );
+        }
+        for missing_takeover in [false, true] {
+            let mut driver = MacOs26PlatformDriver::default()
+                .with_takeover_pointer_fronting_review_revision(Some(
+                    "fixture-pointer-review".into(),
+                ))
+                .with_takeover_dispatch_review_revision(
+                    missing_takeover.then(|| "fixture-takeover-review".into()),
+                )
+                .with_global_dispatch_review_revision(
+                    (!missing_takeover).then(|| "fixture-global-review".into()),
+                );
+            assert!(!driver.accept_pointer_fronting(guard()));
+        }
+    }
+
     /// Two drivers from one factory share one idle estimator: what the first
     /// sequence records, the second reads. A plane builds a driver per
     /// dispatch, so an estimator owned by the driver would be new every time
@@ -2026,6 +2427,7 @@ mod tests {
             element_addressed_review_revision: Some(
                 "fixture-element-addressed-review-v1".to_string(),
             ),
+            takeover_pointer_fronting_review_revision: Some("fixture-pointer-review".into()),
             takeover_dispatch_review_revision: Some(
                 "fixture-takeover-dispatch-review-v1".to_string(),
             ),
@@ -2076,6 +2478,7 @@ mod tests {
         };
         let rows = [
             "computer.takeover_move",
+            "computer.takeover_click",
             "computer.takeover_drag",
             "computer.takeover_scroll",
         ];
@@ -2214,6 +2617,7 @@ mod tests {
                 element_addressed_review_revision: Some(
                     "fixture-element-addressed-review-v1".to_string(),
                 ),
+                takeover_pointer_fronting_review_revision: Some("fixture-pointer-review".into()),
                 takeover_dispatch_review_revision: Some(
                     "fixture-takeover-dispatch-review-v1".to_string(),
                 ),
@@ -2260,6 +2664,7 @@ mod tests {
                 element_addressed_review_revision: Some(
                     "fixture-element-addressed-review-v1".to_string(),
                 ),
+                takeover_pointer_fronting_review_revision: Some("fixture-pointer-review".into()),
                 takeover_dispatch_review_revision: Some(
                     "fixture-takeover-dispatch-review-v1".to_string(),
                 ),
