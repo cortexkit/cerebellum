@@ -474,6 +474,168 @@
         "source": "export const action = input.action == \"read_state\" ? \"Read app\" : input.action == \"press_element\" || input.action == \"press_point\" ? \"Press\" : input.action == \"write_text\" || input.action == \"type\" ? \"Type\" : input.action == \"keys\" ? \"Press keys\" : input.action == \"takeover_move\" ? \"Move pointer\" : input.action == \"takeover_drag\" ? \"Drag\" : input.action == \"takeover_scroll\" ? \"Scroll\" : input.action == \"wait\" ? \"Wait\" : input.action == \"list_apps\" ? \"List apps\" : input.action == \"open_app\" ? \"Open app\" : Replace(input.action, \"_\", \" \")\nexport const outcome = view.completion.outcome ?? view.record.outcome\nexport const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason\nexport const target = input.target ?? input.app ?? \"\"\nexport const appName = !Contains(target, \" \") && Contains(target, \".\") ? Last(Split(target, \".\")) : target\n\n<Card appearance=\"clear\" direction=\"row\" gap=\"s\" align=\"center\">\n<TextContent text={action} maxLines={1} />\n<Slot width=\"fill\">\n<TextContent text={appName} size=\"small\" maxLines={1} />\n</Slot>\n<Slot width=\"short\">\n{outcome == \"held\" ? <Badge text={reason == \"login_handoff\" ? \"Signed out\" : \"Asked you\"} tone=\"neutral\" /> : outcome == \"error\" ? <Badge text=\"Refused\" tone=\"danger\" /> : outcome == \"partial\" ? <Badge text=\"Unknown\" tone=\"warning\" /> : outcome == \"success\" ? <Badge text=\"Done\" tone=\"neutral\" /> : null}\n</Slot>\n<Slot width=\"short\">\n{outcome == null && view.call.phase == \"running\" ? <Elapsed start={view.call.startedAtMs ?? now} /> : view.completion.durationMs == null && view.record.durationMs == null ? null : <TextContent text={FormatDuration(view.completion.durationMs ?? view.record.durationMs ?? 0)} size=\"small\" maxLines={1} />}\n</Slot>\n</Card>\n"
       }
     },
-    "template_revision": 2
+    "template_revision": 2,
+    "tool": {
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "read_state",
+              "press_element",
+              "press_point",
+              "write_text",
+              "type",
+              "keys",
+              "takeover_move",
+              "takeover_drag",
+              "takeover_scroll",
+              "wait",
+              "list_apps",
+              "open_app"
+            ],
+            "type": "string"
+          },
+          "amount_lines": {
+            "maximum": 100,
+            "minimum": -100,
+            "type": "integer"
+          },
+          "app": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "axis": {
+            "enum": [
+              "vertical",
+              "horizontal"
+            ],
+            "type": "string"
+          },
+          "bring_to_front": {
+            "default": false,
+            "type": "boolean"
+          },
+          "element_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "element_ids": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "type": "array"
+          },
+          "from": {
+            "additionalProperties": false,
+            "properties": {
+              "x": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "y": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "image_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "include_image": {
+            "type": "boolean"
+          },
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "predicate": {
+            "type": "string"
+          },
+          "role_filter": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "type": "array"
+          },
+          "target": {
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "text_filter": {
+            "type": "string"
+          },
+          "timeout_ms": {
+            "maximum": 30000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "to": {
+            "additionalProperties": false,
+            "properties": {
+              "x": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "y": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "url": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "write_mode": {
+            "enum": [
+              "replace_value",
+              "insert_at_caret"
+            ],
+            "type": "string"
+          },
+          "x": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "y": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "zoom": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "computer_use",
+      "semantics": 1
+    }
   }
 }

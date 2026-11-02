@@ -3,8 +3,11 @@
 //! A view is keyed by a schema pin: `tp1:<tool>:<schema digest>:<semantics>`,
 //! which names one version of one tool's definition. Old transcripts keep the
 //! pin their call was made with, so once a pin's view is published it must keep
-//! being served, with the same record schema and reads, even after the tool's
-//! definition changes. `published-v1.json` is that permanent list.
+//! being served, with the same record schema, reads and tool definition, even
+//! after the tool's definition changes. `published-v1.json` is that permanent
+//! list, and it stores each pin's tool definition as data: the display server
+//! recomputes the pin from it, so a pin that has left the current catalog still
+//! renders.
 
 use super::*;
 use cortexkit_role_tool_provider::views::{ViewEntry, ViewManifest, ViewsReply, ViewsRequest};
@@ -34,30 +37,40 @@ fn template(profile: &str, source: &str) -> Value {
     })
 }
 
+fn templates(tool: &str) -> (&'static str, &'static str) {
+    match tool {
+        flat_tools::BROWSER_USE => (BROWSER_ROW, BROWSER_PAGE),
+        flat_tools::COMPUTER_USE => (COMPUTER_ROW, COMPUTER_PAGE),
+        _ => panic!("published pin has no templates"),
+    }
+}
+
+/// The view for one pin, read from the published table as data. Neither the
+/// record schema, the reads nor the tool definition is rebuilt from current
+/// code, so a later definition change cannot alter a pin already served.
+fn view(pin: &str, entry: &Value) -> ViewManifest {
+    let tool = SchemaPin::parse(pin).expect("published pin").tool;
+    let (row, page) = templates(&tool);
+    let schema = serde_json::from_value(entry["record_schema"].clone()).expect("kept schema");
+    let reads = serde_json::from_value(entry["reads"].clone()).expect("kept reads");
+    let tool = serde_json::from_value(entry["tool"].clone()).expect("kept tool definition");
+    let template = json!({
+        "row": template("tool_row", row),
+        "page": template("tool_page", page),
+    });
+    ViewManifest::new(schema, reads, template)
+        .with_template_revision(TEMPLATE_REVISION)
+        .with_tool(tool)
+}
+
 fn published() -> BTreeMap<String, ViewManifest> {
     let entries: BTreeMap<String, Value> =
         serde_json::from_str(PUBLISHED).expect("published views");
     entries
         .into_iter()
         .map(|(pin, entry)| {
-            let tool = SchemaPin::parse(&pin).expect("published pin").tool;
-            let (row, page) = match tool.as_str() {
-                flat_tools::BROWSER_USE => (BROWSER_ROW, BROWSER_PAGE),
-                flat_tools::COMPUTER_USE => (COMPUTER_ROW, COMPUTER_PAGE),
-                _ => panic!("published pin has no templates"),
-            };
-            let schema =
-                serde_json::from_value(entry["record_schema"].clone()).expect("kept schema");
-            let reads = serde_json::from_value(entry["reads"].clone()).expect("kept reads");
-            let template = json!({
-                "row": template("tool_row", row),
-                "page": template("tool_page", page),
-            });
-            (
-                pin,
-                ViewManifest::new(schema, reads, template)
-                    .with_template_revision(TEMPLATE_REVISION),
-            )
+            let view = view(&pin, &entry);
+            (pin, view)
         })
         .collect()
 }

@@ -11,7 +11,236 @@
         "site": "web_origin"
       }
     },
-    "reads": []
+    "reads": [],
+    "tool": {
+      "name": "browser_use",
+      "semantics": 1,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "action": {
+            "enum": [
+              "launch",
+              "open_tab",
+              "claim_tab",
+              "status",
+              "close",
+              "navigate",
+              "snapshot",
+              "screenshot",
+              "scroll",
+              "click",
+              "type",
+              "click_point",
+              "fill_login",
+              "open_grant",
+              "present",
+              "resume",
+              "import_login",
+              "capture_login",
+              "revoke_access"
+            ],
+            "type": "string"
+          },
+          "amount": {
+            "default": 600,
+            "maximum": 10000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "browser": {
+            "enum": [
+              "own",
+              "user"
+            ],
+            "type": "string"
+          },
+          "browser_session_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "clear_first": {
+            "default": false,
+            "type": "boolean"
+          },
+          "credential_domain": {
+            "type": "string"
+          },
+          "direction": {
+            "enum": [
+              "up",
+              "down",
+              "left",
+              "right"
+            ],
+            "type": "string"
+          },
+          "fetch_url": {
+            "type": "string"
+          },
+          "hazards": {
+            "items": {
+              "enum": [
+                "credential_form_submit",
+                "financial_form_submit",
+                "unverified_form_contents"
+              ],
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          },
+          "image_height_px": {
+            "type": "integer"
+          },
+          "image_width_px": {
+            "type": "integer"
+          },
+          "intent": {
+            "type": "string"
+          },
+          "login_url": {
+            "type": "string"
+          },
+          "max_bytes": {
+            "default": 5000,
+            "maximum": 262144,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "mode": {
+            "default": "actionable",
+            "enum": [
+              "actionable",
+              "ax",
+              "dom_full"
+            ],
+            "type": "string"
+          },
+          "origin": {
+            "type": "string"
+          },
+          "origins": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 256,
+            "minItems": 1,
+            "type": "array"
+          },
+          "otp_ref": {
+            "type": "string"
+          },
+          "password_ref": {
+            "type": "string"
+          },
+          "point": {
+            "additionalProperties": false,
+            "properties": {
+              "x": {
+                "type": "integer"
+              },
+              "y": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "read_page": {
+            "default": false,
+            "type": "boolean"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "role_filter": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "type": "array"
+          },
+          "secret": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "severity": {
+            "additionalProperties": false,
+            "properties": {
+              "credential": {
+                "type": "boolean"
+              },
+              "financial": {
+                "type": "boolean"
+              },
+              "tier": {
+                "maximum": 5,
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "tier",
+              "credential",
+              "financial"
+            ],
+            "type": "object"
+          },
+          "severity_tier": {
+            "maximum": 4,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "snapshot_id": {
+            "type": "string"
+          },
+          "tab": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 10000,
+            "type": "string"
+          },
+          "text_filter": {
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "username_ref": {
+            "type": "string"
+          },
+          "wait": {
+            "enum": [
+              "settle",
+              "none"
+            ],
+            "type": "string"
+          },
+          "zoom": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      }
+    }
   },
   "tp1:computer_use:9ee42a746247a28d0b25686acd76b0687e8b6c7f439d0776fd5d6fd9cc67b9a2:1": {
     "record_schema": {
@@ -25,6 +254,168 @@
         "site": "web_origin"
       }
     },
-    "reads": []
+    "reads": [],
+    "tool": {
+      "name": "computer_use",
+      "semantics": 1,
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "read_state",
+              "press_element",
+              "press_point",
+              "write_text",
+              "type",
+              "keys",
+              "takeover_move",
+              "takeover_drag",
+              "takeover_scroll",
+              "wait",
+              "list_apps",
+              "open_app"
+            ],
+            "type": "string"
+          },
+          "amount_lines": {
+            "maximum": 100,
+            "minimum": -100,
+            "type": "integer"
+          },
+          "app": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "axis": {
+            "enum": [
+              "vertical",
+              "horizontal"
+            ],
+            "type": "string"
+          },
+          "bring_to_front": {
+            "default": false,
+            "type": "boolean"
+          },
+          "element_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "element_ids": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "type": "array"
+          },
+          "from": {
+            "additionalProperties": false,
+            "properties": {
+              "x": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "y": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "image_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "include_image": {
+            "type": "boolean"
+          },
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "predicate": {
+            "type": "string"
+          },
+          "role_filter": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "type": "array"
+          },
+          "target": {
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "text_filter": {
+            "type": "string"
+          },
+          "timeout_ms": {
+            "maximum": 30000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "to": {
+            "additionalProperties": false,
+            "properties": {
+              "x": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "y": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "url": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "write_mode": {
+            "enum": [
+              "replace_value",
+              "insert_at_caret"
+            ],
+            "type": "string"
+          },
+          "x": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "y": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "zoom": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      }
+    }
   }
 }
