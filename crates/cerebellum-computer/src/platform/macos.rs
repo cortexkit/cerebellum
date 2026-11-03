@@ -469,6 +469,8 @@ fn read_hid_idle() -> IdleReading {
 /// target's exact process generation. Session observation is the same as the
 /// global pointer sequence's.
 struct MacBracketHost {
+    #[cfg(test)]
+    pointer_primitives: Option<pointer::TestPrimitives>,
     started: Instant,
     tap: Option<cerebellum_macos::SessionEventTap>,
     heartbeat: HeartbeatPoster,
@@ -584,6 +586,8 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
         let cancelled = observation.cancelled;
         let event_count = steps.len();
         let mut operations = pointer::NativePointerOperations {
+            #[cfg(test)]
+            primitives: self.pointer_primitives.as_mut(),
             started: self.started,
             target: self.target,
             transport: &mut self.transport,
@@ -1800,6 +1804,17 @@ impl PlatformDriver for MacOs26PlatformDriver {
             ));
         }
         request.synthetic.target.validate()?;
+        if !super::DOWN_GESTURE_RECOVERY_MEASURED
+            && self.pointer_fronting_review_bound()
+            && matches!(
+                request.synthetic.action,
+                SyntheticAction::ClickPointer { .. } | SyntheticAction::DragPointer { .. }
+            )
+        {
+            return Err(DriverError::StartupRefused(
+                "mouse-up routing measurement is not recorded",
+            ));
+        }
         if let Some(guard) = self.pointer_fronting.take() {
             if !self.pointer_fronting_review_bound() {
                 return Err(DriverError::StartupRefused(
@@ -1833,6 +1848,8 @@ impl PlatformDriver for MacOs26PlatformDriver {
             let started = Instant::now();
             let (tap, heartbeat) = open_session_observation(started)?;
             let mut host = MacBracketHost {
+                #[cfg(test)]
+                pointer_primitives: None,
                 started,
                 tap: Some(tap),
                 heartbeat,
@@ -1952,6 +1969,8 @@ impl PlatformDriver for MacOs26PlatformDriver {
             maximum_seize_detection_latency_ms: request.maximum_seize_detection_latency_ms,
         };
         let mut host = MacBracketHost {
+            #[cfg(test)]
+            pointer_primitives: None,
             started,
             tap: Some(tap),
             heartbeat,
@@ -2019,6 +2038,8 @@ impl PlatformDriver for MacOs26PlatformDriver {
         let started = Instant::now();
         let (tap, heartbeat) = open_session_observation(started)?;
         let mut host = MacBracketHost {
+            #[cfg(test)]
+            pointer_primitives: None,
             started,
             tap: Some(tap),
             heartbeat,
@@ -2256,7 +2277,7 @@ mod tests {
 
     #[test]
     fn pointer_fronting_requires_its_new_review_and_both_existing_reviews() {
-        let guard = || super::super::GlobalPointerGuard(Arc::new(|| true));
+        let guard = || super::super::GlobalPointerGuard(Arc::new(|| Ok(())));
         for revision in [
             None,
             Some(""),
@@ -2286,6 +2307,51 @@ mod tests {
                     (!missing_takeover).then(|| "fixture-global-review".into()),
                 );
             assert!(!driver.accept_pointer_fronting(guard()));
+        }
+    }
+
+    #[test]
+    fn native_fronted_down_gestures_refuse_even_with_all_reviews_bound() {
+        let point = SyntheticPoint { x: 10.0, y: 20.0 };
+        for action in [
+            SyntheticAction::ClickPointer { point },
+            SyntheticAction::drag_pointer(point, point),
+        ] {
+            for install_guard in [false, true] {
+                let mut driver = MacOs26PlatformDriver::default()
+                    .with_global_dispatch_review_revision(Some("fixture-global".into()))
+                    .with_takeover_dispatch_review_revision(Some("fixture-takeover".into()))
+                    .with_takeover_pointer_fronting_review_revision(Some("fixture-pointer".into()));
+                if install_guard {
+                    assert!(
+                        driver.accept_pointer_fronting(super::super::GlobalPointerGuard(Arc::new(
+                            || panic!("interlock must precede containment and OS calls")
+                        )))
+                    );
+                }
+                let result = driver.dispatch_global(
+                    GlobalDispatchRequest {
+                        synthetic: SyntheticDispatchRequest {
+                            target: ProcessGrant {
+                                pid: 42,
+                                bundle_identity: "com.example.target".into(),
+                                process_generation_evidence: "123".into(),
+                            },
+                            action: action.clone(),
+                        },
+                        once_dispatch_token:
+                            cerebellum_core::consent::OnceDispatchToken::admitted_by_takeover_grant(
+                            ),
+                        maximum_seize_detection_latency_ms: 50,
+                        minimum_inter_post_interval_ms: 50,
+                    },
+                    &|| false,
+                );
+                assert_eq!(
+                    result.unwrap_err(),
+                    DriverError::StartupRefused("mouse-up routing measurement is not recorded")
+                );
+            }
         }
     }
 

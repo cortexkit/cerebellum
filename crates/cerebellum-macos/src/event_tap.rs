@@ -345,13 +345,24 @@ mod framework {
     /// A listen-only session event tap on its own run-loop thread.
     pub struct SessionEventTap {
         events: Receiver<SessionEvent>,
-        port: CFRetained<CFMachPort>,
+        port: Option<CFRetained<CFMachPort>>,
         run_loop: Option<CFRetained<CFRunLoop>>,
         thread: Option<JoinHandle<()>>,
         user_info: *mut TapCallbackState,
     }
 
     impl SessionEventTap {
+        /// Channel-only test seam: no OS tap, thread, permission query or posts.
+        #[cfg(any(test, feature = "test-support"))]
+        pub fn from_test_channel(events: Receiver<SessionEvent>) -> Self {
+            Self {
+                events,
+                port: None,
+                run_loop: None,
+                thread: None,
+                user_info: std::ptr::null_mut(),
+            }
+        }
         /// Start one process-lifetime observer lazily at the first state read.
         /// No permission request is made. Missing access or a disabled tap is
         /// unavailable, never evidence that a person acted. Coverage begins
@@ -472,7 +483,7 @@ mod framework {
             match ready_rx.recv() {
                 Ok(Ok(SendRunLoop(run_loop))) => Ok(Self {
                     events: rx,
-                    port,
+                    port: Some(port),
                     run_loop: Some(run_loop),
                     thread: Some(thread),
                     user_info,
@@ -507,7 +518,11 @@ mod framework {
         /// (`kCGEventTapDisabledByTimeout`). This reports that state; it does
         /// not re-enable the tap.
         pub fn is_enabled(&self) -> bool {
-            CGEvent::tap_is_enabled(&self.port)
+            self.port
+                .as_ref()
+                .map_or(cfg!(any(test, feature = "test-support")), |port| {
+                    CGEvent::tap_is_enabled(port)
+                })
         }
     }
 
@@ -517,14 +532,18 @@ mod framework {
         }
 
         fn enable(&self) {
-            CGEvent::tap_enable(&self.port, true);
+            if let Some(port) = &self.port {
+                CGEvent::tap_enable(port, true);
+            }
         }
     }
 
     impl Drop for SessionEventTap {
         fn drop(&mut self) {
-            CGEvent::tap_enable(&self.port, false);
-            self.port.invalidate();
+            if let Some(port) = &self.port {
+                CGEvent::tap_enable(port, false);
+                port.invalidate();
+            }
             if let Some(run_loop) = self.run_loop.take() {
                 run_loop.stop();
                 run_loop.wake_up();
@@ -535,7 +554,9 @@ mod framework {
             // SAFETY: the run-loop thread has joined, so the callback can no
             // longer observe this pointer.
             unsafe {
-                drop(Box::from_raw(self.user_info));
+                if !self.user_info.is_null() {
+                    drop(Box::from_raw(self.user_info));
+                }
             }
         }
     }

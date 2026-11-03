@@ -141,10 +141,10 @@ mod window_image;
 #[cfg(all(target_os = "macos", feature = "desk-probe"))]
 pub use window_image::{
     current_app_activation_mode_raw, pointer_hit_test_startup_diagnosis,
-    pointer_probe_own_window_count, pointer_probe_posting_permitted,
+    pointer_probe_own_window_count, pointer_probe_posting_permitted, prepare_pointer_hit_tests,
 };
 #[cfg(target_os = "macos")]
-pub use window_image::{pointer_window_at, prepare_pointer_hit_tests};
+pub use window_image::{cursor_position, pointer_window_at};
 #[cfg(any(target_os = "macos", test))]
 mod window_visibility;
 #[cfg(any(target_os = "macos", test))]
@@ -213,9 +213,10 @@ pub use input::{
 };
 #[cfg(target_os = "macos")]
 pub use launch::{
-    executed_image_identity, process_descriptors, spawn_barred, spawn_barred_stdin,
-    terminate_exact_generation, BarredChild, ExecutedImageIdentity, ImageIdentityError,
-    ProcessControlError, ProcessGeneration, ReleasedChild, SpawnError, TerminationOutcome,
+    executed_image_identity, process_descriptors, spawn_barred, spawn_barred_cursor,
+    spawn_barred_stdin, terminate_exact_generation, BarredChild, ExecutedImageIdentity,
+    ImageIdentityError, ProcessControlError, ProcessGeneration, ReleasedChild, SpawnError,
+    TerminationOutcome,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{

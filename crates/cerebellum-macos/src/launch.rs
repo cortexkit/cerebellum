@@ -23,6 +23,9 @@ const O_WRONLY: c_int = 1;
 const NULL_DEVICE: &std::ffi::CStr = c"/dev/null";
 const F_DUPFD_CLOEXEC: c_int = 67;
 const F_SETFD: c_int = 2;
+const F_GETFL: c_int = 3;
+const F_SETFL: c_int = 4;
+const O_NONBLOCK: c_int = 0x0004;
 const FD_CLOEXEC: c_int = 1;
 // The value on Darwin. Declared here beside the other signal and fcntl
 // constants rather than pulled from a crate, matching this module's existing
@@ -58,8 +61,6 @@ const SIG_IGN: usize = 1;
 const SIG_ERR: usize = usize::MAX;
 #[cfg(test)]
 const WNOHANG: c_int = 1;
-#[cfg(test)]
-const F_GETFL: c_int = 3;
 #[cfg(test)]
 const O_ACCMODE: c_int = 3;
 const PROC_PIDLISTFDS: c_int = 1;
@@ -551,6 +552,31 @@ pub fn spawn_barred_stdin(
     Ok((child, write))
 }
 
+/// Cursor-helper command pipe on stdin and a private reply pipe on fd 4.
+/// Standard output/error remain /dev/null; no daemon descriptors are inherited.
+pub fn spawn_barred_cursor(
+    executable: &Path,
+    arguments: &[OsString],
+) -> Result<(BarredChild, OwnedFd, OwnedFd), SpawnError> {
+    let (read, write) = create_pipe()?;
+    // Queries must never wait for pipe space.
+    let flags = unsafe { fcntl(write.as_raw_fd(), F_GETFL) };
+    if flags < 0 || unsafe { fcntl(write.as_raw_fd(), F_SETFL, flags | O_NONBLOCK) } < 0 {
+        return Err(SpawnError::Pipe(io::Error::last_os_error().kind()));
+    }
+    let (reply_read, reply_write) = create_pipe()?;
+    let child = spawn_barred_impl(
+        executable,
+        arguments,
+        &[],
+        read.as_raw_fd(),
+        reply_write.as_raw_fd(),
+        true,
+        true,
+    )?;
+    Ok((child, write, reply_read))
+}
+
 fn spawn_barred_impl(
     executable: &Path,
     arguments: &[OsString],
@@ -851,7 +877,7 @@ fn prepare_spawn(
     if status == 0 && !stdin_mode {
         status = unsafe { posix_spawn_file_actions_adddup2(&mut actions, command_source, 3) };
     }
-    if status == 0 && !stdin_mode {
+    if status == 0 {
         status = unsafe { posix_spawn_file_actions_adddup2(&mut actions, response_source, 4) };
     }
     // Standard descriptors are opened fresh on /dev/null in the child rather
@@ -870,7 +896,7 @@ fn prepare_spawn(
     if status == 0 && stdin_mode {
         status = unsafe { posix_spawn_file_actions_adddup2(&mut actions, command_source, 0) };
     }
-    for fd in if stdin_mode { 0..=0 } else { 3..=4 } {
+    for fd in if stdin_mode { [0, 4] } else { [3, 4] } {
         if status == 0 {
             status = unsafe { posix_spawn_file_actions_addinherit_np(&mut actions, fd) };
         }
@@ -2325,4 +2351,26 @@ fn other() {
             "comments, strings or a relocated launch were flagged: {violations:?}"
         );
     }
+}
+#[test]
+fn cursor_helper_private_reply_pipe_is_separate_from_standard_output() {
+    use std::io::{Read, Write};
+    let (barred, commands, replies) = spawn_barred_cursor(
+        Path::new("/bin/sh"),
+        &[
+            "-c".into(),
+            "read line; printf '%s\\n' \"$line\" >&4; printf 'must-not-reach-reply'".into(),
+        ],
+    )
+    .unwrap();
+    let child = barred.release().unwrap();
+    std::fs::File::from(commands)
+        .write_all(b"private-query\n")
+        .unwrap();
+    let mut reply = String::new();
+    std::fs::File::from(replies)
+        .read_to_string(&mut reply)
+        .unwrap();
+    child.wait().unwrap();
+    assert_eq!(reply, "private-query\n");
 }

@@ -144,12 +144,9 @@ mod probe {
     }
 
     fn receiver_window_at() -> Option<u32> {
-        // Match production's blocking worker instead of assuming a successful
-        // main-thread query proves that off-main-thread reads work.
-        std::thread::spawn(|| pointer_window_at(POINT.x, POINT.y))
-            .join()
-            .ok()
-            .flatten()
+        // The production cursor helper runs this same AppKit query on its main
+        // thread. The VM probe owns its own main-thread AppKit instance.
+        pointer_window_at(POINT.x, POINT.y)
     }
 
     pub(super) fn run() -> Result<()> {
@@ -188,9 +185,9 @@ mod probe {
         writeln!(out, "Logs: {}", root.display())?;
         writeln!(
             out,
-            "case | down window | A up | B up | receipt (1 second observation)"
+            "case | down window | recovery guard | A up | B up | receipt (1 second observation)"
         )?;
-        for case in ["baseline", "move", "close", "terminate"] {
+        for case in ["baseline", "move", "close", "terminate", "secure-focus"] {
             let mut b = App::start(&root.join("B.app"), root.join(format!("{case}-B.log")))?;
             b.command("raise")?;
             let mut a = App::start(&root.join("A.app"), root.join(format!("{case}-A.log")))?;
@@ -208,15 +205,19 @@ mod probe {
                 match case {
                     "move" => a.command("move")?,
                     "close" => a.command("close")?,
+                    "secure-focus" => a.command("secure-focus")?,
                     "terminate" => {
                         a.child.kill()?;
                         a.child.wait()?;
                     }
                     _ => {}
                 }
-                if case != "baseline" {
+                if matches!(case, "move" | "close" | "terminate") {
                     b.command("raise")?;
                     wait_top(b.window)?;
+                }
+                if case == "secure-focus" {
+                    wait_top(a.window)?;
                 }
                 Ok(())
             })();
@@ -241,7 +242,16 @@ mod probe {
                 (0, 0) if case != "baseline" => "none observed",
                 _ => return Err(format!("{case}: ambiguous receipts A={a_ups} B={b_ups}").into()),
             };
-            writeln!(out, "{case} | {} | {a_ups} | {b_ups} | {receipt}", a.window)?;
+            let guard = match case {
+                "baseline" => "requires fresh containment/sensitivity",
+                "secure-focus" => "BLOCKED: secure focused field in same window",
+                _ => "BLOCKED: original recipient lost",
+            };
+            writeln!(
+                out,
+                "{case} | {} | {guard} | {a_ups} | {b_ups} | {receipt}",
+                a.window
+            )?;
         }
         Ok(())
     }
@@ -289,6 +299,13 @@ DispatchQueue.global().async {
                 window.orderFrontRegardless()
             case "move": window.setFrameOrigin(NSPoint(x: 600, y: screen.height - 320))
             case "close": window.close()
+            case "secure-focus":
+                let secure = NSSecureTextField(frame: NSRect(x: 20, y: 20, width: 180, height: 28))
+                window.contentView!.addSubview(secure)
+                window.makeKeyAndOrderFront(nil)
+                window.makeFirstResponder(secure)
+                guard window.firstResponder === secure.currentEditor() else { exit(3) }
+                record("secure focused \(window.windowNumber)")
             case "barrier": break
             default: exit(2)
             }

@@ -2152,8 +2152,10 @@ impl State {
 
 #[cfg(target_os = "macos")]
 fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
-    use std::io::Write;
-    let mut helper: Option<(cerebellum_macos::ReleasedChild, std::fs::File)> = None;
+    use cerebellum_computer::pointer_query::{self, Client, Reply, MAX_REPLY_BYTES};
+    use std::io::{BufRead, Read, Write};
+    type Writer = Arc<std::sync::Mutex<Box<dyn Write + Send>>>;
+    let mut helper: Option<(cerebellum_macos::ReleasedChild, Writer)> = None;
     let mut restarts = RestartLimit::default();
     write_lines(&state, &mut rx, |event| {
         // A locked or unreadable screen never launches or displays the helper.
@@ -2178,8 +2180,8 @@ fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let executable = helper_launch_path(pinned.as_ref())?;
-                let (barred, pipe) =
-                    cerebellum_macos::spawn_barred_stdin(&executable, &["--agent-cursor".into()])
+                let (barred, pipe, replies) =
+                    cerebellum_macos::spawn_barred_cursor(&executable, &["--agent-cursor".into()])
                         .ok()?;
                 if !pinned.as_ref()?.accepts_child(barred.generation().pid) {
                     HELPER_BINARY_UNAVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2196,7 +2198,39 @@ fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
                 cerebellum_macos::register_cursor_generation(*generation);
                 drop(generation);
                 let child = barred.release().ok()?;
-                Some((child, std::fs::File::from(pipe)))
+                let pipe: Writer =
+                    Arc::new(std::sync::Mutex::new(Box::new(std::fs::File::from(pipe))));
+                let (tx, rx) = std::sync::mpsc::sync_channel(32);
+                std::thread::Builder::new()
+                    .name("cursor-pointer-replies".into())
+                    .spawn(move || {
+                        let mut reader = std::io::BufReader::new(std::fs::File::from(replies));
+                        loop {
+                            let mut line = Vec::new();
+                            let read = reader
+                                .by_ref()
+                                .take(MAX_REPLY_BYTES + 1)
+                                .read_until(b'\n', &mut line);
+                            if !matches!(read, Ok(1..)) {
+                                break;
+                            }
+                            let reply = if line.len() as u64 > MAX_REPLY_BYTES
+                                || line.last() != Some(&b'\n')
+                            {
+                                Err("mouse-down recipient helper reply malformed")
+                            } else {
+                                serde_json::from_slice::<Reply>(&line)
+                                    .map_err(|_| "mouse-down recipient helper reply malformed")
+                            };
+                            let malformed = reply.is_err();
+                            if tx.try_send(reply).is_err() || malformed {
+                                break;
+                            }
+                        }
+                    })
+                    .ok()?;
+                pointer_query::set_helper(Some(Arc::new(Client::new(pipe.clone(), rx))));
+                Some((child, pipe))
             })();
             helper = launched;
             // A helper that did not start draws nothing; until another one
@@ -2211,10 +2245,16 @@ fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
         let Some((_, pipe)) = helper.as_mut() else {
             return false;
         };
-        if pipe.write_all(&line).is_ok() {
+        if pipe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write_all(&line)
+            .is_ok()
+        {
             return true;
         }
         helper.take();
+        pointer_query::set_helper(None);
         cerebellum_macos::register_cursor_generation(None);
         *state
             .generation
@@ -2222,6 +2262,7 @@ fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         false
     });
+    pointer_query::set_helper(None);
     drop(helper);
 }
 

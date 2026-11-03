@@ -29,6 +29,15 @@ use crate::dispatch::{DispatchError, MutationGate, OpenGate};
 use crate::platform::input_route::InputRouteEvidence;
 use crate::platform::ProcessGrant;
 
+static RESERVATION_CLEANUP_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Process-lifetime count of unused reservations whose destructor could not
+/// durably close the journal row. No journal content is retained here.
+pub fn audit_reservation_cleanup_failures() -> u64 {
+    RESERVATION_CLEANUP_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The audit steps the dispatcher needs for one actuation.
 ///
 /// Implemented by [`AuditToken`], which production workers use, and by
@@ -166,7 +175,12 @@ impl<R: Redactor, T: SeverityTaxonomy, S: JournalStorage> Drop for AuditToken<R,
         // its reservation. Close it as stopped; committed intents are not in
         // the unused-reservation slot and remain the dispatcher's responsibility. Explicit
         // refusal paths call release_unused so journal errors reach the reply.
-        let _ = self.release_unused(&DispatchError::DispatchStopped);
+        if self
+            .release_unused(&DispatchError::DispatchStopped)
+            .is_err()
+        {
+            RESERVATION_CLEANUP_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

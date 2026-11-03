@@ -468,6 +468,21 @@ fn capability_declaration(
             Some("takeover pointer fronting review revision is not bound".to_string())
         } else if !context.inputs.takeover_dispatch_ready() {
             Some("release signing topology revision is not bound".to_string())
+        } else if !DOWN_GESTURE_RECOVERY_MEASURED
+            && (capability == ComputerCapability::TakeoverClick
+                || (capability == ComputerCapability::TakeoverDrag
+                    && context
+                        .inputs
+                        .takeover_pointer_fronting_review_revision
+                        .as_deref()
+                        .is_some_and(|value| {
+                            !value.trim().is_empty()
+                                && !["placeholder", "tbd", "unknown"]
+                                    .iter()
+                                    .any(|stand_in| value.eq_ignore_ascii_case(stand_in))
+                        })))
+        {
+            Some("mouse-up routing measurement is not recorded".to_string())
         } else {
             None
         };
@@ -596,6 +611,14 @@ fn capability_declaration(
         suppression_reason,
     }
 }
+
+/// Keep fronted button-down gestures unavailable until `mouse_up_routing_probe`
+/// measures secure-focus, moved/closed windows and termination. The receipts
+/// must establish how a held button can be released without acting on an
+/// unrelated target after containment or sensitivity changes. Record that
+/// justification in `.cortexkit/internal-docs/designs/takeover-pointer-fronting-review-packet.md`,
+/// section "Live evidence still to collect", before changing this constant.
+pub const DOWN_GESTURE_RECOVERY_MEASURED: bool = false;
 
 /// Platform-neutral semantic action intents a semantic dispatch may carry.
 pub const SEMANTIC_PRESS_ACTION: &str = "press";
@@ -1079,7 +1102,9 @@ pub struct GlobalDispatchRequest {
 /// Revalidate coordinate containment immediately before each pointer post.
 /// The callback owns its image/session data and may not post input itself.
 #[derive(Clone)]
-pub struct GlobalPointerGuard(pub std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
+pub struct GlobalPointerGuard(
+    pub std::sync::Arc<dyn Fn() -> Result<(), &'static str> + Send + Sync>,
+);
 
 impl std::fmt::Debug for GlobalPointerGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

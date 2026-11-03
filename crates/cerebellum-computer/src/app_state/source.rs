@@ -623,6 +623,16 @@ pub trait AppStateSource: Send + Sync {
         None
     }
 
+    /// The same query with a failure step for the guarded posting refusal.
+    fn pointer_recipient(&self, point: (f64, f64)) -> Result<Option<u32>, &'static str> {
+        Ok(self.pointer_window_at(point))
+    }
+
+    /// The real cursor, not the agent's visual badge. Missing telemetry refuses scroll.
+    fn cursor_position(&self) -> Option<(f64, f64)> {
+        None
+    }
+
     /// The target application's own focused element, asked of that
     /// application rather than of whichever one is frontmost.
     fn focused_element(

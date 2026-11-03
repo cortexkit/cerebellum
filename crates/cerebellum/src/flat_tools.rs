@@ -306,9 +306,11 @@ pub(crate) fn pointer_fronting_definition(admitted: &[String]) -> bool {
     admitted
         .iter()
         .any(|name| name == "computer.takeover_click")
+        || (admitted.iter().any(|name| name == "computer.takeover_move")
+            && !admitted.iter().any(|name| name == "computer.takeover_drag"))
 }
 
-fn computer_description(pointer_fronting: bool) -> String {
+fn computer_description(pointer_fronting: bool, click: bool) -> String {
     if !pointer_fronting {
         return COMPUTER_DESCRIPTION.to_owned();
     }
@@ -318,7 +320,15 @@ fn computer_description(pointer_fronting: bool) -> String {
         " Presses, writes, keys and type accept read filters for their returned state.",
         " press_element takes element_id or 1-8 ordered same-app element_ids; stops on failure, returns steps and one report.",
     ] { description = description.replace(duplicated, ""); }
-    description.replace("Covered images are withheld; see bring_to_front.", "Covered images are withheld; see bring_to_front. Under takeover, pointer actions front the target if needed, then restore the previous app unless the person switched apps. Global delivery is best-effort; drawn credential/payment forms are undetected. takeover_click left-clicks image x/y; press_point uses accessibility.")
+    let mut replacement = "Covered images are withheld; see bring_to_front. Under takeover, pointer actions front the target if needed, then restore the previous app unless the person switched apps. Global delivery is best-effort; drawn credential/payment forms are undetected.".to_owned();
+    if click {
+        replacement
+            .push_str(" takeover_click left-clicks image x/y; press_point uses accessibility.");
+    }
+    description.replace(
+        "Covered images are withheld; see bring_to_front.",
+        &replacement,
+    )
 }
 
 pub fn computer_tool(admitted: &[String]) -> Option<Tool> {
@@ -367,7 +377,12 @@ pub fn computer_tool(admitted: &[String]) -> Option<Tool> {
     );
     Some(Tool {
         name: COMPUTER_USE.into(),
-        description: Some(computer_description(pointer_fronting)),
+        description: Some(computer_description(
+            pointer_fronting,
+            admitted
+                .iter()
+                .any(|name| name == "computer.takeover_click"),
+        )),
         execution_mode: ExecutionMode::Unfenceable,
         // Flat: no root-level union. Which fields each action needs is in
         // the property descriptions (see `annotate_required_actions`).
@@ -2047,6 +2062,7 @@ mod tests {
                 })
                 .with_permission_liveness(crate::computer_capability::live_for_test())
                 .with_takeover_pointer_fronting_admitted(true)
+                .with_measured_pointer_recovery_for_test()
                 .with_session_lock_for_test(Some(false)),
             )
         });

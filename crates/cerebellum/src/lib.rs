@@ -593,6 +593,10 @@ fn declaration_gate_passes(
         // these admissions is inferred from another row's artifact.
         (id != "computer.takeover_click"
             || gate_passes(outcomes, "takeover_pointer_fronting_review_revision"))
+            && (cerebellum_computer::platform::DOWN_GESTURE_RECOVERY_MEASURED
+                || (id != "computer.takeover_click"
+                    && (id != "computer.takeover_drag"
+                        || !gate_passes(outcomes, "takeover_pointer_fronting_review_revision"))))
             && [
                 "global_dispatch_review_revision",
                 "takeover_dispatch_review_revision",
@@ -1392,14 +1396,6 @@ pub fn takeover_pointer_fronting_admitted(inputs: &ComputerReleaseInputs) -> boo
     )
 }
 
-#[cfg(any(test, target_os = "macos"))]
-fn initialize_admitted_pointer_queries(
-    inputs: &ComputerReleaseInputs,
-    initialize: impl FnOnce() -> bool,
-) -> bool {
-    takeover_pointer_fronting_admitted(inputs) && initialize()
-}
-
 /// Fronting outside the keystroke bracket: foreground mode's one-way front,
 /// fronting a disabled press or a modifier chord under the app grant alone,
 /// skipping the restore when the person switched apps, and holding the restore
@@ -2106,11 +2102,6 @@ pub async fn run_entry() -> Result<(), ModuleError> {
     // configuration can already run a browser probe, and a child started
     // before this read would inherit the launch-nonce pipe.
     launch_nonce::read_before_any_spawn();
-    #[cfg(target_os = "macos")]
-    let _ = initialize_admitted_pointer_queries(
-        &compiled_release_inputs(),
-        cerebellum_macos::prepare_pointer_hit_tests,
-    );
     #[cfg(target_os = "macos")]
     let cursor_executable = computer_capability::cursor::pin_helper_at_startup();
     let config = ModuleConfig::from_env()?;
@@ -9266,6 +9257,8 @@ fn record_engram_catalog_write() {
 ///   whose owner-only mode could not be enforced at startup;
 /// - `engramCatalogWriteFailures`, the number of startup attempts to write the
 ///   backup catalog (`engram-catalog.json`) that failed;
+/// - `auditReservationCleanupFailures`, unused computer reservations whose Drop
+///   cleanup failed to durably close their journal row;
 /// - on macOS, `previewCaptureRequests` and `previewFramesWritten`, how many
 ///   capture requests the background-mode preview has made and how many frame
 ///   lines it has written to the agent-cursor helper since the process
@@ -9300,6 +9293,10 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
     } = &mut report
     {
         let counts = browser_crash_reports::leftover_counts();
+        metrics.insert(
+            "auditReservationCleanupFailures".into(),
+            json!(cerebellum_computer::audit::audit_reservation_cleanup_failures()),
+        );
         #[cfg(target_os = "macos")]
         {
             metrics.insert(
@@ -13682,11 +13679,12 @@ mod tests {
         assert_eq!(digest(&legacy), before_pointer_fronting);
 
         // Full HELLO pins are separate from the computer_use prompt pin:
-        // binding the review also adds click and its definition on macOS.
+        // Binding CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION withholds button-down gestures until recovery is
+        // measured, while advertising the fronted move/scroll definition.
         #[cfg(target_os = "linux")]
         let expected = "2b3184c68f59f3da166b6e2ec711781e09cca8d9aac9cd2182b5344256bb8752";
         #[cfg(target_os = "macos")]
-        let expected = "d44d9c748486c0b25b5cfceaff106e545826d1134cda41ea33727bbf93d1b45d";
+        let expected = "3d3477f40476645c313c36790d4844019b6416340f1bbfee40b27751ab86be5b";
         #[cfg(target_os = "linux")]
         let expected_unbound = "07b08b84e41cccff515bb6765bd90831c1fae3b67d0fb90d1bccbb7a488da86d";
         #[cfg(target_os = "macos")]
@@ -13731,7 +13729,8 @@ mod tests {
     /// Every external attestation bound, as a release build supplying all of
     /// them would compile it.
     #[test]
-    fn pointer_fronting_review_controls_click_and_leaves_legacy_rows_admitted() {
+    fn pointer_fronting_review_withholds_unmeasured_down_gestures_and_keeps_legacy_drag() {
+        use std::collections::BTreeSet;
         let bound = release_inputs_from_build_bindings(fully_bound_release_bindings());
         let names = |inputs: ComputerReleaseInputs| {
             let context = ComputerCapabilityAdvertisementContext {
@@ -13750,13 +13749,29 @@ mod tests {
         };
         assert!(takeover_pointer_fronting_admitted(&bound));
         let bound_names = names(bound.clone());
-        assert!(bound_names
+        assert!(!bound_names
             .iter()
             .any(|name| name == "computer.takeover_click"));
-        let legacy_names: Vec<_> = bound_names
-            .into_iter()
-            .filter(|name| name != "computer.takeover_click")
-            .collect();
+        assert!(!bound_names
+            .iter()
+            .any(|name| name == "computer.takeover_drag"));
+        assert!(bound_names
+            .iter()
+            .any(|name| name == "computer.takeover_move"));
+        assert!(bound_names
+            .iter()
+            .any(|name| name == "computer.takeover_scroll"));
+        let definition = flat_tools::computer_tool(&bound_names).unwrap();
+        let bytes = serde_json::to_string(&definition).unwrap();
+        assert!(
+            bytes.len() <= 7_000,
+            "bound definition is {} bytes",
+            bytes.len()
+        );
+        assert!(!bytes.contains("takeover_click"));
+        assert!(!bytes.contains("takeover_drag"));
+        let mut legacy_names = bound_names.into_iter().collect::<BTreeSet<_>>();
+        legacy_names.insert("computer.takeover_drag".into());
         for absent in [
             None,
             Some(""),
@@ -13767,7 +13782,10 @@ mod tests {
             let mut inputs = bound.clone();
             inputs.takeover_pointer_fronting_review_revision = absent.map(str::to_owned);
             assert!(!takeover_pointer_fronting_admitted(&inputs));
-            assert_eq!(names(inputs), legacy_names);
+            assert_eq!(
+                names(inputs).into_iter().collect::<BTreeSet<_>>(),
+                legacy_names
+            );
         }
         assert_eq!(
             compiled_release_inputs()
@@ -14034,7 +14052,12 @@ mod tests {
 
         let both = admitted(&bindings(Some("fixture-global"), Some("fixture-takeover")));
         for row in takeover_rows {
-            assert!(both.iter().any(|id| id == row), "{row}: {both:?}");
+            let available = matches!(row, "computer.takeover_move" | "computer.takeover_scroll");
+            assert_eq!(
+                both.iter().any(|id| id == row),
+                available,
+                "{row}: {both:?}"
+            );
         }
         for (gate, context) in [
             (
@@ -15646,6 +15669,14 @@ mod sigterm_listener_tests {
     async fn the_backup_catalog_write_failure_count_is_on_the_health_reply() {
         assert_eq!(health_metrics().await["engramCatalogWriteFailures"], 0);
     }
+
+    #[tokio::test]
+    async fn audit_reservation_cleanup_failures_are_on_the_health_reply() {
+        assert_eq!(
+            health_metrics().await["auditReservationCleanupFailures"],
+            json!(cerebellum_computer::audit::audit_reservation_cleanup_failures())
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -16435,36 +16466,5 @@ mod browser_login_fact_tests {
         assert_eq!(reply["outcome"], "transferred");
         assert!(signed_in.is_signed_in("agent", "default", "https://account.example.com"));
         assert!(!signed_in.is_signed_in("other-agent", "default", "https://account.example.com"));
-    }
-}
-
-#[cfg(test)]
-mod pointer_startup_tests {
-    use super::*;
-
-    #[test]
-    fn unbound_pointer_review_never_initializes_module_appkit() {
-        let mut inputs = compiled_release_inputs();
-        inputs.takeover_pointer_fronting_review_revision = None;
-        let called = std::cell::Cell::new(false);
-        assert!(!initialize_admitted_pointer_queries(&inputs, || {
-            called.set(true);
-            true
-        }));
-        assert!(!called.get());
-    }
-
-    #[test]
-    fn admitted_pointer_review_requires_successful_appkit_readiness() {
-        let mut inputs = compiled_release_inputs();
-        inputs.takeover_pointer_fronting_review_revision = Some("test-pointer-review".into());
-        inputs.takeover_dispatch_review_revision = Some("test-takeover-review".into());
-        inputs.global_dispatch_review_revision = Some("test-global-review".into());
-        let called = std::cell::Cell::new(false);
-        assert!(!initialize_admitted_pointer_queries(&inputs, || {
-            called.set(true);
-            false
-        }));
-        assert!(called.get());
     }
 }

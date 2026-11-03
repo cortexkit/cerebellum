@@ -706,6 +706,8 @@ impl std::fmt::Debug for DeskHook {
 
 #[derive(Debug)]
 pub struct DeskState {
+    pub real_cursor: Option<(f64, f64)>,
+    pub pointer_query_error: Option<&'static str>,
     pub cursor_frame: Option<[f64; 4]>,
     /// Frames for particular elements, which take the place of
     /// `cursor_frame` for them, so each element's badge aims somewhere of
@@ -792,6 +794,8 @@ pub struct Desk(pub Arc<Mutex<DeskState>>);
 impl Desk {
     pub fn new(roots: Vec<RawElement>) -> Self {
         Self(Arc::new(Mutex::new(DeskState {
+            real_cursor: None,
+            pointer_query_error: None,
             cursor_frame: None,
             cursor_frames: std::collections::HashMap::new(),
             on_cursor_frame: None,
@@ -1092,6 +1096,17 @@ impl AppStateSource for Desk {
 
     fn pointer_window_at(&self, point: (f64, f64)) -> Option<u32> {
         self.topmost_window_at(point)
+    }
+
+    fn cursor_position(&self) -> Option<(f64, f64)> {
+        self.state().real_cursor
+    }
+
+    fn pointer_recipient(&self, point: (f64, f64)) -> Result<Option<u32>, &'static str> {
+        if let Some(error) = self.state().pointer_query_error {
+            return Err(error);
+        }
+        Ok(self.pointer_window_at(point))
     }
 
     fn focused_element(

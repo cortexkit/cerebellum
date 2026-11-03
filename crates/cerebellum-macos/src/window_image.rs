@@ -420,9 +420,9 @@ pub fn topmost_window_at(x: f64, y: f64) -> Option<u32> {
     crate::window_visibility::topmost_window_at([x, y], &cursor_window_list()?)
 }
 
-static POINTER_APPKIT_READY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "desk-probe")]
 type PointerStartupDiagnosis = (Option<isize>, Option<bool>, Option<isize>);
+#[cfg(feature = "desk-probe")]
 static POINTER_STARTUP_DIAGNOSIS: std::sync::Mutex<PointerStartupDiagnosis> =
     std::sync::Mutex::new((None, None, None));
 
@@ -430,15 +430,12 @@ static POINTER_STARTUP_DIAGNOSIS: std::sync::Mutex<PointerStartupDiagnosis> =
 /// click-through windows and transparency at the point. This is a snapshot,
 /// not a prediction of mouse-up tracking or atomic event delivery.
 pub fn pointer_window_at(x: f64, y: f64) -> Option<u32> {
-    if !POINTER_APPKIT_READY.load(std::sync::atomic::Ordering::Acquire) {
-        return None;
-    }
+    let _main = objc2::MainThreadMarker::new()?;
     // SAFETY: CoreGraphics returns the primary display's value-type bounds.
     let primary = unsafe { CGDisplayBounds(objc2_core_graphics::CGMainDisplayID()) };
     let windows = cursor_window_list()?;
     crate::window_visibility::mouse_down_window_at([x, y], primary.size.height, &windows, |point| {
-        // SAFETY: this class query takes only screen coordinates and a window
-        // number; it creates no AppKit UI. The selector's NSInteger return and
+        // SAFETY: the query runs on the helper/probe main thread. The selector's NSInteger return and
         // NSPoint argument match the documented AppKit method signature.
         unsafe {
             objc2::msg_send![objc2::class!(NSWindow), windowNumberAtPoint: objc2_foundation::NSPoint::new(point[0], point[1]), belowWindowWithWindowNumber: 0isize]
@@ -446,12 +443,20 @@ pub fn pointer_window_at(x: f64, y: f64) -> Option<u32> {
     })
 }
 
-/// Main-thread-only startup for the admitted pointer route. No launch/run,
+/// Snapshot the real cursor without moving it or posting an event.
+pub fn cursor_position() -> Option<(f64, f64)> {
+    let event = objc2_core_graphics::CGEvent::new(None)?;
+    let point = objc2_core_graphics::CGEvent::location(Some(&event));
+    (point.x.is_finite() && point.y.is_finite()).then_some((point.x, point.y))
+}
+
+/// VM-probe-only startup. Production initializes AppKit only in the cursor helper.
+/// No launch/run,
 /// activation, menu or window creation is performed. Embedders with an already
 /// regular application must not silently change their activation policy.
+#[cfg(feature = "desk-probe")]
 pub fn prepare_pointer_hit_tests() -> bool {
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSRunningApplication};
-    POINTER_APPKIT_READY.store(false, std::sync::atomic::Ordering::Release);
     let Some(main) = objc2::MainThreadMarker::new() else {
         return false;
     };
@@ -471,9 +476,7 @@ pub fn prepare_pointer_hit_tests() -> bool {
         (Some(before.0), Some(setter), Some(after.0));
     // The setter reports whether a switch succeeded, not whether the process
     // currently has the required policy. Only the policy read-back admits it.
-    let ready = pointer_policy_ready(before.0, after.0);
-    POINTER_APPKIT_READY.store(ready, std::sync::atomic::Ordering::Release);
-    ready
+    pointer_policy_ready(before.0, after.0)
 }
 
 /// Non-prompting posting permission preflight for the manual VM probe.
@@ -483,6 +486,7 @@ pub fn pointer_probe_posting_permitted() -> bool {
     unsafe { CGPreflightPostEventAccess() }
 }
 
+#[cfg(feature = "desk-probe")]
 fn pointer_policy_ready(before: isize, after: isize) -> bool {
     // -1 was observed for a pre-AppKit command-line process in the test VM;
     // Apple does not document it as an activation-policy enum case. Admit that
@@ -505,7 +509,7 @@ pub fn current_app_activation_mode_raw() -> isize {
         .0
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "desk-probe"))]
 #[test]
 fn pointer_startup_readiness_requires_nonregular_before_and_prohibited_after() {
     assert!(pointer_policy_ready(-1, 2));
@@ -554,6 +558,16 @@ fn window_visibility_with_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_thread_pointer_query_returns_without_entering_appkit() {
+        assert_eq!(
+            std::thread::spawn(|| pointer_window_at(10.0, 20.0))
+                .join()
+                .unwrap(),
+            None
+        );
+    }
 
     fn rect(x: f64, y: f64, width: f64, height: f64) -> CGRect {
         CGRect::new(CGPoint::new(x, y), CGSize::new(width, height))

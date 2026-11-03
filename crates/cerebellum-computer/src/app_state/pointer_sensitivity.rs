@@ -13,8 +13,23 @@ pub fn pointer_target_contained(
     point: (f64, f64),
     window: u32,
 ) -> bool {
-    source.pointer_window_at(point) == Some(window)
-        && pointer_target_safe(source, target, point, window)
+    pointer_target_check(source, target, point, window).is_ok()
+}
+
+/// Preserve the failed query step instead of turning helper failure into a match.
+pub fn pointer_target_check(
+    source: &dyn AppStateSource,
+    target: &ProcessGrant,
+    point: (f64, f64),
+    window: u32,
+) -> Result<(), &'static str> {
+    if source.pointer_recipient(point)? != Some(window) {
+        return Err("mouse-down recipient window changed or unavailable");
+    }
+    if !pointer_target_safe(source, target, point, window) {
+        return Err("pointer accessibility sensitivity step failed");
+    }
+    Ok(())
 }
 
 fn hazardous(facts: &ElementFacts) -> bool {

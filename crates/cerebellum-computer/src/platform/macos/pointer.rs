@@ -20,7 +20,7 @@ pub(super) trait PointerOperations {
     type Event;
     fn prepare(&mut self, index: usize) -> Result<(), DriverError>;
     fn refresh_observer(&mut self, index: usize) -> Result<(), DriverError>;
-    fn contained(&mut self) -> bool;
+    fn contained(&mut self) -> Result<(), DriverError>;
     fn generation(&mut self) -> super::super::process_event::ProcessGenerationReading;
     fn frontmost_pid(&mut self) -> Option<u32>;
     fn final_observation(&mut self, index: usize) -> Result<(), DriverError>;
@@ -59,7 +59,8 @@ pub(super) fn post_pointer_unit<O: PointerOperations>(
             let focused = operations.frontmost_pid() == Some(target.pid);
             let final_observation = operations.final_observation(index);
             let stopped = cancelled() || live.is_err() || final_observation.is_err();
-            if !contained || !focused {
+            contained?;
+            if !focused {
                 return Err(DriverError::Unsupported(
                     "global pointer target containment changed",
                 ));
@@ -83,6 +84,8 @@ pub(super) fn post_pointer_unit<O: PointerOperations>(
 }
 
 pub(super) struct NativePointerOperations<'a, 'b> {
+    #[cfg(test)]
+    pub(super) primitives: Option<&'a mut TestPrimitives>,
     pub(super) started: Instant,
     pub(super) target: ProcessEventTarget,
     pub(super) transport: &'a mut MacOsPerProcessEventTransport,
@@ -92,6 +95,18 @@ pub(super) struct NativePointerOperations<'a, 'b> {
     pub(super) last_post_at: Instant,
     pub(super) live_at: Option<Instant>,
     pub(super) event_count: usize,
+}
+
+#[cfg(test)]
+type TestDrain = Box<dyn FnMut(&mut SeizeWatcher, usize)>;
+
+#[cfg(test)]
+pub(super) struct TestPrimitives {
+    pub(super) live_at: Instant,
+    pub(super) generation: super::super::process_event::ProcessGenerationReading,
+    pub(super) frontmost: Option<u32>,
+    pub(super) drain: TestDrain,
+    pub(super) post: Box<dyn FnMut(cerebellum_macos::OwnedCgEvent)>,
 }
 
 impl PointerOperations for NativePointerOperations<'_, '_> {
@@ -134,6 +149,11 @@ impl PointerOperations for NativePointerOperations<'_, '_> {
     }
 
     fn refresh_observer(&mut self, index: usize) -> Result<(), DriverError> {
+        #[cfg(test)]
+        if let Some(primitives) = &self.primitives {
+            self.live_at = Some(primitives.live_at);
+            return Ok(());
+        }
         let probe = self.heartbeat.post().0;
         let observation = heartbeat_observation(
             self.observation.tap,
@@ -150,25 +170,44 @@ impl PointerOperations for NativePointerOperations<'_, '_> {
         Ok(())
     }
 
-    fn contained(&mut self) -> bool {
-        (self.pointer.guard.0)()
+    fn contained(&mut self) -> Result<(), DriverError> {
+        (self.pointer.guard.0)().map_err(DriverError::Unsupported)
     }
 
     fn generation(&mut self) -> super::super::process_event::ProcessGenerationReading {
+        #[cfg(test)]
+        if let Some(primitives) = &self.primitives {
+            return primitives.generation;
+        }
         self.transport.process_generation(self.target.pid)
     }
 
     fn frontmost_pid(&mut self) -> Option<u32> {
+        #[cfg(test)]
+        if let Some(primitives) = &self.primitives {
+            return primitives.frontmost;
+        }
         cerebellum_macos::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok())
     }
 
     fn final_observation(&mut self, index: usize) -> Result<(), DriverError> {
-        drain_session_events(
-            self.observation.tap,
-            self.observation.watcher,
-            self.heartbeat.our_pid,
-            index,
-        );
+        #[cfg(test)]
+        let injected = if let Some(primitives) = &mut self.primitives {
+            (primitives.drain)(self.observation.watcher, index);
+            true
+        } else {
+            false
+        };
+        #[cfg(not(test))]
+        let injected = false;
+        if !injected {
+            drain_session_events(
+                self.observation.tap,
+                self.observation.watcher,
+                self.heartbeat.our_pid,
+                index,
+            );
+        }
         if self.observation.watcher.abort_decision().is_some() {
             return Err(observed_abort_error(self.observation.watcher));
         }
@@ -189,6 +228,13 @@ impl PointerOperations for NativePointerOperations<'_, '_> {
     }
 
     fn post(&mut self, index: usize, event: Self::Event) {
+        #[cfg(test)]
+        if let Some(primitives) = &mut self.primitives {
+            (primitives.post)(event);
+        } else {
+            let _ = cerebellum_macos::post_event_globally(event);
+        }
+        #[cfg(not(test))]
         let _ = cerebellum_macos::post_event_globally(event);
         self.last_post_at = Instant::now();
         self.pointer.last_post_at = Some(self.last_post_at);
@@ -203,6 +249,108 @@ impl PointerOperations for NativePointerOperations<'_, '_> {
 mod tests {
     use super::super::super::process_event::SyntheticStepRole;
     use super::*;
+
+    #[test]
+    fn host_native_pointer_delegation_reaches_the_poster_only_after_final_observation() {
+        use crate::dispatch::{FrontingBracketHost, ObservedUnit};
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+        for mode in ["ok", "stale", "seize"] {
+            let started = Instant::now();
+            let posts = Rc::new(Cell::new(0));
+            let post_count = posts.clone();
+            let contained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let in_guard = contained.clone();
+            let after_guard = contained.clone();
+            let drains = Rc::new(RefCell::new(Vec::new()));
+            let drain_log = drains.clone();
+            let (_tx, rx) = std::sync::mpsc::channel();
+            let tap = cerebellum_macos::SessionEventTap::from_test_channel(rx);
+            let target = ProcessEventTarget {
+                pid: 42,
+                start_time_micros: 123,
+            };
+            let marker = HeartbeatMarker::new(1);
+            let mut host = MacBracketHost {
+                started,
+                tap: None,
+                target,
+                heartbeat: HeartbeatPoster {
+                    marker,
+                    event: None,
+                    started,
+                    our_pid: 99,
+                },
+                units: vec![Some(
+                    super::super::super::macos_synthetic::synthetic_event_steps(
+                        &SyntheticAction::move_pointer(SyntheticPoint { x: 10.0, y: 20.0 }),
+                    )
+                    .unwrap(),
+                )],
+                transport: MacOsPerProcessEventTransport::new(Duration::from_millis(50)),
+                pointer: Some(MacPointerUnit {
+                    guard: super::super::super::GlobalPointerGuard(Arc::new(move || {
+                        in_guard.store(true, Ordering::Relaxed);
+                        Ok(())
+                    })),
+                    interval_ms: 50,
+                    last_post_at: None,
+                    error: None,
+                    observed_abort: None,
+                }),
+                pointer_primitives: Some(TestPrimitives {
+                    live_at: if mode == "stale" {
+                        started - Duration::from_millis(51)
+                    } else {
+                        started
+                    },
+                    generation:
+                        super::super::super::process_event::ProcessGenerationReading::Started(123),
+                    frontmost: Some(42),
+                    drain: Box::new(move |watcher, index| {
+                        let final_read = after_guard.load(Ordering::Relaxed);
+                        drain_log.borrow_mut().push(final_read);
+                        if mode == "seize" && final_read {
+                            watcher.abort(
+                                crate::dispatch::AbortReason::UserSeizedControl,
+                                index,
+                                Some(0),
+                            );
+                        }
+                    }),
+                    post: Box::new(move |_| post_count.set(post_count.get() + 1)),
+                }),
+            };
+            let mut watcher = SeizeWatcher::new(50);
+            watcher.queue_post();
+            let result = host.post_observed_unit(
+                0,
+                ObservedUnit {
+                    tap: &tap,
+                    watcher: &mut watcher,
+                    probe: HeartbeatProbe {
+                        marker,
+                        posted_at_ms: 0,
+                        our_pid: 99,
+                    },
+                    heartbeat: HeartbeatObservation::Missed,
+                    cancelled: &|| false,
+                    deadline_ms: 1000,
+                },
+            );
+            assert!(
+                contained.load(Ordering::Relaxed),
+                "host must delegate through native containment"
+            );
+            assert_eq!(
+                &*drains.borrow(),
+                &[false, true],
+                "native final drain follows containment"
+            );
+            assert_eq!(result.is_ok(), mode == "ok", "{mode}: {result:?}");
+            assert_eq!(posts.get(), usize::from(mode == "ok"), "{mode}");
+        }
+    }
     use crate::app_state::pointer_sensitivity::pointer_target_safe;
     use crate::app_state::source::*;
     use std::sync::{Arc, Mutex};
@@ -364,7 +512,7 @@ mod tests {
                 Ok(())
             }
         }
-        fn contained(&mut self) -> bool {
+        fn contained(&mut self) -> Result<(), DriverError> {
             self.calls.push(("containment", self.index));
             *self.ax.0.lock().unwrap() = self.replace_at_seam;
             if self.stop_in_containment && self.index > 0 {
@@ -378,12 +526,13 @@ mod tests {
                 },
                 std::sync::atomic::Ordering::Relaxed,
             );
-            crate::app_state::pointer_sensitivity::pointer_target_contained(
+            crate::app_state::pointer_sensitivity::pointer_target_check(
                 &self.ax,
                 &grant(),
                 (10.0, 20.0),
                 7,
             )
+            .map_err(DriverError::Unsupported)
         }
         fn generation(&mut self) -> super::super::super::process_event::ProcessGenerationReading {
             self.calls.push(("generation", self.index));

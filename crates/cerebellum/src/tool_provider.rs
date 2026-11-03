@@ -520,6 +520,10 @@ mod tests {
                 .map(|capability| capability.capability_id().to_string())
                 .filter(|name| crate::computer_capability::servable(name).is_some())
                 .filter(|name| pointer_fronting || name != "computer.takeover_click")
+                .filter(|name| {
+                    !pointer_fronting
+                        || (name != "computer.takeover_click" && name != "computer.takeover_drag")
+                })
                 .collect::<Vec<_>>();
             let pointer_fronting = flat_tools::pointer_fronting_definition(&computer_names);
             let flat = [
@@ -550,7 +554,7 @@ mod tests {
                         "fbef38d68cd09cb42c8283f195871cb13c88180570f989314bc89a833258ac1c"
                     }
                     "computer_use" => {
-                        "060e40a0b77e8b11d96547e11fe911fc23bfe9964e75835011acb8b0961afe6f"
+                        "955b32959d12b2829fea214c162a7c83ec4c39c7e45783033e59b45793047af3"
                     }
                     _ => unreachable!("only the two flat model tools are served"),
                 };

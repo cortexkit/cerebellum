@@ -12,8 +12,6 @@
           "type",
           "keys",
           "takeover_move",
-          "takeover_click",
-          "takeover_drag",
           "takeover_scroll",
           "wait",
           "list_apps",
@@ -60,27 +58,8 @@
         "minItems": 1,
         "type": "array"
       },
-      "from": {
-        "additionalProperties": false,
-        "description": "A point in the pixel space of the image named by image_id, top-left origin. Required for: takeover_drag.",
-        "properties": {
-          "x": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "y": {
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "x",
-          "y"
-        ],
-        "type": "object"
-      },
       "image_id": {
-        "description": "The image_id of an image a read_state call on this application returned. Required for: press_point, takeover_move, takeover_click, takeover_drag.",
+        "description": "The image_id of an image a read_state call on this application returned. Required for: press_point, takeover_move.",
         "minLength": 1,
         "type": "string"
       },
@@ -131,7 +110,7 @@
       },
       "to": {
         "additionalProperties": false,
-        "description": "A point in the pixel space of the image named by image_id, top-left origin. Required for: takeover_move, takeover_drag.",
+        "description": "A point in the pixel space of the image named by image_id, top-left origin. Required for: takeover_move.",
         "properties": {
           "x": {
             "minimum": 0,
@@ -162,12 +141,12 @@
         "type": "string"
       },
       "x": {
-        "description": "Horizontal pixel in the named image. Required for: press_point, takeover_click.",
+        "description": "Horizontal pixel in the named image. Required for: press_point.",
         "minimum": 0,
         "type": "integer"
       },
       "y": {
-        "description": "Vertical pixel in the named image. Required for: press_point, takeover_click.",
+        "description": "Vertical pixel in the named image. Required for: press_point.",
         "minimum": 0,
         "type": "integer"
       },
@@ -489,8 +468,6 @@
               "type",
               "keys",
               "takeover_move",
-              "takeover_click",
-              "takeover_drag",
               "takeover_scroll",
               "wait",
               "list_apps",
@@ -530,24 +507,6 @@
             "maxItems": 8,
             "minItems": 1,
             "type": "array"
-          },
-          "from": {
-            "additionalProperties": false,
-            "properties": {
-              "x": {
-                "minimum": 0,
-                "type": "integer"
-              },
-              "y": {
-                "minimum": 0,
-                "type": "integer"
-              }
-            },
-            "required": [
-              "x",
-              "y"
-            ],
-            "type": "object"
           },
           "image_id": {
             "minLength": 1,

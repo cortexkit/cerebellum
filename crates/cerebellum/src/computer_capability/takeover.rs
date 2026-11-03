@@ -417,6 +417,25 @@ where
         arguments: &Value,
         context: super::ServeContext<'_, C>,
     ) -> Value {
+        if self.takeover_pointer_fronting_admitted
+            && matches!(
+                capability,
+                ComputerCapability::TakeoverClick | ComputerCapability::TakeoverDrag
+            )
+            && !cerebellum_computer::platform::DOWN_GESTURE_RECOVERY_MEASURED
+            && !{
+                #[cfg(test)]
+                {
+                    self.down_gesture_recovery_measured
+                }
+                #[cfg(not(test))]
+                {
+                    false
+                }
+            }
+        {
+            return invalid("action", "unknown_value");
+        }
         if capability == ComputerCapability::TakeoverClick
             && !self.takeover_pointer_fronting_admitted
         {
@@ -444,7 +463,7 @@ where
             now_ms: _,
         } = context;
 
-        let (mut target, mut action) = match self
+        let (mut target, mut action, mut scroll_window) = match self
             .place(
                 management,
                 &identity.conversation_key,
@@ -485,9 +504,10 @@ where
                 )
                 .await
             {
-                Ok((placed_target, placed_action)) => {
+                Ok((placed_target, placed_action, placed_window)) => {
                     target = placed_target;
                     action = placed_action;
+                    scroll_window = placed_window;
                 }
                 Err(refusal) => return self.placement_refused(grantee, &request, refusal).await,
             }
@@ -517,6 +537,7 @@ where
                 clock,
                 management,
                 &request,
+                scroll_window,
             )
             .await;
         admission.decorate(&mut reply);
@@ -549,13 +570,28 @@ where
         management: &Arc<ManagementPlane>,
         conversation_key: &str,
         request: &TakeoverRequest,
+        target: &ProcessGrant,
+        scroll_window: Option<u32>,
     ) -> cerebellum_computer::platform::GlobalPointerGuard {
         let (image_id, points) = match request {
             TakeoverRequest::Move { image_id, to } => (image_id.clone(), vec![*to]),
             TakeoverRequest::Click { image_id, point } => (image_id.clone(), vec![*point]),
             TakeoverRequest::Drag { image_id, from, to } => (image_id.clone(), vec![*from, *to]),
             TakeoverRequest::Scroll { .. } => {
-                return cerebellum_computer::platform::GlobalPointerGuard(Arc::new(|| true))
+                let source = Arc::clone(&self.app_state_source);
+                let target = target.clone();
+                return cerebellum_computer::platform::GlobalPointerGuard(Arc::new(move || {
+                    let window = scroll_window.ok_or("scroll target window unavailable")?;
+                    let point = source
+                        .cursor_position()
+                        .ok_or("scroll real cursor location unavailable")?;
+                    cerebellum_computer::app_state::pointer_sensitivity::pointer_target_check(
+                        source.as_ref(),
+                        &target,
+                        point,
+                        window,
+                    )
+                }));
             }
         };
         let management = Arc::clone(management);
@@ -566,27 +602,32 @@ where
                 .app_state_sessions()
                 .resolve_image(&conversation_key, &image_id)
             else {
-                return false;
+                return Err("pointer image unavailable");
             };
             let Some(window) = management
                 .app_state_sessions()
                 .image_window(&conversation_key, &image_id)
             else {
-                return false;
+                return Err("pointer image window unavailable");
             };
-            points.iter().all(|point| {
+            points.iter().try_for_each(|point| {
                 let point = desktop(&image, *point);
-                cerebellum_computer::app_state::pointer_sensitivity::pointer_target_contained(
+                cerebellum_computer::app_state::pointer_sensitivity::pointer_target_check(
                     source.as_ref(),
                     &image_grant(&image),
                     (point.x, point.y),
                     window,
-                ) && application_under(source.as_ref(), &management, &image, point).is_ok_and(
+                )?;
+                if application_under(source.as_ref(), &management, &image, point).is_ok_and(
                     |owner| {
                         owner.pid == image.pid
                             && owner.process_generation_evidence == image.process_generation
                     },
-                )
+                ) {
+                    Ok(())
+                } else {
+                    Err("pointer target application changed")
+                }
             })
         }))
     }
@@ -598,7 +639,7 @@ where
         conversation_key: &str,
         caller: &GrantCaller,
         request: &TakeoverRequest,
-    ) -> Result<(ProcessGrant, SyntheticAction), Value> {
+    ) -> Result<(ProcessGrant, SyntheticAction, Option<u32>), Value> {
         let (image_id, points) = match request {
             TakeoverRequest::Click { image_id, point } => (image_id, vec![*point]),
             TakeoverRequest::Scroll {
@@ -607,9 +648,26 @@ where
                 lines,
             } => {
                 let grant = management.resolve_process(target)?;
+                let mut scroll_window = None;
+                if self.takeover_pointer_fronting_admitted {
+                    let source = Arc::clone(&self.app_state_source);
+                    let target = grant.clone();
+                    scroll_window = Some(tokio::task::spawn_blocking(move || {
+                        let focused = source.focused_window(&target).ok().flatten().ok_or("scroll target window unavailable")?;
+                        let window = source.element_window_number(&focused.handle).ok_or("scroll target window number unavailable")?;
+                        let point = source.cursor_position().ok_or("scroll real cursor location unavailable")?;
+                        cerebellum_computer::app_state::pointer_sensitivity::pointer_target_check(source.as_ref(), &target, point, window)?;
+                        Ok::<_, &'static str>(window)
+                    }).await.unwrap_or(Err("scroll cursor placement worker failed")).map_err(|step| {
+                        let mut refusal = nothing_identifiable_at_point();
+                        refusal["remedy"] = json!(format!("{step}; nothing was posted"));
+                        refusal
+                    })?);
+                }
                 return Ok((
                     grant,
                     SyntheticAction::scroll_along(*axis, SyntheticScrollUnit::Line, *lines),
+                    scroll_window,
                 ));
             }
             TakeoverRequest::Move { image_id, to } => (image_id, vec![*to]),
@@ -680,7 +738,7 @@ where
                 }
                 _ => SyntheticAction::move_pointer(desktop_points[0]),
             };
-            return Ok((grant, action));
+            return Ok((grant, action, None));
         }
         let source = self.app_state_source.clone();
         let hit_management = Arc::clone(management);
@@ -757,9 +815,14 @@ where
                 Ok((
                     target,
                     SyntheticAction::drag_pointer(desktop_points[0], desktop_points[1]),
+                    None,
                 ))
             }
-            _ => Ok((target, SyntheticAction::move_pointer(desktop_points[0]))),
+            _ => Ok((
+                target,
+                SyntheticAction::move_pointer(desktop_points[0]),
+                None,
+            )),
         }
     }
 
@@ -779,6 +842,7 @@ where
         clock: &C,
         management: &Arc<ManagementPlane>,
         takeover_request: &TakeoverRequest,
+        scroll_window: Option<u32>,
     ) -> Value {
         let Some(row) = FrozenDispatchRow::for_capability(capability.capability_id()) else {
             return json!({
@@ -814,7 +878,7 @@ where
         let request = DispatchRequest::new(
             row,
             DispatchMode::Observed,
-            target,
+            target.clone(),
             expected,
             attendance,
             at_ms,
@@ -838,6 +902,7 @@ where
         }
         let mode =
             super::app_use::call_mode().unwrap_or(cerebellum_core::config::AppUse::Background);
+        let pointer_failure = Arc::new(std::sync::Mutex::new(None));
         let (hooks, exclusion, pointer_guard) = if self.takeover_pointer_fronting_admitted {
             let mut stopped = |stop| {
                 let reason = match stop {
@@ -888,7 +953,25 @@ where
             (
                 Some(hooks),
                 Some(lock),
-                Some(self.pointer_guard(management, &identity.conversation_key, takeover_request)),
+                Some({
+                    let guard = self.pointer_guard(
+                        management,
+                        &identity.conversation_key,
+                        takeover_request,
+                        &target,
+                        scroll_window,
+                    );
+                    let failure = Arc::clone(&pointer_failure);
+                    cerebellum_computer::platform::GlobalPointerGuard(Arc::new(move || {
+                        let result = (guard.0)();
+                        if let Err(step) = result {
+                            *failure
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(step);
+                        }
+                        result
+                    }))
+                }),
             )
         } else {
             (None, None, None)
@@ -1035,6 +1118,17 @@ where
                 reply["outcome"] = json!("restore_failed");
                 reply["remedy"] = json!("the previous application could not be restored; application restoration does not select its previous window. Read state before continuing");
             }
+        }
+        // Dispatch's existing reason vocabulary is intentionally coarse. Keep
+        // the private query step in the existing remedy, not a new stored error.
+        if let Some(step) = *pointer_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            let remedy = reply["remedy"]
+                .as_str()
+                .unwrap_or("Read state before retrying");
+            reply["remedy"] = json!(format!("{step}; {remedy}"));
         }
         reply
     }
