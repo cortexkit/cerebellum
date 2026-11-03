@@ -1101,8 +1101,9 @@ pub struct GlobalDispatchRequest {
 
 /// Revalidate coordinate containment immediately before each pointer post.
 /// The callback owns its image/session data and may not post input itself.
-/// Its deadline is established when the target application's front request
-/// starts; recipient queries must not renew that budget.
+/// The `Instant` it receives is the bracket's deadline, fixed when this module
+/// asks the system to bring the target application forward. Recipient queries
+/// (including a cursor-helper launch) must finish by it and never renew it.
 #[derive(Clone)]
 pub struct GlobalPointerGuard(
     pub std::sync::Arc<dyn Fn(std::time::Instant) -> Result<(), &'static str> + Send + Sync>,
