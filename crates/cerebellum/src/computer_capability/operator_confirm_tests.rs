@@ -613,7 +613,6 @@ mod daemon {
             f.events(), f.responses.lock().unwrap()
         );
         assert_eq!(f.prompts(), 2);
-        println!("operator cancel/retry: busy={busy:?}; daemon_error={busy_reply}; resumed={resumed:?}; prompts={}", f.prompts());
 
         let f = Fixture::start("hang\n").await;
         let live = f.live();
