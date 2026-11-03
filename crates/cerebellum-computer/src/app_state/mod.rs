@@ -10,6 +10,7 @@ pub mod image;
 #[cfg(target_os = "macos")]
 pub mod native;
 pub mod person;
+pub mod pointer_sensitivity;
 pub mod render;
 pub mod session;
 pub mod source;

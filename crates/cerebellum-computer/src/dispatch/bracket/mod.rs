@@ -128,8 +128,8 @@ pub trait FrontingBracketHost {
     }
     /// The process-wide session observer's hardware input timestamps, on
     /// this host's clock, for the restore decision. `None` when unavailable,
-    /// which the decision reads as no input seen, so the previous application
-    /// is restored as it always was.
+    /// which cannot establish safe inactivity, so the decision leaves focus
+    /// alone instead of requesting the previous application.
     fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
         None
     }
@@ -389,6 +389,9 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
     let heartbeat = host
         .borrow_mut()
         .observe_heartbeat(&tap, probe, &mut watcher);
+    // A missed echo is a refusal before any activation, even when no input
+    // event happened to give the watcher a separate abort reason.
+    watcher.observe_heartbeat(super::seize::heartbeat_liveness(probe, heartbeat), 0);
     if let Some(abort) = watcher.abort_decision() {
         estimator.clear_carry();
         report.stop = Some(BracketStop::Aborted(abort));

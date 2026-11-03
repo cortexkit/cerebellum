@@ -642,6 +642,21 @@ pub fn focused_element(pid: u32) -> Result<Option<AxRetainedElement>, AxElementA
     }
 }
 
+/// Read a live parent without treating a failed AX message as an absent parent.
+pub fn element_parent(
+    element: &AxRetainedElement,
+) -> Result<Option<AxRetainedElement>, AxElementActionError> {
+    require_trust()?;
+    prepare_element(element.as_ptr());
+    bound_messages(element.as_ptr());
+    match copy(element.as_ptr(), "AXParent") {
+        Ok(Some(value)) if is_ax_element(&value) => Ok(Some(AxRetainedElement(value))),
+        Ok(None) | Err(AX_ERROR_NO_VALUE) => Ok(None),
+        Ok(Some(_)) => Err(AxElementActionError::Failed { ax_error: 0 }),
+        Err(code) => Err(classify(code)),
+    }
+}
+
 /// The window that is focused inside the application `pid` runs, with its
 /// title, asked of that application rather than of whichever one is
 /// frontmost. `Ok(None)` when the application reports no focused window; a

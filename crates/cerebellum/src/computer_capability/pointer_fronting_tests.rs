@@ -22,6 +22,8 @@ pub(super) struct Script {
     pub switch_after: bool,
     pub checks: usize,
     pub roles: Vec<SyntheticStepRole>,
+    pub reject_pointer: bool,
+    pub reject_hooks: bool,
 }
 
 struct PointerHost {
@@ -281,6 +283,15 @@ async fn fixture_with_grants(takeover: bool, app: bool) -> (Rig, String) {
     rig.desk.state().topmost_window = Some(COVER);
     rig.desk.state().application_hit = Some((1, Some(TARGET)));
     rig.desk.state().system_wide_hit = Some((1, Some(TARGET)));
+    rig.desk.state().elements.insert(
+        1,
+        support::DeskElement {
+            facts: support::facts("AXWindow", &[]),
+            ..support::DeskElement::default()
+        },
+    );
+    rig.desk.state().element_windows.insert(1, WINDOW);
+    rig.desk.state().focus = support::DeskFocus::Nothing;
     let image_id = rig.management.app_state_sessions().register_window_image(
         &support::identity().conversation_key,
         RegisteredImage {
@@ -337,7 +348,7 @@ async fn a_covered_granted_image_click_fronts_posts_down_up_and_restores() {
     assert_eq!(
         rig.screen.state().pointer.checks,
         2,
-        "every native post has a window check"
+        "every fake sequence post invokes the production window guard"
     );
     assert_eq!(
         rig.screen.state().pointer.action,
@@ -583,7 +594,203 @@ async fn another_point_owner_is_refused_even_when_the_window_number_matches() {
         )
         .await;
     assert_eq!(reply["outcome"], "target_not_frontmost", "{reply}");
-    assert_eq!(reply["reason"], "target_focus_mismatch", "{reply}");
-    assert_eq!(rig.screen.log(), ["front:4242", "restore:100"]);
+    // The fresh accessibility placement check refuses a foreign owner before any front, rather
+    // than waiting for the posting guard to reject it after activation.
+    assert_eq!(reply["reason"], "no_application_at_point", "{reply}");
+    assert!(rig.screen.log().is_empty());
     assert!(!rig.lock.held());
+}
+
+fn assert_no_action_reservation(rig: &Rig) {
+    let audit = cerebellum_computer::audit::lock_audit(&rig.plane.audit);
+    assert_eq!(audit.journal().active_pre_dispatch_count(), 0);
+    assert_eq!(audit.journal().unfinalized_dispatch_count(), 0);
+    drop(audit);
+    let rows = journal_results(rig);
+    let row = rows
+        .iter()
+        .find(|row| row["outcome"] == "no_action")
+        .expect("refusal finalized as no action");
+    assert!(row["refusal"].is_object(), "{row}");
+    assert!(rig.screen.log().is_empty());
+}
+
+#[tokio::test]
+async fn pointer_audit_missing_terminal_closes_reservation_without_posts() {
+    let (rig, image_id) = fixture().await;
+    let reply = rig
+        .call(
+            "computer.takeover_click",
+            json!({"image_id":image_id,"x":10,"y":20}),
+        )
+        .await;
+    assert_eq!(
+        reply["fronting"]["not_fronted_reason"], "fronting_unavailable",
+        "{reply}"
+    );
+    assert_no_action_reservation(&rig);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pointer_audit_lock_timeout_closes_reservation_without_posts() {
+    let (rig, image_id) = fixture().await;
+    let lock = rig
+        .lock
+        .take(&crate::CancelHandle::pending())
+        .await
+        .unwrap();
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.takeover_click",
+            json!({"image_id":image_id,"x":10,"y":20}),
+        )
+        .await;
+    assert_eq!(
+        reply["fronting"]["not_fronted_reason"], "fronting_busy",
+        "{reply}"
+    );
+    assert_no_action_reservation(&rig);
+    drop(lock);
+}
+
+#[tokio::test]
+async fn pointer_audit_driver_hook_refusals_close_reservation_without_posts() {
+    for pointer in [true, false] {
+        let (rig, image_id) = fixture().await;
+        rig.screen.state().pointer.reject_pointer = pointer;
+        rig.screen.state().pointer.reject_hooks = !pointer;
+        let reply = rig
+            .call_under(
+                &under_terminal(),
+                "computer.takeover_click",
+                json!({"image_id":image_id,"x":10,"y":20}),
+            )
+            .await;
+        assert_eq!(reply["outcome"], "dispatch_failed", "{reply}");
+        assert_no_action_reservation(&rig);
+    }
+}
+
+#[tokio::test]
+async fn pointer_audit_cancelled_lock_wait_closes_reservation_without_posts() {
+    let (rig, image_id) = fixture().await;
+    let lock = rig
+        .lock
+        .take(&crate::CancelHandle::pending())
+        .await
+        .unwrap();
+    let cancel = crate::CancelHandle::pending();
+    let worker_rig = rig.clone();
+    let signal = cancel.clone();
+    let worker = tokio::spawn(async move {
+        crate::CALL_TERMINAL
+            .scope(
+                under_terminal(),
+                worker_rig.serve(
+                    "computer.takeover_click",
+                    json!({"image_id":image_id,"x":10,"y":20}),
+                    signal,
+                ),
+            )
+            .await
+    });
+    for _ in 0..1000 {
+        if cerebellum_computer::audit::lock_audit(&rig.plane.audit)
+            .journal()
+            .active_pre_dispatch_count()
+            == 1
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        cerebellum_computer::audit::lock_audit(&rig.plane.audit)
+            .journal()
+            .active_pre_dispatch_count(),
+        1
+    );
+    cancel.cancel();
+    let reply = worker.await.unwrap();
+    assert_eq!(
+        reply["fronting"]["not_fronted_reason"], "cancelled",
+        "{reply}"
+    );
+    assert_no_action_reservation(&rig);
+    drop(lock);
+}
+
+#[tokio::test]
+async fn pointer_audit_abandoned_predispatch_token_is_closed_by_raii() {
+    use cerebellum_computer::audit::{AuditToken, ComputerPlaneDescriptor, ObservationState};
+    let (rig, _) = fixture().await;
+    let mut token = AuditToken::new(
+        rig.plane.audit.clone(),
+        Arc::new(cerebellum_computer::dispatch::OpenGate),
+    );
+    token
+        .reserve_ahead(
+            support::identity(),
+            ComputerPlaneDescriptor::new(
+                ComputerCapability::TakeoverClick,
+                cerebellum_computer::grounding::ContainmentRung::GlobalNone,
+                ObservationState::HumanObserved,
+            ),
+        )
+        .unwrap();
+    assert!(token.has_unused_reservation());
+    drop(token);
+    assert_no_action_reservation(&rig);
+}
+
+#[tokio::test]
+async fn pointer_audit_held_input_after_lock_wait_closes_reservation_without_posts() {
+    let (rig, image_id) = fixture().await;
+    let lock = rig
+        .lock
+        .take(&crate::CancelHandle::pending())
+        .await
+        .unwrap();
+    let worker_rig = rig.clone();
+    let worker = tokio::spawn(async move {
+        worker_rig
+            .call_under(
+                &under_terminal(),
+                "computer.takeover_click",
+                json!({"image_id":image_id,"x":10,"y":20}),
+            )
+            .await
+    });
+    for _ in 0..1000 {
+        if cerebellum_computer::audit::lock_audit(&rig.plane.audit)
+            .journal()
+            .active_pre_dispatch_count()
+            == 1
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        cerebellum_computer::audit::lock_audit(&rig.plane.audit)
+            .journal()
+            .active_pre_dispatch_count(),
+        1
+    );
+    let press = super::super::held_input::HeldPress::global_send(
+        &support::grant(),
+        &SyntheticAction::ClickPointer {
+            point: cerebellum_computer::platform::SyntheticPoint { x: 10.0, y: 20.0 },
+        },
+    );
+    let ticket = rig.plane.held_input.begin_send(press, None);
+    drop(ticket);
+    drop(lock);
+    let reply = worker.await.unwrap();
+    assert_eq!(
+        reply["fronting"]["not_fronted_reason"], "held_input_unconfirmed",
+        "{reply}"
+    );
+    assert_no_action_reservation(&rig);
 }

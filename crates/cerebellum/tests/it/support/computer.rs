@@ -1090,6 +1090,10 @@ impl AppStateSource for Desk {
             .or(state.topmost_window)
     }
 
+    fn pointer_window_at(&self, point: (f64, f64)) -> Option<u32> {
+        self.topmost_window_at(point)
+    }
+
     fn focused_element(
         &self,
         _target: &ProcessGrant,

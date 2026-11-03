@@ -800,6 +800,9 @@ impl PlatformDriver for FakeDriver {
         &mut self,
         guard: cerebellum_computer::platform::GlobalPointerGuard,
     ) -> bool {
+        if self.screen.state().pointer.reject_pointer {
+            return false;
+        }
         self.pointer_guard = Some(guard);
         true
     }
@@ -926,6 +929,9 @@ impl PlatformDriver for FakeDriver {
         Ok(Box::new(FakeSession(self.screen.clone())))
     }
     fn accept_fronted_dispatch_hooks(&mut self, hooks: Box<dyn FrontedDispatchHooks>) -> bool {
+        if self.screen.state().pointer.reject_hooks {
+            return false;
+        }
         self.hooks = Some(hooks);
         true
     }
@@ -1579,12 +1585,11 @@ async fn a_press_still_disabled_in_front_refuses_and_restores() {
     assert_eq!(rig.screen.log(), ["front:4242", "restore:100"]);
 }
 
-/// The person switching to a third application with hardware input while
-/// the target is in front is left there: no restore request. The same
-/// switch without hardware input was the press's own doing, and the
-/// previous application is restored.
+/// A third application is left alone even without key/button/scroll evidence:
+/// a virtual-desktop gesture can make the same switch without such an event.
+/// Observed person input is still disclosed only when it was actually seen.
 #[tokio::test]
-async fn a_person_switch_with_input_is_left_alone_and_one_without_is_restored() {
+async fn a_third_app_switch_is_left_alone_with_or_without_hardware_evidence() {
     for input in [true, false] {
         let rig = rig(AppUse::Background, mail_desk()).await;
         let send = rig.send_id().await;
@@ -1607,13 +1612,14 @@ async fn a_person_switch_with_input_is_left_alone_and_one_without_is_restored() 
             )
             .await;
         assert_eq!(reply["outcome"], "completed", "{reply}");
+        assert_eq!(reply["fronting"]["restore"], "skipped_person", "{reply}");
+        assert_eq!(rig.screen.log(), ["front:4242"], "no restore request");
         if input {
-            assert_eq!(reply["fronting"]["restore"], "skipped_person", "{reply}");
             assert_eq!(reply["fronting"]["person_input_during_fronting"], true);
-            assert_eq!(rig.screen.log(), ["front:4242"], "no restore request");
         } else {
-            assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
-            assert_eq!(rig.screen.log(), ["front:4242", "restore:100"]);
+            assert!(reply["fronting"]
+                .get("person_input_during_fronting")
+                .is_none());
         }
     }
 }

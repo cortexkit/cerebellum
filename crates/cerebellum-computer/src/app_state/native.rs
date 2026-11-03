@@ -276,6 +276,15 @@ impl AppStateSource for MacAppStateSource {
         cerebellum_macos::element_enabled(retained(element).ok()?)
     }
 
+    fn element_parent(
+        &self,
+        element: &ElementHandle,
+    ) -> Result<Option<ElementHandle>, ElementActionError> {
+        Ok(cerebellum_macos::element_parent(retained(element)?)
+            .map_err(action_error)?
+            .map(handle))
+    }
+
     fn press(&self, element: &ElementHandle) -> Result<(), ElementActionError> {
         cerebellum_macos::press_element(retained(element)?).map_err(action_error)
     }
@@ -331,6 +340,10 @@ impl AppStateSource for MacAppStateSource {
 
     fn topmost_window_at(&self, point: (f64, f64)) -> Option<u32> {
         cerebellum_macos::topmost_window_at(point.0, point.1)
+    }
+
+    fn pointer_window_at(&self, point: (f64, f64)) -> Option<u32> {
+        cerebellum_macos::pointer_window_at(point.0, point.1)
     }
 
     /// Read only while the process is still the granted one, for the same

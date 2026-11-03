@@ -2264,7 +2264,12 @@ mod restore_slot_tests {
             now: 0,
             frontmost: Some(TARGET),
             comes_forward,
-            snapshot: None,
+            // Restore-race tests model continuous observation unless they
+            // explicitly replace it; missing coverage now forbids restoration.
+            snapshot: Some(HardwareInputSnapshot {
+                coverage_start_ms: 0,
+                last_input_ms: None,
+            }),
             requests: Vec::new(),
             log: Vec::new(),
         }))

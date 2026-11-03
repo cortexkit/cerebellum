@@ -560,19 +560,23 @@ fn a_switch_to_a_third_app_with_hardware_input_skips_the_restore() {
     );
 }
 
-/// A press that itself brought a third application forward, with no
-/// hardware input, was the action's doing: the previous application is
-/// restored over it.
+/// A third-app switch without key/button/scroll evidence cannot safely be
+/// attributed to the press: a virtual-desktop gesture may make the same switch.
 #[test]
-fn a_press_that_activates_a_third_app_without_hardware_input_is_restored() {
+fn a_press_leaves_a_third_app_alone_without_hardware_evidence() {
     let mut desk = PressDesk::new(vec![StepScript {
         switch_to_during_settle: Some(THIRD),
         ..StepScript::disabled_in_background()
     }]);
     let report = run(&mut desk);
-    assert_eq!(report.restore, RestoreStatus::Restored);
-    assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
-    assert_eq!(desk.frontmost, Some(PREVIOUS));
+    assert_eq!(
+        report.restore,
+        RestoreStatus::SkippedPerson {
+            now_front: Some(THIRD)
+        }
+    );
+    assert_eq!(desk.front_requests, [TARGET]);
+    assert_eq!(desk.frontmost, Some(THIRD));
     assert!(!report.person_input_during_fronting);
 }
 

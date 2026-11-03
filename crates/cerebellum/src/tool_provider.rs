@@ -550,7 +550,7 @@ mod tests {
                         "fbef38d68cd09cb42c8283f195871cb13c88180570f989314bc89a833258ac1c"
                     }
                     "computer_use" => {
-                        "86edb7dbb2d49e3f5e206807968c4be2ca31adae0b4e1ef6b38ed6b32c82577b"
+                        "060e40a0b77e8b11d96547e11fe911fc23bfe9964e75835011acb8b0961afe6f"
                     }
                     _ => unreachable!("only the two flat model tools are served"),
                 };

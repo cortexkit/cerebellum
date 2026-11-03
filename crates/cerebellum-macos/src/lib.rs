@@ -138,6 +138,13 @@ pub use window_follow::{watch_window, AxWindowChange, AxWindowWatch};
 mod window_identity;
 #[cfg(target_os = "macos")]
 mod window_image;
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
+pub use window_image::{
+    pointer_hit_test_activation_policy, pointer_hit_test_startup_diagnosis,
+    pointer_probe_own_window_count, pointer_probe_posting_permitted,
+};
+#[cfg(target_os = "macos")]
+pub use window_image::{pointer_window_at, prepare_pointer_hit_tests};
 #[cfg(any(target_os = "macos", test))]
 mod window_visibility;
 #[cfg(any(target_os = "macos", test))]
@@ -169,7 +176,7 @@ pub use ax_actions::enable_manual_accessibility;
 #[cfg(target_os = "macos")]
 pub use ax_actions::{
     cursor_element_frame, cursor_element_label, cursor_element_window, cursor_focused_window,
-    element_at_position, element_enabled, element_facts, element_selected_range,
+    element_at_position, element_enabled, element_facts, element_parent, element_selected_range,
     element_text_value, element_window_number, focused_element, focused_window, press_element,
     request_frontmost, show_element_menu, window_minimized, write_element_text,
     AxElementActionError, AxElementFacts, AxHitScope, AxTextAttribute,

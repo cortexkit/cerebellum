@@ -392,8 +392,11 @@ impl ElementFacts {
     /// Whether the element carries the secure-text subrole. Trustworthy when
     /// present; its absence says nothing.
     pub fn is_secure(&self) -> bool {
-        self.subrole.as_deref() == Some("AXSecureTextField")
-            || self.role.as_deref() == Some("AXSecureTextField")
+        self.role.as_deref() == Some("AXSecureTextField")
+            || self.subrole.as_ref().is_some_and(|role| {
+                let role = role.to_ascii_lowercase();
+                role.contains("secure") || role.contains("password")
+            })
     }
 }
 
@@ -533,6 +536,14 @@ pub trait AppStateSource: Send + Sync {
         Err(ElementActionError::UnsupportedOnPlatform)
     }
 
+    /// The live accessibility parent, with errors distinct from a root's absent parent.
+    fn element_parent(
+        &self,
+        _element: &ElementHandle,
+    ) -> Result<Option<ElementHandle>, ElementActionError> {
+        Err(ElementActionError::UnsupportedOnPlatform)
+    }
+
     /// The element's live `AXEnabled`, read now rather than taken from an
     /// earlier read. `None` when it cannot be read, which a caller must treat
     /// as unknown, never as disabled.
@@ -603,6 +614,12 @@ pub trait AppStateSource: Send + Sync {
     /// point: the window a real pointer event there would reach. `None` when
     /// it cannot be established.
     fn topmost_window_at(&self, _point: (f64, f64)) -> Option<u32> {
+        None
+    }
+
+    /// Mouse-down recipient hit test, distinct from geometric window
+    /// coverage. An unavailable/uninitialized native query refuses.
+    fn pointer_window_at(&self, _point: (f64, f64)) -> Option<u32> {
         None
     }
 
