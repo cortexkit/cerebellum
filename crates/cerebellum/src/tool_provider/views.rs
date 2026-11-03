@@ -13,6 +13,8 @@ use super::*;
 use cortexkit_role_tool_provider::views::{ViewEntry, ViewManifest, ViewsReply, ViewsRequest};
 
 const PUBLISHED: &str = include_str!("../../resources/tool-views/published-v1.json");
+const POINTER_FRONTING_PUBLISHED: &str =
+    include_str!("../../resources/tool-views/published-v2.json");
 const BROWSER_ROW: &str = include_str!("../../resources/tool-views/browser-row.ui");
 const BROWSER_PAGE: &str = include_str!("../../resources/tool-views/browser-page.ui");
 const COMPUTER_ROW: &str = include_str!("../../resources/tool-views/computer-row.ui");
@@ -64,8 +66,16 @@ fn view(pin: &str, entry: &Value) -> ViewManifest {
 }
 
 fn published() -> BTreeMap<String, ViewManifest> {
-    let entries: BTreeMap<String, Value> =
+    let mut entries: BTreeMap<String, Value> =
         serde_json::from_str(PUBLISHED).expect("published views");
+    let pointer_fronting: BTreeMap<String, Value> =
+        serde_json::from_str(POINTER_FRONTING_PUBLISHED).expect("pointer-fronting published views");
+    for (pin, entry) in pointer_fronting {
+        assert!(
+            entries.insert(pin, entry).is_none(),
+            "a published pin must never be replaced"
+        );
+    }
     entries
         .into_iter()
         .map(|(pin, entry)| {

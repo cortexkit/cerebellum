@@ -25,7 +25,9 @@ pub(super) fn refusal(
     // rows name only the posting/monitoring services.
     if matches!(
         capability,
-        ComputerCapability::TakeoverMove | ComputerCapability::TakeoverDrag
+        ComputerCapability::TakeoverMove
+            | ComputerCapability::TakeoverClick
+            | ComputerCapability::TakeoverDrag
     ) {
         services.push(PermissionService::Accessibility);
     }

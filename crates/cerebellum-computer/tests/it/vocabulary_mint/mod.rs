@@ -2618,3 +2618,64 @@ pub fn v33_from_v32(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// Revision 34 adds a real left-button click and the separately reviewed
+/// temporary-front result contract to the global pointer rows.
+pub fn v34_from_v33(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    let rows = next["rows"].as_array_mut().unwrap();
+    let mut click = rows
+        .iter()
+        .find(|row| row["capability_id"] == "computer.takeover_move")
+        .unwrap()
+        .clone();
+    let point_request = rows
+        .iter()
+        .find(|row| row["capability_id"] == "computer.press_point")
+        .unwrap()["request_schema"]
+        .clone();
+    let fronting_properties = rows
+        .iter()
+        .find(|row| row["capability_id"] == "computer.type")
+        .unwrap()["result_schema"]["properties"]
+        .clone();
+    click["capability_id"] = json!("computer.takeover_click");
+    click["request_schema"] = closed(
+        ["image_id", "x", "y"]
+            .into_iter()
+            .map(|field| (field.to_owned(), point_request["properties"][field].clone()))
+            .collect(),
+        &["image_id", "x", "y"],
+    );
+    click["required_permission_services"] = json!(["post_event", "input_monitoring"]);
+    click["review_requirement"] = json!("takeover_pointer_fronting_review_revision");
+    let position = rows
+        .iter()
+        .position(|row| row["capability_id"] == "computer.takeover_move")
+        .unwrap()
+        + 1;
+    rows.insert(position, click);
+    for row in rows.iter_mut().filter(|row| {
+        row["capability_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("computer.takeover_")
+    }) {
+        row["maximum_fronting_bracket_interval_ms"] = json!(300);
+        let result = row["result_schema"]["properties"].as_object_mut().unwrap();
+        for field in ["fronting", "fronting_bound_exceeded"] {
+            result.insert(field.into(), fronting_properties[field].clone());
+        }
+        let choices = result.get_mut("outcome").unwrap()["enum"]
+            .as_array_mut()
+            .unwrap();
+        for word in ["not_fronted", "restore_failed"] {
+            if !choices.contains(&json!(word)) {
+                choices.push(json!(word));
+            }
+        }
+        result.get_mut("outcome").unwrap()["description"] = json!("completed means the pointer events were posted, with no effect claim or diff; read state afterwards. With the pointer-fronting review bound, the target is temporarily fronted under takeover and the previous application restored unless the person switched applications. Without that review, existing pointer actions require a frontmost target and takeover_click is unavailable. A failed restore is reported, never hidden.");
+    }
+    next
+}

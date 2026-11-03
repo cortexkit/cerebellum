@@ -15,7 +15,9 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v33.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v34.json");
+const V33_ARTIFACT_SHA256: &str =
+    "bec5b6cad004606960c684bafea3c7b219fc780cec9630158c29ff935833c849";
 /// The digests of retained historical artifacts: operator-app refusal, image
 /// handles and terminal-keystroke result envelopes, respectively.
 const V30_ARTIFACT_SHA256: &str =
@@ -57,11 +59,11 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 #[test]
-fn vocabulary_has_exactly_twelve_rows_and_locked_digest() {
+fn vocabulary_has_exactly_thirteen_rows_and_locked_digest() {
     let validated = validate_vocabulary().expect("frozen vocabulary must validate");
     assert_eq!(validated.revision, COMPUTER_ACTION_VOCABULARY_REVISION);
     assert_eq!(validated.schema_id, "ck-computer-action-vocabulary/v2");
-    assert_eq!(validated.row_count, 12, "absolute row-count invariant");
+    assert_eq!(validated.row_count, 13, "absolute row-count invariant");
     assert_eq!(validated.sha256, COMPUTER_ACTION_VOCABULARY_SHA256);
     assert_eq!(
         computed_vocabulary_sha256(),
@@ -137,6 +139,8 @@ fn every_repository_vocabulary_mirror_names_the_current_revision() {
                 V31_ARTIFACT_SHA256
             } else if path.ends_with("v32.json") {
                 V32_ARTIFACT_SHA256
+            } else if path.ends_with("v33.json") {
+                V33_ARTIFACT_SHA256
             } else {
                 panic!("{path} is a vocabulary artifact with no pinned digest")
             };
@@ -357,7 +361,7 @@ fn startup_probe_is_fail_closed_for_private_envelope_and_permission_liveness() {
         permissions: PermissionLivenessReport::default(),
         startup: driver.startup_probe().clone(),
     });
-    assert_eq!(declarations.len(), 12);
+    assert_eq!(declarations.len(), 13);
     assert_eq!(
         declarations
             .iter()
@@ -455,6 +459,7 @@ fn the_takeover_rows_are_the_only_observed_only_capabilities() {
         observed_only,
         [
             "computer.takeover_move",
+            "computer.takeover_click",
             "computer.takeover_drag",
             "computer.takeover_scroll"
         ]
@@ -463,7 +468,7 @@ fn the_takeover_rows_are_the_only_observed_only_capabilities() {
         .iter()
         .map(|item| item.capability_id.as_str())
         .collect();
-    assert_eq!(ids.len(), 12);
+    assert_eq!(ids.len(), 13);
 }
 
 fn recreated_v9() -> Value {
@@ -811,7 +816,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v31_from_v30(&generated, historical_revision(31).as_str().unwrap());
     let generated =
         vocabulary_mint::v32_from_v31(&generated, historical_revision(32).as_str().unwrap());
-    let generated = vocabulary_mint::v33_from_v32(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v33_from_v32(&generated, historical_revision(33).as_str().unwrap());
+    let generated = vocabulary_mint::v34_from_v33(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -826,6 +833,11 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
             .collect::<Vec<_>>(),
         vocabulary_mint::V15_ROW_IDS
             .into_iter()
+            .flat_map(|id| if id == "computer.takeover_move" {
+                vec![id, "computer.takeover_click"]
+            } else {
+                vec![id]
+            })
             .chain(["computer.open_app"])
             .collect::<Vec<_>>()
     );
@@ -2018,7 +2030,7 @@ fn recreated_v32() -> Value {
             }
         }
     }
-    let mut vocabulary: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut vocabulary = recreated_v33();
     vocabulary["revision"] = historical_revision(32);
     for row in vocabulary["rows"].as_array_mut().unwrap() {
         if row["capability_id"] != "computer.list_apps" {
@@ -2035,10 +2047,10 @@ fn v33_only_adds_the_optional_development_diagnostic_to_results() {
         hex_digest(&canonical_json_bytes(&previous).unwrap()),
         V32_ARTIFACT_SHA256
     );
-    let current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let current = recreated_v33();
     assert_eq!(
         current,
-        vocabulary_mint::v33_from_v32(&previous, COMPUTER_ACTION_VOCABULARY_REVISION)
+        vocabulary_mint::v33_from_v32(&previous, historical_revision(33).as_str().unwrap())
     );
     for (before, after) in previous["rows"]
         .as_array()
@@ -2060,14 +2072,14 @@ fn mint_current_vocabulary_artifact() {
     let resources = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
     let previous_path = resources.join(format!(
         "{}.json",
-        historical_revision(32).as_str().unwrap()
+        historical_revision(33).as_str().unwrap()
     ));
     let previous: Value = serde_json::from_slice(&std::fs::read(previous_path).unwrap()).unwrap();
     assert_eq!(
         hex_digest(&canonical_json_bytes(&previous).unwrap()),
-        V32_ARTIFACT_SHA256
+        V33_ARTIFACT_SHA256
     );
-    let generated = vocabulary_mint::v33_from_v32(&previous, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated = vocabulary_mint::v34_from_v33(&previous, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     std::fs::write(
         resources.join(format!("{COMPUTER_ACTION_VOCABULARY_REVISION}.json")),
@@ -2160,5 +2172,57 @@ fn v30_changes_only_the_outcomes() {
     assert_eq!(
         previous, current,
         "a document field other than revision changed"
+    );
+}
+
+fn recreated_v33() -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join(format!(
+            "{}.json",
+            historical_revision(33).as_str().unwrap()
+        ));
+    let previous: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&previous).unwrap()),
+        V33_ARTIFACT_SHA256
+    );
+    let mut current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    current["revision"] = historical_revision(33);
+    let rows = current["rows"].as_array_mut().unwrap();
+    let click = rows
+        .iter()
+        .position(|row| row["capability_id"] == "computer.takeover_click")
+        .unwrap();
+    assert_eq!(rows[click - 1]["capability_id"], "computer.takeover_move");
+    rows.remove(click);
+    for row in rows.iter_mut().filter(|row| {
+        row["capability_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("computer.takeover_")
+    }) {
+        *row = previous["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|old| old["capability_id"] == row["capability_id"])
+            .unwrap()
+            .clone();
+    }
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&current).unwrap()),
+        V33_ARTIFACT_SHA256
+    );
+    current
+}
+
+#[test]
+fn v34_only_adds_click_and_the_pointer_fronting_contract() {
+    let previous = recreated_v33();
+    let current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    assert_eq!(
+        current,
+        vocabulary_mint::v34_from_v33(&previous, COMPUTER_ACTION_VOCABULARY_REVISION)
     );
 }

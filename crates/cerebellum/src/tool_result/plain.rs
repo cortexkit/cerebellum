@@ -725,7 +725,7 @@ pub(super) fn facts(
     }
     if let Some(unavailable) = object.get("image_unavailable") {
         if let Some(reason) = text_of(unavailable, "reason") {
-            lines.push(format!("No image: {}.", words(reason)));
+            lines.push(image_unavailable_line(reason));
         }
     }
     let read_page = object.get("read_page").and_then(Value::as_object);
@@ -924,6 +924,26 @@ fn refusal_lines(object: &Map<String, Value>, code: &str, lines: &mut Vec<String
     }
 }
 
+/// Why an image read returned no image. Most reasons read well as words; the
+/// fronting bound needs its number and the fact that it is per call, or an
+/// agent reads it as a quota and stops asking.
+fn image_unavailable_line(reason: &str) -> String {
+    if reason == "fronting_bound_exceeded" {
+        let bound = cerebellum_computer::platform::vocabulary::frozen_row_bound_ms(
+            "computer.read_state",
+            "maximum_fronting_read_interval_ms",
+        );
+        if let Some(bound) = bound {
+            return format!(
+                "No image: the app took longer than {bound} ms to come to the front and be \
+                 captured, so the image was withheld and the previous app put back. Every call \
+                 gets the same {bound} ms; try again."
+            );
+        }
+    }
+    format!("No image: {}.", words(reason))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,6 +1004,21 @@ mod tests {
         assert!(
             !lines.iter().any(|line| line.contains("detail.required")),
             "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn an_overrun_fronting_bound_names_its_allowance_and_says_it_is_per_call() {
+        let line = image_unavailable_line("fronting_bound_exceeded");
+        assert_eq!(
+            line,
+            "No image: the app took longer than 300 ms to come to the front and be captured, \
+             so the image was withheld and the previous app put back. Every call gets the same \
+             300 ms; try again."
+        );
+        assert_eq!(
+            image_unavailable_line("restore_failed"),
+            "No image: restore failed."
         );
     }
 }

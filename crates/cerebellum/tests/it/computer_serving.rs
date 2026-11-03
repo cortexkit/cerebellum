@@ -58,6 +58,7 @@ fn only_the_capabilities_with_a_wire_handler_are_servable() {
         ("computer.type", ComputerCapability::Type),
         ("computer.keys", ComputerCapability::Keys),
         ("computer.takeover_move", ComputerCapability::TakeoverMove),
+        ("computer.takeover_click", ComputerCapability::TakeoverClick),
         ("computer.takeover_drag", ComputerCapability::TakeoverDrag),
         (
             "computer.takeover_scroll",
@@ -68,7 +69,7 @@ fn only_the_capabilities_with_a_wire_handler_are_servable() {
         assert_eq!(
             servable(name).map(|s| s.capability()),
             Some(capability),
-            "{name} has a reviewed wire path and must be servable"
+            "{name} has a wire handler; release admission is checked separately"
         );
     }
     for name in [

@@ -15,6 +15,8 @@ Run only what your change needs, and keep each run to minutes:
 
 Run cargo on this Mac only for macOS-only checks. Each fresh test binary run on this Mac costs a system security scan while Ufuk works on it. Keep the normal build directory; a separate `CARGO_TARGET_DIR` forces a cold build.
 
+Build-server Linux jobs can't change tracked files (from 2 Nov 2026): a write, `sed -i`, formatter or golden rewrite in a job fails with "Operation not permitted". So for a red-first proof, undo the fix in your local checkout (or a scratch copy under `$TMPDIR`), run the test, then restore it; never edit a tracked file inside the job, or the test runs against the fix and reads as a false red-first result. Regenerate tracked fixtures locally, or name them in the job's `return_paths`. Keep cargo `--locked` and use `cargo fmt --check` in jobs.
+
 If a test you didn't touch fails, rerun that one test by name on the base commit; never rerun a whole suite. A filtered run that takes longer than about 15 minutes means the filter is too broad. If a check can't run in your sandbox, name it in your report rather than skipping it silently.
 
 ## Standing approvals

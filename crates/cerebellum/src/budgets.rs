@@ -351,7 +351,21 @@ budget!(
         ("journal", STORE_MS, 1),
     ]
 );
-pub const COMPUTER_ACTIONS: [ActionBudget; 12] = [
+budget!(
+    COMPUTER_TAKEOVER_CLICK,
+    "takeover_click",
+    [
+        ("preflight", PREFLIGHT_MS, 1),
+        ("placement", AX_STEP_MS, 2),
+        ("fronting_lock", FRONTING_LOCK_WAIT_MS, 1),
+        ("focus", AX_STEP_MS, 1),
+        ("post", SYNTHETIC_POST_PHASE_MS, 1),
+        ("observe", MOVE_OBSERVE_MS, 1),
+        ("journal", STORE_MS, 1),
+    ]
+);
+pub const COMPUTER_ACTIONS: [ActionBudget; 13] = [
+    COMPUTER_TAKEOVER_CLICK,
     COMPUTER_READ_STATE,
     COMPUTER_WAIT,
     COMPUTER_OPEN_APP,
@@ -1213,6 +1227,15 @@ mod tests {
             (
                 COMPUTER_TAKEOVER_MOVE,
                 PREFLIGHT_MS + 3 * AX_STEP_MS + SYNTHETIC_POST_PHASE_MS + 200 + STORE_MS,
+            ),
+            (
+                COMPUTER_TAKEOVER_CLICK,
+                PREFLIGHT_MS
+                    + FRONTING_LOCK_WAIT_MS
+                    + 3 * AX_STEP_MS
+                    + SYNTHETIC_POST_PHASE_MS
+                    + 200
+                    + STORE_MS,
             ),
             (
                 COMPUTER_TAKEOVER_DRAG,

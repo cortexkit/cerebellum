@@ -139,14 +139,21 @@ mod daemon {
         .unwrap()
     }
 
-    fn ctx(id: u64) -> (RouteCtx, mpsc::Receiver<OutboundFrame>) {
+    fn ctx(
+        id: u64,
+    ) -> (
+        RouteCtx,
+        mpsc::Receiver<OutboundFrame>,
+        mpsc::Sender<OutboundFrame>,
+    ) {
         let (tx, rx) = mpsc::channel(16);
         (
             RouteCtx {
                 connection_id: ConnectionId::new(id),
-                egress: FrameSink::new(tx),
+                egress: FrameSink::new(tx.clone()),
             },
             rx,
+            tx,
         )
     }
 
@@ -189,6 +196,9 @@ mod daemon {
         client: RouteCtx,
         client_route: (u16, u32),
         config: PathBuf,
+        module_egress: mpsc::Sender<OutboundFrame>,
+        responses: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        reply_received: tokio::sync::watch::Sender<u64>,
     }
 
     impl Drop for Fixture {
@@ -224,7 +234,7 @@ mod daemon {
                 ControlHandler::with_forwarding(Arc::new(Registry::default()), forwarding.clone())
                     .with_supervisor(supervisor),
             );
-            let (module, mut module_rx) = ctx(1);
+            let (module, mut module_rx, module_egress) = ctx(1);
             let manifest = ModuleManifest::builder("cerebellum", "0.1.0")
                 .protocol_ver(PROTOCOL_VERSION)
                 .provides(vec![ProviderRole::ToolProvider {
@@ -246,18 +256,28 @@ mod daemon {
                 control_ops: None,
                 launch_nonce: Some("fixture-nonce".into()),
             };
+            let mut hello = serde_json::to_value(hello).unwrap();
+            // Optional release evidence must not prevent registration of a
+            // valid tool provider whose takeover_pointer_fronting_review_revision
+            // gate is reported as MissingExternalInput.
+            let mut gate_outcomes = vec![json!("Pass"); 16];
+            gate_outcomes[11] = json!({"MissingExternalInput":{"gate":"takeover_pointer_fronting_review_revision"}});
+            hello["manifest"]["computer_plane_release"] = json!({
+                "frozen_row_count":13,"canonical_row_count":13,
+                "advertised_row_count":1,"advertised_capabilities":["computer.wait"],
+                "gate_admitted_capabilities":["computer.wait"],
+                "exercised_row_count":0,"functional_computer_plane":false,
+                "scope":"partial_runtime_advertisement","gate_outcomes":gate_outcomes,
+            });
             assert!(handler
-                .handle_control_frame(
-                    &module,
-                    frame(FrameType::Hello, 1, serde_json::to_value(hello).unwrap())
-                )
+                .handle_control_frame(&module, frame(FrameType::Hello, 1, hello))
                 .await
                 .unwrap()
                 .is_empty());
             let ack: ModuleHelloAckBody =
                 serde_json::from_slice(&receive(&mut module_rx).await.body).unwrap();
             assert!(ack.subc_ops.contains(&"operator.confirm".into()));
-            let (client, mut client_rx) = ctx(2);
+            let (client, mut client_rx, _client_egress) = ctx(2);
             let open = ClientControlRequest::RouteOpen {
                 target: RouteTarget::ToolProvider {
                     module_id: "cerebellum".into(),
@@ -315,7 +335,11 @@ mod daemon {
             );
             let wire = Arc::new(Wire::default());
             let (writer, mut outgoing) = mpsc::channel(16);
+            let responses = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (reply_received, _) = tokio::sync::watch::channel(0);
             let request_pump = {
+                let responses = responses.clone();
+                let reply_received = reply_received.clone();
                 let handler = handler.clone();
                 let module = module.clone();
                 let wire = wire.clone();
@@ -326,15 +350,21 @@ mod daemon {
                             .await
                             .unwrap()
                         {
+                            responses.lock().unwrap().push(json!({"corr":response.header.corr,"body":serde_json::from_slice::<serde_json::Value>(&response.body).unwrap_or_default()}));
+                            reply_received.send_modify(|received| *received += 1);
                             wire.deliver(&response);
                         }
                     }
                 })
             };
             let response_pump = {
+                let responses = responses.clone();
+                let reply_received = reply_received.clone();
                 let wire = wire.clone();
                 tokio::spawn(async move {
                     while let Some(response) = module_rx.recv().await {
+                        responses.lock().unwrap().push(json!({"corr":response.frame.header.corr,"body":serde_json::from_slice::<serde_json::Value>(&response.frame.body).unwrap_or_default()}));
+                        reply_received.send_modify(|received| *received += 1);
                         wire.deliver(&response.frame);
                     }
                 })
@@ -358,6 +388,9 @@ mod daemon {
                 client,
                 client_route,
                 config,
+                module_egress,
+                responses,
+                reply_received,
             }
         }
 
@@ -409,6 +442,24 @@ mod daemon {
             })
             .await
             .expect("script provider event deadline");
+        }
+
+        async fn cancelled_reply(&self, corr: u64) {
+            let mut received = self.reply_received.subscribe();
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    if self.responses.lock().unwrap().iter().any(|response| {
+                        response["corr"] == corr
+                            && response["body"]["code"] == "operator_declined"
+                            && response["body"]["detail"]["reason"] == "caller_cancelled"
+                    }) {
+                        return;
+                    }
+                    received.changed().await.expect("reply pump remains alive");
+                }
+            })
+            .await
+            .expect("daemon cancellation reply deadline");
         }
     }
 
@@ -523,15 +574,43 @@ mod daemon {
             _ = &mut waiting => panic!("hang must await cancellation"),
             _ = f.event("prompt_shown") => {},
         }
+        let cancelled_corr = {
+            let pending = f.call.wire.pending.lock().unwrap();
+            assert_eq!(pending.len(), 1);
+            *pending.keys().next().unwrap()
+        };
+        let held_delivery = f.module_egress.reserve_many(16).await.unwrap();
         cancel.cancel();
         assert_eq!(waiting.await.0, AppUse::Background);
         f.event("withdraw").await;
         f.event("provider_returned").await;
         assert_eq!(f.prompts(), 1);
+        // Provider return is not cancellation completion: the daemon retains
+        // its per-module slot until the terminal reply can enter egress.
+        let busy = f.mode(&live, &crate::CancelHandle::pending()).await;
+        assert_eq!(busy.0, AppUse::Background, "{busy:?}");
+        assert!(busy
+            .1
+            .as_deref()
+            .unwrap()
+            .contains("presence is unavailable"));
+        let busy_reply = f.responses.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(busy_reply["body"]["code"], "operator_presence_unavailable");
+        assert_eq!(busy_reply["body"]["detail"]["reason"], "module_limit");
+        assert_eq!(f.prompts(), 1, "a busy module cannot start another prompt");
+        drop(held_delivery);
+        f.cancelled_reply(cancelled_corr).await;
+        let resumed = f.mode(&live, &crate::CancelHandle::pending()).await;
+        fs::write(
+            f.root.join("operator.responses.json"),
+            serde_json::to_vec_pretty(&*f.responses.lock().unwrap()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            f.mode(&live, &crate::CancelHandle::pending()).await.0,
+            resumed.0,
             AppUse::Foreground,
-            "a cancelled prompt never seeds approval"
+            "a cancelled prompt never seeds approval: {resumed:?}; provider events: {:?}; replies: {:?}",
+            f.events(), f.responses.lock().unwrap()
         );
         assert_eq!(f.prompts(), 2);
 
@@ -584,8 +663,10 @@ mod daemon {
             }
             return;
         }
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+        // The daemon clears its module slot synchronously after enqueueing the
+        // terminal reply. On one runtime thread, receiving that reply is a
+        // post-cleanup barrier; a provider log from a blocking thread is not.
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()

@@ -163,7 +163,10 @@ pub(crate) fn arrive(
             && (!facts.acts_as_agent
                 || matches!(
                     capability.0,
-                    Served::TakeoverMove | Served::TakeoverDrag | Served::TakeoverScroll
+                    Served::TakeoverMove
+                        | Served::TakeoverClick
+                        | Served::TakeoverDrag
+                        | Served::TakeoverScroll
                 )))
     {
         return None;
@@ -309,7 +312,7 @@ where
             Served::PressPoint => sessions
                 .resolve_image(conversation, arguments.get("image_id")?.as_str()?)
                 .map(|image| image.bundle_identity),
-            Served::TakeoverMove | Served::TakeoverDrag => {
+            Served::TakeoverMove | Served::TakeoverClick | Served::TakeoverDrag => {
                 let request =
                     super::takeover::parse_request(capability.capability(), arguments).ok()?;
                 let (image_id, points) = match request {
@@ -483,6 +486,7 @@ pub(super) fn queued_refusal(
             Served::Type
             | Served::Keys
             | Served::TakeoverMove
+            | Served::TakeoverClick
             | Served::TakeoverDrag
             | Served::TakeoverScroll => super::synthetic_dispatch_refusal(
                 &cerebellum_computer::dispatch::DispatchError::Cancelled {
@@ -508,7 +512,10 @@ fn valid_request(capability: Servable, arguments: &Value) -> Result<(), Value> {
         Served::PressElement => super::element_actions::parse_press_element(arguments).map(|_| ()),
         Served::PressPoint => super::element_actions::parse_press_point(arguments).map(|_| ()),
         Served::WriteText => super::element_actions::parse_write_text(arguments).map(|_| ()),
-        Served::TakeoverMove | Served::TakeoverDrag | Served::TakeoverScroll => {
+        Served::TakeoverMove
+        | Served::TakeoverClick
+        | Served::TakeoverDrag
+        | Served::TakeoverScroll => {
             super::takeover::parse_request(capability.capability(), arguments).map(|_| ())
         }
         Served::OpenApp => super::open_app::parse_request(arguments).map(|_| ()),

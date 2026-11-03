@@ -250,7 +250,13 @@ export CEREBELLUM_PRIVATE_INPUT_ROUTE_REVIEW_REVISION="private-input-route-revie
 
 # The identifiers the compiler reads. Kept as one list so the loop below and
 # the check after it cannot disagree about what exists.
+# Temporary front/act/restore for takeover pointer gestures and takeover_click
+# needs an independent safety review. Leave its key UNSET until that review
+# approves these paths and supplies its revision. Binding the key also changes
+# computer_use definition bytes. OpenCode caches those definitions until
+# restart, so bind the key only at a coordinated host restart.
 readonly ATTESTATIONS=(
+  CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION
   CEREBELLUM_CAPTURE_REVIEW_REVISION
   CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION
   CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION

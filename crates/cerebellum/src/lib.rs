@@ -249,7 +249,7 @@ pub enum ComputerGateOutcome {
     ImplementationFailure { gate: String },
 }
 
-/// Release evidence records the fixed set of eight canonical computer
+/// Release evidence records the current set of canonical computer
 /// capability rows, while runtime advertisement and successfully exercised
 /// behavior are counted independently.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -306,7 +306,7 @@ struct ComputerReleaseGate {
 /// struck and excluded from evaluation because they lack independent evidence.
 /// Keeping them in the table prevents a future change from restoring an
 /// unsupported comparison.
-const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 23] = [
+const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 24] = [
     ComputerReleaseGate {
         name: "vocabulary_manifest_digest",
         source: ComputerReleaseGateSource::VocabularyManifestDigest,
@@ -357,6 +357,10 @@ const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 23] = [
     },
     ComputerReleaseGate {
         name: "takeover_dispatch_review_revision",
+        source: ComputerReleaseGateSource::External,
+    },
+    ComputerReleaseGate {
+        name: "takeover_pointer_fronting_review_revision",
         source: ComputerReleaseGateSource::External,
     },
     // Reported in release evidence but required by no capability row: it
@@ -501,6 +505,9 @@ fn external_release_input<'a>(inputs: &'a ComputerReleaseInputs, gate: &str) -> 
         "app_state_review_revision" => inputs.app_state_review_revision.as_deref(),
         "element_addressed_review_revision" => inputs.element_addressed_review_revision.as_deref(),
         "takeover_dispatch_review_revision" => inputs.takeover_dispatch_review_revision.as_deref(),
+        "takeover_pointer_fronting_review_revision" => {
+            inputs.takeover_pointer_fronting_review_revision.as_deref()
+        }
         "app_use_fronting_review_revision" => inputs.app_use_fronting_review_revision.as_deref(),
         "release_signing_topology_revision" => inputs.release_signing_topology_revision.as_deref(),
         _ => unreachable!("every external release gate has a bound input"),
@@ -576,19 +583,23 @@ fn declaration_gate_passes(
         .all(|gate| gate_passes(outcomes, gate))
     } else if matches!(
         id,
-        "computer.takeover_move" | "computer.takeover_drag" | "computer.takeover_scroll"
+        "computer.takeover_move"
+            | "computer.takeover_drag"
+            | "computer.takeover_scroll"
+            | "computer.takeover_click"
     ) {
-        // The real-pointer rows need two reviews, and each is checked here
-        // rather than trusted to the row's artifact: the row names only the
-        // takeover review, while the global pointer stream they post through
-        // stays under its own review of record.
-        [
-            "global_dispatch_review_revision",
-            "takeover_dispatch_review_revision",
-            "release_signing_topology_revision",
-        ]
-        .iter()
-        .all(|gate| gate_passes(outcomes, gate))
+        // Global posting and takeover permission have separate reviews. The
+        // click row additionally needs the pointer-fronting review; none of
+        // these admissions is inferred from another row's artifact.
+        (id != "computer.takeover_click"
+            || gate_passes(outcomes, "takeover_pointer_fronting_review_revision"))
+            && [
+                "global_dispatch_review_revision",
+                "takeover_dispatch_review_revision",
+                "release_signing_topology_revision",
+            ]
+            .iter()
+            .all(|gate| gate_passes(outcomes, gate))
     } else {
         // Every current row has its gate above; a row added without one is
         // never admitted.
@@ -1247,7 +1258,7 @@ fn computer_permission_readings(
 /// Collect the release attestations supplied to the compiler and derive the
 /// vocabulary mirrors from their independent checked-in sources.
 ///
-/// The twelve external identifiers use `option_env!` so a release invocation must
+/// External identifiers use `option_env!` so a release invocation must
 /// supply each attestation before compilation. Starting a binary with a new
 /// environment value cannot manufacture a review after the binary was built.
 fn compiled_release_inputs() -> ComputerReleaseInputs {
@@ -1275,6 +1286,9 @@ fn compiled_release_inputs() -> ComputerReleaseInputs {
         app_state_review_revision,
         element_addressed_review_revision,
         takeover_dispatch_review_revision,
+        takeover_pointer_fronting_review_revision: option_env!(
+            "CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION"
+        ),
         app_use_fronting_review_revision,
         release_signing_topology_revision,
     })
@@ -1291,6 +1305,7 @@ struct BuildReleaseBindings<'a> {
     app_state_review_revision: Option<&'a str>,
     element_addressed_review_revision: Option<&'a str>,
     takeover_dispatch_review_revision: Option<&'a str>,
+    takeover_pointer_fronting_review_revision: Option<&'a str>,
     app_use_fronting_review_revision: Option<&'a str>,
     release_signing_topology_revision: Option<&'a str>,
 }
@@ -1317,6 +1332,9 @@ fn release_inputs_from_build_bindings(bindings: BuildReleaseBindings<'_>) -> Com
             .map(str::to_owned),
         takeover_dispatch_review_revision: bindings
             .takeover_dispatch_review_revision
+            .map(str::to_owned),
+        takeover_pointer_fronting_review_revision: bindings
+            .takeover_pointer_fronting_review_revision
             .map(str::to_owned),
         app_use_fronting_review_revision: bindings
             .app_use_fronting_review_revision
@@ -1353,6 +1371,25 @@ fn release_attestation_bound(gate: &'static str, value: Option<&str>) -> bool {
 )]
 fn fronting_bracket_admitted(inputs: &ComputerReleaseInputs) -> bool {
     inputs.takeover_dispatch_review_revision.is_some()
+}
+
+#[cfg_attr(
+    not(any(test, target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
+/// Release-review admission for temporary pointer fronting. This does not
+/// replace the conversation's takeover permission, checked on each dispatch.
+pub fn takeover_pointer_fronting_admitted(inputs: &ComputerReleaseInputs) -> bool {
+    release_attestation_bound(
+        "takeover_pointer_fronting_review_revision",
+        inputs.takeover_pointer_fronting_review_revision.as_deref(),
+    ) && release_attestation_bound(
+        "takeover_dispatch_review_revision",
+        inputs.takeover_dispatch_review_revision.as_deref(),
+    ) && release_attestation_bound(
+        "global_dispatch_review_revision",
+        inputs.global_dispatch_review_revision.as_deref(),
+    )
 }
 
 /// Fronting outside the keystroke bracket: foreground mode's one-way front,
@@ -3576,6 +3613,10 @@ impl Planes {
                                 .with_takeover_dispatch_review_revision(
                                     takeover_dispatch_review_revision.clone(),
                                 )
+                                .with_takeover_pointer_fronting_review_revision(
+                                    compiled_release_inputs()
+                                        .takeover_pointer_fronting_review_revision,
+                                )
                                 .with_shared_user_idle(user_idle.clone());
                             driver
                         },
@@ -3591,6 +3632,9 @@ impl Planes {
                     // The fronting bracket is served only by a build carrying
                     // its review; without it a background target is refused.
                     .with_fronting_bracket_admitted(fronting_bracket_admitted(
+                        &compiled_release_inputs(),
+                    ))
+                    .with_takeover_pointer_fronting_admitted(takeover_pointer_fronting_admitted(
                         &compiled_release_inputs(),
                     ))
                     // Fronting outside that bracket needs the app-use review
@@ -7910,7 +7954,10 @@ async fn handle_tool_request_inner(
     if accepted_facts.flow_id.is_some()
         && matches!(
             name,
-            "computer.takeover_move" | "computer.takeover_drag" | "computer.takeover_scroll"
+            "computer.takeover_move"
+                | "computer.takeover_click"
+                | "computer.takeover_drag"
+                | "computer.takeover_scroll"
         )
     {
         return send_tool_response(
@@ -7926,7 +7973,10 @@ async fn handle_tool_request_inner(
     if codemode::legacy_run(&accepted_facts)
         && matches!(
             name,
-            "computer.takeover_move" | "computer.takeover_drag" | "computer.takeover_scroll"
+            "computer.takeover_move"
+                | "computer.takeover_click"
+                | "computer.takeover_drag"
+                | "computer.takeover_scroll"
         )
     {
         return send_tool_response(
@@ -9790,8 +9840,8 @@ mod tests {
 
         assert_eq!(
             read_here.len(),
-            12,
-            "expected twelve attestations, found {read_here:?}"
+            13,
+            "expected thirteen attestations, found {read_here:?}"
         );
 
         for name in &read_here {
@@ -13428,6 +13478,7 @@ mod tests {
             app_state_review_revision: None,
             element_addressed_review_revision: None,
             takeover_dispatch_review_revision: None,
+            takeover_pointer_fronting_review_revision: None,
             app_use_fronting_review_revision: None,
             release_signing_topology_revision: None,
         });
@@ -13444,6 +13495,7 @@ mod tests {
                 app_state_review_revision: None,
                 element_addressed_review_revision: None,
                 takeover_dispatch_review_revision: None,
+                takeover_pointer_fronting_review_revision: None,
                 app_use_fronting_review_revision: None,
                 release_signing_topology_revision: None,
                 vocabulary_digests: computer::platform::VocabularyDigestInputs {
@@ -13508,6 +13560,7 @@ mod tests {
                 app_state_review_revision: Some("fixture-app-state-review"),
                 element_addressed_review_revision: Some("fixture-element-addressed-review"),
                 takeover_dispatch_review_revision: Some("fixture-takeover-dispatch-review"),
+                takeover_pointer_fronting_review_revision: Some("fixture-pointer-fronting-review"),
                 app_use_fronting_review_revision: Some("fixture-app-use-fronting-review"),
                 release_signing_topology_revision: Some("fixture-signing-topology"),
             }),
@@ -13517,7 +13570,7 @@ mod tests {
         let outcomes = computer_gate_outcomes(&context);
         assert_eq!(
             outcomes.into_values().collect::<Vec<_>>(),
-            vec![ComputerGateOutcome::Pass; 15]
+            vec![ComputerGateOutcome::Pass; 16]
         );
     }
 
@@ -13536,12 +13589,57 @@ mod tests {
             "manifest-fixture",
             &context,
             &BrowserSurface::NotConfigured,
+            Some(provenance.clone()),
+        );
+        assert!(takeover_pointer_fronting_admitted(&context.inputs));
+        let mut unbound_context = ComputerCapabilityAdvertisementContext {
+            inputs: context.inputs.clone(),
+            permissions: context.permissions.clone(),
+            startup: context.startup.clone(),
+        };
+        unbound_context
+            .inputs
+            .takeover_pointer_fronting_review_revision = None;
+        assert!(!takeover_pointer_fronting_admitted(&unbound_context.inputs));
+        let unbound = compose_manifest(
+            "manifest-fixture",
+            &unbound_context,
+            &BrowserSurface::NotConfigured,
             Some(provenance),
         );
-        // Removing the views declaration must recover the previous HELLO bytes.
-        // Keep the older subtraction guard too, so neither addition can hide
-        // unrelated changes to the manifest.
-        let mut without_views = value.clone();
+        let digest = |manifest: &Value| manifest::sha256_hex(manifest.to_string().as_bytes());
+        println!(
+            "fixed HELLO bound={} unbound={}",
+            digest(&value),
+            digest(&unbound)
+        );
+
+        // Without the pointer review, only release evidence differs from the
+        // pre-pointer HELLO: the canonical row count and the extra unresolved
+        // gate remain visible even though its tool definitions are unchanged.
+        let mut legacy = unbound.clone();
+        let release = &mut legacy["computer_plane_release"];
+        assert_eq!(release["frozen_row_count"], 13);
+        assert_eq!(release["canonical_row_count"], 13);
+        release["frozen_row_count"] = json!(12);
+        release["canonical_row_count"] = json!(12);
+        let missing =
+            json!({"MissingExternalInput":{"gate":"takeover_pointer_fronting_review_revision"}});
+        let outcomes = release["gate_outcomes"].as_array_mut().unwrap();
+        assert_eq!(outcomes.len(), 16);
+        let index = outcomes
+            .iter()
+            .position(|outcome| *outcome == missing)
+            .expect("the unbound review is reported on HELLO");
+        assert_eq!(outcomes.remove(index), missing);
+        if release["advertised_row_count"] == 12 {
+            assert_eq!(release["scope"], "partial_runtime_advertisement");
+            release["scope"] = json!("all_frozen_rows");
+        }
+
+        // Keep the historical view and no-project subtraction guards. The
+        // normalization above must not hide any unrelated manifest change.
+        let mut without_views = legacy.clone();
         without_views["capabilities"]["provides"]
             .as_array_mut()
             .unwrap()
@@ -13550,10 +13648,7 @@ mod tests {
         let before_views = "f46b5ddc8c5b081adb40a3c2982d27822f9c7400bc62d189d74816a5eaa5d466";
         #[cfg(target_os = "macos")]
         let before_views = "6c98e57299920c8ee405321aecbd63e4e514a5c23676632df8b971f900f3f436";
-        assert_eq!(
-            manifest::sha256_hex(without_views.to_string().as_bytes()),
-            before_views
-        );
+        assert_eq!(digest(&without_views), before_views);
         #[cfg(target_os = "linux")]
         let previous = "76dbb08edce1bb7742f5efc2686b7e2ec42ad623586d16d91be1fbd52fa15662";
         #[cfg(target_os = "macos")]
@@ -13563,23 +13658,27 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .retain(|name| name != subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY);
-        use sha2::Digest;
-        assert_eq!(
-            format!(
-                "{:x}",
-                sha2::Sha256::digest(predecessor.to_string().as_bytes())
-            ),
-            previous
-        );
-
+        assert_eq!(digest(&predecessor), previous);
         #[cfg(target_os = "linux")]
-        let expected = "62fe03bb1a213e8c6d0c73000fca4de891118d5347440e35b96f8534a4c1fd51";
+        let before_pointer_fronting =
+            "62fe03bb1a213e8c6d0c73000fca4de891118d5347440e35b96f8534a4c1fd51";
         #[cfg(target_os = "macos")]
-        let expected = "129c9cf0b18bcd2f225d4a8aa0189f097991ec4685348e0e3fa294cc495829ff";
-        assert_eq!(
-            format!("{:x}", sha2::Sha256::digest(value.to_string().as_bytes())),
-            expected
-        );
+        let before_pointer_fronting =
+            "129c9cf0b18bcd2f225d4a8aa0189f097991ec4685348e0e3fa294cc495829ff";
+        assert_eq!(digest(&legacy), before_pointer_fronting);
+
+        // Full HELLO pins are separate from the computer_use prompt pin:
+        // binding the review also adds click and its definition on macOS.
+        #[cfg(target_os = "linux")]
+        let expected = "2b3184c68f59f3da166b6e2ec711781e09cca8d9aac9cd2182b5344256bb8752";
+        #[cfg(target_os = "macos")]
+        let expected = "be5b2ce816d58556761241e11a588b07e079c0cdc5bff7197c1363c4300f26b1";
+        #[cfg(target_os = "linux")]
+        let expected_unbound = "07b08b84e41cccff515bb6765bd90831c1fae3b67d0fb90d1bccbb7a488da86d";
+        #[cfg(target_os = "macos")]
+        let expected_unbound = "bb026a1261e64db0449497393698649769dbb983261bd368e64465328f35ffd3";
+        assert_eq!(digest(&value), expected);
+        assert_eq!(digest(&unbound), expected_unbound);
     }
 
     /// A daemon linking subc-protocol 0.32.11 must keep accepting this module's
@@ -13617,6 +13716,53 @@ mod tests {
 
     /// Every external attestation bound, as a release build supplying all of
     /// them would compile it.
+    #[test]
+    fn pointer_fronting_review_controls_click_and_leaves_legacy_rows_admitted() {
+        let bound = release_inputs_from_build_bindings(fully_bound_release_bindings());
+        let names = |inputs: ComputerReleaseInputs| {
+            let context = ComputerCapabilityAdvertisementContext {
+                inputs,
+                permissions: Default::default(),
+                startup: StartupCapabilityProbe::default(),
+            };
+            let mut declarations = computer::platform::capability_declarations(&context, true);
+            for declaration in &mut declarations {
+                declaration.advertised = true;
+            }
+            gate_admitted_computer_declarations(&declarations, &computer_gate_outcomes(&context))
+                .into_iter()
+                .map(|row| row.capability_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(takeover_pointer_fronting_admitted(&bound));
+        let bound_names = names(bound.clone());
+        assert!(bound_names
+            .iter()
+            .any(|name| name == "computer.takeover_click"));
+        let legacy_names: Vec<_> = bound_names
+            .into_iter()
+            .filter(|name| name != "computer.takeover_click")
+            .collect();
+        for absent in [
+            None,
+            Some(""),
+            Some("placeholder"),
+            Some("tbd"),
+            Some("unknown"),
+        ] {
+            let mut inputs = bound.clone();
+            inputs.takeover_pointer_fronting_review_revision = absent.map(str::to_owned);
+            assert!(!takeover_pointer_fronting_admitted(&inputs));
+            assert_eq!(names(inputs), legacy_names);
+        }
+        assert_eq!(
+            compiled_release_inputs()
+                .takeover_pointer_fronting_review_revision
+                .as_deref(),
+            option_env!("CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION")
+        );
+    }
+
     fn fully_bound_release_bindings() -> BuildReleaseBindings<'static> {
         BuildReleaseBindings {
             attendance_contract_owner: Some("fixture-attendance-owner"),
@@ -13629,6 +13775,7 @@ mod tests {
             app_state_review_revision: Some("fixture-app-state-review"),
             element_addressed_review_revision: Some("fixture-element-addressed-review"),
             takeover_dispatch_review_revision: Some("fixture-takeover-dispatch-review"),
+            takeover_pointer_fronting_review_revision: Some("fixture-pointer-fronting-review"),
             app_use_fronting_review_revision: Some("fixture-app-use-fronting-review"),
             release_signing_topology_revision: Some("fixture-signing-topology"),
         }
@@ -13845,6 +13992,7 @@ mod tests {
                     app_state_review_revision: Some("fixture-app-state-review"),
                     element_addressed_review_revision: Some("fixture-element-addressed-review"),
                     takeover_dispatch_review_revision: takeover,
+                    takeover_pointer_fronting_review_revision: Some("fixture-pointer-review"),
                     app_use_fronting_review_revision: Some("fixture-app-use-fronting-review"),
                     release_signing_topology_revision: Some("fixture-signing-topology"),
                 }),
@@ -13854,6 +14002,7 @@ mod tests {
         };
         let takeover_rows = [
             "computer.takeover_move",
+            "computer.takeover_click",
             "computer.takeover_drag",
             "computer.takeover_scroll",
         ];
@@ -15983,6 +16132,7 @@ mod relayed_computer_call_tests {
         planes.computer_admitted = Arc::new(
             [
                 "computer.takeover_move".into(),
+                "computer.takeover_click".into(),
                 "computer.takeover_drag".into(),
                 "computer.takeover_scroll".into(),
             ]
@@ -16012,6 +16162,10 @@ mod relayed_computer_call_tests {
             },
         );
         for (corr, action) in [
+            (
+                45,
+                json!({"action":"takeover_click", "image_id":image_id, "x":1,"y":1}),
+            ),
             (
                 44,
                 json!({"action":"takeover_scroll", "target":APP,"axis":"vertical","amount_lines":1}),

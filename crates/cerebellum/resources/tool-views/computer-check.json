@@ -12,6 +12,7 @@
           "type",
           "keys",
           "takeover_move",
+          "takeover_click",
           "takeover_drag",
           "takeover_scroll",
           "wait",
@@ -21,7 +22,7 @@
         "type": "string"
       },
       "amount_lines": {
-        "description": "Lines to scroll. Vertical: positive scrolls up toward the top, negative scrolls down. takeover_scroll carries no location: it turns the real scroll wheel wherever the pointer already is, in the application target names, which must be frontmost. It is the one takeover action that needs only the conversation's takeover grant and no app grant. Required for: takeover_scroll.",
+        "description": "Lines to scroll. Vertical: positive scrolls up toward the top, negative scrolls down. takeover_scroll carries no location: it turns the real scroll wheel wherever the pointer already is, in the application target names, fronted temporarily if needed. It is the one takeover action that needs only the conversation's takeover grant and no app grant. Required for: takeover_scroll.",
         "maximum": 100,
         "minimum": -100,
         "type": "integer"
@@ -79,7 +80,7 @@
         "type": "object"
       },
       "image_id": {
-        "description": "The image_id of an image a read_state call on this application returned. Required for: press_point, takeover_move, takeover_drag.",
+        "description": "The image_id of an image a read_state call on this application returned. Required for: press_point, takeover_move, takeover_click, takeover_drag.",
         "minLength": 1,
         "type": "string"
       },
@@ -161,12 +162,12 @@
         "type": "string"
       },
       "x": {
-        "description": "Horizontal pixel in the named image. Required for: press_point.",
+        "description": "Horizontal pixel in the named image. Required for: press_point, takeover_click.",
         "minimum": 0,
         "type": "integer"
       },
       "y": {
-        "description": "Vertical pixel in the named image. Required for: press_point.",
+        "description": "Vertical pixel in the named image. Required for: press_point, takeover_click.",
         "minimum": 0,
         "type": "integer"
       },
@@ -488,6 +489,7 @@
               "type",
               "keys",
               "takeover_move",
+              "takeover_click",
               "takeover_drag",
               "takeover_scroll",
               "wait",

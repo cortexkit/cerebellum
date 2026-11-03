@@ -90,6 +90,7 @@ impl FrozenDispatchRow {
                 ComputerCapability::Type => (true, true, true),
                 ComputerCapability::Keys => (false, true, true),
                 ComputerCapability::TakeoverMove
+                | ComputerCapability::TakeoverClick
                 | ComputerCapability::TakeoverDrag
                 | ComputerCapability::TakeoverScroll => (false, false, true),
                 ComputerCapability::ReadState
@@ -1298,6 +1299,40 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                         )?;
                         return Err(refusal);
                     }
+                    Err(DriverError::ObservedSequenceFailed { abort, failure }) => {
+                        let failure = *failure;
+                        self.last_observed_abort = Some(abort);
+                        let refusal = DispatchError::SyntheticSequenceFailed {
+                            posts_returned: failure.posts_returned,
+                            refusal: failure.refusal,
+                            held_state: failure.held_state,
+                        };
+                        self.finalize_audit_outcome(
+                            audit,
+                            state,
+                            &ActuationOutcome::Refused {
+                                refusal: refusal.clone(),
+                                abort: Some(abort),
+                            },
+                        )?;
+                        return Err(refusal);
+                    }
+                    Err(DriverError::SyntheticDispatchFailed(failure)) => {
+                        let refusal = DispatchError::SyntheticSequenceFailed {
+                            posts_returned: failure.posts_returned,
+                            refusal: failure.refusal,
+                            held_state: failure.held_state,
+                        };
+                        self.finalize_audit_outcome(
+                            audit,
+                            state,
+                            &ActuationOutcome::Refused {
+                                refusal: refusal.clone(),
+                                abort: None,
+                            },
+                        )?;
+                        return Err(refusal);
+                    }
                     Err(DriverError::ObservedDispatchAborted(abort)) => {
                         self.last_observed_abort = Some(abort);
                         let refusal = Self::dispatch_error_for_abort(abort);
@@ -1575,6 +1610,7 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
             | DriverError::EventConstructionFailed(_)
             | DriverError::SyntheticDispatchFailed(_)
             | DriverError::ObservedDispatchAborted(_) => DispatchError::SemanticPathUnavailable,
+            DriverError::ObservedSequenceFailed { .. } => DispatchError::SemanticPathUnavailable,
         }
     }
 }

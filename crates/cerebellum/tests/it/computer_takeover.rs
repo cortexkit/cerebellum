@@ -773,7 +773,7 @@ async fn a_scroll_without_the_takeover_grant_asks_for_it_even_under_an_app_grant
 // ---------------------------------------------------------------------------
 
 /// A target that is not frontmost is refused by the check made before every
-/// post, and nothing is posted: a takeover action never fronts anything.
+/// post, and nothing is posted when the pointer-fronting review is unbound.
 #[tokio::test]
 async fn a_target_that_is_not_frontmost_is_refused_at_the_post() {
     let rig = granted_rig().await;
@@ -907,4 +907,20 @@ async fn a_cancel_mid_drag_releases_the_button() {
     assert_eq!(reply["posts_returned"], 1);
     assert_eq!(reply["reason"], "caller_interrupted_held_input_released");
     assert_eq!(rig.posts(), vec![(0, false), (2, true)]);
+}
+
+/// An unbound build retains the old pointer surface even when takeover is held.
+#[tokio::test]
+async fn a_click_without_the_pointer_fronting_review_posts_nothing() {
+    let rig = granted_rig().await;
+    let reply = serve(
+        &rig,
+        "computer.takeover_click",
+        json!({"image_id":rig.image_id,"x":10,"y":20}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "invalid_request", "{reply}");
+    assert_eq!(reply["reason"], "unknown_value", "{reply}");
+    assert!(rig.dispatched().is_empty());
+    assert!(rig.posts().is_empty());
 }

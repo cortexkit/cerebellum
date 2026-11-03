@@ -165,6 +165,12 @@ fn map_event_construction_error(
             "CoreGraphics could not create the combination key-up event"
         }
         Construction::ScrollUnavailable => "CoreGraphics could not create the scroll event",
+        Construction::ClickPressUnavailable => {
+            "CoreGraphics could not create the click press event"
+        }
+        Construction::ClickReleaseUnavailable => {
+            "CoreGraphics could not create the click release event"
+        }
         Construction::MouseMoveUnavailable => "CoreGraphics could not create the mouse-move event",
         Construction::HeartbeatMarkerUnavailable => {
             "CoreGraphics could not create the observer heartbeat marker"
@@ -229,6 +235,12 @@ pub fn synthetic_event_steps(
         SyntheticAction::MovePointer { point } => {
             vec![cerebellum_macos::mouse_move_event(macos_point(*point))
                 .map_err(map_event_construction_error)?]
+        }
+        SyntheticAction::ClickPointer { point } => {
+            cerebellum_macos::mouse_click_events(macos_point(*point))
+                .map_err(map_event_construction_error)?
+                .into_iter()
+                .collect()
         }
         SyntheticAction::DragPointer { from, to } => {
             let [press, drag, release] =

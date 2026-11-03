@@ -50,11 +50,35 @@ fn published_pins_schemas_and_reads_are_kept_byte_for_byte() {
 }
 
 #[test]
+fn pointer_fronting_publication_is_a_separately_frozen_addition() {
+    assert_eq!(
+        manifest::sha256_hex(POINTER_FRONTING_PUBLISHED.as_bytes()),
+        "c4a12dab86d1ceebe50aa5f3b8b22c3536fb318d4aec51779673865ab5ca719f"
+    );
+    let addition: BTreeMap<String, Value> =
+        serde_json::from_str(POINTER_FRONTING_PUBLISHED).unwrap();
+    assert_eq!(addition.len(), 1);
+    let legacy: BTreeMap<String, Value> = serde_json::from_str(PUBLISHED).unwrap();
+    let served = published();
+    for (pin, entry) in addition {
+        assert!(!legacy.contains_key(&pin));
+        assert_eq!(entry["tool"]["name"], "computer_use");
+        assert_eq!(
+            serde_json::to_value(&served[&pin].record_schema).unwrap(),
+            entry["record_schema"]
+        );
+    }
+}
+
+#[test]
 fn every_published_pin_recomputes_from_its_stored_tool() {
     // The display server rebuilds a pin from the view's `tool`, so a stored
     // definition that no longer hashes to its key would turn a working row into
     // an unknown view.
-    let kept: BTreeMap<String, Value> = serde_json::from_str(PUBLISHED).unwrap();
+    let mut kept: BTreeMap<String, Value> = serde_json::from_str(PUBLISHED).unwrap();
+    kept.extend(
+        serde_json::from_str::<BTreeMap<String, Value>>(POINTER_FRONTING_PUBLISHED).unwrap(),
+    );
     for (pin, entry) in &kept {
         let tool: ViewTool = serde_json::from_value(entry["tool"].clone()).unwrap();
         assert_eq!(tool.name, SchemaPin::parse(pin).unwrap().tool, "{pin}");
@@ -251,7 +275,7 @@ fn row_badges_fit_short_slots_at_phone_width() {
 #[test]
 fn views_validate_requests_and_answer_only_requested_pins() {
     let pins = published().into_keys().collect::<Vec<_>>();
-    assert_eq!(pins.len(), 2);
+    assert_eq!(pins.len(), 3);
     let request = cortexkit_role_tool_provider::views::ViewsRequest::new(vec![
         pins[0].clone(),
         pins[0].clone(),

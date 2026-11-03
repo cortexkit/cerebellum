@@ -553,6 +553,7 @@ impl GroundingPolicy {
             | "computer.open_app"
             | "computer.keys"
             | "computer.takeover_move"
+            | "computer.takeover_click"
             | "computer.takeover_drag"
             | "computer.takeover_scroll"
             | "computer.wait" => GroundingRequirement::NotGrounded,
@@ -568,7 +569,9 @@ impl GroundingPolicy {
     /// and therefore remains on the weakest containment rung.
     pub fn coordinate_addressable_for_capability(capability_id: &str) -> Option<bool> {
         match capability_id {
-            "computer.takeover_move" | "computer.takeover_drag" => Some(true),
+            "computer.takeover_move" | "computer.takeover_drag" | "computer.takeover_click" => {
+                Some(true)
+            }
             "computer.read_state"
             | "computer.list_apps"
             | "computer.open_app"

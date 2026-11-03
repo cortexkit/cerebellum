@@ -153,7 +153,9 @@ fn readback_failure_reason(error: &DriverError) -> &'static str {
         DriverError::StartupRefused(_) => "platform_startup_refused",
         DriverError::EventConstructionFailed(_) => "event_construction_failed",
         DriverError::SyntheticDispatchFailed(_) => "synthetic_dispatch_failed",
-        DriverError::ObservedDispatchAborted(_) => "observed_dispatch_aborted",
+        DriverError::ObservedDispatchAborted(_) | DriverError::ObservedSequenceFailed { .. } => {
+            "observed_dispatch_aborted"
+        }
         DriverError::Semantic(_) => "semantic_read_failed",
     }
 }

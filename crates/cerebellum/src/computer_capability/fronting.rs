@@ -725,6 +725,7 @@ impl ObligationParts {
 
 #[derive(Default)]
 struct HooksState {
+    report: Option<cerebellum_computer::dispatch::BracketReport>,
     parts: Option<ObligationParts>,
     cell: Option<Arc<RestoreCell>>,
     refused: bool,
@@ -740,6 +741,7 @@ pub(crate) struct CellHooks(Arc<StdMutex<HooksState>>);
 
 /// What the call learns from its hooks once the bracket returned.
 pub(crate) struct HookedEnd {
+    pub(crate) report: Option<cerebellum_computer::dispatch::BracketReport>,
     /// The registered obligation, when one was registered.
     pub(crate) cell: Option<Arc<RestoreCell>>,
     /// Registration was refused because the terminal was already chosen.
@@ -770,6 +772,7 @@ impl CellHooks {
         let mut state = self.state();
         state.parts.take();
         HookedEnd {
+            report: state.report.clone(),
             cell: state.cell.clone(),
             refused: state.refused,
             decided: state.decided,
@@ -786,6 +789,7 @@ impl CellHooks {
     pub(crate) fn peek(&self) -> HookedEnd {
         let state = self.state();
         HookedEnd {
+            report: state.report.clone(),
             cell: state.cell.clone(),
             refused: state.refused,
             decided: state.decided,
@@ -839,6 +843,7 @@ impl FrontedDispatchHooks for CellHooks {
     }
 
     fn finished(&mut self, outcome: &BracketOutcome) {
+        self.state().report = Some(outcome.report.clone());
         self.state().finished = Some((
             outcome.deferred_restore,
             outcome.person_input_during_fronting,
@@ -1181,7 +1186,7 @@ pub(crate) fn hooked_fronting(mode: AppUse, purpose: Purpose, end: &HookedEnd) -
     }
 }
 
-/// End a chord's hooked bracket once the held input is settled. A bracket
+/// End a hooked synthetic bracket once the held input is settled. A bracket
 /// whose post failed with a key possibly held deferred its restore: when
 /// settling `held` confirmed the release (or nothing was held), the one
 /// restore decision runs now and `bracket` reports it. When the release is
@@ -1204,6 +1209,7 @@ pub(crate) fn finish_after_release(
         );
         if released {
             let decided = decide_with_restore_budget(cell);
+            hooks.state().decided = Some(decided);
             end.decided = Some(decided);
             if let Some(bracket) = bracket {
                 bracket.restore = decided.restore;

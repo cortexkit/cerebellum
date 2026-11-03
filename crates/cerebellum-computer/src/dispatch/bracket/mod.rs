@@ -61,11 +61,22 @@ pub struct UnitPosted {
     pub generation_verifications: u64,
 }
 
+/// The observation already admitted by the bracket, shared with a gesture
+/// that contains several posts. No unit may start a second idle sequence.
+pub struct ObservedUnit<'a, T> {
+    pub tap: &'a T,
+    pub watcher: &'a mut SeizeWatcher,
+    pub probe: HeartbeatProbe,
+    pub heartbeat: HeartbeatObservation,
+    pub cancelled: &'a dyn Fn() -> bool,
+    pub deadline_ms: u64,
+}
+
 /// The platform a bracket runs on.
 ///
 /// A unit must not be split across a restore: one image read, one character
-/// of typed text, or one whole key chord. A chord's modifiers must never stay
-/// held while another application is in front.
+/// of typed text, one whole key chord, or one complete pointer gesture. Held
+/// modifiers or mouse buttons must never cross a restore.
 pub trait FrontingBracketHost {
     type Tap;
 
@@ -99,6 +110,22 @@ pub trait FrontingBracketHost {
     /// Post unit `index` to the target process, checking its generation
     /// before each post.
     fn post_unit(&mut self, index: usize) -> Result<UnitPosted, SequencePostFailure>;
+    fn post_observed_unit(
+        &mut self,
+        index: usize,
+        _observation: ObservedUnit<'_, Self::Tap>,
+    ) -> Result<UnitPosted, SequencePostFailure> {
+        self.post_unit(index)
+    }
+    /// Complete any platform-specific observation tail after restoration.
+    fn finish_observation(
+        &mut self,
+        _tap: &Self::Tap,
+        _estimator: &mut UserIdleEstimator,
+        _user_idle: IdleReading,
+        _idle_read_at: Instant,
+    ) {
+    }
     /// The process-wide session observer's hardware input timestamps, on
     /// this host's clock, for the restore decision. `None` when unavailable,
     /// which the decision reads as no input seen, so the previous application
@@ -323,11 +350,12 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
     for _ in 0..plan.units {
         watcher.queue_post();
     }
+    let idle_read_at = Instant::now();
     let begun = begin_observed_sequence(
         estimator,
         &mut watcher,
         our_pid,
-        Instant::now(),
+        idle_read_at,
         ObservedSequenceHooks {
             create_tap: || host.borrow_mut().create_tap(),
             read_idle: || host.borrow_mut().read_idle(),
@@ -338,8 +366,8 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
             post_heartbeat: || host.borrow_mut().post_heartbeat(),
         },
     );
-    let (tap, probe) = match begun {
-        Ok((Some(tap), _user_idle, probe)) => (tap, probe),
+    let (tap, user_idle, probe) = match begun {
+        Ok((Some(tap), user_idle, probe)) => (tap, user_idle, probe),
         Ok((None, _, _)) => {
             report.stop = Some(BracketStop::ObserverUnavailable);
             return unfronted(report);
@@ -390,8 +418,32 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
         report.chunks += 1;
         let requested =
             plan.target_pid == previous || host.borrow_mut().request_front(plan.target_pid);
-        if !requested || !await_front(&host, plan.target_pid, fronted_at, bound) {
-            report.stop = Some(BracketStop::FrontFailed);
+        let mut front_ok = requested;
+        while front_ok {
+            let drained = host.borrow_mut().drain(&tap);
+            observe_drained_events(&mut watcher, drained, our_pid, next_unit);
+            if cancelled() || watcher.abort_decision().is_some() {
+                front_ok = false;
+                break;
+            }
+            if host.borrow_mut().frontmost_pid() == Some(plan.target_pid) {
+                break;
+            }
+            if host.borrow_mut().now_ms().saturating_sub(fronted_at) >= bound {
+                front_ok = false;
+                break;
+            }
+            host.borrow_mut().pause_ms(FRONTING_POLL_MS);
+        }
+        if !front_ok {
+            report.stop = Some(if cancelled() {
+                BracketStop::Cancelled
+            } else {
+                watcher
+                    .abort_decision()
+                    .map(BracketStop::Aborted)
+                    .unwrap_or(BracketStop::FrontFailed)
+            });
             restore(
                 &host,
                 &mut report,
@@ -432,8 +484,21 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
                 probe,
                 |_| heartbeat,
                 || host.borrow_mut().frontmost_pid() == Some(plan.target_pid),
-                || host.borrow_mut().post_unit(index),
+                || (),
             );
+            let posted = posted.map(|_| {
+                host.borrow_mut().post_observed_unit(
+                    index,
+                    ObservedUnit {
+                        tap: &tap,
+                        watcher: &mut watcher,
+                        probe,
+                        heartbeat,
+                        cancelled,
+                        deadline_ms: fronted_at.saturating_add(bound),
+                    },
+                )
+            });
             match posted {
                 Ok(Ok(unit)) => {
                     watcher.take_post_slot();
@@ -555,6 +620,8 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
         }
         _ => {}
     }
+    host.borrow_mut()
+        .finish_observation(&tap, estimator, user_idle, idle_read_at);
     BracketOutcome {
         report,
         person_input_during_fronting: person_input,

@@ -25,6 +25,8 @@ struct FakeDesk {
     input_after_units: Option<usize>,
     idle_ms: u64,
     posted: Vec<usize>,
+    /// A cancellation signal set by the first completed unit, not by polling.
+    cancel_after_first_unit: Option<std::rc::Rc<std::cell::Cell<bool>>>,
     /// Every interval the target spent frontmost, measured by the desk.
     fronted_since: Option<u64>,
     fronted_intervals: Vec<u64>,
@@ -55,6 +57,7 @@ impl FakeDesk {
             input_after_units: None,
             idle_ms: OBSERVED_DISPATCH_IDLE_MS + 500,
             posted: Vec::new(),
+            cancel_after_first_unit: None,
             fronted_since: None,
             fronted_intervals: Vec::new(),
             frontmost_at_post: Vec::new(),
@@ -162,6 +165,9 @@ impl FrontingBracketHost for FakeDesk {
         self.frontmost_at_post.push(self.frontmost);
         self.posted.push(index);
         self.advance(self.unit_ms);
+        if let Some(cancel) = &self.cancel_after_first_unit {
+            cancel.set(true);
+        }
         if let Some((after, pid, input)) = self.switch_after_unit {
             if after == index {
                 self.set_frontmost(pid);
@@ -284,15 +290,11 @@ fn a_failed_restore_names_the_application_left_in_front() {
 #[test]
 fn a_cancel_mid_bracket_stops_at_the_chunk_boundary_after_restoring() {
     let mut desk = FakeDesk::new();
-    let chunks_started = std::cell::Cell::new(0);
-    let desk_ref = &mut desk;
-    let report = {
-        let cancel = || {
-            chunks_started.set(chunks_started.get() + 1);
-            chunks_started.get() > 1
-        };
-        run_fronting_bracket(desk_ref, &mut UserIdleEstimator::new(), plan(60), &cancel)
-    };
+    let cancelled = std::rc::Rc::new(std::cell::Cell::new(false));
+    desk.cancel_after_first_unit = Some(cancelled.clone());
+    let report = run_fronting_bracket(&mut desk, &mut UserIdleEstimator::new(), plan(60), &|| {
+        cancelled.get()
+    });
     assert_eq!(report.stop, Some(BracketStop::Cancelled));
     assert_eq!(report.chunks, 1);
     assert!(report.units_posted > 0 && report.units_posted < 60);
