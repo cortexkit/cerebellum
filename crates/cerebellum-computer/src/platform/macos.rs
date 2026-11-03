@@ -2480,7 +2480,8 @@ mod tests {
     /// The takeover rows are advertised only when both of their reviews are
     /// bound, and each review is proved by isolation: with every other input
     /// bound and every permission live, leaving that one review unbound
-    /// withholds all three rows and names that review.
+    /// withholds all four rows and names that review. Click/drag also remain
+    /// withheld by the independent recovery-measurement interlock.
     #[test]
     fn the_takeover_rows_need_both_reviews_each_proved_by_isolation() {
         let driver = MacOs26PlatformDriver::default();
@@ -2504,13 +2505,18 @@ mod tests {
             "computer.takeover_drag",
             "computer.takeover_scroll",
         ];
-        // The accepting case first, so a gate that withheld everything fails.
+        // Move/scroll must pass when all reviews are bound; click/drag must
+        // name the independent recovery barrier, not a missing review.
         for id in rows {
             let declaration = driver.declaration(id, &context(fully_bound_inputs()));
-            assert!(
-                declaration.advertised,
-                "{id} was withheld with everything bound: {:?}",
-                declaration.suppression_reason
+            let expected_reason =
+                matches!(id, "computer.takeover_click" | "computer.takeover_drag")
+                    .then_some("mouse-up routing measurement is not recorded");
+            assert_eq!(declaration.advertised, expected_reason.is_none(), "{id}");
+            assert_eq!(
+                declaration.suppression_reason.as_deref(),
+                expected_reason,
+                "{id}"
             );
         }
         let mut without_global = fully_bound_inputs();

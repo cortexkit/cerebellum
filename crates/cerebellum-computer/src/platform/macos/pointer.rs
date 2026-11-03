@@ -102,11 +102,22 @@ type TestDrain = Box<dyn FnMut(&mut SeizeWatcher, usize)>;
 
 #[cfg(test)]
 pub(super) struct TestPrimitives {
+    pub(super) observation_at: Instant,
     pub(super) live_at: Instant,
     pub(super) generation: super::super::process_event::ProcessGenerationReading,
     pub(super) frontmost: Option<u32>,
     pub(super) drain: TestDrain,
     pub(super) post: Box<dyn FnMut(cerebellum_macos::OwnedCgEvent)>,
+}
+
+impl NativePointerOperations<'_, '_> {
+    fn elapsed_at_observation(&self, since: Instant) -> Duration {
+        #[cfg(test)]
+        if let Some(primitives) = &self.primitives {
+            return primitives.observation_at.saturating_duration_since(since);
+        }
+        since.elapsed()
+    }
 }
 
 impl PointerOperations for NativePointerOperations<'_, '_> {
@@ -212,15 +223,16 @@ impl PointerOperations for NativePointerOperations<'_, '_> {
         if self.observation.watcher.abort_decision().is_some() {
             return Err(observed_abort_error(self.observation.watcher));
         }
-        if elapsed_millis(self.started) >= self.observation.deadline_ms {
+        let elapsed_ms = u64::try_from(self.elapsed_at_observation(self.started).as_millis())
+            .unwrap_or(u64::MAX);
+        if elapsed_ms >= self.observation.deadline_ms {
             return Err(DriverError::Unsupported(
                 "pointer fronting interval exceeded",
             ));
         }
-        if self
-            .live_at
-            .is_some_and(|at| at.elapsed() > Duration::from_millis(OBSERVER_HEARTBEAT_BOUND_MS))
-        {
+        if self.live_at.is_some_and(|at| {
+            self.elapsed_at_observation(at) > Duration::from_millis(OBSERVER_HEARTBEAT_BOUND_MS)
+        }) {
             return Err(DriverError::Unsupported(
                 "pointer observer evidence expired during containment reads",
             ));
@@ -257,7 +269,12 @@ mod tests {
         use std::cell::{Cell, RefCell};
         use std::rc::Rc;
         for mode in ["ok", "stale", "seize"] {
-            let started = Instant::now();
+            // Keep heartbeat freshness and the deadline on a fixed test clock.
+            // Neither constructing CoreGraphics events nor losing CPU time
+            // advances this clock. A future clock origin also exposes
+            // accidental reads of the real clock.
+            let observation_at = Instant::now() + Duration::from_secs(3600);
+            let started = observation_at - Duration::from_millis(250);
             let posts = Rc::new(Cell::new(0));
             let post_count = posts.clone();
             let contained = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -301,10 +318,11 @@ mod tests {
                     observed_abort: None,
                 }),
                 pointer_primitives: Some(TestPrimitives {
+                    observation_at,
                     live_at: if mode == "stale" {
-                        started - Duration::from_millis(51)
+                        observation_at - Duration::from_millis(51)
                     } else {
-                        started
+                        observation_at
                     },
                     generation:
                         super::super::super::process_event::ProcessGenerationReading::Started(123),
