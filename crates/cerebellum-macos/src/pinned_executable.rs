@@ -368,12 +368,12 @@ mod tests {
         let root = fixture
             .directory
             .join("home/Library/Caches/ck-cerebellum/helper-pins");
-        let launch = root.join("42-100/module");
-        assert_eq!(pin.launch_path().unwrap(), launch);
+        let expected_launch = root.join("42-100/module");
+        assert_eq!(pin.launch_path().unwrap(), expected_launch);
         assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
         assert!(!fixture.directory.join("temporary").exists());
         drop(pin);
-        assert!(!launch.exists());
+        assert!(!expected_launch.exists());
         assert!(!root.join("42-100").exists());
     }
 
@@ -387,11 +387,11 @@ mod tests {
         let root = fixture
             .directory
             .join("temporary/ck-cerebellum-helper-pins");
-        let launch = root.join("42-100/module");
-        assert_eq!(pin.launch_path().unwrap(), launch);
+        let expected_launch = root.join("42-100/module");
+        assert_eq!(pin.launch_path().unwrap(), expected_launch);
         assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
         fixture.replace_module();
-        assert_eq!(pin.launch_path().unwrap(), launch);
+        assert_eq!(pin.launch_path().unwrap(), expected_launch);
         drop(pin);
         assert!(!root.join("42-100").exists());
     }

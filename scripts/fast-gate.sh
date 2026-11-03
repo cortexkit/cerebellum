@@ -249,6 +249,16 @@ trap 'exit 143' TERM HUP QUIT
 
 if [ "$part" = linux ]; then
 start_static_phase "module wiring: scripts/module-wiring-gate.sh" ./scripts/module-wiring-gate.sh
+# The full gate's test-code source scans take seconds and catch defects no
+# compiler or test sees (a ck-* spawn from a test went unnoticed for days
+# because only the full gate ran this). Each scan first proves it detects its
+# planted offenders, then scans the tree.
+start_static_phase "no test journals to the operator's disk" \
+  bash -c 'scripts/lib/durable-journal-scan.test.sh >/dev/null && python3 scripts/lib/durable-journal-scan.py .'
+start_static_phase "no test requests macOS permissions" \
+  bash -c 'scripts/lib/mac-permission-request-scan.test.sh >/dev/null && python3 scripts/lib/mac-permission-request-scan.py .'
+start_static_phase "test and script ck-* executions use ckdev names" \
+  bash -c 'scripts/lib/ckdev-naming-scan.test.sh >/dev/null && python3 scripts/lib/ckdev-naming-scan.py .'
 # This proof builds format_versions, so it must not overlap another Cargo phase.
 run_serial_phase "format-floor gate proofs: scripts/lib/format-floor-gate.test.sh" scripts/lib/format-floor-gate.test.sh
 
