@@ -100,6 +100,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 cortexkit-test-support = "=0.1.10"
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+cerebellum-computer = { path = "../cerebellum-computer", features = ["test-support"] }
+
 # Examples carry their own tests, and cargo defaults an example target to
 # test = false -- so `cargo test --workspace` builds them and skips their
 # #[cfg(test)] modules. iceteaSA found the workspace count unmoved by five

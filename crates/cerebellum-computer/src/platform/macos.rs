@@ -231,6 +231,9 @@ fn release_held_to_pid(
     let mut released = 0_u64;
     let mut failed = None;
     for step in super::macos_synthetic::synthetic_event_steps(action)? {
+        // The original action may contain a withheld button-down. Cleanup
+        // must still release an already-held button, but can never replay
+        // the press or the dragged move, even for trusted library callers.
         if step.role != super::process_event::SyntheticStepRole::Release {
             continue;
         }
@@ -252,6 +255,10 @@ fn release_held_to_pid(
 
 const SESSION_TAP_UNREAD_BOUND: usize = 256;
 mod pointer;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
 static NEXT_HEARTBEAT_NONCE: AtomicU64 = AtomicU64::new(1);
 
 fn elapsed_millis(started: Instant) -> u64 {
@@ -469,7 +476,7 @@ fn read_hid_idle() -> IdleReading {
 /// target's exact process generation. Session observation is the same as the
 /// global pointer sequence's.
 struct MacBracketHost {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pointer_primitives: Option<pointer::TestPrimitives>,
     started: Instant,
     tap: Option<cerebellum_macos::SessionEventTap>,
@@ -586,7 +593,7 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
         let cancelled = observation.cancelled;
         let event_count = steps.len();
         let mut operations = pointer::NativePointerOperations {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             primitives: self.pointer_primitives.as_mut(),
             started: self.started,
             target: self.target,
@@ -1758,6 +1765,16 @@ impl PlatformDriver for MacOs26PlatformDriver {
         request: SyntheticDispatchRequest,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
+        if !super::DOWN_GESTURE_RECOVERY_MEASURED
+            && matches!(
+                request.action,
+                SyntheticAction::ClickPointer { .. } | SyntheticAction::DragPointer { .. }
+            )
+        {
+            return Err(DriverError::StartupRefused(
+                "mouse-up routing measurement is not recorded",
+            ));
+        }
         request.target.validate()?;
         let mut transport = if matches!(
             request.action,
@@ -1848,7 +1865,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
             let started = Instant::now();
             let (tap, heartbeat) = open_session_observation(started)?;
             let mut host = MacBracketHost {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 pointer_primitives: None,
                 started,
                 tap: Some(tap),
@@ -1969,7 +1986,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
             maximum_seize_detection_latency_ms: request.maximum_seize_detection_latency_ms,
         };
         let mut host = MacBracketHost {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             pointer_primitives: None,
             started,
             tap: Some(tap),
@@ -2038,7 +2055,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
         let started = Instant::now();
         let (tap, heartbeat) = open_session_observation(started)?;
         let mut host = MacBracketHost {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             pointer_primitives: None,
             started,
             tap: Some(tap),
@@ -3511,6 +3528,45 @@ mod cached_element_tests {
                 transport,
                 &super::super::process_event::never_cancelled,
             )
+        }
+
+        #[test]
+        fn per_pid_down_gestures_refuse_without_the_routing_measurement() {
+            let point = SyntheticPoint { x: 10.0, y: 20.0 };
+            for action in [
+                SyntheticAction::ClickPointer { point },
+                SyntheticAction::drag_pointer(point, point),
+            ] {
+                let mut driver = MacOs26PlatformDriver::default();
+                // Cancellation makes the negative control safe even without
+                // the interlock: it cannot post any event to a real process.
+                let result = driver.dispatch_per_pid(request(action), &|| true);
+                assert_eq!(
+                    result.unwrap_err(),
+                    DriverError::StartupRefused("mouse-up routing measurement is not recorded")
+                );
+            }
+        }
+
+        #[test]
+        fn held_pointer_cleanup_posts_only_up_even_while_down_is_withheld() {
+            let point = SyntheticPoint { x: 10.0, y: 20.0 };
+            for action in [
+                SyntheticAction::ClickPointer { point },
+                SyntheticAction::drag_pointer(point, point),
+            ] {
+                // Spare results let a broken release filter reach the event
+                // assertions instead of exhausting the recording transport.
+                let mut transport = RecordingTransport::succeeding(3);
+                let released = release_held_to_pid(&grant(), &action, &mut transport).unwrap();
+                let types: Vec<_> = transport
+                    .posted
+                    .iter()
+                    .map(|event| CGEvent::r#type(Some(event)))
+                    .collect();
+                assert_eq!(types, vec![CGEventType::LeftMouseUp]);
+                assert_eq!(released, 1);
+            }
         }
 
         #[test]

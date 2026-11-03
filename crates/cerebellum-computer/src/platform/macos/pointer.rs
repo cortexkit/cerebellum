@@ -84,7 +84,7 @@ pub(super) fn post_pointer_unit<O: PointerOperations>(
 }
 
 pub(super) struct NativePointerOperations<'a, 'b> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) primitives: Option<&'a mut TestPrimitives>,
     pub(super) started: Instant,
     pub(super) target: ProcessEventTarget,
@@ -97,22 +97,22 @@ pub(super) struct NativePointerOperations<'a, 'b> {
     pub(super) event_count: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 type TestDrain = Box<dyn FnMut(&mut SeizeWatcher, usize)>;
 
-#[cfg(test)]
-pub(super) struct TestPrimitives {
-    pub(super) observation_at: Instant,
-    pub(super) live_at: Instant,
-    pub(super) generation: super::super::process_event::ProcessGenerationReading,
-    pub(super) frontmost: Option<u32>,
-    pub(super) drain: TestDrain,
-    pub(super) post: Box<dyn FnMut(cerebellum_macos::OwnedCgEvent)>,
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestPrimitives {
+    pub observation_at: Instant,
+    pub live_at: Instant,
+    pub generation: super::super::process_event::ProcessGenerationReading,
+    pub frontmost: Option<u32>,
+    pub drain: TestDrain,
+    pub post: Box<dyn FnMut(cerebellum_macos::OwnedCgEvent)>,
 }
 
 impl NativePointerOperations<'_, '_> {
     fn elapsed_at_observation(&self, since: Instant) -> Duration {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(primitives) = &self.primitives {
             return primitives.observation_at.saturating_duration_since(since);
         }
@@ -160,7 +160,7 @@ impl PointerOperations for NativePointerOperations<'_, '_> {
     }
 
     fn refresh_observer(&mut self, index: usize) -> Result<(), DriverError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(primitives) = &self.primitives {
             self.live_at = Some(primitives.live_at);
             return Ok(());
@@ -187,7 +187,7 @@ impl PointerOperations for NativePointerOperations<'_, '_> {
     }
 
     fn generation(&mut self) -> super::super::process_event::ProcessGenerationReading {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(primitives) = &self.primitives {
             return primitives.generation;
         }
@@ -195,7 +195,7 @@ impl PointerOperations for NativePointerOperations<'_, '_> {
     }
 
     fn frontmost_pid(&mut self) -> Option<u32> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(primitives) = &self.primitives {
             return primitives.frontmost;
         }
@@ -203,14 +203,14 @@ impl PointerOperations for NativePointerOperations<'_, '_> {
     }
 
     fn final_observation(&mut self, index: usize) -> Result<(), DriverError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let injected = if let Some(primitives) = &mut self.primitives {
             (primitives.drain)(self.observation.watcher, index);
             true
         } else {
             false
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let injected = false;
         if !injected {
             drain_session_events(
@@ -241,13 +241,13 @@ impl PointerOperations for NativePointerOperations<'_, '_> {
     }
 
     fn post(&mut self, index: usize, event: Self::Event) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(primitives) = &mut self.primitives {
             (primitives.post)(event);
         } else {
             let _ = cerebellum_macos::post_event_globally(event);
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let _ = cerebellum_macos::post_event_globally(event);
         self.last_post_at = Instant::now();
         self.pointer.last_post_at = Some(self.last_post_at);

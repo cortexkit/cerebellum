@@ -5,6 +5,10 @@
 
 use std::io::Write;
 
+#[cfg(target_os = "macos")]
+#[path = "mouse_up_routing_probe/helper_startup.rs"]
+mod helper_startup;
+
 fn main() {
     if let Err(error) = run() {
         let _ = writeln!(std::io::stderr(), "UNMEASURABLE: {error}");
@@ -28,6 +32,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .output()?;
     if !vm.status.success() || String::from_utf8_lossy(&vm.stdout).trim() != "1" {
         return Err("refusing input: kern.hv_vmm_present is not 1".into());
+    }
+    let arguments: Vec<_> = std::env::args_os().collect();
+    if let Some(index) = arguments
+        .iter()
+        .position(|arg| arg == "--helper-startup-only")
+    {
+        let executable = arguments
+            .get(index + 1)
+            .ok_or("--helper-startup-only requires a path to ck-cerebellum")?;
+        if arguments.iter().any(|arg| arg == "--startup-init-only") {
+            return Err("helper startup and probe initialization are separate modes".into());
+        }
+        return helper_startup::run(std::path::Path::new(executable));
     }
     if !cerebellum_macos::pointer_probe_posting_permitted() {
         return Err("input posting not permitted for this process".into());

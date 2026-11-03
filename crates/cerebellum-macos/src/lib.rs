@@ -131,6 +131,8 @@ mod skylight;
 mod window_follow;
 #[cfg(target_os = "macos")]
 pub use window_follow::{watch_window, AxWindowChange, AxWindowWatch};
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
+mod pointer_probe;
 // The fail-closed rule is pure Rust, so its tests run on every host; off
 // macOS only those tests use it.
 #[cfg(any(target_os = "macos", test))]
@@ -138,6 +140,10 @@ pub use window_follow::{watch_window, AxWindowChange, AxWindowWatch};
 mod window_identity;
 #[cfg(target_os = "macos")]
 mod window_image;
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
+pub use pointer_probe::{
+    pointer_helper_startup_sample, PointerHelperStartupSample, PointerHelperState,
+};
 #[cfg(all(target_os = "macos", feature = "desk-probe"))]
 pub use window_image::{
     current_app_activation_mode_raw, pointer_hit_test_startup_diagnosis,
