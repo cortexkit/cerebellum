@@ -343,7 +343,23 @@ impl AppStateSource for MacAppStateSource {
     }
 
     fn pointer_window_at(&self, point: (f64, f64)) -> Option<u32> {
-        cerebellum_macos::pointer_window_at(point.0, point.1)
+        self.pointer_recipient(point).ok().flatten()
+    }
+
+    fn pointer_recipient(&self, point: (f64, f64)) -> Result<Option<u32>, &'static str> {
+        crate::pointer_query::window_at([point.0, point.1])
+    }
+
+    fn pointer_recipient_until(
+        &self,
+        point: (f64, f64),
+        deadline: std::time::Instant,
+    ) -> Result<Option<u32>, &'static str> {
+        crate::pointer_query::window_at_until([point.0, point.1], deadline)
+    }
+
+    fn cursor_position(&self) -> Option<(f64, f64)> {
+        cerebellum_macos::cursor_position()
     }
 
     /// Read only while the process is still the granted one, for the same

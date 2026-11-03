@@ -58,6 +58,11 @@ fn agent_cursor() {
     );
     let (sender, receiver) = std::sync::mpsc::sync_channel(32);
     std::thread::spawn(move || {
+        use cerebellum_computer::pointer_query::{answer_request, Request, QUERY_TIMEOUT};
+        // The barred cursor launch maps only its private reply pipe to fd 4.
+        let Ok(mut replies) = std::fs::OpenOptions::new().write(true).open("/dev/fd/4") else {
+            return;
+        };
         let input = std::io::stdin();
         let mut input = input.lock();
         // Decides which preview lines are drawn: none from an older
@@ -82,6 +87,25 @@ fn agent_cursor() {
             ) || line.len() > MAX_CURSOR_LINE
             {
                 break;
+            }
+            if let Ok(query) = serde_json::from_slice::<Request>(&line) {
+                if !answer_request(
+                    query,
+                    |point| {
+                        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+                        sender
+                            .try_send(cerebellum_macos::OverlayMessage::PointerWindow {
+                                point,
+                                reply,
+                            })
+                            .ok()?;
+                        answer.recv_timeout(QUERY_TIMEOUT).ok()
+                    },
+                    &mut replies,
+                ) {
+                    break;
+                }
+                continue;
             }
             let Ok(line) = serde_json::from_slice::<CursorLine>(&line) else {
                 continue;

@@ -435,6 +435,67 @@ fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJou
 }
 
 #[test]
+fn dropped_unused_reservation_counts_failed_durable_cleanup() {
+    use cerebellum_computer::audit::{audit_reservation_cleanup_failures, AuditToken};
+    use cerebellum_core::journal::{DurableState, IoDiagnostic, JournalStorage, StorageError};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+
+    #[derive(Clone)]
+    struct FailingCleanup {
+        inner: InMemoryJournalStorage,
+        fail: Arc<AtomicBool>,
+    }
+    impl JournalStorage for FailingCleanup {
+        fn load(&self) -> Result<DurableState, StorageError> {
+            self.inner.load()
+        }
+        fn save(&self, state: &DurableState) -> Result<(), StorageError> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(StorageError::TemporaryWrite {
+                    path: "isolated-cleanup-failure".into(),
+                    source: IoDiagnostic {
+                        kind: std::io::ErrorKind::PermissionDenied,
+                        message: "injected cleanup failure".into(),
+                    },
+                });
+            }
+            self.inner.save(state)
+        }
+        fn raise_format(
+            &self,
+            format: cerebellum_core::format_floor::DurableFormat,
+        ) -> Result<(), StorageError> {
+            self.inner.raise_format(format)
+        }
+    }
+    let fail = Arc::new(AtomicBool::new(false));
+    let audit = Arc::new(Mutex::new(ordering_audit(FailingCleanup {
+        inner: InMemoryJournalStorage::new(),
+        fail: fail.clone(),
+    })));
+    let mut token = AuditToken::new(
+        audit.clone(),
+        Arc::new(cerebellum_computer::dispatch::OpenGate),
+    );
+    token
+        .reserve_ahead(identity(), actuation_descriptor())
+        .unwrap();
+    let before = audit_reservation_cleanup_failures();
+    fail.store(true, Ordering::Relaxed);
+    drop(token);
+    assert_eq!(audit_reservation_cleanup_failures(), before + 1);
+    let before_empty = audit_reservation_cleanup_failures();
+    drop(AuditToken::new(
+        audit,
+        Arc::new(cerebellum_computer::dispatch::OpenGate),
+    ));
+    assert_eq!(audit_reservation_cleanup_failures(), before_empty);
+}
+
+#[test]
 fn capability_and_containment_maps_are_closed() {
     assert_eq!(ComputerCapability::ALL.len(), 13);
     assert_eq!(ComputerCapability::RETIRED.len(), 5);

@@ -121,8 +121,8 @@ fn available_capabilities(context: &ComputerCapabilityAdvertisementContext) -> V
         .collect()
 }
 
-/// Every current row, in artifact order: each has a wire handler.
-fn every_served_row() -> Vec<&'static str> {
+/// Rows the fully bound build can run before mouse-up recovery is measured.
+fn bound_advertised_rows() -> Vec<&'static str> {
     vec![
         "computer.read_state",
         "computer.press_element",
@@ -131,8 +131,6 @@ fn every_served_row() -> Vec<&'static str> {
         "computer.type",
         "computer.keys",
         "computer.takeover_move",
-        "computer.takeover_click",
-        "computer.takeover_drag",
         "computer.takeover_scroll",
         "computer.wait",
         "computer.list_apps",
@@ -140,9 +138,9 @@ fn every_served_row() -> Vec<&'static str> {
     ]
 }
 
-/// Every current row but the named ones, in artifact order.
-fn every_served_row_but(withheld: &[&str]) -> Vec<&'static str> {
-    every_served_row()
+/// Every runnable bound row but the named ones, in artifact order.
+fn bound_advertised_rows_but(withheld: &[&str]) -> Vec<&'static str> {
+    bound_advertised_rows()
         .into_iter()
         .filter(|row| !withheld.contains(row))
         .collect()
@@ -191,20 +189,19 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     let context = valid_context();
     let evidence = computer_release_evidence(&context);
 
-    // Complete release identifiers with every permission live admit every row
-    // with a wire handler: the state read, the element presses and write, the
-    // two keystroke rows, the four takeover rows and wait. This was
+    // Complete release identifiers still withhold click/drag until recovery is
+    // measured. The remaining reviewed rows have wire handlers. This was
     // originally asserted against the manifest, on the assumption that
     // advertisement is a function of the identifiers alone -- the assumption
     // that allowed a capability to be advertised which dispatch cannot serve.
     // Advertisement also requires production grant support and dispatchability,
     // so the driver-level identifier half is asserted here and the module's
     // manifest half below.
-    assert_eq!(available_capabilities(&context), every_served_row());
+    assert_eq!(available_capabilities(&context), bound_advertised_rows());
     assert_eq!(
         evidence.gate_admitted_capabilities,
         if cfg!(target_os = "macos") {
-            every_served_row()
+            bound_advertised_rows()
         } else {
             vec![]
         }
@@ -227,8 +224,8 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert_eq!(evidence.advertised_capabilities, computer_tools);
 
     // The scope describes what is advertised rather than what the identifiers
-    // admit. With every row now served, a macOS build carrying every review
-    // advertises ALL of the frozen rows; elsewhere no production app identity
+    // admit. A macOS build carrying every review advertises the runnable subset
+    // of frozen rows; elsewhere no production app identity
     // reader exists, so no app grant can authorize even wait.
     //
     // This is a release-visible claim: it says what a caller can do on the
@@ -238,7 +235,7 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert_eq!(
         evidence.scope,
         if cfg!(target_os = "macos") {
-            ComputerAdvertisementScope::AllFrozenRows
+            ComputerAdvertisementScope::PartialRuntimeAdvertisement
         } else {
             ComputerAdvertisementScope::EmptyRuntimeAdvertisement
         }
@@ -246,7 +243,7 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert_eq!(
         computer_tools,
         if cfg!(target_os = "macos") {
-            every_served_row()
+            bound_advertised_rows()
         } else {
             vec![]
         },
@@ -310,7 +307,6 @@ fn caller_manifest_requires_the_input_review_to_advertise_keystrokes() {
         "computer.press_point",
         "computer.write_text",
         "computer.takeover_move",
-        "computer.takeover_drag",
         "computer.takeover_scroll",
     ] {
         assert!(
@@ -319,6 +315,8 @@ fn caller_manifest_requires_the_input_review_to_advertise_keystrokes() {
         );
     }
     for never in [
+        "computer.takeover_click",
+        "computer.takeover_drag",
         "computer.click",
         "computer.screenshot",
         "computer.move",
@@ -548,10 +546,15 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
                 assert!(!cerebellum::takeover_pointer_fronting_admitted(
                     &context.inputs
                 ));
+                let mut legacy = bound_advertised_rows();
+                let scroll = legacy
+                    .iter()
+                    .position(|row| *row == "computer.takeover_scroll")
+                    .unwrap();
+                legacy.insert(scroll, "computer.takeover_drag");
                 assert_eq!(
-                    admitted,
-                    every_served_row_but(&["computer.takeover_click"]),
-                    "only click is withdrawn; the old pointer rows remain frontmost-only"
+                    admitted, legacy,
+                    "unbound drag retains its legacy frontmost-only route; click remains withheld"
                 );
             }
             "attendance_contract_owner"
@@ -559,7 +562,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             | "input_review_revision" => {
                 assert_eq!(
                     admitted,
-                    every_served_row_but(&["computer.type", "computer.keys"]),
+                    bound_advertised_rows_but(&["computer.type", "computer.keys"]),
                     "{gate} governs the keystroke rows"
                 )
             }
@@ -570,7 +573,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             ),
             "app_state_review_revision" => assert_eq!(
                 admitted,
-                every_served_row_but(&[
+                bound_advertised_rows_but(&[
                     "computer.read_state",
                     "computer.list_apps",
                     "computer.open_app"
@@ -579,7 +582,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             ),
             "element_addressed_review_revision" => assert_eq!(
                 admitted,
-                every_served_row_but(&[
+                bound_advertised_rows_but(&[
                     "computer.press_element",
                     "computer.press_point",
                     "computer.write_text",
@@ -595,7 +598,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             "takeover_dispatch_review_revision" | "global_dispatch_review_revision" => {
                 assert_eq!(
                     admitted,
-                    every_served_row_but(&TAKEOVER_ROWS),
+                    bound_advertised_rows_but(&TAKEOVER_ROWS),
                     "{gate} governs the takeover rows alone"
                 )
             }
@@ -659,17 +662,26 @@ fn supplied_placeholder_external_pin_is_an_implementation_failure_not_an_unresol
 /// The takeover rows need both the global-dispatch review and the takeover
 /// review, each proved by isolation: with every other release input bound
 /// and every permission live, leaving exactly one of the two unbound
-/// withholds all three rows, from the declaration, the release gate and the
+/// withholds all four rows, from the declaration, the release gate and the
 /// manifest, and each withheld row names that review as the reason.
 #[test]
 fn the_takeover_rows_need_both_reviews_each_proved_by_isolation() {
-    // Everything bound admits them, so the refusals below are the gates'.
+    // The available positive rows prove the missing-review negatives below;
+    // click/drag additionally remain withheld by the independent recovery barrier.
     let bound = valid_context();
     let admitted = computer_release_evidence(&bound).gate_admitted_capabilities;
     for row in TAKEOVER_ROWS {
-        assert!(available_capabilities(&bound).contains(&row.to_string()));
+        let available = matches!(row, "computer.takeover_move" | "computer.takeover_scroll");
+        assert_eq!(
+            available_capabilities(&bound).contains(&row.to_string()),
+            available
+        );
         if cfg!(target_os = "macos") {
-            assert!(admitted.contains(&row.to_string()), "{row}: {admitted:?}");
+            assert_eq!(
+                admitted.contains(&row.to_string()),
+                available,
+                "{row}: {admitted:?}"
+            );
         }
     }
 
@@ -732,7 +744,7 @@ fn the_takeover_rows_need_both_reviews_each_proved_by_isolation() {
         // The rest of the served surface is untouched by either review.
         assert_eq!(
             available_capabilities(&context),
-            every_served_row_but(&TAKEOVER_ROWS),
+            bound_advertised_rows_but(&TAKEOVER_ROWS),
             "{gate}"
         );
     }

@@ -581,6 +581,8 @@ where
     /// build can do instead.
     fronting_bracket_admitted: bool,
     takeover_pointer_fronting_admitted: bool,
+    #[cfg(test)]
+    down_gesture_recovery_measured: bool,
     /// Whether this build's release carries both the takeover review and the
     /// app-use review, which alone admit fronting outside the keystroke
     /// bracket: foreground mode's one-way front, fronting a disabled press or
@@ -709,6 +711,8 @@ where
             make_synthetic_driver,
             fronting_bracket_admitted: false,
             takeover_pointer_fronting_admitted: false,
+            #[cfg(test)]
+            down_gesture_recovery_measured: false,
             app_use_fronting_admitted: false,
             fronting_lock: fronting::FrontingLock::process_wide(),
             own_input: Arc::new(OwnInputLedger::new()),
@@ -763,6 +767,14 @@ where
     /// Admit the separately reviewed temporary-front pointer path.
     pub fn with_takeover_pointer_fronting_admitted(mut self, admitted: bool) -> Self {
         self.takeover_pointer_fronting_admitted = admitted;
+        self
+    }
+
+    /// Keep dormant down-gesture parser/orchestration tests independent of
+    /// the production measurement barrier. This override is never compiled in releases.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn with_measured_pointer_recovery_for_test(mut self) -> Self {
+        self.down_gesture_recovery_measured = true;
         self
     }
 

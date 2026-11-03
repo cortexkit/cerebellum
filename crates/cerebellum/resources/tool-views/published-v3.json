@@ -1,0 +1,159 @@
+{
+  "tp1:computer_use:60bc251692df735e657a97e196b3e10d0ae73d003b4da6a5765d2843a0d4de11:1": {
+    "reads": [],
+    "record_schema": {
+      "fields": {
+        "action": "code",
+        "app": "app_id",
+        "plane": "code",
+        "postsReturned": "integer",
+        "site": "web_origin"
+      },
+      "name": "cerebellum_call",
+      "revision": 1
+    },
+    "tool": {
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "read_state",
+              "press_element",
+              "press_point",
+              "write_text",
+              "type",
+              "keys",
+              "takeover_move",
+              "takeover_scroll",
+              "wait",
+              "list_apps",
+              "open_app"
+            ],
+            "type": "string"
+          },
+          "amount_lines": {
+            "maximum": 100,
+            "minimum": -100,
+            "type": "integer"
+          },
+          "app": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "axis": {
+            "enum": [
+              "vertical",
+              "horizontal"
+            ],
+            "type": "string"
+          },
+          "bring_to_front": {
+            "default": false,
+            "type": "boolean"
+          },
+          "element_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "element_ids": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "type": "array"
+          },
+          "image_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "include_image": {
+            "type": "boolean"
+          },
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "predicate": {
+            "type": "string"
+          },
+          "role_filter": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "type": "array"
+          },
+          "target": {
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "text_filter": {
+            "type": "string"
+          },
+          "timeout_ms": {
+            "maximum": 30000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "to": {
+            "additionalProperties": false,
+            "properties": {
+              "x": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "y": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "url": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "write_mode": {
+            "enum": [
+              "replace_value",
+              "insert_at_caret"
+            ],
+            "type": "string"
+          },
+          "x": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "y": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "zoom": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "computer_use",
+      "semantics": 1
+    }
+  }
+}

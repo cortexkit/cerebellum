@@ -13,6 +13,7 @@ fn current_definitions() -> Vec<CatalogTool> {
         .into_iter()
         .map(|capability| capability.capability_id().to_string())
         .filter(|name| crate::computer_capability::servable(name).is_some())
+        .filter(|name| name != "computer.takeover_click" && name != "computer.takeover_drag")
         .collect::<Vec<_>>();
     definitions(&browser, &computer)
 }
@@ -71,6 +72,24 @@ fn pointer_fronting_publication_is_a_separately_frozen_addition() {
 }
 
 #[test]
+fn move_scroll_only_publication_keeps_both_historical_tables() {
+    assert_eq!(
+        manifest::sha256_hex(POINTER_MOVE_SCROLL_PUBLISHED.as_bytes()),
+        "ae2dde192735556ff3e8f95349aeeb17f840ed8750d198ea857d578d32c718f0"
+    );
+    let addition: BTreeMap<String, Value> =
+        serde_json::from_str(POINTER_MOVE_SCROLL_PUBLISHED).unwrap();
+    assert_eq!(addition.len(), 1);
+    let served = published();
+    for (pin, entry) in addition {
+        assert!(served.contains_key(&pin));
+        let bytes = entry.to_string();
+        assert!(!bytes.contains("takeover_click"));
+        assert!(!bytes.contains("takeover_drag"));
+    }
+}
+
+#[test]
 fn every_published_pin_recomputes_from_its_stored_tool() {
     // The display server rebuilds a pin from the view's `tool`, so a stored
     // definition that no longer hashes to its key would turn a working row into
@@ -78,6 +97,9 @@ fn every_published_pin_recomputes_from_its_stored_tool() {
     let mut kept: BTreeMap<String, Value> = serde_json::from_str(PUBLISHED).unwrap();
     kept.extend(
         serde_json::from_str::<BTreeMap<String, Value>>(POINTER_FRONTING_PUBLISHED).unwrap(),
+    );
+    kept.extend(
+        serde_json::from_str::<BTreeMap<String, Value>>(POINTER_MOVE_SCROLL_PUBLISHED).unwrap(),
     );
     for (pin, entry) in &kept {
         let tool: ViewTool = serde_json::from_value(entry["tool"].clone()).unwrap();
@@ -275,7 +297,7 @@ fn row_badges_fit_short_slots_at_phone_width() {
 #[test]
 fn views_validate_requests_and_answer_only_requested_pins() {
     let pins = published().into_keys().collect::<Vec<_>>();
-    assert_eq!(pins.len(), 3);
+    assert_eq!(pins.len(), 4);
     let request = cortexkit_role_tool_provider::views::ViewsRequest::new(vec![
         pins[0].clone(),
         pins[0].clone(),

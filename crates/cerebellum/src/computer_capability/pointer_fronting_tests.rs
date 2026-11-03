@@ -13,6 +13,7 @@ const COVER: u32 = 88;
 
 #[derive(Default)]
 pub(super) struct Script {
+    pub before_post: Option<support::DeskHook>,
     pub action: Option<SyntheticAction>,
     pub held: Option<Arc<super::super::held_input::HeldInput>>,
     pub input_on_front: bool,
@@ -104,6 +105,10 @@ impl FrontingBracketHost for PointerHost {
         observation: ObservedUnit<'_, ()>,
     ) -> Result<UnitPosted, SequencePostFailure> {
         let screen = self.base.0.clone();
+        let hook = screen.state().pointer.before_post.take();
+        if let Some(hook) = hook {
+            (hook.0)();
+        }
         assert!(
             screen
                 .state()
@@ -145,7 +150,10 @@ impl FrontingBracketHost for PointerHost {
                     return Ok(0);
                 }
                 screen.state().pointer.checks += 1;
-                if !(self.guard.0)() || screen.frontmost() != Some(TARGET) {
+                if (self.guard.0)(std::time::Instant::now() + std::time::Duration::from_millis(300))
+                    .is_err()
+                    || screen.frontmost() != Some(TARGET)
+                {
                     observation
                         .watcher
                         .abort(AbortReason::FocusMismatch, index, None);
@@ -272,12 +280,14 @@ async fn fixture_with_grants(takeover: bool, app: bool) -> (Rig, String) {
         support::management()
     };
     let mut rig = rig_with(AppUse::Background, mail_desk(), management);
-    let plane = Arc::try_unwrap(rig.plane)
+    let mut plane = Arc::try_unwrap(rig.plane)
         .ok()
         .unwrap()
         .with_takeover_pointer_fronting_admitted(true)
         .with_app_use_fronting_admitted(false)
         .with_fronting_bracket_admitted(false);
+    // Exercise the dormant down/up orchestration without enabling production.
+    plane.down_gesture_recovery_measured = true;
     rig.plane = Arc::new(plane);
     rig.screen.state().pointer.held = Some(Arc::clone(&rig.plane.held_input));
     rig.desk.state().topmost_window = Some(COVER);
@@ -291,6 +301,8 @@ async fn fixture_with_grants(takeover: bool, app: bool) -> (Rig, String) {
         },
     );
     rig.desk.state().element_windows.insert(1, WINDOW);
+    rig.desk.state().real_cursor = Some((110.0, 70.0));
+    rig.desk.state().window = Some((1, None));
     rig.desk.state().focus = support::DeskFocus::Nothing;
     let image_id = rig.management.app_state_sessions().register_window_image(
         &support::identity().conversation_key,
@@ -365,6 +377,129 @@ async fn a_covered_granted_image_click_fronts_posts_down_up_and_restores() {
         .expect("the pointer post has an actuation row");
     assert_eq!(actuation["fronting"]["fronted"], true, "{actuation}");
     assert_eq!(actuation["fronting"]["restore"], "restored", "{actuation}");
+}
+
+#[tokio::test]
+async fn bound_down_gestures_refuse_without_the_routing_measurement() {
+    for action in ["takeover_click", "takeover_drag"] {
+        let (mut rig, image_id) = fixture().await;
+        let mut plane = Arc::try_unwrap(rig.plane).ok().unwrap();
+        plane.down_gesture_recovery_measured = false;
+        rig.plane = Arc::new(plane);
+        let args = if action == "takeover_click" {
+            json!({"image_id":image_id,"x":10,"y":20})
+        } else {
+            json!({"image_id":image_id,"from":{"x":10,"y":20},"to":{"x":20,"y":30}})
+        };
+        let reply = rig
+            .call_under(&under_terminal(), &format!("computer.{action}"), args)
+            .await;
+        assert_eq!(reply["outcome"], "invalid_request", "{reply}");
+        assert!(rig.screen.log().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn scroll_requires_real_cursor_recipient_and_safe_ax_at_placement() {
+    for failure in ["cursor", "window", "secure", "unreadable"] {
+        let (rig, _) = fixture().await;
+        rig.desk.state().topmost_window = Some(WINDOW);
+        match failure {
+            "cursor" => rig.desk.state().real_cursor = None,
+            "window" => rig.desk.state().topmost_window = Some(COVER),
+            "secure" => {
+                rig.desk.state().elements.get_mut(&1).unwrap().facts =
+                    support::facts("AXSecureTextField", &[])
+            }
+            _ => {
+                rig.desk.state().elements.clear();
+            }
+        }
+        let reply = rig
+            .call_under(
+                &under_terminal(),
+                "computer.takeover_scroll",
+                json!({"target":support::TARGET_BUNDLE_ID,"axis":"vertical","amount_lines":-3}),
+            )
+            .await;
+        assert_ne!(reply["outcome"], "completed", "{failure}: {reply}");
+        assert!(
+            rig.screen.log().is_empty(),
+            "{failure}: {:?}",
+            rig.screen.log()
+        );
+    }
+}
+
+#[tokio::test]
+async fn scroll_rechecks_the_current_cursor_and_sensitivity_at_the_post() {
+    for failure in ["cursor", "window", "secure", "unreadable"] {
+        let (rig, _) = fixture().await;
+        rig.desk.state().topmost_window = Some(WINDOW);
+        let desk = rig.desk.clone();
+        rig.screen.state().pointer.before_post =
+            Some(support::DeskHook(Arc::new(move || match failure {
+                "cursor" => {
+                    desk.state().real_cursor = Some((500.0, 500.0));
+                    desk.state().topmost_windows_at = vec![((500.0, 500.0), COVER)];
+                }
+                "window" => desk.state().topmost_window = Some(COVER),
+                "secure" => {
+                    desk.state().elements.get_mut(&1).unwrap().facts =
+                        support::facts("AXSecureTextField", &[])
+                }
+                _ => {
+                    desk.state().elements.clear();
+                }
+            })));
+        let reply = rig
+            .call_under(
+                &under_terminal(),
+                "computer.takeover_scroll",
+                json!({"target":support::TARGET_BUNDLE_ID,"axis":"vertical","amount_lines":-3}),
+            )
+            .await;
+        assert_ne!(reply["outcome"], "completed", "{failure}: {reply}");
+        assert!(
+            !rig.screen.log().iter().any(|post| post == "move"),
+            "{failure}: {:?}",
+            rig.screen.log()
+        );
+        assert!(rig
+            .screen
+            .log()
+            .iter()
+            .any(|post| post.starts_with("front:")));
+    }
+}
+
+#[tokio::test]
+async fn helper_query_failures_name_the_step_in_the_takeover_refusal() {
+    for step in [
+        "mouse-down recipient helper unavailable",
+        "mouse-down recipient helper reply timed out",
+        "mouse-down recipient helper disconnected",
+        "mouse-down recipient helper reply malformed",
+    ] {
+        let (rig, image_id) = fixture().await;
+        rig.desk.state().pointer_query_error = Some(step);
+        let reply = rig
+            .call_under(
+                &under_terminal(),
+                "computer.takeover_move",
+                json!({"image_id":image_id,"to":{"x":10,"y":20}}),
+            )
+            .await;
+        assert_ne!(reply["outcome"], "completed", "{reply}");
+        assert!(
+            reply["remedy"]
+                .as_str()
+                .is_some_and(|remedy| remedy.contains(step)),
+            "{reply}"
+        );
+        assert!(!rig.screen.log().iter().any(|post| post == "move"));
+        assert!(rig.plane.result_schema_findings().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -562,6 +697,9 @@ async fn a_failed_pointer_front_is_bounded_and_posts_nothing() {
 async fn move_drag_and_location_free_scroll_share_the_temporary_front() {
     for action in ["takeover_move", "takeover_drag", "takeover_scroll"] {
         let (rig, image_id) = fixture_with_grants(true, action != "takeover_scroll").await;
+        if action == "takeover_scroll" {
+            rig.desk.state().topmost_window = Some(WINDOW);
+        }
         let arguments = match action {
             "takeover_move" => json!({"image_id":image_id,"to":{"x":10,"y":20}}),
             "takeover_drag" => {
