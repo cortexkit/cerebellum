@@ -10,6 +10,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_millis(50);
+/// Cold initialization gets more time than a hit test, but must not hold
+/// the helper's input reader or delay placement for a whole call budget.
+pub const PREPARE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_REPLY_BYTES: u64 = 512;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub type QueryProvider =
@@ -42,13 +45,18 @@ pub struct PrepareRequest {
 
 pub fn answer_prepare_request(
     request: PrepareRequest,
-    ready: impl FnOnce() -> bool,
+    ready: impl FnOnce() -> Option<mpsc::Receiver<()>>,
     replies: &mut impl Write,
 ) -> bool {
     if request.helper_ready_id == 0 {
         return false;
     }
-    if !ready() {
+    let Some(ready) = ready() else {
+        return true;
+    };
+    // A stalled AppKit loop must not stop later cursor or preview lines.
+    // Like a late hit test, an unanswered readiness barrier emits no reply.
+    if ready.recv_timeout(PREPARE_TIMEOUT).is_err() {
         return true;
     }
     write_reply(request.helper_ready_id, None, replies)
@@ -233,7 +241,11 @@ mod tests {
                     PrepareRequest {
                         helper_ready_id: id
                     },
-                    || true,
+                    || {
+                        let (reply, ready) = mpsc::sync_channel(1);
+                        reply.send(()).unwrap();
+                        Some(ready)
+                    },
                     &mut response
                 ));
                 self.0
@@ -255,7 +267,7 @@ mod tests {
         let mut replies = Vec::new();
         assert!(answer_prepare_request(
             PrepareRequest { helper_ready_id: 1 },
-            || false,
+            || None,
             &mut replies
         ));
         assert!(replies.is_empty());
@@ -265,6 +277,45 @@ mod tests {
             &mut replies
         ));
         assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn unanswered_preparation_does_not_end_the_helper_input_loop() {
+        assert_eq!(PREPARE_TIMEOUT, Duration::from_secs(2));
+        let (held_reply, ready) = mpsc::sync_channel(1);
+        let (finished, result) = mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let mut replies = Vec::new();
+            let keep_reading = answer_prepare_request(
+                PrepareRequest { helper_ready_id: 1 },
+                || Some(ready),
+                &mut replies,
+            );
+            if keep_reading {
+                assert!(answer_request(
+                    Request {
+                        pointer_query_id: 2,
+                        point: [10.0, 20.0]
+                    },
+                    |_| Some(Some(42)),
+                    &mut replies,
+                ));
+            }
+            finished.send((keep_reading, replies)).unwrap();
+        });
+        let observed = result.recv_timeout(PREPARE_TIMEOUT + Duration::from_secs(1));
+        // Closing the channel also releases a broken unbounded reader before
+        // reporting failure, so the regression cannot strand the test process.
+        drop(held_reply);
+        reader.join().unwrap();
+        let (keep_reading, replies) = observed.expect("preparation must stop waiting at its bound");
+        assert!(keep_reading, "late readiness must not end the input loop");
+        let reply: Reply = serde_json::from_slice(&replies).unwrap();
+        assert_eq!(
+            reply.pointer_query_id, 2,
+            "only the next line receives a reply"
+        );
+        assert_eq!(reply.window, Some(42));
     }
 
     struct Answer(mpsc::Sender<Result<Reply, &'static str>>);

@@ -95,16 +95,10 @@ fn agent_cursor() {
                     prepare,
                     || {
                         let (reply, ready) = std::sync::mpsc::sync_channel(1);
-                        if sender
+                        sender
                             .try_send(cerebellum_macos::OverlayMessage::Ready { reply })
-                            .is_err()
-                        {
-                            return false;
-                        }
-                        // The parent transport stops waiting at the call deadline.
-                        // This private reader can await cold AppKit initialization
-                        // without the hit test's 50 ms response cap.
-                        ready.recv().is_ok()
+                            .ok()?;
+                        Some(ready)
                     },
                     &mut replies,
                 ) {

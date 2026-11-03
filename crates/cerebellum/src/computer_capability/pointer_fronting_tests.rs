@@ -554,6 +554,73 @@ async fn move_and_scroll_prewarm_before_placement_with_only_the_existing_call_bu
             assert!(rig.screen.log().is_empty());
         }
     }
+    for action in ["takeover_move", "takeover_scroll"] {
+        stalled_prewarm_reaches_placement(action).await;
+    }
+}
+
+async fn stalled_prewarm_reaches_placement(action: &'static str) {
+    use cerebellum_computer::pointer_query::PREPARE_TIMEOUT;
+    let (rig, image_id) = fixture().await;
+    rig.desk.state().real_cursor = None;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = StdMutex::new(released);
+    let entered = Arc::clone(&started);
+    rig.desk.state().on_pointer_prewarm = Some(support::DeskHook(Arc::new(move || {
+        entered.notify_one();
+        // The sender is dropped on assertion failure too, so a broken timeout
+        // cannot leave a blocking worker alive after the test ends.
+        let _ = released.lock().unwrap().recv();
+    })));
+    let arguments = if action == "takeover_move" {
+        json!({"image_id":format!("missing-{image_id}"),"to":{"x":10,"y":20}})
+    } else {
+        json!({"target":support::TARGET_BUNDLE_ID,"axis":"vertical","amount_lines":2})
+    };
+    let end = tokio::time::Instant::now() + Duration::from_secs(60);
+    let before = std::time::Instant::now();
+    let worker_rig = rig.clone();
+    let mut call = tokio::spawn(async move {
+        crate::call_context::CALL_DEADLINE
+            .scope(
+                end,
+                worker_rig.call_under(&under_terminal(), &format!("computer.{action}"), arguments),
+            )
+            .await
+    });
+    tokio::time::timeout(crate::test_support::HANG_GUARD, started.notified())
+        .await
+        .expect("preparation never started");
+    let deadline = rig.desk.state().pointer_prewarm_deadlines[0];
+    assert!(deadline >= before + PREPARE_TIMEOUT);
+    assert!(
+        deadline <= std::time::Instant::now() + PREPARE_TIMEOUT,
+        "preparation must not inherit the much longer call deadline"
+    );
+    let observed = tokio::time::timeout(PREPARE_TIMEOUT + Duration::from_secs(1), &mut call).await;
+    drop(release);
+    let reply = match observed {
+        Ok(reply) => reply.unwrap(),
+        Err(_) => {
+            let _ = call.await;
+            panic!("placement must proceed while readiness remains unanswered");
+        }
+    };
+    assert!(
+        tokio::time::Instant::now() < end,
+        "preparation must leave call time for placement"
+    );
+    let expected = if action == "takeover_move" {
+        "image_reference_unknown"
+    } else {
+        "target_not_frontmost"
+    };
+    assert_eq!(
+        reply["outcome"], expected,
+        "placement must produce its ordinary refusal: {reply}"
+    );
+    assert!(rig.screen.log().is_empty());
 }
 
 #[tokio::test]

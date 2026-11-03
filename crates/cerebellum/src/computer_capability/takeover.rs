@@ -472,11 +472,15 @@ where
             let work = super::quarantine::CallWork::current();
             let deadline = crate::call_context::CALL_DEADLINE
                 .try_with(|end| end.into_std().min(work.deadline()))
-                .unwrap_or_else(|_| work.deadline());
+                .unwrap_or_else(|_| work.deadline())
+                .min(
+                    std::time::Instant::now() + cerebellum_computer::pointer_query::PREPARE_TIMEOUT,
+                );
             let source = Arc::clone(&self.app_state_source);
             // Pay cold AppKit startup before placement and before requesting a
-            // front. Readiness authorizes no input: failed or late preparation
-            // leaves every recipient check and its original deadline intact.
+            // front, without spending the whole call on an unready helper.
+            // Readiness authorizes no input: failed or late preparation leaves
+            // every recipient check and its original deadline intact.
             let preparation = tokio::task::spawn_blocking(move || {
                 let _ax = work.bound_ax();
                 source.prewarm_pointer_query(deadline)
