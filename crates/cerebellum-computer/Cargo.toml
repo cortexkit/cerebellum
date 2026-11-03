@@ -10,6 +10,9 @@ description = "The macOS computer-plane platform surface for ck-cerebellum."
 name = "cerebellum_computer"
 path = "src/lib.rs"
 
+[features]
+test-support = ["cerebellum-macos/test-support"]
+
 [dependencies]
 base64 = "0.22"
 cerebellum-core = { path = "../cerebellum-core" }

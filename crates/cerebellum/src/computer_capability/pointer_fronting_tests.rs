@@ -11,8 +11,16 @@ use cerebellum_computer::platform::GlobalPointerGuard;
 const WINDOW: u32 = 77;
 const COVER: u32 = 88;
 
+#[cfg(target_os = "macos")]
+#[path = "pointer_fronting_native_tests.rs"]
+mod native_composed;
+
 #[derive(Default)]
 pub(super) struct Script {
+    #[cfg(target_os = "macos")]
+    pub native_post: Option<support::DeskHook>,
+    #[cfg(target_os = "macos")]
+    pub native: bool,
     pub before_post: Option<support::DeskHook>,
     pub action: Option<SyntheticAction>,
     pub held: Option<Arc<super::super::held_input::HeldInput>>,
@@ -104,6 +112,10 @@ impl FrontingBracketHost for PointerHost {
         _index: usize,
         observation: ObservedUnit<'_, ()>,
     ) -> Result<UnitPosted, SequencePostFailure> {
+        #[cfg(target_os = "macos")]
+        if self.base.0.state().pointer.native {
+            return self.post_native(observation);
+        }
         let screen = self.base.0.clone();
         let hook = screen.state().pointer.before_post.take();
         if let Some(hook) = hook {
