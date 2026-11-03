@@ -20,8 +20,11 @@
 //! pointer. That grant is checked, never asked for: the question belongs to a
 //! call that names the application, and `read_state` on it asks.
 //!
-//! The separately reviewed pointer-fronting path temporarily fronts the image's
-//! own application and checks exact-window containment before every post. Builds
+//! The admitted pointer-fronting path (admitted only when its release review key
+//! is bound) temporarily fronts the target application. For image actions, the
+//! request's image_id identifies a window image returned by read_state, and the
+//! target is that window's owning app. Exact-window containment is checked before
+//! every image-addressed post; scroll uses its named target. Builds
 //! without that review retain frontmost-only move, drag and scroll, with no
 //! click action. Both paths check generation and focus at each post.
 

@@ -249,7 +249,7 @@ pub enum ComputerGateOutcome {
     ImplementationFailure { gate: String },
 }
 
-/// Release evidence records the fixed set of eight canonical computer
+/// Release evidence records the current set of canonical computer
 /// capability rows, while runtime advertisement and successfully exercised
 /// behavior are counted independently.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1377,7 +1377,9 @@ fn fronting_bracket_admitted(inputs: &ComputerReleaseInputs) -> bool {
     not(any(test, target_os = "macos", target_os = "windows")),
     allow(dead_code)
 )]
-fn takeover_pointer_fronting_admitted(inputs: &ComputerReleaseInputs) -> bool {
+/// Release-review admission for temporary pointer fronting. This does not
+/// replace the conversation's takeover permission, checked on each dispatch.
+pub fn takeover_pointer_fronting_admitted(inputs: &ComputerReleaseInputs) -> bool {
     release_attestation_bound(
         "takeover_pointer_fronting_review_revision",
         inputs.takeover_pointer_fronting_review_revision.as_deref(),
@@ -13568,7 +13570,7 @@ mod tests {
         let outcomes = computer_gate_outcomes(&context);
         assert_eq!(
             outcomes.into_values().collect::<Vec<_>>(),
-            vec![ComputerGateOutcome::Pass; 15]
+            vec![ComputerGateOutcome::Pass; 16]
         );
     }
 
@@ -13587,12 +13589,57 @@ mod tests {
             "manifest-fixture",
             &context,
             &BrowserSurface::NotConfigured,
+            Some(provenance.clone()),
+        );
+        assert!(takeover_pointer_fronting_admitted(&context.inputs));
+        let mut unbound_context = ComputerCapabilityAdvertisementContext {
+            inputs: context.inputs.clone(),
+            permissions: context.permissions.clone(),
+            startup: context.startup.clone(),
+        };
+        unbound_context
+            .inputs
+            .takeover_pointer_fronting_review_revision = None;
+        assert!(!takeover_pointer_fronting_admitted(&unbound_context.inputs));
+        let unbound = compose_manifest(
+            "manifest-fixture",
+            &unbound_context,
+            &BrowserSurface::NotConfigured,
             Some(provenance),
         );
-        // Removing the views declaration must recover the previous HELLO bytes.
-        // Keep the older subtraction guard too, so neither addition can hide
-        // unrelated changes to the manifest.
-        let mut without_views = value.clone();
+        let digest = |manifest: &Value| manifest::sha256_hex(manifest.to_string().as_bytes());
+        println!(
+            "fixed HELLO bound={} unbound={}",
+            digest(&value),
+            digest(&unbound)
+        );
+
+        // Without the pointer review, only release evidence differs from the
+        // pre-pointer HELLO: the canonical row count and the extra unresolved
+        // gate remain visible even though its tool definitions are unchanged.
+        let mut legacy = unbound.clone();
+        let release = &mut legacy["computer_plane_release"];
+        assert_eq!(release["frozen_row_count"], 13);
+        assert_eq!(release["canonical_row_count"], 13);
+        release["frozen_row_count"] = json!(12);
+        release["canonical_row_count"] = json!(12);
+        let missing =
+            json!({"MissingExternalInput":{"gate":"takeover_pointer_fronting_review_revision"}});
+        let outcomes = release["gate_outcomes"].as_array_mut().unwrap();
+        assert_eq!(outcomes.len(), 16);
+        let index = outcomes
+            .iter()
+            .position(|outcome| *outcome == missing)
+            .expect("the unbound review is reported on HELLO");
+        assert_eq!(outcomes.remove(index), missing);
+        if release["advertised_row_count"] == 12 {
+            assert_eq!(release["scope"], "partial_runtime_advertisement");
+            release["scope"] = json!("all_frozen_rows");
+        }
+
+        // Keep the historical view and no-project subtraction guards. The
+        // normalization above must not hide any unrelated manifest change.
+        let mut without_views = legacy.clone();
         without_views["capabilities"]["provides"]
             .as_array_mut()
             .unwrap()
@@ -13601,10 +13648,7 @@ mod tests {
         let before_views = "f46b5ddc8c5b081adb40a3c2982d27822f9c7400bc62d189d74816a5eaa5d466";
         #[cfg(target_os = "macos")]
         let before_views = "6c98e57299920c8ee405321aecbd63e4e514a5c23676632df8b971f900f3f436";
-        assert_eq!(
-            manifest::sha256_hex(without_views.to_string().as_bytes()),
-            before_views
-        );
+        assert_eq!(digest(&without_views), before_views);
         #[cfg(target_os = "linux")]
         let previous = "76dbb08edce1bb7742f5efc2686b7e2ec42ad623586d16d91be1fbd52fa15662";
         #[cfg(target_os = "macos")]
@@ -13614,23 +13658,27 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .retain(|name| name != subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY);
-        use sha2::Digest;
-        assert_eq!(
-            format!(
-                "{:x}",
-                sha2::Sha256::digest(predecessor.to_string().as_bytes())
-            ),
-            previous
-        );
-
+        assert_eq!(digest(&predecessor), previous);
         #[cfg(target_os = "linux")]
-        let expected = "62fe03bb1a213e8c6d0c73000fca4de891118d5347440e35b96f8534a4c1fd51";
+        let before_pointer_fronting =
+            "62fe03bb1a213e8c6d0c73000fca4de891118d5347440e35b96f8534a4c1fd51";
         #[cfg(target_os = "macos")]
-        let expected = "129c9cf0b18bcd2f225d4a8aa0189f097991ec4685348e0e3fa294cc495829ff";
-        assert_eq!(
-            format!("{:x}", sha2::Sha256::digest(value.to_string().as_bytes())),
-            expected
-        );
+        let before_pointer_fronting =
+            "129c9cf0b18bcd2f225d4a8aa0189f097991ec4685348e0e3fa294cc495829ff";
+        assert_eq!(digest(&legacy), before_pointer_fronting);
+
+        // Full HELLO pins are separate from the computer_use prompt pin:
+        // binding the review also adds click and its definition on macOS.
+        #[cfg(target_os = "linux")]
+        let expected = "2b3184c68f59f3da166b6e2ec711781e09cca8d9aac9cd2182b5344256bb8752";
+        #[cfg(target_os = "macos")]
+        let expected = "be5b2ce816d58556761241e11a588b07e079c0cdc5bff7197c1363c4300f26b1";
+        #[cfg(target_os = "linux")]
+        let expected_unbound = "07b08b84e41cccff515bb6765bd90831c1fae3b67d0fb90d1bccbb7a488da86d";
+        #[cfg(target_os = "macos")]
+        let expected_unbound = "bb026a1261e64db0449497393698649769dbb983261bd368e64465328f35ffd3";
+        assert_eq!(digest(&value), expected);
+        assert_eq!(digest(&unbound), expected_unbound);
     }
 
     /// A daemon linking subc-protocol 0.32.11 must keep accepting this module's

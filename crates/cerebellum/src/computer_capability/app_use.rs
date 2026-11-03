@@ -706,7 +706,7 @@ mod serve_tests {
         );
     }
 
-    /// Every served row, `wait`, `list_apps` and the three takeover actions
+    /// Every served row, `wait`, `list_apps` and the four takeover actions
     /// included, refuses before lookup, journaling or any work while the file
     /// does not parse.
     #[tokio::test]
@@ -715,16 +715,16 @@ mod serve_tests {
         files.write(at(0), r#"{"computer_use":{"app_use":"sideways"}}"#);
         let plane = plane(live);
         let (management, lookups) = management();
-        let mut served = 0;
+        let mut served = std::collections::BTreeSet::new();
         for capability in ComputerCapability::ALL {
             if servable(capability.capability_id()).is_none() {
                 continue;
             }
-            served += 1;
             let before = plane.journal_entry_count().await;
             let reply = serve(&plane, &management, capability.capability_id(), json!({})).await;
             let id = capability.capability_id();
             assert_eq!(reply["outcome"], "config_invalid", "{id}: {reply}");
+            assert!(served.insert(id), "{id} was checked twice");
             let remedy = reply["remedy"].as_str().unwrap();
             assert!(remedy.contains(PATH), "{id}: {remedy}");
             assert!(
@@ -741,14 +741,18 @@ mod serve_tests {
             }
             assert_eq!(plane.journal_entry_count().await, before, "{id}");
         }
-        assert_eq!(served, 12, "every served row was checked");
+        assert_eq!(served.len(), 13, "every served row was checked");
+        assert!(
+            served.contains("computer.takeover_click"),
+            "click must reach the config-invalid refusal"
+        );
         assert_eq!(lookups.load(Ordering::SeqCst), 0);
         assert!(
             plane.app_use_seen_for_test.lock().unwrap().is_empty(),
             "no call's work began"
         );
         // One stat per call and one parse in all: the file never changed.
-        assert_eq!(files.counts(), (12, 1));
+        assert_eq!(files.counts(), (13, 1));
     }
 
     /// The file is edited between calls to one plane that keeps running: each

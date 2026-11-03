@@ -41,9 +41,10 @@ pub(crate) enum HeldRoute {
     Global,
 }
 
-/// One tracked send. Its route and action identify any paired releases; a
-/// bracketed global send also prevents terminal restoration until its worker
-/// has finished posting to the global stream.
+/// One tracked send. Its route and action identify any paired releases.
+/// When an app is temporarily fronted for a global send, terminal restoration
+/// (putting the previous front app back when the call ends) waits until its
+/// worker has finished posting to the global stream.
 #[derive(Debug, Clone)]
 pub(crate) struct HeldPress {
     pub(crate) route: HeldRoute,

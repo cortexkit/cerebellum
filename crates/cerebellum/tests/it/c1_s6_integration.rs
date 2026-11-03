@@ -14,7 +14,9 @@ use subc_protocol::manifest::{ProviderRole, Tool};
 
 fn valid_inputs() -> ComputerReleaseInputs {
     ComputerReleaseInputs {
-        takeover_pointer_fronting_review_revision: None,
+        takeover_pointer_fronting_review_revision: Some(
+            "fixture-pointer-fronting-review-v1".into(),
+        ),
         attendance_contract_owner: Some("fixture-attendance-owner".into()),
         attendance_contract_revision: Some("fixture-attendance-contract-v1".into()),
         input_review_revision: Some("fixture-input-review-v1".into()),
@@ -70,7 +72,11 @@ fn valid_context() -> ComputerCapabilityAdvertisementContext {
 #[cfg(target_os = "macos")]
 #[test]
 fn tonights_all_live_computer_use_definition_is_byte_identical() {
-    let manifest = build_manifest_with_computer_plane("cerebellum", &valid_context());
+    let mut context = valid_context();
+    // Live permissions must not change the historical definition while the
+    // new review is unbound, even when every other release binding is present.
+    context.inputs.takeover_pointer_fronting_review_revision = None;
+    let manifest = build_manifest_with_computer_plane("cerebellum", &context);
     let tool = tools(&manifest)
         .into_iter()
         .find(|tool| tool.name == "computer_use")
@@ -88,8 +94,8 @@ fn tonights_all_live_computer_use_definition_is_byte_identical() {
 fn no_app_identity_reader_means_no_computer_advertisement_even_with_all_release_bindings() {
     let context = valid_context();
     let evidence = computer_release_evidence(&context);
-    assert_eq!(evidence.gate_outcomes, vec![ComputerGateOutcome::Pass; 15]);
-    assert_eq!(evidence.canonical_row_count, 12);
+    assert_eq!(evidence.gate_outcomes, vec![ComputerGateOutcome::Pass; 16]);
+    assert_eq!(evidence.canonical_row_count, 13);
     assert!(
         evidence.advertised_capabilities.is_empty(),
         "release bindings cannot supply the missing production app identity reader: {:?}",
@@ -125,6 +131,7 @@ fn every_served_row() -> Vec<&'static str> {
         "computer.type",
         "computer.keys",
         "computer.takeover_move",
+        "computer.takeover_click",
         "computer.takeover_drag",
         "computer.takeover_scroll",
         "computer.wait",
@@ -141,8 +148,9 @@ fn every_served_row_but(withheld: &[&str]) -> Vec<&'static str> {
         .collect()
 }
 
-const TAKEOVER_ROWS: [&str; 3] = [
+const TAKEOVER_ROWS: [&str; 4] = [
     "computer.takeover_move",
+    "computer.takeover_click",
     "computer.takeover_drag",
     "computer.takeover_scroll",
 ];
@@ -162,8 +170,8 @@ fn empty_runtime_advertisement_reports_every_frozen_row_without_functional_claim
         startup: StartupCapabilityProbe::default(),
     };
     let evidence = computer_release_evidence(&context);
-    assert_eq!(evidence.frozen_row_count, 12);
-    assert_eq!(evidence.canonical_row_count, 12);
+    assert_eq!(evidence.frozen_row_count, 13);
+    assert_eq!(evidence.canonical_row_count, 13);
     assert_eq!(evidence.advertised_row_count, 0);
     assert_eq!(evidence.exercised_row_count, 0);
     assert_eq!(
@@ -185,7 +193,7 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
 
     // Complete release identifiers with every permission live admit every row
     // with a wire handler: the state read, the element presses and write, the
-    // two keystroke rows, the three takeover rows and wait. This was
+    // two keystroke rows, the four takeover rows and wait. This was
     // originally asserted against the manifest, on the assumption that
     // advertisement is a function of the identifiers alone -- the assumption
     // that allowed a capability to be advertised which dispatch cannot serve.
@@ -215,7 +223,7 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
         .iter()
         .all(|name| cerebellum::dispatchable_tool(name).is_some()));
 
-    assert_eq!(evidence.frozen_row_count, 12);
+    assert_eq!(evidence.frozen_row_count, 13);
     assert_eq!(evidence.advertised_capabilities, computer_tools);
 
     // The scope describes what is advertised rather than what the identifiers
@@ -463,7 +471,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
     let complete = valid_context();
     assert_eq!(
         computer_release_evidence(&complete).gate_outcomes,
-        vec![ComputerGateOutcome::Pass; 15],
+        vec![ComputerGateOutcome::Pass; 16],
         "the complete fixture must prove the passing direction before it is spoiled"
     );
 
@@ -478,6 +486,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
         "app_state_review_revision",
         "element_addressed_review_revision",
         "takeover_dispatch_review_revision",
+        "takeover_pointer_fronting_review_revision",
         "app_use_fronting_review_revision",
         "release_signing_topology_revision",
         "vocabulary_manifest_digest",
@@ -499,6 +508,9 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             "app_state_review_revision" => inputs.app_state_review_revision = None,
             "element_addressed_review_revision" => inputs.element_addressed_review_revision = None,
             "takeover_dispatch_review_revision" => inputs.takeover_dispatch_review_revision = None,
+            "takeover_pointer_fronting_review_revision" => {
+                inputs.takeover_pointer_fronting_review_revision = None
+            }
             "app_use_fronting_review_revision" => inputs.app_use_fronting_review_revision = None,
             "release_signing_topology_revision" => inputs.release_signing_topology_revision = None,
             "vocabulary_manifest_digest" => inputs.vocabulary_digests.manifest_digest = None,
@@ -529,6 +541,19 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
         );
         let admitted = available_capabilities(&context);
         match gate {
+            "takeover_pointer_fronting_review_revision" => {
+                assert!(cerebellum::takeover_pointer_fronting_admitted(
+                    &complete.inputs
+                ));
+                assert!(!cerebellum::takeover_pointer_fronting_admitted(
+                    &context.inputs
+                ));
+                assert_eq!(
+                    admitted,
+                    every_served_row_but(&["computer.takeover_click"]),
+                    "only click is withdrawn; the old pointer rows remain frontmost-only"
+                );
+            }
             "attendance_contract_owner"
             | "attendance_contract_revision"
             | "input_review_revision" => {

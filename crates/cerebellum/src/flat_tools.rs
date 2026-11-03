@@ -300,8 +300,8 @@ pub(crate) fn computer_action_requirements(admitted: &[String]) -> Vec<(String, 
         .collect()
 }
 
-/// The admitted takeover_click row and its pointer-fronting prose follow the
-/// same immutable admission list. Permission liveness never selects prompt text.
+/// Prompt text is chosen from the compiled admission list, never from current
+/// permission status.
 pub(crate) fn pointer_fronting_definition(admitted: &[String]) -> bool {
     admitted
         .iter()
@@ -2046,6 +2046,7 @@ mod tests {
                     NativeComputerPlatformDriver::default().without_expected_post_condition()
                 })
                 .with_permission_liveness(crate::computer_capability::live_for_test())
+                .with_takeover_pointer_fronting_admitted(true)
                 .with_session_lock_for_test(Some(false)),
             )
         });
@@ -2065,6 +2066,7 @@ mod tests {
             ("type", json!({"target": app, "text": "hi"})),
             ("keys", json!({"target": app, "keys": ["s"]})),
             ("takeover_move", json!({"image_id": "i1", "to": point})),
+            ("takeover_click", json!({"image_id": "i1", "x": 1, "y": 1})),
             (
                 "takeover_drag",
                 json!({"image_id": "i1", "from": point, "to": point}),
