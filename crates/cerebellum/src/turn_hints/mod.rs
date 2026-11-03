@@ -1,18 +1,22 @@
 //! Optional live turn hints. Core's direct notification and the helper's idle
 //! fade remain the fallback when a live subscription misses a notice.
 
+#[cfg(target_os = "macos")]
 mod live;
 mod notice;
+mod reply;
 #[cfg(test)]
 mod tests;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
-use futures_util::future::BoxFuture;
 use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 
+#[cfg(target_os = "macos")]
 pub(crate) use live::LiveTransport;
 pub(crate) use notice::{Kind, Notice};
+
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 const LINGER: Duration = Duration::from_secs(30);
 const RETRY: Duration = Duration::from_secs(1);

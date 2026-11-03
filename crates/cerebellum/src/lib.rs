@@ -97,6 +97,10 @@ mod tool_display;
 mod tool_provider;
 mod tool_result;
 mod turn_ended;
+// Only macOS draws the native badge. Other hosts compile this module for unit
+// tests that parse turn hints, end matching badges, and exercise connection
+// lifetime with a fake transport rather than a live NATS bus.
+#[cfg(any(target_os = "macos", test))]
 mod turn_hints;
 #[cfg(test)]
 #[path = "../tests/support/turn_stop_vectors.rs"]
@@ -2871,6 +2875,7 @@ where
     expect_hello_ack(read_half).await?;
 
     planes.scopes.control.connect(&writer);
+    #[cfg(target_os = "macos")]
     if let Some(cursor) = planes_cursor(&planes) {
         cursor.listen_for_turn_hints(Arc::new(turn_hints::LiveTransport::new(
             config.connection_file_path.clone(),

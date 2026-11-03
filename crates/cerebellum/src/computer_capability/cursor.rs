@@ -225,6 +225,7 @@ struct Drawn {
     /// Current, not historical, badge ownership. An end consumes this entry so
     /// the other notification source cannot hide the same appearance twice.
     active: HashMap<String, Option<SessionScope>>,
+    #[cfg(any(target_os = "macos", test))]
     hint_sequences: HashMap<(&'static str, String, String), u64>,
     hint_sessions: HashMap<String, (&'static str, String)>,
     /// Where each agent's badge was last sent, so the next picture's glide
@@ -346,6 +347,7 @@ struct State {
     sender: OnceLock<mpsc::Sender<CursorLine>>,
     serial: std::sync::atomic::AtomicU64,
     drawn: std::sync::Mutex<Drawn>,
+    #[cfg(any(target_os = "macos", test))]
     turn_hints: OnceLock<crate::turn_hints::Listener>,
     /// For each agent whose badge is on screen, the window it rests on.
     follows: std::sync::Mutex<HashMap<String, Follow>>,
@@ -507,6 +509,7 @@ impl RestartLimit {
 }
 
 impl Coordinator {
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn listen_for_turn_hints(&self, transport: Arc<dyn crate::turn_hints::Transport>) {
         self.0.turn_hints.get_or_init(|| {
             let weak = Arc::downgrade(&self.0);
@@ -522,6 +525,7 @@ impl Coordinator {
         });
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn note_queued_badge(&self, agent: &str) {
         // A real helper reports successful writes through State::settle. A
         // memory-only transport treats a queued line as already written.
@@ -698,6 +702,7 @@ impl Coordinator {
 
     fn end_locked(&self, agent: &str, drawn: &mut Drawn) {
         drawn.active.remove(agent);
+        #[cfg(any(target_os = "macos", test))]
         if let Some(listener) = self.0.turn_hints.get() {
             listener.ended(agent);
         }
@@ -1009,6 +1014,7 @@ impl Coordinator {
         matched
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn turn_hint(&self, notice: crate::turn_hints::Notice) -> bool {
         if self.0.stopped.load(std::sync::atomic::Ordering::Acquire) {
             return false;
@@ -1120,6 +1126,7 @@ impl Coordinator {
         let agent = event.agent.clone();
         let sent = self.send_awaited(CursorLine::Picture(event), &agent, tip.serial, waits)?;
         drawn.keep(&agent, tip);
+        #[cfg(any(target_os = "macos", test))]
         self.note_queued_badge(&agent);
         sent.map(|written| Sent {
             duration: Duration::from_secs_f64(motion.duration_ms / 1000.0),
@@ -1344,6 +1351,7 @@ impl Coordinator {
         let sent = self.send_awaited(CursorLine::PreviewMotion(motion), &agent, serial, waits);
         if sent.is_some() {
             drawn.keep(&agent, tip);
+            #[cfg(any(target_os = "macos", test))]
             self.note_queued_badge(&agent);
         }
         sent.flatten().map(|written| Sent {
@@ -1732,6 +1740,7 @@ impl Coordinator {
     /// Signal before browser teardown starts. Reaping and any blocked pipe write
     /// belong to the transport thread, never to the twenty-second drain budget.
     pub fn shutdown(&self) {
+        #[cfg(any(target_os = "macos", test))]
         if let Some(listener) = self.0.turn_hints.get() {
             listener.shutdown();
         }
@@ -2251,11 +2260,13 @@ impl State {
             }
             _ => return,
         };
+        #[cfg(any(target_os = "macos", test))]
         let badge = match line {
             CursorLine::Picture(event) => !event.avatar_update && !event.agent.is_empty(),
             CursorLine::PreviewMotion(_) => true,
             _ => false,
         };
+        #[cfg(any(target_os = "macos", test))]
         if written.is_some() && badge && !self.stopped.load(std::sync::atomic::Ordering::Acquire) {
             let drawn = self
                 .drawn
