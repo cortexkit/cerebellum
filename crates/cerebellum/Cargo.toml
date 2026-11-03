@@ -44,6 +44,10 @@ path = "src/lib.rs"
 
 [dependencies]
 base64 = "0.22"
+cortexkit-bus-nats = "=0.3.0"
+cortexkit-bus-naming = "=0.2.10"
+async-nats = { version = "=0.50.0", default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 cortexkit-resource-busy = { workspace = true }
 cerebellum-bridge-protocol = { path = "../cerebellum-bridge-protocol" }
 cortexkit-paths = "=0.1.2"

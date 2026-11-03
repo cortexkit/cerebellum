@@ -1,0 +1,75 @@
+[
+  {
+    "subject": "ck.test.live.thalamus-harness.turn_started.v1",
+    "headers": {
+      "Nats-Msg-Id": "0123456789abcdef0123456789abcdef:turn_started:10",
+      "agent": "agent-a",
+      "session_ref": "0123456789abcdef0123456789abcdef"
+    },
+    "accepted": true,
+    "seq": 10
+  },
+  {
+    "subject": "ck.test.live.thalamus-harness.turn_ended.v1",
+    "headers": {
+      "Nats-Msg-Id": "0123456789abcdef0123456789abcdef:turn_ended:11",
+      "agent": "agent-a",
+      "session_ref": "0123456789abcdef0123456789abcdef"
+    },
+    "accepted": true,
+    "seq": 11
+  },
+  {
+    "subject": "ck.test.live.thalamus-pi.turn_ended.v1",
+    "headers": {
+      "Nats-Msg-Id": "0123456789abcdef0123456789abcdef:turn_ended:12",
+      "agent": "agent-a",
+      "session_ref": "0123456789abcdef0123456789abcdef"
+    },
+    "accepted": true,
+    "seq": 12
+  },
+  {
+    "subject": "ck.test.live.thalamus-harness.turn_ended.v1",
+    "headers": {
+      "agent": "agent-a",
+      "session_ref": "0123456789abcdef0123456789abcdef"
+    },
+    "accepted": false
+  },
+  {
+    "subject": "ck.test.live.thalamus-harness.turn_ended.v1",
+    "headers": {
+      "Nats-Msg-Id": "fedcba9876543210fedcba9876543210:turn_ended:11",
+      "agent": "agent-a",
+      "session_ref": "0123456789abcdef0123456789abcdef"
+    },
+    "accepted": false
+  },
+  {
+    "subject": "ck.test.live.thalamus-harness.turn_ended.v1",
+    "headers": {
+      "Nats-Msg-Id": "0123456789abcdef0123456789abcdef:turn_started:11",
+      "agent": "agent-a",
+      "session_ref": "0123456789abcdef0123456789abcdef"
+    },
+    "accepted": false
+  },
+  {
+    "subject": "ck.test.event.thalamus-harness.turn_ended.v1",
+    "headers": {
+      "Nats-Msg-Id": "0123456789abcdef0123456789abcdef:turn_ended:11",
+      "agent": "agent-a",
+      "session_ref": "0123456789abcdef0123456789abcdef"
+    },
+    "accepted": false
+  },
+  {
+    "subject": "ck.test.live.thalamus-harness.turn_ended.v1",
+    "headers": {
+      "Nats-Msg-Id": "0123456789abcdef0123456789abcdef:turn_ended:11",
+      "session_ref": "0123456789abcdef0123456789abcdef"
+    },
+    "accepted": false
+  }
+]

@@ -222,6 +222,11 @@ struct Drawn {
     /// Which head session drew which agent's badge, least recently drawn
     /// first.
     sessions: VecDeque<(SessionScope, String)>,
+    /// Current, not historical, badge ownership. An end consumes this entry so
+    /// the other notification source cannot hide the same appearance twice.
+    active: HashMap<String, Option<SessionScope>>,
+    hint_sequences: HashMap<(&'static str, String, String), u64>,
+    hint_sessions: HashMap<String, (&'static str, String)>,
     /// Where each agent's badge was last sent, so the next picture's glide
     /// length, and so the moment it arrives, can be worked out here.
     tips: HashMap<String, Tip>,
@@ -341,6 +346,7 @@ struct State {
     sender: OnceLock<mpsc::Sender<CursorLine>>,
     serial: std::sync::atomic::AtomicU64,
     drawn: std::sync::Mutex<Drawn>,
+    turn_hints: OnceLock<crate::turn_hints::Listener>,
     /// For each agent whose badge is on screen, the window it rests on.
     follows: std::sync::Mutex<HashMap<String, Follow>>,
     follow_ids: std::sync::atomic::AtomicU64,
@@ -501,6 +507,35 @@ impl RestartLimit {
 }
 
 impl Coordinator {
+    pub(crate) fn listen_for_turn_hints(&self, transport: Arc<dyn crate::turn_hints::Transport>) {
+        self.0.turn_hints.get_or_init(|| {
+            let weak = Arc::downgrade(&self.0);
+            crate::turn_hints::Listener::new(
+                transport,
+                Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS),
+                move |notice| {
+                    if let Some(state) = weak.upgrade() {
+                        Coordinator(state).turn_hint(notice);
+                    }
+                },
+            )
+        });
+    }
+
+    fn note_queued_badge(&self, agent: &str) {
+        // A real helper reports successful writes through State::settle. A
+        // memory-only transport treats a queued line as already written.
+        if !self
+            .0
+            .writes_confirmed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if let Some(listener) = self.0.turn_hints.get() {
+                listener.drawn(agent);
+            }
+        }
+    }
+
     /// The desk probe measures the same helper generation the transport owns,
     /// without a wrapper process or a pid file next to the build output.
     #[cfg(all(target_os = "macos", feature = "desk-probe"))]
@@ -656,6 +691,16 @@ impl Coordinator {
             return;
         }
         let mut drawn = self.drawn();
+        self.end_locked(agent, &mut drawn);
+        drop(drawn);
+        self.finish_end(agent);
+    }
+
+    fn end_locked(&self, agent: &str, drawn: &mut Drawn) {
+        drawn.active.remove(agent);
+        if let Some(listener) = self.0.turn_hints.get() {
+            listener.ended(agent);
+        }
         if drawn.ended_at.len() >= RECORD_CAP && !drawn.ended_at.contains_key(agent) {
             // Each entry only matters for the few milliseconds a geometry read
             // can still be running, so forgetting old ones loses nothing real.
@@ -687,7 +732,9 @@ impl Coordinator {
         // Sent while holding the record, so a picture whose read finishes now
         // either goes out before this hide or sees the end and is dropped.
         self.send_line(CursorLine::Hide(CursorHide::new(agent)));
-        drop(drawn);
+    }
+
+    fn finish_end(&self, agent: &str) {
         // A frame still waiting would be drawn into nothing: the helper drops
         // a frame after a hide, so it is not sent at all.
         self.frames().retain(|frame| frame.frame_agent != agent);
@@ -913,16 +960,14 @@ impl Coordinator {
         }
     }
 
-    /// A head session's turn ended: end every badge that session's calls drew.
-    /// This is the single internal entry for that signal, whatever delivers it
-    /// (today a management call from Prefrontal core; later the harness's
-    /// turn-ended event), so changing the source never touches the mapping.
+    /// Core's fallback notification ends the active badges drawn by its scope.
+    /// Live hints use the agent identity and runner sequence instead; both
+    /// paths consume the same active appearance under the drawing lock.
     ///
     /// Badges are matched on the daemon-stamped `scope_ref`, the only session
     /// name a computer call carries. `session_ref` is the harness runner's own
-    /// ref; nothing records it against badges yet, so a source that knows only
-    /// that ref ends nothing until such a record exists. It is in the signature
-    /// so that source can be wired without changing every caller.
+    /// ref. When a live start has associated an agent with a runner session,
+    /// the fallback must agree with that session too.
     ///
     /// An unknown session is not an error; it simply drew nothing that is
     /// still recorded. Every outcome ends the badge the same way: a turn that
@@ -934,22 +979,75 @@ impl Coordinator {
         scope_ref: Option<&str>,
         outcome: TurnOutcome,
     ) -> bool {
-        let _ = (session_ref, outcome);
+        let _ = outcome;
         let Some(scope_ref) = scope_ref else {
             return false;
         };
-        let agents: BTreeSet<String> = self
-            .drawn()
-            .sessions
+        let mut drawn = self.drawn();
+        let agents: Vec<String> = drawn
+            .active
             .iter()
-            .filter(|(session, _)| session.scope_ref == scope_ref)
-            .map(|(_, agent)| agent.clone())
+            .filter(|(agent, session)| {
+                session
+                    .as_ref()
+                    .is_some_and(|session| session.scope_ref == scope_ref)
+                    && drawn
+                        .hint_sessions
+                        .get(*agent)
+                        .is_none_or(|(_, session)| session == session_ref)
+            })
+            .map(|(agent, _)| agent.clone())
             .collect();
         let matched = !agents.is_empty();
-        for agent in agents {
-            self.end(&agent);
+        for agent in &agents {
+            self.end_locked(agent, &mut drawn);
+        }
+        drop(drawn);
+        for agent in &agents {
+            self.finish_end(agent);
         }
         matched
+    }
+
+    pub(crate) fn turn_hint(&self, notice: crate::turn_hints::Notice) -> bool {
+        if self.0.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        let mut drawn = self.drawn();
+        let key = (notice.module, notice.session.clone(), notice.agent.clone());
+        if drawn
+            .hint_sequences
+            .get(&key)
+            .is_some_and(|seq| notice.seq <= *seq)
+        {
+            return false;
+        }
+        if drawn.hint_sequences.len() >= RECORD_CAP && !drawn.hint_sequences.contains_key(&key) {
+            // Missing a cosmetic hint is safer than forgetting a known start
+            // and then accepting an older end for a badge already tracked.
+            return false;
+        }
+        drawn.hint_sequences.insert(key, notice.seq);
+        if notice.kind == crate::turn_hints::Kind::Started {
+            drawn
+                .hint_sessions
+                .insert(notice.agent, (notice.module, notice.session));
+            return false;
+        }
+        if !drawn.active.contains_key(&notice.agent)
+            || drawn
+                .hint_sessions
+                .get(&notice.agent)
+                .is_some_and(|(module, session)| {
+                    *module != notice.module || *session != notice.session
+                })
+        {
+            return false;
+        }
+        self.end_locked(&notice.agent, &mut drawn);
+        drop(drawn);
+        self.finish_end(&notice.agent);
+        true
     }
 
     /// Remember who is drawing this badge, before any read starts, so an end
@@ -960,6 +1058,10 @@ impl Coordinator {
             call.note_cursor_agent(agent);
         }
         let mut drawn = self.drawn();
+        if drawn.active.len() >= RECORD_CAP && !drawn.active.contains_key(agent) {
+            drawn.active.clear();
+        }
+        drawn.active.insert(agent.clone(), identity.session.clone());
         if let Some(call) = &identity.call {
             drawn
                 .routes
@@ -1018,6 +1120,7 @@ impl Coordinator {
         let agent = event.agent.clone();
         let sent = self.send_awaited(CursorLine::Picture(event), &agent, tip.serial, waits)?;
         drawn.keep(&agent, tip);
+        self.note_queued_badge(&agent);
         sent.map(|written| Sent {
             duration: Duration::from_secs_f64(motion.duration_ms / 1000.0),
             written,
@@ -1241,6 +1344,7 @@ impl Coordinator {
         let sent = self.send_awaited(CursorLine::PreviewMotion(motion), &agent, serial, waits);
         if sent.is_some() {
             drawn.keep(&agent, tip);
+            self.note_queued_badge(&agent);
         }
         sent.flatten().map(|written| Sent {
             duration: Duration::from_secs_f64(chosen.duration_ms / 1000.0),
@@ -1628,6 +1732,9 @@ impl Coordinator {
     /// Signal before browser teardown starts. Reaping and any blocked pipe write
     /// belong to the transport thread, never to the twenty-second drain budget.
     pub fn shutdown(&self) {
+        if let Some(listener) = self.0.turn_hints.get() {
+            listener.shutdown();
+        }
         self.0
             .stopped
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1923,6 +2030,11 @@ impl Coordinator {
     pub(crate) fn draw_for_test(&self, identity: &Identity) {
         self.record(identity);
     }
+
+    #[cfg(test)]
+    pub(crate) fn send_scheduled_for_test(&self, event: CursorEvent) {
+        self.send_unless_ended(event);
+    }
 }
 
 /// The geometry read for an on-screen picture, on a blocking thread: the
@@ -2139,6 +2251,26 @@ impl State {
             }
             _ => return,
         };
+        let badge = match line {
+            CursorLine::Picture(event) => !event.avatar_update && !event.agent.is_empty(),
+            CursorLine::PreviewMotion(_) => true,
+            _ => false,
+        };
+        if written.is_some() && badge && !self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            let drawn = self
+                .drawn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !drawn
+                .ended_at
+                .get(&key.0)
+                .is_some_and(|ended| key.1 < *ended)
+            {
+                if let Some(listener) = self.turn_hints.get() {
+                    listener.drawn(&key.0);
+                }
+            }
+        }
         let waiter = self
             .awaiting
             .lock()

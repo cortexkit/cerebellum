@@ -242,7 +242,6 @@ impl ClaustrumVault {
 
     /// Reuse the authenticated, one-call transport for another management read.
     /// The caller owns the deadline and dropping the route closes its connection.
-    #[cfg(target_os = "macos")]
     pub(crate) fn management(connection_file: PathBuf, module_id: String, target: &str) -> Self {
         Self {
             target_module: target.to_owned(),
