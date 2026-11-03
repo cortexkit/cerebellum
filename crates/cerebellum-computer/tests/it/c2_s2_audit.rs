@@ -436,8 +436,17 @@ fn audit() -> ComputerAudit<TestRedactor, ValidatedSeverityTaxonomy, InMemoryJou
 
 #[test]
 fn capability_and_containment_maps_are_closed() {
-    assert_eq!(ComputerCapability::ALL.len(), 12);
+    assert_eq!(ComputerCapability::ALL.len(), 13);
     assert_eq!(ComputerCapability::RETIRED.len(), 5);
+    assert!(ComputerCapability::ALL.contains(&ComputerCapability::TakeoverClick));
+    assert_eq!(
+        ComputerCapability::TakeoverClick.capability_id(),
+        "computer.takeover_click"
+    );
+    assert_eq!(
+        ComputerCapability::TakeoverClick.action_kind(),
+        cerebellum_computer::platform::ActionKind::Compose
+    );
     assert_eq!(
         ComputerCapability::ReadState.action_kind(),
         cerebellum_computer::platform::ActionKind::Observe

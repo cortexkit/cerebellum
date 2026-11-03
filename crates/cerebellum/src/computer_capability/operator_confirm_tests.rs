@@ -528,10 +528,12 @@ mod daemon {
         f.event("withdraw").await;
         f.event("provider_returned").await;
         assert_eq!(f.prompts(), 1);
+        let resumed = f.mode(&live, &crate::CancelHandle::pending()).await;
         assert_eq!(
-            f.mode(&live, &crate::CancelHandle::pending()).await.0,
+            resumed.0,
             AppUse::Foreground,
-            "a cancelled prompt never seeds approval"
+            "a cancelled prompt never seeds approval: {resumed:?}; provider events: {:?}",
+            f.events()
         );
         assert_eq!(f.prompts(), 2);
 
