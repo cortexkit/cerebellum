@@ -15,9 +15,11 @@ compared numerically, never by sorting the whole key.
 An end below the latest observed sequence for that publisher, session and
 agent is stale; an equal sequence is a redelivery. Missing agent/key, malformed
 keys, different sessions in the key and header, and non-live subjects do not
-end any badge. Headers remain publisher claims for presentation, never scope
-stamps or permission to act. A missed live hint leaves the direct core call and
-the existing badge idle fade as fallback.
+end any badge. The `agent` and `session_ref` headers are claims by the
+publishing module, used only to pick which badge to hide. They are not the
+daemon-stamped scope that core's direct call is matched on, and they never
+authorize an action. A missed live hint leaves the direct core call and the
+existing badge idle fade as fallback.
 
 `turn_hints::notice::tests::live_hint_vectors_pin_headers_and_keys` reads these
 fixed examples. The lifecycle tests inject a transport and use no live bus,
