@@ -495,6 +495,7 @@ async fn helper_query_failures_name_the_step_in_the_takeover_refusal() {
     ] {
         let (rig, image_id) = fixture().await;
         rig.desk.state().pointer_query_error = Some(step);
+        rig.desk.state().pointer_prewarm_error = Some(step);
         let reply = rig
             .call_under(
                 &under_terminal(),
@@ -510,7 +511,48 @@ async fn helper_query_failures_name_the_step_in_the_takeover_refusal() {
             "{reply}"
         );
         assert!(!rig.screen.log().iter().any(|post| post == "move"));
+        assert_eq!(rig.desk.state().pointer_prewarm_deadlines.len(), 1);
         assert!(rig.plane.result_schema_findings().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn move_and_scroll_prewarm_before_placement_with_only_the_existing_call_budget() {
+    for admitted in [false, true] {
+        for action in ["takeover_move", "takeover_scroll"] {
+            let (mut rig, image_id) = fixture().await;
+            rig.plane = Arc::new(
+                Arc::try_unwrap(rig.plane)
+                    .ok()
+                    .unwrap()
+                    .with_takeover_pointer_fronting_admitted(admitted),
+            );
+            // Force placement to refuse. Preparation must precede even this
+            // first placement, not just dispatch after a successful placement.
+            rig.desk.state().real_cursor = None;
+            let arguments = if action == "takeover_move" {
+                json!({"image_id":format!("missing-{image_id}"),"to":{"x":10,"y":20}})
+            } else {
+                json!({"target":support::TARGET_BUNDLE_ID,"axis":"vertical","amount_lines":2})
+            };
+            let end = tokio::time::Instant::now() + Duration::from_millis(100);
+            let _ = crate::call_context::CALL_DEADLINE
+                .scope(
+                    end,
+                    rig.call_under(&under_terminal(), &format!("computer.{action}"), arguments),
+                )
+                .await;
+            let deadlines = rig.desk.state().pointer_prewarm_deadlines.clone();
+            if admitted {
+                assert_eq!(deadlines, [end.into_std()], "{action}");
+            } else {
+                assert!(
+                    deadlines.is_empty(),
+                    "unbound {action} must not prepare a helper"
+                );
+            }
+            assert!(rig.screen.log().is_empty());
+        }
     }
 }
 

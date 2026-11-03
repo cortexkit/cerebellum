@@ -113,6 +113,10 @@ pub struct OverlayAccent {
 /// picture to take off the screen now because that agent is done, or the
 /// window under one agent's picture having moved.
 pub enum OverlayMessage {
+    /// A no-drawing barrier acknowledged after AppKit initialization.
+    Ready {
+        reply: std::sync::mpsc::SyncSender<()>,
+    },
     /// Query on this AppKit application's main thread, never the pipe reader.
     PointerWindow {
         point: [f64; 2],
@@ -1283,6 +1287,9 @@ fn run_cursor_loop(
             // a noisy agent is continuously sending events.
             for _ in 0..32 {
                 match pending.take().map_or_else(|| events.try_recv(), Ok) {
+                    Ok(OverlayMessage::Ready { reply }) => {
+                        let _ = reply.try_send(());
+                    }
                     Ok(OverlayMessage::PointerWindow { point, reply }) => {
                         let _ = reply.try_send(crate::pointer_window_at(point[0], point[1]));
                     }
