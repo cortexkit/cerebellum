@@ -65,8 +65,10 @@ pub(super) fn post_pointer_unit<O: PointerOperations>(
                 ));
             }
             // Do not discard an already-selected up when cancellation or observer
-            // loss happened during an AX read. Recovery still requires containment;
-            // an unchecked up awaits disposable-VM routing measurements.
+            // loss happened during an AX read. Recovery still requires containment:
+            // posting the up without the window check would be safe only if the
+            // window server routes it to the window that received the down, which
+            // `examples/mouse_up_routing_probe.rs` measures and has not yet confirmed.
             if !recovery && !(releases[index] && stopped) {
                 live?;
                 final_observation?;

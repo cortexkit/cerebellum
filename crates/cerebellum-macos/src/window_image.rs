@@ -499,7 +499,7 @@ pub fn pointer_hit_test_startup_diagnosis() -> PointerStartupDiagnosis {
 }
 
 #[cfg(feature = "desk-probe")]
-pub fn pointer_hit_test_activation_policy() -> isize {
+pub fn current_app_activation_mode_raw() -> isize {
     objc2_app_kit::NSRunningApplication::currentApplication()
         .activationPolicy()
         .0

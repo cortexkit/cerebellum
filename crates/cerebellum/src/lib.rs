@@ -13686,7 +13686,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         let expected = "2b3184c68f59f3da166b6e2ec711781e09cca8d9aac9cd2182b5344256bb8752";
         #[cfg(target_os = "macos")]
-        let expected = "be5b2ce816d58556761241e11a588b07e079c0cdc5bff7197c1363c4300f26b1";
+        let expected = "d44d9c748486c0b25b5cfceaff106e545826d1134cda41ea33727bbf93d1b45d";
         #[cfg(target_os = "linux")]
         let expected_unbound = "07b08b84e41cccff515bb6765bd90831c1fae3b67d0fb90d1bccbb7a488da86d";
         #[cfg(target_os = "macos")]

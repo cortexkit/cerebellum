@@ -140,7 +140,7 @@ mod window_identity;
 mod window_image;
 #[cfg(all(target_os = "macos", feature = "desk-probe"))]
 pub use window_image::{
-    pointer_hit_test_activation_policy, pointer_hit_test_startup_diagnosis,
+    current_app_activation_mode_raw, pointer_hit_test_startup_diagnosis,
     pointer_probe_own_window_count, pointer_probe_posting_permitted,
 };
 #[cfg(target_os = "macos")]

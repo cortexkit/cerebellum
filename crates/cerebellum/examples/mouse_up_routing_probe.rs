@@ -45,7 +45,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             writeln!(
                 std::io::stdout(),
                 "second={second} policy={} (Prohibited=2) own_on_screen_windows={own}",
-                cerebellum_macos::pointer_hit_test_activation_policy()
+                cerebellum_macos::current_app_activation_mode_raw()
             )?;
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
@@ -220,9 +220,10 @@ mod probe {
                 }
                 Ok(())
             })();
-            // Even an unmeasurable transition must not strand VM input. The
-            // entire desktop is disposable and explicitly approved for this
-            // probe; production never takes this unchecked recovery path.
+            // Even an unmeasurable transition must not strand a held button. This
+            // probe runs only inside a VM (checked at startup), where posting an
+            // up to whatever is under the point is acceptable; production never
+            // posts an up without its containment check.
             let _ = post_event_globally(up);
             transition?;
             std::thread::sleep(Duration::from_secs(1));
