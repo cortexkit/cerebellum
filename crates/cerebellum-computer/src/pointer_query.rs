@@ -10,11 +10,16 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_millis(50);
+/// Cold initialization gets more time than a hit test, but must not hold
+/// the helper's input reader or delay placement for a whole call budget.
+pub const PREPARE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_REPLY_BYTES: u64 = 512;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub type QueryProvider =
     Arc<dyn Fn([f64; 2], Instant) -> Result<Option<u32>, &'static str> + Send + Sync>;
 static PROVIDER: Mutex<Option<QueryProvider>> = Mutex::new(None);
+pub type PrewarmProvider = Arc<dyn Fn(Instant) -> Result<(), &'static str> + Send + Sync>;
+static PREWARM_PROVIDER: Mutex<Option<PrewarmProvider>> = Mutex::new(None);
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +33,44 @@ pub struct Request {
 pub struct Reply {
     pub pointer_query_id: u64,
     pub window: Option<u32>,
+}
+
+/// A readiness barrier, not a hit test or a drawing command. The helper
+/// acknowledges the ID only after its AppKit main loop is running.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareRequest {
+    pub helper_ready_id: u64,
+}
+
+pub fn answer_prepare_request(
+    request: PrepareRequest,
+    ready: impl FnOnce() -> Option<mpsc::Receiver<()>>,
+    replies: &mut impl Write,
+) -> bool {
+    if request.helper_ready_id == 0 {
+        return false;
+    }
+    let Some(ready) = ready() else {
+        return true;
+    };
+    // A stalled AppKit loop must not stop later cursor or preview lines.
+    // Like a late hit test, an unanswered readiness barrier emits no reply.
+    if ready.recv_timeout(PREPARE_TIMEOUT).is_err() {
+        return true;
+    }
+    write_reply(request.helper_ready_id, None, replies)
+}
+
+fn write_reply(id: u64, window: Option<u32>, replies: &mut impl Write) -> bool {
+    let Ok(mut bytes) = serde_json::to_vec(&Reply {
+        pointer_query_id: id,
+        window,
+    }) else {
+        return false;
+    };
+    bytes.push(b'\n');
+    replies.write_all(&bytes).is_ok()
 }
 
 /// Handle one helper request without tying the input loop's lifetime to query
@@ -45,14 +88,7 @@ pub fn answer_request(
     let Some(window) = answer(request.point) else {
         return true;
     };
-    let Ok(mut bytes) = serde_json::to_vec(&Reply {
-        pointer_query_id: request.pointer_query_id,
-        window,
-    }) else {
-        return false;
-    };
-    bytes.push(b'\n');
-    replies.write_all(&bytes).is_ok()
+    write_reply(request.pointer_query_id, window, replies)
 }
 
 pub struct Client {
@@ -78,6 +114,30 @@ impl Client {
         point: [f64; 2],
         timeout: Duration,
     ) -> Result<Option<u32>, &'static str> {
+        if !point.iter().all(|v| v.is_finite()) {
+            return Err("mouse-down recipient helper query point invalid");
+        }
+        self.request(timeout, |id| Request {
+            pointer_query_id: id,
+            point,
+        })
+    }
+
+    pub fn wait_ready(&self, timeout: Duration) -> Result<(), &'static str> {
+        self.request(timeout, |id| PrepareRequest {
+            helper_ready_id: id,
+        })
+        .and_then(|window| match window {
+            None => Ok(()),
+            Some(_) => Err("mouse-down recipient helper reply malformed"),
+        })
+    }
+
+    fn request<T: Serialize>(
+        &self,
+        timeout: Duration,
+        request: impl FnOnce(u64) -> T,
+    ) -> Result<Option<u32>, &'static str> {
         let deadline = Instant::now() + timeout;
         let replies = self
             .replies
@@ -86,14 +146,8 @@ impl Client {
         let id = NEXT_ID
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| "mouse-down recipient helper request ids exhausted")?;
-        if !point.iter().all(|v| v.is_finite()) {
-            return Err("mouse-down recipient helper query point invalid");
-        }
-        let mut bytes = serde_json::to_vec(&Request {
-            pointer_query_id: id,
-            point,
-        })
-        .map_err(|_| "mouse-down recipient helper request encoding failed")?;
+        let mut bytes = serde_json::to_vec(&request(id))
+            .map_err(|_| "mouse-down recipient helper request encoding failed")?;
         bytes.push(b'\n');
         self.writer
             .try_lock()
@@ -135,6 +189,21 @@ pub fn set_provider(provider: Option<QueryProvider>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = provider;
 }
 
+pub fn set_prewarm_provider(provider: Option<PrewarmProvider>) {
+    *PREWARM_PROVIDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = provider;
+}
+
+pub fn prewarm_until(deadline: Instant) -> Result<(), &'static str> {
+    let provider = PREWARM_PROVIDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .ok_or("mouse-down recipient helper transport unavailable")?;
+    provider(deadline)
+}
+
 pub fn window_at(point: [f64; 2]) -> Result<Option<u32>, &'static str> {
     window_at_until(point, Instant::now() + QUERY_TIMEOUT)
 }
@@ -151,6 +220,103 @@ pub fn window_at_until(point: [f64; 2], deadline: Instant) -> Result<Option<u32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_barrier_sends_no_hit_test_or_drawing_and_matches_its_id() {
+        struct ReadyAnswer(mpsc::Sender<Result<Reply, &'static str>>);
+        impl Write for ReadyAnswer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                assert_eq!(value.as_object().unwrap().len(), 1);
+                let id = value["helper_ready_id"].as_u64().unwrap();
+                assert!(id > 0);
+                self.0
+                    .send(Ok(Reply {
+                        pointer_query_id: id - 1,
+                        window: Some(99),
+                    }))
+                    .unwrap();
+                let mut response = Vec::new();
+                assert!(answer_prepare_request(
+                    PrepareRequest {
+                        helper_ready_id: id
+                    },
+                    || {
+                        let (reply, ready) = mpsc::sync_channel(1);
+                        reply.send(()).unwrap();
+                        Some(ready)
+                    },
+                    &mut response
+                ));
+                self.0
+                    .send(Ok(serde_json::from_slice(&response).unwrap()))
+                    .unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let client = Client::new(Arc::new(Mutex::new(Box::new(ReadyAnswer(tx)))), rx);
+        assert_eq!(client.wait_ready(QUERY_TIMEOUT), Ok(()));
+    }
+
+    #[test]
+    fn unreadiness_sends_no_reply_and_invalid_readiness_stops_the_loop() {
+        let mut replies = Vec::new();
+        assert!(answer_prepare_request(
+            PrepareRequest { helper_ready_id: 1 },
+            || None,
+            &mut replies
+        ));
+        assert!(replies.is_empty());
+        assert!(!answer_prepare_request(
+            PrepareRequest { helper_ready_id: 0 },
+            || panic!("invalid ID"),
+            &mut replies
+        ));
+        assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn unanswered_preparation_does_not_end_the_helper_input_loop() {
+        assert_eq!(PREPARE_TIMEOUT, Duration::from_secs(2));
+        let (held_reply, ready) = mpsc::sync_channel(1);
+        let (finished, result) = mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let mut replies = Vec::new();
+            let keep_reading = answer_prepare_request(
+                PrepareRequest { helper_ready_id: 1 },
+                || Some(ready),
+                &mut replies,
+            );
+            if keep_reading {
+                assert!(answer_request(
+                    Request {
+                        pointer_query_id: 2,
+                        point: [10.0, 20.0]
+                    },
+                    |_| Some(Some(42)),
+                    &mut replies,
+                ));
+            }
+            finished.send((keep_reading, replies)).unwrap();
+        });
+        let observed = result.recv_timeout(PREPARE_TIMEOUT + Duration::from_secs(1));
+        // Closing the channel also releases a broken unbounded reader before
+        // reporting failure, so the regression cannot strand the test process.
+        drop(held_reply);
+        reader.join().unwrap();
+        let (keep_reading, replies) = observed.expect("preparation must stop waiting at its bound");
+        assert!(keep_reading, "late readiness must not end the input loop");
+        let reply: Reply = serde_json::from_slice(&replies).unwrap();
+        assert_eq!(
+            reply.pointer_query_id, 2,
+            "only the next line receives a reply"
+        );
+        assert_eq!(reply.window, Some(42));
+    }
 
     struct Answer(mpsc::Sender<Result<Reply, &'static str>>);
     impl Write for Answer {

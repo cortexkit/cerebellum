@@ -3602,10 +3602,15 @@ mod helper_transport {
 
     pub(super) fn install_queries() {
         pointer_query::set_provider(Some(shared().provider()));
+        let service = shared().clone();
+        pointer_query::set_prewarm_provider(Some(Arc::new(move |deadline| {
+            service.prewarm(deadline)
+        })));
     }
 
     pub(super) fn shutdown() {
         pointer_query::set_provider(None);
+        pointer_query::set_prewarm_provider(None);
         if let Some(service) = SHARED.get() {
             service.stop();
         }
@@ -3615,6 +3620,7 @@ mod helper_transport {
         fn alive(&self) -> bool;
         fn generation(&self) -> ProcessGeneration;
         fn write(&mut self, bytes: &[u8]) -> bool;
+        fn wait_ready(&mut self, deadline: Instant) -> Result<(), &'static str>;
         fn query(
             &mut self,
             point: [f64; 2],
@@ -3638,6 +3644,10 @@ mod helper_transport {
     }
 
     enum Command {
+        Prewarm {
+            deadline: Instant,
+            reply: pipe::SyncSender<Result<(), &'static str>>,
+        },
         Visual {
             owner: Arc<State>,
             bytes: Vec<u8>,
@@ -3676,6 +3686,12 @@ mod helper_transport {
                             break;
                         }
                         match command {
+                            Command::Prewarm { deadline, reply } => {
+                                let result = worker.ensure(true, Some(deadline)).and_then(|()| {
+                                    worker.helper.as_mut().unwrap().wait_ready(deadline)
+                                });
+                                let _ = reply.try_send(result);
+                            }
                             Command::Query {
                                 point,
                                 deadline,
@@ -3731,6 +3747,19 @@ mod helper_transport {
         fn provider(&self) -> QueryProvider {
             let service = self.clone();
             Arc::new(move |point, deadline| service.query(point, deadline))
+        }
+
+        fn prewarm(&self, deadline: Instant) -> Result<(), &'static str> {
+            if self.stopped.load(Ordering::Acquire) || Instant::now() >= deadline {
+                return Err("mouse-down recipient helper launch budget exceeded");
+            }
+            let (reply, answer) = pipe::sync_channel(1);
+            self.tx
+                .try_send(Command::Prewarm { deadline, reply })
+                .map_err(|_| "mouse-down recipient helper transport busy or unavailable")?;
+            answer
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|_| "mouse-down recipient helper launch budget exceeded")?
         }
 
         fn query(&self, point: [f64; 2], deadline: Instant) -> Result<Option<u32>, &'static str> {
@@ -3846,6 +3875,13 @@ mod helper_transport {
         fn generation(&self) -> ProcessGeneration {
             self.child.generation()
         }
+        fn wait_ready(&mut self, deadline: Instant) -> Result<(), &'static str> {
+            if Instant::now() >= deadline {
+                return Err("mouse-down recipient helper launch budget exceeded");
+            }
+            self.client
+                .wait_ready(deadline.saturating_duration_since(Instant::now()))
+        }
         fn write(&mut self, bytes: &[u8]) -> bool {
             use std::io::Write;
             self.pipe
@@ -3952,6 +3988,7 @@ mod helper_transport {
             launches: usize,
             writes: usize,
             queries: usize,
+            preparations: usize,
             alive: bool,
             now: Instant,
         }
@@ -3970,6 +4007,10 @@ mod helper_transport {
                     pid: 42,
                     start_time_micros: 123,
                 }
+            }
+            fn wait_ready(&mut self, _: Instant) -> Result<(), &'static str> {
+                self.0.lock().unwrap().preparations += 1;
+                Ok(())
             }
             fn write(&mut self, _: &[u8]) -> bool {
                 self.0.lock().unwrap().writes += 1;
@@ -4003,6 +4044,7 @@ mod helper_transport {
                 launches: 0,
                 writes: 0,
                 queries: 0,
+                preparations: 0,
                 alive: false,
                 now: Instant::now(),
             }));
@@ -4017,6 +4059,46 @@ mod helper_transport {
         }
         fn deadline() -> Instant {
             Instant::now() + Duration::from_millis(50)
+        }
+
+        #[test]
+        fn prewarmed_helper_is_reused_by_the_bracket_query_without_drawing() {
+            let (service, stats) = fixture(Some(false), false);
+            assert_eq!(service.prewarm(deadline()), Ok(()));
+            {
+                let stats = stats.lock().unwrap();
+                assert_eq!(stats.launches, 1);
+                assert_eq!(stats.preparations, 1);
+                assert_eq!(stats.queries, 0);
+                assert_eq!(stats.writes, 0);
+            }
+            assert_eq!(service.query([10.0, 20.0], deadline()), Ok(Some(77)));
+            let stats = stats.lock().unwrap();
+            assert_eq!(
+                stats.launches, 1,
+                "the bracket must reuse the prepared child"
+            );
+            assert_eq!(stats.queries, 1);
+            assert_eq!(stats.writes, 0);
+            service.stop();
+        }
+
+        #[test]
+        fn failed_prewarm_preserves_the_restart_limit_and_query_refusal() {
+            let (service, stats) = fixture(Some(false), true);
+            assert_eq!(
+                service.prewarm(deadline()),
+                Err("mouse-down recipient helper pinned executable unavailable")
+            );
+            assert_eq!(
+                service.query([10.0, 20.0], deadline()),
+                Err("mouse-down recipient helper restart limit reached")
+            );
+            let stats = stats.lock().unwrap();
+            assert_eq!(stats.launches, 1);
+            assert_eq!(stats.queries, 0);
+            assert_eq!(stats.writes, 0);
+            service.stop();
         }
 
         #[test]
@@ -4056,6 +4138,10 @@ mod helper_transport {
         fn locked_or_unreadable_screen_never_launches_a_query_helper() {
             for screen in [None, Some(true)] {
                 let (service, stats) = fixture(screen, false);
+                assert_eq!(
+                    service.prewarm(deadline()),
+                    Err("mouse-down recipient helper screen locked or unreadable")
+                );
                 assert_eq!(
                     service.query([10.0, 20.0], deadline()),
                     Err("mouse-down recipient helper screen locked or unreadable")
@@ -4124,6 +4210,15 @@ mod helper_transport {
 
         #[test]
         fn slow_launch_cannot_extend_the_call_budget_or_issue_a_late_query() {
+            slow_launch(false);
+        }
+
+        #[test]
+        fn timed_out_prewarm_leaves_the_later_query_fail_closed() {
+            slow_launch(true);
+        }
+
+        fn slow_launch(prewarm: bool) {
             struct SlowLauncher {
                 started: pipe::SyncSender<()>,
                 release: pipe::Receiver<()>,
@@ -4139,6 +4234,9 @@ mod helper_transport {
             impl Helper for LateHelper {
                 fn alive(&self) -> bool {
                     true
+                }
+                fn wait_ready(&mut self, _: Instant) -> Result<(), &'static str> {
+                    panic!("late helper must be dropped before readiness")
                 }
                 fn generation(&self) -> ProcessGeneration {
                     ProcessGeneration {
@@ -4177,15 +4275,30 @@ mod helper_transport {
             });
             let query = service.clone();
             let call = std::thread::spawn(move || {
-                query.query([10.0, 20.0], Instant::now() + Duration::from_millis(100))
+                let deadline = Instant::now() + Duration::from_millis(100);
+                if prewarm {
+                    query.prewarm(deadline)
+                } else {
+                    query.query([10.0, 20.0], deadline).map(|_| ())
+                }
             });
             started.recv_timeout(Duration::from_secs(1)).unwrap();
             assert_eq!(
                 call.join().unwrap(),
-                Err("mouse-down recipient helper launch/query budget exceeded")
+                Err(if prewarm {
+                    "mouse-down recipient helper launch budget exceeded"
+                } else {
+                    "mouse-down recipient helper launch/query budget exceeded"
+                })
             );
             release.send(()).unwrap();
             dropped.recv_timeout(Duration::from_secs(1)).unwrap();
+            if prewarm {
+                assert_eq!(
+                    service.query([10.0, 20.0], deadline()),
+                    Err("mouse-down recipient helper restart limit reached")
+                );
+            }
             assert_eq!(queries.load(Ordering::Relaxed), 0);
             service.stop();
         }

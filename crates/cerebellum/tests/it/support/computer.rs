@@ -708,6 +708,9 @@ impl std::fmt::Debug for DeskHook {
 pub struct DeskState {
     pub real_cursor: Option<(f64, f64)>,
     pub pointer_query_error: Option<&'static str>,
+    pub pointer_prewarm_deadlines: Vec<std::time::Instant>,
+    pub pointer_prewarm_error: Option<&'static str>,
+    pub on_pointer_prewarm: Option<DeskHook>,
     pub cursor_frame: Option<[f64; 4]>,
     /// Frames for particular elements, which take the place of
     /// `cursor_frame` for them, so each element's badge aims somewhere of
@@ -796,6 +799,9 @@ impl Desk {
         Self(Arc::new(Mutex::new(DeskState {
             real_cursor: None,
             pointer_query_error: None,
+            pointer_prewarm_deadlines: Vec::new(),
+            pointer_prewarm_error: None,
+            on_pointer_prewarm: None,
             cursor_frame: None,
             cursor_frames: std::collections::HashMap::new(),
             on_cursor_frame: None,
@@ -1107,6 +1113,21 @@ impl AppStateSource for Desk {
             return Err(error);
         }
         Ok(self.pointer_window_at(point))
+    }
+
+    fn prewarm_pointer_query(&self, deadline: std::time::Instant) -> Result<(), &'static str> {
+        let (hook, result) = {
+            let mut state = self.state();
+            state.pointer_prewarm_deadlines.push(deadline);
+            (
+                state.on_pointer_prewarm.take(),
+                state.pointer_prewarm_error.map_or(Ok(()), Err),
+            )
+        };
+        if let Some(hook) = hook {
+            (hook.0)();
+        }
+        result
     }
 
     fn focused_element(

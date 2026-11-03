@@ -358,6 +358,10 @@ impl AppStateSource for MacAppStateSource {
         crate::pointer_query::window_at_until([point.0, point.1], deadline)
     }
 
+    fn prewarm_pointer_query(&self, deadline: std::time::Instant) -> Result<(), &'static str> {
+        crate::pointer_query::prewarm_until(deadline)
+    }
+
     fn cursor_position(&self) -> Option<(f64, f64)> {
         cerebellum_macos::cursor_position()
     }

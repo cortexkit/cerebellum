@@ -637,6 +637,12 @@ pub trait AppStateSource: Send + Sync {
         self.pointer_recipient(point)
     }
 
+    /// Best-effort no-query preparation before placement or temporary fronting.
+    /// Sources without a separate helper have nothing to prepare.
+    fn prewarm_pointer_query(&self, _deadline: std::time::Instant) -> Result<(), &'static str> {
+        Ok(())
+    }
+
     /// The real cursor, not the agent's visual badge. Missing telemetry refuses scroll.
     fn cursor_position(&self) -> Option<(f64, f64)> {
         None

@@ -58,7 +58,9 @@ fn agent_cursor() {
     );
     let (sender, receiver) = std::sync::mpsc::sync_channel(32);
     std::thread::spawn(move || {
-        use cerebellum_computer::pointer_query::{answer_request, Request, QUERY_TIMEOUT};
+        use cerebellum_computer::pointer_query::{
+            answer_prepare_request, answer_request, PrepareRequest, Request, QUERY_TIMEOUT,
+        };
         // The barred cursor launch maps only its private reply pipe to fd 4.
         let Ok(mut replies) = std::fs::OpenOptions::new().write(true).open("/dev/fd/4") else {
             return;
@@ -87,6 +89,22 @@ fn agent_cursor() {
             ) || line.len() > MAX_CURSOR_LINE
             {
                 break;
+            }
+            if let Ok(prepare) = serde_json::from_slice::<PrepareRequest>(&line) {
+                if !answer_prepare_request(
+                    prepare,
+                    || {
+                        let (reply, ready) = std::sync::mpsc::sync_channel(1);
+                        sender
+                            .try_send(cerebellum_macos::OverlayMessage::Ready { reply })
+                            .ok()?;
+                        Some(ready)
+                    },
+                    &mut replies,
+                ) {
+                    break;
+                }
+                continue;
             }
             if let Ok(query) = serde_json::from_slice::<Request>(&line) {
                 if !answer_request(
