@@ -150,7 +150,10 @@ impl FrontingBracketHost for PointerHost {
                     return Ok(0);
                 }
                 screen.state().pointer.checks += 1;
-                if (self.guard.0)().is_err() || screen.frontmost() != Some(TARGET) {
+                if (self.guard.0)(std::time::Instant::now() + std::time::Duration::from_millis(300))
+                    .is_err()
+                    || screen.frontmost() != Some(TARGET)
+                {
                     observation
                         .watcher
                         .abort(AbortReason::FocusMismatch, index, None);

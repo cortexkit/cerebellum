@@ -171,7 +171,8 @@ impl PointerOperations for NativePointerOperations<'_, '_> {
     }
 
     fn contained(&mut self) -> Result<(), DriverError> {
-        (self.pointer.guard.0)().map_err(DriverError::Unsupported)
+        (self.pointer.guard.0)(self.started + Duration::from_millis(self.observation.deadline_ms))
+            .map_err(DriverError::Unsupported)
     }
 
     fn generation(&mut self) -> super::super::process_event::ProcessGenerationReading {
@@ -289,7 +290,8 @@ mod tests {
                 )],
                 transport: MacOsPerProcessEventTransport::new(Duration::from_millis(50)),
                 pointer: Some(MacPointerUnit {
-                    guard: super::super::super::GlobalPointerGuard(Arc::new(move || {
+                    guard: super::super::super::GlobalPointerGuard(Arc::new(move |deadline| {
+                        assert_eq!(deadline, started + Duration::from_millis(1000));
                         in_guard.store(true, Ordering::Relaxed);
                         Ok(())
                     })),

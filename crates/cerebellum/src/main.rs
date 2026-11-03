@@ -58,8 +58,7 @@ fn agent_cursor() {
     );
     let (sender, receiver) = std::sync::mpsc::sync_channel(32);
     std::thread::spawn(move || {
-        use cerebellum_computer::pointer_query::{Reply, Request, QUERY_TIMEOUT};
-        use std::io::Write;
+        use cerebellum_computer::pointer_query::{answer_request, Request, QUERY_TIMEOUT};
         // The barred cursor launch maps only its private reply pipe to fd 4.
         let Ok(mut replies) = std::fs::OpenOptions::new().write(true).open("/dev/fd/4") else {
             return;
@@ -90,30 +89,20 @@ fn agent_cursor() {
                 break;
             }
             if let Ok(query) = serde_json::from_slice::<Request>(&line) {
-                if query.pointer_query_id == 0 || !query.point.iter().all(|v| v.is_finite()) {
-                    break;
-                }
-                let (reply, answer) = std::sync::mpsc::sync_channel(1);
-                if sender
-                    .try_send(cerebellum_macos::OverlayMessage::PointerWindow {
-                        point: query.point,
-                        reply,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-                let Ok(window) = answer.recv_timeout(QUERY_TIMEOUT) else {
-                    break;
-                };
-                let Ok(mut bytes) = serde_json::to_vec(&Reply {
-                    pointer_query_id: query.pointer_query_id,
-                    window,
-                }) else {
-                    break;
-                };
-                bytes.push(b'\n');
-                if replies.write_all(&bytes).is_err() {
+                if !answer_request(
+                    query,
+                    |point| {
+                        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+                        sender
+                            .try_send(cerebellum_macos::OverlayMessage::PointerWindow {
+                                point,
+                                reply,
+                            })
+                            .ok()?;
+                        answer.recv_timeout(QUERY_TIMEOUT).ok()
+                    },
+                    &mut replies,
+                ) {
                     break;
                 }
                 continue;

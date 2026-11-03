@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 pub const QUERY_TIMEOUT: Duration = Duration::from_millis(50);
 pub const MAX_REPLY_BYTES: u64 = 512;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static HELPER: Mutex<Option<Arc<Client>>> = Mutex::new(None);
+pub type QueryProvider =
+    Arc<dyn Fn([f64; 2], Instant) -> Result<Option<u32>, &'static str> + Send + Sync>;
+static PROVIDER: Mutex<Option<QueryProvider>> = Mutex::new(None);
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,6 +28,31 @@ pub struct Request {
 pub struct Reply {
     pub pointer_query_id: u64,
     pub window: Option<u32>,
+}
+
+/// Handle one helper request without tying the input loop's lifetime to query
+/// latency. `None` means the main thread did not answer in time; `Some(None)`
+/// is a completed hit test with no recipient. Only invalid input or a failed
+/// reply write ends the input loop.
+pub fn answer_request(
+    request: Request,
+    answer: impl FnOnce([f64; 2]) -> Option<Option<u32>>,
+    replies: &mut impl Write,
+) -> bool {
+    if request.pointer_query_id == 0 || !request.point.iter().all(|v| v.is_finite()) {
+        return false;
+    }
+    let Some(window) = answer(request.point) else {
+        return true;
+    };
+    let Ok(mut bytes) = serde_json::to_vec(&Reply {
+        pointer_query_id: request.pointer_query_id,
+        window,
+    }) else {
+        return false;
+    };
+    bytes.push(b'\n');
+    replies.write_all(&bytes).is_ok()
 }
 
 pub struct Client {
@@ -102,19 +129,23 @@ impl Client {
     }
 }
 
-pub fn set_helper(client: Option<Arc<Client>>) {
-    *HELPER
+pub fn set_provider(provider: Option<QueryProvider>) {
+    *PROVIDER
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = client;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = provider;
 }
 
 pub fn window_at(point: [f64; 2]) -> Result<Option<u32>, &'static str> {
-    let helper = HELPER
+    window_at_until(point, Instant::now() + QUERY_TIMEOUT)
+}
+
+pub fn window_at_until(point: [f64; 2], deadline: Instant) -> Result<Option<u32>, &'static str> {
+    let provider = PROVIDER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
-        .ok_or("mouse-down recipient helper unavailable")?;
-    helper.window_at(point, QUERY_TIMEOUT)
+        .ok_or("mouse-down recipient helper transport unavailable")?;
+    provider(point, deadline)
 }
 
 #[cfg(test)]
@@ -169,10 +200,10 @@ mod tests {
     }
 
     #[test]
-    fn no_helper_refuses_before_a_query_can_be_sent() {
+    fn missing_transport_refuses_before_a_query_can_be_sent() {
         assert_eq!(
             window_at([1.0, 2.0]),
-            Err("mouse-down recipient helper unavailable")
+            Err("mouse-down recipient helper transport unavailable")
         );
     }
 
@@ -186,5 +217,72 @@ mod tests {
             client.window_at([1.0, 2.0], QUERY_TIMEOUT),
             Err("mouse-down recipient helper reply malformed")
         );
+    }
+
+    #[test]
+    fn slow_answer_does_not_end_the_helper_input_loop() {
+        let mut replies = Vec::new();
+        let mut queries = 0;
+        for id in [1, 2] {
+            if !answer_request(
+                Request {
+                    pointer_query_id: id,
+                    point: [10.0, 20.0],
+                },
+                |_| {
+                    queries += 1;
+                    if id == 1 {
+                        None
+                    } else {
+                        Some(Some(42))
+                    }
+                },
+                &mut replies,
+            ) {
+                break;
+            }
+        }
+        assert_eq!(
+            queries, 2,
+            "the next request must survive a slow main-thread answer"
+        );
+        let reply: Reply = serde_json::from_slice(&replies).unwrap();
+        assert_eq!(reply.pointer_query_id, 2);
+        assert_eq!(reply.window, Some(42));
+    }
+
+    #[test]
+    fn invalid_helper_request_ends_the_loop_without_querying() {
+        for (id, point) in [(0, [1.0, 2.0]), (1, [f64::NAN, 2.0])] {
+            assert!(!answer_request(
+                Request {
+                    pointer_query_id: id,
+                    point
+                },
+                |_| panic!("invalid request must not query AppKit"),
+                &mut Vec::new()
+            ));
+        }
+    }
+
+    #[test]
+    fn a_closed_reply_pipe_still_ends_the_helper_input_loop() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(!answer_request(
+            Request {
+                pointer_query_id: 1,
+                point: [1.0, 2.0]
+            },
+            |_| Some(Some(77)),
+            &mut Closed
+        ));
     }
 }

@@ -628,6 +628,15 @@ pub trait AppStateSource: Send + Sync {
         Ok(self.pointer_window_at(point))
     }
 
+    /// Bound helper startup and its reply by the caller-provided deadline.
+    fn pointer_recipient_until(
+        &self,
+        point: (f64, f64),
+        _deadline: std::time::Instant,
+    ) -> Result<Option<u32>, &'static str> {
+        self.pointer_recipient(point)
+    }
+
     /// The real cursor, not the agent's visual badge. Missing telemetry refuses scroll.
     fn cursor_position(&self) -> Option<(f64, f64)> {
         None

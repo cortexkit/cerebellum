@@ -2277,7 +2277,7 @@ mod tests {
 
     #[test]
     fn pointer_fronting_requires_its_new_review_and_both_existing_reviews() {
-        let guard = || super::super::GlobalPointerGuard(Arc::new(|| Ok(())));
+        let guard = || super::super::GlobalPointerGuard(Arc::new(|_| Ok(())));
         for revision in [
             None,
             Some(""),
@@ -2325,7 +2325,7 @@ mod tests {
                 if install_guard {
                     assert!(
                         driver.accept_pointer_fronting(super::super::GlobalPointerGuard(Arc::new(
-                            || panic!("interlock must precede containment and OS calls")
+                            |_| panic!("interlock must precede containment and OS calls")
                         )))
                     );
                 }

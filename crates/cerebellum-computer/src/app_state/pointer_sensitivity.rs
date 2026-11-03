@@ -23,7 +23,25 @@ pub fn pointer_target_check(
     point: (f64, f64),
     window: u32,
 ) -> Result<(), &'static str> {
-    if source.pointer_recipient(point)? != Some(window) {
+    pointer_target_check_until(
+        source,
+        target,
+        point,
+        window,
+        std::time::Instant::now() + crate::pointer_query::QUERY_TIMEOUT,
+    )
+}
+
+/// Use the caller's existing deadline for helper startup and the recipient
+/// reply, rather than starting a new budget when posting.
+pub fn pointer_target_check_until(
+    source: &dyn AppStateSource,
+    target: &ProcessGrant,
+    point: (f64, f64),
+    window: u32,
+    deadline: std::time::Instant,
+) -> Result<(), &'static str> {
+    if source.pointer_recipient_until(point, deadline)? != Some(window) {
         return Err("mouse-down recipient window changed or unavailable");
     }
     if !pointer_target_safe(source, target, point, window) {

@@ -580,24 +580,27 @@ where
             TakeoverRequest::Scroll { .. } => {
                 let source = Arc::clone(&self.app_state_source);
                 let target = target.clone();
-                return cerebellum_computer::platform::GlobalPointerGuard(Arc::new(move || {
-                    let window = scroll_window.ok_or("scroll target window unavailable")?;
-                    let point = source
-                        .cursor_position()
-                        .ok_or("scroll real cursor location unavailable")?;
-                    cerebellum_computer::app_state::pointer_sensitivity::pointer_target_check(
+                return cerebellum_computer::platform::GlobalPointerGuard(Arc::new(
+                    move |deadline| {
+                        let window = scroll_window.ok_or("scroll target window unavailable")?;
+                        let point = source
+                            .cursor_position()
+                            .ok_or("scroll real cursor location unavailable")?;
+                        cerebellum_computer::app_state::pointer_sensitivity::pointer_target_check_until(
                         source.as_ref(),
                         &target,
                         point,
                         window,
+                        deadline,
                     )
-                }));
+                    },
+                ));
             }
         };
         let management = Arc::clone(management);
         let source = Arc::clone(&self.app_state_source);
         let conversation_key = conversation_key.to_owned();
-        cerebellum_computer::platform::GlobalPointerGuard(Arc::new(move || {
+        cerebellum_computer::platform::GlobalPointerGuard(Arc::new(move |deadline| {
             let Some(image) = management
                 .app_state_sessions()
                 .resolve_image(&conversation_key, &image_id)
@@ -612,11 +615,12 @@ where
             };
             points.iter().try_for_each(|point| {
                 let point = desktop(&image, *point);
-                cerebellum_computer::app_state::pointer_sensitivity::pointer_target_check(
+                cerebellum_computer::app_state::pointer_sensitivity::pointer_target_check_until(
                     source.as_ref(),
                     &image_grant(&image),
                     (point.x, point.y),
                     window,
+                    deadline,
                 )?;
                 if application_under(source.as_ref(), &management, &image, point).is_ok_and(
                     |owner| {
@@ -962,8 +966,8 @@ where
                         scroll_window,
                     );
                     let failure = Arc::clone(&pointer_failure);
-                    cerebellum_computer::platform::GlobalPointerGuard(Arc::new(move || {
-                        let result = (guard.0)();
+                    cerebellum_computer::platform::GlobalPointerGuard(Arc::new(move |deadline| {
+                        let result = (guard.0)(deadline);
                         if let Err(step) = result {
                             *failure
                                 .lock()

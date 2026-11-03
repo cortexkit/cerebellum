@@ -75,6 +75,7 @@ pub struct HelperExecutableGuard(());
 #[cfg(target_os = "macos")]
 impl Drop for HelperExecutableGuard {
     fn drop(&mut self) {
+        helper_transport::shutdown();
         HELPER_EXECUTABLE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -91,6 +92,7 @@ pub(crate) fn pin_helper_at_startup() -> HelperExecutableGuard {
     *HELPER_EXECUTABLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = executable;
+    helper_transport::install_queries();
     HelperExecutableGuard(())
 }
 
@@ -122,6 +124,7 @@ pub fn pin_helper_for_probe(
     *HELPER_EXECUTABLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(executable);
+    helper_transport::install_queries();
     Ok(HelperExecutableGuard(()))
 }
 /// Bounds each memory-only record of who drew a badge. Far more than the agents
@@ -2152,118 +2155,19 @@ impl State {
 
 #[cfg(target_os = "macos")]
 fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
-    use cerebellum_computer::pointer_query::{self, Client, Reply, MAX_REPLY_BYTES};
-    use std::io::{BufRead, Read, Write};
-    type Writer = Arc<std::sync::Mutex<Box<dyn Write + Send>>>;
-    let mut helper: Option<(cerebellum_macos::ReleasedChild, Writer)> = None;
-    let mut restarts = RestartLimit::default();
+    let helper = helper_transport::shared();
     write_lines(&state, &mut rx, |event| {
-        // A locked or unreadable screen never launches or displays the helper.
-        if cerebellum_macos::screen_is_locked() != Some(false) {
-            return false;
-        }
-        if helper.is_none() {
-            // No helper means no badge and no preview on screen, so there is
-            // nothing to hide, move or fill in; never launch a helper just
-            // for that.
-            if !event.launches_helper() {
-                return false;
-            }
-            if !restarts.admit(Instant::now()) {
-                state
-                    .helper_down
-                    .store(true, std::sync::atomic::Ordering::Release);
-                return false;
-            }
-            let launched = (|| {
-                let pinned = HELPER_EXECUTABLE
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let executable = helper_launch_path(pinned.as_ref())?;
-                let (barred, pipe, replies) =
-                    cerebellum_macos::spawn_barred_cursor(&executable, &["--agent-cursor".into()])
-                        .ok()?;
-                if !pinned.as_ref()?.accepts_child(barred.generation().pid) {
-                    HELPER_BINARY_UNAVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return None;
-                }
-                let mut generation = state
-                    .generation
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if state.stopped.load(std::sync::atomic::Ordering::Acquire) {
-                    return None;
-                }
-                *generation = Some(barred.generation());
-                cerebellum_macos::register_cursor_generation(*generation);
-                drop(generation);
-                let child = barred.release().ok()?;
-                let pipe: Writer =
-                    Arc::new(std::sync::Mutex::new(Box::new(std::fs::File::from(pipe))));
-                let (tx, rx) = std::sync::mpsc::sync_channel(32);
-                std::thread::Builder::new()
-                    .name("cursor-pointer-replies".into())
-                    .spawn(move || {
-                        let mut reader = std::io::BufReader::new(std::fs::File::from(replies));
-                        loop {
-                            let mut line = Vec::new();
-                            let read = reader
-                                .by_ref()
-                                .take(MAX_REPLY_BYTES + 1)
-                                .read_until(b'\n', &mut line);
-                            if !matches!(read, Ok(1..)) {
-                                break;
-                            }
-                            let reply = if line.len() as u64 > MAX_REPLY_BYTES
-                                || line.last() != Some(&b'\n')
-                            {
-                                Err("mouse-down recipient helper reply malformed")
-                            } else {
-                                serde_json::from_slice::<Reply>(&line)
-                                    .map_err(|_| "mouse-down recipient helper reply malformed")
-                            };
-                            let malformed = reply.is_err();
-                            if tx.try_send(reply).is_err() || malformed {
-                                break;
-                            }
-                        }
-                    })
-                    .ok()?;
-                pointer_query::set_helper(Some(Arc::new(Client::new(pipe.clone(), rx))));
-                Some((child, pipe))
-            })();
-            helper = launched;
-            // A helper that did not start draws nothing; until another one
-            // starts, no action waits for its badge.
-            state
-                .helper_down
-                .store(helper.is_none(), std::sync::atomic::Ordering::Release);
-        }
-        let Some(line) = event.encode_line() else {
-            return false;
-        };
-        let Some((_, pipe)) = helper.as_mut() else {
-            return false;
-        };
-        if pipe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .write_all(&line)
-            .is_ok()
-        {
-            return true;
-        }
-        helper.take();
-        pointer_query::set_helper(None);
-        cerebellum_macos::register_cursor_generation(None);
+        let written = helper.write(&state, event);
         *state
             .generation
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        false
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = written.generation;
+        state.helper_down.store(
+            written.generation.is_none(),
+            std::sync::atomic::Ordering::Release,
+        );
+        written.written
     });
-    pointer_query::set_helper(None);
-    drop(helper);
 }
 
 impl Coordinator {
@@ -3675,5 +3579,615 @@ mod tests {
         until_read(|| motions().len() == 2);
         let entry = PictureMotion::chosen(0.0, true, false);
         assert_eq!(motions(), [entry, entry]);
+    }
+}
+
+/// Drawing and safety queries share one serialized, process-lifetime helper
+/// transport. Disabling badges never disables or shuts down the query service.
+#[cfg(target_os = "macos")]
+mod helper_transport {
+    use super::*;
+    use cerebellum_computer::pointer_query::{self, QueryProvider};
+    use cerebellum_macos::ProcessGeneration;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc as pipe,
+    };
+
+    static SHARED: OnceLock<Service> = OnceLock::new();
+
+    pub(super) fn shared() -> &'static Service {
+        SHARED.get_or_init(|| Service::start(NativeLauncher))
+    }
+
+    pub(super) fn install_queries() {
+        pointer_query::set_provider(Some(shared().provider()));
+    }
+
+    pub(super) fn shutdown() {
+        pointer_query::set_provider(None);
+        if let Some(service) = SHARED.get() {
+            service.stop();
+        }
+    }
+
+    trait Helper: Send + 'static {
+        fn alive(&self) -> bool;
+        fn generation(&self) -> ProcessGeneration;
+        fn write(&mut self, bytes: &[u8]) -> bool;
+        fn query(
+            &mut self,
+            point: [f64; 2],
+            deadline: Instant,
+        ) -> Result<Option<u32>, &'static str>;
+    }
+
+    trait Launcher: Send + 'static {
+        type Helper: Helper;
+        fn screen_unlocked(&self) -> bool;
+        fn launch(&mut self, deadline: Option<Instant>) -> Result<Self::Helper, &'static str>;
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+    }
+
+    #[derive(Default)]
+    pub(super) struct Written {
+        pub(super) written: bool,
+        pub(super) generation: Option<ProcessGeneration>,
+    }
+
+    enum Command {
+        Visual {
+            owner: Arc<State>,
+            bytes: Vec<u8>,
+            launches: bool,
+            reply: pipe::SyncSender<Written>,
+        },
+        Query {
+            point: [f64; 2],
+            deadline: Instant,
+            reply: pipe::SyncSender<Result<Option<u32>, &'static str>>,
+        },
+        Stop,
+    }
+
+    #[derive(Clone)]
+    pub(super) struct Service {
+        tx: pipe::SyncSender<Command>,
+        stopped: Arc<AtomicBool>,
+    }
+
+    impl Service {
+        fn start<L: Launcher>(launcher: L) -> Self {
+            let (tx, rx) = pipe::sync_channel(CAPACITY);
+            let stopped = Arc::new(AtomicBool::new(false));
+            let ending = stopped.clone();
+            if std::thread::Builder::new()
+                .name("agent-helper-transport".into())
+                .spawn(move || {
+                    let mut worker = Worker {
+                        launcher,
+                        helper: None,
+                        restarts: RestartLimit::default(),
+                    };
+                    while let Ok(command) = rx.recv() {
+                        if ending.load(Ordering::Acquire) {
+                            break;
+                        }
+                        match command {
+                            Command::Query {
+                                point,
+                                deadline,
+                                reply,
+                            } => {
+                                let result = worker.ensure(true, Some(deadline)).and_then(|()| {
+                                    worker.helper.as_mut().unwrap().query(point, deadline)
+                                });
+                                if matches!(
+                                    result,
+                                    Err("mouse-down recipient helper disconnected"
+                                        | "mouse-down recipient helper request write failed"
+                                        | "mouse-down recipient helper reply malformed")
+                                ) {
+                                    worker.helper.take();
+                                }
+                                let _ = reply.try_send(result);
+                            }
+                            Command::Visual {
+                                owner,
+                                bytes,
+                                launches,
+                                reply,
+                            } => {
+                                // Cosmetic writes retain their existing launch behavior,
+                                // but reuse the same helper process and restart allowance.
+                                let mut written = Written::default();
+                                if !owner.stopped.load(Ordering::Acquire)
+                                    && worker.ensure(launches, None).is_ok()
+                                    && !owner.stopped.load(Ordering::Acquire)
+                                {
+                                    let helper = worker.helper.as_mut().unwrap();
+                                    written.written = helper.write(&bytes);
+                                    if written.written {
+                                        written.generation = Some(helper.generation());
+                                    } else {
+                                        worker.helper.take();
+                                    }
+                                }
+                                let _ = reply.try_send(written);
+                            }
+                            Command::Stop => break,
+                        }
+                    }
+                })
+                .is_err()
+            {
+                stopped.store(true, Ordering::Release);
+            }
+            Self { tx, stopped }
+        }
+
+        fn provider(&self) -> QueryProvider {
+            let service = self.clone();
+            Arc::new(move |point, deadline| service.query(point, deadline))
+        }
+
+        fn query(&self, point: [f64; 2], deadline: Instant) -> Result<Option<u32>, &'static str> {
+            if self.stopped.load(Ordering::Acquire) {
+                return Err("mouse-down recipient helper transport stopped");
+            }
+            if Instant::now() >= deadline {
+                return Err("mouse-down recipient helper launch/query budget exceeded");
+            }
+            let (reply, answer) = pipe::sync_channel(1);
+            self.tx
+                .try_send(Command::Query {
+                    point,
+                    deadline,
+                    reply,
+                })
+                .map_err(|_| "mouse-down recipient helper transport busy or unavailable")?;
+            let result = answer
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|_| "mouse-down recipient helper launch/query budget exceeded")?;
+            if Instant::now() >= deadline {
+                return Err("mouse-down recipient helper launch/query budget exceeded");
+            }
+            result
+        }
+
+        pub(super) fn write(&self, owner: &Arc<State>, line: &CursorLine) -> Written {
+            let Some(bytes) = line.encode_line() else {
+                return Written::default();
+            };
+            let (reply, answer) = pipe::sync_channel(1);
+            if self.stopped.load(Ordering::Acquire)
+                || self
+                    .tx
+                    .try_send(Command::Visual {
+                        owner: owner.clone(),
+                        bytes,
+                        launches: line.launches_helper(),
+                        reply,
+                    })
+                    .is_err()
+            {
+                return Written::default();
+            }
+            answer.recv().unwrap_or_default()
+        }
+
+        fn stop(&self) {
+            self.stopped.store(true, Ordering::Release);
+            let _ = self.tx.try_send(Command::Stop);
+        }
+    }
+
+    struct Worker<L: Launcher> {
+        launcher: L,
+        helper: Option<L::Helper>,
+        restarts: RestartLimit,
+    }
+
+    impl<L: Launcher> Worker<L> {
+        fn ensure(
+            &mut self,
+            launches: bool,
+            deadline: Option<Instant>,
+        ) -> Result<(), &'static str> {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err("mouse-down recipient helper launch budget exceeded");
+            }
+            if !self.launcher.screen_unlocked() {
+                return Err("mouse-down recipient helper screen locked or unreadable");
+            }
+            if self.helper.as_ref().is_some_and(|helper| !helper.alive()) {
+                self.helper.take();
+            }
+            if self.helper.is_none() {
+                if !launches {
+                    return Err("mouse-down recipient helper unavailable");
+                }
+                if !self.restarts.admit(self.launcher.now()) {
+                    return Err("mouse-down recipient helper restart limit reached");
+                }
+                let helper = self.launcher.launch(deadline)?;
+                // A slow spawn may finish after its caller has already refused.
+                // Drop that child rather than retain a late startup as readiness.
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err("mouse-down recipient helper launch budget exceeded");
+                }
+                self.helper = Some(helper);
+            }
+            Ok(())
+        }
+    }
+
+    struct NativeLauncher;
+    struct NativeHelper {
+        child: cerebellum_macos::ReleasedChild,
+        pipe: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
+        client: pointer_query::Client,
+    }
+
+    impl Drop for NativeHelper {
+        fn drop(&mut self) {
+            cerebellum_macos::register_cursor_generation(None);
+        }
+    }
+
+    impl Helper for NativeHelper {
+        fn alive(&self) -> bool {
+            let generation = self.child.generation();
+            cerebellum_macos::process_start_time_micros(generation.pid)
+                == Some(generation.start_time_micros)
+        }
+        fn generation(&self) -> ProcessGeneration {
+            self.child.generation()
+        }
+        fn write(&mut self, bytes: &[u8]) -> bool {
+            use std::io::Write;
+            self.pipe
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .write_all(bytes)
+                .is_ok()
+        }
+        fn query(
+            &mut self,
+            point: [f64; 2],
+            deadline: Instant,
+        ) -> Result<Option<u32>, &'static str> {
+            if Instant::now() >= deadline {
+                return Err("mouse-down recipient helper query budget exceeded");
+            }
+            self.client.window_at(
+                point,
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(pointer_query::QUERY_TIMEOUT),
+            )
+        }
+    }
+
+    impl Launcher for NativeLauncher {
+        type Helper = NativeHelper;
+        fn screen_unlocked(&self) -> bool {
+            cerebellum_macos::screen_is_locked() == Some(false)
+        }
+        fn launch(&mut self, deadline: Option<Instant>) -> Result<NativeHelper, &'static str> {
+            use pointer_query::{Client, Reply, MAX_REPLY_BYTES};
+            use std::io::{BufRead, Read};
+            let pinned = HELPER_EXECUTABLE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let executable = helper_launch_path(pinned.as_ref())
+                .ok_or("mouse-down recipient helper pinned executable unavailable")?;
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err("mouse-down recipient helper launch budget exceeded");
+            }
+            let (barred, pipe, replies) =
+                cerebellum_macos::spawn_barred_cursor(&executable, &["--agent-cursor".into()])
+                    .map_err(|_| "mouse-down recipient helper spawn failed")?;
+            if !pinned
+                .as_ref()
+                .is_some_and(|pin| pin.accepts_child(barred.generation().pid))
+            {
+                HELPER_BINARY_UNAVAILABLE.store(true, Ordering::Relaxed);
+                return Err("mouse-down recipient helper pinned child verification failed");
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err("mouse-down recipient helper launch budget exceeded");
+            }
+            let child = barred
+                .release()
+                .map_err(|_| "mouse-down recipient helper release failed")?;
+            drop(pinned);
+            let pipe: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>> =
+                Arc::new(std::sync::Mutex::new(Box::new(std::fs::File::from(pipe))));
+            let (tx, rx) = pipe::sync_channel(32);
+            std::thread::Builder::new()
+                .name("cursor-pointer-replies".into())
+                .spawn(move || {
+                    let mut reader = std::io::BufReader::new(std::fs::File::from(replies));
+                    loop {
+                        let mut line = Vec::new();
+                        let read = reader
+                            .by_ref()
+                            .take(MAX_REPLY_BYTES + 1)
+                            .read_until(b'\n', &mut line);
+                        if !matches!(read, Ok(1..)) {
+                            break;
+                        }
+                        let reply =
+                            if line.len() as u64 > MAX_REPLY_BYTES || line.last() != Some(&b'\n') {
+                                Err("mouse-down recipient helper reply malformed")
+                            } else {
+                                serde_json::from_slice::<Reply>(&line)
+                                    .map_err(|_| "mouse-down recipient helper reply malformed")
+                            };
+                        let malformed = reply.is_err();
+                        if tx.try_send(reply).is_err() || malformed {
+                            break;
+                        }
+                    }
+                })
+                .map_err(|_| "mouse-down recipient helper reply reader start failed")?;
+            cerebellum_macos::register_cursor_generation(Some(child.generation()));
+            Ok(NativeHelper {
+                child,
+                client: Client::new(pipe.clone(), rx),
+                pipe,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Mutex;
+
+        struct Stats {
+            launches: usize,
+            writes: usize,
+            queries: usize,
+            alive: bool,
+            now: Instant,
+        }
+        struct FakeLauncher {
+            stats: Arc<Mutex<Stats>>,
+            screen: Option<bool>,
+            fail: bool,
+        }
+        struct FakeHelper(Arc<Mutex<Stats>>);
+        impl Helper for FakeHelper {
+            fn alive(&self) -> bool {
+                self.0.lock().unwrap().alive
+            }
+            fn generation(&self) -> ProcessGeneration {
+                ProcessGeneration {
+                    pid: 42,
+                    start_time_micros: 123,
+                }
+            }
+            fn write(&mut self, _: &[u8]) -> bool {
+                self.0.lock().unwrap().writes += 1;
+                true
+            }
+            fn query(&mut self, _: [f64; 2], _: Instant) -> Result<Option<u32>, &'static str> {
+                self.0.lock().unwrap().queries += 1;
+                Ok(Some(77))
+            }
+        }
+        impl Launcher for FakeLauncher {
+            type Helper = FakeHelper;
+            fn screen_unlocked(&self) -> bool {
+                self.screen == Some(false)
+            }
+            fn now(&self) -> Instant {
+                self.stats.lock().unwrap().now
+            }
+            fn launch(&mut self, _: Option<Instant>) -> Result<FakeHelper, &'static str> {
+                let mut stats = self.stats.lock().unwrap();
+                stats.launches += 1;
+                if self.fail {
+                    return Err("mouse-down recipient helper pinned executable unavailable");
+                }
+                stats.alive = true;
+                Ok(FakeHelper(self.stats.clone()))
+            }
+        }
+        fn fixture(screen: Option<bool>, fail: bool) -> (Service, Arc<Mutex<Stats>>) {
+            let stats = Arc::new(Mutex::new(Stats {
+                launches: 0,
+                writes: 0,
+                queries: 0,
+                alive: false,
+                now: Instant::now(),
+            }));
+            (
+                Service::start(FakeLauncher {
+                    stats: stats.clone(),
+                    screen,
+                    fail,
+                }),
+                stats,
+            )
+        }
+        fn deadline() -> Instant {
+            Instant::now() + Duration::from_millis(50)
+        }
+
+        #[test]
+        fn pointer_query_launches_without_a_badge_even_when_cursor_drawing_is_off() {
+            for drawing in [false, true] {
+                let (cursor, mut visual_lines) = Coordinator::channel();
+                cursor.enable(drawing);
+                assert_eq!(cursor.enabled(), drawing);
+                while visual_lines.try_recv().is_ok() {}
+                let (service, stats) = fixture(Some(false), false);
+                let query = service.provider();
+                assert_eq!(query([10.0, 20.0], deadline()), Ok(Some(77)));
+                cursor.end("agent-with-no-badge");
+                assert_eq!(query([10.0, 20.0], deadline()), Ok(Some(77)));
+                let stats = stats.lock().unwrap();
+                assert_eq!((stats.launches, stats.queries, stats.writes), (1, 2, 0));
+                assert!(
+                    !matches!(visual_lines.try_recv(), Ok(line) if !matches!(line, CursorLine::Hide(_)))
+                );
+                service.stop();
+            }
+        }
+
+        #[test]
+        fn pointer_query_launch_failure_names_the_failed_step() {
+            let (service, stats) = fixture(Some(false), true);
+            assert_eq!(
+                service.query([10.0, 20.0], deadline()),
+                Err("mouse-down recipient helper pinned executable unavailable")
+            );
+            assert_eq!(stats.lock().unwrap().launches, 1);
+            assert_eq!(stats.lock().unwrap().queries, 0);
+            service.stop();
+        }
+
+        #[test]
+        fn locked_or_unreadable_screen_never_launches_a_query_helper() {
+            for screen in [None, Some(true)] {
+                let (service, stats) = fixture(screen, false);
+                assert_eq!(
+                    service.query([10.0, 20.0], deadline()),
+                    Err("mouse-down recipient helper screen locked or unreadable")
+                );
+                assert_eq!(stats.lock().unwrap().launches, 0);
+                service.stop();
+            }
+        }
+
+        #[test]
+        fn queries_and_visuals_share_the_same_child_and_restart_limit() {
+            let (service, stats) = fixture(Some(false), false);
+            assert!(
+                service
+                    .write(
+                        &Arc::new(State::default()),
+                        &CursorLine::Picture(CursorEvent {
+                            agent: "agent".into(),
+                            initial: 'A',
+                            to: [10.0, 20.0],
+                            target: None,
+                            resting: true,
+                            label: None,
+                            kind: CursorKind::Reading,
+                            serial: 1,
+                            avatar_rgba: None,
+                            avatar_update: false,
+                            avatar_tint: None,
+                            motion: PictureMotion::still(),
+                        })
+                    )
+                    .written
+            );
+            assert_eq!(service.query([10.0, 20.0], deadline()), Ok(Some(77)));
+            {
+                let mut stats = stats.lock().unwrap();
+                assert_eq!(stats.launches, 1);
+                stats.alive = false;
+                stats.now += Duration::from_secs(61);
+            }
+            assert_eq!(service.query([10.0, 20.0], deadline()), Ok(Some(77)));
+            {
+                let mut stats = stats.lock().unwrap();
+                assert_eq!(stats.launches, 2);
+                stats.alive = false;
+                stats.now += Duration::from_secs(61);
+            }
+            assert_eq!(
+                service.query([10.0, 20.0], deadline()),
+                Err("mouse-down recipient helper restart limit reached")
+            );
+            assert_eq!(stats.lock().unwrap().launches, 2);
+            service.stop();
+        }
+
+        #[test]
+        fn an_expired_fronting_budget_never_starts_a_helper() {
+            let (service, stats) = fixture(Some(false), false);
+            assert_eq!(
+                service.query([10.0, 20.0], Instant::now()),
+                Err("mouse-down recipient helper launch/query budget exceeded")
+            );
+            assert_eq!(stats.lock().unwrap().launches, 0);
+            service.stop();
+        }
+
+        #[test]
+        fn slow_launch_cannot_extend_the_call_budget_or_issue_a_late_query() {
+            struct SlowLauncher {
+                started: pipe::SyncSender<()>,
+                release: pipe::Receiver<()>,
+                dropped: pipe::SyncSender<()>,
+                queries: Arc<std::sync::atomic::AtomicUsize>,
+            }
+            struct LateHelper(pipe::SyncSender<()>, Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for LateHelper {
+                fn drop(&mut self) {
+                    let _ = self.0.try_send(());
+                }
+            }
+            impl Helper for LateHelper {
+                fn alive(&self) -> bool {
+                    true
+                }
+                fn generation(&self) -> ProcessGeneration {
+                    ProcessGeneration {
+                        pid: 42,
+                        start_time_micros: 123,
+                    }
+                }
+                fn write(&mut self, _: &[u8]) -> bool {
+                    panic!("no visual command")
+                }
+                fn query(&mut self, _: [f64; 2], _: Instant) -> Result<Option<u32>, &'static str> {
+                    self.1.fetch_add(1, Ordering::Relaxed);
+                    Ok(Some(77))
+                }
+            }
+            impl Launcher for SlowLauncher {
+                type Helper = LateHelper;
+                fn screen_unlocked(&self) -> bool {
+                    true
+                }
+                fn launch(&mut self, _: Option<Instant>) -> Result<LateHelper, &'static str> {
+                    self.started.send(()).unwrap();
+                    self.release.recv().unwrap();
+                    Ok(LateHelper(self.dropped.clone(), self.queries.clone()))
+                }
+            }
+            let (start, started) = pipe::sync_channel(1);
+            let (release, released) = pipe::sync_channel(1);
+            let (drop, dropped) = pipe::sync_channel(1);
+            let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let service = Service::start(SlowLauncher {
+                started: start,
+                release: released,
+                dropped: drop,
+                queries: queries.clone(),
+            });
+            let query = service.clone();
+            let call = std::thread::spawn(move || {
+                query.query([10.0, 20.0], Instant::now() + Duration::from_millis(100))
+            });
+            started.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(
+                call.join().unwrap(),
+                Err("mouse-down recipient helper launch/query budget exceeded")
+            );
+            release.send(()).unwrap();
+            dropped.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(queries.load(Ordering::Relaxed), 0);
+            service.stop();
+        }
     }
 }
