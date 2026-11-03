@@ -44,6 +44,7 @@ path = "src/lib.rs"
 
 [dependencies]
 base64 = "0.22"
+cortexkit-bus-naming = "=0.2.10"
 cortexkit-resource-busy = { workspace = true }
 cerebellum-bridge-protocol = { path = "../cerebellum-bridge-protocol" }
 cortexkit-paths = "=0.1.2"
@@ -78,6 +79,9 @@ signal-hook = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+cortexkit-bus-nats = "=0.3.0"
+async-nats = { version = "=0.50.0", default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 cerebellum-macos = { path = "../cerebellum-macos" }
 avatar-svg = { git = "ssh://git@github.com/cortexkit/avatar.git", rev = "b9696127a4095e76b5ace3503aab877d449702f0" }
 resvg = "0.44"
