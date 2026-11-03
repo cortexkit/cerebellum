@@ -43,6 +43,12 @@ struct FakeDesk {
     /// Set by a fronted read; the next frontmost read then sees the person's
     /// switch to `THIRD`, with hardware input.
     switch_after_read: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+    missed_heartbeat: bool,
+    observer_lost: bool,
+    snapshot_reads: usize,
+    lose_observer_on_second_sample: bool,
+    switch_on_second_sample: bool,
+    input_on_second_sample: bool,
 }
 
 impl FakeDesk {
@@ -65,6 +71,12 @@ impl FakeDesk {
             hardware_input_ms: None,
             switch_after_unit: None,
             switch_after_read: None,
+            missed_heartbeat: false,
+            observer_lost: false,
+            snapshot_reads: 0,
+            lose_observer_on_second_sample: false,
+            switch_on_second_sample: false,
+            input_on_second_sample: false,
         }
     }
 
@@ -155,6 +167,9 @@ impl FrontingBracketHost for FakeDesk {
         probe: HeartbeatProbe,
         _watcher: &mut SeizeWatcher,
     ) -> HeartbeatObservation {
+        if self.missed_heartbeat {
+            return HeartbeatObservation::Missed;
+        }
         HeartbeatObservation::Seen {
             marker: probe.marker,
             source_unix_process_id: OUR_PID,
@@ -182,6 +197,16 @@ impl FrontingBracketHost for FakeDesk {
         })
     }
     fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
+        self.snapshot_reads += 1;
+        if self.snapshot_reads == 2 && self.switch_on_second_sample {
+            self.set_frontmost(THIRD);
+        }
+        if self.snapshot_reads == 2 && self.input_on_second_sample {
+            self.hardware_input_ms = Some(self.now);
+        }
+        if self.observer_lost || (self.lose_observer_on_second_sample && self.snapshot_reads >= 2) {
+            return None;
+        }
         Some(HardwareInputSnapshot {
             coverage_start_ms: 0,
             last_input_ms: self.hardware_input_ms,
@@ -562,15 +587,20 @@ fn without_admission_a_persons_switch_is_restored_as_before() {
     assert_eq!(report.stop, None);
 }
 
-/// A third application the action itself brought forward, with no hardware
-/// input, is restored over.
+/// Absence of key/button/scroll evidence cannot distinguish an action's switch
+/// from a person's Space gesture, so a third application is left alone.
 #[test]
-fn a_switch_with_no_hardware_input_is_restored() {
+fn a_switch_with_no_hardware_input_leaves_the_third_app_alone() {
     let mut desk = FakeDesk::new();
     desk.switch_after_unit = Some((0, THIRD, false));
     let outcome = run_admitted(&mut desk, 1);
-    assert_eq!(outcome.report.restore, RestoreStatus::Restored);
-    assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
+    assert_eq!(
+        outcome.report.restore,
+        RestoreStatus::SkippedPerson {
+            now_front: Some(THIRD)
+        }
+    );
+    assert_eq!(desk.front_requests, [TARGET]);
     assert!(!outcome.person_input_during_fronting);
 }
 
@@ -750,7 +780,7 @@ fn a_skipped_restore_is_never_serialized() {
 }
 
 #[test]
-fn hardware_input_counts_only_after_the_front_and_only_under_coverage() {
+fn hardware_input_is_conservative_for_same_bucket_and_unknown_coverage() {
     let snapshot = |coverage_start_ms, last_input_ms| {
         Some(HardwareInputSnapshot {
             coverage_start_ms,
@@ -759,14 +789,10 @@ fn hardware_input_counts_only_after_the_front_and_only_under_coverage() {
     };
     let front = 1_000;
     let cases = [
-        (None, false, "no snapshot"),
+        (None, true, "no snapshot"),
         (snapshot(0, None), false, "no input at all"),
         (snapshot(0, Some(999)), false, "input before the front"),
-        (
-            snapshot(0, Some(1_000)),
-            false,
-            "input at the front instant",
-        ),
+        (snapshot(0, Some(1_000)), true, "input at the front instant"),
         (snapshot(0, Some(1_001)), true, "input after the front"),
         (
             snapshot(1_000, Some(1_001)),
@@ -775,7 +801,7 @@ fn hardware_input_counts_only_after_the_front_and_only_under_coverage() {
         ),
         (
             snapshot(1_001, Some(1_500)),
-            false,
+            true,
             "coverage began after the front",
         ),
     ];
@@ -785,7 +811,7 @@ fn hardware_input_counts_only_after_the_front_and_only_under_coverage() {
 }
 
 #[test]
-fn the_restore_is_skipped_only_for_another_app_with_hardware_input() {
+fn the_restore_leaves_unknown_or_third_application_focus_alone() {
     let restore = |input| RestoreDecision::Restore {
         person_input_during_fronting: input,
     };
@@ -797,12 +823,18 @@ fn the_restore_is_skipped_only_for_another_app_with_hardware_input() {
                 now_front: Some(THIRD),
             },
         ),
-        (Some(THIRD), false, restore(false)),
+        (
+            Some(THIRD),
+            false,
+            RestoreDecision::SkipPerson {
+                now_front: Some(THIRD),
+            },
+        ),
         (Some(TARGET), true, restore(true)),
         (Some(TARGET), false, restore(false)),
         (Some(PREVIOUS), true, restore(true)),
-        (None, true, restore(true)),
-        (None, false, restore(false)),
+        (None, true, RestoreDecision::SkipPerson { now_front: None }),
+        (None, false, RestoreDecision::SkipPerson { now_front: None }),
     ];
     for (frontmost, input, expected) in cases {
         assert_eq!(
@@ -1087,11 +1119,11 @@ fn observer_instants_map_onto_the_host_clock() {
         }
     );
     assert!(hardware_input_since(Some(snapshot), 100));
-    assert!(!hardware_input_since(Some(snapshot), 250));
+    assert!(hardware_input_since(Some(snapshot), 250));
 
     let old_input = HardwareInputSnapshot::from_instants(origin, before_host, Some(before_host));
     assert_eq!(old_input.last_input_ms, Some(0));
-    assert!(!hardware_input_since(Some(old_input), 0));
+    assert!(hardware_input_since(Some(old_input), 0));
 
     // Coverage that began after the front cannot speak for the time between.
     let late_coverage = HardwareInputSnapshot::from_instants(
@@ -1099,5 +1131,75 @@ fn observer_instants_map_onto_the_host_clock() {
         origin + Duration::from_millis(400),
         Some(origin + Duration::from_millis(500)),
     );
-    assert!(!hardware_input_since(Some(late_coverage), 100));
+    assert!(hardware_input_since(Some(late_coverage), 100));
+}
+
+#[test]
+fn missed_initial_heartbeat_never_requests_front() {
+    let mut desk = FakeDesk::new();
+    desk.missed_heartbeat = true;
+    let report = run(&mut desk, 1);
+    assert!(report.stop.is_some());
+    assert!(desk.front_requests.is_empty());
+    assert!(desk.posted.is_empty());
+}
+
+#[test]
+fn restore_with_lost_observer_coverage_leaves_focus_alone() {
+    let mut desk = FakeDesk::new();
+    desk.observer_lost = true;
+    let outcome = run_admitted(&mut desk, 1);
+    assert_eq!(
+        outcome.report.restore,
+        RestoreStatus::SkippedPerson {
+            now_front: Some(TARGET)
+        }
+    );
+    assert_eq!(desk.front_requests, [TARGET]);
+    assert!(
+        !outcome.person_input_during_fronting,
+        "unknown coverage is not a recorded person event"
+    );
+}
+
+#[test]
+fn restore_rechecks_observer_coverage_immediately_before_request() {
+    let mut desk = FakeDesk::new();
+    desk.lose_observer_on_second_sample = true;
+    let outcome = run_admitted(&mut desk, 1);
+    assert_eq!(
+        outcome.report.restore,
+        RestoreStatus::SkippedPerson {
+            now_front: Some(TARGET)
+        }
+    );
+    assert_eq!(desk.front_requests, [TARGET]);
+}
+
+#[test]
+fn restore_rechecks_frontmost_after_the_last_activity_sample() {
+    let mut desk = FakeDesk::new();
+    desk.switch_on_second_sample = true;
+    let outcome = run_admitted(&mut desk, 1);
+    assert_eq!(
+        outcome.report.restore,
+        RestoreStatus::SkippedPerson {
+            now_front: Some(THIRD)
+        }
+    );
+    assert_eq!(desk.front_requests, [TARGET]);
+}
+
+#[test]
+fn restore_new_activity_during_final_sampling_leaves_focus_alone() {
+    let mut desk = FakeDesk::new();
+    desk.input_on_second_sample = true;
+    let outcome = run_admitted(&mut desk, 1);
+    assert_eq!(
+        outcome.report.restore,
+        RestoreStatus::SkippedPerson {
+            now_front: Some(TARGET)
+        }
+    );
+    assert_eq!(desk.front_requests, [TARGET]);
 }

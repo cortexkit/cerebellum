@@ -2,10 +2,8 @@
 //! a front attempt that cleanup may race.
 //!
 //! After this module fronts an application for a moment, the previous
-//! application is put back, with one exception: when another application is
-//! now frontmost and the person touched a key, a button or the scroll wheel
-//! since the front, the person went somewhere on purpose, and dragging them
-//! back would undo their own switch. Every caller decides with
+//! application is put back only with continuous observation and a readable
+//! frontmost application. Unknown coverage leaves focus alone. Every caller decides with
 //! [`decide_restore`] on the same evidence, the process-wide hardware input
 //! snapshot floored at the front instant, so a worker and the terminal
 //! cleanup that may race it cannot disagree.
@@ -51,18 +49,23 @@ impl HardwareInputSnapshot {
             u64::try_from(at.saturating_duration_since(origin).as_millis()).unwrap_or(u64::MAX)
         };
         Self {
-            coverage_start_ms: millis(coverage_start),
+            // Round coverage up: rounding down could hide a gap that began
+            // just after the front within the same millisecond bucket.
+            coverage_start_ms: u64::try_from(
+                coverage_start
+                    .saturating_duration_since(origin)
+                    .as_nanos()
+                    .div_ceil(1_000_000),
+            )
+            .unwrap_or(u64::MAX),
             last_input_ms: last_input.map(millis),
         }
     }
 }
 
-/// Whether hardware input arrived strictly after `front_instant_ms`.
-///
-/// An unavailable snapshot, or one whose coverage began after the front,
-/// cannot say what happened in between, and counts as no input seen. That
-/// keeps the default the restore, which is what happened before this decision
-/// existed.
+/// Whether input may have arrived since the front. Equality is conservative:
+/// millisecond truncation cannot order two events in the same bucket. Unknown
+/// coverage is not evidence of inactivity.
 pub fn hardware_input_since(
     snapshot: Option<HardwareInputSnapshot>,
     front_instant_ms: u64,
@@ -70,8 +73,8 @@ pub fn hardware_input_since(
     match snapshot {
         Some(snapshot) if snapshot.coverage_start_ms <= front_instant_ms => snapshot
             .last_input_ms
-            .is_some_and(|last| last > front_instant_ms),
-        _ => false,
+            .is_some_and(|last| last >= front_instant_ms),
+        _ => true,
     }
 }
 
@@ -87,12 +90,9 @@ pub enum RestoreDecision {
 
 /// The restore decision.
 ///
-/// The restore is skipped only when an application that is neither the
-/// target nor the previous one is frontmost AND hardware input was seen since
-/// the front. A switch with no hardware input, such as a pressed link opening
-/// the browser, was caused by the action itself, so the previous application
-/// is still restored. An unreadable frontmost application is not known to be
-/// another one, so it restores too.
+/// An unreadable frontmost or a third application leaves focus alone. A virtual
+/// desktop gesture may switch applications without a key/button/scroll event, so lack
+/// of that evidence cannot attribute the switch to the module.
 pub fn decide_restore(
     previous: u32,
     target: u32,
@@ -100,11 +100,12 @@ pub fn decide_restore(
     input_since_front: bool,
 ) -> RestoreDecision {
     match frontmost {
-        Some(now_front) if input_since_front && now_front != target && now_front != previous => {
+        Some(now_front) if now_front != target && now_front != previous => {
             RestoreDecision::SkipPerson {
                 now_front: Some(now_front),
             }
         }
+        None => RestoreDecision::SkipPerson { now_front: None },
         _ => RestoreDecision::Restore {
             person_input_during_fronting: input_since_front,
         },
@@ -143,8 +144,34 @@ pub fn restore_after_front<H: FrontingBracketHost + ?Sized>(
             finished_at_ms: host.now_ms(),
         };
     }
+    let first_front = host.frontmost_pid();
+    let first_snapshot = host.hardware_input_snapshot();
+    let requested_at = host.now_ms();
+    // Revalidate immediately before requesting the previous application. These
+    // reads shrink the race; they are not atomic with WindowServer activation.
+    let snapshot = host.hardware_input_snapshot();
     let frontmost = host.frontmost_pid();
-    let input = hardware_input_since(host.hardware_input_snapshot(), front_instant_ms);
+    // Disclose only observed input. Unknown coverage independently skips the
+    // restore below; it must not be reported as a person event that was seen.
+    let input = snapshot
+        .and_then(|snapshot| snapshot.last_input_ms)
+        .is_some_and(|last| last >= front_instant_ms);
+    let covered = |snapshot: Option<HardwareInputSnapshot>| {
+        snapshot.is_some_and(|snapshot| snapshot.coverage_start_ms <= front_instant_ms)
+    };
+    if !covered(first_snapshot)
+        || !covered(snapshot)
+        || first_front != frontmost
+        || first_snapshot != snapshot
+    {
+        return RestoreOutcome {
+            restore: RestoreStatus::SkippedPerson {
+                now_front: frontmost,
+            },
+            person_input_during_fronting: input,
+            finished_at_ms: host.now_ms(),
+        };
+    }
     match decide_restore(previous, target, frontmost, input) {
         RestoreDecision::SkipPerson { now_front } => RestoreOutcome {
             restore: RestoreStatus::SkippedPerson { now_front },
@@ -154,7 +181,6 @@ pub fn restore_after_front<H: FrontingBracketHost + ?Sized>(
         RestoreDecision::Restore {
             person_input_during_fronting,
         } => {
-            let requested_at = host.now_ms();
             let restore = request_restore(host, previous, requested_at, wait_ms);
             RestoreOutcome {
                 restore,

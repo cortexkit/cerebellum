@@ -318,7 +318,7 @@ fn computer_description(pointer_fronting: bool) -> String {
         " Presses, writes, keys and type accept read filters for their returned state.",
         " press_element takes element_id or 1-8 ordered same-app element_ids; stops on failure, returns steps and one report.",
     ] { description = description.replace(duplicated, ""); }
-    description.replace("Covered images are withheld; see bring_to_front.", "Covered images are withheld; see bring_to_front. Under takeover, pointer actions front the target if needed, then restore unless the person switched apps. takeover_click left-clicks image x/y; press_point uses accessibility.")
+    description.replace("Covered images are withheld; see bring_to_front.", "Covered images are withheld; see bring_to_front. Under takeover, pointer actions front the target if needed, then restore the previous app unless the person switched apps. Global delivery is best-effort; drawn credential/payment forms are undetected. takeover_click left-clicks image x/y; press_point uses accessibility.")
 }
 
 pub fn computer_tool(admitted: &[String]) -> Option<Tool> {

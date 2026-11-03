@@ -142,3 +142,7 @@ test = true
 name = "app_use_desk_probe"
 test = true
 required-features = ["desk-probe"]
+
+[[example]]
+name = "mouse_up_routing_probe"
+required-features = ["desk-probe"]

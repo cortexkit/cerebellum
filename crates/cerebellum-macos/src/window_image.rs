@@ -16,6 +16,8 @@ use crate::macos::{bgra_image, encode_image};
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
+    #[cfg(feature = "desk-probe")]
+    fn CGPreflightPostEventAccess() -> bool;
     fn CGGetActiveDisplayList(max_displays: u32, displays: *mut u32, count: *mut u32) -> i32;
     fn CGDisplayBounds(display: u32) -> CGRect;
     fn CGDisplayIsAsleep(display: u32) -> u32;
@@ -412,12 +414,108 @@ pub(crate) fn normal_frontmost_process_id() -> Option<i32> {
     crate::window_visibility::frontmost_from_windows(&cursor_window_list()?)
 }
 
-/// The number of the on-screen window a pointer event at the desktop point
-/// `(x, y)` would reach, read from the same front-to-back list as the image
-/// visibility reading. `None` when the list cannot be read or does not settle
-/// which window is there.
+/// Legacy rectangular window-list containment; it does not account for
+/// click-through overlays. The admitted pointer route uses pointer_window_at.
 pub fn topmost_window_at(x: f64, y: f64) -> Option<u32> {
     crate::window_visibility::topmost_window_at([x, y], &cursor_window_list()?)
+}
+
+static POINTER_APPKIT_READY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+type PointerStartupDiagnosis = (Option<isize>, Option<bool>, Option<isize>);
+static POINTER_STARTUP_DIAGNOSIS: std::sync::Mutex<PointerStartupDiagnosis> =
+    std::sync::Mutex::new((None, None, None));
+
+/// The window selected by AppKit's mouse-down hit test, which excludes
+/// click-through windows and transparency at the point. This is a snapshot,
+/// not a prediction of mouse-up tracking or atomic event delivery.
+pub fn pointer_window_at(x: f64, y: f64) -> Option<u32> {
+    if !POINTER_APPKIT_READY.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    // SAFETY: CoreGraphics returns the primary display's value-type bounds.
+    let primary = unsafe { CGDisplayBounds(objc2_core_graphics::CGMainDisplayID()) };
+    let windows = cursor_window_list()?;
+    crate::window_visibility::mouse_down_window_at([x, y], primary.size.height, &windows, |point| {
+        // SAFETY: this class query takes only screen coordinates and a window
+        // number; it creates no AppKit UI. The selector's NSInteger return and
+        // NSPoint argument match the documented AppKit method signature.
+        unsafe {
+            objc2::msg_send![objc2::class!(NSWindow), windowNumberAtPoint: objc2_foundation::NSPoint::new(point[0], point[1]), belowWindowWithWindowNumber: 0isize]
+        }
+    })
+}
+
+/// Main-thread-only startup for the admitted pointer route. No launch/run,
+/// activation, menu or window creation is performed. Embedders with an already
+/// regular application must not silently change their activation policy.
+pub fn prepare_pointer_hit_tests() -> bool {
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSRunningApplication};
+    POINTER_APPKIT_READY.store(false, std::sync::atomic::Ordering::Release);
+    let Some(main) = objc2::MainThreadMarker::new() else {
+        return false;
+    };
+    let before = NSRunningApplication::currentApplication().activationPolicy();
+    if before == NSApplicationActivationPolicy::Regular {
+        *POINTER_STARTUP_DIAGNOSIS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (Some(before.0), None, None);
+        return false;
+    }
+    let app = NSApplication::sharedApplication(main);
+    let setter = app.setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
+    let after = app.activationPolicy();
+    *POINTER_STARTUP_DIAGNOSIS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        (Some(before.0), Some(setter), Some(after.0));
+    // The setter reports whether a switch succeeded, not whether the process
+    // currently has the required policy. Only the policy read-back admits it.
+    let ready = pointer_policy_ready(before.0, after.0);
+    POINTER_APPKIT_READY.store(ready, std::sync::atomic::Ordering::Release);
+    ready
+}
+
+/// Non-prompting posting permission preflight for the manual VM probe.
+#[cfg(feature = "desk-probe")]
+pub fn pointer_probe_posting_permitted() -> bool {
+    // SAFETY: the documented preflight takes no arguments and requests no grant.
+    unsafe { CGPreflightPostEventAccess() }
+}
+
+fn pointer_policy_ready(before: isize, after: isize) -> bool {
+    // -1 was observed for a pre-AppKit command-line process in the test VM;
+    // Apple does not document it as an activation-policy enum case. Admit that
+    // initial unknown only after a concrete Prohibited read-back. Other unknown
+    // values, and an initially Regular application, are not admitted.
+    matches!(before, -1 | 1 | 2) && after == 2
+}
+
+#[cfg(feature = "desk-probe")]
+pub fn pointer_hit_test_startup_diagnosis() -> PointerStartupDiagnosis {
+    *POINTER_STARTUP_DIAGNOSIS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(feature = "desk-probe")]
+pub fn pointer_hit_test_activation_policy() -> isize {
+    objc2_app_kit::NSRunningApplication::currentApplication()
+        .activationPolicy()
+        .0
+}
+
+#[cfg(test)]
+#[test]
+fn pointer_startup_readiness_requires_nonregular_before_and_prohibited_after() {
+    assert!(pointer_policy_ready(-1, 2));
+    assert!(!pointer_policy_ready(-1, -1));
+    assert!(!pointer_policy_ready(99, 2));
+    assert!(pointer_policy_ready(2, 2));
+    assert!(pointer_policy_ready(1, 2));
+    assert!(!pointer_policy_ready(0, 2));
+    assert!(!pointer_policy_ready(2, 0));
+    assert!(!pointer_policy_ready(2, 1));
 }
 
 fn window_visibility_with_entries(
@@ -533,4 +631,26 @@ mod tests {
         assert!(encode_scaled_jpeg(&[0; 12], 2, 2, 1, 1).is_err());
         assert!(encode_scaled_jpeg(&[0; 16], 2, 2, 0, 1).is_err());
     }
+}
+
+/// Count only this process's on-screen window-server entries, without capture,
+/// ScreenCaptureKit enumeration, or any permission-requesting API.
+#[cfg(feature = "desk-probe")]
+pub fn pointer_probe_own_window_count() -> Option<usize> {
+    let windows = CGWindowListCopyWindowInfo(CGWindowListOption::OptionOnScreenOnly, 0)?;
+    // SAFETY: CoreGraphics documents this array as string-keyed dictionaries.
+    let windows: &CFArray<CFDictionary<CFString, CFType>> = unsafe { windows.cast_unchecked() };
+    let own_pid = f64::from(std::process::id());
+    Some(
+        (0..windows.len())
+            .filter(|index| {
+                windows
+                    .get(*index)
+                    .and_then(|window| window.get(&CFString::from_static_str("kCGWindowOwnerPID")))
+                    .and_then(|value| value.downcast::<CFNumber>().ok())
+                    .and_then(|value| value.as_f64())
+                    == Some(own_pid)
+            })
+            .count(),
+    )
 }

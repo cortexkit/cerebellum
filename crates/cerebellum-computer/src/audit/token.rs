@@ -160,6 +160,16 @@ where
     finalized: BTreeSet<ActionObligationId>,
 }
 
+impl<R: Redactor, T: SeverityTaxonomy, S: JournalStorage> Drop for AuditToken<R, T, S> {
+    fn drop(&mut self) {
+        // A dropped pre-dispatch future (including a lock wait) never consumed
+        // its reservation. Close it as stopped; committed intents are not in
+        // the unused-reservation slot and remain the dispatcher's responsibility. Explicit
+        // refusal paths call release_unused so journal errors reach the reply.
+        let _ = self.release_unused(&DispatchError::DispatchStopped);
+    }
+}
+
 impl<R, T, S> AuditToken<R, T, S>
 where
     R: Redactor,

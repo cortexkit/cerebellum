@@ -1392,6 +1392,14 @@ pub fn takeover_pointer_fronting_admitted(inputs: &ComputerReleaseInputs) -> boo
     )
 }
 
+#[cfg(any(test, target_os = "macos"))]
+fn initialize_admitted_pointer_queries(
+    inputs: &ComputerReleaseInputs,
+    initialize: impl FnOnce() -> bool,
+) -> bool {
+    takeover_pointer_fronting_admitted(inputs) && initialize()
+}
+
 /// Fronting outside the keystroke bracket: foreground mode's one-way front,
 /// fronting a disabled press or a modifier chord under the app grant alone,
 /// skipping the restore when the person switched apps, and holding the restore
@@ -2098,6 +2106,11 @@ pub async fn run_entry() -> Result<(), ModuleError> {
     // configuration can already run a browser probe, and a child started
     // before this read would inherit the launch-nonce pipe.
     launch_nonce::read_before_any_spawn();
+    #[cfg(target_os = "macos")]
+    let _ = initialize_admitted_pointer_queries(
+        &compiled_release_inputs(),
+        cerebellum_macos::prepare_pointer_hit_tests,
+    );
     #[cfg(target_os = "macos")]
     let cursor_executable = computer_capability::cursor::pin_helper_at_startup();
     let config = ModuleConfig::from_env()?;
@@ -13614,9 +13627,10 @@ mod tests {
             digest(&unbound)
         );
 
-        // Without the pointer review, only release evidence differs from the
-        // pre-pointer HELLO: the canonical row count and the extra unresolved
-        // gate remain visible even though its tool definitions are unchanged.
+        // The unbound computer_use flat tool definition is byte-identical, but HELLO has
+        // additive release evidence (and vocabulary/views differ elsewhere).
+        // Normalize those HELLO additions only for historical comparison;
+        // this is not a claim of raw HELLO byte equality.
         let mut legacy = unbound.clone();
         let release = &mut legacy["computer_plane_release"];
         assert_eq!(release["frozen_row_count"], 13);
@@ -16421,5 +16435,36 @@ mod browser_login_fact_tests {
         assert_eq!(reply["outcome"], "transferred");
         assert!(signed_in.is_signed_in("agent", "default", "https://account.example.com"));
         assert!(!signed_in.is_signed_in("other-agent", "default", "https://account.example.com"));
+    }
+}
+
+#[cfg(test)]
+mod pointer_startup_tests {
+    use super::*;
+
+    #[test]
+    fn unbound_pointer_review_never_initializes_module_appkit() {
+        let mut inputs = compiled_release_inputs();
+        inputs.takeover_pointer_fronting_review_revision = None;
+        let called = std::cell::Cell::new(false);
+        assert!(!initialize_admitted_pointer_queries(&inputs, || {
+            called.set(true);
+            true
+        }));
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn admitted_pointer_review_requires_successful_appkit_readiness() {
+        let mut inputs = compiled_release_inputs();
+        inputs.takeover_pointer_fronting_review_revision = Some("test-pointer-review".into());
+        inputs.takeover_dispatch_review_revision = Some("test-takeover-review".into());
+        inputs.global_dispatch_review_revision = Some("test-global-review".into());
+        let called = std::cell::Cell::new(false);
+        assert!(!initialize_admitted_pointer_queries(&inputs, || {
+            called.set(true);
+            false
+        }));
+        assert!(called.get());
     }
 }

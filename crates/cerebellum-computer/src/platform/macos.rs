@@ -251,6 +251,7 @@ fn release_held_to_pid(
 }
 
 const SESSION_TAP_UNREAD_BOUND: usize = 256;
+mod pointer;
 static NEXT_HEARTBEAT_NONCE: AtomicU64 = AtomicU64::new(1);
 
 fn elapsed_millis(started: Instant) -> u64 {
@@ -263,6 +264,15 @@ fn observe_session_event(
     our_pid: i64,
     index: usize,
 ) {
+    if event.event_type >= u32::MAX - 1 {
+        // Disabled notifications do not have a meaningful source PID.
+        watcher.abort(
+            crate::dispatch::AbortReason::ObserverUnavailable,
+            index,
+            None,
+        );
+        return;
+    }
     watcher.observe_sourced_input(sourced_event(&event), our_pid, index);
 }
 
@@ -272,8 +282,36 @@ fn drain_session_events(
     our_pid: i64,
     index: usize,
 ) {
-    while let Ok(event) = tap.events().try_recv() {
-        observe_session_event(watcher, event, our_pid, index);
+    drain_observer_events(tap.events(), tap.is_enabled(), watcher, our_pid, index);
+}
+
+fn drain_observer_events(
+    events: &std::sync::mpsc::Receiver<cerebellum_macos::SessionEvent>,
+    enabled: bool,
+    watcher: &mut SeizeWatcher,
+    our_pid: i64,
+    index: usize,
+) {
+    if !enabled {
+        watcher.abort(
+            crate::dispatch::AbortReason::ObserverUnavailable,
+            index,
+            None,
+        );
+    }
+    loop {
+        match events.try_recv() {
+            Ok(event) => observe_session_event(watcher, event, our_pid, index),
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                watcher.abort(
+                    crate::dispatch::AbortReason::ObserverUnavailable,
+                    index,
+                    None,
+                );
+                break;
+            }
+        }
     }
 }
 
@@ -326,13 +364,25 @@ fn heartbeat_observation(
     probe: HeartbeatProbe,
     started: Instant,
 ) -> HeartbeatObservation {
+    if !tap.is_enabled() {
+        watcher.abort(crate::dispatch::AbortReason::ObserverUnavailable, 0, None);
+        return HeartbeatObservation::Missed;
+    }
     let deadline = Instant::now() + Duration::from_millis(OBSERVER_HEARTBEAT_BOUND_MS);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let Ok(event) = tap.events().recv_timeout(remaining) else {
-            return HeartbeatObservation::Missed;
+        let event = match tap.events().recv_timeout(remaining) {
+            Ok(event) => event,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return HeartbeatObservation::Missed,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                watcher.abort(crate::dispatch::AbortReason::ObserverUnavailable, 0, None);
+                return HeartbeatObservation::Missed;
+            }
         };
         observe_session_event(watcher, event, probe.our_pid, 0);
+        if watcher.abort_decision().is_some() || !tap.is_enabled() {
+            return HeartbeatObservation::Missed;
+        }
         if event.source_unix_process_id == probe.our_pid && event.marker_nonce == probe.marker.nonce
         {
             return HeartbeatObservation::Seen {
@@ -361,6 +411,11 @@ struct HeartbeatPoster {
 impl HeartbeatPoster {
     /// Post the marker, returning the probe to look for and when it went.
     fn post(&mut self) -> (HeartbeatProbe, Instant) {
+        if self.event.is_none() {
+            let nonce = NEXT_HEARTBEAT_NONCE.fetch_add(1, Ordering::Relaxed) & i64::MAX as u64;
+            self.marker = HeartbeatMarker::new(nonce.max(1));
+            self.event = cerebellum_macos::heartbeat_marker_event(self.marker.nonce).ok();
+        }
         let posted_at_ms = elapsed_millis(self.started);
         if let Some(event) = self.event.take() {
             let _ = cerebellum_macos::post_event_globally(event);
@@ -447,17 +502,12 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
     }
 
     fn request_front(&mut self, pid: u32) -> bool {
-        if self.pointer.is_some()
-            && pid == self.target.pid
-            && super::process_event::require_exact_generation(
-                self.target,
-                self.transport.process_generation(pid),
-            )
-            .is_err()
-        {
-            return false;
-        }
-        cerebellum_macos::request_frontmost(pid).is_ok()
+        pointer::request_verified_front(
+            self.pointer.as_ref().map(|_| self.target),
+            pid,
+            || self.transport.process_generation(pid),
+            || cerebellum_macos::request_frontmost(pid).is_ok(),
+        )
     }
 
     fn our_pid(&self) -> i64 {
@@ -528,126 +578,32 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
             .get_mut(index)
             .and_then(Option::take)
             .unwrap_or_default();
-        let mut last_post_at = Instant::now();
-        let our_pid = self.heartbeat.our_pid;
-        let releases: Vec<_> = steps
-            .iter()
-            .map(|step| step.role == super::process_event::SyntheticStepRole::Release)
-            .collect();
         for _ in 1..steps.len() {
             observation.watcher.queue_post();
         }
+        let cancelled = observation.cancelled;
         let event_count = steps.len();
-        let result = super::process_event::post_guarded_event_sequence(
-            steps,
-            observation.cancelled,
-            |index, event, recovery| {
-                if event.is_none() {
-                    if index > 0 {
-                        let next =
-                            last_post_at + Duration::from_millis(u64::from(pointer.interval_ms));
-                        while Instant::now() < next {
-                            if (observation.cancelled)() {
-                                break;
-                            }
-                            match observation.tap.events().recv_timeout(
-                                next.saturating_duration_since(Instant::now())
-                                    .min(Duration::from_millis(2)),
-                            ) {
-                                Ok(event) => observe_session_event(
-                                    observation.watcher,
-                                    event,
-                                    our_pid,
-                                    index,
-                                ),
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                                Err(_) => {
-                                    return Err(DriverError::Unsupported(
-                                        "session observer disconnected",
-                                    ))
-                                }
-                            }
-                            if observation.watcher.abort_decision().is_some() {
-                                return Err(observed_abort_error(observation.watcher));
-                            }
-                        }
-                    }
-                    drain_session_events(observation.tap, observation.watcher, our_pid, index);
-                    if observation.watcher.abort_decision().is_some() {
-                        return Err(observed_abort_error(observation.watcher));
-                    }
-                    if elapsed_millis(self.started) >= observation.deadline_ms {
-                        return Err(DriverError::Unsupported(
-                            "pointer fronting interval exceeded",
-                        ));
-                    }
-                    return Ok(0);
-                }
-                // Containment may change while fronting, or between the down and
-                // up. A release is not exempt from identity/window containment.
-                let contained = (pointer.guard.0)();
-                drain_session_events(observation.tap, observation.watcher, our_pid, index);
-                super::process_event::require_exact_generation(
-                    self.target,
-                    self.transport.process_generation(self.target.pid),
-                )
-                .map_err(|_| DriverError::Unsupported("global target generation changed"))?;
-                let focused = contained
-                    && cerebellum_macos::frontmost_process_id()
-                        == i32::try_from(self.target.pid).ok();
-                let stopped = (observation.cancelled)()
-                    || observation.watcher.abort_decision().is_some()
-                    || elapsed_millis(self.started) >= observation.deadline_ms;
-                // A release already removed from the sequence cannot be handed
-                // back to its recovery scan. If input/cancel arrived during
-                // containment reads, deliver that release as recovery instead.
-                if recovery || (releases[index] && stopped) {
-                    if !focused {
-                        return Err(DriverError::Unsupported(
-                            "global release target is no longer frontmost",
-                        ));
-                    }
-                } else {
-                    if elapsed_millis(self.started) >= observation.deadline_ms {
-                        return Err(DriverError::Unsupported(
-                            "pointer fronting interval exceeded",
-                        ));
-                    }
-                    dispatch_observed_post_in_order(
-                        observation.watcher,
-                        index,
-                        observation.probe,
-                        |_| observation.heartbeat,
-                        || focused,
-                        || (),
-                    )
-                    .map_err(|_| observed_abort_error(observation.watcher))?;
-                    if stopped {
-                        return Err(DriverError::SyntheticDispatchFailed(SequencePostFailure {
-                            posts_returned: 0,
-                            refusal: super::process_event::ProcessEventRefusal::Cancelled,
-                            held_state: super::HeldStateDisposition::NoneHeld,
-                        }));
-                    }
-                }
-                let _ = cerebellum_macos::post_event_globally(event.unwrap());
-                last_post_at = Instant::now();
-                pointer.last_post_at = Some(last_post_at);
-                if index + 1 < event_count {
-                    observation.watcher.take_post_slot();
-                }
-                Ok(1)
-            },
-        );
-        pointer.observed_abort = observation.watcher.abort_decision();
+        let mut operations = pointer::NativePointerOperations {
+            started: self.started,
+            target: self.target,
+            transport: &mut self.transport,
+            heartbeat: &mut self.heartbeat,
+            pointer,
+            observation,
+            last_post_at: Instant::now(),
+            live_at: None,
+            event_count,
+        };
+        let result = pointer::post_pointer_unit(self.target, steps, cancelled, &mut operations);
+        operations.pointer.observed_abort = operations.observation.watcher.abort_decision();
         match result {
             Ok(report) => Ok(crate::dispatch::UnitPosted {
                 posts_returned: report.posts_returned,
                 generation_verifications: report.generation_verifications,
             }),
             Err(failure) => {
-                pointer.error = failure.refusal;
-                let refusal = match &pointer.error {
+                operations.pointer.error = failure.refusal;
+                let refusal = match &operations.pointer.error {
                     None => super::process_event::ProcessEventRefusal::Cancelled,
                     Some(DriverError::SyntheticDispatchFailed(failure)) => failure.refusal.clone(),
                     Some(error) => super::process_event::ProcessEventRefusal::PostCallFailed(

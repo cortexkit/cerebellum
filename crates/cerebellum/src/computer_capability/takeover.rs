@@ -576,13 +576,17 @@ where
             };
             points.iter().all(|point| {
                 let point = desktop(&image, *point);
-                source.topmost_window_at((point.x, point.y)) == Some(window)
-                    && application_under(source.as_ref(), &management, &image, point).is_ok_and(
-                        |owner| {
-                            owner.pid == image.pid
-                                && owner.process_generation_evidence == image.process_generation
-                        },
-                    )
+                cerebellum_computer::app_state::pointer_sensitivity::pointer_target_contained(
+                    source.as_ref(),
+                    &image_grant(&image),
+                    (point.x, point.y),
+                    window,
+                ) && application_under(source.as_ref(), &management, &image, point).is_ok_and(
+                    |owner| {
+                        owner.pid == image.pid
+                            && owner.process_generation_evidence == image.process_generation
+                    },
+                )
             })
         }))
     }
@@ -646,6 +650,25 @@ where
             }
             require_app_grant(management, &self.process_executable, caller, &grant)?;
             if window_number.is_none() {
+                return Err(nothing_identifiable_at_point());
+            }
+            let source = Arc::clone(&self.app_state_source);
+            let check_grant = grant.clone();
+            let check_points = desktop_points.clone();
+            let window = window_number.unwrap();
+            if !tokio::task::spawn_blocking(move || {
+                check_points.iter().all(|point| {
+                    cerebellum_computer::app_state::pointer_sensitivity::pointer_target_safe(
+                        source.as_ref(),
+                        &check_grant,
+                        (point.x, point.y),
+                        window,
+                    )
+                })
+            })
+            .await
+            .unwrap_or(false)
+            {
                 return Err(nothing_identifiable_at_point());
             }
             let action = match request {
@@ -816,7 +839,22 @@ where
         let mode =
             super::app_use::call_mode().unwrap_or(cerebellum_core::config::AppUse::Background);
         let (hooks, exclusion, pointer_guard) = if self.takeover_pointer_fronting_admitted {
-            let stopped = |stop| {
+            let mut stopped = |stop| {
+                let reason = match stop {
+                    cerebellum_computer::dispatch::FrontingStop::Cancelled => {
+                        DispatchError::DispatchStopped
+                    }
+                    cerebellum_computer::dispatch::FrontingStop::FrontingLockTimedOut => {
+                        DispatchError::FrontingBoundExceeded
+                    }
+                    cerebellum_computer::dispatch::FrontingStop::HeldInputUnconfirmed => {
+                        DispatchError::DispatchStopped
+                    }
+                    _ => DispatchError::SyntheticUnavailable,
+                };
+                if audit.release_unused(&reason).is_err() {
+                    return refusal_reply(&DispatchError::AuditUnavailable);
+                }
                 super::fronting::not_fronted_reply(super::fronting::Fronting::stopped(
                     mode,
                     super::fronting::Purpose::NeedsFront,
@@ -869,7 +907,15 @@ where
                     .await
                 {
                     Ok(ticket) => ticket,
-                    Err(_) => return super::held_input::held_input_unconfirmed_reply("takeover"),
+                    Err(_) => {
+                        if audit
+                            .release_unused(&DispatchError::DispatchStopped)
+                            .is_err()
+                        {
+                            return refusal_reply(&DispatchError::AuditUnavailable);
+                        }
+                        return super::held_input::held_input_unconfirmed_reply("takeover");
+                    }
                 }
             };
             if let Some(terminal) = &work.terminal {
@@ -913,7 +959,14 @@ where
                         &Err::<(), _>(DispatchError::SyntheticUnavailable),
                         make_driver.as_ref(),
                     );
-                    return Err(DispatchError::SyntheticUnavailable);
+                    return if audit
+                        .release_unused(&DispatchError::SyntheticUnavailable)
+                        .is_err()
+                    {
+                        Err(DispatchError::AuditUnavailable)
+                    } else {
+                        Err(DispatchError::SyntheticUnavailable)
+                    };
                 }
             }
             let mut dispatcher = Dispatcher::new(driver, &cancelled);
@@ -937,7 +990,7 @@ where
         };
         if let Some(hooks) = &hooks {
             if reply["reason"] == "target_focus_mismatch" {
-                reply["remedy"] = json!("the target's focus or the exact imaged window could not be confirmed immediately before the pointer post, so no further action posts were made; read state again before retrying");
+                reply["remedy"] = json!("pointer containment could not be confirmed at the AppKit mouse-down window hit-test, exact imaged-window, accessibility sensitivity or target-focus check; no further action posts were made. Read state again before retrying");
             }
             let end = hooks.end();
             let mut fronting = super::fronting::chord_fronting(mode, &end);
@@ -980,6 +1033,7 @@ where
             }
             if matches!(fronting.restore, super::fronting::Restore::Failed) {
                 reply["outcome"] = json!("restore_failed");
+                reply["remedy"] = json!("the previous application could not be restored; application restoration does not select its previous window. Read state before continuing");
             }
         }
         reply
