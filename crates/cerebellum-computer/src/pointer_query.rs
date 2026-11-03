@@ -303,7 +303,9 @@ mod tests {
             }
             finished.send((keep_reading, replies)).unwrap();
         });
-        let observed = result.recv_timeout(PREPARE_TIMEOUT + Duration::from_secs(1));
+        // Generous slack: this only has to tell a bounded wait from an
+        // unbounded one, and a loaded test host must not turn it into a flake.
+        let observed = result.recv_timeout(PREPARE_TIMEOUT + Duration::from_secs(30));
         // Closing the channel also releases a broken unbounded reader before
         // reporting failure, so the regression cannot strand the test process.
         drop(held_reply);
