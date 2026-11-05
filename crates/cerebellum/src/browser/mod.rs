@@ -345,8 +345,8 @@ impl BrowserError {
             Self::NavigateNotReady { navigation_sent: false, .. } => "the setup step in detail.reason_code did not become ready before the deadline; Page.navigate was not sent; retry navigation when the browser is ready",
             Self::NavigateNotReady { navigation_sent: true, .. } => "Page.navigate was sent but its response did not arrive before the deadline; navigation may have completed; snapshot first to inspect the current page, then retry only if needed",
             Self::TypeNotReady { .. } => "the typing step in detail.reason_code was not ready; snapshot again and inspect the field before retrying, because earlier input may have reached the page",
-            Self::CommandTimeout { .. } => "the CDP step in detail.step exceeded its deadline; let the page settle, then retry snapshot; inspect the page before retrying input because earlier input may have reached it",
-            Self::CdpStepFailure { .. } | Self::ZoomStepFailure { .. } => "the CDP step in detail.step could not supply a valid response; let the page settle, then retry snapshot; if it persists, report detail.reason_code and detail.step; do not assume earlier input completed",
+            Self::CommandTimeout { .. } => "the CDP step in detail.step exceeded its deadline; let the page settle, then retry snapshot; if reads keep failing, use navigate to reload the page, or close then launch if the browser connection is unavailable; inspect the page before retrying input because earlier input may have reached it",
+            Self::CdpStepFailure { .. } | Self::ZoomStepFailure { .. } => "the CDP step in detail.step could not supply a valid response; let the page settle, then retry snapshot; if reads keep failing, use navigate to reload the page, or close then launch if the browser connection is unavailable; report detail.reason_code and detail.step if recovery fails; do not assume earlier input completed",
             Self::InvalidRequest { .. } => {
                 "correct detail.field according to detail.reason_code, then resubmit the request"
             }

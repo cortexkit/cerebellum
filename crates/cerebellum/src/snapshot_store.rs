@@ -867,6 +867,9 @@ pub fn render_ax_text(
             line.push_str(", Value: ");
             line.push_str(&value);
         }
+        if let Some(reference) = &record.reference {
+            crate::browser::state_text::append_classification_notice(&mut line, reference, facts);
+        }
         line.push('\n');
         lines.push((line, record.reference.as_deref()));
         printed.push(record.depth);
