@@ -531,7 +531,8 @@ mod tests {
     use crate::*;
     use cerebellum_computer::app_state::source::{
         AppStateReadError, AppStateSource, BundleSignature, ElementActionError, ElementHandle,
-        InstalledApp, InstalledApps, OpenAppBounds, OpenedApp, RawAppState, ReadBounds, RunningApp,
+        InstalledApp, InstalledApps, OpenAppBounds, OpenedApp, RawAppState, RawElement, ReadBounds,
+        RunningApp,
     };
     use cerebellum_computer::platform::{ProcessGrant, TargetResolution};
     use cerebellum_core::journal::{ComputerOrderRecord, ComputerOrdering};
@@ -579,6 +580,7 @@ mod tests {
     /// the first reads an unreadable subtree, the second sees a vanished app.
     /// This makes wire correlation, not just task start order, observable.
     struct Desk {
+        scroll_recipient: AtomicBool,
         reads: AtomicUsize,
         unreadable_reads: AtomicBool,
         events: mpsc::UnboundedSender<Event>,
@@ -677,9 +679,13 @@ mod tests {
         }
         fn element_at(
             &self,
-            _: HitScope,
+            scope: HitScope,
             _: (f64, f64),
         ) -> Result<Option<(ElementHandle, Option<u32>)>, ElementActionError> {
+            if self.scroll_recipient.load(Ordering::SeqCst) && matches!(scope, HitScope::SystemWide)
+            {
+                return Ok(Some((RawElement::fixture(1, "AXWindow").handle, Some(42))));
+            }
             let number = self.hits.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = self.hit_started.send(number);
             if number == 1 {
@@ -702,6 +708,22 @@ mod tests {
         /// a move reaches its placement hit tests.
         fn topmost_window_at(&self, _: (f64, f64)) -> Option<u32> {
             Some(MOVE_IMAGE_WINDOW)
+        }
+        fn cursor_position(&self) -> Option<(f64, f64)> {
+            self.scroll_recipient
+                .load(Ordering::SeqCst)
+                .then_some((0.0, 0.0))
+        }
+        fn pointer_recipient(&self, _: (f64, f64)) -> Result<Option<u32>, &'static str> {
+            Ok(self
+                .scroll_recipient
+                .load(Ordering::SeqCst)
+                .then_some(MOVE_IMAGE_WINDOW))
+        }
+        fn element_window_number(&self, _: &ElementHandle) -> Option<u32> {
+            self.scroll_recipient
+                .load(Ordering::SeqCst)
+                .then_some(MOVE_IMAGE_WINDOW)
         }
         fn running_apps(&self) -> Result<Vec<RunningApp>, AppStateReadError> {
             self.running_queries.fetch_add(1, Ordering::SeqCst);
@@ -926,6 +948,7 @@ mod tests {
         let (events_tx, events) = mpsc::unbounded_channel();
         let (hit_started, hit_events) = mpsc::unbounded_channel();
         let desk = Arc::new(Desk {
+            scroll_recipient: AtomicBool::new(false),
             reads: AtomicUsize::new(0),
             unreadable_reads: AtomicBool::new(false),
             events: events_tx,
@@ -2025,6 +2048,9 @@ mod tests {
     #[tokio::test]
     async fn scroll_waits_for_keys_on_its_resolved_target() {
         let mut rig = rig(false, None);
+        // The scroll must identify its wheel recipient before asking for consent;
+        // this test cancels both calls before any native input can be posted.
+        rig.desk.scroll_recipient.store(true, Ordering::SeqCst);
         rig.send(frame(FrameType::Request, 7, 1, serde_json::json!({
             "name":"computer_use", "arguments":{"action":"keys", "target":"Editor", "keys":["d"]},
         }))).await;

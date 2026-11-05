@@ -707,6 +707,11 @@ impl std::fmt::Debug for DeskHook {
 #[derive(Debug)]
 pub struct DeskState {
     pub real_cursor: Option<(f64, f64)>,
+    pub cursor_reads: usize,
+    pub pointer_recipient_queries: usize,
+    /// AppKit's recipient when it differs from the rectangular window list;
+    /// `Some(None)` represents a query that could not identify a recipient.
+    pub pointer_window_override: Option<Option<u32>>,
     pub pointer_query_error: Option<&'static str>,
     pub pointer_prewarm_deadlines: Vec<std::time::Instant>,
     pub pointer_prewarm_error: Option<&'static str>,
@@ -725,6 +730,9 @@ pub struct DeskState {
     pub dispatched_at: Vec<tokio::time::Instant>,
     pub cursor_visible: bool,
     pub roots: Vec<RawElement>,
+    pub read_error: Option<AppStateReadError>,
+    pub read_bound_reached: bool,
+    pub unreadable_subtrees: usize,
     /// Swapped in for `roots` by the first press, menu opening or write, so
     /// the diff that follows has something to report.
     pub after_action: Option<Vec<RawElement>>,
@@ -798,6 +806,9 @@ impl Desk {
     pub fn new(roots: Vec<RawElement>) -> Self {
         Self(Arc::new(Mutex::new(DeskState {
             real_cursor: None,
+            cursor_reads: 0,
+            pointer_recipient_queries: 0,
+            pointer_window_override: None,
             pointer_query_error: None,
             pointer_prewarm_deadlines: Vec::new(),
             pointer_prewarm_error: None,
@@ -809,6 +820,9 @@ impl Desk {
             dispatched_at: Vec::new(),
             cursor_visible: false,
             roots,
+            read_error: None,
+            read_bound_reached: false,
+            unreadable_subtrees: 0,
             after_action: None,
             focus_after_action: None,
             focused_in_tree: None,
@@ -934,11 +948,14 @@ impl AppStateSource for Desk {
         _bounds: ReadBounds,
     ) -> Result<RawAppState, AppStateReadError> {
         let state = self.state();
+        if let Some(error) = state.read_error {
+            return Err(error);
+        }
         Ok(RawAppState {
             roots: state.roots.clone(),
             focused: state.focused_in_tree.map(fixture_handle),
-            unreadable_subtrees: 0,
-            read_bound_reached: false,
+            unreadable_subtrees: state.unreadable_subtrees,
+            read_bound_reached: state.read_bound_reached,
         })
     }
 
@@ -1101,15 +1118,23 @@ impl AppStateSource for Desk {
     }
 
     fn pointer_window_at(&self, point: (f64, f64)) -> Option<u32> {
-        self.topmost_window_at(point)
+        let recipient = self.state().pointer_window_override;
+        recipient.unwrap_or_else(|| self.topmost_window_at(point))
     }
 
     fn cursor_position(&self) -> Option<(f64, f64)> {
-        self.state().real_cursor
+        let mut state = self.state();
+        state.cursor_reads += 1;
+        state.real_cursor
     }
 
     fn pointer_recipient(&self, point: (f64, f64)) -> Result<Option<u32>, &'static str> {
-        if let Some(error) = self.state().pointer_query_error {
+        let error = {
+            let mut state = self.state();
+            state.pointer_recipient_queries += 1;
+            state.pointer_query_error
+        };
+        if let Some(error) = error {
             return Err(error);
         }
         Ok(self.pointer_window_at(point))

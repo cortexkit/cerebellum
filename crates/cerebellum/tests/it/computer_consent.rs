@@ -1047,6 +1047,45 @@ async fn the_signature_a_grant_was_made_for_is_admitted_without_asking_again() {
     }
 }
 
+#[tokio::test]
+async fn a_conversation_denial_wins_when_the_original_app_signature_returns() {
+    for permanent in [false, true] {
+        let code = InjectedCode::default();
+        let storage = InMemoryAgentGrantStorage::default();
+        let management = signed_agent_management(&code, &storage);
+        let carrier = ScriptedCarrier::answering(&[
+            if permanent {
+                "allow_always"
+            } else {
+                "allow_30m"
+            },
+            "deny",
+        ]);
+        let owner = caller("conversation-1", permanent);
+        admit(&management, &carrier, owner.clone()).await.unwrap();
+        code.replace(Ok(team_identity("IMPOSTOR01")));
+        let denied = admit(&management, &carrier, owner.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(denied["outcome"], "consent_denied", "{denied}");
+        assert_eq!(carrier.questions().len(), 2);
+        code.replace(Ok(team_identity(FIXTURE_TEAM)));
+        let again = admit(&management, &carrier, owner.clone()).await;
+        assert!(
+            again.is_err(),
+            "the original row overrode the conversation denial"
+        );
+        let again = again.unwrap_err();
+        assert_eq!(again["reason"], "denied_earlier_in_this_conversation");
+        assert!(!management.computer_grants().holds(&owner, &need_for(&code)));
+        admit(&management, &carrier, caller("conversation-2", permanent))
+            .await
+            .expect("the denial must not revoke another conversation's standing grant");
+        assert_eq!(carrier.questions().len(), 2);
+        assert_eq!(storage.load().unwrap().unwrap().grants.len(), 1);
+    }
+}
+
 /// A changed signer or designated code-signing requirement prompts again for
 /// both lifetimes. Declining preserves the grant for the original app signature.
 #[tokio::test]

@@ -2498,6 +2498,45 @@ async fn a_capability_scope_in_a_retired_place_refuses_the_bind() {
     assert_eq!(launches, 1);
 }
 
+#[tokio::test]
+async fn a_malformed_capability_scope_refuses_the_bind() {
+    for scope in [
+        json!(null),
+        json!(false),
+        json!(42),
+        json!({"unknown": ["browser.status"]}),
+        json!({"capabilities": null}),
+        json!(["browser.status", false]),
+        json!({"allowed": ["browser.status", null]}),
+    ] {
+        let launcher = Arc::new(RecordingLauncher::default());
+        let mut planes = permission_support::planes(
+            Arc::new(HealthState::new()),
+            Some(config()),
+            cerebellum::JournalPersistence::Isolated,
+        );
+        planes.launch_service = Some(launcher.clone());
+        let reply = send_tool_route_bind(
+            &planes,
+            json!({
+                "agentProjectId": "pj-accepted",
+                "sessionKind": "primary",
+                "browserControlOperations": ["browser.launch"],
+                "effectiveCapabilityScope": scope,
+            }),
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Error, "{scope}");
+        let error: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(error.code, "admission_fact_malformed", "{scope}");
+        assert_eq!(error.detail.unwrap()["key"], "effectiveCapabilityScope");
+        let response = invoke_existing(&planes, 1, "browser.launch", json!({})).await;
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["code"], "route_not_bound", "{scope}: {body}");
+        assert_eq!(*launcher.launches.lock().unwrap(), 0);
+    }
+}
+
 /// A route opened without the admission carrier is refused with the reason
 /// and remedy that say so, through the declared reply contract.
 ///
@@ -5502,11 +5541,15 @@ async fn late_in_call_answer(decision: &str, _linkable: bool) {
             body(&question)["id"].as_str().unwrap()
         );
         assert_eq!(rows[0].expires_at_ms.is_some(), decision == "allow_30m");
-        // An "always" answer covers the registrable domain of an https origin
-        // on the default port.
+        // Only an "always" answer covers the registrable domain; a temporary
+        // answer is limited to the exact origin named by the card.
         assert_eq!(
             rows[0].subject,
-            cerebellum::agent_grants::GrantSubject::Domain("example.com".into())
+            if decision == "allow_30m" {
+                cerebellum::agent_grants::GrantSubject::Origin("https://example.com".into())
+            } else {
+                cerebellum::agent_grants::GrantSubject::Domain("example.com".into())
+            }
         );
     } else {
         assert!(rows.is_empty());

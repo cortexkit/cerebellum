@@ -20,10 +20,14 @@ pub(super) fn store_answer(
         }
         _ => return Err(refusal("unrecognized_answer")),
     };
-    let subject = crate::browser_standing_grants::domain_scope(&intent.origin).map_or_else(
-        || GrantSubject::Origin(intent.origin.clone()),
-        GrantSubject::Domain,
-    );
+    let subject = if always {
+        crate::browser_standing_grants::domain_scope(&intent.origin).map_or_else(
+            || GrantSubject::Origin(intent.origin.clone()),
+            GrantSubject::Domain,
+        )
+    } else {
+        GrantSubject::Origin(intent.origin.clone())
+    };
     let now = store.now_ms();
     store
         .upsert(

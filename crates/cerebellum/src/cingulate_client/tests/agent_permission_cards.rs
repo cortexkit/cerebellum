@@ -491,6 +491,8 @@ fn user_browser_cards_never_offer_all_sites_or_danger() {
 
 #[tokio::test]
 async fn profile_site_answers_keep_the_row_id_and_bind_worker_choices_before_filing() {
+    // Both site lifetimes stay origin-scoped on a non-default port, so the
+    // second answer replaces the same subject rather than adding a domain.
     let store = Arc::new(crate::agent_grants::AgentGrants::in_memory(Some(
         "machine-test".into(),
     )));
@@ -505,6 +507,11 @@ async fn profile_site_answers_keep_the_row_id_and_bind_worker_choices_before_fil
         (false, "allow_all_sites_30m", None),
     ] {
         let identity = holder(head);
+        let origin = if temporary.contains("all_sites") {
+            "https://example.com"
+        } else {
+            "https://example.com:8443"
+        };
         let choices: Vec<&str> = std::iter::once(temporary).chain(permanent).collect();
         let mut id = None;
         let before = store.live_rows(None, store.now_ms()).unwrap().len();
@@ -512,7 +519,7 @@ async fn profile_site_answers_keep_the_row_id_and_bind_worker_choices_before_fil
             let (_, mut question) = plane
                 .open_browser_grant_at_tier(
                     "conversation",
-                    vec!["https://example.com".into()],
+                    vec![origin.into()],
                     vec![],
                     Some(3),
                     true,

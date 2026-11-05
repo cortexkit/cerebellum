@@ -1222,6 +1222,19 @@ impl ComputerGrants {
     }
 
     fn standing(&self, caller: &GrantCaller, need: &GrantNeed) -> Standing {
+        if let GrantNeed::App {
+            bundle_identity, ..
+        } = need
+        {
+            let key = (caller.conversation_key.clone(), bundle_identity.clone());
+            // A deny given in this conversation holds even over an older
+            // standing answer: the person said no to this conversation.
+            if !caller.conversation_key.is_empty()
+                && lock(&self.state).conversation_app_denies.contains(&key)
+            {
+                return Standing::Denied;
+            }
+        }
         if let Some(used) = self.authorizing_row(caller, need) {
             return Standing::Granted(used);
         }
@@ -1233,14 +1246,6 @@ impl ComputerGrants {
                 code,
                 ..
             } => {
-                let key = (caller.conversation_key.clone(), bundle_identity.clone());
-                // A deny given in this conversation holds even over an older
-                // standing answer: the person said no to this conversation.
-                if !caller.conversation_key.is_empty()
-                    && state.conversation_app_denies.contains(&key)
-                {
-                    return Standing::Denied;
-                }
                 // Released before the signature checks, which read the
                 // process and must not hold every other call up meanwhile.
                 drop(state);

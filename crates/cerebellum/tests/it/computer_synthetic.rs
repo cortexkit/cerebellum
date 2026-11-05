@@ -1267,6 +1267,67 @@ async fn an_unreadable_focus_refuses_keystrokes() {
     assert!(dispatched_calls(&shared).is_empty());
 }
 
+#[tokio::test]
+async fn a_failed_fallback_focus_read_refuses_type_and_keys_before_dispatch() {
+    assert_fallback_focus_refuses(true, false, 0).await;
+}
+
+#[tokio::test]
+async fn an_incomplete_fallback_focus_read_refuses_type_and_keys_before_dispatch() {
+    assert_fallback_focus_refuses(false, true, 0).await;
+    assert_fallback_focus_refuses(false, false, 1).await;
+}
+
+async fn assert_fallback_focus_refuses(failed: bool, cut: bool, unreadable_subtrees: usize) {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    {
+        let mut state = desk.state();
+        state.focus = DeskFocus::Nothing;
+        // The secure field exists, but the failed or incomplete fallback cannot see it.
+        state.elements.get_mut(&2).unwrap().facts.subrole = Some("AXSecureTextField".into());
+        state.roots[0].children.clear();
+        state.read_error =
+            failed.then_some(cerebellum_computer::app_state::source::AppStateReadError::Unreadable);
+        state.read_bound_reached = cut;
+        state.unreadable_subtrees = unreadable_subtrees;
+    }
+    let plane = plane_on(&shared, &desk, true);
+    let management = granted_management().await;
+    let mut replies = Vec::new();
+    for (name, request) in [
+        ("computer.type", type_request()),
+        ("computer.keys", keys_request(&["a"])),
+    ] {
+        replies.push((
+            name,
+            serve(&plane, name, request, &management, &FakeClock::new()).await,
+        ));
+    }
+    assert!(dispatched_calls(&shared).is_empty(), "{replies:?}");
+    for (name, reply) in replies {
+        assert_eq!(reply["outcome"], "secure_field_refused", "{name}: {reply}");
+        assert_eq!(reply["reason"], "focus_unreadable");
+    }
+}
+
+#[tokio::test]
+async fn a_complete_fallback_without_focus_still_dispatches_type_and_keys() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    desk.state().focus = DeskFocus::Nothing;
+    let plane = plane_on(&shared, &desk, true);
+    let management = granted_management().await;
+    for (name, request) in [
+        ("computer.type", type_request()),
+        ("computer.keys", keys_request(&["a"])),
+    ] {
+        let reply = serve(&plane, name, request, &management, &FakeClock::new()).await;
+        assert_eq!(reply["outcome"], "delivery_unconfirmed", "{name}: {reply}");
+    }
+    assert_eq!(dispatched_calls(&shared).len(), 2);
+}
+
 /// An application that reports no focused element, but whose field carries
 /// its own focused flag (a backgrounded Electron app), still has that field
 /// checked for a secure one before anything is posted.

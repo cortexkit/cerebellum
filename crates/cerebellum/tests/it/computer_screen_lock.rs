@@ -332,6 +332,14 @@ async fn until(mut condition: impl FnMut() -> bool) {
     .expect("the condition came true");
 }
 
+fn prepare_scroll_recipient(desk: &Desk) {
+    let mut state = desk.state();
+    state.real_cursor = Some((10.0, 20.0));
+    state.system_wide_hit = Some((2, Some(grant().pid)));
+    state.element_windows.insert(2, 77);
+    state.pointer_window_override = Some(Some(77));
+}
+
 /// A locked screen refuses every row by name, and the refusal comes first:
 /// no application is resolved, nobody is asked, no element is read, pressed,
 /// written or hit-tested, nothing is posted and nothing is journaled.
@@ -342,6 +350,7 @@ async fn until(mut condition: impl FnMut() -> bool) {
 #[tokio::test]
 async fn a_locked_screen_refuses_every_row_before_resolving_asking_or_posting() {
     let rig = rig(Some(true));
+    prepare_scroll_recipient(&rig.desk);
     let carrier = ScriptedCarrier::answering(&["allow_30m"; 20]);
     let journal_before = rig.plane.journal_entry_count().await;
 
@@ -369,6 +378,15 @@ async fn a_locked_screen_refuses_every_row_before_resolving_asking_or_posting() 
         assert!(desk.writes.is_empty(), "a locked call wrote");
         assert!(desk.hit_scopes.is_empty(), "a locked call hit-tested");
         assert_eq!(desk.focus_reads, 0, "a locked call read focus");
+        assert_eq!(desk.cursor_reads, 0, "a locked call read the real cursor");
+        assert_eq!(
+            desk.pointer_recipient_queries, 0,
+            "a locked call queried a pointer recipient"
+        );
+        assert!(
+            desk.pointer_prewarm_deadlines.is_empty(),
+            "a locked call prepared the recipient helper"
+        );
     }
     assert_eq!(
         rig.plane.journal_entry_count().await,
@@ -540,23 +558,39 @@ async fn a_lock_after_takeover_is_granted_refuses_background_chords_before_posti
 
 /// The takeover grant's wait is re-checked the same way: a pointer row whose
 /// question was answered after the screen locked posts nothing.
+/// Its initial unlocked placement must not be repeated after that wait.
 #[tokio::test]
 async fn a_lock_during_the_takeover_wait_refuses_before_placing_or_posting() {
     let rig = rig(Some(false));
+    prepare_scroll_recipient(&rig.desk);
     let carrier = ScriptedCarrier::default();
     let arguments = json!({"target": TARGET_BUNDLE_ID, "axis": "vertical", "amount_lines": 1});
     let answering = {
         let carrier = carrier.clone();
         let lock = rig.lock.clone();
+        let desk = rig.desk.clone();
         async move {
             until(|| carrier.questions().len() == 1).await;
+            let queries_before_lock = {
+                let state = desk.state();
+                (
+                    state.cursor_reads,
+                    state.pointer_recipient_queries,
+                    state.hit_scopes.len(),
+                )
+            };
+            assert!(
+                queries_before_lock.0 > 0 && queries_before_lock.1 > 0,
+                "the unlocked placement must identify its recipient before asking"
+            );
             lock.set(Some(true));
             assert!(carrier.answer_next(ScriptedAnswer::Answered(
                 json!({"decision": "computer_30m"})
             )));
+            queries_before_lock
         }
     };
-    let (reply, ()) = tokio::join!(
+    let (reply, queries_before_lock) = tokio::join!(
         serve(
             &rig,
             "computer.takeover_scroll",
@@ -566,6 +600,18 @@ async fn a_lock_during_the_takeover_wait_refuses_before_placing_or_posting() {
         answering
     );
     assert_screen_locked("computer.takeover_scroll", &reply);
+    {
+        let state = rig.desk.state();
+        assert_eq!(
+            (
+                state.cursor_reads,
+                state.pointer_recipient_queries,
+                state.hit_scopes.len()
+            ),
+            queries_before_lock,
+            "the locked call queried or placed its recipient again after the takeover wait"
+        );
+    }
     assert!(rig.posted.lock().unwrap().is_empty(), "the scroll posted");
     assert_eq!(
         carrier.questions()[0]["params"]["target"]["kind"],

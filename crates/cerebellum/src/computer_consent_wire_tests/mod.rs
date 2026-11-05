@@ -427,7 +427,12 @@ async fn turn_stop_cancel_running_keys_releases_both_presses() {
             _: &ProcessGrant,
             _: ReadBounds,
         ) -> Result<RawAppState, AppStateReadError> {
-            Err(AppStateReadError::Unreadable)
+            Ok(RawAppState {
+                roots: Vec::new(),
+                focused: None,
+                unreadable_subtrees: 0,
+                read_bound_reached: false,
+            })
         }
         fn focused_element(
             &self,
