@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent_grants::{AgentGrants, BrowserTarget};
+use crate::agent_grants::{AgentGrants, BrowserTarget, GrantHolder, GrantSubject};
 use crate::browser_standing_grants::ManualWallClock;
 
 fn rows(fixture: &Fixture) -> Vec<crate::agent_grants::AgentGrant> {
@@ -9,6 +9,40 @@ fn rows(fixture: &Fixture) -> Vec<crate::agent_grants::AgentGrant> {
 
 fn ask(tier: u8, hazards: Value, origin: &str) -> Value {
     json!({"browser":"user","action":"open_grant","origins":[origin],"hazards":hazards,"severity_tier":tier})
+}
+
+#[tokio::test]
+async fn default_isolated_planes_record_user_browser_answers_in_unified_store() {
+    let fixture = Fixture::with_stores(None, None, false);
+    bind_probe_head(&fixture).await;
+    let (reply, cards) = fixture
+        .call(
+            PROBE_CHANNEL,
+            ask(1, json!([]), "http://127.0.0.1:53967"),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(cards.len(), 1);
+    let rows = rows(&fixture);
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(
+        row.holder,
+        GrantHolder::Head {
+            agent_id: PROBE_AGENT.into()
+        }
+    );
+    assert_eq!(
+        row.subject,
+        GrantSubject::Origin("http://127.0.0.1:53967".into())
+    );
+    assert_eq!(row.browser_target, Some(BrowserTarget::UserBrowser));
+    assert_eq!(row.machine_uuid, "isolated-plane");
+    assert_eq!(row.expires_at_ms, Some(row.granted_at_ms + 1_800_000));
+    assert_eq!(row.card_ref.as_deref(), Some("el_site_1"));
+    assert_eq!(row.max_level, 2);
+    assert!(row.hazards.is_empty());
 }
 
 const PROBE_CHANNEL: u16 = 9;
@@ -125,8 +159,12 @@ async fn prefrontal_head_offers_thirty_minutes_on_loopback_and_public_origins() 
 }
 
 #[tokio::test]
-async fn probe_isolated_store_refuses_before_raising_a_deny_only_card() {
-    let fixture = Fixture::with_stores(None, None, false);
+async fn probe_missing_store_refuses_before_raising_a_deny_only_card() {
+    let mut fixture = Fixture::with_stores(None, None, false);
+    Arc::get_mut(&mut fixture.planes).unwrap().management =
+        Arc::new(crate::management::ManagementPlane::new(Arc::new(
+            crate::management::PlatformResolver::new(),
+        )));
     bind_probe_head(&fixture).await;
     assert!(fixture.planes.management.unified_agent_grants().is_none());
     assert!(!fixture.planes.user_browser.target().grants.can_record());

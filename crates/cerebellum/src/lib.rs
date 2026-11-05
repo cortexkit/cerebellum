@@ -57,6 +57,8 @@ mod egress;
 pub mod flat_tools;
 mod grant_enforcement;
 mod image_handles;
+#[cfg(test)]
+mod isolated_grants_tests;
 pub mod journal;
 pub mod journal_admin;
 pub mod journal_pin;
@@ -3446,11 +3448,10 @@ impl Planes {
         ));
         // Built before the launch service, which publishes what its startup
         // recovery kept into this plane's registry.
-        // The operator's "always" grants are read from their store only for a
-        // durable plane; an isolated plane keeps grants in memory and, with no
-        // machine identity, never offers "always".
-        // Standing browser grants follow the same rule, and are bound to the
-        // same machine identity.
+        // Both modes use the unified grant path. Isolation changes storage,
+        // not the authorization implementation exercised by tests and probes.
+        // A synthetic machine identity keeps isolated answers recordable
+        // without reading the operator's identity or grant stores.
         let (computer_grants, agent_grants) = match journal {
             JournalPersistence::Durable => {
                 let machine_uuid = computer_grants::this_machine_uuid();
@@ -3467,9 +3468,12 @@ impl Planes {
                     Some(grants),
                 )
             }
-            JournalPersistence::Isolated => {
-                (Arc::new(computer_grants::ComputerGrants::in_memory()), None)
-            }
+            JournalPersistence::Isolated => (
+                Arc::new(computer_grants::ComputerGrants::in_memory()),
+                Some(Arc::new(agent_grants::AgentGrants::in_memory(Some(
+                    "isolated-plane".into(),
+                )))),
+            ),
         };
         let user_grants = Arc::new(browser_standing_grants::StandingBrowserGrants::in_memory());
         let standing = standing.unwrap_or_else(|| {
@@ -10685,19 +10689,10 @@ mod tests {
     /// Planes with an admitted agent-session management route and an answerable
     /// consent-service fixture (channel 4, epoch 1).
     fn open_grant_planes() -> Planes {
-        let mut planes = Planes::with_browser_config_journaling(
+        let planes = Planes::with_browser_config_journaling(
             Arc::new(HealthState::default()),
             None,
             JournalPersistence::Isolated,
-        );
-        // Card-lifetime tests need an answer that can be recorded; isolated
-        // browser defaults have no machine identity and offer no site grants.
-        planes.management = Arc::new(
-            ManagementPlane::new(Arc::new(management::PlatformResolver::new())).with_agent_grants(
-                Arc::new(agent_grants::AgentGrants::in_memory(Some(
-                    "test-machine".into(),
-                ))),
-            ),
         );
         planes.routes.insert(
             4,
