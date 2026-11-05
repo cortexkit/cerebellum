@@ -2498,6 +2498,45 @@ async fn a_capability_scope_in_a_retired_place_refuses_the_bind() {
     assert_eq!(launches, 1);
 }
 
+#[tokio::test]
+async fn a_malformed_capability_scope_refuses_the_bind() {
+    for scope in [
+        json!(null),
+        json!(false),
+        json!(42),
+        json!({"unknown": ["browser.status"]}),
+        json!({"capabilities": null}),
+        json!(["browser.status", false]),
+        json!({"allowed": ["browser.status", null]}),
+    ] {
+        let launcher = Arc::new(RecordingLauncher::default());
+        let mut planes = permission_support::planes(
+            Arc::new(HealthState::new()),
+            Some(config()),
+            cerebellum::JournalPersistence::Isolated,
+        );
+        planes.launch_service = Some(launcher.clone());
+        let reply = send_tool_route_bind(
+            &planes,
+            json!({
+                "agentProjectId": "pj-accepted",
+                "sessionKind": "primary",
+                "browserControlOperations": ["browser.launch"],
+                "effectiveCapabilityScope": scope,
+            }),
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Error, "{scope}");
+        let error: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(error.code, "admission_fact_malformed", "{scope}");
+        assert_eq!(error.detail.unwrap()["key"], "effectiveCapabilityScope");
+        let response = invoke_existing(&planes, 1, "browser.launch", json!({})).await;
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["code"], "route_not_bound", "{scope}: {body}");
+        assert_eq!(*launcher.launches.lock().unwrap(), 0);
+    }
+}
+
 /// A route opened without the admission carrier is refused with the reason
 /// and remedy that say so, through the declared reply contract.
 ///

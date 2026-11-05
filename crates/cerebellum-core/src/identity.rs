@@ -372,8 +372,8 @@ impl AcceptedBindFacts {
             acts_as_agent: admitted_agent_project_id(admission_facts).is_some(),
             session_kind_attested: admitted_session_kind(admission_facts).is_some(),
             control_operations: control_operations_from_facts(admission_facts),
-            // A bind carrying a scope under a retired name is refused before it
-            // is retained (see `admission_facts_refusal`). Should any caller
+            // A bind carrying a malformed scope or one under a retired name is
+            // refused before it is retained (see `admission_facts_refusal`). Should any caller
             // build facts from such a bind without that check, the scope is
             // taken as explicitly empty rather than absent: absent means the
             // permissive default, and a scope the carrier meant to restrict
@@ -383,6 +383,7 @@ impl AcceptedBindFacts {
                 Some(Vec::new())
             } else {
                 effective_capability_scope_from_facts(admission_facts)
+                    .unwrap_or_else(|()| Some(Vec::new()))
             },
             consumer_capabilities: consumer_capabilities.unwrap_or_default().to_vec(),
             surface: RouteSurface::from_target(target),
@@ -466,8 +467,12 @@ impl AcceptedBindFacts {
     pub fn admission_facts_refusal(
         admission_facts: Option<&Value>,
     ) -> Option<AdmissionFactsRefusal> {
-        misplaced_capability_scope_key(admission_facts)
-            .map(|key| AdmissionFactsRefusal::CapabilityScopeMisspelled { key })
+        if let Some(key) = misplaced_capability_scope_key(admission_facts) {
+            return Some(AdmissionFactsRefusal::CapabilityScopeMisspelled { key });
+        }
+        effective_capability_scope_from_facts(admission_facts)
+            .err()
+            .map(|()| AdmissionFactsRefusal::CapabilityScopeMalformed)
     }
 
     /// Refuse a bind when its eligible scope stamp and daemon admission facts
@@ -696,6 +701,8 @@ pub enum AdmissionFactsRefusal {
     /// longer reads. `key` is where it was found, as a dotted path from the
     /// root of the facts (for example `accepted.effectiveCapabilityScope`).
     CapabilityScopeMisspelled { key: String },
+    /// The canonical scope fact is present but cannot be read as a capability list.
+    CapabilityScopeMalformed,
     /// The scope stamp and daemon admission facts disagree about this identity field.
     ScopeFactsConflict { field: &'static str },
 }
@@ -705,6 +712,7 @@ impl AdmissionFactsRefusal {
     pub const fn reason_code(&self) -> &'static str {
         match self {
             Self::CapabilityScopeMisspelled { .. } => "admission_fact_misspelled",
+            Self::CapabilityScopeMalformed => "admission_fact_malformed",
             Self::ScopeFactsConflict { .. } => "scope_admission_conflict",
         }
     }
@@ -712,6 +720,10 @@ impl AdmissionFactsRefusal {
     /// A human-readable account of the refusal and what to do about it.
     pub fn message(&self) -> String {
         match self {
+            Self::CapabilityScopeMalformed => "the admission fact 'effectiveCapabilityScope' must be \
+                 a string, a string array, or an object with a string array at 'capabilities', \
+                 'allowed', or 'tools'; restamp the scope rather than omitting its restriction"
+                .to_owned(),
             Self::ScopeFactsConflict { field } => format!("scope stamp and admission facts disagree about {field}; reopen the route with consistent daemon-stamped identity"),
             Self::CapabilityScopeMisspelled { key } => format!(
                 "the admission facts carry a capability scope at '{key}', which is not read; \
@@ -725,6 +737,9 @@ impl AdmissionFactsRefusal {
     /// Structured facts about the refusal, for the error body's `detail`.
     pub fn detail(&self) -> Value {
         match self {
+            Self::CapabilityScopeMalformed => {
+                serde_json::json!({"key": "effectiveCapabilityScope"})
+            }
             Self::ScopeFactsConflict { field } => serde_json::json!({"field": field}),
             Self::CapabilityScopeMisspelled { key } => serde_json::json!({
                 "key": key,
@@ -827,32 +842,29 @@ fn control_operations_from_facts(facts: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn effective_capability_scope_from_facts(facts: Option<&Value>) -> Option<Vec<String>> {
-    let value = fact(facts, "effectiveCapabilityScope")?;
+fn effective_capability_scope_from_facts(facts: Option<&Value>) -> Result<Option<Vec<String>>, ()> {
+    let Some(value) = fact(facts, "effectiveCapabilityScope") else {
+        return Ok(None);
+    };
     if let Some(scope) = value.as_str() {
-        return Some(vec![scope.to_string()]);
+        return Ok(Some(vec![scope.to_string()]));
     }
-    if let Some(scope) = value.as_array() {
-        return Some(
-            scope
+    let scope = value
+        .as_array()
+        .or_else(|| {
+            let object = value.as_object()?;
+            ["capabilities", "allowed", "tools"]
                 .iter()
-                .filter_map(Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect(),
-        );
-    }
-    let object = value.as_object()?;
-    ["capabilities", "allowed", "tools"]
-        .iter()
-        .find_map(|key| object.get(*key))
-        .and_then(Value::as_array)
-        .map(|scope| {
-            scope
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect()
+                .find_map(|key| object.get(*key))
+                .and_then(Value::as_array)
         })
+        .ok_or(())?;
+    scope
+        .iter()
+        .map(|entry| entry.as_str().map(ToOwned::to_owned))
+        .collect::<Option<Vec<_>>>()
+        .map(Some)
+        .ok_or(())
 }
 
 #[cfg(any(test, feature = "test-observer"))]
@@ -1454,6 +1466,72 @@ mod tests {
             );
         }
         assert_eq!(AcceptedBindFacts::admission_facts_refusal(None), None);
+    }
+
+    #[test]
+    fn a_malformed_capability_scope_refuses_rather_than_widening() {
+        let bind = bind_identity("conversation-1");
+        for scope in [
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(42),
+            serde_json::json!({"unknown": ["browser.status"]}),
+            serde_json::json!({"capabilities": null, "allowed": ["browser.status"]}),
+            serde_json::json!(["browser.status", false]),
+            serde_json::json!({"tools": ["browser.status", 42]}),
+        ] {
+            let facts = serde_json::json!({"effectiveCapabilityScope": scope});
+            let refusal = AcceptedBindFacts::admission_facts_refusal(Some(&facts));
+            assert_eq!(
+                refusal.as_ref().map(AdmissionFactsRefusal::reason_code),
+                Some("admission_fact_malformed"),
+                "{facts}"
+            );
+            assert_eq!(refusal.unwrap().detail()["key"], "effectiveCapabilityScope");
+            let accepted = AcceptedBindFacts::from_bind(
+                &bind,
+                Some(Principal::Direct),
+                Some(&facts),
+                None,
+                &tool_route(),
+            );
+            assert!(!accepted.allows_capability("browser.status"), "{facts}");
+        }
+    }
+
+    #[test]
+    fn valid_and_absent_capability_scopes_keep_their_meaning() {
+        let bind = bind_identity("conversation-1");
+        for scope in [
+            serde_json::json!("browser.status"),
+            serde_json::json!(["browser.status"]),
+            serde_json::json!({"capabilities": ["browser.status"]}),
+            serde_json::json!({"allowed": ["browser.status"]}),
+            serde_json::json!({"tools": ["browser.status"]}),
+            serde_json::json!([]),
+        ] {
+            let facts = serde_json::json!({"effectiveCapabilityScope": scope});
+            assert_eq!(
+                AcceptedBindFacts::admission_facts_refusal(Some(&facts)),
+                None
+            );
+            let accepted = AcceptedBindFacts::from_bind(
+                &bind,
+                Some(Principal::Direct),
+                Some(&facts),
+                None,
+                &tool_route(),
+            );
+            assert_eq!(
+                accepted.allows_capability("browser.status"),
+                scope != serde_json::json!([])
+            );
+            assert!(!accepted.allows_capability("computer.type"));
+        }
+        let accepted =
+            AcceptedBindFacts::from_bind(&bind, Some(Principal::Direct), None, None, &tool_route());
+        assert!(accepted.allows_capability("browser.status"));
+        assert!(accepted.allows_capability("computer.type"));
     }
 
     #[test]
