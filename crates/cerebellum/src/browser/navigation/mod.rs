@@ -325,6 +325,17 @@ struct PendingJavaScriptDialog {
     dialog_type: String,
 }
 
+enum ReadTurn {
+    WouldBlock,
+    Progress(Option<CdpResponse>),
+}
+
+fn read_cancelled() -> bool {
+    crate::browser_session::drive_context()
+        .and_then(|context| context.terminal)
+        .is_some_and(|terminal| terminal.gate.stopped())
+}
+
 /// Owns every CDP write, frame decoder, and request correlator for one browser.
 /// Keeping these together prevents a lifecycle command and a navigation command
 /// from assigning competing request ids or interleaving frames on the pipe.
@@ -1751,13 +1762,16 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         while !tracker.main_frame_navigation_observed()
             && tracker.same_document_url().is_none()
             && clock.now() < window_end
+            && !read_cancelled()
         {
-            self.read_turn(None, Some((context_key, &mut tracker)), clock.now())?;
+            let turn = self.read_turn(None, Some((context_key, &mut tracker)), clock.now())?;
             if tracker.main_frame_navigation_observed() || tracker.same_document_url().is_some() {
                 break;
             }
-            let remaining = window_end.saturating_duration_since(clock.now());
-            clock.sleep(cmp::min(POLL_INTERVAL, remaining));
+            if matches!(turn, ReadTurn::WouldBlock) {
+                let remaining = window_end.saturating_duration_since(clock.now());
+                clock.sleep(cmp::min(POLL_INTERVAL, remaining));
+            }
         }
 
         if tracker.main_frame_navigation_observed() {
@@ -2610,12 +2624,16 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 break;
             }
             // A page that never finishes loading is not shown to work.
-            if clock.now() >= deadline {
+            if clock.now() >= deadline || read_cancelled() {
                 return Err(NavigationDriveError::CdpFailure);
             }
-            self.read_turn(None, None, clock.now())?;
-            let remaining = deadline.saturating_duration_since(clock.now());
-            clock.sleep(cmp::min(POLL_INTERVAL, remaining));
+            if matches!(
+                self.read_turn(None, None, clock.now())?,
+                ReadTurn::WouldBlock
+            ) {
+                let remaining = deadline.saturating_duration_since(clock.now());
+                clock.sleep(cmp::min(POLL_INTERVAL, remaining));
+            }
         }
         let status = self.verification.as_ref().and_then(|load| load.status);
         let history = self.command(
@@ -2960,13 +2978,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         ended: impl Fn(&Tracker) -> bool,
         clock: &mut C,
     ) -> Result<(), NavigationDriveError> {
-        while clock.now() < deadline {
-            self.read_turn(None, Some((context_key, tracker)), clock.now())?;
+        while clock.now() < deadline && !read_cancelled() {
+            let turn = self.read_turn(None, Some((context_key, tracker)), clock.now())?;
             if tracker.download_blocked || tracker.poll_settlement(clock.now()) || ended(tracker) {
                 return Ok(());
             }
-            let remaining = deadline.saturating_duration_since(clock.now());
-            clock.sleep(cmp::min(POLL_INTERVAL, remaining));
+            if matches!(turn, ReadTurn::WouldBlock) {
+                let remaining = deadline.saturating_duration_since(clock.now());
+                clock.sleep(cmp::min(POLL_INTERVAL, remaining));
+            }
         }
         tracker.poll_settlement(clock.now());
         Ok(())
@@ -3259,7 +3279,11 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             if let Some(response) = self.pending_responses.remove(&command_id) {
                 break response;
             }
-            if clock.now() >= deadline {
+            // Input-release commands may finish after cancellation so the
+            // session does not retain a held key or mouse button.
+            if clock.now() >= deadline
+                || (read_cancelled() && !matches!(effect, CommandEffect::Release { .. }))
+            {
                 // A read deadline is not a disconnected browser. Retire the
                 // request so a late reply cannot occupy the next call's state.
                 self.transport.abandon_command(command_id);
@@ -3279,11 +3303,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             if let Some(dialogs) = handled_dialogs.as_deref_mut() {
                 self.dismiss_pending_javascript_dialogs(deadline, dialogs, &mut tracking, clock)?;
             }
-            if let Some(response) = response {
-                break response;
+            match response {
+                ReadTurn::Progress(Some(response)) => break response,
+                ReadTurn::Progress(None) => {}
+                ReadTurn::WouldBlock => {
+                    let remaining = deadline.saturating_duration_since(clock.now());
+                    clock.sleep(cmp::min(POLL_INTERVAL, remaining));
+                }
             }
-            let remaining = deadline.saturating_duration_since(clock.now());
-            clock.sleep(cmp::min(POLL_INTERVAL, remaining));
         };
         if let Some(context) = &context {
             settle_command(context, &effect, response.error.is_none());
@@ -3325,18 +3352,22 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         Ok(())
     }
 
+    // Keep each drain turn to one read (at most READ_CHUNK_BYTES). Callers
+    // recheck their absolute deadline and cancellation between these bounded
+    // turns, including under a continuous event stream, and sleep only when
+    // the pipe reports WouldBlock, never merely because no reply matched.
     fn read_turn(
         &mut self,
         expected_response_id: Option<u64>,
         mut tracking: Option<(&str, &mut Tracker)>,
         observed_at: Instant,
-    ) -> Result<Option<CdpResponse>, NavigationDriveError> {
+    ) -> Result<ReadTurn, NavigationDriveError> {
         let bytes = match self.pipe.read(&mut self.read_buffer) {
             Ok(PipeRead::Bytes(bytes)) if bytes <= self.read_buffer.len() => bytes,
             Ok(PipeRead::Bytes(_)) | Ok(PipeRead::Closed) => {
                 return Err(NavigationDriveError::ConnectorFailure)
             }
-            Ok(PipeRead::WouldBlock) => return Ok(None),
+            Ok(PipeRead::WouldBlock) => return Ok(ReadTurn::WouldBlock),
             Err(_) => return Err(NavigationDriveError::ConnectorFailure),
         };
 
@@ -3409,7 +3440,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 self.apply_event(context_key, tracker, &event, observed_at);
             }
         }
-        Ok(matched)
+        Ok(ReadTurn::Progress(matched))
     }
 
     fn apply_event(
@@ -5199,6 +5230,8 @@ fn collect_dom_facts(
 
 #[cfg(test)]
 mod large_page_tests;
+#[cfg(test)]
+mod read_loop_tests;
 
 #[cfg(test)]
 mod tests {
