@@ -954,22 +954,7 @@ async fn pointer_audit_cancelled_lock_wait_closes_reservation_without_posts() {
             )
             .await
     });
-    for _ in 0..1000 {
-        if cerebellum_computer::audit::lock_audit(&rig.plane.audit)
-            .journal()
-            .active_pre_dispatch_count()
-            == 1
-        {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        cerebellum_computer::audit::lock_audit(&rig.plane.audit)
-            .journal()
-            .active_pre_dispatch_count(),
-        1
-    );
+    wait_for_one_pre_dispatch_reservation(&rig).await;
     cancel.cancel();
     let reply = worker.await.unwrap();
     assert_eq!(
@@ -978,6 +963,25 @@ async fn pointer_audit_cancelled_lock_wait_closes_reservation_without_posts() {
     );
     assert_no_action_reservation(&rig);
     drop(lock);
+}
+
+/// Waits until the call has reserved its audit entry and is parked on the
+/// fronting lock. Bounded by the shared hang guard rather than a yield count:
+/// under a loaded test run the worker can need more than any fixed number of
+/// yields to reach the lock.
+async fn wait_for_one_pre_dispatch_reservation(rig: &Rig) {
+    let count = || {
+        cerebellum_computer::audit::lock_audit(&rig.plane.audit)
+            .journal()
+            .active_pre_dispatch_count()
+    };
+    tokio::time::timeout(crate::test_support::HANG_GUARD, async {
+        while count() != 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no audit reservation; count is {}", count()));
 }
 
 #[tokio::test]
@@ -1021,22 +1025,7 @@ async fn pointer_audit_held_input_after_lock_wait_closes_reservation_without_pos
             )
             .await
     });
-    for _ in 0..1000 {
-        if cerebellum_computer::audit::lock_audit(&rig.plane.audit)
-            .journal()
-            .active_pre_dispatch_count()
-            == 1
-        {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        cerebellum_computer::audit::lock_audit(&rig.plane.audit)
-            .journal()
-            .active_pre_dispatch_count(),
-        1
-    );
+    wait_for_one_pre_dispatch_reservation(&rig).await;
     let press = super::super::held_input::HeldPress::global_send(
         &support::grant(),
         &SyntheticAction::ClickPointer {
