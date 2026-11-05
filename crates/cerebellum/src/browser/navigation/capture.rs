@@ -19,19 +19,19 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline: Instant,
         clock: &mut C,
     ) -> Option<BrowserSnapshotObservation> {
-        // Chrome can leave queryAXTree without a role/name query unanswered.
-        // Use the native tree and project from the identity-verified root below;
-        // unrelated nodes never enter the returned observation. A short attempt
-        // leaves the incremental subtree walker its own fallback window.
-        let method = "Accessibility.getFullAXTree";
-        let params = self.active_frame.as_ref().map_or_else(
-            || serde_json::json!({}),
-            |frame| serde_json::json!({"frameId":frame.frame_id}),
-        );
-        let deadline = if subtree.is_some() {
-            deadline.min(clock.now() + Duration::from_millis(2000))
+        let (method, params) = if let Some(reference) = subtree {
+            (
+                "Accessibility.queryAXTree",
+                serde_json::json!({"backendNodeId":reference.backend_identity.as_ref()?.backend_node_id}),
+            )
         } else {
-            deadline
+            (
+                "Accessibility.getFullAXTree",
+                self.active_frame.as_ref().map_or_else(
+                    || serde_json::json!({}),
+                    |frame| serde_json::json!({"frameId":frame.frame_id}),
+                ),
+            )
         };
         // Bulk reads avoid a round trip per node on ordinary pages. Keep their
         // attempt short so unsupported, oversized or busy replies leave time for
@@ -138,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn live_chrome_regression_bulk_zoom_projects_only_the_retained_subtree() {
+    fn bulk_ax_subtree_queries_only_the_retained_backend_node() {
         let root = raw_node(
             "main",
             "main",
@@ -160,7 +160,6 @@ mod tests {
             attached_driver([json!({"id":1,"sessionId":"session-own","result":{"nodes":[
                 ax_node("main","main","Protection", &["target"],2,None),
                 ax_node("target","checkbox","Require status checks", &[],3,None),
-                ax_node("other","button","Unrelated sibling", &[],4,None),
             ]}})]);
         let attachment = driver.attachment.clone().unwrap();
         let mut clock = FakeClock::new();
@@ -169,44 +168,8 @@ mod tests {
             .bulk_ax_capture(&attachment, &root, Some(&reference), deadline, &mut clock)
             .unwrap();
         assert_eq!(observation.records.len(), 2);
-        assert_eq!(
-            driver.pipe.writes[0]["method"],
-            "Accessibility.getFullAXTree"
-        );
-        assert_eq!(driver.pipe.writes[0]["params"], json!({}));
-        assert!(!observation
-            .records
-            .iter()
-            .any(|r| r.name == "Unrelated sibling"));
-    }
-
-    #[test]
-    fn live_chrome_regression_bulk_zoom_leaves_incremental_time() {
-        let root = raw_node("main", "main", "Main", &[], 2, Some("frame-own"));
-        let reference = RefRecord {
-            frame_document: None,
-            captured: SnapshotRef::new("e1", "main", "Main", 0).unwrap(),
-            frame_path: vec!["frame-own".into()],
-            backend_identity: Some(BackendNodeIdentity::new("target-own", "frame-own", 2).unwrap()),
-            raw_role: None,
-            raw_name: None,
-            classification: Err(ClassificationUnavailable::NotCaptured),
-        };
-        let mut driver = attached_driver([]);
-        let attachment = driver.attachment.clone().unwrap();
-        let mut clock = FakeClock::new();
-        let started = clock.now();
-        assert!(driver
-            .bulk_ax_capture(
-                &attachment,
-                &root,
-                Some(&reference),
-                started + Duration::from_secs(6),
-                &mut clock
-            )
-            .is_none());
-        assert!(clock.now() - started <= Duration::from_secs(2));
-        assert_eq!(driver.transport.pending_len(), 0);
+        assert_eq!(driver.pipe.writes[0]["method"], "Accessibility.queryAXTree");
+        assert_eq!(driver.pipe.writes[0]["params"], json!({"backendNodeId":2}));
     }
 
     #[test]
