@@ -247,6 +247,14 @@ pub enum PipeRead {
 
 pub trait CdpPipeIo {
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()>;
+    /// Write before an absolute deadline, or refuse without a blocking write.
+    /// Teardown must still be able to kill a browser that stopped reading.
+    fn write_frame_until(&mut self, _bytes: &[u8], _deadline: Instant) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bounded CDP write unavailable",
+        ))
+    }
     fn read(&mut self, destination: &mut [u8]) -> io::Result<PipeRead>;
 }
 
@@ -536,6 +544,33 @@ impl UnixCdpPipe {
 impl CdpPipeIo for UnixCdpPipe {
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.command.write_all(bytes)
+    }
+
+    fn write_frame_until(&mut self, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+        let previous = self.command.write_timeout()?;
+        let result = (|| {
+            while !bytes.is_empty() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "CDP write deadline",
+                    ));
+                }
+                // Recompute after partial writes and interruptions: a socket
+                // timeout alone would give each write a fresh grace period.
+                self.command.set_write_timeout(Some(remaining))?;
+                match self.command.write(bytes) {
+                    Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                    Ok(written) => bytes = &bytes[written..],
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        })();
+        let restored = self.command.set_write_timeout(previous);
+        result.and(restored)
     }
 
     fn read(&mut self, destination: &mut [u8]) -> io::Result<PipeRead> {
