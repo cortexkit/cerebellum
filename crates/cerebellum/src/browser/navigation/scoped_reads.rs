@@ -62,17 +62,22 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         if let Some(response) = self.pending_responses.remove(id) {
                             break response;
                         }
-                        if clock.now() >= step {
+                        if clock.now() >= step || read_cancelled() {
                             return Err(NavigationDriveError::CommandDeadline {
                                 method: method.into(),
                                 command_sent: true,
                             });
                         }
-                        if let Some(response) = self.read_turn(Some(*id), None, clock.now())? {
-                            break response;
+                        // Sleep only when the pipe is empty: a read that made
+                        // progress may have more frames already waiting.
+                        match self.read_turn(Some(*id), None, clock.now())? {
+                            ReadTurn::Progress(Some(response)) => break response,
+                            ReadTurn::Progress(None) => {}
+                            ReadTurn::WouldBlock => {
+                                let remaining = step.saturating_duration_since(clock.now());
+                                clock.sleep(cmp::min(POLL_INTERVAL, remaining));
+                            }
                         }
-                        let remaining = step.saturating_duration_since(clock.now());
-                        clock.sleep(cmp::min(POLL_INTERVAL, remaining));
                     };
                     if let Some(context) = &context {
                         settle_command(
