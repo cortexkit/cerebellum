@@ -37,6 +37,7 @@ struct FixturePipe {
     keep_hidden_frame: bool,
     main_loader_changed: bool,
     private_frames: bool,
+    next_dynamic_child: Option<u64>,
 }
 
 struct AttachmentResponse {
@@ -97,17 +98,25 @@ impl CdpPipeIo for FixturePipe {
                 json!({"node":ax(1,1,"RootWebArea","Events",if self.churn_siblings { &[2,4] } else { &[2] })})
             }
             "Accessibility.getChildAXNodes" if command["params"]["id"] == "1" => {
-                let children = if self.large_fanout {
+                let mut children = if self.large_fanout {
                     (100..20_100).collect::<Vec<_>>()
                 } else {
                     vec![3]
                 };
+                if let Some(next) = self.next_dynamic_child.as_mut() {
+                    // The advertised child disappears before the child read,
+                    // while the next capture advertises a different child.
+                    children.push(*next);
+                    *next += 1;
+                }
                 let mut nodes = vec![ax(
                     2,
                     42,
                     "generic",
                     if self.churn_siblings {
                         "Vanished row"
+                    } else if self.large_fanout {
+                        "more replies"
                     } else {
                         ""
                     },
@@ -383,7 +392,11 @@ async fn fixture_with_fault(
     let pipe = FixturePipe {
         reads: VecDeque::new(),
         held: None,
-        block_once: block_once.filter(|method| *method != "large_fanout"),
+        block_once: if block_once == Some("timeout_then_churn") {
+            Some("Accessibility.getRootAXNode")
+        } else {
+            block_once.filter(|method| *method != "large_fanout")
+        },
         large_fanout: block_once == Some("large_fanout"),
         hit_backend,
         commands: commands.clone(),
@@ -396,6 +409,7 @@ async fn fixture_with_fault(
         keep_hidden_frame: hidden_owner && (fault.is_none() || block_once == Some("private_frame")),
         main_loader_changed: false,
         private_frames: block_once == Some("private_frame"),
+        next_dynamic_child: (block_once == Some("timeout_then_churn")).then_some(1000),
     };
     let process = FixtureProcess {
         driver: CdpNavigationDriver::new(pipe, CdpTransport::new(), CdpFrameDecoder::default()),
@@ -467,6 +481,78 @@ async fn busy_snapshot_child_deadline_returns_bounded_partial_through_dispatch()
     assert_eq!(fresh["outcome"], "ok", "{fresh}");
     assert_eq!(fresh["truncated"], false);
     assert!(fresh["state_text"].as_str().unwrap().contains("Event row"));
+}
+
+#[tokio::test]
+async fn busy_timeout_then_changing_ax_children_remain_readable() {
+    let (plane, route, commands) = fixture(Some("timeout_then_churn"), 42, None).await;
+    let request = json!({"mode":"ax"});
+    let timed_out = plane
+        .dispatch(&route, BrowserCapability::Snapshot, &request)
+        .await;
+    assert_eq!(timed_out["outcome"], "command_timeout", "{timed_out}");
+    assert_eq!(timed_out["detail"]["step"], "Accessibility.getRootAXNode");
+    for _ in 0..6 {
+        let snapshot = plane
+            .dispatch(&route, BrowserCapability::Snapshot, &request)
+            .await;
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        assert_eq!(snapshot["truncated"], true);
+        assert_eq!(snapshot["refs_truncated"], true);
+        assert!(snapshot["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("Event row"));
+        assert!(snapshot.get("omitted").is_some(), "{snapshot}");
+    }
+    assert_eq!(
+        commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c["method"] == "Target.attachToTarget")
+            .count(),
+        1,
+        "the late response and changing children must not require a browser relaunch"
+    );
+}
+
+#[tokio::test]
+async fn busy_filtered_partial_snapshot_refs_keep_computed_classification() {
+    let (plane, route, commands) = fixture(Some("large_fanout"), 42, None).await;
+    let snapshot = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Snapshot,
+            &json!({"text_filter":"more repl"}),
+        )
+        .await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert_eq!(snapshot["truncated"], true);
+    let text = snapshot["state_text"].as_str().unwrap();
+    let reference = text
+        .lines()
+        .find(|line| line.contains("more replies"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let clicked = plane
+        .dispatch(
+            &route,
+            BrowserCapability::Click,
+            &json!({
+                "ref":reference,"snapshot_id":snapshot["snapshot_id"],"intent":"expand replies",
+                "severity":{"tier":2,"credential":false,"financial":false}
+            }),
+        )
+        .await;
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
+    assert!(commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c["method"] == "DOM.getFlattenedDocument"));
 }
 
 #[tokio::test]
@@ -610,7 +696,7 @@ async fn busy_snapshot_large_fanout_is_partial_without_requesting_the_huge_subtr
     assert_eq!(partial["outcome"], "ok", "{partial}");
     assert_eq!(partial["truncated"], true);
     assert_eq!(partial["refs_truncated"], true);
-    assert!(!commands
+    assert!(commands
         .lock()
         .unwrap()
         .iter()
@@ -652,6 +738,7 @@ async fn an_attachment_click_is_blocked_without_writing_downloads_even_after_rel
             keep_hidden_frame: false,
             main_loader_changed: false,
             private_frames: false,
+            next_dynamic_child: None,
         };
         let process = FixtureProcess {
             driver: CdpNavigationDriver::new(pipe, CdpTransport::new(), CdpFrameDecoder::default()),
@@ -963,18 +1050,34 @@ async fn snapshot_cdp_failure_journal_keeps_step_without_error_text() {
 }
 
 #[tokio::test]
-async fn snapshot_ax_declared_child_missing_names_get_child_ax_nodes() {
-    assert_snapshot_step_and_recovery(
+async fn snapshot_ax_declared_child_missing_returns_partial_then_recovers() {
+    let (plane, route, _) = fixture_with_fault(
+        None,
+        42,
+        None,
         Some(SnapshotFault {
             method: "Accessibility.getChildAXNodes",
             kind: SnapshotFaultKind::MissingChild,
         }),
         false,
         false,
-        "Accessibility.getChildAXNodes",
-        "ax",
     )
     .await;
+    let partial = plane
+        .dispatch(&route, BrowserCapability::Snapshot, &json!({"mode":"ax"}))
+        .await;
+    assert_eq!(partial["outcome"], "ok", "{partial}");
+    assert_eq!(partial["truncated"], true);
+    assert_eq!(partial["refs_truncated"], true);
+    let recovered = plane
+        .dispatch(&route, BrowserCapability::Snapshot, &json!({"mode":"ax"}))
+        .await;
+    assert_eq!(recovered["outcome"], "ok", "{recovered}");
+    assert_eq!(recovered["truncated"], false);
+    assert!(recovered["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("Event row"));
 }
 
 #[tokio::test]
@@ -992,7 +1095,7 @@ async fn snapshot_dom_classification_error_keeps_observation_usable() {
             false,
         )
         .await;
-        for _ in 0..2 {
+        for attempt in 0..2 {
             let snapshot = plane
                 .dispatch(
                     &route,
@@ -1005,6 +1108,20 @@ async fn snapshot_dom_classification_error_keeps_observation_usable() {
                 .as_str()
                 .unwrap()
                 .contains("Event row"));
+            if attempt == 0 {
+                let reason = if step == "DOM.enable" {
+                    "dom_enable_refused"
+                } else {
+                    "flattened_document_refused"
+                };
+                assert!(
+                    snapshot["state_text"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("classification unavailable: {reason}")),
+                    "{snapshot}"
+                );
+            }
         }
     }
 }
@@ -1068,11 +1185,13 @@ async fn snapshot_disappearing_ax_node_omits_only_its_subtree_and_continues() {
                     1,
                     "unbounded or futile retry of vanished node"
                 );
-                assert!(
-                    !commands
+                assert_eq!(
+                    commands
                         .iter()
-                        .any(|command| command["method"] == "DOM.getFlattenedDocument"),
-                    "partial AX read started an unbounded DOM classification read"
+                        .filter(|command| command["method"] == "DOM.getFlattenedDocument")
+                        .count(),
+                    1,
+                    "surviving refs still need one bounded DOM classification read"
                 );
             }
             let recovered = plane

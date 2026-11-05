@@ -2096,6 +2096,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         } else {
             None
         };
+        let mut ax_children_timed_out = false;
         let mut observation = if let Some(observation) = bulk {
             observation
         } else {
@@ -2121,7 +2122,11 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         },
                         None,
                         clock,
-                    )?;
+                    );
+                    if matches!(result, Err(NavigationDriveError::CommandDeadline { .. })) {
+                        ax_children_timed_out = true;
+                    }
+                    let result = result?;
                     let mut nodes = required_ax_nodes(&result)
                         .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))?;
                     for node in &mut nodes {
@@ -2162,10 +2167,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         } else {
             None
         };
-        // A bounded AX prefix must not start another unbounded DOM read on the
-        // same oversized page. Refs remain observable, with explicitly unknown
-        // classification and withheld field values rather than weaker permission.
-        let snapshot_dom = if observation.ax_truncated {
+        // A structural AX cut says nothing about the DOM's availability. Capture
+        // real form facts even for a partial outline, since filters can expose
+        // any of its refs. Bound this read, and do not prolong an AX timeout.
+        let snapshot_dom = if ax_children_timed_out {
             Some(Err(ClassificationUnavailable::NotCaptured))
         } else if let Some(dom) = &zoom_dom {
             Some(parse_flattened_dom_nodes(dom))
@@ -2173,7 +2178,11 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             Some(
                 self.flattened_dom_nodes_before(
                     &attachment,
-                    snapshot_step_deadline(deadline, bounded, clock.now()),
+                    snapshot_step_deadline(
+                        deadline,
+                        bounded || observation.ax_truncated,
+                        clock.now(),
+                    ),
                     clock,
                 )
                 .unwrap_or(Err(ClassificationUnavailable::DomReadFailed)),
@@ -2205,6 +2214,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                             reference.classification = Err(reason.clone());
                         }
                     }
+                }
+            }
+            for reference in &observation.refs {
+                if let Err(reason) = &reference.classification {
+                    observation
+                        .facts
+                        .entry(reference.captured.reference.clone())
+                        .or_default()
+                        .classification_unavailable = Some(reason.reason_code());
                 }
             }
         }
@@ -4811,7 +4829,14 @@ where
                     .into_iter()
                     .filter(|child| !selected_ids.contains(&child.node_id)),
             );
+            let mut fetched_ids = HashSet::new();
             for child in ordered {
+                if !fetched_ids.insert(child.node_id.clone()) {
+                    if node_cache.get(&child.node_id) != Some(&child) {
+                        return Err(NavigationDriveError::CdpFailure);
+                    }
+                    continue;
+                }
                 if node_cache.len() == max_nodes && !selected_ids.contains(&child.node_id) {
                     // Descendants omitted only from this command-local cache can be
                     // fetched when their parent is visited, so this is not a lossy
@@ -4824,21 +4849,34 @@ where
                     }
                     std::collections::hash_map::Entry::Occupied(entry) if entry.get() == &child => {
                     }
-                    std::collections::hash_map::Entry::Occupied(_) => {
-                        return Err(NavigationDriveError::CdpFailure)
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        // A later read can observe a changed node already cached
+                        // as a descendant. Keep its newest observation, without
+                        // claiming the walk was an atomic view of the tree.
+                        ax_truncated = true;
+                        refs_truncated = true;
+                        entry.insert(child);
                     }
                 }
             }
         }
         let mut selected = child_ids
             .into_iter()
-            .map(|child_id| {
-                node_cache
-                    .remove(&child_id)
-                    .map(|child| (child_id, child))
-                    .ok_or(NavigationDriveError::CdpFailure)
+            .filter_map(|child_id| {
+                match node_cache.remove(&child_id) {
+                    Some(child) => Some((child_id, child)),
+                    None => {
+                        // Replies can change the declared children between the
+                        // parent and child reads. Preserve observed siblings and
+                        // disclose the missing edge instead of failing every
+                        // snapshot of a continuously changing list.
+                        ax_truncated = true;
+                        refs_truncated = true;
+                        None
+                    }
+                }
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Vec<_>>();
         selected.reverse();
         // A child of an ignored node keeps that node and the ignored nodes
         // above it as its ignored ancestors; a child of a recorded node has
@@ -5394,6 +5432,144 @@ mod tests {
             driver.attachment.as_ref().unwrap().session_id,
             "session-own"
         );
+    }
+
+    #[test]
+    fn partial_ax_snapshots_keep_type_and_login_field_classification() {
+        let ids = (0..MAX_AX_NODES + 1)
+            .map(|n| format!("child-{n}"))
+            .collect::<Vec<_>>();
+        let children = ids.iter().map(String::as_str).collect::<Vec<_>>();
+        for (input_type, autocomplete, expected_reason) in [
+            ("text", "username", None),
+            ("password", "current-password", Some("credential_field")),
+            ("text", "cc-number", Some("payment_field")),
+        ] {
+            let mut driver = attached_driver([
+                json!({"id":1,"sessionId":"session-own","result":{}}),
+                json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","Form", &["field"],1,Some("frame-own"))}}),
+                json!({"id":3,"sessionId":"session-own","result":{"nodes":[ax_node("field","textbox","Field", &children,3,None)]}}),
+                json!({"id":4,"sessionId":"session-own","result":{}}),
+                json!({"id":5,"sessionId":"session-own","result":{"nodes":[
+                    {"nodeId":1,"backendNodeId":1,"nodeType":9,"localName":"#document"},
+                    {"nodeId":2,"backendNodeId":2,"parentId":1,"nodeType":1,"localName":"form","attributes":[]},
+                    {"nodeId":3,"backendNodeId":3,"parentId":2,"nodeType":1,"localName":"input","attributes":["type",input_type,"autocomplete",autocomplete]},
+                ]}}),
+            ]);
+            let observation = driver
+                .snapshot_with_clock(
+                    "route-own",
+                    SnapshotKind::Actionable,
+                    30_000,
+                    Some((7, "https://example.com/")),
+                    None,
+                    &[],
+                    &mut FakeClock::new(),
+                )
+                .unwrap();
+            assert!(observation.ax_truncated && observation.refs_truncated);
+            let record = observation.refs[1].classification.as_ref().unwrap();
+            assert_eq!(record.document_epoch, 7);
+            assert_eq!(record.effective_input_type.as_deref(), Some(input_type));
+            assert_eq!(classification::type_field_reason(record), expected_reason);
+            assert!(
+                record.login_field.is_some(),
+                "fill_login needs captured field facts"
+            );
+            assert_eq!(record.is_credential_field(), input_type == "password");
+            assert_eq!(record.financial, autocomplete == "cc-number");
+        }
+    }
+
+    #[test]
+    fn partial_ax_dom_classification_read_is_bounded_and_disclosed() {
+        let ids = (0..MAX_AX_NODES + 1)
+            .map(|n| format!("child-{n}"))
+            .collect::<Vec<_>>();
+        let children = ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut driver = attached_driver([
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","Huge", &children,1,Some("frame-own"))}}),
+            json!({"id":3,"sessionId":"session-own","result":{}}),
+        ]);
+        let mut clock = FakeClock::new();
+        let start = clock.now();
+        let observation = driver
+            .snapshot_with_clock(
+                "route-own",
+                SnapshotKind::Actionable,
+                120_000,
+                Some((7, "https://example.com/")),
+                None,
+                &[],
+                &mut clock,
+            )
+            .unwrap();
+        assert_eq!(
+            clock.now().duration_since(start),
+            Duration::from_millis(crate::budgets::CDP_STEP_MS)
+        );
+        assert!(observation.ax_truncated && observation.refs_truncated);
+        assert_eq!(
+            observation.refs[0].classification,
+            Err(ClassificationUnavailable::DomReadFailed)
+        );
+        assert_eq!(
+            observation.facts["e1"].classification_unavailable,
+            Some("dom_read_failed")
+        );
+        assert_eq!(driver.transport.pending_len(), 0);
+        assert!(!driver.transport.is_closed());
+    }
+
+    #[test]
+    fn ax_cache_changes_between_reads_are_partial_but_conflicting_replies_fail() {
+        for conflicting_reply in [false, true] {
+            let observation = traverse_ax_tree(
+                raw_node(
+                    "root",
+                    "RootWebArea",
+                    "Changing",
+                    &["parent"],
+                    1,
+                    Some("frame-own"),
+                ),
+                "target-own",
+                MAX_AX_NODES,
+                MAX_AX_DEPTH,
+                |id, _| match id {
+                    "root" => Ok(vec![
+                        raw_node("parent", "group", "Parent", &["cached", "fresh"], 2, None),
+                        raw_node("cached", "button", "Old", &[], 3, None),
+                    ]),
+                    "parent" => {
+                        let mut nodes = vec![
+                            raw_node("cached", "button", "New", &[], 3, None),
+                            raw_node("fresh", "button", "Fresh", &[], 4, None),
+                        ];
+                        if conflicting_reply {
+                            nodes.push(raw_node("cached", "button", "Ambiguous", &[], 5, None));
+                        }
+                        Ok(nodes)
+                    }
+                    _ => panic!("unexpected child query {id}"),
+                },
+            );
+            if conflicting_reply {
+                assert_eq!(observation, Err(NavigationDriveError::CdpFailure));
+            } else {
+                let observation = observation.unwrap();
+                assert!(observation.ax_truncated && observation.refs_truncated);
+                assert_eq!(
+                    observation
+                        .records
+                        .iter()
+                        .map(|record| record.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["Changing", "Parent", "New", "Fresh"]
+                );
+            }
+        }
     }
 
     fn event(method: &str, params: Value) -> CdpEvent {
