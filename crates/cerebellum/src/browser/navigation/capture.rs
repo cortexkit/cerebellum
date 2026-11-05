@@ -47,9 +47,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             )
             .ok()?;
         let nodes = required_ax_nodes(&result).ok()?;
-        if nodes.len() > MAX_AX_NODES {
-            return None;
-        }
+        // A tree larger than the capture limit is still walked from memory:
+        // the walk below stops at MAX_AX_NODES and marks the observation
+        // partial. Falling back to the incremental walker instead would refetch
+        // the same prefix one node per round trip (seconds on a large page).
         let mut by_id = HashMap::new();
         for node in nodes {
             if by_id.insert(node.node_id.clone(), node).is_some() {
@@ -207,5 +208,58 @@ mod tests {
                     <= Duration::from_millis(crate::budgets::CDP_STEP_MS)
             );
         }
+    }
+
+    /// A real heavy page (a long GitHub issue) returns more AX nodes than the
+    /// capture limit. Rejecting that reply made the incremental walker refetch
+    /// the same prefix with about 800 `getChildAXNodes` round trips, which ran
+    /// the snapshot into its deadline before classification could start.
+    #[test]
+    fn an_oversized_bulk_tree_is_walked_from_memory_up_to_the_capture_limit() {
+        // 100 comment-like groups of 50 buttons: more nodes than the capture
+        // limit, in the shape of a real page rather than one huge fan-out.
+        let group_ids = (0..100).map(|g| format!("group-{g}")).collect::<Vec<_>>();
+        let groups = group_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let root = ax_node("root", "RootWebArea", "Huge", &groups, 1, Some("frame-own"));
+        let mut nodes = vec![root.clone()];
+        let mut backend = 2;
+        for (g, group) in group_ids.iter().enumerate() {
+            let items = (0..50).map(|i| format!("item-{g}-{i}")).collect::<Vec<_>>();
+            let item_refs = items.iter().map(String::as_str).collect::<Vec<_>>();
+            nodes.push(ax_node(
+                group,
+                "group",
+                &format!("Group {g}"),
+                &item_refs,
+                backend,
+                None,
+            ));
+            backend += 1;
+            for item in &items {
+                nodes.push(ax_node(item, "button", item, &[], backend, None));
+                backend += 1;
+            }
+        }
+        assert!(nodes.len() > MAX_AX_NODES);
+        let mut driver = bulk_driver([
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{"node":root}}),
+            json!({"id":3,"sessionId":"session-own","result":{"nodes":nodes}}),
+        ]);
+        let mut clock = FakeClock::new();
+        let observation = driver
+            .snapshot_for_test("route-own", SnapshotKind::Ax, 30_000, &mut clock)
+            .unwrap();
+        assert!(observation.ax_truncated && observation.refs_truncated);
+        assert_eq!(observation.records.len(), MAX_AX_NODES);
+        assert_eq!(observation.records[1].name, "Group 0");
+        assert!(
+            !driver
+                .pipe
+                .writes
+                .iter()
+                .any(|w| w["method"] == "Accessibility.getChildAXNodes"),
+            "the bulk tree must not be refetched node by node"
+        );
     }
 }
