@@ -1960,13 +1960,17 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let ax_phase = crate::budgets::PhaseDeadline::new(
             clock.now(),
             crate::budgets::AX_CHILDREN_PHASE_MS,
-            deadline,
+            // AX incompleteness must leave time to classify the refs already
+            // observed. The DOM allowance is part of, not added to, this read.
+            deadline
+                - Duration::from_millis(deadline_ms / 3)
+                    .min(Duration::from_millis(crate::budgets::CDP_STEP_MS)),
         );
         self.command(
             "Accessibility.enable",
             None,
             Some(attachment.session_id.clone()),
-            snapshot_step_deadline(deadline, bounded, clock.now()),
+            ax_phase.step_deadline(clock.now(), crate::budgets::CDP_STEP_MS),
             None,
             clock,
         )?;
@@ -2052,7 +2056,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         .clone()
                 }),
                 Some(attachment.session_id.clone()),
-                snapshot_step_deadline(deadline, bounded, clock.now()),
+                ax_phase.step_deadline(clock.now(), crate::budgets::CDP_STEP_MS),
                 None,
                 clock,
             )?;
@@ -2096,7 +2100,6 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         } else {
             None
         };
-        let mut ax_children_timed_out = false;
         let mut observation = if let Some(observation) = bulk {
             observation
         } else {
@@ -2115,17 +2118,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         "Accessibility.getChildAXNodes",
                         Some(params),
                         Some(session_id.clone()),
-                        if bounded {
-                            ax_phase.step_deadline(clock.now(), crate::budgets::CDP_STEP_MS)
-                        } else {
-                            deadline
-                        },
+                        ax_phase.step_deadline(clock.now(), crate::budgets::CDP_STEP_MS),
                         None,
                         clock,
                     );
-                    if matches!(result, Err(NavigationDriveError::CommandDeadline { .. })) {
-                        ax_children_timed_out = true;
-                    }
                     let result = result?;
                     let mut nodes = required_ax_nodes(&result)
                         .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))?;
@@ -2169,10 +2165,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         };
         // A structural AX cut says nothing about the DOM's availability. Capture
         // real form facts even for a partial outline, since filters can expose
-        // any of its refs. Bound this read, and do not prolong an AX timeout.
-        let snapshot_dom = if ax_children_timed_out {
-            Some(Err(ClassificationUnavailable::NotCaptured))
-        } else if let Some(dom) = &zoom_dom {
+        // any of its refs. An unrelated child timeout cannot supply or erase
+        // those facts; only the DOM read determines each ref's classification.
+        let snapshot_dom = if let Some(dom) = &zoom_dom {
             Some(parse_flattened_dom_nodes(dom))
         } else if classification_context.is_some() || mode == SnapshotKind::Actionable {
             Some(
@@ -4812,11 +4807,11 @@ where
                     continue;
                 }
                 Err(NavigationDriveError::CommandDeadline { .. }) => {
-                    // The already observed prefix is usable even when a large
-                    // subtree exceeds the capture budget. Never claim it is complete.
+                    // A stalled subtree does not invalidate observed siblings.
+                    // Continue through cached nodes under the same phase deadline.
                     ax_truncated = true;
                     refs_truncated = true;
-                    break;
+                    continue;
                 }
                 Err(error) => return Err(error),
             };
@@ -5249,6 +5244,7 @@ mod tests {
     pub(super) struct FakePipe {
         pub(super) writes: Vec<Value>,
         reads: VecDeque<Vec<u8>>,
+        on_write: HashMap<u64, Value>,
     }
 
     impl FakePipe {
@@ -5264,14 +5260,30 @@ mod tests {
             Self {
                 writes: Vec::new(),
                 reads,
+                on_write: HashMap::new(),
+            }
+        }
+
+        fn on_write_frames(frames: impl IntoIterator<Item = Value>) -> Self {
+            Self {
+                on_write: frames
+                    .into_iter()
+                    .map(|frame| (frame["id"].as_u64().unwrap(), frame))
+                    .collect(),
+                ..Self::default()
             }
         }
     }
 
     impl CdpPipeIo for FakePipe {
         fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
-            self.writes
-                .push(serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap());
+            let request: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+            if let Some(frame) = self.on_write.remove(&request["id"].as_u64().unwrap()) {
+                let mut bytes = serde_json::to_vec(&frame).unwrap();
+                bytes.push(0);
+                self.reads.push_back(bytes);
+            }
+            self.writes.push(request);
             Ok(())
         }
 
@@ -5366,10 +5378,16 @@ mod tests {
             raw_name: None,
             classification: Err(ClassificationUnavailable::NotCaptured),
         };
-        let mut driver = attached_driver([
+        let mut driver = attached_driver([]);
+        driver.pipe = FakePipe::on_write_frames([
             json!({"id":1,"sessionId":"session-own","result":{}}),
             json!({"id":2,"sessionId":"session-own","result":{"nodes":[
                 ax_node("tail", "row", "Tail", &["child"], 90, None)
+            ]}}),
+            // The child read stalls, but classification has its own reserved time.
+            json!({"id":4,"sessionId":"session-own","result":{}}),
+            json!({"id":5,"sessionId":"session-own","result":{"nodes":[
+                {"nodeId":1,"backendNodeId":90,"nodeType":1,"localName":"div","attributes":[]}
             ]}}),
         ]);
         let mut clock = FakeClock::new();
@@ -5489,6 +5507,132 @@ mod tests {
             assert_eq!(record.is_credential_field(), input_type == "password");
             assert_eq!(record.financial, autocomplete == "cc-number");
         }
+    }
+
+    #[test]
+    fn filtered_ref_stays_clickable_after_an_ad_child_read_stalls() {
+        let dom = json!({"nodes":[
+            {"nodeId":1,"backendNodeId":1,"nodeType":9,"localName":"#document"},
+            {"nodeId":2,"backendNodeId":60,"parentId":1,"nodeType":1,"localName":"button","attributes":["type","button"]},
+            {"nodeId":3,"backendNodeId":70,"parentId":1,"nodeType":1,"localName":"iframe","attributes":[]},
+        ]});
+        let mut driver = attached_driver([]);
+        driver.pipe = FakePipe::on_write_frames([
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","Thread", &["button","ad"],1,Some("frame-main"))}}),
+            json!({"id":3,"sessionId":"session-own","result":{"nodes":[
+                ax_node("button","button","7 more replies", &[],60,None),
+                ax_node("ad","Iframe","Video ad", &["stalled"],70,None),
+            ]}}),
+            // Command 4, the ad's child read, never answers.
+            json!({"id":5,"sessionId":"session-own","result":{}}),
+            json!({"id":6,"sessionId":"session-own","result":dom}),
+        ]);
+        let mut clock = FakeClock::new();
+        let started = clock.now();
+        let observation = driver
+            .snapshot_with_clock(
+                "route-own",
+                SnapshotKind::Actionable,
+                30_000,
+                Some((7, "https://example.com/")),
+                None,
+                &[],
+                &mut clock,
+            )
+            .unwrap();
+        let rendered = state_text::render(&state_text::RenderInput {
+            records: &observation.records,
+            facts: &observation.facts,
+            filters: &state_text::Filters {
+                text: Some("more repl".into()),
+                roles: Vec::new(),
+            },
+            page_url: "https://example.com/",
+            snapshot_id: "0123456789abcdef0123456789abcdef",
+            zoom: None,
+            max_bytes: 30_000,
+        });
+        assert!(
+            rendered.text.contains("e2 button 7 more replies"),
+            "{}",
+            rendered.text
+        );
+        let printed: Vec<_> = observation
+            .refs
+            .iter()
+            .filter(|r| rendered.printed_refs.contains(&r.captured.reference))
+            .cloned()
+            .collect();
+        let candidates: Vec<_> = printed
+            .iter()
+            .enumerate()
+            .map(|(index, r)| RefCandidate {
+                identity: r.backend_identity.clone(),
+                frame_path: r.frame_path.clone(),
+                role: r.captured.role.clone(),
+                name: r.captured.name.clone(),
+                traversal_index: index,
+            })
+            .collect();
+        let snapshot_id = new_snapshot_id("filtered-thread");
+        let mut store = BrowserSnapshotStore::new(1).unwrap();
+        store
+            .retain_text(TextSnapshot {
+                snapshot_id: snapshot_id.clone(),
+                kind: SnapshotKind::Actionable,
+                document_epoch: 7,
+                source_origin: "https://example.com/".into(),
+                source_document: None,
+                content_schema: crate::snapshot_store::STATE_TEXT_SCHEMA,
+                content: rendered.text,
+                truncated: true,
+                refs_truncated: true,
+                refs: printed,
+            })
+            .unwrap();
+        let RefResolution::Resolved(reference) = store
+            .resolve_ref(&snapshot_id, "e2", 7, &candidates)
+            .unwrap()
+        else {
+            panic!("a ref printed by a filtered partial snapshot must resolve");
+        };
+        let classified = reference
+            .classification
+            .as_ref()
+            .expect("a stalled ad must not poison the top-document button");
+        assert_eq!(classified.required_tier, 2);
+        assert!(!classified.is_credential_field() && !classified.financial);
+        assert!(clock.now().duration_since(started) < Duration::from_secs(30));
+
+        let quad = json!([[10., 20., 34., 20., 34., 52., 10., 52.]]);
+        let mut click = attached_driver([
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":dom}),
+            json!({"id":3,"sessionId":"session-own","result":{"quads":quad}}),
+            json!({"id":4,"sessionId":"session-own","result":{}}),
+            json!({"id":5,"sessionId":"session-own","result":{"quads":quad}}),
+            json!({"id":6,"sessionId":"session-own","result":layout_metrics(0.,0.,1280.,713.)}),
+            json!({"id":7,"sessionId":"session-own","result":{"backendNodeId":60,"frameId":"frame-main"}}),
+            json!({"id":8,"sessionId":"session-own","result":{}}),
+            json!({"id":9,"sessionId":"session-own","result":dom}),
+            json!({"id":10,"sessionId":"session-own","result":{}}),
+            json!({"id":11,"sessionId":"session-own","result":{}}),
+            json!({"id":12,"sessionId":"session-own","result":{}}),
+            json!({"id":13,"sessionId":"session-own","result":{}}),
+        ]);
+        let mut events = Vec::new();
+        click
+            .click_with_clock(
+                "route-own",
+                reference.backend_identity.as_ref().unwrap(),
+                1000,
+                &mut |event| events.push(event),
+                Some((7, "https://example.com/", Some(classified))),
+                &mut clock,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 2);
     }
 
     #[test]

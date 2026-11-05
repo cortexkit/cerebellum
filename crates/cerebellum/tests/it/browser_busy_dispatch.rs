@@ -815,6 +815,31 @@ async fn assert_snapshot_step_and_recovery(
     let refused = plane
         .dispatch(&route, BrowserCapability::Snapshot, &request)
         .await;
+    if step == "DOM.getFrameOwner"
+        && fault.is_some_and(|fault| {
+            matches!(
+                fault.kind,
+                SnapshotFaultKind::Error | SnapshotFaultKind::BadResult
+            )
+        })
+    {
+        // A valid CDP envelope with an unusable owner is confined to that
+        // embedded document. Transport/envelope corruption still fails below.
+        assert_eq!(refused["outcome"], "ok", "{refused}");
+        assert_eq!(refused["truncated"], true);
+        assert_eq!(refused["refs_truncated"], true);
+        let text = refused["state_text"].as_str().unwrap();
+        assert!(
+            text.contains("Event row") && text.contains("frame frame-child unread"),
+            "{refused}"
+        );
+        assert!(!plane.journal_export_for_test().await.contains(PRIVATE_NAME));
+        let recovered = plane
+            .dispatch(&route, BrowserCapability::Snapshot, &request)
+            .await;
+        assert_eq!(recovered["outcome"], "ok", "{recovered}");
+        return;
+    }
     assert_eq!(refused["outcome"], "internal_error", "{step}: {refused}");
     assert_eq!(refused["detail"]["reason_code"], "cdp_failure", "{refused}");
     assert_eq!(refused["detail"]["step"], step, "{refused}");
@@ -1270,24 +1295,59 @@ async fn snapshot_disappearance_classifier_does_not_swallow_other_errors() {
         ),
         ("Accessibility.getChildAXNodes", "Invalid ID", -32603),
         ("Accessibility.getRootAXNode", "Invalid ID", -32602),
-        (
-            "DOM.getFrameOwner",
-            "Session with given id not found.",
-            -32000,
-        ),
     ] {
         assert_snapshot_step_and_recovery(
             Some(SnapshotFault {
                 method: step,
                 kind: SnapshotFaultKind::Gone { message, code },
             }),
-            step == "DOM.getFrameOwner",
-            step == "DOM.getFrameOwner",
+            false,
+            false,
             step,
             "ax",
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn snapshot_failed_frame_owner_discloses_unread_frame_and_recovers() {
+    let (plane, route, _) = fixture_with_fault(
+        None,
+        42,
+        None,
+        Some(SnapshotFault {
+            method: "DOM.getFrameOwner",
+            kind: SnapshotFaultKind::Gone {
+                message: "Session with given id not found.",
+                code: -32000,
+            },
+        }),
+        true,
+        true,
+    )
+    .await;
+    let snapshot = plane
+        .dispatch(&route, BrowserCapability::Snapshot, &json!({}))
+        .await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert_eq!(snapshot["truncated"], true);
+    assert!(
+        snapshot["state_text"].as_str().unwrap().contains("unread"),
+        "{snapshot}"
+    );
+    assert!(
+        snapshot["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("Surviving sibling"),
+        "{snapshot}"
+    );
+    let recovered = plane
+        .dispatch(&route, BrowserCapability::Snapshot, &json!({}))
+        .await;
+    assert_eq!(recovered["outcome"], "ok", "{recovered}");
+    assert_eq!(recovered["truncated"], false);
 }
 
 #[tokio::test]
