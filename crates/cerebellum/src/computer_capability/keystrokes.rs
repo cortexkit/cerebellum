@@ -119,8 +119,8 @@ impl FocusRefusal {
 }
 
 /// Read the target application's own focused element and refuse a secure
-/// one. `Ok(None)` when no focused element can be found: there is no field to
-/// protect, and nothing to confirm typing against either.
+/// one. `Ok(None)` requires a complete fallback read with no focused element:
+/// an unreadable or cut tree cannot establish the absence of a secure field.
 ///
 /// Some applications report no focused element at the application level
 /// while one of their elements carries its own focused flag: a backgrounded
@@ -172,9 +172,9 @@ fn flagged_focus(
             collect(&node.children, out);
         }
     }
-    let Ok(read) = source.read_app_state(grant, ReadBounds::default()) else {
-        return Ok(None);
-    };
+    let read = source
+        .read_app_state(grant, ReadBounds::default())
+        .map_err(|_| FocusRefusal::Unreadable)?;
     let mut flagged = Vec::new();
     collect(&read.roots, &mut flagged);
     for handle in &flagged {
@@ -184,6 +184,9 @@ fn flagged_focus(
         if facts.is_secure() {
             return Err(FocusRefusal::Secure);
         }
+    }
+    if flagged.is_empty() && (read.read_bound_reached || read.unreadable_subtrees > 0) {
+        return Err(FocusRefusal::Unreadable);
     }
     Ok(match flagged.len() {
         1 => flagged.pop(),

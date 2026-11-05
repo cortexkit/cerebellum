@@ -725,6 +725,9 @@ pub struct DeskState {
     pub dispatched_at: Vec<tokio::time::Instant>,
     pub cursor_visible: bool,
     pub roots: Vec<RawElement>,
+    pub read_error: Option<AppStateReadError>,
+    pub read_bound_reached: bool,
+    pub unreadable_subtrees: usize,
     /// Swapped in for `roots` by the first press, menu opening or write, so
     /// the diff that follows has something to report.
     pub after_action: Option<Vec<RawElement>>,
@@ -809,6 +812,9 @@ impl Desk {
             dispatched_at: Vec::new(),
             cursor_visible: false,
             roots,
+            read_error: None,
+            read_bound_reached: false,
+            unreadable_subtrees: 0,
             after_action: None,
             focus_after_action: None,
             focused_in_tree: None,
@@ -934,11 +940,14 @@ impl AppStateSource for Desk {
         _bounds: ReadBounds,
     ) -> Result<RawAppState, AppStateReadError> {
         let state = self.state();
+        if let Some(error) = state.read_error {
+            return Err(error);
+        }
         Ok(RawAppState {
             roots: state.roots.clone(),
             focused: state.focused_in_tree.map(fixture_handle),
-            unreadable_subtrees: 0,
-            read_bound_reached: false,
+            unreadable_subtrees: state.unreadable_subtrees,
+            read_bound_reached: state.read_bound_reached,
         })
     }
 
