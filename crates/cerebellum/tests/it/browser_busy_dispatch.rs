@@ -22,7 +22,10 @@ struct SnapshotFault {
     kind: SnapshotFaultKind,
 }
 
+use crate::scoped_fixture;
+
 struct FixturePipe {
+    scoped: scoped_fixture::ScopedDom,
     reads: VecDeque<Vec<u8>>,
     held: Option<Value>,
     block_once: Option<&'static str>,
@@ -72,7 +75,16 @@ impl CdpPipeIo for FixturePipe {
         let command: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
         self.commands.lock().unwrap().push(command.clone());
         let method = command["method"].as_str().unwrap();
+        let mut scoped_dom = dom();
+        if self.attachment.is_some() {
+            scoped_dom["nodes"][1]["localName"] = json!("a");
+            scoped_dom["nodes"][1]["attributes"] =
+                json!(["href", "https://requested.example.com/attachment"]);
+        }
         let result = match method {
+            _ if scoped_fixture::ScopedDom::handles(&command) => {
+                self.scoped.answer(&command, &scoped_dom).unwrap()
+            }
             "Browser.setDownloadBehavior" => {
                 assert!(
                     command.get("sessionId").is_none(),
@@ -202,6 +214,13 @@ impl CdpPipeIo for FixturePipe {
         }
         if self.fault.is_some_and(|fault| {
             fault.method == method
+                && (!matches!(
+                    method,
+                    "DOM.resolveNode"
+                        | "Runtime.callFunctionOn"
+                        | "Runtime.getProperties"
+                        | "DOM.describeNode"
+                ) || self.scoped.target == 43)
                 && (!matches!(fault.kind, SnapshotFaultKind::Gone { .. })
                     || method != "Accessibility.getChildAXNodes"
                     || command["params"]["id"] == "2")
@@ -390,6 +409,7 @@ async fn fixture_with_fault(
     let route = identity();
     let commands = Arc::new(Mutex::new(Vec::new()));
     let pipe = FixturePipe {
+        scoped: scoped_fixture::ScopedDom::default(),
         reads: VecDeque::new(),
         held: None,
         block_once: if block_once == Some("timeout_then_churn") {
@@ -700,7 +720,7 @@ async fn busy_snapshot_large_fanout_is_partial_without_requesting_the_huge_subtr
         .lock()
         .unwrap()
         .iter()
-        .any(|c| c["method"] == "DOM.getFlattenedDocument"));
+        .any(|c| c["method"] == "Runtime.getProperties"));
     assert_eq!(
         commands
             .lock()
@@ -721,6 +741,7 @@ async fn an_attachment_click_is_blocked_without_writing_downloads_even_after_rel
         let route = identity();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let pipe = FixturePipe {
+            scoped: scoped_fixture::ScopedDom::default(),
             reads: VecDeque::new(),
             held: None,
             block_once: None,
@@ -1091,7 +1112,14 @@ async fn snapshot_ax_declared_child_missing_names_get_child_ax_nodes() {
 
 #[tokio::test]
 async fn snapshot_dom_classification_error_keeps_observation_usable() {
-    for step in ["DOM.enable", "DOM.getFlattenedDocument"] {
+    for step in [
+        "DOM.enable",
+        "Page.createIsolatedWorld",
+        "DOM.resolveNode",
+        "Runtime.callFunctionOn",
+        "Runtime.getProperties",
+        "DOM.describeNode",
+    ] {
         let (plane, route, _) = fixture_with_fault(
             None,
             42,
@@ -1121,12 +1149,10 @@ async fn snapshot_dom_classification_error_keeps_observation_usable() {
                 let reason = if step == "DOM.enable" {
                     "dom_enable_refused"
                 } else {
-                    "flattened_document_refused"
+                    "dom_read_failed"
                 };
                 assert!(
-                    snapshot["state_text"].as_str().unwrap().contains(&format!(
-                        "Classification unavailable for 3 captured refs: {reason}"
-                    )),
+                    snapshot["state_text"].as_str().unwrap().contains(reason),
                     "{snapshot}"
                 );
             }
@@ -1198,8 +1224,8 @@ async fn snapshot_disappearing_ax_node_omits_only_its_subtree_and_continues() {
                         .iter()
                         .filter(|command| command["method"] == "DOM.getFlattenedDocument")
                         .count(),
-                    1,
-                    "surviving refs still need one bounded DOM classification read"
+                    0,
+                    "snapshot classification must not flatten the whole document"
                 );
             }
             let recovered = plane
