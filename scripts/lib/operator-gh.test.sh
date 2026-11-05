@@ -5,7 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESOLVER="$SCRIPT_DIR/operator-gh.sh"
 BASH_BIN="$(command -v bash)"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/operator-gh-test.XXXXXX")"
-trap 'rm -rf "$TMP_DIR"' EXIT
+source "$SCRIPT_DIR/fail-closed-exit.sh"
+trap 'fail_closed_exit rm -rf "$TMP_DIR"' EXIT
 
 SHIM_DIR="$TMP_DIR/fake/cortexkit/aft/shims"
 SHIM_TARGET_DIR="$TMP_DIR/fake/cortexkit/bin"
@@ -49,3 +50,4 @@ fi
 echo "operator-gh.test.sh: selected upstream gh after skipping shim"
 echo "operator-gh.test.sh: reported missing upstream gh without fallback roots"
 echo "operator-gh.test.sh: passed"
+finished=1

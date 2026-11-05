@@ -5,7 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCAN="$SCRIPT_DIR/ckdev-naming-scan.py"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ckdev-naming-scan.XXXXXX")"
-trap 'rm -rf "$TMP_DIR"' EXIT
+source "$SCRIPT_DIR/fail-closed-exit.sh"
+trap 'fail_closed_exit rm -rf "$TMP_DIR"' EXIT
 
 failures=0
 checks=0
@@ -79,3 +80,4 @@ if [ "$failures" -ne 0 ]; then
   exit 1
 fi
 echo "ckdev-naming-scan.test.sh: $checks checks passed"
+finished=1

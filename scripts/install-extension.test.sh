@@ -11,7 +11,8 @@ INSTALL="$SCRIPT_DIR/install-extension.sh"
 SOURCE="$SCRIPT_DIR/../extension"
 
 TMP_DIR="$(mktemp -d /tmp/ck-install-extension-test.XXXXXX)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+source "$SCRIPT_DIR/lib/fail-closed-exit.sh"
+trap 'fail_closed_exit rm -rf "$TMP_DIR"' EXIT
 
 failures=0
 checks=0
@@ -100,3 +101,4 @@ check "the default install has the source's revision" \
 
 echo "install-extension.sh: $checks checks, $failures failed"
 [ "$failures" -eq 0 ]
+finished=1

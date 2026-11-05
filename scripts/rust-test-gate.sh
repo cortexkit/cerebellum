@@ -53,7 +53,9 @@ release_gate_lock() {
 }
 
 acquire_gate_lock "$GATE_LOCK"
-trap release_gate_lock EXIT INT TERM HUP QUIT
+source "$repo_root/scripts/lib/fail-closed-exit.sh"
+trap 'fail_closed_exit release_gate_lock' EXIT
+trap release_gate_lock INT TERM HUP QUIT
 parallel_phase_dir="$gate_target_dir/rust-test-gate-phases.$$"
 mkdir "$parallel_phase_dir"
 
@@ -515,3 +517,4 @@ fi
 # true on Fedora and Arch and false on Debian and Ubuntu, and no local run could
 # have seen either one.
 echo "        (host tests + cross-lint only; Linux-gated tests run in CI, not here)"
+finished=1

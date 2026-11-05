@@ -207,7 +207,9 @@ find_unlisted_identifiers() {
 # non-matching prefixes are ignored; planting an unlisted identifier proves
 # missing attestations fail the comparison.
 control_scratch="$(mktemp -d "${TMPDIR:-/tmp}/module-wiring-control.XXXXXX")"
-trap 'rm -rf "$control_scratch"' EXIT INT TERM
+source scripts/lib/fail-closed-exit.sh
+trap 'fail_closed_exit rm -rf "$control_scratch"' EXIT
+trap 'rm -rf "$control_scratch"' INT TERM
 
 cat >"$control_scratch/planted.rs" <<'EOF'
 // split-form

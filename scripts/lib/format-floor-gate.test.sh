@@ -14,7 +14,8 @@ GATE="$SCRIPT_DIR/format-floor-gate.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/format-floor-gate-test.XXXXXX")"
-trap 'rm -rf "$TMP_DIR"' EXIT
+source "$SCRIPT_DIR/fail-closed-exit.sh"
+trap 'fail_closed_exit rm -rf "$TMP_DIR"' EXIT
 
 failures=0
 checks=0
@@ -145,3 +146,4 @@ expect "an unreadable floor file stops the gate" 2 "$home" "cannot be read"
 
 echo "$checks checks, $failures failed"
 [ "$failures" -eq 0 ]
+finished=1

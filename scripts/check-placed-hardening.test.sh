@@ -22,7 +22,8 @@ STAGE="$SCRIPT_DIR/stage.sh"
 SOURCE_BINARY=/usr/bin/true
 
 TMP_DIR="$(mktemp -d /tmp/ck-placed-hardening-test.XXXXXX)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+source "$SCRIPT_DIR/lib/fail-closed-exit.sh"
+trap 'fail_closed_exit rm -rf "$TMP_DIR"' EXIT
 
 failures=0
 checks=0
@@ -128,3 +129,4 @@ if [ "$failures" -ne 0 ]; then
   exit 1
 fi
 echo "check-placed-hardening: all $checks cases passed"
+finished=1

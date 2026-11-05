@@ -94,7 +94,8 @@ fi
 # script resolves no data home itself, so it cannot disagree with the module
 # about where the floors are.
 FORMAT_VERSIONS="$(mktemp)"
-trap 'rm -f "$FORMAT_VERSIONS"' EXIT
+source scripts/lib/fail-closed-exit.sh
+trap 'fail_closed_exit rm -f "$FORMAT_VERSIONS"' EXIT
 ./scripts/lib/format-floor-gate.sh "$FORMAT_VERSIONS"
 
 # Unfiltered and unpiped: this script's refusals must reach the terminal. The
@@ -312,3 +313,4 @@ echo "Then install the Chrome extension staged with this build, so the copy Chro
 echo "runs speaks the same contract, and ask the person to reload it in"
 echo "chrome://extensions:"
 echo "    scripts/install-extension.sh $STAGE/extension"
+finished=1

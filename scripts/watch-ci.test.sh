@@ -5,7 +5,8 @@ set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/watch-ci-test.XXXXXX")"
-trap 'rm -rf "$scratch"' EXIT
+source "$root/scripts/lib/fail-closed-exit.sh"
+trap 'fail_closed_exit rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/bin"
 failures=0
 
@@ -77,4 +78,5 @@ WATCH_TARGET=$head_sha run_case refused_lookups_do_not_use_attempts 0 \
 WATCH_TARGET=$head_sha run_case refusals_past_patience_give_up 2 \
   LIST_FAILS=1000 WATCH_CI_API_PATIENCE=0 CONCLUSION=success FAILED_JOBS=""
 
-[ "$failures" = 0 ]
+[ "$failures" = 0 ] || exit 1
+finished=1

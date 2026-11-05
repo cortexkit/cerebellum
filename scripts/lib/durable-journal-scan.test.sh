@@ -11,7 +11,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCAN="$SCRIPT_DIR/durable-journal-scan.py"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/durable-journal-scan-test.XXXXXX")"
-trap 'rm -rf "$TMP_DIR"' EXIT
+source "$SCRIPT_DIR/fail-closed-exit.sh"
+trap 'fail_closed_exit rm -rf "$TMP_DIR"' EXIT
 
 failures=0
 checks=0
@@ -215,3 +216,4 @@ if [ "$failures" -ne 0 ]; then
   exit 1
 fi
 echo "durable-journal-scan.test.sh: $checks checks passed"
+finished=1

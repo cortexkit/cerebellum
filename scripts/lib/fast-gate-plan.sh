@@ -23,6 +23,8 @@ workspace_wide = any(
 )
 selected_packages = set()
 selected_suites = set()
+if any(path.startswith("scripts/") for path in files):
+    print("A|shell-exit-traps")
 
 # Some sources live at the repo root but are compiled into a crate with
 # include_str!, so a path-containment match never selects that crate. Map them
