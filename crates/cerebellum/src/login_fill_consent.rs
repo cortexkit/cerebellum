@@ -16,8 +16,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::browser::fill::{
-    Approval, FillPlan, FillRefusal, LoginMaterialSource, SecretUseAnswer, SecretUseRequest,
-    SourceUnavailable,
+    Approval, FillPlan, FillRefusal, LoginMaterial, LoginMaterialSource, SecretUseAnswer,
+    SecretUseRequest, SourceUnavailable,
 };
 use crate::browser::BrowserError;
 use crate::cingulate_client::card::{consent_request, CardKind};
@@ -183,7 +183,7 @@ async fn serve_inner(
     }
     let result = match ask(source.as_ref(), &secret_use).await {
         Ok(SecretUseAnswer::Released(material)) => {
-            browser.fill_planned_login(identity, plan, material).await
+            fill_released(planes, facts, plan, material).await
         }
         Ok(SecretUseAnswer::ApprovalRequired(approval)) => {
             return Box::pin(approve_then_fill(
@@ -202,6 +202,29 @@ async fn serve_inner(
         Err(SourceUnavailable) => Err(BrowserError::FillRefused(FillRefusal::VaultUnavailable)),
     };
     browser.finish_fill_reply(browser.fill_reply(identity, result).await)
+}
+
+async fn fill_released(
+    planes: &Planes,
+    facts: &AcceptedBindFacts,
+    plan: FillPlan,
+    material: LoginMaterial,
+) -> Result<Value, BrowserError> {
+    // Credentials can reach the page even if insertion later aborts or the
+    // person never submits. Retain privacy evidence before dispatch, not only
+    // after a successful reply. A failed write makes the evidence fail closed.
+    let identity = &facts.identity;
+    let profile = crate::browser_signed_in::SignedInDomains::profile_name(identity);
+    planes
+        .signed_in
+        .record(&identity.agent_project_id, &profile, &plan.origin)
+        .map_err(|_| BrowserError::Internal {
+            reason_code: crate::journal::JournalReasonCode::InternalFailure,
+        })?;
+    planes
+        .browser
+        .fill_planned_login(identity, plan, material)
+        .await
 }
 
 async fn refuse(
@@ -332,7 +355,7 @@ async fn approve_then_fill(
                 Err(error) => Err(error),
                 Ok(()) => match ask(source, secret_use).await {
                     Ok(SecretUseAnswer::Released(material)) => {
-                        browser.fill_planned_login(identity, plan, material).await
+                        fill_released(planes, facts, plan, material).await
                     }
                     Ok(_) => Err(BrowserError::FillRefused(FillRefusal::LoginUnavailable)),
                     Err(SourceUnavailable) => {

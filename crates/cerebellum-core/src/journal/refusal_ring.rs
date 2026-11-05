@@ -42,8 +42,8 @@ impl RefusalRingConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RefusalRecord<R> {
-    /// The address exactly as presented to the authorization decision. This must
-    /// never be enriched with a page title, body, or other target data: letting an
+    /// The claimed address, reduced to its origin when it is URL-shaped. This
+    /// must never be enriched with a page title, body, or other target data: letting an
     /// unauthorized attempt trigger a privileged read would make auditing itself
     /// an exfiltration path.
     pub claimed_addressing: String,
@@ -244,11 +244,17 @@ where
         reason: R,
     ) -> Result<(), RefusalRingError> {
         let caller = caller.into();
+        let claimed_addressing = claimed_addressing.into();
+        let claimed_addressing = if claimed_addressing.contains("://") {
+            reduce_url_to_origin(&claimed_addressing)
+        } else {
+            claimed_addressing
+        };
         let mut next = self.state.clone();
         let history = next.callers.entry(caller).or_default();
         history.total_count = history.total_count.saturating_add(1);
         history.records.push_back(RefusalRecord {
-            claimed_addressing: claimed_addressing.into(),
+            claimed_addressing,
             reason,
         });
         if history.records.len() > self.config.records_per_caller {
@@ -284,6 +290,50 @@ where
         let bytes = serde_json::to_vec(state)
             .map_err(|error| RefusalRingError::Serialization(error.to_string()))?;
         write_atomically(path, &bytes)
+    }
+}
+
+/// A durable address keeps only its HTTP(S) origin, never login material or a
+/// private path. Other URL schemes have no retained web origin.
+pub fn reduce_url_to_origin(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
+        None => return "null".to_string(),
+    };
+    if scheme != "http" && scheme != "https" {
+        return "null".to_string();
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, value)| value);
+    if authority.is_empty() {
+        return "null".to_string();
+    }
+    let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
+        let Some(close) = stripped.find(']') else {
+            return "null".to_string();
+        };
+        (
+            &authority[..close + 2],
+            authority[close + 2..].strip_prefix(':'),
+        )
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return "null".to_string();
+    }
+    let host = host.to_ascii_lowercase();
+    let default_port = if scheme == "http" { "80" } else { "443" };
+    match port {
+        Some(port) if !port.is_empty() && port != default_port => {
+            format!("{scheme}://{host}:{port}")
+        }
+        _ => format!("{scheme}://{host}"),
     }
 }
 
@@ -415,28 +465,80 @@ mod tests {
     }
 
     #[test]
+    fn url_shaped_app_targets_never_persist_path_query_or_fragment_tokens() {
+        const TOKEN: &str = "refused-app-url-token-278d";
+        const ADDRESS: &str = "https://user:password@host.example:8443/refused-app-url-token-278d/Alfonso?code=refused-app-url-token-278d#refused-app-url-token-278d";
+        let directory = temporary_directory();
+        let path = directory.join("refusals.json");
+        let mut ring = RefusalRing::new(&path, config(2)).unwrap();
+        ring.record_refusal("caller", ADDRESS, Reason::OriginScope)
+            .unwrap();
+        ring.record_refusal("caller", "/Applications/Alfonso.app", Reason::OriginScope)
+            .unwrap();
+        let mut planted = ring.state().clone();
+        planted.callers.get_mut("caller").unwrap().records[0].claimed_addressing = ADDRESS.into();
+        assert!(
+            String::from_utf8(serde_json::to_vec(&planted).unwrap())
+                .unwrap()
+                .contains(TOKEN),
+            "the scanner must detect a URL token planted in a real refusal record"
+        );
+        let durable = fs::read_to_string(&path).unwrap();
+        assert!(
+            !durable.contains(TOKEN),
+            "URL-shaped app address leaked into durable refusal record: {durable}"
+        );
+        assert!(!durable.contains("password"));
+        let reopened = RefusalRing::<Reason>::new(&path, config(2)).unwrap();
+        let records = &reopened.history("caller").unwrap().records;
+        assert_eq!(records[0].claimed_addressing, "https://host.example:8443");
+        assert_eq!(records[1].claimed_addressing, "/Applications/Alfonso.app");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn one_callers_spam_evicts_only_its_own_rows() {
         let mut ring = RefusalRing::new_in_memory(config(2)).unwrap();
-        ring.record_refusal("quiet", "https://quiet.example/first", Reason::NoGrant)
-            .unwrap();
-        ring.record_refusal("noisy", "https://noisy.example/one", Reason::NoGrant)
-            .unwrap();
-        ring.record_refusal("quiet", "https://quiet.example/second", Reason::OriginScope)
-            .unwrap();
-        ring.record_refusal("noisy", "https://noisy.example/two", Reason::NoGrant)
-            .unwrap();
-        ring.record_refusal("noisy", "https://noisy.example/three", Reason::OriginScope)
-            .unwrap();
+        ring.record_refusal(
+            "quiet",
+            "https://first.quiet.example/private",
+            Reason::NoGrant,
+        )
+        .unwrap();
+        ring.record_refusal(
+            "noisy",
+            "https://one.noisy.example/private",
+            Reason::NoGrant,
+        )
+        .unwrap();
+        ring.record_refusal(
+            "quiet",
+            "https://second.quiet.example/private",
+            Reason::OriginScope,
+        )
+        .unwrap();
+        ring.record_refusal(
+            "noisy",
+            "https://two.noisy.example/private",
+            Reason::NoGrant,
+        )
+        .unwrap();
+        ring.record_refusal(
+            "noisy",
+            "https://three.noisy.example/private",
+            Reason::OriginScope,
+        )
+        .unwrap();
 
         let quiet = ring.history("quiet").unwrap();
         assert_eq!(quiet.records.len(), 2);
         assert_eq!(
             quiet.records[0].claimed_addressing,
-            "https://quiet.example/first"
+            "https://first.quiet.example"
         );
         assert_eq!(
             quiet.records[1].claimed_addressing,
-            "https://quiet.example/second"
+            "https://second.quiet.example"
         );
         assert_eq!(quiet.total_count, 2);
         assert!(!quiet.trimmed);
@@ -445,11 +547,11 @@ mod tests {
         assert_eq!(noisy.records.len(), 2);
         assert_eq!(
             noisy.records[0].claimed_addressing,
-            "https://noisy.example/two"
+            "https://two.noisy.example"
         );
         assert_eq!(
             noisy.records[1].claimed_addressing,
-            "https://noisy.example/three"
+            "https://three.noisy.example"
         );
     }
 

@@ -193,6 +193,9 @@ pub enum CallState {
 #[serde(deny_unknown_fields)]
 pub struct CallRecord {
     pub principal: String,
+    /// Opaque caller identity, not a page address: preserve even URL-shaped
+    /// keys exactly for idempotency after restart and for echoing in late_results.
+    /// URL projection or hashing would change the caller's wire identity.
     pub call_key: String,
     #[serde(default)]
     pub scope: Option<ScopeIdentity>,

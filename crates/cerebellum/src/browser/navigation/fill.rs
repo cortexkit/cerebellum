@@ -9,6 +9,40 @@ use super::*;
 use crate::browser::fill::{
     FillDispatch, FillOutcome, FillTarget, FilledField, FilledFieldsState, LoginField,
 };
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct ValueArgument<T> {
+    value: T,
+}
+
+#[derive(Serialize)]
+struct ObjectArgument<'a> {
+    #[serde(rename = "objectId")]
+    object_id: &'a str,
+}
+
+type InsertArguments<'a> = (
+    ObjectArgument<'a>,
+    ValueArgument<&'a str>,
+    ValueArgument<&'a [String]>,
+    ValueArgument<&'a str>,
+    ValueArgument<Option<&'a str>>,
+    ValueArgument<bool>,
+    Value,
+    ValueArgument<bool>,
+);
+
+// Borrow values from FillTarget's zeroizing owner; never build a JSON value
+// tree containing credentials or derive Debug for these borrowed params.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InsertParams<'a> {
+    object_id: &'a str,
+    function_declaration: &'static str,
+    return_by_value: bool,
+    arguments: InsertArguments<'a>,
+}
 
 // No focus events or focus-directed CDP insertion: the page cannot redirect
 // this value to a different element between validation and the setter.
@@ -395,14 +429,63 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 frame: target.frame.clone(),
             });
         }
-        let result = self.fill_command(&attachment.session_id, "Runtime.callFunctionOn", serde_json::json!({
-            "objectId":object_id, "functionDeclaration":INSERT_FILLED, "returnByValue":true,
-            "arguments":[{"objectId":owner_id},
-                {"value":target.classification.effective_input_type.as_deref().unwrap_or("text")},
-                {"value":target.classification.target_autocomplete_tokens},
-                {"value":expected_origin}, {"value":if check_only { None } else { Some(target.value.as_str()) }},
-                {"value":target.field == LoginField::Username}, password_argument, {"value":check_only}]
-        }), deadline, clock).ok_or("fill_insert_not_ready")?;
+        let params = InsertParams {
+            object_id: &object_id,
+            function_declaration: INSERT_FILLED,
+            return_by_value: true,
+            arguments: (
+                ObjectArgument {
+                    object_id: owner_id,
+                },
+                ValueArgument {
+                    value: target
+                        .classification
+                        .effective_input_type
+                        .as_deref()
+                        .unwrap_or("text"),
+                },
+                ValueArgument {
+                    value: &target.classification.target_autocomplete_tokens,
+                },
+                ValueArgument {
+                    value: expected_origin,
+                },
+                ValueArgument {
+                    value: if check_only {
+                        None
+                    } else {
+                        Some(target.value.as_str())
+                    },
+                },
+                ValueArgument {
+                    value: target.field == LoginField::Username,
+                },
+                password_argument,
+                ValueArgument { value: check_only },
+            ),
+        };
+        let encode = |command: &crate::cdp::CdpCommand| command.sensitive_json_bytes(&params);
+        let response = self
+            .command_response_inner(
+                "Runtime.callFunctionOn",
+                // Admission sees the same function, but no credential params enter
+                // command correlation. The encoder borrows them only for the write.
+                serde_json::json!({"functionDeclaration": INSERT_FILLED})
+                    .as_object()
+                    .cloned(),
+                Some(attachment.session_id.clone()),
+                deadline,
+                None,
+                None,
+                None,
+                Some(&encode),
+                clock,
+            )
+            .map_err(|_| "fill_insert_not_ready")?;
+        if response.error.is_some() {
+            return Err("fill_insert_not_ready");
+        }
+        let result = response.result.ok_or("fill_insert_not_ready")?;
         if result.contains_key("exceptionDetails")
             || result
                 .get("result")
@@ -455,10 +538,13 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline: Instant,
         clock: &mut SystemNavigationClock,
     ) -> Option<Map<String, Value>> {
+        let Value::Object(params) = params else {
+            return None;
+        };
         let response = self
             .command_response(
                 method,
-                params.as_object().cloned(),
+                Some(params),
                 Some(session.to_owned()),
                 deadline,
                 None,

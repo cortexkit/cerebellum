@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use serde_json::{Map, Value};
+use zeroize::Zeroizing;
 
 pub const MAX_MESSAGE_BYTES: usize = 67_108_864;
 pub const MAX_PENDING_COMMANDS: usize = 4_096;
@@ -92,7 +94,7 @@ impl fmt::Display for CdpError {
 }
 impl std::error::Error for CdpError {}
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CdpCommand {
     pub id: u64,
     pub method: String,
@@ -101,25 +103,86 @@ pub struct CdpCommand {
     pub committed_at: Instant,
 }
 
+impl fmt::Debug for CdpCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CdpCommand")
+            .field("id", &self.id)
+            .field("method", &self.method)
+            .field("params", &"<withheld>")
+            .field("session_id", &self.session_id)
+            .field("committed_at", &self.committed_at)
+            .finish()
+    }
+}
+
+#[derive(Serialize)]
+struct CommandFrame<'a, P: Serialize> {
+    id: u64,
+    method: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<&'a P>,
+    #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+}
+
+#[derive(Default)]
+struct SerializedLength(usize);
+
+impl std::io::Write for SerializedLength {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl CdpCommand {
     pub fn json_bytes(&self) -> Result<Vec<u8>, CdpError> {
-        let mut object = Map::new();
-        object.insert("id".into(), Value::Number(self.id.into()));
-        object.insert("method".into(), Value::String(self.method.clone()));
-        if let Some(params) = &self.params {
-            object.insert("params".into(), Value::Object(params.clone()));
-        }
-        if let Some(session_id) = &self.session_id {
-            object.insert("sessionId".into(), Value::String(session_id.clone()));
-        }
-        let bytes =
-            serde_json::to_vec(&Value::Object(object)).map_err(|_| CdpError::InvalidJson)?;
+        let frame = self.frame(self.params.as_ref());
+        let bytes = serde_json::to_vec(&frame).map_err(|_| CdpError::InvalidJson)?;
         if bytes.len() > MAX_MESSAGE_BYTES {
             return Err(CdpError::MessageTooLarge {
                 bytes: bytes.len(),
                 bound: MAX_MESSAGE_BYTES,
             });
         }
+        Ok(bytes)
+    }
+
+    fn frame<'a, P: Serialize>(&'a self, params: Option<&'a P>) -> CommandFrame<'a, P> {
+        CommandFrame {
+            id: self.id,
+            method: &self.method,
+            params,
+            session_id: self.session_id.as_deref(),
+        }
+    }
+
+    /// Borrow credential params directly from their zeroizing owner. No JSON
+    /// value tree or pending command owns a second copy of the credentials.
+    pub(crate) fn sensitive_json_bytes<P: Serialize>(
+        &self,
+        params: &P,
+    ) -> Result<Zeroizing<Vec<u8>>, CdpError> {
+        let frame = self.frame(Some(params));
+        let mut length = SerializedLength::default();
+        serde_json::to_writer(&mut length, &frame).map_err(|_| CdpError::InvalidJson)?;
+        if length.0 > MAX_MESSAGE_BYTES {
+            return Err(CdpError::MessageTooLarge {
+                bytes: length.0,
+                bound: MAX_MESSAGE_BYTES,
+            });
+        }
+        // Size before writing secrets: growing a Vec could leave an unwiped
+        // allocation behind. Reserve the pipe delimiter too, then write only
+        // through a fixed slice, which cannot reallocate even on encoding error.
+        let mut bytes = Zeroizing::new(vec![0; length.0 + 1]);
+        serde_json::to_writer(std::io::Cursor::new(&mut bytes[..length.0]), &frame)
+            .map_err(|_| CdpError::InvalidJson)?;
+        bytes.truncate(length.0);
         Ok(bytes)
     }
 }
@@ -374,7 +437,14 @@ impl CdpTransport {
         self.pending.insert(
             id,
             Pending {
-                command: command.clone(),
+                // Correlation needs metadata, never the value-bearing params.
+                command: CdpCommand {
+                    id: command.id,
+                    method: command.method.clone(),
+                    params: None,
+                    session_id: command.session_id.clone(),
+                    committed_at: command.committed_at,
+                },
                 deadline: now + COMMAND_TIMEOUT,
             },
         );
@@ -642,6 +712,69 @@ fn escaped_code_unit(bytes: &[u8], at: usize) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_commands_never_expose_params_in_debug_or_pending_state() {
+        const SECRET: &str = "cdp-password-and-otp-67cb";
+        let mut transport = CdpTransport::new();
+        let command = transport
+            .issue_command(
+                "Runtime.callFunctionOn",
+                serde_json::json!({"arguments":[{"value":SECRET}]})
+                    .as_object()
+                    .cloned(),
+                Some("session".into()),
+                Instant::now(),
+            )
+            .unwrap();
+        let wire = String::from_utf8(command.json_bytes().unwrap()).unwrap();
+        assert!(
+            wire.contains(SECRET),
+            "the command really contains credential material"
+        );
+        assert!(
+            !format!("{command:?} {transport:?}").contains(SECRET),
+            "Debug exposed credential material"
+        );
+        assert!(
+            transport.pending[&command.id].command.params.is_none(),
+            "pending correlation must not retain command params"
+        );
+    }
+
+    #[test]
+    fn sensitive_params_serialize_borrowed_into_a_fixed_zeroizing_frame() {
+        #[derive(Serialize)]
+        struct Params<'a> {
+            value: &'a str,
+        }
+        let secret = Zeroizing::new("password-é-\"\\\n-otp-123456".to_string());
+        let mut transport = CdpTransport::new();
+        let command = transport
+            .issue_command(
+                "Runtime.callFunctionOn",
+                None,
+                Some("session".into()),
+                Instant::now(),
+            )
+            .unwrap();
+        let mut bytes: Zeroizing<Vec<u8>> = command
+            .sensitive_json_bytes(&Params { value: &secret })
+            .unwrap();
+        assert!(
+            bytes.capacity() > bytes.len(),
+            "the pipe delimiter must not cause reallocation"
+        );
+        bytes.push(0);
+        let parsed: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({"id":command.id,"method":"Runtime.callFunctionOn","sessionId":"session","params":{"value":secret.as_str()}})
+        );
+        assert!(command.params.is_none());
+        assert!(transport.pending[&command.id].command.params.is_none());
+        assert!(!format!("{transport:?} {command:?}").contains(secret.as_str()));
+    }
     use serde_json::json;
 
     #[test]

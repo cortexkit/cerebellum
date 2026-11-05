@@ -1341,30 +1341,66 @@ async fn a_failed_floor_write_fails_closed_without_writing_marks() {
 }
 
 #[tokio::test]
-async fn delivered_codemode_image_withholding_does_not_mark() {
-    let planes = isolated_test_planes(&Arc::new(HealthState::new()));
-    let facts = scoped("withheld", ScopeKind::Head);
-    let (tx, mut rx) = mpsc::channel(1);
-    codemode::CALL_DETAIL
-        .scope(
-            std::cell::RefCell::new(Some(json!({"action":"screenshot"}))),
-            async {
-                private_content::send_reply(
-                    &planes,
-                    &facts,
-                    ReplyPlane::PersonBrowser,
-                    &tx,
-                    (PROTOCOL_VERSION, 2, 1, 1),
-                    json!({"image":{"data_b64":"pixels"}}),
-                )
-                .await
-                .unwrap();
-            },
+async fn delivered_codemode_image_handle_marks_before_resolve() {
+    for (plane, source) in [
+        (ReplyPlane::PersonBrowser, "person_browser"),
+        (ReplyPlane::DesktopApp, "desktop_app"),
+        (ReplyPlane::OwnBrowser, "signed_in_site"),
+    ] {
+        let planes = isolated_test_planes(&Arc::new(HealthState::new()));
+        let capture_facts = run(&planes, "withheld", 2);
+        planes
+            .signed_in
+            .record("fixture", "default", "https://example.com")
+            .unwrap();
+        let mut image = json!({"image":{"data_b64":"cGl4ZWxz", "mime":"image/png"}});
+        mint_image_handle(&planes, &capture_facts, &mut image);
+        let handle = image["image_handle"]
+            .as_str()
+            .expect("minted handle")
+            .to_owned();
+        let (tx, mut rx) = mpsc::channel(1);
+        codemode::CALL_DETAIL
+            .scope(
+                std::cell::RefCell::new(Some(json!({"action":"screenshot"}))),
+                async {
+                    private_content::send_reply(
+                        &planes,
+                        &capture_facts,
+                        plane,
+                        &tx,
+                        (PROTOCOL_VERSION, 2, 1, 1),
+                        image,
+                    )
+                    .await
+                    .unwrap();
+                },
+            )
+            .await;
+        let delivered: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+        assert!(delivered["image"].get("data_b64").is_none());
+        assert_eq!(delivered["image_handle"], handle);
+        assert_eq!(query(&planes, "withheld").await["sources"], json!([source]));
+        assert_eq!(query(&planes, "head").await["sources"], json!([source]));
+
+        planes.routes.insert(8, 1, facts("broca"));
+        handle_route_request(
+            request(
+                8,
+                json!({"method":"image.resolve", "params":{
+                    "scope_ref":"withheld", "handle":handle
+                }}),
+            ),
+            &tx,
+            &planes,
         )
-        .await;
-    let delivered: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
-    assert!(delivered["image"].get("data_b64").is_none());
-    assert_eq!(query(&planes, "withheld").await["private_content"], false);
+        .await
+        .unwrap();
+        let resolved = rx.recv().await.unwrap();
+        assert!(resolved.header.flags.is_binary());
+        assert!(resolved.body.ends_with(b"pixels"));
+        assert_eq!(query(&planes, "withheld").await["sources"], json!([source]));
+    }
 }
 
 #[tokio::test]

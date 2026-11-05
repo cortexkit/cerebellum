@@ -616,6 +616,12 @@ fn carries_content(reply: &Value) -> bool {
             .pointer("/image/data_b64")
             .and_then(Value::as_str)
             .is_some_and(|image| !image.is_empty())
+        // A handle delivers the same pixels through image.resolve even when
+        // inline bytes are withheld. Mark before sending the handle.
+        || reply
+            .get("image_handle")
+            .and_then(Value::as_str)
+            .is_some_and(|handle| !handle.is_empty())
         || reply
             .pointer("/detail/hit_name")
             .and_then(Value::as_str)

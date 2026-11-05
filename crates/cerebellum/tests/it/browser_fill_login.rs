@@ -871,6 +871,7 @@ impl LoginMaterialSource for Vault {
 
 struct Fixture {
     planes: Planes,
+    signed_in: Arc<cerebellum::browser_signed_in::SignedInDomains>,
     page: Shared,
     vault: Vault,
     next_corr: Mutex<u64>,
@@ -890,12 +891,30 @@ async fn fixture_with_source(
     window: Duration,
     source: Option<Arc<dyn LoginMaterialSource>>,
 ) -> Fixture {
+    fixture_with_evidence(page, vault, window, source, Arc::default()).await
+}
+
+async fn fixture_with_evidence(
+    page: Page,
+    vault: VaultState,
+    window: Duration,
+    source: Option<Arc<dyn LoginMaterialSource>>,
+    signed_in: Arc<cerebellum::browser_signed_in::SignedInDomains>,
+) -> Fixture {
     let page = Shared::new(page);
     let vault = Vault(Arc::new(Mutex::new(vault)));
-    let mut planes = permission_support::planes(
-        Arc::new(HealthState::new()),
-        Some(config()),
-        JournalPersistence::Isolated,
+    let mut planes = permission_support::attach(
+        Planes::with_browser_state(
+            Arc::new(HealthState::new()),
+            Some(config()),
+            JournalPersistence::Isolated,
+            None,
+            Some(signed_in.clone()),
+        ),
+        Arc::new(cerebellum::agent_grants::AgentGrants::in_memory(Some(
+            "test-machine".into(),
+        ))),
+        Some(signed_in.clone()),
     );
     planes.launch_service = Some(Arc::new(Launcher(page.clone())));
     let grants = GrantStore::new([ActionGrant::new(
@@ -919,6 +938,7 @@ async fn fixture_with_source(
     let planes = ScriptedCarrier::default().install(planes);
     Fixture {
         planes,
+        signed_in,
         page,
         vault,
         next_corr: Mutex::new(100),
@@ -1521,6 +1541,65 @@ async fn a_fill_inserts_the_login_and_replies_with_fields_and_origin_only() {
         })]
     );
     assert!(fixture.planes.browser.result_schema_findings().is_empty());
+}
+
+#[tokio::test]
+async fn a_vault_fill_records_login_evidence_without_submitting() {
+    let scratch = cortexkit_test_support::ScratchDir::new("fill-login-evidence");
+    let path = scratch.join("domains.json");
+    let fixture = fixture_with_evidence(
+        Page::default(),
+        VaultState::default(),
+        Duration::from_secs(600),
+        None,
+        Arc::new(cerebellum::browser_signed_in::SignedInDomains::open(
+            path.clone(),
+        )),
+    )
+    .await;
+    fixture
+        .signed_in
+        .initialize_profile(AGENT, "default", "fresh-profile", true)
+        .unwrap();
+    assert!(!fixture.signed_in.is_signed_in(AGENT, "default", SITE));
+    let reply = fixture.fill(false).await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(fixture.page.value(PASSWORD_NODE), PASSWORD);
+    assert!(
+        fixture.signed_in.is_signed_in(AGENT, "default", SITE),
+        "a filled, unsubmitted login is privacy evidence"
+    );
+    let reopened = cerebellum::browser_signed_in::SignedInDomains::open(path);
+    assert!(reopened.is_signed_in(AGENT, "default", SITE));
+}
+
+#[tokio::test]
+async fn a_failed_vault_fill_evidence_write_cannot_leave_a_clean_profile() {
+    let scratch = cortexkit_test_support::ScratchDir::new("fill-login-evidence-failed");
+    let directory = scratch.join("store");
+    let path = directory.join("domains.json");
+    let fixture = fixture_with_evidence(
+        Page::default(),
+        VaultState::default(),
+        Duration::from_secs(600),
+        None,
+        Arc::new(cerebellum::browser_signed_in::SignedInDomains::open(
+            path.clone(),
+        )),
+    )
+    .await;
+    fixture
+        .signed_in
+        .initialize_profile(AGENT, "default", "fresh-profile", true)
+        .unwrap();
+    assert!(!fixture.signed_in.is_signed_in(AGENT, "default", SITE));
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(&directory).unwrap();
+    std::fs::write(directory, b"cannot create a directory here").unwrap();
+    let reply = fixture.fill(false).await;
+    assert_eq!(reply["outcome"], "internal_error", "{reply}");
+    assert_eq!(fixture.page.insertions(), 0);
+    assert!(fixture.signed_in.is_signed_in(AGENT, "default", SITE));
 }
 
 /// Every origin refusal is decided from the fields' own frames before the
