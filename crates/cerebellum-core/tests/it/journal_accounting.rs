@@ -154,6 +154,22 @@ fn compact_record_size(path: &Path, collection: &str, sequence: u64) -> u64 {
         .len() as u64
 }
 
+fn compact_transition_bytes(path: &Path) -> u64 {
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(path).expect("read journal file"))
+            .expect("parse journal file");
+    stored["state"]["transitions"]
+        .as_array()
+        .expect("stored terminal transitions")
+        .iter()
+        .map(|transition| {
+            serde_json::to_vec(transition)
+                .expect("serialize stored transition")
+                .len() as u64
+        })
+        .sum()
+}
+
 #[test]
 fn active_reservation_charge_matches_the_full_serialized_record() {
     let directory = TemporaryDirectory::new("active");
@@ -227,7 +243,7 @@ fn dispatch_and_finalization_reaccount_each_full_record() {
     assert_eq!(journal.active_reserved_bytes(), 0);
     assert_eq!(
         journal.retained_bytes(),
-        compact_record_size(&path, "entries", 1)
+        compact_record_size(&path, "entries", 1) + compact_transition_bytes(&path)
     );
     assert_eq!(journal.status().entry_count, 1);
 }
@@ -248,8 +264,16 @@ fn terminal_accounting_matches_serialized_record_not_payload() {
         )
         .unwrap();
 
-    let actual = compact_record_size(&path, "entries", 1);
+    let entry_bytes = compact_record_size(&path, "entries", 1);
+    let transition_bytes = compact_transition_bytes(&path);
     assert_eq!(journal.active_reserved_bytes(), 0);
-    assert_eq!(journal.retained_bytes(), actual);
-    assert_eq!(journal.purge().purged_bytes, actual);
+    assert_eq!(journal.retained_bytes(), entry_bytes + transition_bytes);
+    // Purge removes the entry, not its separately retained transitions.
+    assert_eq!(journal.purge().purged_bytes, entry_bytes);
+    let purged: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("read purged journal file"))
+            .expect("parse purged journal file");
+    assert!(purged["state"]["entries"].as_object().unwrap().is_empty());
+    assert_eq!(compact_transition_bytes(&path), transition_bytes);
+    assert_eq!(journal.retained_bytes(), transition_bytes);
 }
