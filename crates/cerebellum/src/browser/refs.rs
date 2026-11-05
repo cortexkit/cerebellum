@@ -319,6 +319,80 @@ mod tests {
         assert!(registry.shown.is_empty());
     }
 
+    // A closed tab has no readable backend identities, even if its counters
+    // must survive a later reopen of the same conversation.
+    #[tokio::test]
+    async fn audit_closed_contexts_release_all_ref_name_caches() {
+        let plane = super::super::BrowserPlane::new();
+        for conversation in 0..32 {
+            let identity = super::super::RouteIdentity::from_accepted_bind(
+                &subc_protocol::BindIdentity::new("test", format!("conversation-{conversation}")),
+                &Some(subc_protocol::Principal::Direct),
+                None,
+            );
+            plane.open_context(identity.clone()).await.unwrap();
+            let last_number = {
+                let mut state = plane.state.lock().await;
+                let refs = &mut state
+                    .contexts
+                    .get_mut(&identity.conversation_key)
+                    .unwrap()
+                    .refs;
+                for backend in 1..=1000 {
+                    let mut captured = vec![record(backend, "loader")];
+                    refs.assign(&mut [], &mut captured, &mut HashMap::new(), 0, None);
+                    refs.remember(&captured, "snapshot", 0, None);
+                }
+                assert_eq!(refs.names.len(), 1000);
+                refs.next
+            };
+            plane.end_context(&identity, false).await;
+            {
+                let state = plane.state.lock().await;
+                assert_eq!(
+                    state
+                        .contexts
+                        .values()
+                        .map(|c| c.refs.names.len())
+                        .sum::<usize>(),
+                    0
+                );
+                assert_eq!(
+                    state
+                        .contexts
+                        .values()
+                        .map(|c| c.refs.name_recency.len())
+                        .sum::<usize>(),
+                    0
+                );
+                assert_eq!(
+                    state
+                        .contexts
+                        .values()
+                        .map(|c| c.refs.shown.len())
+                        .sum::<usize>(),
+                    0
+                );
+            }
+            plane.open_context(identity.clone()).await.unwrap();
+            {
+                let mut state = plane.state.lock().await;
+                let refs = &mut state
+                    .contexts
+                    .get_mut(&identity.conversation_key)
+                    .unwrap()
+                    .refs;
+                let mut captured = vec![record(1, "loader")];
+                refs.assign(&mut [], &mut captured, &mut HashMap::new(), 0, None);
+                assert_eq!(
+                    captured[0].captured.reference,
+                    format!("e{}", last_number + 1)
+                );
+            }
+            plane.end_context(&identity, false).await;
+        }
+    }
+
     #[test]
     fn stable_refs_name_cache_is_bounded_by_least_recently_shown_identity() {
         let mut registry = StableRefs::default();

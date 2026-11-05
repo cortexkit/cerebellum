@@ -2041,7 +2041,10 @@ impl BrowserPlane {
                 context.fill_window = None;
                 context.snapshots.begin_teardown();
                 let _ = context.snapshots.complete_teardown();
-                context.refs.prune_shown(&context.snapshots);
+                // Backend identities belong to the closed tab. Retain only
+                // the counter so a reopen cannot recycle a name still held
+                // by its caller.
+                context.refs = context.refs.next_document();
             }
         }
         self.journal
