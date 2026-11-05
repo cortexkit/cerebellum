@@ -1,5 +1,5 @@
 Workers Observability · dash.cloudflare.com/acct/workers/observability · snapshot 0123456789abcdef0123456789abcdef
-e1 page (focused) Workers Observability
+e1 page (focused) Workers Observability [e1 classification unavailable: target_not_in_document]
   e3 heading Events
   e9 " event ": "boat_start_timeout" ,
   e16 " eventType ": "fetch" ,

@@ -1792,6 +1792,64 @@ async fn snapshot_byte_budget_is_disclosed_as_partial() {
 }
 
 #[tokio::test]
+async fn filtered_partial_capture_discloses_unsearched_content_in_user_browser() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    let mut capture = ax();
+    capture["nodes"][1]["name"]["value"] = json!("X".repeat(8192));
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.top_level_only = true;
+        state.ax_override = Some(capture);
+    }
+    for max_bytes in [64, 5000] {
+        let (snapshot, _) = fixture.call(1,
+            json!({"browser":"user","action":"snapshot","tab":tab,"text_filter":"more repl","max_bytes":max_bytes}),
+            "allow_30m").await;
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        let text = snapshot["state_text"].as_str().unwrap();
+        assert!(text.len() <= max_bytes);
+        assert!(
+            !text.contains("No matches for the requested filters."),
+            "{snapshot}"
+        );
+        let notice = snapshot["remedy"].as_str().unwrap();
+        assert!(
+            notice.contains("matches beyond the captured portion were not searched")
+                && notice.contains("container ref"),
+            "{snapshot}"
+        );
+        if max_bytes == 5000 {
+            assert!(text.contains("Capture stopped early"), "{snapshot}");
+        }
+        assert_eq!(snapshot["truncated"], true);
+    }
+}
+
+#[tokio::test]
+async fn shared_classification_failure_prints_once_in_user_browser() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.top_level_only = true;
+        state.dom_override = Some(json!({"nodes":[]}));
+    }
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    let text = snapshot["state_text"].as_str().unwrap();
+    assert_eq!(
+        text.matches("target_not_in_document").count(),
+        1,
+        "{snapshot}"
+    );
+    assert!(
+        text.contains("Classification unavailable for") && text.contains("clicks and typing"),
+        "{snapshot}"
+    );
+}
+
+#[tokio::test]
 async fn outside_group_tab_is_refused_before_any_cdp_command() {
     let fixture = Fixture::new();
     let (status, _) = fixture

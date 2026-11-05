@@ -3452,18 +3452,21 @@ async fn capture_attempt(
             .into_iter()
             .collect();
     }
-    let rendered = state_text::render(&RenderInput {
-        records: &records,
-        facts: &facts,
-        page_url: &document.committed.url,
-        snapshot_id: &id,
-        zoom: zoom_ref.filter(|_| !omitted_zoom).map(|requested| Zoom {
-            requested,
-            target: zoom_target.as_deref(),
-        }),
-        filters: &filters,
-        max_bytes,
-    });
+    let rendered = state_text::render_with_capture_status(
+        &RenderInput {
+            records: &records,
+            facts: &facts,
+            page_url: &document.committed.url,
+            snapshot_id: &id,
+            zoom: zoom_ref.filter(|_| !omitted_zoom).map(|requested| Zoom {
+                requested,
+                target: zoom_target.as_deref(),
+            }),
+            filters: &filters,
+            max_bytes,
+        },
+        ax_truncated || refs_truncated || omitted_frames != 0,
+    );
     let (text, text_truncated) = if args["mode"] == "dom_full" {
         let mut seen = BTreeSet::new();
         let mut documents = Vec::new();
@@ -3537,7 +3540,9 @@ async fn capture_attempt(
         reply["omitted_frames"] = json!(omitted_frames);
     }
     reply["settlement_reason"] = json!("Page settlement is not observed on the person's browser.");
-    if truncated {
+    if ax_truncated || refs_truncated || omitted_frames != 0 {
+        reply["remedy"] = json!(state_text::capture_cut_notice(&filters));
+    } else if truncated {
         reply["remedy"] = json!(
             "This snapshot is partial; read again before assuming absent controls are unavailable."
         );

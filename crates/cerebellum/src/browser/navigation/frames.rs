@@ -578,7 +578,6 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         .as_millis() as u64,
                     epoch.map(|e| (e, frame.origin.as_str())),
                     None,
-                    true,
                     filled,
                     clock,
                 );

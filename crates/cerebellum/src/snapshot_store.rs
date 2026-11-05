@@ -821,6 +821,12 @@ pub fn render_ax_text(
         in_field: bool,
     }
     let mut lines: Vec<(String, Option<&str>)> = Vec::new();
+    let notices = crate::browser::state_text::ClassificationNotices::new(records, facts);
+    let mut summary = String::new();
+    notices.append_summary(&mut summary);
+    if !summary.is_empty() {
+        lines.push((format!("{}\n", summary.trim_start()), None));
+    }
     let mut ancestors: Vec<Seen<'_>> = Vec::new();
     // Depths of the ancestors that printed, which set a line's indent.
     let mut printed: Vec<i64> = Vec::new();
@@ -868,7 +874,7 @@ pub fn render_ax_text(
             line.push_str(&value);
         }
         if let Some(reference) = &record.reference {
-            crate::browser::state_text::append_classification_notice(&mut line, reference, facts);
+            notices.append_inline(&mut line, reference, facts);
         }
         line.push('\n');
         lines.push((line, record.reference.as_deref()));
@@ -880,20 +886,30 @@ pub fn render_ax_text(
         cut_bytes: 0,
         cut_lines: 0,
     };
-    let mut lines = lines.into_iter();
-    for (line, reference) in lines.by_ref() {
-        if rendered.text.len().saturating_add(line.len()) > max_bytes {
-            rendered.cut_bytes = line.len();
-            rendered.cut_lines = 1;
+    let total = lines.iter().map(|(line, _)| line.len()).sum::<usize>();
+    let mut used = total;
+    let mut kept = lines.len();
+    let mut trailer = String::new();
+    while used + trailer.len() > max_bytes {
+        if kept == 0 {
+            trailer = format!("[cut {} lines; zoom or raise max_bytes]\n", lines.len());
+            if trailer.len() > max_bytes {
+                trailer.clear();
+            }
             break;
         }
-        rendered.text.push_str(&line);
+        kept -= 1;
+        used -= lines[kept].0.len();
+        trailer = format!("[cut {} lines, {} to fit max_bytes {max_bytes}; zoom a container ref or raise max_bytes]\n",
+            lines.len() - kept, crate::browser::state_text::size_text(total - used));
+    }
+    for (line, reference) in &lines[..kept] {
+        rendered.text.push_str(line);
         rendered.printed_refs.extend(reference.map(str::to_string));
     }
-    for (line, _) in lines {
-        rendered.cut_bytes += line.len();
-        rendered.cut_lines += 1;
-    }
+    rendered.text.push_str(&trailer);
+    rendered.cut_bytes = total - used;
+    rendered.cut_lines = lines.len() - kept;
     Ok(rendered)
 }
 
@@ -1352,17 +1368,27 @@ mod tests {
     fn ax_cut_keeps_whole_lines_and_only_their_refs() {
         let records = vec![
             ax(0, "RootWebArea", "hello", Some("e1")),
-            ax(1, "button", "world", Some("e2")),
-            ax(1, "button", "again", Some("e3")),
+            ax(1, "button", "world ".repeat(40).trim_end(), Some("e2")),
+            ax(1, "button", "again ".repeat(40).trim_end(), Some("e3")),
         ];
         let first = "e1 RootWebArea hello\n";
-        let rendered = render_ax_text(&records, &HashMap::new(), first.len() + 1).unwrap();
-        assert_eq!(rendered.text, first);
+        let rendered = render_ax_text(&records, &HashMap::new(), first.len() + 150).unwrap();
+        assert!(rendered.text.starts_with(first));
+        assert!(rendered
+            .text
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("[cut 2 lines,"));
         assert_eq!(rendered.printed_refs, BTreeSet::from(["e1".to_string()]));
         assert_eq!(rendered.cut_lines, 2);
         assert_eq!(
             rendered.cut_bytes,
-            "  e2 button world\n  e3 button again\n".len()
+            format!(
+                "  e2 button {}\n  e3 button {}\n",
+                records[1].name, records[2].name
+            )
+            .len()
         );
         let none = render_ax_text(&records, &HashMap::new(), 0).unwrap();
         assert!(none.text.is_empty() && none.printed_refs.is_empty());

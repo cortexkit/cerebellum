@@ -2417,7 +2417,7 @@ async fn max_bytes_and_lossy_traversal_each_report_honest_incompleteness() {
         AxRecord {
             depth: 1,
             role: "heading".into(),
-            name: "This record exceeds the remaining output budget".into(),
+            name: "This record exceeds the remaining output budget ".repeat(10),
             value: None,
             reference: Some("e2".into()),
         },
@@ -2436,13 +2436,18 @@ async fn max_bytes_and_lossy_traversal_each_report_honest_incompleteness() {
         .dispatch(
             &route,
             BrowserCapability::Snapshot,
-            &json!({"mode": "ax", "max_bytes": first_line.len()}),
+            &json!({"mode": "ax", "max_bytes": first_line.len() + 150}),
         )
         .await;
 
     assert_eq!(result["truncated"], true);
     // The cut keeps whole lines only.
-    assert_eq!(result["state_text"], first_line);
+    let text = result["state_text"].as_str().unwrap();
+    assert!(text.starts_with(first_line), "{result}");
+    assert!(
+        text.lines().last().unwrap().starts_with("[cut 1 lines,"),
+        "{result}"
+    );
     assert_eq!(result["omitted"]["state_text_lines"], 1);
 
     let route = identity();

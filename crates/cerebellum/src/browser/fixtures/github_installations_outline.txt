@@ -14,3 +14,4 @@ e2 banner
 e4 navigation Organization settings
   e5 link General, Value: github.com/organizations/cortexkit/settings/profile
   e6 link GitHub Apps, Value: github.com/organizations/cortexkit/settings/installations
+[outline: content is folded into the summaries above; use zoom on a container ref to read it]

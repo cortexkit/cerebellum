@@ -3386,18 +3386,21 @@ impl BrowserPlane {
         let mut ax_refs_withheld = false;
         let (content, encoded_truncated, schema, prior_cut) = match mode {
             SnapshotKind::Actionable => {
-                let rendered = state_text::render(&state_text::RenderInput {
-                    records: &records,
-                    facts: &facts,
-                    filters,
-                    page_url: &source_origin,
-                    snapshot_id: &id,
-                    zoom: zoom.map(|requested| state_text::Zoom {
-                        requested,
-                        target: target.as_deref(),
-                    }),
-                    max_bytes,
-                });
+                let rendered = state_text::render_with_capture_status(
+                    &state_text::RenderInput {
+                        records: &records,
+                        facts: &facts,
+                        filters,
+                        page_url: &source_origin,
+                        snapshot_id: &id,
+                        zoom: zoom.map(|requested| state_text::Zoom {
+                            requested,
+                            target: target.as_deref(),
+                        }),
+                        max_bytes,
+                    },
+                    content_incomplete || refs_truncated,
+                );
                 // A ref stays usable only if the caller was shown it.
                 refs.retain(|record| rendered.printed_refs.contains(&record.captured.reference));
                 (
@@ -3481,6 +3484,9 @@ impl BrowserPlane {
             prior_cut,
             BrowserContextResult::from_identity(identity).json(),
         );
+        if content_incomplete || refs_truncated {
+            reply["remedy"] = json!(state_text::capture_cut_notice(filters));
+        }
         let ref_count = snapshot.refs.len();
         if let Some(window) = &context.fill_window {
             window.with_redactor(|_| ())?;
@@ -6836,7 +6842,10 @@ mod tests {
         let route = identity();
         let plane = BrowserPlane::new();
         plane.open_context(route.clone()).await.unwrap();
-        let (records, refs) = ax_fixture();
+        let (mut records, refs) = ax_fixture();
+        // Leave room for the cut disclosure without admitting either later row.
+        records[2].name = "Terms ".repeat(60).trim_end().to_string();
+        records[3].name = "Cancel ".repeat(60).trim_end().to_string();
         let kept = "e1 RootWebArea Checkout\n  e2 button Pay now\n";
         let reply = plane
             .retain_text_snapshot(
@@ -6845,18 +6854,27 @@ mod tests {
                 &records,
                 None,
                 refs,
-                kept.len() + 4,
+                kept.len() + 150,
                 Some(CommittedDocument::new("https://example.com/", 1, "loader")),
             )
             .await
             .unwrap();
-        assert_eq!(reply[state_text::STATE_TEXT_FIELD], kept, "{reply}");
+        let text = reply[state_text::STATE_TEXT_FIELD].as_str().unwrap();
+        assert!(text.starts_with(kept), "{reply}");
+        assert!(
+            text.lines().last().unwrap().starts_with("[cut 2 lines,"),
+            "{reply}"
+        );
         assert_eq!(reply["truncated"], true);
         assert_eq!(reply["refs_truncated"], true);
         assert_eq!(reply["omitted"]["state_text_lines"], 2);
         assert_eq!(
             reply["omitted"]["state_text_bytes"],
-            "  e3 link Terms\n  e4 button Cancel\n".len()
+            format!(
+                "  e3 link {}\n  e4 button {}\n",
+                records[2].name, records[3].name
+            )
+            .len()
         );
         let snapshot_id = reply["snapshot_id"].as_str().unwrap();
         let state = plane.state.lock().await;
