@@ -1285,7 +1285,6 @@ struct ContextState {
     snapshots: BrowserSnapshotStore,
     tracker: Tracker,
     ended: bool,
-    crashed: bool,
     next_snapshot_seed: u64,
     /// Random bits mixed into every snapshot id this context mints. The
     /// counter alone restarts at zero whenever the module restarts, so
@@ -1341,7 +1340,6 @@ impl ContextState {
             snapshots: BrowserSnapshotStore::new(8).expect("positive retention"),
             tracker: Tracker::default(),
             ended: false,
-            crashed: false,
             next_snapshot_seed: 0,
             snapshot_nonce: new_snapshot_nonce(),
             refs: refs::StableRefs::default(),
@@ -1402,14 +1400,22 @@ fn zoom_target(
 struct BrowserState {
     contexts: HashMap<String, ContextState>,
     late_events: HashMap<String, VecDeque<LateEvent>>,
-    operations: Vec<(String, Operation)>,
+    operations: VecDeque<(String, Operation)>,
+    operation_sequence: u64,
     invocations: HashMap<String, Vec<BrowserInvocation>>,
+    retired_refs: refs::StableRefs,
+    retired_snapshot_seed: u64,
 }
+
+const MAX_OPERATION_HISTORY: usize = 4096;
+const MAX_INVOCATION_HISTORY: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 struct BrowserInvocation {
     capability: BrowserCapability,
     outcome: Option<Outcome>,
+    reserve_sequence: u64,
+    committed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1479,7 +1485,7 @@ impl BrowserJournalState {
 
 pub struct BrowserPlane {
     state: Arc<Mutex<BrowserState>>,
-    lanes: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    lanes: Arc<Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>,
     grants: Arc<Mutex<GrantStore>>,
     journal_mode: BrowserJournalMode,
     refusal_ring: Arc<Mutex<BrowserRefusalRing>>,
@@ -1991,10 +1997,17 @@ impl BrowserPlane {
     async fn lane(&self, key: &str) -> OwnedMutexGuard<()> {
         let lane = {
             let mut lanes = self.lanes.lock().await;
-            lanes
-                .entry(key.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
+            // Guards and waiters keep the strong reference. Never remove a
+            // live lane: replacing it would let two calls bypass each other.
+            lanes.retain(|_, lane| lane.strong_count() > 0);
+            match lanes.get(key).and_then(std::sync::Weak::upgrade) {
+                Some(lane) => lane,
+                None => {
+                    let lane = Arc::new(Mutex::new(()));
+                    lanes.insert(key.to_string(), Arc::downgrade(&lane));
+                    lane
+                }
+            }
         };
         lane.lock_owned().await
     }
@@ -2014,12 +2027,13 @@ impl BrowserPlane {
         let next_snapshot_seed = state
             .contexts
             .get(&key)
-            .map_or(0, |previous| previous.next_snapshot_seed);
-        let refs = state
-            .contexts
-            .get(&key)
-            .map(|previous| previous.refs.next_document())
-            .unwrap_or_default();
+            .map_or(state.retired_snapshot_seed, |previous| {
+                previous.next_snapshot_seed
+            });
+        let mut refs = state.retired_refs.next_document();
+        if let Some(previous) = state.contexts.get(&key) {
+            refs.advance_past(&previous.refs);
+        }
         let mut context = ContextState::new(identity);
         context.refs = refs;
         context.next_snapshot_seed = next_snapshot_seed;
@@ -2030,28 +2044,32 @@ impl BrowserPlane {
         state.late_events.remove(&key);
         Ok(())
     }
-    pub async fn end_context(&self, identity: &RouteIdentity, crashed: bool) {
-        let _lane = self.lane(&identity.conversation_key).await;
+    pub async fn end_context(&self, identity: &RouteIdentity, _crashed: bool) {
+        let lane = self.lane(&identity.conversation_key).await;
         {
             let mut state = self.state.lock().await;
-            if let Some(context) = state.contexts.get_mut(&identity.conversation_key) {
-                context.ended = true;
-                context.crashed = crashed;
-                // The tab is gone, and the filled password with it.
-                context.fill_window = None;
+            if let Some(mut context) = state.contexts.remove(&identity.conversation_key) {
                 context.snapshots.begin_teardown();
                 let _ = context.snapshots.complete_teardown();
-                // Backend identities belong to the closed tab. Retain only
-                // the counter so a reopen cannot recycle a name still held
-                // by its caller.
-                context.refs = context.refs.next_document();
+                // One lifetime-wide watermark prevents retired names from
+                // being recycled without keeping a tombstone per conversation.
+                state.retired_refs.advance_past(&context.refs);
+                state.retired_snapshot_seed =
+                    state.retired_snapshot_seed.max(context.next_snapshot_seed);
             }
+            state.invocations.remove(&identity.conversation_key);
+            state.late_events.remove(&identity.conversation_key);
         }
         self.journal
             .lock()
             .await
             .invocations
             .remove(&identity.conversation_key);
+        drop(lane);
+        self.lanes
+            .lock()
+            .await
+            .retain(|_, lane| lane.strong_count() > 0);
     }
     pub async fn queue_event(&self, identity: &RouteIdentity, event: LateEvent) {
         let mut state = self.state.lock().await;
@@ -2062,7 +2080,7 @@ impl BrowserPlane {
             .push_back(event);
     }
     pub async fn operation_log(&self) -> Vec<(String, Operation)> {
-        self.state.lock().await.operations.clone()
+        self.state.lock().await.operations.iter().cloned().collect()
     }
 
     /// Test seam for checking that nested browser operations retain distinct
@@ -2083,7 +2101,11 @@ impl BrowserPlane {
     }
 
     fn op(state: &mut BrowserState, key: &str, operation: Operation) {
-        state.operations.push((key.to_string(), operation));
+        state.operation_sequence = state.operation_sequence.saturating_add(1);
+        if state.operations.len() == MAX_OPERATION_HISTORY {
+            state.operations.pop_front();
+        }
+        state.operations.push_back((key.to_string(), operation));
     }
 
     fn record_invocation_outcome(
@@ -2132,7 +2154,7 @@ impl BrowserPlane {
                     .await;
             }
         }
-        let start = self.state.lock().await.operations.len();
+        let start = self.state.lock().await.operation_sequence;
         let result = self.dispatch_inner(identity, capability, args).await;
         if let Err(error) = &result {
             self.terminal_on_error(identity, capability, start, error)
@@ -2205,26 +2227,28 @@ impl BrowserPlane {
         &self,
         identity: &RouteIdentity,
         capability: BrowserCapability,
-        start: usize,
+        start: u64,
         error: &BrowserError,
     ) {
-        let operations = self.state.lock().await.operations[start..].to_vec();
-        let committed = operations
-            .iter()
-            .any(|(_, operation)| *operation == Operation::CommitDispatched);
-        let finalized = operations.iter().any(|(_, operation)| {
-            matches!(
-                *operation,
-                Operation::FinalizeRejected | Operation::FinalizeDispatched
-            )
-        });
-        if finalized
-            || !operations
-                .iter()
-                .any(|(_, operation)| *operation == Operation::Reserve)
-        {
-            return;
-        }
+        // Finalization looks up the live invocation. Other conversations may
+        // overwrite the bounded operation log while a call awaits CDP.
+        let committed = {
+            let state = self.state.lock().await;
+            let invocation = state
+                .invocations
+                .get(&identity.conversation_key)
+                .and_then(|items| {
+                    items.iter().rev().find(|item| {
+                        item.capability == capability
+                            && item.reserve_sequence > start
+                            && item.outcome.is_none()
+                    })
+                });
+            let Some(invocation) = invocation else {
+                return;
+            };
+            invocation.committed
+        };
         let outcome = journal_outcome(error);
         let detail = journal_refusal_detail(error);
         if committed {
@@ -2401,6 +2425,20 @@ impl BrowserPlane {
         capability: BrowserCapability,
         persist_journal: bool,
     ) -> Result<(), BrowserError> {
+        {
+            let mut state = self.state.lock().await;
+            if let Some(invocations) = state.invocations.get_mut(&identity.conversation_key) {
+                while invocations.len() >= MAX_INVOCATION_HISTORY {
+                    let Some(oldest) = invocations.iter().position(|item| item.outcome.is_some())
+                    else {
+                        // Keep unfinished calls available for journal recovery,
+                        // and refuse more work rather than growing without limit.
+                        return Err(map_journal_error(JournalError::reservation_failed()));
+                    };
+                    invocations.remove(oldest);
+                }
+            }
+        }
         if persist_journal && self.journal_mode.is_enabled() {
             let mut journal = self.journal.lock().await;
             if journal.store.is_none() {
@@ -2423,14 +2461,17 @@ impl BrowserPlane {
                 .push(invocation);
         }
         let mut state = self.state.lock().await;
-        state
+        let reserve_sequence = state.operation_sequence.saturating_add(1);
+        let invocations = state
             .invocations
             .entry(identity.conversation_key.clone())
-            .or_default()
-            .push(BrowserInvocation {
-                capability,
-                outcome: None,
-            });
+            .or_default();
+        invocations.push(BrowserInvocation {
+            capability,
+            outcome: None,
+            reserve_sequence,
+            committed: false,
+        });
         Self::op(&mut state, &identity.conversation_key, Operation::Reserve);
         Ok(())
     }
@@ -2476,6 +2517,18 @@ impl BrowserPlane {
         // disabled this is the only mark.
         identity.witness.mark_committed();
         let mut state = self.state.lock().await;
+        if let Some(invocation) = state
+            .invocations
+            .get_mut(&identity.conversation_key)
+            .and_then(|items| {
+                items
+                    .iter_mut()
+                    .rev()
+                    .find(|item| item.capability == capability && item.outcome.is_none())
+            })
+        {
+            invocation.committed = true;
+        }
         Self::op(
             &mut state,
             &identity.conversation_key,
@@ -2757,7 +2810,7 @@ impl BrowserPlane {
         // -- the vocabulary had no Snapshot member, so recording the read would
         // have written it as a navigation -- and that hole closed when the
         // members were added rather than by anything here changing.
-        let read_start = self.state.lock().await.operations.len();
+        let read_start = self.state.lock().await.operation_sequence;
         let mut page = match self
             .capture_snapshot(
                 identity,
@@ -6433,6 +6486,158 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Replacement page"));
+    }
+
+    #[tokio::test]
+    async fn audit_browser_operation_history_is_bounded() {
+        let plane = BrowserPlane::new();
+        let mut state = plane.state.lock().await;
+        for _ in 0..8192 {
+            BrowserPlane::op(&mut state, "conversation", Operation::Reserve);
+        }
+        assert_eq!(state.operations.len(), 4096);
+        assert!(state
+            .operations
+            .iter()
+            .all(|(_, op)| *op == Operation::Reserve));
+    }
+
+    #[tokio::test]
+    async fn audit_browser_invocation_history_is_bounded_and_errors_still_finalize() {
+        let plane = BrowserPlane::new();
+        let route = identity();
+        for _ in 0..1024 {
+            plane
+                .reserve_journal(&route, BrowserCapability::Click, false)
+                .await
+                .unwrap();
+            plane
+                .commit(&route, BrowserCapability::Click)
+                .await
+                .unwrap();
+            plane
+                .finalize(
+                    &route,
+                    BrowserCapability::Click,
+                    Outcome::Success,
+                    json!({}),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(plane.invocation_outcomes_for_test(&route).await.len(), 256);
+        let start = plane.state.lock().await.operation_sequence;
+        plane
+            .reserve_journal(&route, BrowserCapability::Click, false)
+            .await
+            .unwrap();
+        plane
+            .commit(&route, BrowserCapability::Click)
+            .await
+            .unwrap();
+        {
+            let mut state = plane.state.lock().await;
+            for _ in 0..8192 {
+                BrowserPlane::op(
+                    &mut state,
+                    "other-conversation",
+                    Operation::FinalizeRejected,
+                );
+            }
+        }
+        plane
+            .terminal_on_error(
+                &route,
+                BrowserCapability::Click,
+                start,
+                &BrowserError::ElementIntercepted,
+            )
+            .await;
+        assert!(plane
+            .invocation_outcomes_for_test(&route)
+            .await
+            .iter()
+            .all(|(_, result)| result.is_some()));
+        assert_eq!(
+            plane.operation_log().await.last().unwrap(),
+            &(route.conversation_key, Operation::FinalizeDispatched)
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_browser_unfinished_invocations_bound_admission_without_eviction() {
+        let plane = BrowserPlane::new();
+        let route = identity();
+        for _ in 0..256 {
+            plane
+                .reserve_journal(&route, BrowserCapability::Click, false)
+                .await
+                .unwrap();
+        }
+        assert!(plane
+            .reserve_journal(&route, BrowserCapability::Click, false)
+            .await
+            .is_err());
+        let outcomes = plane.invocation_outcomes_for_test(&route).await;
+        assert_eq!(outcomes.len(), 256);
+        assert!(outcomes.iter().all(|(_, outcome)| outcome.is_none()));
+    }
+
+    #[tokio::test]
+    async fn audit_browser_ended_contexts_and_invocations_are_released() {
+        let plane = BrowserPlane::new();
+        for n in 0..128 {
+            let mut route = identity();
+            route.conversation_key = format!("conversation-{n}");
+            plane.open_context(route.clone()).await.unwrap();
+            plane
+                .reserve_journal(&route, BrowserCapability::Click, false)
+                .await
+                .unwrap();
+            plane
+                .finalize(
+                    &route,
+                    BrowserCapability::Click,
+                    Outcome::Success,
+                    json!({}),
+                )
+                .await
+                .unwrap();
+            plane.end_context(&route, false).await;
+            let state = plane.state.lock().await;
+            assert!(state.contexts.is_empty());
+            assert!(state.invocations.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_browser_idle_lanes_are_released_without_splitting_a_live_lane() {
+        let plane = Arc::new(BrowserPlane::new());
+        let held = plane.lane_for_test("held").await;
+        let waiting = {
+            let plane = plane.clone();
+            tokio::spawn(async move { plane.lane_for_test("held").await })
+        };
+        tokio::task::yield_now().await;
+        for n in 0..128 {
+            let guard = plane.lane_for_test(&format!("conversation-{n}")).await;
+            assert!(plane.lanes.lock().await.len() <= 2);
+            assert!(!waiting.is_finished());
+            drop(guard);
+        }
+        drop(held);
+        let guard = waiting.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), plane.lane_for_test("held"))
+                .await
+                .is_err()
+        );
+        drop(guard);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), plane.lane_for_test("held"))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

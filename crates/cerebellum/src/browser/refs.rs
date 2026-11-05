@@ -75,6 +75,10 @@ pub(super) struct ShownRef {
 }
 
 impl StableRefs {
+    pub fn advance_past(&mut self, previous: &Self) {
+        self.next = self.next.max(previous.next);
+    }
+
     pub fn next_document(&self) -> Self {
         Self {
             next: self.next,
