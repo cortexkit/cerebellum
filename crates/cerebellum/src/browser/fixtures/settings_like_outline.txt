@@ -35,3 +35,4 @@ e46 contentinfo
   e47 link Terms, Value: docs.github.com/site-policy/github-terms
   e48 link Privacy, Value: docs.github.com/site-policy/privacy-policies
   e49 link Status, Value: www.githubstatus.com
+[outline: content is folded into the summaries above; use zoom on a container ref to read it]

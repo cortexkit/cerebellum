@@ -1009,6 +1009,35 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         }))
     }
 
+    fn zoom_dom_before<C: NavigationClock>(
+        &mut self,
+        attachment: &AttachedTarget,
+        deadline: Instant,
+        clock: &mut C,
+    ) -> Result<Map<String, Value>, NavigationDriveError> {
+        self.command(
+            "DOM.enable",
+            None,
+            Some(attachment.session_id.clone()),
+            deadline,
+            None,
+            clock,
+        )?;
+        self.command(
+            "DOM.getFlattenedDocument",
+            Some(
+                serde_json::json!({"depth":-1,"pierce":true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            Some(attachment.session_id.clone()),
+            deadline,
+            None,
+            clock,
+        )
+    }
+
     fn flattened_dom_nodes_before<C: NavigationClock>(
         &mut self,
         attachment: &AttachedTarget,
@@ -1918,7 +1947,6 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             deadline_ms,
             classification_context,
             subtree,
-            subtree.is_some(),
             filled,
             clock,
         )
@@ -1932,7 +1960,6 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline_ms: u64,
         classification_context: Option<(u64, &str)>,
         subtree: Option<&RefRecord>,
-        bounded: bool,
         filled: &[BackendNodeIdentity],
         clock: &mut C,
     ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
@@ -1960,11 +1987,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let ax_phase = crate::budgets::PhaseDeadline::new(
             clock.now(),
             crate::budgets::AX_CHILDREN_PHASE_MS,
-            // AX incompleteness must leave time to classify the refs already
-            // observed. The DOM allowance is part of, not added to, this read.
-            deadline
-                - Duration::from_millis(deadline_ms / 3)
-                    .min(Duration::from_millis(crate::budgets::CDP_STEP_MS)),
+            deadline,
         );
         self.command(
             "Accessibility.enable",
@@ -2028,7 +2051,6 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     deadline.saturating_duration_since(clock.now()).as_millis() as u64,
                     classification_context,
                     None,
-                    bounded,
                     filled,
                     clock,
                 );
@@ -2100,6 +2122,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         } else {
             None
         };
+        let mut early_dom = None;
+        let mut early_zoom_dom = None;
         let mut observation = if let Some(observation) = bulk {
             observation
         } else {
@@ -2122,6 +2146,28 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         None,
                         clock,
                     );
+                    // Keep one batch of observed children even if the DOM never
+                    // answers. Read classification before walking any of their
+                    // subtrees: ad/child stalls must not spend the DOM's time.
+                    // The DOM shares the frame's remaining absolute allowance,
+                    // not a fresh step or a fixed fraction of that allowance.
+                    if early_dom.is_none()
+                        && (classification_context.is_some()
+                            || mode == SnapshotKind::Actionable
+                            || (mode == SnapshotKind::DomFull && subtree.is_some()))
+                    {
+                        let dom_started = Instant::now();
+                        early_dom = Some(if mode == SnapshotKind::DomFull && subtree.is_some() {
+                            let dom = self.zoom_dom_before(&attachment, deadline, clock)?;
+                            let nodes = parse_flattened_dom_nodes(&dom);
+                            early_zoom_dom = Some(dom);
+                            nodes
+                        } else {
+                            self.flattened_dom_nodes_before(&attachment, deadline, clock)
+                                .unwrap_or(Err(ClassificationUnavailable::DomReadFailed))
+                        });
+                        timings.dom_read_ms += dom_started.elapsed().as_millis();
+                    }
                     let result = result?;
                     let mut nodes = required_ax_nodes(&result)
                         .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))?;
@@ -2134,32 +2180,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))?
         };
 
-        timings.ax_ms = ax_started.elapsed().as_millis();
+        timings.ax_ms = ax_started
+            .elapsed()
+            .as_millis()
+            .saturating_sub(timings.dom_read_ms);
         let dom_started = Instant::now();
-        let zoom_dom = if mode == SnapshotKind::DomFull && subtree.is_some() {
-            self.command(
-                "DOM.enable",
-                None,
-                Some(attachment.session_id.clone()),
-                snapshot_step_deadline(deadline, bounded, clock.now()),
-                None,
-                clock,
-            )?;
-            Some(
-                self.command(
-                    "DOM.getFlattenedDocument",
-                    Some(
-                        serde_json::json!({"depth":-1,"pierce":true})
-                            .as_object()
-                            .unwrap()
-                            .clone(),
-                    ),
-                    Some(attachment.session_id.clone()),
-                    snapshot_step_deadline(deadline, bounded, clock.now()),
-                    None,
-                    clock,
-                )?,
-            )
+        let zoom_dom = if let Some(dom) = early_zoom_dom {
+            Some(dom)
+        } else if mode == SnapshotKind::DomFull && subtree.is_some() {
+            Some(self.zoom_dom_before(&attachment, deadline, clock)?)
         } else {
             None
         };
@@ -2169,23 +2198,17 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         // those facts; only the DOM read determines each ref's classification.
         let snapshot_dom = if let Some(dom) = &zoom_dom {
             Some(parse_flattened_dom_nodes(dom))
+        } else if let Some(dom) = early_dom {
+            Some(dom)
         } else if classification_context.is_some() || mode == SnapshotKind::Actionable {
             Some(
-                self.flattened_dom_nodes_before(
-                    &attachment,
-                    snapshot_step_deadline(
-                        deadline,
-                        bounded || observation.ax_truncated,
-                        clock.now(),
-                    ),
-                    clock,
-                )
-                .unwrap_or(Err(ClassificationUnavailable::DomReadFailed)),
+                self.flattened_dom_nodes_before(&attachment, deadline, clock)
+                    .unwrap_or(Err(ClassificationUnavailable::DomReadFailed)),
             )
         } else {
             None
         };
-        timings.dom_read_ms = dom_started.elapsed().as_millis();
+        timings.dom_read_ms += dom_started.elapsed().as_millis();
         let classification_started = Instant::now();
         if let Some((document_epoch, document_url)) = classification_context {
             // One DOM read serves every ref. A failure here leaves each ref
@@ -3699,6 +3722,15 @@ pub(crate) fn snapshot_from_capture(
     if let Ok(nodes) = projected {
         collect_dom_facts(&mut observation, &nodes, Some(document_url));
     }
+    for reference in &observation.refs {
+        if let Err(reason) = &reference.classification {
+            observation
+                .facts
+                .entry(reference.captured.reference.clone())
+                .or_default()
+                .classification_unavailable = Some(reason.reason_code());
+        }
+    }
     Ok(observation)
 }
 
@@ -5155,6 +5187,9 @@ fn collect_dom_facts(
 }
 
 #[cfg(test)]
+mod large_page_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::io;
@@ -5524,9 +5559,9 @@ mod tests {
                 ax_node("button","button","7 more replies", &[],60,None),
                 ax_node("ad","Iframe","Video ad", &["stalled"],70,None),
             ]}}),
-            // Command 4, the ad's child read, never answers.
-            json!({"id":5,"sessionId":"session-own","result":{}}),
-            json!({"id":6,"sessionId":"session-own","result":dom}),
+            json!({"id":4,"sessionId":"session-own","result":{}}),
+            json!({"id":5,"sessionId":"session-own","result":dom}),
+            // Command 6, the ad's child read, never answers.
         ]);
         let mut clock = FakeClock::new();
         let started = clock.now();
@@ -5661,7 +5696,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             clock.now().duration_since(start),
-            Duration::from_millis(crate::budgets::CDP_STEP_MS)
+            Duration::from_millis(120_000)
         );
         assert!(observation.ax_truncated && observation.refs_truncated);
         assert_eq!(
@@ -7975,13 +8010,16 @@ mod tests {
             json!({"id":1,"sessionId":"session-own","result":{}}),
             json!({"id":2,"sessionId":"session-own","result":{"node":ax(0)}}),
         ];
-        for (_, _, children) in &nodes {
-            if !children.is_empty() {
-                let id = frames.len() + 1;
+        let mut child_replies = nodes
+            .iter()
+            .filter(|(_, _, children)| !children.is_empty())
+            .map(|(_, _, children)| {
                 let replies: Vec<Value> = children.iter().map(|child| ax(*child)).collect();
-                frames.push(json!({"id":id,"sessionId":"session-own","result":{"nodes":replies}}));
-            }
-        }
+                json!({"sessionId":"session-own","result":{"nodes":replies}})
+            });
+        // Classification follows the first observed child batch, before any
+        // deeper AX walk. Keep the fixture's replies in that protocol order.
+        frames.extend(child_replies.next());
         let dom: Vec<Value> = nodes
             .iter()
             .enumerate()
@@ -8004,6 +8042,10 @@ mod tests {
         let id = frames.len() + 1;
         frames.push(json!({"id":id,"sessionId":"session-own","result":{}}));
         frames.push(json!({"id":id + 1,"sessionId":"session-own","result":{"nodes":dom}}));
+        frames.extend(child_replies);
+        for (index, reply) in frames.iter_mut().enumerate() {
+            reply["id"] = json!(index + 1);
+        }
         let observation = attached_driver(frames)
             .snapshot_with_clock(
                 "route-own",

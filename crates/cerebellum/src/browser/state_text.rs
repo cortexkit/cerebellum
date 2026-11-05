@@ -112,8 +112,9 @@ pub struct NodeFacts {
     /// just as `Some(true)` does: a value is printed only when the page's own
     /// markup shows the field is neither.
     pub credential: Option<bool>,
-    /// Why the ref has no captured input classification. Print this beside
-    /// every exposed ref so a filtered match does not promise usable input.
+    /// Why the ref has no captured input classification. Shared failures print
+    /// once; a different failure prints beside its ref so a filtered match does
+    /// not imply that input classification was captured.
     pub classification_unavailable: Option<&'static str>,
     /// The field's placeholder text, which is a hint and never the value.
     pub placeholder: Option<String>,
@@ -151,6 +152,66 @@ pub(crate) fn append_classification_notice(
             " [{reference} classification unavailable: {reason}]"
         ));
     }
+}
+
+/// A repeated failure is capture metadata, not part of every element's label.
+/// Count captured identities, not occurrences in joined rows or zoom headers.
+#[derive(Default)]
+pub(crate) struct ClassificationNotices {
+    shared: Option<(&'static str, usize)>,
+}
+
+impl ClassificationNotices {
+    pub(crate) fn new(records: &[AxRecord], facts: &HashMap<String, NodeFacts>) -> Self {
+        let mut counts = std::collections::BTreeMap::new();
+        let references = records
+            .iter()
+            .filter_map(|r| r.reference.as_deref())
+            .collect::<BTreeSet<_>>();
+        for reference in references {
+            if let Some(reason) = facts
+                .get(reference)
+                .and_then(|f| f.classification_unavailable)
+            {
+                *counts.entry(reason).or_insert(0) += 1;
+            }
+        }
+        Self {
+            shared: counts
+                .into_iter()
+                .filter(|(_, count)| *count > 1)
+                .max_by_key(|(_, count)| *count),
+        }
+    }
+
+    pub(crate) fn append_summary(&self, text: &mut String) {
+        if let Some((reason, count)) = self.shared {
+            text.push_str(&format!("\nClassification unavailable for {count} captured refs: {reason}; clicks and typing on them will refuse until a snapshot captures their classification."));
+        }
+    }
+
+    pub(crate) fn append_inline(
+        &self,
+        text: &mut String,
+        reference: &str,
+        facts: &HashMap<String, NodeFacts>,
+    ) {
+        let reason = facts
+            .get(reference)
+            .and_then(|f| f.classification_unavailable);
+        if reason.is_some() && reason != self.shared.map(|(reason, _)| reason) {
+            append_classification_notice(text, reference, facts);
+        }
+    }
+}
+
+pub(crate) fn capture_cut_notice(filters: &Filters) -> String {
+    let unsearched = if filters.narrows() {
+        "; matches beyond the captured portion were not searched"
+    } else {
+        ""
+    };
+    format!("This snapshot is partial. Capture stopped early; some content or refs were not captured{unsearched}. Zoom into a container ref to search or read that subtree.")
 }
 
 /// Which element a zoom asked for and which element of this capture it is.
@@ -253,6 +314,15 @@ pub struct RenderedState {
 /// Render a captured page as plain text, as an outline or as one zoomed
 /// subtree, within `max_bytes`.
 pub fn render(input: &RenderInput<'_>) -> RenderedState {
+    render_with_capture_status(input, false)
+}
+
+/// Capture bounds apply before filtering. A renderer cannot infer missing
+/// subtrees from the records it received, so adapters must pass that status.
+pub fn render_with_capture_status(
+    input: &RenderInput<'_>,
+    capture_incomplete: bool,
+) -> RenderedState {
     let tree = Tree::build(input.records, input.facts);
     let mut header = String::new();
     let title = cap_chars(one_line(&tree.names[0]), NAME_CHARS);
@@ -276,7 +346,8 @@ pub fn render(input: &RenderInput<'_>) -> RenderedState {
                 match tree.reference(target) {
                     Some(reference) => {
                         header.push_str(reference);
-                        append_classification_notice(&mut header, reference, input.facts);
+                        tree.notices
+                            .append_inline(&mut header, reference, input.facts);
                         header_refs.push(reference.to_string());
                     }
                     None => header.push_str(zoom.requested),
@@ -310,7 +381,12 @@ pub fn render(input: &RenderInput<'_>) -> RenderedState {
         }
         None => tree.outline_lines(),
     };
-    if input.filters.narrows() && lines.is_empty() {
+    tree.notices.append_summary(&mut header);
+    if capture_incomplete {
+        header.push('\n');
+        header.push_str(&capture_cut_notice(input.filters));
+    }
+    if input.filters.narrows() && lines.is_empty() && !capture_incomplete {
         header.push_str("\nNo matches for the requested filters.");
     }
     for notice in input
@@ -539,7 +615,7 @@ pub fn resolve_href(href: &str, page_url: &str) -> String {
     format!("{directory}{href}")
 }
 
-pub(super) fn size_text(bytes: usize) -> String {
+pub(crate) fn size_text(bytes: usize) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
     } else {
@@ -615,6 +691,7 @@ struct Tree<'a> {
     kids: Vec<Vec<usize>>,
     by_ref: HashMap<&'a str, usize>,
     facts: &'a HashMap<String, NodeFacts>,
+    notices: ClassificationNotices,
     class: Vec<u8>,
     has_landmark_below: Vec<bool>,
     section: Vec<Option<usize>>,
@@ -677,6 +754,7 @@ impl<'a> Tree<'a> {
             kids: Vec::new(),
             by_ref,
             facts,
+            notices: ClassificationNotices::new(records, facts),
             class: Vec::new(),
             has_landmark_below: Vec::new(),
             section: Vec::new(),
@@ -960,7 +1038,7 @@ impl<'a> Tree<'a> {
 
     fn line(&self, node: usize, depth: usize, mut text: String) -> Line {
         if let Some(reference) = self.reference(node) {
-            append_classification_notice(&mut text, reference, self.facts);
+            self.notices.append_inline(&mut text, reference, self.facts);
         }
         Line {
             depth,
@@ -1520,7 +1598,7 @@ impl<'a> Tree<'a> {
         if let Some(reference) = self.reference(owner) {
             text.push_str("; zoom ");
             text.push_str(reference);
-            append_classification_notice(&mut text, reference, self.facts);
+            self.notices.append_inline(&mut text, reference, self.facts);
             refs.push(reference.to_string());
         }
         let sizes: Vec<_> = members
@@ -1649,7 +1727,7 @@ impl<'a> Tree<'a> {
             if let Some(reference) = self.reference(owner) {
                 text.push_str("; zoom ");
                 text.push_str(reference);
-                append_classification_notice(&mut text, reference, self.facts);
+                self.notices.append_inline(&mut text, reference, self.facts);
                 refs.push(reference.to_string());
             }
             out.push(Line {
@@ -1696,10 +1774,23 @@ impl<'a> Tree<'a> {
 /// removed row.
 fn fit_outline(
     header: String,
-    lines: Vec<Line>,
+    mut lines: Vec<Line>,
     tree: &Tree<'_>,
     max_bytes: usize,
 ) -> RenderedState {
+    if lines.iter().any(|line| line.covered_bytes.is_some()) {
+        // Per-container rows account for the folded nodes. A final reminder
+        // keeps that disclosure visible even when a later landmark is expanded.
+        lines.push(Line {
+            depth: 0,
+            text: "[outline: content is folded into the summaries above; use zoom on a container ref to read it]".into(),
+            class: CHROME,
+            refs: Vec::new(),
+            section: None,
+            covered: 0,
+            covered_bytes: Some(0),
+        });
+    }
     if header.len() + 1 + lines.iter().map(Line::bytes).sum::<usize>() <= max_bytes {
         return fit(header, Vec::new(), lines, tree, max_bytes);
     }
@@ -1774,12 +1865,14 @@ fn fit_outline(
             text.push('\n');
         }
         let mut disclosures = disclosures.into_iter().peekable();
+        let mut ended_with_disclosure = false;
         for index in 0..=lines.len() {
             while disclosures.peek().is_some_and(|(at, _, _)| *at == index) {
                 let (_, disclosure, reference) =
                     disclosures.next().expect("a disclosure was present");
                 text.push_str(&disclosure);
                 text.push('\n');
+                ended_with_disclosure = true;
                 if let Some(reference) = reference {
                     printed_refs.insert(reference.to_string());
                 }
@@ -1790,13 +1883,18 @@ fn fit_outline(
                 text.push_str(&line.text);
                 text.push('\n');
                 printed_refs.extend(line.refs.iter().cloned());
+                ended_with_disclosure = line.covered == 0;
             }
+        }
+        if !ended_with_disclosure {
+            text.push_str(&cut_report(&lines, &keep, tree, max_bytes));
+            text.push('\n');
         }
         if text.len() <= max_bytes || (!header_kept && order.is_empty()) {
             // No readable disclosure fits a cap smaller than the disclosure
             // itself. The reply's omitted counters still describe that case.
             if text.len() > max_bytes {
-                text.clear();
+                text = compact_cut_report(lines.len() + 1, max_bytes);
                 printed_refs.clear();
             }
             return RenderedState {
@@ -1875,12 +1973,28 @@ fn fit(
     if cut_lines > 0 && text.len() + trailer.len() < max_bytes {
         text.push_str(&trailer);
         text.push('\n');
+    } else if cut_lines > 0 {
+        // Tiny budgets cannot hold the section list. Never spend the remaining
+        // space on undisclosed content; keep a short whole disclosure instead.
+        text = compact_cut_report(lines.len() + 1, max_bytes);
+        printed_refs.clear();
+        cut_lines = lines.len() + 1;
+        cut_bytes = header_bytes + lines.iter().map(Line::bytes).sum::<usize>();
     }
     RenderedState {
         text,
         printed_refs,
         cut_bytes,
         cut_lines,
+    }
+}
+
+fn compact_cut_report(lines: usize, max_bytes: usize) -> String {
+    let text = format!("[cut {lines} lines; zoom or raise max_bytes]\n");
+    if text.len() <= max_bytes {
+        text
+    } else {
+        String::new()
     }
 }
 
@@ -1899,7 +2013,7 @@ fn select_lines(
     let mut header_kept = total <= max_bytes || header_bytes <= max_bytes;
     if total > max_bytes {
         let mut reserve = 0;
-        for _ in 0..4 {
+        loop {
             let budget = max_bytes.saturating_sub(reserve);
             keep = vec![false; lines.len()];
             header_kept = header_bytes <= budget;
@@ -1918,7 +2032,9 @@ fn select_lines(
             if trailer.len() < reserve {
                 break;
             }
-            reserve = trailer.len() + 1;
+            // Reserving monotonically avoids both a fixed retry limit and
+            // oscillation when the omitted-section names change at a boundary.
+            reserve = reserve.max(trailer.len() + 1);
         }
     }
 
@@ -1975,6 +2091,152 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repeated_classification_failures_print_once_and_keep_exceptions() {
+        let records = vec![
+            record(0, "RootWebArea", "Thread", Some("e1")),
+            record(1, "region", "Comments", Some("e2")),
+            record(2, "button", "13 more replies", Some("e3")),
+            record(2, "textbox", "Reply", Some("e4")),
+            record(2, "button", "Other frame", Some("e5")),
+        ];
+        let facts = records
+            .iter()
+            .map(|record| {
+                (
+                    record.reference.clone().unwrap(),
+                    NodeFacts {
+                        classification_unavailable: Some(
+                            if record.reference.as_deref() == Some("e5") {
+                                "target_not_in_document"
+                            } else {
+                                "dom_read_failed"
+                            },
+                        ),
+                        ..NodeFacts::default()
+                    },
+                )
+            })
+            .collect();
+        let rendered = render(&RenderInput {
+            records: &records,
+            facts: &facts,
+            page_url: "https://example.com/",
+            snapshot_id: "s1",
+            zoom: Some(Zoom {
+                requested: "e2",
+                target: Some("e2"),
+            }),
+            filters: &Filters::default(),
+            max_bytes: 30_000,
+        });
+        assert_eq!(
+            rendered.text.matches("dom_read_failed").count(),
+            1,
+            "{}",
+            rendered.text
+        );
+        assert!(
+            rendered.text.contains("Classification unavailable for"),
+            "{}",
+            rendered.text
+        );
+        assert!(
+            rendered.text.contains("clicks and typing"),
+            "{}",
+            rendered.text
+        );
+        assert!(
+            rendered
+                .text
+                .contains("[e5 classification unavailable: target_not_in_document]"),
+            "{}",
+            rendered.text
+        );
+        assert!(rendered.printed_refs.contains("e3") && rendered.printed_refs.contains("e4"));
+    }
+
+    #[test]
+    fn every_rendered_byte_cut_ends_with_a_disclosure() {
+        let mut records = vec![record(0, "RootWebArea", "Page", Some("e1"))];
+        for section in 0..8 {
+            records.push(record(
+                1,
+                "region",
+                &format!("Section {section}"),
+                Some(&format!("e{}", 2 + section * 10)),
+            ));
+            for row in 1..10 {
+                records.push(record(
+                    2,
+                    "button",
+                    &format!("{section} {row} {}", "comment ".repeat(12)),
+                    Some(&format!("e{}", 2 + section * 10 + row)),
+                ));
+            }
+        }
+        for zoom in [
+            None,
+            Some(Zoom {
+                requested: "e1",
+                target: Some("e1"),
+            }),
+        ] {
+            for max_bytes in 64..4_000 {
+                let rendered = render(&RenderInput {
+                    records: &records,
+                    facts: &HashMap::new(),
+                    page_url: "https://example.com/",
+                    snapshot_id: "s1",
+                    zoom,
+                    filters: &Filters::default(),
+                    max_bytes,
+                });
+                assert!(rendered.text.len() <= max_bytes);
+                if rendered.cut_lines > 0 {
+                    let last = rendered.text.lines().last().unwrap_or_default();
+                    assert!(
+                        (last.contains("not shown")
+                            || last.contains("[cut ")
+                            || last.contains("[outline:"))
+                            && last.contains("zoom"),
+                        "silent cut at {max_bytes} bytes, zoom {zoom:?}: {}",
+                        rendered.text
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_outline_budget_cut_still_ends_with_a_disclosure_after_later_content() {
+        let mut records = vec![
+            record(0, "RootWebArea", "Page", Some("e1")),
+            record(1, "main", "Comments", Some("e2")),
+        ];
+        for i in 3..200 {
+            records.push(record(
+                2,
+                "button",
+                &format!("Comment {i} {}", "reply ".repeat(40)),
+                Some(&format!("e{i}")),
+            ));
+        }
+        records.push(record(1, "region", "Later content", Some("e200")));
+        let rendered = render_plain(&records, &HashMap::new());
+        assert_eq!(rendered.cut_lines, 0);
+        assert!(
+            rendered.text.contains("more button like this"),
+            "{}",
+            rendered.text
+        );
+        assert!(
+            rendered.text.lines().last().unwrap().contains("[outline:"),
+            "{}",
+            rendered.text
+        );
+    }
+
+    #[test]
     fn classification_notices_survive_filtered_rows_and_byte_cuts() {
         let records = vec![
             record(0, "RootWebArea", "Page", Some("e1")),
@@ -2024,7 +2286,9 @@ mod tests {
                     assert!(
                         rendered.text.contains(&format!(
                             "[{reference} classification unavailable: dom_read_failed]"
-                        )),
+                        )) || rendered.text.contains(
+                            "Classification unavailable for 6 captured refs: dom_read_failed"
+                        ),
                         "{}",
                         rendered.text
                     );
@@ -2036,7 +2300,9 @@ mod tests {
             assert!(
                 ax.text.contains(&format!(
                     "[{reference} classification unavailable: dom_read_failed]"
-                )),
+                )) || ax
+                    .text
+                    .contains("Classification unavailable for 6 captured refs: dom_read_failed"),
                 "{}",
                 ax.text
             );
@@ -2916,6 +3182,9 @@ mod tests {
             .enumerate()
             .map(|(index, line)| {
                 let row = line.trim_start();
+                if row.starts_with("[outline:") {
+                    return 0;
+                }
                 if let Some(more) = row.strip_prefix('+') {
                     let count = more
                         .split_whitespace()

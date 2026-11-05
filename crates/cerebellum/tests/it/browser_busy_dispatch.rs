@@ -1124,10 +1124,9 @@ async fn snapshot_dom_classification_error_keeps_observation_usable() {
                     "flattened_document_refused"
                 };
                 assert!(
-                    snapshot["state_text"]
-                        .as_str()
-                        .unwrap()
-                        .contains(&format!("classification unavailable: {reason}")),
+                    snapshot["state_text"].as_str().unwrap().contains(&format!(
+                        "Classification unavailable for 3 captured refs: {reason}"
+                    )),
                     "{snapshot}"
                 );
             }
