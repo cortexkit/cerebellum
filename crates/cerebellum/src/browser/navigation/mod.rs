@@ -4633,6 +4633,7 @@ where
     let mut processed = 0usize;
     let mut ax_truncated = false;
     let mut refs_truncated = false;
+    let mut missing_ax_children = false;
 
     while let Some(pending) = stack.pop() {
         if processed == max_nodes {
@@ -4872,6 +4873,7 @@ where
                         // snapshot of a continuously changing list.
                         ax_truncated = true;
                         refs_truncated = true;
+                        missing_ax_children = true;
                         None
                     }
                 }
@@ -4902,6 +4904,14 @@ where
                 ignored_ancestors: child_ignored_ancestors.clone(),
             });
         }
+    }
+
+    // A document that declares children but supplies no page content may still
+    // be building its AX tree. Preserve the caller's not-ready refusal instead
+    // of exposing an empty partial page. A root with no declared children can
+    // be genuinely empty, and missing edges beside observed content are partial.
+    if missing_ax_children && records.iter().all(|record| record.role == "RootWebArea") {
+        return Err(NavigationDriveError::CdpFailure);
     }
 
     Ok(BrowserSnapshotObservation {
@@ -5520,6 +5530,54 @@ mod tests {
         );
         assert_eq!(driver.transport.pending_len(), 0);
         assert!(!driver.transport.is_closed());
+    }
+
+    #[test]
+    fn missing_ax_children_require_content_beyond_document_root() {
+        for (root_role, child_role, child_ignored, ready) in [
+            ("RootWebArea", None, false, false),
+            ("RootWebArea", Some("button"), false, true),
+            ("RootWebArea", Some("generic"), true, false),
+            ("button", None, false, true),
+        ] {
+            let mut children = vec!["not_returned"];
+            let child = child_role.map(|role| {
+                children.push("observed");
+                let mut node = raw_node("observed", role, "Observed", &[], 2, None);
+                node.ignored = child_ignored;
+                node
+            });
+            let observation = traverse_ax_tree(
+                raw_node("root", root_role, "Page", &children, 1, Some("frame-own")),
+                "target-own",
+                MAX_AX_NODES,
+                MAX_AX_DEPTH,
+                |id, _| {
+                    assert_eq!(id, "root");
+                    Ok(child.clone().into_iter().collect())
+                },
+            );
+            if ready {
+                let observation = observation.unwrap();
+                assert!(observation.ax_truncated && observation.refs_truncated);
+                assert!(observation
+                    .records
+                    .iter()
+                    .any(|record| record.role == "button"));
+            } else {
+                assert_eq!(observation, Err(NavigationDriveError::CdpFailure));
+            }
+        }
+        let empty = traverse_ax_tree(
+            raw_node("root", "RootWebArea", "Empty", &[], 1, Some("frame-own")),
+            "target-own",
+            MAX_AX_NODES,
+            MAX_AX_DEPTH,
+            |_, _| panic!("a genuinely empty root needs no child read"),
+        )
+        .unwrap();
+        assert_eq!(empty.records.len(), 1);
+        assert!(!empty.ax_truncated && !empty.refs_truncated);
     }
 
     #[test]

@@ -1050,34 +1050,18 @@ async fn snapshot_cdp_failure_journal_keeps_step_without_error_text() {
 }
 
 #[tokio::test]
-async fn snapshot_ax_declared_child_missing_returns_partial_then_recovers() {
-    let (plane, route, _) = fixture_with_fault(
-        None,
-        42,
-        None,
+async fn snapshot_ax_declared_child_missing_names_get_child_ax_nodes() {
+    assert_snapshot_step_and_recovery(
         Some(SnapshotFault {
             method: "Accessibility.getChildAXNodes",
             kind: SnapshotFaultKind::MissingChild,
         }),
         false,
         false,
+        "Accessibility.getChildAXNodes",
+        "ax",
     )
     .await;
-    let partial = plane
-        .dispatch(&route, BrowserCapability::Snapshot, &json!({"mode":"ax"}))
-        .await;
-    assert_eq!(partial["outcome"], "ok", "{partial}");
-    assert_eq!(partial["truncated"], true);
-    assert_eq!(partial["refs_truncated"], true);
-    let recovered = plane
-        .dispatch(&route, BrowserCapability::Snapshot, &json!({"mode":"ax"}))
-        .await;
-    assert_eq!(recovered["outcome"], "ok", "{recovered}");
-    assert_eq!(recovered["truncated"], false);
-    assert!(recovered["state_text"]
-        .as_str()
-        .unwrap()
-        .contains("Event row"));
 }
 
 #[tokio::test]

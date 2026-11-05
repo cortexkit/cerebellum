@@ -38,10 +38,12 @@ invalidates old snapshots; commands are never replayed.
 Navigation confirms the committed document, not page or network settlement, and
 reports `settled: false`. Snapshots make the same limitation explicit: a stable
 document and interaction epoch do not prove that Chrome has finished loading the
-accessibility tree. An empty AX response or a missing declared child refuses with
-`snapshot_not_ready` and `read again`. A root-only tree can be a legitimate empty
-page, so it remains readable; its remedy explains that the page may instead still
-be loading and that absent controls should not be assumed unavailable.
+accessibility tree. An empty AX response, or missing declared children when only
+the document root was observed, refuses with `snapshot_not_ready` and `read again`.
+Missing children beside observed page content instead produce a partial snapshot
+with disclosure. A root with no declared children can be a legitimate empty page,
+so it remains readable; the snapshot's remedy explains that the page may instead
+still be loading and that absent controls should not be assumed unavailable.
 
 Like own-browser snapshots, user snapshots report `truncated` and
 `refs_truncated`. Accessibility-tree and actionable-reference limits (4,096
