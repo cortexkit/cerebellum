@@ -8,7 +8,8 @@ source "$repo_root/scripts/lib/fast-gate-plan.sh"
 scratch_root="${CARGO_TARGET_DIR:-$repo_root/target}/scratch"
 mkdir -p "$scratch_root"
 scratch="$(mktemp -d "$scratch_root/fast-gate-test.XXXXXX")"
-trap 'rm -rf "$scratch"' EXIT
+source "$repo_root/scripts/lib/fail-closed-exit.sh"
+trap 'fail_closed_exit rm -rf "$scratch"' EXIT
 failures=0
 checks=0
 
@@ -32,6 +33,14 @@ setup_phases() {
   static_logs=()
   phase_failed=0
   not_verified=()
+}
+
+shell_exit_plan() {
+  local plan
+  plan="$(plan_for_files 'scripts/lib/new-check.sh' '{"packages": []}')" || return 1
+  printf '%s\n' "$plan" | grep -Fxq 'A|shell-exit-traps' || return 1
+  plan="$(plan_for_files 'README.md' '{"packages": []}')" || return 1
+  if printf '%s\n' "$plan" | grep -Fxq 'A|shell-exit-traps'; then return 1; fi
 }
 
 browser_source_plan() {
@@ -377,6 +386,9 @@ mac_clippy_pipeline() {
   cp "$repo_root/scripts/lib/fast-gate-phases.sh" \
     "$repo_root/scripts/lib/fast-gate-plan.sh" \
     "$repo_root/scripts/lib/gate-lock.sh" \
+    "$repo_root/scripts/lib/fail-closed-exit.sh" \
+    "$repo_root/scripts/lib/fail-closed-exit.test.sh" \
+    "$repo_root/scripts/lib/fail-closed-exit-scan.py" \
     "$repo_root/scripts/lib/gate-cargo-test.sh" \
     "$repo_root/scripts/lib/fast-gate-fingerprint.py" \
     "$repo_root/scripts/lib/process-table-probe.py" "$fixture/scripts/lib/"
@@ -428,6 +440,16 @@ PY
     ./scripts/fast-gate.sh --part mac --base HEAD >"$scratch/mac-linux-only" 2>&1 || exit 1
     [ "$(wc -l <"$CALL_LOG" | tr -d ' ')" = 1 ] || exit 1
     printf 'fixture\n' >crates/cerebellum-linux/src/lib.rs
+    printf '# scripts-only change\n' >scripts/new.sh
+    : >"$CALL_LOG"
+    ./scripts/fast-gate.sh --part mac --base HEAD >"$scratch/mac-script-check" 2>&1 || exit 1
+    grep -Fq 'PASS: nounset scripts fail closed on EXIT' "$scratch/mac-script-check" || exit 1
+    [ "$(wc -l <"$CALL_LOG" | tr -d ' ')" = 1 ] || exit 1
+    printf 'set -u\ntrap ":" EXIT\n' >scripts/new.sh
+    ./scripts/fast-gate.sh --part mac --base HEAD >"$scratch/mac-script-refusal" 2>&1
+    status=$?
+    [ "$status" -ne 0 ] && grep -Fq 'scripts/new.sh:' "$scratch/mac-script-refusal" || exit 1
+    rm scripts/new.sh
     printf 'changed\n' >crates/cerebellum/src/lib.rs
     : >"$CALL_LOG"
     FIXTURE_CLIPPY_STATUS=31 ./scripts/fast-gate.sh --part mac --base HEAD >"$scratch/mac-lint-failure" 2>&1
@@ -446,6 +468,7 @@ mac_vm_pipeline() {
   cp "$repo_root/scripts/lib/fast-gate-phases.sh" \
     "$repo_root/scripts/lib/fast-gate-plan.sh" \
     "$repo_root/scripts/lib/gate-lock.sh" \
+    "$repo_root/scripts/lib/fail-closed-exit.sh" \
     "$repo_root/scripts/lib/gate-cargo-test.sh" \
     "$repo_root/scripts/lib/fast-gate-fingerprint.py" \
     "$repo_root/scripts/lib/process-table-probe.py" "$fixture/scripts/lib/"
@@ -527,6 +550,7 @@ combined_missing() {
 }
 
 check 'a browser-only source diff selects browser_session_wire' browser_source_plan
+check 'every scripts change selects the fail-closed EXIT source check' shell_exit_plan
 check 'standalone source areas select their binaries without unrelated suites' standalone_source_plans
 check 'every standalone cerebellum binary has source coverage or an unconditional phase' standalone_source_coverage
 check 'a stale lock naming a reused live pid is not refused' reused_pid_lock
@@ -550,4 +574,5 @@ check 'default mode preserves NOT VERIFIED from the Mac half' combined_skip
 check 'default mode refuses mismatched tree fingerprints and names both' combined_mismatch
 check 'default mode refuses a missing tree fingerprint' combined_missing
 echo "fast-gate phase tests: $checks checks, $failures failures"
-[ "$failures" -eq 0 ]
+[ "$failures" -eq 0 ] || exit 1
+finished=1

@@ -243,9 +243,14 @@ release_lock() {
   done
   rm -rf "$static_dir"
 }
-trap release_lock EXIT
+source "$repo_root/scripts/lib/fail-closed-exit.sh"
+trap 'fail_closed_exit release_lock' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP QUIT
+
+if printf '%s\n' "$plan" | grep -Fxq 'A|shell-exit-traps'; then
+  start_static_phase "nounset scripts fail closed on EXIT" check_shell_exit_traps
+fi
 
 if [ "$part" = linux ]; then
 start_static_phase "module wiring: scripts/module-wiring-gate.sh" ./scripts/module-wiring-gate.sh
@@ -426,3 +431,4 @@ fi
 # Source-check logs are replayed in launch order, never interleaved with Cargo.
 wait_static_phases
 finish_gate
+finished=1

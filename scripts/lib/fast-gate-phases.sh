@@ -199,6 +199,11 @@ run_phase() {
   fi
 }
 
+check_shell_exit_traps() {
+  bash "$repo_root/scripts/lib/fail-closed-exit.test.sh" &&
+    python3 "$repo_root/scripts/lib/fail-closed-exit-scan.py" "$repo_root"
+}
+
 run_serial_phase() {
   run_phase "$@" || phase_failed=1
 }

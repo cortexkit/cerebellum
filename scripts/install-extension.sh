@@ -95,7 +95,8 @@ cleanup() {
   rm -rf "$staging"
   if [[ -n "$retired" ]]; then rm -rf "$retired"; fi
 }
-trap cleanup EXIT
+source "$root/scripts/lib/fail-closed-exit.sh"
+trap 'fail_closed_exit cleanup' EXIT
 cp -R "$source_dir/." "$staging/"
 rm -rf "$staging/tests"
 chmod 755 "$staging"
@@ -112,3 +113,4 @@ fi
 
 printf 'Installed CortexKit extension %s (contract revision %s) into %s.\n' "$version" "$revision" "$dest"
 printf 'Ask the person to reload it in chrome://extensions (Load unpacked from this directory the first time).\n'
+finished=1
