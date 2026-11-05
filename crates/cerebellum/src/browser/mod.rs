@@ -14,6 +14,7 @@ pub mod navigation;
 mod refs;
 mod scroll;
 pub mod state_text;
+mod url_privacy;
 pub(crate) mod zoom;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -2485,8 +2486,9 @@ impl BrowserPlane {
         identity: &RouteIdentity,
         capability: BrowserCapability,
         outcome: Outcome,
-        detail: Value,
+        mut detail: Value,
     ) -> Result<(), BrowserError> {
+        url_privacy::urls_to_origins(&mut detail);
         let mut state = self.state.lock().await;
         Self::record_invocation_outcome(
             &mut state,
@@ -6183,6 +6185,7 @@ fn journal_refusal_detail(error: &BrowserError) -> Value {
         object.remove("hit_name");
         object.insert("outcome".into(), json!(error.outcome()));
     }
+    url_privacy::urls_to_origins(&mut detail);
     detail
 }
 

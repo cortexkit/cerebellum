@@ -3429,6 +3429,8 @@ async fn the_plane_production_builds_runs_its_authorization_gate() {
     );
 }
 
+const PRIVATE_LANDING_URL: &str = "https://attacker.example/private-url-token-749c?code=private-url-token-749c#private-url-token-749c";
+
 /// A navigation double that lands somewhere other than the authorized origin.
 #[derive(Clone)]
 struct OffOriginRedirectProcess {
@@ -3445,7 +3447,7 @@ impl OwnedBrowserProcess for OffOriginRedirectProcess {
         tracker: &mut Tracker,
     ) -> Result<(), NavigationDriveError> {
         let now = Instant::now();
-        tracker.url_final = Some("https://attacker.example/landed".into());
+        tracker.url_final = Some(PRIVATE_LANDING_URL.into());
         tracker.load(now);
         tracker.poll_settlement(now + Duration::from_millis(browser::QUIET_MS));
         Ok(())
@@ -3457,7 +3459,7 @@ impl OwnedBrowserProcess for OffOriginRedirectProcess {
         _: u64,
     ) -> Result<CommittedDocument, NavigationDriveError> {
         Ok(CommittedDocument::new(
-            "https://attacker.example/landed",
+            PRIVATE_LANDING_URL,
             2,
             "loader-attacker",
         ))
@@ -3536,7 +3538,7 @@ async fn a_redirect_off_the_authorized_origin_refuses_the_next_snapshot() {
         .await;
     assert_eq!(navigated["outcome"], "ok", "{navigated}");
     assert_eq!(
-        navigated["url_final"], "https://attacker.example/landed",
+        navigated["url_final"], PRIVATE_LANDING_URL,
         "the caller is told where it actually landed: {navigated}"
     );
 
@@ -3589,7 +3591,7 @@ async fn a_redirect_off_the_authorized_origin_withholds_read_page_content() {
 
     assert_eq!(result["outcome"], "ok", "{result}");
     assert_eq!(
-        result["url_final"], "https://attacker.example/landed",
+        result["url_final"], PRIVATE_LANDING_URL,
         "the navigation must have succeeded and reported its landing page: {result}"
     );
     assert_eq!(
@@ -3688,7 +3690,7 @@ async fn the_journal_lifecycle_runs_and_separates_a_read_from_a_navigation() {
 
 /// A snapshot authorization denial is recorded without reading its target.
 #[tokio::test]
-async fn a_refusal_records_only_claimed_addressing_and_typed_reason() {
+async fn landing_url_tokens_never_reach_journal_or_refusal_records() {
     const SECRET: &str = "private-page-secret-7be680b9";
 
     let route = identity();
@@ -3738,10 +3740,6 @@ async fn a_refusal_records_only_claimed_addressing_and_typed_reason() {
     assert!(!history.trimmed);
     assert_eq!(history.records.len(), 1);
     assert_eq!(
-        history.records[0].claimed_addressing,
-        "https://attacker.example/landed"
-    );
-    assert_eq!(
         history.records[0].reason,
         SnapshotRefusalReason::OriginScope
     );
@@ -3754,6 +3752,37 @@ async fn a_refusal_records_only_claimed_addressing_and_typed_reason() {
     );
 
     let serialized = plane.refusal_ring_export_for_test().await;
+    const URL_TOKEN: &str = "private-url-token-749c";
+    let mut planted_record: Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+    planted_record["detail"]["url_final"] = json!(PRIVATE_LANDING_URL);
+    let planted_record = planted_record.to_string();
+    assert!(planted_record.contains(URL_TOKEN));
+    let encoded_record = format!(
+        "{{\"bytes\":\"{}\"}}",
+        cerebellum_core::serde_base64::encode(planted_record.as_bytes())
+    );
+    assert!(
+        base64_decoded_strings(&encoded_record)
+            .iter()
+            .any(|text| text.contains(URL_TOKEN)),
+        "scanner must detect a planted URL token in an encoded record"
+    );
+    for record in [&journal, &serialized] {
+        assert!(
+            !record.contains(URL_TOKEN),
+            "URL token in durable record: {record}"
+        );
+        assert!(
+            !base64_decoded_strings(record)
+                .iter()
+                .any(|text| text.contains(URL_TOKEN)),
+            "encoded URL token in durable record"
+        );
+    }
+    assert_eq!(
+        history.records[0].claimed_addressing,
+        "https://attacker.example"
+    );
     let planted = format!(
         "{{\"bytes\":\"{}\"}}",
         cerebellum_core::serde_base64::encode(SECRET.as_bytes())
