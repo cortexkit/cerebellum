@@ -327,7 +327,6 @@ fn violations(path: &str, source: &str) -> Vec<String> {
                         | "kill"
                         | "/usr/bin/sqlite3"
                         | "/usr/sbin/ioreg"
-                        | "node"
                 )
         });
         let self_reexec = at(4) == Some("std")
@@ -348,18 +347,6 @@ fn violations(path: &str, source: &str) -> Vec<String> {
         }
     }
     found
-}
-
-#[test]
-fn literal_node_is_a_non_browser_cli_without_allowing_dynamic_or_chrome() {
-    let path = "cerebellum/tests/collector_parity.rs";
-    assert!(violations(path, r#"Command::new("node").spawn();"#).is_empty());
-    for source in [
-        "Command::new(executable).spawn();",
-        r#"Command::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome").spawn();"#,
-    ] {
-        assert_eq!(violations(path, source).len(), 1, "missed {source}");
-    }
 }
 
 #[test]

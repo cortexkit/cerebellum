@@ -100,10 +100,7 @@ struct FrameSpec {
     security_origin: Option<String>,
 }
 
-use crate::scoped_fixture;
-
 struct Page {
-    scoped: scoped_fixture::ScopedDom,
     main_url: String,
     main_opaque: bool,
     adopted_owner: bool,
@@ -142,7 +139,6 @@ struct Page {
 impl Default for Page {
     fn default() -> Self {
         Self {
-            scoped: scoped_fixture::ScopedDom::default(),
             main_url: format!("{SITE}/signin"),
             main_opaque: false,
             adopted_owner: false,
@@ -272,13 +268,6 @@ impl Page {
     /// Answer one CDP command: `Ok` result or `Err` error message.
     fn answer(&mut self, method: &str, params: &Value) -> Result<Value, &'static str> {
         self.commands.push(method.to_string());
-        let dom = Value::Object(self.dom());
-        if let Some(result) = self
-            .scoped
-            .answer(&json!({"method":method,"params":params}), &dom)
-        {
-            return Ok(result);
-        }
         let field = |node: u64| matches!(node, USERNAME_NODE | PASSWORD_NODE | OTP_NODE);
         Ok(match method {
             "Target.createTarget" => json!({"targetId": TARGET}),
