@@ -324,7 +324,17 @@ impl CdpTransport {
         if self.closed {
             return Err(CdpError::ProtocolFailure("cdp transport is closed"));
         }
-        if self.pending.len() >= MAX_PENDING_COMMANDS {
+        // An unanswered abandonment must keep its session tombstone for the
+        // lifetime of the transport. Reserve space for those as well as pending
+        // commands; never trade correlation safety for another command slot.
+        if self.pending.len()
+            + self
+                .completed
+                .values()
+                .filter(|completion| matches!(completion, Completion::Abandoned { .. }))
+                .count()
+            >= MAX_PENDING_COMMANDS
+        {
             return Err(CdpError::PendingCapacity);
         }
         let method = method.into();
@@ -352,6 +362,15 @@ impl CdpTransport {
         // Serialize before adding the command to pending state: a command that
         // cannot be represented must never become an unresolvable pending item.
         command.json_bytes()?;
+        if self.pending.len() + self.completed.len() >= MAX_PENDING_COMMANDS {
+            if let Some(id) = self.completed.iter().find_map(|(id, completion)| {
+                matches!(completion, Completion::Received).then_some(*id)
+            }) {
+                // Retired received IDs are never reused. A duplicate outside
+                // this window still fails closed as an unknown response.
+                self.completed.remove(&id);
+            }
+        }
         self.pending.insert(
             id,
             Pending {
@@ -698,6 +717,58 @@ mod tests {
             Err(CdpError::InvalidUtf8)
         ));
     }
+    #[test]
+    fn audit_completed_history_is_bounded_without_evicting_abandoned_identity() {
+        let mut transport = CdpTransport::new();
+        let now = Instant::now();
+        let abandoned = transport
+            .issue_command("Runtime.evaluate", None, Some("old-page".into()), now)
+            .unwrap();
+        transport.abandon_command(abandoned.id);
+        for _ in 0..MAX_PENDING_COMMANDS * 2 {
+            let command = transport
+                .issue_command("Runtime.evaluate", None, Some("page".into()), now)
+                .unwrap();
+            let bytes = serde_json::to_vec(
+                &serde_json::json!({"id":command.id,"sessionId":"page","result":{}}),
+            )
+            .unwrap();
+            assert!(!transport.take_response(&bytes).unwrap().abandoned);
+            assert!(transport.completed.len() <= MAX_PENDING_COMMANDS);
+        }
+        let late = serde_json::to_vec(
+            &serde_json::json!({"id":abandoned.id,"sessionId":"old-page","result":{}}),
+        )
+        .unwrap();
+        assert!(transport.take_response(&late).unwrap().abandoned);
+        assert_eq!(
+            transport.take_response(&late),
+            Err(CdpError::DuplicateResponseId(abandoned.id))
+        );
+    }
+
+    #[test]
+    fn audit_unanswered_abandonments_bound_admission_and_keep_session_checks() {
+        let mut transport = CdpTransport::new();
+        let now = Instant::now();
+        for _ in 0..MAX_PENDING_COMMANDS {
+            let command = transport
+                .issue_command("Runtime.evaluate", None, Some("page".into()), now)
+                .unwrap();
+            transport.abandon_command(command.id);
+        }
+        assert_eq!(transport.pending_len(), 0);
+        assert!(matches!(
+            transport.issue_command("Runtime.evaluate", None, None, now),
+            Err(CdpError::PendingCapacity)
+        ));
+        assert_eq!(transport.completed.len(), MAX_PENDING_COMMANDS);
+        assert_eq!(
+            transport.take_response(br#"{"id":1,"sessionId":"other","result":{}}"#),
+            Err(CdpError::SessionMismatch)
+        );
+    }
+
     #[test]
     fn abandoned_commands_release_capacity_and_validate_late_replies() {
         let mut transport = CdpTransport::new();

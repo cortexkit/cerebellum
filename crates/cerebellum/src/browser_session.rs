@@ -902,6 +902,15 @@ pub trait OwnedBrowserProcess: Send {
     }
 
     fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure>;
+    /// A blocking close adapter must override this, bound its write by the
+    /// grace budget, and return only the time left for exit observation.
+    fn request_graceful_termination_with_budget(
+        &mut self,
+        grace_period: Duration,
+    ) -> Result<Duration, ProcessControlFailure> {
+        self.request_graceful_termination()?;
+        Ok(grace_period)
+    }
     fn wait_for_exit(&mut self, grace_period: Duration) -> Result<bool, ProcessControlFailure>;
     fn force_terminate(&mut self) -> Result<(), ProcessControlFailure>;
     fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure>;
@@ -4254,8 +4263,10 @@ fn teardown_process_with_grace(
     }
     // A broken close pipe or failed exit observation is not proof of death.
     // If the close request fails, skip the grace wait and try the generation-checked kill.
-    let exited = process.request_graceful_termination().is_ok()
-        && process.wait_for_exit(grace_period).unwrap_or(false);
+    let exited = process
+        .request_graceful_termination_with_budget(grace_period)
+        .and_then(|remaining| process.wait_for_exit(remaining))
+        .unwrap_or(false);
     if !exited {
         // Recheck the generation immediately before signaling: the PID may have
         // been recycled since the initial exit observation or graceful wait.
@@ -4271,6 +4282,130 @@ fn teardown_process_with_grace(
         }
     }
     process.wait_until_reaped()
+}
+
+#[cfg(all(test, unix))]
+mod close_write_tests {
+    use super::*;
+    use crate::browser::navigation::CdpNavigationDriver;
+    use crate::browser_launch_readiness::UnixCdpPipe;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    struct FullPipeProcess {
+        driver: CdpNavigationDriver<UnixCdpPipe>,
+        killed: Arc<AtomicBool>,
+    }
+
+    #[test]
+    fn audit_writable_close_pipe_sends_a_unique_command_within_budget() {
+        let (command, mut reader) = UnixStream::pair().unwrap();
+        let (response, _response_peer) = UnixStream::pair().unwrap();
+        let mut transport = crate::cdp::CdpTransport::new();
+        let handshake = transport
+            .issue_command("Browser.getVersion", None, None, Instant::now())
+            .unwrap();
+        transport
+            .take_response(
+                &serde_json::to_vec(&serde_json::json!({"id":handshake.id,"result":{}})).unwrap(),
+            )
+            .unwrap();
+        let mut driver = CdpNavigationDriver::new(
+            UnixCdpPipe::new(command, response).unwrap(),
+            transport,
+            crate::cdp::CdpFrameDecoder::default(),
+        );
+        driver
+            .request_browser_close(Instant::now() + Duration::from_millis(100))
+            .unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut bytes = [0u8; 128];
+        let count = reader.read(&mut bytes).unwrap();
+        assert_eq!(bytes[count - 1], 0);
+        let command: serde_json::Value = serde_json::from_slice(&bytes[..count - 1]).unwrap();
+        assert_eq!(command["id"], 2);
+        assert_eq!(command["method"], "Browser.close");
+    }
+
+    impl OwnedBrowserProcess for FullPipeProcess {
+        fn generation_matches(&self) -> bool {
+            !self.killed.load(Ordering::SeqCst)
+        }
+        fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+            self.request_graceful_termination_with_budget(Duration::from_millis(
+                crate::budgets::TERMINATION_GRACE_MS,
+            ))
+            .map(|_| ())
+        }
+        fn request_graceful_termination_with_budget(
+            &mut self,
+            grace_period: Duration,
+        ) -> Result<Duration, ProcessControlFailure> {
+            let deadline = Instant::now() + grace_period;
+            self.driver
+                .request_browser_close(deadline)
+                .map_err(|_| ProcessControlFailure::new(ProcessControlStep::GracefulCloseRequest))
+                .map(|()| deadline.saturating_duration_since(Instant::now()))
+        }
+        fn wait_for_exit(&mut self, grace: Duration) -> Result<bool, ProcessControlFailure> {
+            std::thread::sleep(grace);
+            Ok(false)
+        }
+        fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+            self.killed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn audit_full_close_pipe_reaches_kill_within_the_existing_grace_budget() {
+        let (mut command, blocked_reader) = UnixStream::pair().unwrap();
+        command.set_nonblocking(true).unwrap();
+        for bytes in [&[0u8; 4096][..], &[0u8; 1][..]] {
+            loop {
+                match command.write(bytes) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("fill command socket: {error}"),
+                }
+            }
+        }
+        command.set_nonblocking(false).unwrap();
+        let (response, _response_peer) = UnixStream::pair().unwrap();
+        let killed = Arc::new(AtomicBool::new(false));
+        let mut process = FullPipeProcess {
+            driver: CdpNavigationDriver::new(
+                UnixCdpPipe::new(command, response).unwrap(),
+                crate::cdp::CdpTransport::new(),
+                crate::cdp::CdpFrameDecoder::default(),
+            ),
+            killed: killed.clone(),
+        };
+        let (done, completed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done.send(teardown_process_with_grace(
+                &mut process,
+                Duration::from_millis(100),
+            ))
+            .unwrap();
+        });
+        let result = completed.recv_timeout(Duration::from_millis(250));
+        // Always release a broken implementation before asserting, so the
+        // regression cannot leave a blocked teardown thread in the test binary.
+        drop(blocked_reader);
+        worker.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "close write blocked teardown beyond its grace budget"
+        );
+        result.unwrap().unwrap();
+        assert!(killed.load(Ordering::SeqCst));
+    }
 }
 
 fn stable_route_id(route_key: &str) -> String {

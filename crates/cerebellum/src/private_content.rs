@@ -964,3 +964,81 @@ pub(crate) fn scope_union(planes: &Planes, scope: &str, parent: Option<&str>) ->
     }
     scopes
 }
+
+#[cfg(test)]
+mod growth_tests {
+    use super::*;
+    use subc_protocol::scope::{ScopeKind, ScopeParent, ScopeStamp};
+
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Worker refs currently have the same permanent retention as heads. Keep
+    /// this characterization until an authoritative scope-end signal can
+    /// retire them without making historical privacy queries answer public.
+    #[tokio::test]
+    async fn audit_worker_head_growth_reaches_the_cap_and_then_fails_closed() {
+        let scratch = Scratch(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/scratch/private-content-growth-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        cerebellum_core::private_fs::create_dir_all(&scratch.0).unwrap();
+        let store = Arc::new(PrivateContent::open_at(scratch.0.join(FILE_NAME), 1));
+        let principal = subc_protocol::Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        };
+        let mut facts = AcceptedBindFacts::from_bind(
+            &subc_protocol::BindIdentity::new("fixture", "conversation"),
+            Some(principal.clone()),
+            None,
+            None,
+            &subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "cerebellum".into(),
+            },
+        )
+        .with_scope(Some(
+            ScopeStamp::new(principal.clone(), "worker", 1, ScopeKind::Worker)
+                .with_parent(Some(ScopeParent::new(principal, "head", 1))),
+        ));
+
+        for range in [0..100, 100..100_000] {
+            let mut targets = Vec::new();
+            for worker in range.clone() {
+                facts.scope.as_mut().unwrap().scope_ref =
+                    format!("worker:agent-0123456789abcdef:task-{worker:032x}");
+                let worker_targets = mark_targets(&facts);
+                assert!(worker_targets
+                    .iter()
+                    .all(|(_, retention)| *retention == Retention::Head));
+                targets.extend(worker_targets);
+            }
+            let failures = store.record(&targets, &[Source::SignedInSite], 1).unwrap();
+            assert_eq!(
+                store.state.lock().unwrap().document.heads.len(),
+                range.end + 1
+            );
+            if range.end == 100 {
+                store.write(failures, 1).await;
+                assert_eq!(store.answer(&["unmarked"], 1)["private_content"], false);
+            } else {
+                let error = store.persist(failures).unwrap_err();
+                assert_eq!(error.to_string(), "private-content marks exceed size limit");
+                store.write(failures, 1).await;
+            }
+        }
+        let later = 1 + RETENTION_MS * 3;
+        let answer = store.answer(&["unmarked"], later);
+        assert_eq!(answer["private_content"], true);
+        assert_eq!(answer["sources"], serde_json::to_value(SOURCES).unwrap());
+        let state = store.state.lock().unwrap();
+        assert_eq!(state.document.heads.len(), 100_001);
+        assert!(state.document.runs.is_empty());
+        assert!(state.write_failed);
+    }
+}

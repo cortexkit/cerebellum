@@ -72,23 +72,10 @@ impl BridgeListener {
         let metadata = std::fs::symlink_metadata(&path)?;
         let instance = bridge.clone();
         let task = tokio::spawn(async move {
-            let slots = Arc::new(tokio::sync::Semaphore::new(8));
-            let mut peers = tokio::task::JoinSet::new();
-            loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let Ok((stream, _)) = accepted else { break; };
-                        let Ok(slot) = slots.clone().try_acquire_owned() else { continue; };
-                        let bridge = instance.clone();
-                        let verifier = verifier.clone();
-                        peers.spawn(async move {
-                            let _slot = slot;
-                            serve_peer(bridge, stream, verifier).await;
-                        });
-                    }
-                    _ = peers.join_next(), if !peers.is_empty() => {},
-                }
-            }
+            accept_peers(instance, verifier, || async {
+                listener.accept().await.map(|(stream, _)| stream)
+            })
+            .await;
         });
         Ok(Self {
             bridge,
@@ -97,6 +84,44 @@ impl BridgeListener {
             inode: metadata.ino(),
             device: metadata.dev(),
         })
+    }
+}
+
+async fn accept_peers<A, F>(instance: UserBrowserBridge, verifier: VerifyPeer, mut accept: A)
+where
+    A: FnMut() -> F,
+    F: std::future::Future<Output = io::Result<UnixStream>>,
+{
+    let slots = Arc::new(tokio::sync::Semaphore::new(8));
+    let mut peers = tokio::task::JoinSet::new();
+    let mut retry = Duration::from_millis(10);
+    loop {
+        tokio::select! {
+            accepted = accept() => {
+                let stream = match accepted {
+                    Ok(stream) => {
+                        retry = Duration::from_millis(10);
+                        stream
+                    }
+                    Err(_) => {
+                        // Descriptor pressure and aborted connections can clear
+                        // without a rebind. Back off up to one second rather
+                        // than spinning on a persistent error.
+                        tokio::time::sleep(retry).await;
+                        retry = (retry * 2).min(Duration::from_secs(1));
+                        continue;
+                    }
+                };
+                let Ok(slot) = slots.clone().try_acquire_owned() else { continue; };
+                let bridge = instance.clone();
+                let verifier = verifier.clone();
+                peers.spawn(async move {
+                    let _slot = slot;
+                    serve_peer(bridge, stream, verifier).await;
+                });
+            }
+            _ = peers.join_next(), if !peers.is_empty() => {},
+        }
     }
 }
 
@@ -348,4 +373,53 @@ pub(super) fn test_listener(
         }
     };
     BridgeListener::bind_at(bridge, path.to_path_buf(), verifier)
+}
+
+#[cfg(test)]
+mod accept_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn audit_accept_errors_back_off_and_still_serve_the_next_peer() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let times = attempts.clone();
+        let mut server = Some(server);
+        let task = tokio::spawn(accept_peers(
+            UserBrowserBridge::new(),
+            Arc::new(|_| Err(Reason::ProtocolError)),
+            move || {
+                let index = {
+                    let mut times = times.lock().unwrap();
+                    let index = times.len();
+                    times.push(tokio::time::Instant::now());
+                    index
+                };
+                let stream = if index == 8 { server.take() } else { None };
+                async move {
+                    if index < 8 {
+                        Err(io::Error::from(io::ErrorKind::ConnectionAborted))
+                    } else if let Some(stream) = stream {
+                        Ok(stream)
+                    } else {
+                        std::future::pending().await
+                    }
+                }
+            },
+        ));
+        let reply = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut client))
+            .await
+            .expect("accept retries must reach a reconnected peer")
+            .expect("the listener must not exit on an accept error");
+        assert!(matches!(reply, Frame::HostRefused { .. }));
+        let times = attempts.lock().unwrap();
+        assert!(times.len() >= 9);
+        for (index, pair) in times[..9].windows(2).enumerate() {
+            assert_eq!(
+                pair[1] - pair[0],
+                Duration::from_millis((10u64 << index).min(1000))
+            );
+        }
+        task.abort();
+    }
 }

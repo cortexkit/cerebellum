@@ -2970,7 +2970,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         Ok(())
     }
 
-    pub fn request_browser_close(&mut self) -> Result<(), NavigationDriveError> {
+    pub fn request_browser_close(&mut self, deadline: Instant) -> Result<(), NavigationDriveError> {
         // Teardown uses the same correlator as navigation so request ids remain
         // unique until the descriptor closes; a fixed close id could alias a
         // completed navigation response on a long-lived session.
@@ -2983,7 +2983,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .map_err(|_| NavigationDriveError::CdpFailure)?;
         bytes.push(0);
         self.pipe
-            .write_frame(&bytes)
+            .write_frame_until(&bytes, deadline)
             .map_err(|_| NavigationDriveError::ConnectorFailure)
     }
 

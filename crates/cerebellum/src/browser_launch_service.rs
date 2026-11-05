@@ -969,8 +969,11 @@ impl crate::login_capture::CaptureBrowser for ProductionCaptureBrowser {
         if self.closed {
             return Ok(());
         }
-        let _ = self.process.request_graceful_termination();
-        let reaped = match self.process.wait_for_exit(self.grace_period) {
+        let reaped = match self
+            .process
+            .request_graceful_termination_with_budget(self.grace_period)
+            .and_then(|remaining| self.process.wait_for_exit(remaining))
+        {
             Ok(true) => self.process.wait_until_reaped(),
             _ => self.process.force_terminate(),
         };
@@ -2431,13 +2434,25 @@ impl OwnedBrowserProcess for ProductionProcess {
     }
 
     fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+        self.request_graceful_termination_with_budget(Duration::from_millis(
+            crate::budgets::TERMINATION_GRACE_MS,
+        ))
+        .map(|_| ())
+    }
+
+    fn request_graceful_termination_with_budget(
+        &mut self,
+        grace_period: Duration,
+    ) -> Result<Duration, ProcessControlFailure> {
+        let deadline = Instant::now() + grace_period;
         self.driver
             .as_mut()
             .ok_or(ProcessControlFailure::new(
                 ProcessControlStep::GracefulCloseRequest,
             ))?
-            .request_browser_close()
+            .request_browser_close(deadline)
             .map_err(|_| ProcessControlFailure::new(ProcessControlStep::GracefulCloseRequest))
+            .map(|()| deadline.saturating_duration_since(Instant::now()))
     }
 
     fn wait_for_exit(&mut self, grace_period: Duration) -> Result<bool, ProcessControlFailure> {
