@@ -15,6 +15,7 @@ const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const collect = vm.runInNewContext('(' + input.function + ')');
 const outputs = [];
 for (const fixture of input.fixtures) {
+  let childReads = 0;
   class Node {
     constructor(raw) {
       this.raw = raw; this.children = []; this.parentNode = null;
@@ -31,7 +32,7 @@ for (const fixture of input.fixtures) {
     }
     hasAttribute(name) { return this.attributes.some(attr => attr.name === name); }
     getAttribute(name) { return this.attributes.find(attr => attr.name === name)?.value ?? null; }
-    get firstChild() { return this.children[0] || null; }
+    get firstChild() { ++childReads; return this.children[0] || null; }
     get nextSibling() {
       if (!this.parentNode) return null;
       return this.parentNode.children[this.parentNode.children.indexOf(this) + 1] || null;
@@ -62,7 +63,7 @@ for (const fixture of input.fixtures) {
     }
     host.assignedSlot = byBackend.get(host.raw.assignedSlot?.backendNodeId) || null;
   }
-  let state = null;
+  let state = {keys: new WeakMap(), next: 1};
   const contexts = {};
   for (const backend of fixture.targets) {
     try {
@@ -81,7 +82,7 @@ for (const fixture of input.fixtures) {
       if (!out) throw new Error('disconnected');
       state = out.state;
       contexts[backend] = {metadata: JSON.parse(out[0]), backends: out.slice(1).map(node => node.raw.backendNodeId)};
-    } catch (error) { contexts[backend] = {error: error.message}; }
+    } catch (error) { contexts[backend] = {error: error.message, childReads}; }
   }
   outputs.push(contexts);
 }
@@ -247,9 +248,9 @@ fn classify_scoped(
             .requests
             .iter()
             .filter(|request| request["method"] == "Runtime.callFunctionOn")
-            .all(
-                |request| request["params"]["functionDeclaration"] == include_str!("scoped_dom.js")
-            ),
+            .all(|request| request["params"]["functionDeclaration"]
+                .as_str()
+                .is_some_and(|function| function.contains(include_str!("scoped_dom.js")))),
         "the responder must be driven by the same collector Node executed"
     );
 }
@@ -511,9 +512,13 @@ fn described_backends(
                 .unwrap()
                 .parse::<usize>()
                 .unwrap();
-            let backend = driver.pipe.scoped.collected[&target]["backends"][index]
-                .as_u64()
-                .unwrap();
+            let backend = if driver.cache_snapshot_contexts {
+                driver.pipe.scoped.described_backend(index)
+            } else {
+                driver.pipe.scoped.collected[&target]["backends"][index]
+                    .as_u64()
+                    .unwrap()
+            };
             *descriptions.entry(backend).or_insert(0) += 1;
         }
     }
@@ -547,7 +552,7 @@ fn cached_ancestor_facts_are_rechecked_without_a_second_description() {
 }
 
 #[test]
-fn closed_shadow_attached_after_partial_cache_is_seen_by_fresh_complete_read() {
+fn closed_shadow_is_seen_by_the_shared_fresh_native_read() {
     let fixture = fixture(
         "closed-shadow-upgrade",
         vec![
@@ -573,8 +578,8 @@ fn closed_shadow_attached_after_partial_cache_is_seen_by_fresh_complete_read() {
     );
     assert_eq!(
         described_backends(&driver)[&3],
-        2,
-        "the full phase must freshly describe the previously cached host"
+        1,
+        "the shared native read observes closed roots for the complete context"
     );
 }
 
@@ -616,11 +621,14 @@ fn complete_context(refs: u64) -> Fixture {
 
 #[test]
 fn scoped_classification_round_trips_before_and_after_snapshot_cache() {
+    let mut overflow = complete_context(100);
+    let nodes = overflow.dom["nodes"].as_array_mut().unwrap();
+    nodes.extend((257..16600).map(|id| node(id, Some(2), "div", &[])));
     let fixtures = [
         shared_chains(100),
         shared_chains(2900),
         complete_context(100),
-        complete_context(2900),
+        overflow,
     ];
     let contexts = collected_contexts(
         &fixtures
@@ -646,12 +654,13 @@ fn scoped_classification_round_trips_before_and_after_snapshot_cache() {
                 .count();
             let expected = match (index, cached) {
                 (0, false) => 2803,
-                (0, true) => 444,
+                (0, true) => 246,
                 (1, false) => 81203,
-                (1, true) => 11644,
+                (1, true) => 5846,
                 (2, false) => 25903,
-                (2, true) => 262,
-                (3, _) => 5803,
+                (2, true) => 361,
+                (3, false) => 203,
+                (3, true) => 105,
                 _ => unreachable!(),
             };
             assert_eq!(
@@ -673,4 +682,103 @@ fn scoped_classification_round_trips_before_and_after_snapshot_cache() {
             println!("classification CDP: case={} N={} cached={cached} trips={trips} describes={descriptions} classified={classified} refused={}", fixture.name, fixture.targets.len(), fixture.targets.len() - classified);
         }
     }
+}
+
+#[test]
+fn live_chrome_regression_scoped_reads_have_a_finishable_shared_deadline() {
+    let fixture = shared_chains(100);
+    let contexts = collected_contexts(&[(&fixture.dom, &fixture.targets)]).remove(0);
+    let (mut driver, mut observation) = observation_for(&fixture, contexts, true);
+    driver.pipe.poll_before_reply = true;
+    driver.pipe.requests.clear();
+    let attachment = driver.attachment.clone().unwrap();
+    let mut clock = FakeClock::new();
+    let deadline = clock.now() + Duration::from_millis(500);
+    driver.scoped_snapshot_dom(
+        &mut observation,
+        &attachment,
+        Some((7, "https://example.com/page")),
+        &mut SnapshotTimings::default(),
+        deadline,
+        &mut clock,
+    );
+    assert_eq!(
+        observation
+            .refs
+            .iter()
+            .filter(|r| r.classification.is_ok())
+            .count(),
+        100,
+        "a five-millisecond polling turn must not exhaust each ref's multistep context read"
+    );
+    assert_eq!(
+        driver
+            .pipe
+            .requests
+            .iter()
+            .filter(|r| r["method"] == "Runtime.callFunctionOn")
+            .count(),
+        1
+    );
+    assert_eq!(driver.transport.pending_len(), 0);
+}
+
+#[test]
+fn live_chrome_regression_complete_form_bound_scales_with_controls() {
+    let mut nodes = vec![
+        node(1, None, "#document", &[]),
+        node(2, Some(1), "form", &["id", "ordinary"]),
+    ];
+    let targets = (3..83).collect::<Vec<_>>();
+    nodes.extend(
+        targets
+            .iter()
+            .map(|id| node(*id, Some(2), "input", &["type", "text"])),
+    );
+    nodes.extend((83..600).map(|id| node(id, Some(2), "div", &[])));
+    let fixture = fixture("ordinary-large-form", nodes, targets);
+    let contexts = collected_contexts(&[(&fixture.dom, &fixture.targets)]).remove(0);
+    assert_eq!(
+        contexts[&3]["metadata"]["complete"], true,
+        "ordinary fields need an exact complete context beyond 256 layout nodes"
+    );
+    let (mut driver, mut observation) = observation_for(&fixture, contexts, true);
+    classify_scoped(&mut driver, &mut observation);
+    let nodes = parse_flattened_dom_nodes(fixture.dom.as_object().unwrap()).unwrap();
+    let old = DomClassificationBatch::new(&nodes);
+    for reference in observation.refs {
+        let actual = reference.classification.unwrap();
+        let expected = old
+            .classify(
+                reference.backend_identity.as_ref().unwrap(),
+                7,
+                "https://example.com",
+            )
+            .unwrap();
+        assert_eq!(*actual, expected);
+        assert_eq!(actual.login_field, expected.login_field);
+        assert_eq!(actual.associated_form_controls.len(), 80);
+    }
+}
+
+#[test]
+fn oversized_complete_context_is_walked_only_once_per_snapshot() {
+    let mut nodes = vec![
+        node(1, None, "#document", &[]),
+        node(2, Some(1), "form", &[]),
+    ];
+    nodes.extend([
+        node(3, Some(2), "input", &["type", "password"]),
+        node(4, Some(2), "input", &["type", "text"]),
+    ]);
+    nodes.extend((5..1000).map(|id| node(id, Some(2), "div", &[])));
+    let fixture = fixture("oversized-form", nodes, vec![3, 4]);
+    let contexts = collected_contexts(&[(&fixture.dom, &fixture.targets)]).remove(0);
+    assert_eq!(contexts[&3]["error"], "context bound");
+    assert_eq!(contexts[&4]["error"], "context bound");
+    assert!(contexts[&3]["childReads"].as_u64().unwrap() > 0);
+    assert_eq!(
+        contexts[&3]["childReads"], contexts[&4]["childReads"],
+        "repeated global failures must not keep the renderer walking the same document"
+    );
 }

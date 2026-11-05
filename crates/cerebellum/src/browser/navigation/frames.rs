@@ -1135,7 +1135,7 @@ mod tests {
             if (self.stalled_method == Some(method)
                 || (self.stalled_method == Some("DOM.getFlattenedDocument")
                     && method == "Runtime.callFunctionOn"
-                    && request["params"]["objectId"] == "scoped-target"))
+                    && scoped_fixture::ScopedDom::handles(&request)))
                 && (method == "DOM.getFrameOwner" || cross)
             {
                 return Ok(());
@@ -1166,6 +1166,11 @@ mod tests {
                 scoped_dom["nodes"][2]["frameId"] = json!("cross");
             }
             let result = match method {
+                "DOM.getFlattenedDocument"
+                    if cross && self.stalled_method == Some("Runtime.callFunctionOn") =>
+                {
+                    json!({})
+                }
                 _ if scoped_fixture::ScopedDom::handles(&request) => {
                     self.scoped.answer(&request, &scoped_dom).unwrap()
                 }

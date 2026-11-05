@@ -10,6 +10,9 @@ mod scoped_dom_tests;
 #[cfg(test)]
 #[path = "../../../tests/support/scoped_dom.rs"]
 mod scoped_fixture;
+mod scoped_reads;
+mod scoped_snapshot;
+mod scoped_ua;
 mod scroll;
 mod typing;
 pub use capture::SnapshotTimings;
@@ -1089,6 +1092,22 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         )?;
         if response.error.is_some() {
             return Ok(Err(ClassificationUnavailable::FlattenedDocumentRefused));
+        }
+        if let Some(nodes) = response
+            .result
+            .as_ref()
+            .and_then(|r| r.get("nodes"))
+            .and_then(Value::as_array)
+        {
+            for node in nodes {
+                if matches!(node["localName"].as_str(), Some("iframe" | "frame")) {
+                    if let (Some(frame), Some(backend)) =
+                        (node["frameId"].as_str(), node["backendNodeId"].as_u64())
+                    {
+                        self.snapshot_frame_owners.insert(frame.into(), backend);
+                    }
+                }
+            }
         }
         Ok(response
             .result
@@ -2300,7 +2319,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let dom_started = Instant::now();
         let classification_before = timings.classification_ms;
         let nodes = if classification_context.is_some() || mode == SnapshotKind::Actionable {
-            self.scoped_snapshot_dom(
+            self.snapshot_dom(
                 &mut observation,
                 &attachment,
                 classification_context,

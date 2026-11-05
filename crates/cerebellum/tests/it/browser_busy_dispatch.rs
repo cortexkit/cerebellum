@@ -143,6 +143,20 @@ impl CdpPipeIo for FixturePipe {
             "Accessibility.getChildAXNodes" => {
                 json!({"nodes":[ax(3,43,"StaticText","Event row",&[])]})
             }
+            "DOM.getFlattenedDocument"
+                if self.fault.is_some_and(|fault| {
+                    matches!(
+                        fault.method,
+                        "Page.createIsolatedWorld"
+                            | "DOM.resolveNode"
+                            | "Runtime.callFunctionOn"
+                            | "Runtime.getProperties"
+                            | "DOM.describeNode"
+                    )
+                }) =>
+            {
+                json!({})
+            }
             "DOM.getFlattenedDocument" => {
                 let mut document = dom();
                 if self.attachment.is_some() {

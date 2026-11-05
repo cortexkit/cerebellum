@@ -53,22 +53,48 @@ function(limit, ancestorsOnly, snapshotState) {
         }
     }
     if (global && !ancestorsOnly) {
-        // The legacy classifier stores absolute login-field ordinals and every
-        // associated form-control identity. An incomplete context is not safe
-        // to classify. This bounded fallback is used only for those facts.
-        nodes.length = 0;
-        seen.clear();
-        let visited = 0;
-        const visit = node => {
-            if (++visited > limit) throw new Error('context bound');
-            if (node.nodeType === 1 && node.shadowRoot) visit(node.shadowRoot);
-            for (let child = node.firstChild; child; child = child.nextSibling) {
-                if (child.nodeType === 3 && !child.nodeValue.trim()) continue;
-                visit(child);
-            }
-            if ([1, 3, 9, 11].includes(node.nodeType)) add(node);
-        };
-        visit(target.ownerDocument || target);
+        const document = target.ownerDocument || target;
+        state.completeFailures ||= new WeakSet();
+        if (state.completeFailures.has(document)) throw new Error('context bound');
+        try {
+            // Classification needs each login field's position in the complete
+            // page and every associated form-control identity. An incomplete
+            // context cannot safely supply those facts.
+            // Keep the exact graph, including hidden controls and duplicate IDs.
+            // A form's layout wrappers must not exhaust a fixed page-node quota:
+            // allow 32 graph nodes per control, with a hard transport/memory cap.
+            const hardLimit = 16384;
+            let scanned = 0, controls = 0;
+            const count = node => {
+                if (++scanned > hardLimit) throw new Error('context bound');
+                if (['input', 'button', 'select', 'textarea', 'output'].includes(node.localName)) ++controls;
+                if (node.nodeType === 1 && node.shadowRoot) count(node.shadowRoot);
+                for (let child = node.firstChild; child; child = child.nextSibling) {
+                    if (child.nodeType === 3 && !child.nodeValue.trim()) continue;
+                    count(child);
+                }
+            };
+            count(document);
+            limit = Math.min(hardLimit, limit + controls * 32);
+            nodes.length = 0;
+            seen.clear();
+            let visited = 0;
+            const visit = node => {
+                if (++visited > limit) throw new Error('context bound');
+                if (node.nodeType === 1 && node.shadowRoot) visit(node.shadowRoot);
+                for (let child = node.firstChild; child; child = child.nextSibling) {
+                    if (child.nodeType === 3 && !child.nodeValue.trim()) continue;
+                    visit(child);
+                }
+                if ([1, 3, 9, 11].includes(node.nodeType)) add(node);
+            };
+            visit(document);
+        } catch (error) {
+            // One oversized document must not be rescanned for every captured
+            // field in the same synchronous snapshot call.
+            state.completeFailures.add(document);
+            throw error;
+        }
     }
     if (ancestorsOnly) global = false;
     const indexes = new Map(nodes.map((node, index) => [node, index]));
@@ -86,7 +112,7 @@ function(limit, ancestorsOnly, snapshotState) {
         nodeValue: node.nodeValue || '',
         ...(node.nodeType === 1 ? {attributes: Array.from(node.attributes, attr => [attr.name, attr.value]).flat()} : {})
     }));
-    const result = [JSON.stringify({parents: nodes.map(node => indexes.get(parent(node)) ?? null), complete: global, childCounts,
+    const result = [JSON.stringify({parents: nodes.map(node => indexes.get(parent(node)) ?? null), complete: global, bound: limit, childCounts,
         keys: nodes.map(key), slots: nodes.map(node => node.assignedSlot ? key(node.assignedSlot) : null), facts}), ...nodes];
     result.state = state;
     return result;

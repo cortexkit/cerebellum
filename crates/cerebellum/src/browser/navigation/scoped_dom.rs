@@ -1,12 +1,13 @@
 use super::*;
 
 // Exact login-field ordinals and a form's complete associated-control set are
-// global facts in the existing classifier. Bound their discovery per requested
-// ref, and refuse that ref when completeness cannot be established. Ordinary
+// global facts in the classifier. Complete graphs scale with their control
+// count up to 16,384 nodes; refuse refs when completeness cannot be established.
+// Ordinary
 // non-form controls need only their two ancestor chains (DOM and composed).
-const CONTEXT_NODES: usize = 256;
+pub(super) const CONTEXT_NODES: usize = 256;
 const CONTEXT_FUNCTION: &str = include_str!("scoped_dom.js");
-const OBJECT_GROUP: &str = "ck-snapshot-classification";
+pub(super) const OBJECT_GROUP: &str = "ck-snapshot-classification";
 
 pub(super) struct SnapshotDomCache {
     enabled: bool,
@@ -24,6 +25,7 @@ pub(super) struct SnapshotDomCache {
     failed_keys: HashSet<u64>,
     complete_requested: bool,
     complete_error: Option<ClassificationUnavailable>,
+    #[cfg(test)]
     complete_batch: Option<DomClassificationBatch>,
 }
 
@@ -38,12 +40,13 @@ impl Default for SnapshotDomCache {
             failed_keys: HashSet::new(),
             complete_requested: false,
             complete_error: None,
+            #[cfg(test)]
             complete_batch: None,
         }
     }
 }
 
-fn same_native_facts(described: &Value, native: &Value) -> bool {
+pub(super) fn same_native_facts(described: &Value, native: &Value) -> bool {
     let normalized = |value: &Value| {
         let mut value = value.clone();
         let object = value.as_object_mut()?;
@@ -89,7 +92,269 @@ fn needs_complete_context(node: &RawDomNode) -> bool {
 }
 
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
+    /// Manual live-browser parity oracle. Reads native DOM facts in each
+    /// captured frame and compares every retained classification record without
+    /// performing input or changing the production capture strategy.
+    #[doc(hidden)]
+    pub fn check_snapshot_classification_parity(
+        &mut self,
+        observation: &BrowserSnapshotObservation,
+        epoch: u64,
+        url: &str,
+        deadline_ms: u64,
+    ) -> Result<usize, String> {
+        let mut clock = SystemNavigationClock;
+        let deadline = clock.now() + Duration::from_millis(deadline_ms);
+        let mut batches = HashMap::new();
+        let mut count = 0;
+        for reference in &observation.refs {
+            let Some(identity) = &reference.backend_identity else {
+                continue;
+            };
+            if !batches.contains_key(&identity.frame_id) {
+                let mut attachment = self
+                    .frame_attachment(identity)
+                    .map_err(|e| format!("{e:?}"))?;
+                if let Some(frame) = &reference.frame_document {
+                    attachment.session_id = frame.session_id.clone();
+                }
+                let nodes = self
+                    .flattened_dom_nodes_before(&attachment, deadline, &mut clock)
+                    .map_err(|e| format!("{e:?}"))?
+                    .map_err(|e| format!("{e:?}"))?;
+                batches.insert(
+                    identity.frame_id.clone(),
+                    DomClassificationBatch::new(&nodes),
+                );
+            }
+            let origin = document_origin(
+                reference
+                    .frame_document
+                    .as_ref()
+                    .map_or(url, |f| f.url.as_str()),
+            )
+            .map_err(|e| format!("{e:?}"))?;
+            let expected = batches[&identity.frame_id]
+                .classify(identity, epoch, &origin)
+                .map(Box::new);
+            if reference.classification != expected
+                || reference
+                    .classification
+                    .as_ref()
+                    .ok()
+                    .map(|c| &c.login_field)
+                    != expected.as_ref().ok().map(|c| &c.login_field)
+            {
+                let actual_json = reference
+                    .classification
+                    .as_ref()
+                    .ok()
+                    .map(|c| serde_json::to_value(c).unwrap());
+                let expected_json = expected
+                    .as_ref()
+                    .ok()
+                    .map(|c| serde_json::to_value(c).unwrap());
+                let differences = expected_json
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flat_map(|object| object.keys())
+                    .filter(|key| {
+                        actual_json.as_ref().map(|v| &v[*key])
+                            != expected_json.as_ref().map(|v| &v[*key])
+                    })
+                    .map(|key| {
+                        format!(
+                            "{key}: actual={} old={}",
+                            actual_json.as_ref().unwrap_or(&Value::Null)[key]
+                                .to_string()
+                                .chars()
+                                .take(250)
+                                .collect::<String>(),
+                            expected_json.as_ref().unwrap_or(&Value::Null)[key]
+                                .to_string()
+                                .chars()
+                                .take(250)
+                                .collect::<String>()
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                return Err(format!("{} {} backend={}: differences={differences:?}; actual_error={:?}; old_error={:?}; login={:?}/{:?}", reference.captured.role, reference.captured.name, identity.backend_node_id, reference.classification.as_ref().err(), expected.as_ref().err(), reference.classification.as_ref().ok().map(|c| &c.login_field), expected.as_ref().ok().map(|c| &c.login_field)));
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub(super) fn snapshot_dom<C: NavigationClock>(
+        &mut self,
+        observation: &mut BrowserSnapshotObservation,
+        attachment: &AttachedTarget,
+        classification: Option<(u64, &str)>,
+        timings: &mut SnapshotTimings,
+        deadline: Instant,
+        clock: &mut C,
+    ) -> Vec<RawDomNode> {
+        // Content has already been captured. A single native document read is
+        // much cheaper than remote-object round trips on ordinary pages. Limit
+        // its attempt so a busy renderer still leaves time for scoped reads.
+        let deadline =
+            deadline.min(clock.now() + Duration::from_millis(crate::budgets::CDP_STEP_MS));
+        let remaining = deadline.saturating_duration_since(clock.now());
+        if !observation.ax_truncated
+            && observation.records.len() < MAX_AX_NODES
+            && remaining >= POLL_INTERVAL * 3
+        {
+            let share = (remaining / 3).min(Duration::from_millis(500));
+            match self.flattened_dom_nodes_before(attachment, clock.now() + share, clock) {
+                Ok(Ok(nodes)) => {
+                    let started = Instant::now();
+                    if let Some((epoch, url)) = classification {
+                        match document_origin(url) {
+                            Ok(origin) => {
+                                classify_refs(&mut observation.refs, &nodes, epoch, &origin)
+                            }
+                            Err(reason) => {
+                                for reference in &mut observation.refs {
+                                    reference.classification = Err(reason.clone());
+                                }
+                            }
+                        }
+                    }
+                    timings.classification_ms += started.elapsed().as_millis();
+                    return nodes;
+                }
+                Ok(Err(ClassificationUnavailable::DomEnableRefused)) => {
+                    for reference in &mut observation.refs {
+                        reference.classification = Err(ClassificationUnavailable::DomEnableRefused);
+                    }
+                    return Vec::new();
+                }
+                _ => {}
+            }
+        }
+        self.scoped_snapshot_dom(
+            observation,
+            attachment,
+            classification,
+            timings,
+            deadline,
+            clock,
+        )
+    }
+
     pub(super) fn scoped_snapshot_dom<C: NavigationClock>(
+        &mut self,
+        observation: &mut BrowserSnapshotObservation,
+        attachment: &AttachedTarget,
+        classification: Option<(u64, &str)>,
+        timings: &mut SnapshotTimings,
+        deadline: Instant,
+        clock: &mut C,
+    ) -> Vec<RawDomNode> {
+        #[cfg(test)]
+        if !self.cache_snapshot_contexts {
+            return self.uncached_snapshot_dom(
+                observation,
+                attachment,
+                classification,
+                timings,
+                deadline,
+                clock,
+            );
+        }
+        let mut world_created = false;
+        let read = (|| {
+            if deadline.saturating_duration_since(clock.now()) < POLL_INTERVAL {
+                return Err(ClassificationUnavailable::DomReadFailed);
+            }
+            let enabled = self
+                .command_response(
+                    "DOM.enable",
+                    None,
+                    Some(attachment.session_id.clone()),
+                    snapshot_step_deadline(deadline, true, clock.now()),
+                    None,
+                    None,
+                    clock,
+                )
+                .map_err(|_| ClassificationUnavailable::DomReadFailed)?;
+            if enabled.error.is_some() || enabled.result.is_none() {
+                return Err(ClassificationUnavailable::DomEnableRefused);
+            }
+            let frame = observation
+                .refs
+                .iter()
+                .find_map(|r| r.backend_identity.as_ref())
+                .ok_or(ClassificationUnavailable::DomReadFailed)?;
+            let world = self.command("Page.createIsolatedWorld", Some(serde_json::json!({"frameId":frame.frame_id,"worldName":"ck-snapshot-classification"}).as_object().unwrap().clone()), Some(attachment.session_id.clone()), snapshot_step_deadline(deadline, true, clock.now()), None, clock).map_err(|_| ClassificationUnavailable::DomReadFailed)?;
+            let world = world
+                .get("executionContextId")
+                .and_then(Value::as_u64)
+                .ok_or(ClassificationUnavailable::DomReadFailed)?;
+            world_created = true;
+            self.snapshot_contexts(observation, attachment, world, deadline, clock)
+        })();
+        let started = Instant::now();
+        let mut facts = HashMap::new();
+        match read {
+            Ok((assignments, contexts)) => {
+                let batches = contexts
+                    .into_iter()
+                    .map(|context| {
+                        context.map(|nodes| {
+                            let batch = DomClassificationBatch::new(&nodes);
+                            for node in nodes {
+                                facts.entry(node.backend_node_id).or_insert(node);
+                            }
+                            batch
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                for reference in &mut observation.refs {
+                    if let Some(identity) = &reference.backend_identity {
+                        reference.classification = (|| {
+                            let index = assignments
+                                .get(&identity.backend_node_id)
+                                .ok_or(ClassificationUnavailable::DomReadFailed)?;
+                            let batch = batches[*index].as_ref().map_err(Clone::clone)?;
+                            let (epoch, url) =
+                                classification.ok_or(ClassificationUnavailable::NotCaptured)?;
+                            batch
+                                .classify(identity, epoch, &document_origin(url)?)
+                                .map(Box::new)
+                        })();
+                    }
+                }
+            }
+            Err(reason) => {
+                for reference in &mut observation.refs {
+                    reference.classification = Err(reason.clone());
+                }
+            }
+        }
+        timings.classification_ms += started.elapsed().as_millis();
+        if world_created && deadline.saturating_duration_since(clock.now()) >= POLL_INTERVAL {
+            let _ = self.command(
+                "Runtime.releaseObjectGroup",
+                Some(
+                    serde_json::json!({"objectGroup":OBJECT_GROUP})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                Some(attachment.session_id.clone()),
+                snapshot_step_deadline(deadline, true, clock.now()),
+                None,
+                clock,
+            );
+        }
+        facts.into_values().collect()
+    }
+
+    #[cfg(test)]
+    // Unbatched reference reader for measuring protocol costs in tests only.
+    fn uncached_snapshot_dom<C: NavigationClock>(
         &mut self,
         observation: &mut BrowserSnapshotObservation,
         attachment: &AttachedTarget,
@@ -316,7 +581,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .collect::<Vec<_>>();
         indexed.sort_by_key(|(index, _)| *index);
         if indexed.is_empty()
-            || indexed.len() > CONTEXT_NODES + 1
+            || indexed.len() > 16384 + 1
             || indexed
                 .iter()
                 .enumerate()
@@ -415,99 +680,138 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             }
             values.push(described);
         }
-        let backends = values
+        if !values
             .iter()
-            .map(|node| {
-                node.get("backendNodeId")
-                    .and_then(Value::as_u64)
-                    .filter(|id| *id > 0)
-                    .ok_or(ClassificationUnavailable::DomReadFailed)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        for (node, backend) in values.iter().zip(&backends) {
-            if node["localName"] == "iframe" || node["localName"] == "frame" {
-                if let Some(frame) = node.get("frameId").and_then(Value::as_str) {
-                    self.snapshot_frame_owners
-                        .insert(frame.to_owned(), *backend);
-                }
-            }
-        }
-        if !backends.contains(&identity.backend_node_id) {
+            .any(|node| node["backendNodeId"].as_u64() == Some(identity.backend_node_id))
+        {
             return Err(ClassificationUnavailable::TargetNotInDocument {
                 backend_node_id: identity.backend_node_id,
             });
         }
-        for (index, value) in values.iter_mut().enumerate() {
-            if complete
-                && value
-                    .get("childNodeCount")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|count| metadata["childCounts"][index].as_u64() != Some(count))
-            {
-                return Err(ClassificationUnavailable::DomReadFailed);
-            }
-            // A closed shadow root, assigned slot, or pseudo-element that the
-            // isolated-world walk could not see must not silently disappear.
-            for key in ["shadowRoots", "pseudoElements"] {
-                if complete
-                    && value
-                        .get(key)
-                        .and_then(Value::as_array)
-                        .is_some_and(|nodes| {
-                            nodes.iter().any(|n| {
-                                !n.get("backendNodeId")
-                                    .and_then(Value::as_u64)
-                                    .is_some_and(|id| backends.contains(&id))
-                            })
-                        })
+        self.remember_frame_owners(&values);
+        materialize_context(&metadata, values, ancestors_only)
+    }
+    pub(super) fn remember_frame_owners(&mut self, values: &[Value]) {
+        for node in values {
+            if matches!(node["localName"].as_str(), Some("iframe" | "frame")) {
+                if let (Some(frame), Some(backend)) =
+                    (node["frameId"].as_str(), node["backendNodeId"].as_u64())
                 {
-                    return Err(ClassificationUnavailable::DomReadFailed);
+                    self.snapshot_frame_owners.insert(frame.into(), backend);
                 }
-                value.as_object_mut().unwrap().remove(key);
-            }
-            if complete && value.get("templateContent").is_some() {
-                return Err(ClassificationUnavailable::DomReadFailed);
-            }
-            let slot = slots[index]
-                .map(|key| {
-                    keys.iter()
-                        .position(|candidate| *candidate == key)
-                        .map(|index| backends[index])
-                        .ok_or(ClassificationUnavailable::DomReadFailed)
-                })
-                .transpose()?;
-            if value
-                .get("assignedSlot")
-                .and_then(|s| s.get("backendNodeId"))
-                .and_then(Value::as_u64)
-                .is_some_and(|id| Some(id) != slot)
-            {
-                return Err(ClassificationUnavailable::DomReadFailed);
-            }
-            value.as_object_mut().unwrap().remove("assignedSlot");
-            if let Some(slot) = slot {
-                value["assignedSlot"] = serde_json::json!({"backendNodeId":slot});
-            }
-            value["nodeId"] = Value::from(backends[index]);
-            value.as_object_mut().unwrap().remove("parentId");
-            if let Some(parent) = parents[index] {
-                let backend = backends
-                    .get(parent)
-                    .ok_or(ClassificationUnavailable::DomReadFailed)?;
-                value["parentId"] = Value::from(*backend);
             }
         }
-        let dom = serde_json::json!({"nodes":values,"contextComplete":complete})
-            .as_object()
-            .unwrap()
-            .clone();
-        let nodes = parse_flattened_dom_nodes(&dom)?;
-        // Discovery and attribute reads are separate CDP observations. A node
-        // that gains form/label/base-dependent semantics between them needs a
-        // new complete context, not an inferred form-less classification.
-        if !ancestors_only && !complete && nodes.iter().any(needs_complete_context) {
+    }
+}
+
+pub(super) fn materialize_context(
+    metadata: &Value,
+    mut values: Vec<Value>,
+    ancestors_only: bool,
+) -> Result<Map<String, Value>, ClassificationUnavailable> {
+    let complete = metadata["complete"]
+        .as_bool()
+        .ok_or(ClassificationUnavailable::DomReadFailed)?;
+    let parents: Vec<Option<usize>> = serde_json::from_value(metadata["parents"].clone())
+        .map_err(|_| ClassificationUnavailable::DomReadFailed)?;
+    let keys: Vec<u64> = serde_json::from_value(metadata["keys"].clone())
+        .map_err(|_| ClassificationUnavailable::DomReadFailed)?;
+    let slots: Vec<Option<u64>> = serde_json::from_value(metadata["slots"].clone())
+        .map_err(|_| ClassificationUnavailable::DomReadFailed)?;
+    let bound = metadata
+        .get("bound")
+        .and_then(Value::as_u64)
+        .unwrap_or(CONTEXT_NODES as u64);
+    if bound > 16384
+        || values.len() as u64 > bound
+        || (!complete && bound != CONTEXT_NODES as u64)
+        || parents.len() != values.len()
+        || keys.len() != values.len()
+        || slots.len() != values.len()
+        || keys.contains(&0)
+        || keys.iter().collect::<HashSet<_>>().len() != keys.len()
+    {
+        return Err(ClassificationUnavailable::DomReadFailed);
+    }
+    let backends = values
+        .iter()
+        .map(|node| {
+            node.get("backendNodeId")
+                .and_then(Value::as_u64)
+                .filter(|id| *id > 0)
+                .ok_or(ClassificationUnavailable::DomReadFailed)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (index, value) in values.iter_mut().enumerate() {
+        if complete
+            && value
+                .get("childNodeCount")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| metadata["childCounts"][index].as_u64() != Some(count))
+        {
             return Err(ClassificationUnavailable::DomReadFailed);
         }
-        Ok(dom)
+        // A closed shadow root, assigned slot, or pseudo-element that the
+        // isolated-world walk could not see must not silently disappear.
+        for key in ["shadowRoots", "pseudoElements"] {
+            if complete
+                && value
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .is_some_and(|nodes| {
+                        nodes.iter().any(|n| {
+                            !n.get("backendNodeId")
+                                .and_then(Value::as_u64)
+                                .is_some_and(|id| backends.contains(&id))
+                        })
+                    })
+            {
+                return Err(ClassificationUnavailable::DomReadFailed);
+            }
+            value.as_object_mut().unwrap().remove(key);
+        }
+        if complete && value.get("templateContent").is_some() {
+            return Err(ClassificationUnavailable::DomReadFailed);
+        }
+        let slot = slots[index]
+            .map(|key| {
+                keys.iter()
+                    .position(|candidate| *candidate == key)
+                    .map(|index| backends[index])
+                    .ok_or(ClassificationUnavailable::DomReadFailed)
+            })
+            .transpose()?;
+        if value
+            .get("assignedSlot")
+            .and_then(|s| s.get("backendNodeId"))
+            .and_then(Value::as_u64)
+            .is_some_and(|id| Some(id) != slot)
+        {
+            return Err(ClassificationUnavailable::DomReadFailed);
+        }
+        value.as_object_mut().unwrap().remove("assignedSlot");
+        if let Some(slot) = slot {
+            value["assignedSlot"] = serde_json::json!({"backendNodeId":slot});
+        }
+        value["nodeId"] = Value::from(backends[index]);
+        value.as_object_mut().unwrap().remove("parentId");
+        if let Some(parent) = parents[index] {
+            let backend = backends
+                .get(parent)
+                .ok_or(ClassificationUnavailable::DomReadFailed)?;
+            value["parentId"] = Value::from(*backend);
+        }
     }
+    let dom = serde_json::json!({"nodes":values,"contextComplete":complete})
+        .as_object()
+        .unwrap()
+        .clone();
+    let nodes = parse_flattened_dom_nodes(&dom)?;
+    // Discovery and attribute reads are separate CDP observations. A node
+    // that gains form/label/base-dependent semantics between them needs a
+    // new complete context, not an inferred form-less classification.
+    if !ancestors_only && !complete && nodes.iter().any(needs_complete_context) {
+        return Err(ClassificationUnavailable::DomReadFailed);
+    }
+    Ok(dom)
 }

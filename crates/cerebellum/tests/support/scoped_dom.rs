@@ -16,6 +16,94 @@ pub struct ScopedDom {
 }
 
 impl ScopedDom {
+    pub fn described_backend(&self, index: usize) -> u64 {
+        self.nodes[index]["backendNodeId"].as_u64().unwrap()
+    }
+    fn answer_batch(&mut self, params: &Value, dom: &Value) -> Option<Value> {
+        let mut nodes = Vec::<Value>::new();
+        let mut facts = Vec::<Value>::new();
+        let mut child_counts = Vec::<Value>::new();
+        let mut contexts = Vec::<Value>::new();
+        let mut assignments = Vec::new();
+        let mut complete: Option<usize> = None;
+        for argument in params["arguments"].as_array()?.iter().skip(1) {
+            let backend: u64 = argument["objectId"]
+                .as_str()?
+                .strip_prefix("scoped-target-")?
+                .parse()
+                .ok()?;
+            if let Some(index) = complete {
+                let members = contexts[index]["members"].as_array()?;
+                if members
+                    .iter()
+                    .any(|m| nodes[m.as_u64().unwrap() as usize]["backendNodeId"] == backend)
+                {
+                    assignments.push(json!(index));
+                    continue;
+                }
+            }
+            let answer = self.answer(&json!({"method":"Runtime.callFunctionOn","params":{"objectId":argument["objectId"],"arguments":[{"value":256},{"value":false}]}}), dom)?;
+            if answer.get("exceptionDetails").is_some() {
+                assignments.push(Value::Null);
+                continue;
+            }
+            let properties = self.answer(
+                &json!({"method":"Runtime.getProperties","params":{"objectId":"scoped-context"}}),
+                dom,
+            )?;
+            let meta: Value =
+                serde_json::from_str(properties["result"][0]["value"]["value"].as_str()?).ok()?;
+            let mut members = Vec::new();
+            let mut invalid = false;
+            for (i, node) in self.nodes.iter().enumerate() {
+                let index = match nodes
+                    .iter()
+                    .position(|n| n["backendNodeId"] == node["backendNodeId"])
+                {
+                    Some(index) => index,
+                    None => {
+                        nodes.push(node.clone());
+                        facts.push(meta["facts"][i].clone());
+                        child_counts.push(Value::Null);
+                        nodes.len() - 1
+                    }
+                };
+                invalid |= facts[index] != meta["facts"][i];
+                if meta["complete"] == true {
+                    child_counts[index] = meta["childCounts"][i].clone();
+                }
+                members.push(index);
+            }
+            if meta["complete"] == true {
+                complete = Some(contexts.len());
+            }
+            assignments.push(json!(contexts.len()));
+            contexts.push(json!({"members":members,"complete":meta["complete"],"bound":meta.get("bound").cloned().unwrap_or(json!(256)),"invalid":invalid}));
+        }
+        let parents = nodes
+            .iter()
+            .map(|node| {
+                nodes
+                    .iter()
+                    .position(|n| n["nodeId"] == node["parentId"] && !node["parentId"].is_null())
+            })
+            .collect::<Vec<_>>();
+        let slots = nodes
+            .iter()
+            .map(|node| {
+                nodes.iter().position(|n| {
+                    n["backendNodeId"] == node["assignedSlot"]["backendNodeId"]
+                        && !node["assignedSlot"].is_null()
+                })
+            })
+            .collect::<Vec<_>>();
+        self.metadata = Some(
+            json!({"contexts":contexts,"assignments":assignments,"parents":parents,"slots":slots,"facts":facts,"childCounts":child_counts}),
+        );
+        self.nodes = nodes;
+        Some(json!({"result":{"objectId":"scoped-context"}}))
+    }
+
     pub fn handles(request: &Value) -> bool {
         let params = &request["params"];
         match request["method"].as_str().unwrap_or("") {
@@ -23,7 +111,14 @@ impl ScopedDom {
             "DOM.resolveNode" | "Runtime.releaseObjectGroup" => {
                 params["objectGroup"] == "ck-snapshot-classification"
             }
-            "Runtime.callFunctionOn" => params["objectId"] == "scoped-target",
+            "Runtime.callFunctionOn" => {
+                params["objectId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("scoped-target-"))
+                    || params["functionDeclaration"]
+                        .as_str()
+                        .is_some_and(|f| f.contains("const collect ="))
+            }
             "Runtime.getProperties" => params["objectId"] == "scoped-context",
             "DOM.describeNode" => params["objectId"]
                 .as_str()
@@ -43,9 +138,25 @@ impl ScopedDom {
             }
             "DOM.resolveNode" if params["objectGroup"] == "ck-snapshot-classification" => {
                 self.target = params["backendNodeId"].as_u64().unwrap();
-                Some(json!({"object":{"objectId":"scoped-target"}}))
+                Some(json!({"object":{"objectId":format!("scoped-target-{}", self.target)}}))
             }
-            "Runtime.callFunctionOn" if params["objectId"] == "scoped-target" => {
+            "Runtime.callFunctionOn"
+                if params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|f| f.contains("const collect =")) =>
+            {
+                self.answer_batch(params, dom)
+            }
+            "Runtime.callFunctionOn"
+                if params["objectId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("scoped-target-")) =>
+            {
+                self.target = params["objectId"]
+                    .as_str()?
+                    .strip_prefix("scoped-target-")?
+                    .parse()
+                    .ok()?;
                 self.metadata = None;
                 if let Some(context) = self.collected.get(&self.target) {
                     if let Some(error) = context["error"].as_str() {
@@ -122,7 +233,22 @@ impl ScopedDom {
                 self.nodes
                     .retain(|node| matches!(node["nodeType"].as_u64(), Some(1 | 3 | 9 | 11)));
                 self.complete = global;
-                if self.nodes.len() > 256 {
+                let controls = self
+                    .nodes
+                    .iter()
+                    .filter(|n| {
+                        matches!(
+                            n["localName"].as_str(),
+                            Some("input" | "button" | "select" | "textarea" | "output")
+                        )
+                    })
+                    .count();
+                let bound = if global {
+                    (256 + controls * 32).min(16384)
+                } else {
+                    256
+                };
+                if self.nodes.len() > bound {
                     return Some(json!({"exceptionDetails":{"text":"context bound"}}));
                 }
                 Some(json!({"result":{"objectId":"scoped-context"}}))
@@ -137,7 +263,7 @@ impl ScopedDom {
                         })
                     })
                     .collect::<Vec<_>>();
-                let metadata = self.metadata.clone().unwrap_or_else(|| json!({"parents":parents,"complete":self.complete,"childCounts":self.nodes.iter().map(|n| n["childNodeCount"].clone()).collect::<Vec<_>>(),"keys":self.nodes.iter().map(|node| node["backendNodeId"].clone()).collect::<Vec<_>>(),"slots":self.nodes.iter().map(|node| node["assignedSlot"]["backendNodeId"].clone()).collect::<Vec<_>>(),"facts":self.nodes}));
+                let metadata = self.metadata.clone().unwrap_or_else(|| json!({"parents":parents,"complete":self.complete,"bound":if self.complete { (256 + 32 * self.nodes.iter().filter(|n| matches!(n["localName"].as_str(), Some("input" | "button" | "select" | "textarea" | "output"))).count()).min(16384) } else { 256 },"childCounts":self.nodes.iter().map(|n| n["childNodeCount"].clone()).collect::<Vec<_>>(),"keys":self.nodes.iter().map(|node| node["backendNodeId"].clone()).collect::<Vec<_>>(),"slots":self.nodes.iter().map(|node| node["assignedSlot"]["backendNodeId"].clone()).collect::<Vec<_>>(),"facts":self.nodes}));
                 let mut properties = vec![
                     json!({"name":"0","value":{"value":serde_json::to_string(&metadata).unwrap()}}),
                     json!({"name":"state","value":{"objectId":"scoped-state"}}),
@@ -157,9 +283,7 @@ impl ScopedDom {
                     .parse::<usize>()
                     .unwrap();
                 let mut node = self.nodes[index].clone();
-                if self.mutate_form_on_describe == node["backendNodeId"].as_u64()
-                    && self.mutate_form_on_describe.is_some()
-                {
+                if self.mutate_form_on_describe == Some(self.described_backend(index)) {
                     node["attributes"]
                         .as_array_mut()
                         .unwrap()

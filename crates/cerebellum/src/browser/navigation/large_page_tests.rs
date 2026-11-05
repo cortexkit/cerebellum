@@ -10,9 +10,12 @@ pub(super) struct ThreadPipe {
     reads: VecDeque<Vec<u8>>,
     dom_polls: usize,
     blocked: usize,
+    delayed_flattened: Option<Vec<u8>>,
+    pub(super) poll_before_reply: bool,
+    poll_pending: bool,
     pub(super) stall_ads: bool,
     pub(super) scoped: scoped_fixture::ScopedDom,
-    fail_flattened: bool,
+    pub(super) fail_flattened: bool,
     pub(super) requests: Vec<Value>,
     pub(super) markup: Option<String>,
     frames: Vec<crate::snapshot_store::FrameDocument>,
@@ -20,6 +23,7 @@ pub(super) struct ThreadPipe {
 
 impl CdpPipeIo for ThreadPipe {
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.poll_pending = self.poll_before_reply;
         let request: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
         self.requests.push(request.clone());
         // The browser's frame-tree reply is independent of a timed-out
@@ -69,12 +73,24 @@ impl CdpPipeIo for ThreadPipe {
         }))
         .unwrap();
         reply.push(0);
-        self.reads.push_back(reply);
+        if request["method"] == "DOM.getFlattenedDocument" && self.blocked > 0 {
+            self.delayed_flattened = Some(reply);
+        } else {
+            self.reads.push_back(reply);
+        }
         Ok(())
     }
 
     fn read(&mut self, destination: &mut [u8]) -> io::Result<PipeRead> {
-        if self.blocked > 0 {
+        if std::mem::take(&mut self.poll_pending) {
+            return Ok(PipeRead::WouldBlock);
+        }
+        if self.blocked == 0 {
+            if let Some(reply) = self.delayed_flattened.take() {
+                self.reads.push_back(reply);
+            }
+        }
+        if self.blocked > 0 && self.reads.is_empty() {
             self.blocked -= 1;
             return Ok(PipeRead::WouldBlock);
         }
@@ -100,6 +116,9 @@ pub(super) fn thread_driver(nodes: Vec<Value>) -> CdpNavigationDriver<ThreadPipe
             reads: VecDeque::new(),
             dom_polls: 0,
             blocked: 0,
+            delayed_flattened: None,
+            poll_before_reply: false,
+            poll_pending: false,
             stall_ads: false,
             scoped: scoped_fixture::ScopedDom::default(),
             fail_flattened: false,
@@ -437,11 +456,16 @@ fn scoped_classification_does_not_starve_large_zoom_content() {
         .refs
         .iter()
         .all(|reference| reference.classification.is_ok()));
-    assert!(!driver
-        .pipe
-        .requests
-        .iter()
-        .any(|request| request["method"] == "DOM.getFlattenedDocument"));
+    assert_eq!(
+        driver
+            .pipe
+            .requests
+            .iter()
+            .filter(|request| request["method"] == "DOM.getFlattenedDocument")
+            .count(),
+        1,
+        "the bounded native attempt must fall back without starving content"
+    );
     assert!(!driver
         .pipe
         .requests
@@ -611,6 +635,7 @@ fn bounded_field_context_failure_does_not_poison_a_sibling_button() {
         ],
         serde_json::json!({"nodes":dom}),
     );
+    driver.pipe.fail_flattened = true;
     let observation = driver
         .snapshot_with_clock(
             "route-own",
@@ -666,6 +691,7 @@ fn form_association_added_after_scope_discovery_refuses_instead_of_guessing() {
         dom,
     );
     driver.pipe.scoped.mutate_form_on_describe = Some(2);
+    driver.pipe.fail_flattened = true;
     let observation = driver
         .snapshot_with_clock(
             "route-own",
