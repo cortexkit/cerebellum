@@ -162,3 +162,92 @@ fn prepared_test_entry_does_not_write_the_engram_catalog() {
         "expected exactly the definition and the production call"
     );
 }
+
+#[test]
+fn live_examples_do_not_open_operator_stores() {
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let mut scanned = 0;
+    let mut violations = Vec::new();
+    for entry in std::fs::read_dir(examples).expect("read examples") {
+        let path = entry.expect("example entry").path();
+        let name = path.file_name().unwrap().to_string_lossy();
+        if path.extension().is_none_or(|extension| extension != "rs")
+            || !(name.starts_with("live_") || name == "v13_desk_arms.rs")
+        {
+            continue;
+        }
+        scanned += 1;
+        // The desk harness already refuses before opening stores unless all
+        // three XDG homes are empty scratch directories. Its guard has tests
+        // in the example; it needs a disk journal to check its audit records.
+        if name == "v13_desk_arms.rs" {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("read live example");
+        let code = source_scan::shipped_code(&source);
+        if name == "live_launch.rs" {
+            let main = function_body(&code, "async fn main()");
+            assert!(
+                main.trim_start()
+                    .starts_with("if let Err(refusal) = require_scratch_data_home("),
+                "live_launch must require a scratch data home before opening stores"
+            );
+            continue;
+        }
+        let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        for constructor in [
+            "Planes::with_browser_config(",
+            "Planes::new(",
+            "production_audit(",
+        ] {
+            if compact.contains(constructor) {
+                violations.push(format!("{name}: {constructor}"));
+            }
+        }
+    }
+    assert!(scanned > 0, "must scan the live probes");
+    assert!(
+        violations.is_empty(),
+        "live examples must use isolated planes and audits, not operator stores:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn obsolete_parallel_policy_implementations_are_absent() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut obsolete = Vec::new();
+    for file in ["journal/snapshots.rs", "journal/redaction.rs"] {
+        if root.join(file).exists() {
+            obsolete.push(file.to_owned());
+        }
+    }
+    for (file, definitions) in [
+        (
+            "authorization.rs",
+            &[
+                "struct DecisionBindings",
+                "struct AuthorizationCommitGuard",
+                "fn select_deterministic_covering_grant",
+                "fn evaluate_origin_scope",
+            ][..],
+        ),
+        (
+            "computer_capability/operator_apps.rs",
+            &["const OPERATOR_WEB_ORIGINS"][..],
+        ),
+    ] {
+        let source = std::fs::read_to_string(root.join(file)).expect("read policy source");
+        let code = source_scan::shipped_code(&source);
+        for definition in definitions {
+            if code.contains(definition) {
+                obsolete.push(format!("{file}: {definition}"));
+            }
+        }
+    }
+    assert!(
+        obsolete.is_empty(),
+        "test-only policy implementations must not shadow the production path:\n{}",
+        obsolete.join("\n")
+    );
+}

@@ -161,10 +161,6 @@ impl JournalStore {
         self.core.oversize_flag()
     }
 
-    pub(crate) fn set_oversize_flag(&mut self) {
-        self.core.set_oversize_flag();
-    }
-
     pub fn next_sequence(&self) -> u64 {
         self.core.next_sequence()
     }

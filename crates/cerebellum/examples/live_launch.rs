@@ -8,7 +8,7 @@
 //! Run it with:
 //!
 //! ```text
-//! cargo run -p cerebellum --example live_launch
+//! XDG_DATA_HOME=$(mktemp -d /tmp/ck-live-launch.XXXXXX) cargo run -p cerebellum --example live_launch
 //! ```
 
 #[cfg(target_os = "linux")]
@@ -71,6 +71,10 @@ const MANAGEMENT_EPOCH: u32 = 1;
 
 #[tokio::main]
 async fn main() {
+    if let Err(refusal) = require_scratch_data_home(std::env::var_os("XDG_DATA_HOME")) {
+        eprintln!("{refusal}");
+        std::process::exit(2);
+    }
     if let Err(refusal) = precheck_custody_residue() {
         eprintln!("{refusal}");
         std::process::exit(1);
@@ -128,6 +132,20 @@ async fn main() {
         eprintln!("VERDICT: a wire probe failed");
         std::process::exit(1);
     }
+}
+
+// This probe checks profile reuse across plane restarts, which requires disk
+// storage. Refuse before constructing a plane unless its data home is scratch.
+fn require_scratch_data_home(data_home: Option<std::ffi::OsString>) -> Result<(), String> {
+    let path = data_home.ok_or("refusing: set XDG_DATA_HOME to a scratch directory under /tmp")?;
+    let path = std::fs::canonicalize(path)
+        .map_err(|error| format!("refusing: scratch XDG_DATA_HOME: {error}"))?;
+    let temporary = std::fs::canonicalize("/tmp")
+        .map_err(|error| format!("refusing: scratch root: {error}"))?;
+    if path == temporary || !path.starts_with(&temporary) {
+        return Err("refusing: XDG_DATA_HOME must be a scratch directory under /tmp".into());
+    }
+    Ok(())
 }
 
 async fn run_wire_probe(config: BrowserConfig, label: &str) -> bool {
@@ -591,11 +609,11 @@ fn probe_identity() -> BindIdentity {
 /// being reused correctly. Had absence been read as a verdict instead of as a
 /// missing observation, the probe would have reported a defect that was its own.
 fn profile_directories() -> Vec<String> {
-    let Ok(home) = std::env::var("HOME") else {
+    let Ok(home) = std::env::var("XDG_DATA_HOME") else {
         return Vec::new();
     };
     let profiles = PathBuf::from(home)
-        .join(".local/share/cortexkit/cerebellum/browser")
+        .join("cortexkit/cerebellum/browser")
         .join("profiles");
     let Ok(entries) = std::fs::read_dir(&profiles) else {
         return Vec::new();
@@ -864,10 +882,10 @@ fn signing_identifier(path: &Path) -> Option<String> {
 }
 
 fn precheck_custody_residue() -> Result<(), String> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| "refusing: could not determine HOME for custody inspection. Next step: set HOME and rerun the probe.".to_string())?;
+    let home = std::env::var_os("XDG_DATA_HOME")
+        .ok_or_else(|| "refusing: XDG_DATA_HOME is unset".to_string())?;
     let root = PathBuf::from(home)
-        .join(".local/share/cortexkit/cerebellum/browser")
+        .join("cortexkit/cerebellum/browser")
         .join(CUSTODY_LOCK_DIRECTORY);
     check_custody_residue(&root, observed_supervisor_start_time)
 }
@@ -1009,6 +1027,18 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn durable_probe_requires_a_scratch_data_home() {
+        assert!(require_scratch_data_home(None).is_err());
+        assert!(require_scratch_data_home(Some("/tmp".into())).is_err());
+        assert!(require_scratch_data_home(Some("/".into())).is_err());
+        let root =
+            PathBuf::from("/tmp").join(format!("live-launch-scratch-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        assert!(require_scratch_data_home(Some(root.clone().into_os_string())).is_ok());
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn custody_precheck_refuses_a_gone_supervisor() {

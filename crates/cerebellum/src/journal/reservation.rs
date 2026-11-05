@@ -184,32 +184,6 @@ fn provisional_entry(
     )
 }
 
-fn reduced_entry(
-    sequence: u64,
-    identity: &JournalIdentity,
-    capability: Capability,
-    reason: JournalReasonCode,
-) -> JournalEntry {
-    identity_entry(
-        sequence,
-        identity,
-        capability,
-        Phase::RejectedPreDispatch,
-        EntryMaterial {
-            action: None,
-            locator: None,
-            grant_decision: GrantDecision::not_reached(),
-            governing_observation: GoverningObservation::observation_not_required(),
-            intent_redacted: None,
-            requested_severity: None,
-            effective_severity: None,
-            snapshot_ids: vec![],
-            outcome: Outcome::InternalError,
-            detail: serde_json::json!({ "reason_code": reason.as_str() }),
-        },
-    )
-}
-
 impl JournalStore {
     pub fn reserve(
         &mut self,
@@ -301,33 +275,6 @@ impl JournalStore {
                 },
             )
             .map(|_| Committed)
-            .map_err(JournalStore::map_error)
-    }
-
-    pub(crate) fn select_reduced(
-        &mut self,
-        handle: ReservationHandle,
-        entry_reason: JournalReasonCode,
-        visible_reason: JournalReasonCode,
-    ) -> Result<JournalReasonCode, JournalError> {
-        let (identity, capability) = self
-            .metadata
-            .get(&handle.sequence())
-            .cloned()
-            .ok_or_else(JournalError::internal_failure)?;
-        let entry = reduced_entry(handle.sequence(), &identity, capability, entry_reason);
-        if entry_reason == JournalReasonCode::JournalEntryOversize {
-            self.set_oversize_flag();
-        }
-        self.sync_faults_for_transition();
-        self.core
-            .finalize_rejected(
-                handle.core,
-                core_journal::RejectionMaterial {
-                    rejection_material: entry.export_line().into_bytes(),
-                },
-            )
-            .map(|_| visible_reason)
             .map_err(JournalStore::map_error)
     }
 }

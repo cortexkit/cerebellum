@@ -1,4 +1,4 @@
-//! S7 acceptance tests: audit journal, redaction, snapshots, and late events.
+//! Acceptance tests: audit journal and late events.
 //!
 //! The journal module is implemented in `src/journal` and exposed from the crate
 //! root as the public `cerebellum::journal` API. These tests use that public API
@@ -12,7 +12,7 @@ use cerebellum::journal::recovery::RecoveryClassification;
 use cerebellum::journal::reservation::{
     CompletedResult, DispatchMaterial, FinalContextAssociation, RejectionMaterial,
 };
-use cerebellum::journal::snapshots::{Observation, SnapshotError, SnapshotStore};
+
 use cerebellum::journal::store::JournalStore;
 use cerebellum::journal::{
     Action, Capability, GoverningObservation, GrantDecision, GrantOutcome, HandoffJournalOutcome,
@@ -232,173 +232,6 @@ fn failed_finalization_recovery_finalizes_interrupted_after_dispatch() {
 }
 
 // ---------------------------------------------------------------------------
-// AC4: exact reduced oversize paths and branch-conditioned export visibility.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn oversize_marker_failure_leaves_orphan_that_recovery_cancels_as_gap() {
-    let mut store = store();
-    let handle = store.reserve(identity(), Capability::Navigate).unwrap();
-    let seq = handle.sequence();
-    store.faults.arm("establish_marker", 1);
-    let err = store.select_oversize_reduced(handle).unwrap_err();
-    // Caller surfaces reservation_failed; oversize is never surfaced.
-    assert_eq!(err.reason_code, JournalReasonCode::JournalReservationFailed);
-    assert!(store.oversize_flag());
-    // The reservation is an unmarked orphan.
-    assert_eq!(
-        store.classify(seq),
-        Some(RecoveryClassification::UnmarkedOrphan)
-    );
-    // Recovery cancels it after proving no commitment exists: permanent gap,
-    // no entry exported.
-    store.recover_one(seq).unwrap();
-    assert!(store.export().is_empty());
-    assert!(!store.export().contains("journal_entry_oversize"));
-}
-
-#[test]
-fn oversize_post_marker_failure_is_retried_by_recovery() {
-    let mut store = store();
-    let handle = store.reserve(identity(), Capability::Navigate).unwrap();
-    let seq = handle.sequence();
-    store.faults.arm("commit_rejection", 1);
-    let err = store.select_oversize_reduced(handle).unwrap_err();
-    assert_eq!(err.reason_code, JournalReasonCode::JournalReservationFailed);
-    // No entry exported before recovery.
-    assert!(store.export().is_empty());
-    // Recovery retries the marked exact reduced rejection.
-    store.recover_one(seq).unwrap();
-    assert!(store.export().contains("journal_entry_oversize"));
-}
-
-// ---------------------------------------------------------------------------
-// AC5: redaction-unavailable branch-conditioned export visibility.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn redaction_unavailable_branches_condition_export_visibility() {
-    // Branch 1: marker establishment + finalization succeed => entry exported.
-    {
-        let mut store = store();
-        let handle = store.reserve(identity(), Capability::Navigate).unwrap();
-        let code = store.select_redaction_unavailable_reduced(handle).unwrap();
-        assert_eq!(code, JournalReasonCode::InternalFailure);
-        assert!(store.export().contains("redaction_unavailable"));
-    }
-
-    // Branch 2: marker-establishment failure => no entry, orphan for recovery.
-    {
-        let mut store = store();
-        let handle = store.reserve(identity(), Capability::Navigate).unwrap();
-        let seq = handle.sequence();
-        store.faults.arm("establish_marker", 1);
-        store
-            .select_redaction_unavailable_reduced(handle)
-            .unwrap_err();
-        assert!(store.export().is_empty());
-        assert_eq!(
-            store.classify(seq),
-            Some(RecoveryClassification::UnmarkedOrphan)
-        );
-    }
-
-    // Branch 3: post-marker finalization failure => no entry until recovery.
-    {
-        let mut store = store();
-        let handle = store.reserve(identity(), Capability::Navigate).unwrap();
-        let seq = handle.sequence();
-        store.faults.arm("commit_rejection", 1);
-        store
-            .select_redaction_unavailable_reduced(handle)
-            .unwrap_err();
-        assert!(store.export().is_empty());
-        store.recover_one(seq).unwrap();
-        assert!(store.export().contains("redaction_unavailable"));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AC3: snapshot retention, pins, epoch invalidation, teardown.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn snapshot_pin_held_until_terminal_point_then_released_exactly_once() {
-    let mut snapshots = SnapshotStore::new(2).unwrap();
-    snapshots
-        .retain(
-            "snap-1",
-            Observation::Text {
-                content: "redacted".to_string(),
-            },
-        )
-        .unwrap();
-    let obs = snapshots.validate_and_pin("snap-1").unwrap();
-    // The governing observation carries the exact retained bytes.
-    match obs.to_governing() {
-        GoverningObservation::Text { bytes_utf8, .. } => assert_eq!(bytes_utf8, "redacted"),
-        _ => panic!("expected text observation"),
-    }
-    // An epoch transition invalidates but cannot delete the pinned bytes.
-    snapshots.transition_epoch(1);
-    assert_eq!(snapshots.retained_count(), 1);
-    // Releasing the pin at the durable terminal point deletes the invalidated
-    // observation and frees the slot exactly once.
-    snapshots.release_pin("snap-1");
-    assert_eq!(snapshots.retained_count(), 0);
-    snapshots.release_pin("snap-1"); // idempotent no-op
-    assert_eq!(snapshots.retained_count(), 0);
-}
-
-#[test]
-fn evicted_or_invalidated_snapshot_is_stale_and_never_dispatched() {
-    let mut snapshots = SnapshotStore::new(2).unwrap();
-    snapshots
-        .retain(
-            "snap-1",
-            Observation::Text {
-                content: "x".to_string(),
-            },
-        )
-        .unwrap();
-    snapshots.transition_epoch(1);
-    // Prior-epoch unpinned observation deleted; validation is stale.
-    assert_eq!(
-        snapshots.validate_and_pin("snap-1").unwrap_err(),
-        SnapshotError::StaleSnapshot
-    );
-}
-
-#[test]
-fn teardown_blocks_until_pins_release_then_deletes_once() {
-    let mut snapshots = SnapshotStore::new(3).unwrap();
-    snapshots
-        .retain(
-            "a",
-            Observation::Text {
-                content: "1".to_string(),
-            },
-        )
-        .unwrap();
-    snapshots.validate_and_pin("a").unwrap();
-    snapshots.begin_teardown();
-    // No new capture or pin during teardown.
-    assert!(snapshots
-        .retain(
-            "b",
-            Observation::Text {
-                content: "2".to_string()
-            }
-        )
-        .is_err());
-    // Teardown cannot complete while the pin is held.
-    assert!(snapshots.complete_teardown().is_err());
-    snapshots.release_pin("a");
-    snapshots.complete_teardown().unwrap();
-    assert_eq!(snapshots.retained_count(), 0);
-}
-
-// ---------------------------------------------------------------------------
 // AC7: policy events, combined-count accounting, wait_for, abandonment.
 // ---------------------------------------------------------------------------
 
@@ -509,20 +342,6 @@ fn status_retained_bytes_includes_active_reserved_bytes() {
     assert_eq!(status.active_reservation_count, 1);
     assert!(status.retained_bytes > 0);
     let _ = active;
-}
-
-#[test]
-fn purge_clears_oversize_flag_and_reports_only_finalized_entries() {
-    let mut store = store();
-    let handle = store.reserve(identity(), Capability::Navigate).unwrap();
-    store.select_oversize_reduced(handle).unwrap();
-    assert!(store.oversize_flag());
-    let report = store.purge();
-    assert_eq!(report.purged_entry_count, 1);
-    assert!(!store.oversize_flag());
-    assert!(store.export().is_empty());
-    // The allocator is not reset by purge.
-    assert_eq!(store.next_sequence(), 2);
 }
 
 /// Every browser capability records under its own name, and no two collapse.

@@ -1,9 +1,9 @@
-//! Audit journal, redaction, snapshot retention, and late-event delivery.
+//! Audit journal, policy events, and late-event delivery.
 //!
 //! This module implements the browser plane's journal surface and the closed
 //! `ck-browser-journal/v7` entry contract. It owns durable allocation and
 //! storage, reservations and transition pins, dispatch commitment, recovery,
-//! retained governing observations and snapshot pins, policy events, audit
+//! observations recorded as evidence for actions, policy events, audit
 //! obligations, and live-session late-event delivery.
 //!
 //! Invocation-bound pins, profile association, administration, manifest
@@ -35,10 +35,8 @@ pub mod call_records;
 pub mod core_adapter;
 pub mod late_events;
 pub mod recovery;
-pub mod redaction;
 pub mod reservation;
 pub mod retention;
-pub mod snapshots;
 pub mod store;
 
 pub use cerebellum_core::journal::CallOriginRecord;
