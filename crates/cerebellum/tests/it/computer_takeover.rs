@@ -753,6 +753,57 @@ async fn a_drag_across_two_applications_is_refused_before_anything_is_posted() {
 }
 
 #[tokio::test]
+async fn a_scroll_uses_appkit_recipient_through_a_full_screen_click_through_overlay() {
+    let rig = rig();
+    hold_takeover(&rig.management).await;
+    {
+        let mut state = rig.desk.state();
+        // The rectangle list covers every point with an overlay, but AppKit
+        // passes the wheel through to the target window underneath it.
+        state.topmost_window = Some(999);
+        state.pointer_window_override = Some(Some(IMAGED_WINDOW));
+    }
+    let carrier = ScriptedCarrier::default();
+    let reply = serve_with(
+        &rig,
+        "computer.takeover_scroll",
+        json!({"target": TARGET_BUNDLE_ID, "axis": "vertical", "amount_lines": -3}),
+        relayed(&carrier),
+        cerebellum::CancelHandle::pending(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(rig.posts(), vec![(0, false)]);
+    assert!(carrier.questions().is_empty());
+}
+
+#[tokio::test]
+async fn a_scroll_refuses_an_unconfirmed_appkit_recipient() {
+    for failed in [false, true] {
+        let rig = rig();
+        hold_takeover(&rig.management).await;
+        {
+            let mut state = rig.desk.state();
+            if failed {
+                state.pointer_query_error = Some("recipient query failed");
+            } else {
+                state.pointer_window_override = Some(None);
+            }
+        }
+        let reply = serve_with(
+            &rig,
+            "computer.takeover_scroll",
+            json!({"target": TARGET_BUNDLE_ID, "axis": "vertical", "amount_lines": -3}),
+            no_relay(),
+            cerebellum::CancelHandle::pending(),
+        )
+        .await;
+        assert!(rig.posts().is_empty(), "failed={failed}: {reply}");
+        assert_eq!(reply["reason"], "point_in_another_window", "{reply}");
+    }
+}
+
+#[tokio::test]
 async fn a_scroll_refuses_another_app_under_the_real_pointer_even_when_target_is_frontmost() {
     for owner in [OTHER_PID, OPERATOR_PID] {
         let rig = rig();

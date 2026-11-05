@@ -707,6 +707,9 @@ impl std::fmt::Debug for DeskHook {
 #[derive(Debug)]
 pub struct DeskState {
     pub real_cursor: Option<(f64, f64)>,
+    /// AppKit's recipient when it differs from the rectangular window list;
+    /// `Some(None)` represents a query that could not identify a recipient.
+    pub pointer_window_override: Option<Option<u32>>,
     pub pointer_query_error: Option<&'static str>,
     pub pointer_prewarm_deadlines: Vec<std::time::Instant>,
     pub pointer_prewarm_error: Option<&'static str>,
@@ -801,6 +804,7 @@ impl Desk {
     pub fn new(roots: Vec<RawElement>) -> Self {
         Self(Arc::new(Mutex::new(DeskState {
             real_cursor: None,
+            pointer_window_override: None,
             pointer_query_error: None,
             pointer_prewarm_deadlines: Vec::new(),
             pointer_prewarm_error: None,
@@ -1110,7 +1114,8 @@ impl AppStateSource for Desk {
     }
 
     fn pointer_window_at(&self, point: (f64, f64)) -> Option<u32> {
-        self.topmost_window_at(point)
+        let recipient = self.state().pointer_window_override;
+        recipient.unwrap_or_else(|| self.topmost_window_at(point))
     }
 
     fn cursor_position(&self) -> Option<(f64, f64)> {

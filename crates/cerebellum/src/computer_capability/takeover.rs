@@ -291,7 +291,8 @@ fn application_under(
 }
 
 /// A frontmost app does not own every window under the real pointer. Verify
-/// both the hit element's owner and its topmost window before sending a wheel.
+/// both the hit element's owner and the click-through-aware recipient window
+/// before sending a wheel; rectangular coverage can include transparent overlays.
 fn scroll_recipient(
     source: &dyn AppStateSource,
     target: &ProcessGrant,
@@ -310,8 +311,12 @@ fn scroll_recipient(
     let window = source
         .element_window_number(&element)
         .ok_or("scroll pointer window unavailable")?;
-    if source.topmost_window_at(point) != Some(window) {
-        return Err("scroll pointer window is covered or unavailable");
+    if source
+        .pointer_recipient(point)
+        .map_err(|_| "scroll pointer recipient unconfirmed")?
+        != Some(window)
+    {
+        return Err("scroll pointer recipient window changed or unavailable");
     }
     Ok(())
 }
