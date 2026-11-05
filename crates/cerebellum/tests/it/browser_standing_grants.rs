@@ -951,10 +951,10 @@ async fn each_answered_option_mints_exactly_its_row() {
         assert!(row.hazards.is_empty());
         assert_eq!(row.card_ref.as_deref(), Some(raised_id.as_str()));
         assert_eq!(row.granted_at_ms, fixture.clock_now());
-        let subject = if matches!(id, "allow_30m" | "allow_origin_always") {
-            GrantSubject::Domain("example.com".into())
-        } else {
-            GrantSubject::AllSites
+        let subject = match id {
+            "allow_30m" => GrantSubject::Origin(PUBLIC.into()),
+            "allow_origin_always" => GrantSubject::Domain("example.com".into()),
+            _ => GrantSubject::AllSites,
         };
         assert_eq!(row.subject, subject);
         assert_eq!(

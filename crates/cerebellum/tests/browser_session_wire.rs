@@ -5541,11 +5541,15 @@ async fn late_in_call_answer(decision: &str, _linkable: bool) {
             body(&question)["id"].as_str().unwrap()
         );
         assert_eq!(rows[0].expires_at_ms.is_some(), decision == "allow_30m");
-        // An "always" answer covers the registrable domain of an https origin
-        // on the default port.
+        // Only an "always" answer covers the registrable domain; a temporary
+        // answer is limited to the exact origin named by the card.
         assert_eq!(
             rows[0].subject,
-            cerebellum::agent_grants::GrantSubject::Domain("example.com".into())
+            if decision == "allow_30m" {
+                cerebellum::agent_grants::GrantSubject::Origin("https://example.com".into())
+            } else {
+                cerebellum::agent_grants::GrantSubject::Domain("example.com".into())
+            }
         );
     } else {
         assert!(rows.is_empty());
