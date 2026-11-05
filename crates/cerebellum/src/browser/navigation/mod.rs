@@ -49,6 +49,8 @@ const READ_CHUNK_BYTES: usize = 64 * 1024;
 /// making every non-navigating click wait long.
 const CLICK_NAVIGATION_WINDOW: Duration = Duration::from_millis(100);
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
+type CommandEncoder<'a> = dyn Fn(&crate::cdp::CdpCommand) -> Result<zeroize::Zeroizing<Vec<u8>>, crate::cdp::CdpError>
+    + 'a;
 const MAX_AX_NODES: usize = MAX_REFS;
 const MAX_AX_DEPTH: usize = 64;
 
@@ -3162,7 +3164,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         clock: &mut C,
     ) -> Result<CdpResponse, NavigationDriveError> {
         self.command_response_inner(
-            method, params, session_id, deadline, tracking, dispatched, None, clock,
+            method, params, session_id, deadline, tracking, dispatched, None, None, clock,
         )
         .map_err(|error| error.at_step(method))
     }
@@ -3187,6 +3189,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             Some(tracking),
             dispatched,
             Some(dialogs),
+            None,
             clock,
         )
     }
@@ -3201,6 +3204,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         mut tracking: Option<(&str, &mut Tracker)>,
         mut dispatched: Option<&mut dyn FnMut()>,
         mut handled_dialogs: Option<&mut Vec<BrowserJavaScriptDialog>>,
+        encoder: Option<&CommandEncoder<'_>>,
         clock: &mut C,
     ) -> Result<CdpResponse, NavigationDriveError> {
         if let Some(dialogs) = handled_dialogs.as_deref_mut() {
@@ -3226,9 +3230,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .issue_command(method, params, session_id, clock.now())
             .map_err(|_| NavigationDriveError::CdpFailure)?;
         let command_id = command.id;
-        let mut bytes = command
-            .json_bytes()
-            .map_err(|_| NavigationDriveError::CdpFailure)?;
+        let encoded = match encoder {
+            Some(encode) => encode(&command),
+            None => command.json_bytes().map(zeroize::Zeroizing::new),
+        };
+        let mut bytes = encoded.map_err(|_| {
+            self.transport.abandon_command(command_id);
+            NavigationDriveError::CdpFailure
+        })?;
         bytes.push(0);
         // Recorded before the write, the one step that can block past the
         // deadline. The session's exit sweep reads the record, and kills the
@@ -3237,9 +3246,11 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let _in_flight = context
             .as_ref()
             .map(|context| context.watch.begin_command(method, cap));
-        self.pipe
-            .write_frame(&bytes)
-            .map_err(|_| NavigationDriveError::ConnectorFailure)?;
+        let written = self.pipe.write_frame(&bytes);
+        // Do not retain credential-bearing frames while waiting for a response.
+        drop(bytes);
+        drop(command);
+        written.map_err(|_| NavigationDriveError::ConnectorFailure)?;
         if let Some(callback) = dispatched.as_mut() {
             callback();
         }
