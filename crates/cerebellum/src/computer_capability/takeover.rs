@@ -290,6 +290,32 @@ fn application_under(
         .ok_or_else(nothing_identifiable_at_point)
 }
 
+/// A frontmost app does not own every window under the real pointer. Verify
+/// both the hit element's owner and its topmost window before sending a wheel.
+fn scroll_recipient(
+    source: &dyn AppStateSource,
+    target: &ProcessGrant,
+) -> Result<(), &'static str> {
+    let point = source
+        .cursor_position()
+        .ok_or("scroll real cursor location unavailable")?;
+    let (element, owner) = source
+        .element_at(HitScope::SystemWide, point)
+        .ok()
+        .flatten()
+        .ok_or("scroll pointer recipient unreadable")?;
+    if owner != Some(target.pid) {
+        return Err("scroll pointer recipient belongs to another application");
+    }
+    let window = source
+        .element_window_number(&element)
+        .ok_or("scroll pointer window unavailable")?;
+    if source.topmost_window_at(point) != Some(window) {
+        return Err("scroll pointer window is covered or unavailable");
+    }
+    Ok(())
+}
+
 /// Refuse, without asking anyone, when the application the pointer would
 /// act in holds no app grant in this conversation.
 ///
@@ -692,6 +718,17 @@ where
                         refusal["remedy"] = json!(format!("{step}; nothing was posted"));
                         refusal
                     })?);
+                } else {
+                    let source = Arc::clone(&self.app_state_source);
+                    let target = grant.clone();
+                    tokio::task::spawn_blocking(move || scroll_recipient(source.as_ref(), &target))
+                        .await
+                        .unwrap_or(Err("scroll placement worker failed"))
+                        .map_err(|_| json!({
+                            "outcome": "target_not_frontmost",
+                            "reason": "point_in_another_window",
+                            "remedy": "the real pointer is over another application's window, or its recipient could not be confirmed; nothing was posted. Put the pointer over the named app's window before retrying"
+                        }))?;
                 }
                 return Ok((
                     grant,
@@ -1046,6 +1083,22 @@ where
         // Posting blocks for as long as the sequence takes. Run it off the
         // runtime so a cancel frame can still be read and set the signal.
         let make_driver = self.make_synthetic_driver.clone();
+        let scroll_guard = (!self.takeover_pointer_fronting_admitted
+            && matches!(takeover_request, TakeoverRequest::Scroll { .. }))
+        .then(|| {
+            let source = Arc::clone(&self.app_state_source);
+            let target = target.clone();
+            let failure = Arc::clone(&pointer_failure);
+            cerebellum_computer::platform::GlobalScrollGuard(Arc::new(move || {
+                let result = scroll_recipient(source.as_ref(), &target);
+                if let Err(step) = result {
+                    *failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(step);
+                }
+                result
+            }))
+        });
         // The pointer events posted here reach the platform's input count
         // like the person's do; noting them keeps a later element or
         // keystroke action from taking them for the person's use.
@@ -1062,6 +1115,16 @@ where
             });
             let cancelled = || cancel.is_cancelled();
             let mut driver = make_driver();
+            if scroll_guard.is_some_and(|guard| !driver.accept_global_scroll_guard(guard)) {
+                return if audit
+                    .release_unused(&DispatchError::SyntheticUnavailable)
+                    .is_err()
+                {
+                    Err(DispatchError::AuditUnavailable)
+                } else {
+                    Err(DispatchError::SyntheticUnavailable)
+                };
+            }
             if let (Some(guard), Some(hooks)) = (pointer_guard, &worker_hooks) {
                 if !driver.accept_pointer_fronting(guard)
                     || !driver.accept_fronted_dispatch_hooks(super::fronting::boxed_hooks(hooks))

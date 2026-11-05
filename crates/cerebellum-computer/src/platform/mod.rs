@@ -1099,6 +1099,19 @@ pub struct GlobalDispatchRequest {
     pub minimum_inter_post_interval_ms: u32,
 }
 
+/// Revalidate the real wheel recipient before a non-fronting scroll post.
+/// This callback may only inspect state; it must not front an app or move the pointer.
+#[derive(Clone)]
+pub struct GlobalScrollGuard(
+    pub std::sync::Arc<dyn Fn() -> Result<(), &'static str> + Send + Sync>,
+);
+
+impl std::fmt::Debug for GlobalScrollGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GlobalScrollGuard")
+    }
+}
+
 /// Revalidate coordinate containment immediately before each pointer post.
 /// The callback owns its image/session data and may not post input itself.
 /// The `Instant` it receives is the bracket's deadline, fixed when this module
@@ -1480,6 +1493,11 @@ impl std::error::Error for DriverError {}
 /// The complete bounded surface shared by future Windows, X11, and Wayland
 /// backends. Implementations may refuse an operation, but may not broaden it.
 pub trait PlatformDriver {
+    /// Install containment for a non-fronting wheel dispatch. A driver that
+    /// cannot check it at the post must refuse, not silently ignore the guard.
+    fn accept_global_scroll_guard(&mut self, _guard: GlobalScrollGuard) -> bool {
+        false
+    }
     /// Install one separately admitted pointer-fronting unit. Unsupported
     /// drivers must refuse rather than dispatch without containment checks.
     fn accept_pointer_fronting(&mut self, _guard: GlobalPointerGuard) -> bool {

@@ -38,10 +38,11 @@ use cerebellum_computer::platform::{
     AttendancePreconditionResult, CapabilityAdvertisementContext, CapabilityDeclaration,
     DispatchResult, DriverError, EffectObservationRequest, EffectObservationResult, EffectStatus,
     ElementResolutionRequest, ElementResolutionResult, FocusQueryRequest, FocusQueryResult,
-    FrontingSnapshot, GlobalDispatchRequest, IdleReading, InputObservationRequest,
-    InputObservationResult, InputObserverLiveness, PlatformDriver, ProcessEventRefusal,
-    ProcessGrant, SemanticDispatchRequest, SequencePostFailure, SyntheticAction,
-    SyntheticDispatchRequest, SyntheticPoint, SyntheticScrollAxis, TargetResolution,
+    FrontingSnapshot, GlobalDispatchRequest, GlobalScrollGuard, IdleReading,
+    InputObservationRequest, InputObservationResult, InputObserverLiveness, PlatformDriver,
+    ProcessEventRefusal, ProcessGrant, SemanticDispatchRequest, SequencePostFailure,
+    SyntheticAction, SyntheticDispatchRequest, SyntheticPoint, SyntheticScrollAxis,
+    TargetResolution,
 };
 use cerebellum_core::clock::FakeClock;
 use cerebellum_core::journal::{InMemoryJournalStorage, ValidatedSeverityTaxonomy};
@@ -54,6 +55,8 @@ use support::computer::{
 /// A second application, with no grant unless a test gives it one.
 const OTHER_BUNDLE_ID: &str = "com.example.Other";
 const OTHER_PID: u32 = 5151;
+const OPERATOR_PID: u32 = 6161;
+const OPERATOR_BUNDLE_ID: &str = "com.apple.ScreenContinuity";
 /// The pid the fake desk attributes the module's own posts to.
 const OUR_PID: i64 = 7;
 
@@ -65,7 +68,16 @@ fn other() -> ProcessGrant {
     }
 }
 
-/// Two running applications, each resolvable by name and by pid.
+fn operator() -> ProcessGrant {
+    ProcessGrant {
+        pid: OPERATOR_PID,
+        bundle_identity: OPERATOR_BUNDLE_ID.into(),
+        process_generation_evidence: "1700000000000002".into(),
+    }
+}
+
+/// Running apps resolvable by name and pid: two ordinary apps and iPhone
+/// Mirroring, which agents are forbidden to control.
 struct TwoApplications;
 
 impl TargetResolver for TwoApplications {
@@ -73,12 +85,13 @@ impl TargetResolver for TwoApplications {
         match bundle_identity {
             TARGET_BUNDLE_ID => TargetResolution::Resolved(grant()),
             OTHER_BUNDLE_ID => TargetResolution::Resolved(other()),
+            OPERATOR_BUNDLE_ID => TargetResolution::Resolved(operator()),
             _ => TargetResolution::NotRunning,
         }
     }
 
     fn process_for_pid(&self, pid: u32) -> Option<ProcessGrant> {
-        [grant(), other()]
+        [grant(), other(), operator()]
             .into_iter()
             .find(|process| process.pid == pid)
     }
@@ -105,11 +118,14 @@ struct Pointer {
     heartbeat_missed: bool,
     /// The platform refuses the dispatch outright with this error.
     fail_with: Option<DriverError>,
+    before_post: Option<support::computer::DeskHook>,
+    reject_scroll_guard: bool,
 }
 
 struct PointerDriver {
     pointer: Arc<Mutex<Pointer>>,
     desk: Desk,
+    scroll_guard: Option<GlobalScrollGuard>,
 }
 
 fn stopped(watcher: &SeizeWatcher) -> DriverError {
@@ -120,6 +136,13 @@ fn stopped(watcher: &SeizeWatcher) -> DriverError {
 }
 
 impl PlatformDriver for PointerDriver {
+    fn accept_global_scroll_guard(&mut self, guard: GlobalScrollGuard) -> bool {
+        if self.pointer.lock().unwrap().reject_scroll_guard {
+            return false;
+        }
+        self.scroll_guard = Some(guard);
+        true
+    }
     fn capability_declarations(
         &self,
         _context: &CapabilityAdvertisementContext,
@@ -238,6 +261,10 @@ impl PlatformDriver for PointerDriver {
                     index,
                 );
             }
+            let hook = pointer.lock().unwrap().before_post.take();
+            if let Some(hook) = hook {
+                (hook.0)();
+            }
             dispatch_observed_post_in_order(
                 &mut watcher,
                 index,
@@ -252,7 +279,15 @@ impl PlatformDriver for PointerDriver {
                         observed_at_ms: posted.posted_at_ms,
                     }
                 },
-                || desk.state().frontmost == Some(target_pid),
+                || {
+                    let contained =
+                        !matches!(request.synthetic.action, SyntheticAction::Scroll { .. })
+                            || self
+                                .scroll_guard
+                                .as_ref()
+                                .is_some_and(|guard| (guard.0)().is_ok());
+                    contained && desk.state().frontmost == Some(target_pid)
+                },
                 || pointer.lock().unwrap().posts.push((event, false)),
             )
             .map_err(|_| stopped(&watcher))?;
@@ -389,6 +424,8 @@ fn rig() -> Rig {
         state.application_hit = Some((60, Some(grant().pid)));
         state.system_wide_hit = Some((60, Some(grant().pid)));
         state.topmost_window = Some(IMAGED_WINDOW);
+        state.real_cursor = Some((150.0, 100.0));
+        state.element_windows.insert(60, IMAGED_WINDOW);
     }
     let pointer = Arc::new(Mutex::new(Pointer {
         idle_ms: 60_000,
@@ -403,6 +440,7 @@ fn rig() -> Rig {
             move || PointerDriver {
                 pointer: Arc::clone(&pointer),
                 desk: desk.clone(),
+                scroll_guard: None,
             }
         },
     )
@@ -712,6 +750,104 @@ async fn a_drag_across_two_applications_is_refused_before_anything_is_posted() {
     assert_eq!(reply["reason"], "drag_crosses_applications");
     assert!(rig.dispatched().is_empty());
     assert!(rig.posts().is_empty());
+}
+
+#[tokio::test]
+async fn a_scroll_refuses_another_app_under_the_real_pointer_even_when_target_is_frontmost() {
+    for owner in [OTHER_PID, OPERATOR_PID] {
+        let rig = rig();
+        hold_takeover(&rig.management).await;
+        {
+            let mut state = rig.desk.state();
+            state.system_wide_hit = Some((61, Some(owner)));
+            state.element_windows.insert(61, 88);
+            state.topmost_window = Some(88);
+        }
+        let carrier = ScriptedCarrier::default();
+        let reply = serve_with(
+            &rig,
+            "computer.takeover_scroll",
+            json!({"target": TARGET_BUNDLE_ID, "axis": "vertical", "amount_lines": -3}),
+            relayed(&carrier),
+            cerebellum::CancelHandle::pending(),
+        )
+        .await;
+        assert!(rig.posts().is_empty(), "owner {owner}: {reply}");
+        assert_eq!(reply["reason"], "point_in_another_window", "{reply}");
+        assert!(carrier.questions().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_scroll_refuses_an_unverifiable_real_pointer_recipient() {
+    for missing in ["cursor", "hit", "window", "topmost"] {
+        let rig = rig();
+        hold_takeover(&rig.management).await;
+        {
+            let mut state = rig.desk.state();
+            match missing {
+                "cursor" => state.real_cursor = None,
+                "hit" => state.system_wide_hit = None,
+                "window" => state.element_windows.clear(),
+                _ => state.topmost_window = None,
+            }
+        }
+        let reply = serve_with(
+            &rig,
+            "computer.takeover_scroll",
+            json!({"target": TARGET_BUNDLE_ID, "axis": "vertical", "amount_lines": -3}),
+            no_relay(),
+            cerebellum::CancelHandle::pending(),
+        )
+        .await;
+        assert!(rig.posts().is_empty(), "{missing}: {reply}");
+        assert_eq!(reply["reason"], "point_in_another_window", "{reply}");
+    }
+}
+
+#[tokio::test]
+async fn a_scroll_rechecks_the_real_pointer_recipient_at_the_post() {
+    for owner in [OTHER_PID, OPERATOR_PID] {
+        let rig = rig();
+        hold_takeover(&rig.management).await;
+        let desk = rig.desk.clone();
+        rig.pointer.lock().unwrap().before_post =
+            Some(support::computer::DeskHook(Arc::new(move || {
+                let mut state = desk.state();
+                state.real_cursor = Some((800.0, 400.0));
+                state.system_wide_hit = Some((61, Some(owner)));
+                state.element_windows.insert(61, 88);
+                state.topmost_window = Some(88);
+            })));
+        let reply = serve_with(
+            &rig,
+            "computer.takeover_scroll",
+            json!({"target": TARGET_BUNDLE_ID, "axis": "vertical", "amount_lines": -3}),
+            no_relay(),
+            cerebellum::CancelHandle::pending(),
+        )
+        .await;
+        assert!(rig.posts().is_empty(), "owner {owner}: {reply}");
+        assert_eq!(reply["reason"], "target_focus_mismatch", "{reply}");
+    }
+}
+
+#[tokio::test]
+async fn a_scroll_driver_that_cannot_guard_the_recipient_posts_nothing() {
+    let rig = rig();
+    hold_takeover(&rig.management).await;
+    rig.pointer.lock().unwrap().reject_scroll_guard = true;
+    let reply = serve_with(
+        &rig,
+        "computer.takeover_scroll",
+        json!({"target": TARGET_BUNDLE_ID, "axis": "vertical", "amount_lines": -3}),
+        no_relay(),
+        cerebellum::CancelHandle::pending(),
+    )
+    .await;
+    assert!(rig.posts().is_empty(), "{reply}");
+    assert!(rig.dispatched().is_empty(), "{reply}");
+    assert_ne!(reply["outcome"], "completed", "{reply}");
 }
 
 /// A scroll names its application and carries no point, so the takeover

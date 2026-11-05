@@ -117,6 +117,7 @@ pub struct MacOs26PlatformDriver {
     takeover_dispatch_review_revision: Option<String>,
     takeover_pointer_fronting_review_revision: Option<String>,
     pointer_fronting: Option<super::GlobalPointerGuard>,
+    global_scroll_guard: Option<super::GlobalScrollGuard>,
     input_route_evidence: super::input_route::InputRouteEvidence,
     /// Shared across every driver the plane builds. The plane builds a driver
     /// per dispatch (its accessibility cache must not outlive a process
@@ -869,6 +870,7 @@ fn dispatch_synthetic_globally(
     request: GlobalDispatchRequest,
     estimator: &mut UserIdleEstimator,
     cancelled: &dyn Fn() -> bool,
+    scroll_guard: Option<&super::GlobalScrollGuard>,
 ) -> Result<DispatchResult, DriverError> {
     let GlobalDispatchRequest {
         synthetic,
@@ -973,11 +975,24 @@ fn dispatch_synthetic_globally(
             }
             return Ok(0);
         };
+        let scroll_contained = if matches!(synthetic.action, SyntheticAction::Scroll { .. }) {
+            scroll_guard.is_some_and(|guard| (guard.0)().is_ok())
+        } else {
+            true
+        };
         super::process_event::require_exact_generation(
             target,
             identity_transport.process_generation(target_pid),
         )
         .map_err(|_| DriverError::Unsupported("global target generation changed"))?;
+        if matches!(synthetic.action, SyntheticAction::Scroll { .. }) {
+            // Containment and generation reads can block. Observe input that
+            // arrived during them before deciding whether to post the wheel.
+            drain_session_events(&tap, &mut watcher, our_pid, index);
+            if cancelled() {
+                return Err(DriverError::Unsupported("global scroll dispatch cancelled"));
+            }
+        }
         if recovery {
             if cerebellum_macos::frontmost_process_id() != i32::try_from(target_pid).ok() {
                 return Err(DriverError::Unsupported(
@@ -992,7 +1007,10 @@ fn dispatch_synthetic_globally(
             index,
             probe,
             |_| heartbeat,
-            || cerebellum_macos::frontmost_process_id() == i32::try_from(target_pid).ok(),
+            || {
+                scroll_contained
+                    && cerebellum_macos::frontmost_process_id() == i32::try_from(target_pid).ok()
+            },
             || cerebellum_macos::post_event_globally(event),
         );
         match result {
@@ -1438,6 +1456,7 @@ impl MacOs26PlatformDriver {
             takeover_dispatch_review_revision: None,
             takeover_pointer_fronting_review_revision: None,
             pointer_fronting: None,
+            global_scroll_guard: None,
             input_route_evidence: Default::default(),
             user_idle: Arc::new(Mutex::new(UserIdleEstimator::new())),
             fronted_hooks: FrontedHookSlot::default(),
@@ -1530,6 +1549,10 @@ impl Default for MacOs26PlatformDriver {
 }
 
 impl PlatformDriver for MacOs26PlatformDriver {
+    fn accept_global_scroll_guard(&mut self, guard: super::GlobalScrollGuard) -> bool {
+        self.global_scroll_guard = Some(guard);
+        true
+    }
     fn accept_pointer_fronting(&mut self, guard: super::GlobalPointerGuard) -> bool {
         if !self.pointer_fronting_review_bound() {
             return false;
@@ -1949,7 +1972,12 @@ impl PlatformDriver for MacOs26PlatformDriver {
             .user_idle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        dispatch_synthetic_globally(request, &mut user_idle, cancelled)
+        dispatch_synthetic_globally(
+            request,
+            &mut user_idle,
+            cancelled,
+            self.global_scroll_guard.take().as_ref(),
+        )
     }
     fn dispatch_fronted(
         &mut self,
