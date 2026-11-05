@@ -319,8 +319,8 @@ impl SignedInDomains {
     /// A page read can include embedded documents and pixels from other sites.
     /// Until capture provenance is complete, any login in the profile makes its
     /// returned page content private. Incomplete history cannot prove no login,
-    /// and neither can a missing record: a login the agent makes by itself is
-    /// never recorded, so only a profile recorded as fresh is known clean.
+    /// and neither can a missing record. Only a profile with complete login
+    /// history and no recorded login domains is known clean.
     pub(crate) fn has_login_evidence(&self, agent: &str, profile: &str) -> bool {
         match self.state.lock() {
             Ok(state) => match state.as_ref() {
@@ -338,17 +338,16 @@ impl SignedInDomains {
         }
     }
 
-    /// Called only for an observed handoff login or a successful login import.
+    /// Record a person signing in, a copied browser login, or vault credentials
+    /// about to be inserted into a page, whether or not they are submitted.
     pub fn record(&self, agent: &str, profile: &str, origin: &str) -> Result<(), String> {
-        let Some(domain) = Self::domain(origin) else {
-            return Ok(());
-        };
+        let domain = Self::domain(origin);
         let mut locked = self
             .state
             .lock()
             .map_err(|_| "signed-in domains lock poisoned".to_string())?;
         let state = locked.as_mut().map_err(|error| error.clone())?;
-        if !state
+        let facts = state
             .profiles
             .entry(agent.to_string())
             .or_default()
@@ -357,10 +356,18 @@ impl SignedInDomains {
                 domains: BTreeSet::new(),
                 signed_in_coverage: SignedInCoverage::Incomplete,
                 profile_uuid: None,
-            })
-            .domains
-            .insert(domain)
-        {
+            });
+        let changed = match domain {
+            Some(domain) => facts.domains.insert(domain),
+            None => {
+                // IP addresses and origins without a registrable domain still
+                // cannot prove the profile clean after credentials reach it.
+                let was_complete = facts.signed_in_coverage == SignedInCoverage::Complete;
+                facts.signed_in_coverage = SignedInCoverage::Incomplete;
+                was_complete
+            }
+        };
+        if !changed {
             return Ok(());
         }
         if let Err(error) = self.save(state) {
@@ -430,6 +437,19 @@ mod tests {
             .record("agent", "default", "http://login.example.co.uk")
             .unwrap();
         assert!(store.is_signed_in("agent", "default", "https://account.example.co.uk"));
+    }
+
+    #[test]
+    fn login_evidence_without_a_registrable_domain_is_not_clean() {
+        let store = SignedInDomains::default();
+        store
+            .initialize_profile("agent", "default", "fresh", true)
+            .unwrap();
+        assert!(!store.has_login_evidence("agent", "default"));
+        store
+            .record("agent", "default", "https://127.0.0.1:8443")
+            .unwrap();
+        assert!(store.has_login_evidence("agent", "default"));
     }
 
     #[test]
