@@ -219,12 +219,18 @@ async fn user_site_card_requires_a_holder_and_a_recordable_unified_store() {
 
 #[tokio::test]
 async fn user_site_upgrade_keeps_id_and_temporary_answer_expires_on_the_wall_clock() {
+    // A non-default port keeps Always origin-scoped too: this tests a lifetime
+    // replacement of the same subject, which must keep its revocable row id.
     let clock = Arc::new(ManualWallClock::at(1000));
     let store =
         Arc::new(AgentGrants::in_memory(Some("test-machine".into())).with_clock(clock.clone()));
     let fixture = Fixture::with_agent_grants(None, Some(store));
     let (reply, cards) = fixture
-        .call(1, ask(1, json!([]), "https://example.com"), "allow_30m")
+        .call(
+            1,
+            ask(1, json!([]), "https://example.com:8443"),
+            "allow_30m",
+        )
         .await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
     assert_eq!(cards.len(), 1);
@@ -233,7 +239,7 @@ async fn user_site_upgrade_keeps_id_and_temporary_answer_expires_on_the_wall_clo
     let (reply, cards) = fixture
         .call(
             1,
-            ask(3, json!([]), "https://example.com"),
+            ask(3, json!([]), "https://example.com:8443"),
             "allow_origin_always",
         )
         .await;
@@ -257,7 +263,7 @@ async fn user_site_upgrade_keeps_id_and_temporary_answer_expires_on_the_wall_clo
         .unwrap();
     clock.advance_ms(1_800_000);
     let (reply, cards) = fixture
-        .call(1, ask(1, json!([]), "https://example.com"), "deny")
+        .call(1, ask(1, json!([]), "https://example.com:8443"), "deny")
         .await;
     assert_eq!(reply["reason"], "consent_declined", "{reply}");
     assert_eq!(cards.len(), 1);

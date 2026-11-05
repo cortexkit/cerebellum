@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent_grants::{AgentGrant, AgentGrants, BrowserTarget, GrantHolder, GrantSubject};
+use crate::authorization::OBSERVE;
 
 fn store() -> Arc<AgentGrants> {
     Arc::new(AgentGrants::in_memory(Some("test-machine".into())))
@@ -27,6 +28,52 @@ fn seed(store: &Arc<AgentGrants>, target: BrowserTarget, subject: GrantSubject) 
             now,
         )
         .unwrap()
+}
+
+#[tokio::test]
+async fn thirty_minute_site_answer_stays_exact_while_always_covers_subdomains() {
+    for (choice, always) in [("allow_30m", false), ("allow_origin_always", true)] {
+        let store = store();
+        let fixture = Fixture::with_agent_grants(None, Some(store.clone()));
+        let tab = fixture.claim(1).await;
+        let (reply, cards) = fixture.snapshot(1, &tab, choice).await;
+        assert_eq!(reply["outcome"], "ok", "{reply}");
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0]["scope"]["origins"], json!(["https://example.com"]));
+        let rows = store.live_rows(None, store.now_ms()).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            row.subject,
+            if always {
+                GrantSubject::Domain("example.com".into())
+            } else {
+                GrantSubject::Origin("https://example.com".into())
+            }
+        );
+        assert_eq!(
+            row.expires_at_ms,
+            (!always).then_some(row.granted_at_ms + 1_800_000)
+        );
+        for (origin, covered) in [
+            ("https://example.com", true),
+            ("https://mail.example.com", always),
+            ("https://example.com:8443", false),
+            ("http://example.com", false),
+        ] {
+            assert_eq!(
+                crate::agent_grants::GrantDemand::Browser {
+                    target: BrowserTarget::UserBrowser,
+                    origin: origin.into(),
+                    severity: Severity::new(OBSERVE, false, false),
+                    hazards: Default::default(),
+                }
+                .covers(row),
+                covered,
+                "{choice}: {origin}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

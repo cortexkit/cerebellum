@@ -3012,7 +3012,7 @@ mod tests {
             .open_browser_grant_at_tier(
                 "conversation",
                 vec![
-                    "https://example.com".to_string(),
+                    "https://docs.example.com".to_string(),
                     "https://example.net".to_string(),
                 ],
                 vec![
@@ -3034,7 +3034,7 @@ mod tests {
         );
         assert_eq!(
             question.body["params"]["target"]["label"],
-            "example.com, example.net"
+            "docs.example.com, example.net"
         );
         let prompt = question.body["params"]["prompt"].as_str().unwrap();
         assert!(prompt.contains("example.com") && prompt.contains("example.net"));
@@ -3083,8 +3083,8 @@ mod tests {
                 .map(|row| row.subject.clone())
                 .collect::<Vec<_>>(),
             vec![
-                crate::agent_grants::GrantSubject::Domain("example.com".into()),
-                crate::agent_grants::GrantSubject::Domain("example.net".into())
+                crate::agent_grants::GrantSubject::Origin("https://docs.example.com".into()),
+                crate::agent_grants::GrantSubject::Origin("https://example.net".into())
             ]
         );
         for row in rows {
@@ -3097,6 +3097,23 @@ mod tests {
             );
             assert_eq!(row.max_level, MUTATE_DURABLE);
             assert_eq!(row.expires_at_ms, Some(row.granted_at_ms + 1_800_000));
+            for origin in [
+                "https://example.com",
+                "https://mail.example.com",
+                "https://docs.example.com:8443",
+                "http://docs.example.com",
+            ] {
+                assert!(
+                    !crate::agent_grants::GrantDemand::Browser {
+                        target: crate::agent_grants::BrowserTarget::AgentProfile,
+                        origin: origin.into(),
+                        severity: Severity::new(OBSERVE, false, false),
+                        hazards: Default::default(),
+                    }
+                    .covers(&row),
+                    "{origin}"
+                );
+            }
         }
     }
 

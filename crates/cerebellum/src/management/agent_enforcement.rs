@@ -63,7 +63,13 @@ impl ManagementPlane {
             return BrowserGrantSettlement::UnrecognizedAnswer;
         }
         let subjects = match choice {
-            BrowserGrantChoice::SiteThirtyMinutes | BrowserGrantChoice::OriginAlways => pending
+            BrowserGrantChoice::SiteThirtyMinutes => pending
+                .authorized_origins
+                .iter()
+                .cloned()
+                .map(GrantSubject::Origin)
+                .collect(),
+            BrowserGrantChoice::OriginAlways => pending
                 .authorized_origins
                 .iter()
                 .cloned()
