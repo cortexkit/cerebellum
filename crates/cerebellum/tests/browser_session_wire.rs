@@ -4754,8 +4754,10 @@ async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_snapsh
         "a refused snapshot still reached the capture: {:?}",
         launcher.effects.lock().unwrap()
     );
+    // The refusal ring is durable, so it keeps only the page's origin, never
+    // its path or query.
     let moved = (
-        "https://attacker.example:8443/moved".to_string(),
+        "https://attacker.example:8443".to_string(),
         "no_grant".to_string(),
     );
     assert_eq!(refusal_records(&planes).await, [moved.clone(), moved]);
@@ -4885,7 +4887,7 @@ async fn a_navigation_that_commits_during_a_read_discards_the_capture() {
         records
             .iter()
             .filter(
-                |(addressing, reason)| addressing == "https://attacker.example:8443/mid-read"
+                |(addressing, reason)| addressing == "https://attacker.example:8443"
                     && reason == "page_navigated_during_read"
             )
             .count(),
