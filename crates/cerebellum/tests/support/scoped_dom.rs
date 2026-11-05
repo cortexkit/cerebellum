@@ -1,6 +1,7 @@
 //! Scripted protocol peer for scoped snapshot contexts. This emulates remote
 //! node handles and DOM.describeNode; it does not execute the runtime helper.
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct ScopedDom {
@@ -8,6 +9,10 @@ pub struct ScopedDom {
     nodes: Vec<Value>,
     complete: bool,
     pub mutate_form_on_describe: Option<u64>,
+    pub collected: HashMap<u64, Value>,
+    metadata: Option<Value>,
+    pub close_shadow_on_target: Option<u64>,
+    pub closed_host: Option<u64>,
 }
 
 impl ScopedDom {
@@ -41,6 +46,28 @@ impl ScopedDom {
                 Some(json!({"object":{"objectId":"scoped-target"}}))
             }
             "Runtime.callFunctionOn" if params["objectId"] == "scoped-target" => {
+                self.metadata = None;
+                if let Some(context) = self.collected.get(&self.target) {
+                    if let Some(error) = context["error"].as_str() {
+                        return Some(json!({"exceptionDetails":{"text":error}}));
+                    }
+                    self.nodes = context["backends"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|backend| {
+                            dom["nodes"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|node| node["backendNodeId"] == *backend)
+                                .unwrap()
+                                .clone()
+                        })
+                        .collect();
+                    self.metadata = Some(context["metadata"].clone());
+                    return Some(json!({"result":{"objectId":"scoped-context"}}));
+                }
                 let mut all = dom["nodes"].as_array().cloned().unwrap_or_default();
                 let pierced = all
                     .iter()
@@ -92,6 +119,8 @@ impl ScopedDom {
                 if global {
                     self.nodes = all;
                 }
+                self.nodes
+                    .retain(|node| matches!(node["nodeType"].as_u64(), Some(1 | 3 | 9 | 11)));
                 self.complete = global;
                 if self.nodes.len() > 256 {
                     return Some(json!({"exceptionDetails":{"text":"context bound"}}));
@@ -108,8 +137,10 @@ impl ScopedDom {
                         })
                     })
                     .collect::<Vec<_>>();
+                let metadata = self.metadata.clone().unwrap_or_else(|| json!({"parents":parents,"complete":self.complete,"childCounts":self.nodes.iter().map(|n| n["childNodeCount"].clone()).collect::<Vec<_>>(),"keys":self.nodes.iter().map(|node| node["backendNodeId"].clone()).collect::<Vec<_>>(),"slots":self.nodes.iter().map(|node| node["assignedSlot"]["backendNodeId"].clone()).collect::<Vec<_>>(),"facts":self.nodes}));
                 let mut properties = vec![
-                    json!({"name":"0","value":{"value":serde_json::to_string(&json!({"parents":parents,"complete":self.complete,"childCounts":self.nodes.iter().map(|n| n["childNodeCount"].clone()).collect::<Vec<_>>()})).unwrap()}}),
+                    json!({"name":"0","value":{"value":serde_json::to_string(&metadata).unwrap()}}),
+                    json!({"name":"state","value":{"objectId":"scoped-state"}}),
                 ];
                 properties.extend(self.nodes.iter().enumerate().map(|(i, _)| json!({"name":(i+1).to_string(),"value":{"objectId":format!("scoped-node-{i}")}})));
                 Some(json!({"result":properties}))
@@ -133,6 +164,12 @@ impl ScopedDom {
                         .as_array_mut()
                         .unwrap()
                         .extend([json!("form"), json!("login")]);
+                }
+                if self.close_shadow_on_target == Some(self.target)
+                    && self.closed_host == node["backendNodeId"].as_u64()
+                    && self.closed_host.is_some()
+                {
+                    node["shadowRoots"] = json!([{"nodeId":987654321,"backendNodeId":987654321,"nodeType":11,"nodeName":"#document-fragment","shadowRootType":"closed"}]);
                 }
                 Some(json!({"node":node}))
             }

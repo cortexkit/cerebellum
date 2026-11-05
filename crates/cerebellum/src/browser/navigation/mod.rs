@@ -6,6 +6,8 @@ mod fill;
 mod frames;
 mod scoped_dom;
 #[cfg(test)]
+mod scoped_dom_tests;
+#[cfg(test)]
 #[path = "../../../tests/support/scoped_dom.rs"]
 mod scoped_fixture;
 mod scroll;
@@ -359,6 +361,8 @@ pub struct CdpNavigationDriver<IO> {
     prefer_bulk_ax: bool,
     last_snapshot_timings: Option<SnapshotTimings>,
     snapshot_frame_owners: HashMap<String, u64>,
+    #[cfg(test)]
+    cache_snapshot_contexts: bool,
 }
 
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
@@ -391,6 +395,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             prefer_bulk_ax: true,
             last_snapshot_timings: None,
             snapshot_frame_owners: HashMap::new(),
+            #[cfg(test)]
+            cache_snapshot_contexts: true,
         }
     }
 
@@ -1036,7 +1042,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .and_then(Value::as_u64)
             .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.createIsolatedWorld"))?;
         let dom = self
-            .scoped_dom_context(attachment, identity, world, true, deadline, clock)
+            .scoped_dom_context(
+                attachment,
+                identity,
+                world,
+                true,
+                &mut scoped_dom::SnapshotDomCache::default(),
+                deadline,
+                clock,
+            )
             .map_err(|_| NavigationDriveError::CdpFailure.at_step("DOM.describeNode"))?;
         Ok(dom)
     }

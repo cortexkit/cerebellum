@@ -1,8 +1,14 @@
-function(limit, ancestorsOnly) {
+function(limit, ancestorsOnly, snapshotState) {
     // This function runs in an isolated world, not the page's JavaScript
-    // realm. Only DOM.describeNode supplies attributes and backend identities.
+    // realm. Native attribute reads are fresh for this call; CDP supplies the
+    // backend identities and the shadow details JavaScript cannot observe.
     const target = this;
     if (!target.isConnected) return null;
+    const state = snapshotState || {keys: new WeakMap(), next: 1};
+    const key = node => {
+        if (!state.keys.has(node)) state.keys.set(node, state.next++);
+        return state.keys.get(node);
+    };
     const parent = node => node.parentNode || (node.nodeType === 11 ? node.host : null);
     const nodes = [], seen = new Set();
     let global = false;
@@ -15,6 +21,7 @@ function(limit, ancestorsOnly) {
     const chain = node => {
         for (; node && !seen.has(node); node = parent(node)) {
             add(node);
+            if (node.assignedSlot) chain(node.assignedSlot);
             if (node.nodeType !== 1) continue;
             if (['input', 'form', 'label'].includes(node.localName) || node.hasAttribute('form')) global = true;
             // Relative activation destinations need the document's first base,
@@ -23,7 +30,6 @@ function(limit, ancestorsOnly) {
                 const value = node.getAttribute(attr);
                 if (value !== null && !/^[a-z][a-z0-9+.-]*:/i.test(value.trim()) && !value.trim().startsWith('//')) global = true;
             }
-            if (node.assignedSlot) chain(node.assignedSlot);
         }
     };
     chain(target);
@@ -73,5 +79,15 @@ function(limit, ancestorsOnly) {
         }
         return count;
     }) : [];
-    return [JSON.stringify({parents: nodes.map(node => indexes.get(parent(node)) ?? null), complete: global, childCounts}), ...nodes];
+    const facts = nodes.map(node => ({
+        nodeType: node.nodeType,
+        nodeName: node.nodeName,
+        localName: node.localName || '',
+        nodeValue: node.nodeValue || '',
+        ...(node.nodeType === 1 ? {attributes: Array.from(node.attributes, attr => [attr.name, attr.value]).flat()} : {})
+    }));
+    const result = [JSON.stringify({parents: nodes.map(node => indexes.get(parent(node)) ?? null), complete: global, childCounts,
+        keys: nodes.map(key), slots: nodes.map(node => node.assignedSlot ? key(node.assignedSlot) : null), facts}), ...nodes];
+    result.state = state;
+    return result;
 }

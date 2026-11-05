@@ -11,7 +11,7 @@ pub(super) struct ThreadPipe {
     dom_polls: usize,
     blocked: usize,
     pub(super) stall_ads: bool,
-    scoped: scoped_fixture::ScopedDom,
+    pub(super) scoped: scoped_fixture::ScopedDom,
     fail_flattened: bool,
     pub(super) requests: Vec<Value>,
     pub(super) markup: Option<String>,
@@ -576,6 +576,10 @@ fn scoped_reads_match_whole_document_classification_records() {
             )
             .unwrap();
         let actual = observation.refs[0].classification.as_ref().unwrap();
+        assert_eq!(
+            actual.login_field, expected.login_field,
+            "backend {backend}: exact login ordinals are not part of record serialization"
+        );
         assert_eq!(
             serde_json::to_value(actual).unwrap(),
             serde_json::to_value(expected).unwrap(),
