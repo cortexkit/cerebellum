@@ -4,6 +4,15 @@ mod classification_golden;
 mod classification_index;
 mod fill;
 mod frames;
+mod scoped_dom;
+#[cfg(test)]
+mod scoped_dom_tests;
+#[cfg(test)]
+#[path = "../../../tests/support/scoped_dom.rs"]
+mod scoped_fixture;
+mod scoped_reads;
+mod scoped_snapshot;
+mod scoped_ua;
 mod scroll;
 mod typing;
 pub use capture::SnapshotTimings;
@@ -367,6 +376,9 @@ pub struct CdpNavigationDriver<IO> {
     downloads_denied: bool,
     prefer_bulk_ax: bool,
     last_snapshot_timings: Option<SnapshotTimings>,
+    snapshot_frame_owners: HashMap<String, u64>,
+    #[cfg(test)]
+    cache_snapshot_contexts: bool,
 }
 
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
@@ -398,6 +410,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             downloads_denied: false,
             prefer_bulk_ax: true,
             last_snapshot_timings: None,
+            snapshot_frame_owners: HashMap::new(),
+            #[cfg(test)]
+            cache_snapshot_contexts: true,
         }
     }
 
@@ -1025,6 +1040,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
     fn zoom_dom_before<C: NavigationClock>(
         &mut self,
         attachment: &AttachedTarget,
+        identity: &BackendNodeIdentity,
         deadline: Instant,
         clock: &mut C,
     ) -> Result<Map<String, Value>, NavigationDriveError> {
@@ -1036,19 +1052,23 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             None,
             clock,
         )?;
-        self.command(
-            "DOM.getFlattenedDocument",
-            Some(
-                serde_json::json!({"depth":-1,"pierce":true})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
-            Some(attachment.session_id.clone()),
-            deadline,
-            None,
-            clock,
-        )
+        let world = self.command("Page.createIsolatedWorld", Some(serde_json::json!({"frameId":identity.frame_id,"worldName":"ck-snapshot-classification"}).as_object().unwrap().clone()), Some(attachment.session_id.clone()), snapshot_step_deadline(deadline, true, clock.now()), None, clock)?;
+        let world = world
+            .get("executionContextId")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.createIsolatedWorld"))?;
+        let dom = self
+            .scoped_dom_context(
+                attachment,
+                identity,
+                world,
+                true,
+                &mut scoped_dom::SnapshotDomCache::default(),
+                deadline,
+                clock,
+            )
+            .map_err(|_| NavigationDriveError::CdpFailure.at_step("DOM.describeNode"))?;
+        Ok(dom)
     }
 
     fn flattened_dom_nodes_before<C: NavigationClock>(
@@ -1083,6 +1103,22 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         )?;
         if response.error.is_some() {
             return Ok(Err(ClassificationUnavailable::FlattenedDocumentRefused));
+        }
+        if let Some(nodes) = response
+            .result
+            .as_ref()
+            .and_then(|r| r.get("nodes"))
+            .and_then(Value::as_array)
+        {
+            for node in nodes {
+                if matches!(node["localName"].as_str(), Some("iframe" | "frame")) {
+                    if let (Some(frame), Some(backend)) =
+                        (node["frameId"].as_str(), node["backendNodeId"].as_u64())
+                    {
+                        self.snapshot_frame_owners.insert(frame.into(), backend);
+                    }
+                }
+            }
         }
         Ok(response
             .result
@@ -1998,6 +2034,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             attachment.session_id = frame.session_id.clone();
         }
         self.last_snapshot_timings = None;
+        self.snapshot_frame_owners.clear();
         let mut timings = SnapshotTimings::default();
         let ax_started = Instant::now();
         let ax_phase = crate::budgets::PhaseDeadline::new(
@@ -2112,7 +2149,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             })
             .map(|identity| identity.backend_node_id)
             .collect();
+        let skipped_embedded = std::cell::Cell::new(false);
         let mask_ax = |node: &mut RawAxNode| {
+            // Embedded documents are captured by the frame walker under their
+            // own origin. Fetching untagged iframe children here can stall the
+            // requested main-document subtree before its siblings are read.
+            if node.role.eq_ignore_ascii_case("iframe") && !node.child_ids.is_empty() {
+                node.child_ids.clear();
+                skipped_embedded.set(true);
+            }
             if node
                 .backend_node_id
                 .is_some_and(|id| protected.contains(&id))
@@ -2138,8 +2183,6 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         } else {
             None
         };
-        let mut early_dom = None;
-        let mut early_zoom_dom = None;
         let mut observation = if let Some(observation) = bulk {
             observation
         } else {
@@ -2162,28 +2205,6 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         None,
                         clock,
                     );
-                    // Keep one batch of observed children even if the DOM never
-                    // answers. Read classification before walking any of their
-                    // subtrees: ad/child stalls must not spend the DOM's time.
-                    // The DOM shares the frame's remaining absolute allowance,
-                    // not a fresh step or a fixed fraction of that allowance.
-                    if early_dom.is_none()
-                        && (classification_context.is_some()
-                            || mode == SnapshotKind::Actionable
-                            || (mode == SnapshotKind::DomFull && subtree.is_some()))
-                    {
-                        let dom_started = Instant::now();
-                        early_dom = Some(if mode == SnapshotKind::DomFull && subtree.is_some() {
-                            let dom = self.zoom_dom_before(&attachment, deadline, clock)?;
-                            let nodes = parse_flattened_dom_nodes(&dom);
-                            early_zoom_dom = Some(dom);
-                            nodes
-                        } else {
-                            self.flattened_dom_nodes_before(&attachment, deadline, clock)
-                                .unwrap_or(Err(ClassificationUnavailable::DomReadFailed))
-                        });
-                        timings.dom_read_ms += dom_started.elapsed().as_millis();
-                    }
                     let result = result?;
                     let mut nodes = required_ax_nodes(&result)
                         .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))?;
@@ -2196,98 +2217,38 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .map_err(|error| error.at_step("Accessibility.getChildAXNodes"))?
         };
 
+        if skipped_embedded.get() {
+            observation.ax_truncated = true;
+            observation.refs_truncated = true;
+        }
         timings.ax_ms = ax_started
             .elapsed()
             .as_millis()
             .saturating_sub(timings.dom_read_ms);
         let dom_started = Instant::now();
-        let zoom_dom = if let Some(dom) = early_zoom_dom {
-            Some(dom)
-        } else if mode == SnapshotKind::DomFull && subtree.is_some() {
-            Some(self.zoom_dom_before(&attachment, deadline, clock)?)
-        } else {
-            None
-        };
-        // A structural AX cut says nothing about the DOM's availability. Capture
-        // real form facts even for a partial outline, since filters can expose
-        // any of its refs. An unrelated child timeout cannot supply or erase
-        // those facts; only the DOM read determines each ref's classification.
-        let snapshot_dom = if let Some(dom) = &zoom_dom {
-            Some(parse_flattened_dom_nodes(dom))
-        } else if let Some(dom) = early_dom {
-            Some(dom)
-        } else if classification_context.is_some() || mode == SnapshotKind::Actionable {
+        let zoom_dom = if mode == SnapshotKind::DomFull && subtree.is_some() {
             Some(
-                self.flattened_dom_nodes_before(&attachment, deadline, clock)
-                    .unwrap_or(Err(ClassificationUnavailable::DomReadFailed)),
+                self.zoom_dom_before(
+                    &attachment,
+                    subtree
+                        .and_then(|r| r.backend_identity.as_ref())
+                        .ok_or(NavigationDriveError::CdpFailure)?,
+                    deadline,
+                    clock,
+                )?,
             )
         } else {
             None
         };
         timings.dom_read_ms += dom_started.elapsed().as_millis();
-        let classification_started = Instant::now();
-        if let Some((document_epoch, document_url)) = classification_context {
-            // One DOM read serves every ref. A failure here leaves each ref
-            // with the same named reason rather than failing the snapshot:
-            // the refs are still observable, only their form facts are not.
-            let projection = document_origin(document_url).and_then(|origin| {
-                snapshot_dom
-                    .as_ref()
-                    .expect("classification requested DOM")
-                    .as_ref()
-                    .map(|nodes| (origin, nodes))
-                    .map_err(Clone::clone)
-            });
-            match projection {
-                Ok((origin, nodes)) => {
-                    classify_refs(&mut observation.refs, nodes, document_epoch, &origin)
-                }
-                Err(reason) => {
-                    for reference in &mut observation.refs {
-                        if reference.backend_identity.is_some() {
-                            reference.classification = Err(reason.clone());
-                        }
-                    }
-                }
-            }
-            for reference in &observation.refs {
-                if let Err(reason) = &reference.classification {
-                    observation
-                        .facts
-                        .entry(reference.captured.reference.clone())
-                        .or_default()
-                        .classification_unavailable = Some(reason.reason_code());
-                }
-            }
-        }
-
-        timings.classification_ms = classification_started.elapsed().as_millis();
-        let facts_started = Instant::now();
-        if mode == SnapshotKind::Actionable {
-            // Without the DOM the page text still prints every element; it
-            // only loses field values and placeholders, which stay withheld.
-            if let Some(nodes) = snapshot_dom
-                .as_ref()
-                .and_then(|result| result.as_ref().ok())
-            {
-                collect_dom_facts(
-                    &mut observation,
-                    nodes,
-                    classification_context.map(|(_, url)| url),
-                );
-            }
-        }
-        timings.dom_facts_ms = facts_started.elapsed().as_millis();
         let body_started = Instant::now();
         if mode == SnapshotKind::DomFull {
             if let (Some(reference), Some(dom)) = (subtree, zoom_dom.as_ref()) {
                 let backend = root_backend_id.ok_or_else(|| {
                     NavigationDriveError::CdpFailure.at_step("Accessibility.getPartialAXTree")
                 })?;
-                let (backend, kind) =
-                    super::zoom::enclosing_element(dom, backend).map_err(|_| {
-                        NavigationDriveError::CdpFailure.at_step("DOM.getFlattenedDocument")
-                    })?;
+                let (backend, kind) = super::zoom::enclosing_element(dom, backend)
+                    .map_err(|_| NavigationDriveError::CdpFailure.at_step("DOM.describeNode"))?;
                 let markup = self.masked_outer_html(
                     &attachment,
                     serde_json::json!({"backendNodeId":backend}),
@@ -2366,6 +2327,49 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         }
 
         timings.body_ms = body_started.elapsed().as_millis();
+        // Requested content (including DOM-full markup) precedes optional
+        // classification. Failed context reads mark only the affected refs
+        // unavailable for clicks and typing.
+        let dom_started = Instant::now();
+        let classification_before = timings.classification_ms;
+        let nodes = if classification_context.is_some() || mode == SnapshotKind::Actionable {
+            self.snapshot_dom(
+                &mut observation,
+                &attachment,
+                classification_context,
+                &mut timings,
+                deadline,
+                clock,
+            )
+        } else {
+            Vec::new()
+        };
+        timings.dom_read_ms += dom_started
+            .elapsed()
+            .as_millis()
+            .saturating_sub(timings.classification_ms - classification_before);
+        let classification_started = Instant::now();
+        if classification_context.is_some() {
+            for reference in &observation.refs {
+                if let Err(reason) = &reference.classification {
+                    observation
+                        .facts
+                        .entry(reference.captured.reference.clone())
+                        .or_default()
+                        .classification_unavailable = Some(reason.reason_code());
+                }
+            }
+        }
+        timings.classification_ms += classification_started.elapsed().as_millis();
+        let facts_started = Instant::now();
+        if mode == SnapshotKind::Actionable {
+            collect_dom_facts(
+                &mut observation,
+                &nodes,
+                classification_context.map(|(_, url)| url),
+            );
+        }
+        timings.dom_facts_ms = facts_started.elapsed().as_millis();
         self.last_snapshot_timings = Some(timings);
         Ok(observation)
     }
@@ -5444,6 +5448,26 @@ mod tests {
         driver
     }
 
+    fn scoped_driver(
+        frames: impl IntoIterator<Item = Value>,
+    ) -> CdpNavigationDriver<super::large_page_tests::ThreadPipe> {
+        let mut ax = Vec::new();
+        let mut dom = json!({"nodes":[]});
+        for frame in frames {
+            if frame["result"]["node"]["ignored"].is_boolean() {
+                ax.push(frame["result"]["node"].clone());
+            }
+            if let Some(nodes) = frame["result"]["nodes"].as_array() {
+                if nodes.first().is_some_and(|n| n["ignored"].is_boolean()) {
+                    ax.extend(nodes.clone());
+                } else {
+                    dom = frame["result"].clone();
+                }
+            }
+        }
+        super::large_page_tests::driver_with_dom(ax, dom)
+    }
+
     #[test]
     fn zoom_child_read_obeys_the_cdp_step_cap_and_retains_a_truncated_subtree() {
         let reference = RefRecord {
@@ -5552,7 +5576,7 @@ mod tests {
             ("password", "current-password", Some("credential_field")),
             ("text", "cc-number", Some("payment_field")),
         ] {
-            let mut driver = attached_driver([
+            let mut driver = scoped_driver([
                 json!({"id":1,"sessionId":"session-own","result":{}}),
                 json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","Form", &["field"],1,Some("frame-own"))}}),
                 json!({"id":3,"sessionId":"session-own","result":{"nodes":[ax_node("field","textbox","Field", &children,3,None)]}}),
@@ -5595,8 +5619,7 @@ mod tests {
             {"nodeId":2,"backendNodeId":60,"parentId":1,"nodeType":1,"localName":"button","attributes":["type","button"]},
             {"nodeId":3,"backendNodeId":70,"parentId":1,"nodeType":1,"localName":"iframe","attributes":[]},
         ]});
-        let mut driver = attached_driver([]);
-        driver.pipe = FakePipe::on_write_frames([
+        let mut driver = scoped_driver([
             json!({"id":1,"sessionId":"session-own","result":{}}),
             json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","Thread", &["button","ad"],1,Some("frame-main"))}}),
             json!({"id":3,"sessionId":"session-own","result":{"nodes":[
@@ -5605,8 +5628,8 @@ mod tests {
             ]}}),
             json!({"id":4,"sessionId":"session-own","result":{}}),
             json!({"id":5,"sessionId":"session-own","result":dom}),
-            // Command 6, the ad's child read, never answers.
         ]);
+        driver.pipe.stall_ads = true;
         let mut clock = FakeClock::new();
         let started = clock.now();
         let observation = driver
@@ -5723,7 +5746,6 @@ mod tests {
         let mut driver = attached_driver([
             json!({"id":1,"sessionId":"session-own","result":{}}),
             json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","Huge", &children,1,Some("frame-own"))}}),
-            json!({"id":3,"sessionId":"session-own","result":{}}),
         ]);
         let mut clock = FakeClock::new();
         let start = clock.now();
@@ -5740,7 +5762,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             clock.now().duration_since(start),
-            Duration::from_millis(120_000)
+            Duration::from_millis(crate::budgets::CDP_STEP_MS)
         );
         assert!(observation.ax_truncated && observation.refs_truncated);
         assert_eq!(
@@ -6516,31 +6538,60 @@ mod tests {
     /// form, captured from headless Chrome by `examples/classify_live.rs`.
     const LOOPBACK_CAPTURE: &str = include_str!("../fixtures/loopback_flattened_document.json");
 
-    /// Drive the production snapshot path over an AX tree of a root (backend
-    /// 10) and one button (backend 60, ref `e2`) in `frame-main`, answering the
-    /// DOM reads with `dom_frames`.
+    /// Project legacy flattened-capture failures onto refs for the refusal
+    /// matrix. The CortexKit Chrome extension still supplies this shape on the
+    /// person's-Chrome path; scoped owned-browser
+    /// reads have separate protocol and parity coverage.
     fn snapshot_refs(dom_frames: Vec<Value>, context: Option<(u64, &str)>) -> Vec<RefRecord> {
-        let mut frames = vec![
-            json!({"id":1,"sessionId":"session-own","result":{}}),
-            json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","Login", &["button"], 10, Some("frame-main"))}}),
-            json!({"id":3,"sessionId":"session-own","result":{"nodes":[
-                ax_node("button","button","Sign in", &[], 60, None),
-            ]}}),
-        ];
-        frames.extend(dom_frames);
-        let mut driver = attached_driver(frames);
-        driver
-            .snapshot_with_clock(
-                "route-own",
-                SnapshotKind::Ax,
-                1_000,
-                context,
-                None,
+        let root = RawAxNode::from_value(&ax_node(
+            "root",
+            "RootWebArea",
+            "Login",
+            &["button"],
+            10,
+            Some("frame-main"),
+        ))
+        .unwrap();
+        let mut refs = traverse_ax_tree(root, "target-own", MAX_AX_NODES, MAX_AX_DEPTH, |_, _| {
+            Ok(vec![RawAxNode::from_value(&ax_node(
+                "button",
+                "button",
+                "Sign in",
                 &[],
-                &mut FakeClock::new(),
-            )
-            .expect("the AX tree is coherent")
-            .refs
+                60,
+                None,
+            ))
+            .unwrap()])
+        })
+        .unwrap()
+        .refs;
+        if let Some((epoch, url)) = context {
+            let projection = document_origin(url).and_then(|origin| {
+                if dom_frames.first().is_some_and(|f| f.get("error").is_some()) {
+                    return Err(ClassificationUnavailable::DomEnableRefused);
+                }
+                let dom = dom_frames
+                    .get(1)
+                    .ok_or(ClassificationUnavailable::DomReadFailed)?;
+                if dom.get("error").is_some() {
+                    return Err(ClassificationUnavailable::FlattenedDocumentRefused);
+                }
+                let dom = dom
+                    .get("result")
+                    .and_then(Value::as_object)
+                    .ok_or(ClassificationUnavailable::FlattenedNodesMissing)?;
+                parse_flattened_dom_nodes(dom).map(|nodes| (origin, nodes))
+            });
+            match projection {
+                Ok((origin, nodes)) => classify_refs(&mut refs, &nodes, epoch, &origin),
+                Err(reason) => {
+                    for reference in &mut refs {
+                        reference.classification = Err(reason.clone());
+                    }
+                }
+            }
+        }
+        refs
     }
 
     fn dom_enabled() -> Value {
@@ -7071,7 +7122,7 @@ mod tests {
                 flattened_dom_node(4, Some(2), 60, "button", &["type", "submit"]),
             ]}}),
         ];
-        let mut driver = attached_driver(frames);
+        let mut driver = scoped_driver(frames);
         let observation = driver
             .snapshot_with_clock(
                 "route-own",
@@ -8050,20 +8101,6 @@ mod tests {
             }
             value
         };
-        let mut frames = vec![
-            json!({"id":1,"sessionId":"session-own","result":{}}),
-            json!({"id":2,"sessionId":"session-own","result":{"node":ax(0)}}),
-        ];
-        let mut child_replies = nodes
-            .iter()
-            .filter(|(_, _, children)| !children.is_empty())
-            .map(|(_, _, children)| {
-                let replies: Vec<Value> = children.iter().map(|child| ax(*child)).collect();
-                json!({"sessionId":"session-own","result":{"nodes":replies}})
-            });
-        // Classification follows the first observed child batch, before any
-        // deeper AX walk. Keep the fixture's replies in that protocol order.
-        frames.extend(child_replies.next());
         let dom: Vec<Value> = nodes
             .iter()
             .enumerate()
@@ -8083,24 +8120,20 @@ mod tests {
                 )
             })
             .collect();
-        let id = frames.len() + 1;
-        frames.push(json!({"id":id,"sessionId":"session-own","result":{}}));
-        frames.push(json!({"id":id + 1,"sessionId":"session-own","result":{"nodes":dom}}));
-        frames.extend(child_replies);
-        for (index, reply) in frames.iter_mut().enumerate() {
-            reply["id"] = json!(index + 1);
-        }
-        let observation = attached_driver(frames)
-            .snapshot_with_clock(
-                "route-own",
-                SnapshotKind::Actionable,
-                1000,
-                Some((7, &url)),
-                None,
-                &[],
-                &mut FakeClock::new(),
-            )
-            .unwrap();
+        let observation = super::large_page_tests::driver_with_dom(
+            (0..nodes.len()).map(ax).collect(),
+            json!({"nodes":dom}),
+        )
+        .snapshot_with_clock(
+            "route-own",
+            SnapshotKind::Actionable,
+            1000,
+            Some((7, &url)),
+            None,
+            &[],
+            &mut FakeClock::new(),
+        )
+        .unwrap();
         (observation, url)
     }
 
@@ -8905,13 +8938,18 @@ mod tests {
             raw_name: None,
             classification: Err(ClassificationUnavailable::NotCaptured),
         };
-        let mut driver = attached_driver([
-            json!({"id":1,"sessionId":"session-own","result":{}}),
-            json!({"id":2,"sessionId":"session-own","result":{"nodes":[ax_node("key","StaticText","event", &[], 5, Some("frame-own"))]}}),
-            json!({"id":3,"sessionId":"session-own","result":{}}),
-            json!({"id":4,"sessionId":"session-own","result":crate::browser::zoom::key_value_fixture()}),
-            json!({"id":5,"sessionId":"session-own","result":{"outerHTML":markup}}),
-        ]);
+        let mut driver = super::large_page_tests::driver_with_dom(
+            vec![ax_node(
+                "key",
+                "StaticText",
+                "event",
+                &[],
+                5,
+                Some("frame-own"),
+            )],
+            Value::Object(crate::browser::zoom::key_value_fixture()),
+        );
+        driver.pipe.markup = Some(markup.to_owned());
         let observation = driver
             .snapshot_with_clock(
                 "route-own",
@@ -8928,12 +8966,12 @@ mod tests {
             format!("e2640 is a text node; showing its enclosing element\n{markup}")
         );
         assert_eq!(
-            driver.pipe.writes.last().unwrap()["params"],
+            driver.pipe.requests.last().unwrap()["params"],
             json!({"backendNodeId":3})
         );
         assert!(!driver
             .pipe
-            .writes
+            .requests
             .iter()
             .any(|command| command["method"] == "DOM.querySelector"));
         assert_eq!(

@@ -456,12 +456,32 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             for reference in &mut observation.refs {
                 reference.frame_document = Some(main.clone());
             }
+            let mut captured_owners = self.snapshot_frame_owners.clone();
             for (frame_index, frame) in before
                 .iter()
                 .enumerate()
                 .filter(|(_, f)| f.parent_id.is_some())
             {
                 if frame.frame_id == main.frame_id || omitted_frames.contains(&frame.frame_id) {
+                    continue;
+                }
+                // Being a descendant of the main *document* does not put a
+                // frame inside the selected container. Scoped DOM descriptions
+                // identify the owners actually captured by this zoom, without
+                // querying unrelated advertisement renderers.
+                let unknown_owners = observation.refs.iter().any(|r| {
+                    r.captured.role.eq_ignore_ascii_case("iframe")
+                        && r.backend_identity.as_ref().is_some_and(|i| {
+                            !captured_owners
+                                .values()
+                                .any(|backend| *backend == i.backend_node_id)
+                        })
+                });
+                if subtree.is_some()
+                    && !unknown_owners
+                    && !captured_owners.contains_key(&frame.frame_id)
+                {
+                    omitted_frames.insert(frame.frame_id.clone());
                     continue;
                 }
                 if frame
@@ -502,20 +522,32 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .as_object()
                     .unwrap()
                     .clone();
-                let owner = match self.command_response(
-                    "DOM.getFrameOwner",
-                    Some(params),
-                    Some(parent.session_id.clone()),
-                    frame_deadline,
-                    None,
-                    None,
-                    clock,
-                ) {
-                    Ok(response) if response.error.is_none() => response.result,
-                    Ok(_) | Err(NavigationDriveError::CommandDeadline { .. }) => None,
-                    // A bad envelope or disconnected transport is not confined
-                    // to one frame. Preserve its producing step and fail closed.
-                    Err(error) => return Err(error),
+                let owner = if let Some(backend) = captured_owners
+                    .get(&frame.frame_id)
+                    .filter(|_| subtree.is_some())
+                {
+                    Some(
+                        serde_json::json!({"backendNodeId":backend})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    )
+                } else {
+                    match self.command_response(
+                        "DOM.getFrameOwner",
+                        Some(params),
+                        Some(parent.session_id.clone()),
+                        frame_deadline,
+                        None,
+                        None,
+                        clock,
+                    ) {
+                        Ok(response) if response.error.is_none() => response.result,
+                        Ok(_) | Err(NavigationDriveError::CommandDeadline { .. }) => None,
+                        // A bad envelope or disconnected transport is not confined
+                        // to one frame. Preserve its producing step and fail closed.
+                        Err(error) => return Err(error),
+                    }
                 };
                 let Some(backend) = owner
                     .as_ref()
@@ -593,20 +625,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     {
                         return Err(error)
                     }
-                    Ok(child)
-                        if !child.ax_truncated
-                            && !child.refs_truncated
-                            && !child.refs.iter().any(|r| {
-                                matches!(
-                                    r.classification,
-                                    Err(ClassificationUnavailable::DomReadFailed
-                                        | ClassificationUnavailable::DomEnableRefused
-                                        | ClassificationUnavailable::FlattenedDocumentRefused)
-                                )
-                            }) =>
-                    {
-                        child
-                    }
+                    // Optional classification cannot erase a complete,
+                    // authorized AX document. Unknown refs retain their own
+                    // reasons and remain unusable for input.
+                    Ok(child) if !child.ax_truncated && !child.refs_truncated => child,
                     _ => {
                         mark_unread_frame(
                             &mut observation,
@@ -618,6 +640,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         continue;
                     }
                 };
+                captured_owners.extend(self.snapshot_frame_owners.clone());
                 let remaining_nodes = MAX_AX_NODES.saturating_sub(observation.records.len());
                 if child.records.len() > remaining_nodes {
                     child.records.truncate(remaining_nodes);
@@ -1083,6 +1106,7 @@ mod tests {
         requests: Vec<Value>,
         huge_page: bool,
         stalled_method: Option<&'static str>,
+        scoped: scoped_fixture::ScopedDom,
     }
     fn ax(
         id: &str,
@@ -1108,7 +1132,12 @@ mod tests {
             let method = request["method"].as_str().unwrap();
             let cross = session == "cross-session";
             self.requests.push(request.clone());
-            if self.stalled_method == Some(method) && (method == "DOM.getFrameOwner" || cross) {
+            if (self.stalled_method == Some(method)
+                || (self.stalled_method == Some("DOM.getFlattenedDocument")
+                    && method == "Runtime.callFunctionOn"
+                    && scoped_fixture::ScopedDom::handles(&request)))
+                && (method == "DOM.getFrameOwner" || cross)
+            {
                 return Ok(());
             }
             if method == "Input.dispatchMouseEvent" {
@@ -1127,7 +1156,24 @@ mod tests {
             {
                 self.changed = true;
             }
+            let mut scoped_dom = if cross {
+                json!({"nodes":[dom(30,0,"#document",vec![]),dom(31,30,"form",vec!["id","payment"]),dom(32,31,"input",vec!["autocomplete","cc-number"]),dom(33,31,"button",vec!["type","submit"])]})
+            } else {
+                json!({"nodes":[dom(1,0,"#document",vec![]),dom(10,1,"iframe",vec![]),dom(11,1,"iframe",vec![]),dom(20,10,"#document",vec![]),dom(21,20,"button",vec!["type","button"])]})
+            };
+            if !cross {
+                scoped_dom["nodes"][1]["frameId"] = json!("same");
+                scoped_dom["nodes"][2]["frameId"] = json!("cross");
+            }
             let result = match method {
+                "DOM.getFlattenedDocument"
+                    if cross && self.stalled_method == Some("Runtime.callFunctionOn") =>
+                {
+                    json!({})
+                }
+                _ if scoped_fixture::ScopedDom::handles(&request) => {
+                    self.scoped.answer(&request, &scoped_dom).unwrap()
+                }
                 "Target.createTarget" => json!({"targetId":"target"}),
                 "Target.attachToTarget" => json!({"sessionId":"main-session"}),
                 "Target.setAutoAttach" if !cross => {
@@ -1194,7 +1240,9 @@ mod tests {
                 "DOM.getNodeForLocation" => {
                     json!({"backendNodeId":if cross {33} else {11},"frameId":if cross {"cross"} else {"main"}})
                 }
-                "DOM.getContentQuads" => json!({"quads":[[320.,0.,620.,0.,620.,100.,320.,100.]]}),
+                "DOM.getContentQuads" => {
+                    json!({"quads":[[320.,0.,620.,0.,620.,100.,320.,100.]]})
+                }
                 "DOM.getBoxModel" => {
                     json!({"model":{"content":[320.,0.,620.,0.,620.,100.,320.,100.]}})
                 }
@@ -1256,6 +1304,7 @@ mod tests {
                 requests: Vec::new(),
                 huge_page: false,
                 stalled_method: None,
+                scoped: scoped_fixture::ScopedDom::default(),
             },
             CdpTransport::new(),
             CdpFrameDecoder::default(),
@@ -1349,12 +1398,12 @@ mod tests {
     }
 
     #[test]
-    fn stalled_frame_ax_or_dom_read_omits_only_that_document() {
+    fn stalled_frame_reads_preserve_content_and_disclose_missing_facts() {
         for method in [
             "Accessibility.getRootAXNode",
             "Accessibility.getChildAXNodes",
             "DOM.enable",
-            "DOM.getFlattenedDocument",
+            "Runtime.callFunctionOn",
         ] {
             let (mut driver, frames) = fixture();
             driver.pipe.stalled_method = Some(method);
@@ -1376,27 +1425,48 @@ mod tests {
                 observation.records.iter().any(|r| r.name == "Same button"),
                 "{method}"
             );
-            assert!(
-                observation
-                    .records
-                    .iter()
-                    .any(|r| r.name.contains("frame cross unread")),
-                "{method}"
-            );
-            assert!(
-                !observation
-                    .records
-                    .iter()
-                    .any(|r| r.name == "Card number" || r.name == "Pay"),
-                "{method}"
-            );
-            assert!(
-                observation
+            if method.starts_with("Accessibility.") {
+                assert!(
+                    observation
+                        .records
+                        .iter()
+                        .any(|r| r.name.contains("frame cross unread")),
+                    "{method}"
+                );
+                assert!(
+                    !observation
+                        .records
+                        .iter()
+                        .any(|r| r.name == "Card number" || r.name == "Pay"),
+                    "{method}"
+                );
+                assert!(
+                    observation
+                        .refs
+                        .iter()
+                        .all(|r| r.frame_document.as_ref().unwrap().frame_id != "cross"),
+                    "{method}"
+                );
+            } else {
+                assert!(
+                    observation.records.iter().any(|r| r.name == "Card number"),
+                    "{method}"
+                );
+                let card = observation
                     .refs
                     .iter()
-                    .all(|r| r.frame_document.as_ref().unwrap().frame_id != "cross"),
-                "{method}"
-            );
+                    .find(|r| r.captured.name == "Card number")
+                    .unwrap();
+                assert_eq!(
+                    card.classification,
+                    Err(ClassificationUnavailable::DomReadFailed),
+                    "{method}"
+                );
+                assert_eq!(
+                    observation.facts[&card.captured.reference].classification_unavailable,
+                    Some("dom_read_failed")
+                );
+            }
             assert!(
                 observation
                     .refs
@@ -1414,6 +1484,47 @@ mod tests {
             );
             assert_eq!(driver.transport.pending_len(), 0);
         }
+    }
+
+    #[test]
+    fn main_document_zoom_does_not_wait_for_unrelated_frame_owners() {
+        let (mut driver, frames) = fixture();
+        driver.pipe.huge_page = true;
+        driver.pipe.stalled_method = Some("DOM.getFrameOwner");
+        driver.pipe.requests.clear();
+        driver.set_read_frames(frames.clone());
+        let main = frames
+            .iter()
+            .find(|frame| frame.frame_id == "main")
+            .unwrap();
+        let selected = reference(main, 20_009);
+        let mut clock = super::super::tests::FakeClock::new();
+        let start = clock.now();
+        let observation = driver
+            .snapshot_with_clock(
+                "isolated-fixture",
+                SnapshotKind::Actionable,
+                30_000,
+                Some((7, &main.url)),
+                Some(&selected),
+                &[],
+                &mut clock,
+            )
+            .unwrap();
+        println!(
+            "main-document zoom with silent ad owners: elapsed={:?}, timings={:?}",
+            clock.now().duration_since(start),
+            driver.last_snapshot_timings()
+        );
+        assert_eq!(observation.records.len(), 1);
+        assert_eq!(observation.records[0].name, "Event 19999");
+        assert!(!driver
+            .pipe
+            .requests
+            .iter()
+            .any(|request| request["method"] == "DOM.getFrameOwner"));
+        assert_eq!(clock.now().duration_since(start), Duration::ZERO);
+        assert_eq!(driver.transport.pending_len(), 0);
     }
 
     #[test]

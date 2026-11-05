@@ -45,5 +45,7 @@ mod tests_never_headed;
 
 mod browser_fill_login;
 mod browser_focus;
+#[path = "../support/scoped_dom.rs"]
+mod scoped_fixture;
 
 mod tool_catalog;
