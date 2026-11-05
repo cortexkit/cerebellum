@@ -515,6 +515,13 @@ where
             state = DurableState::fresh();
             storage.save(&state).map_err(BindingError::Storage)?;
         }
+        // Older writers did not charge the terminal feed. Apply the same
+        // retention policy on reopen before copying that history on each write.
+        let before = state.clone();
+        make_room(&mut state, 0, config);
+        if state != before {
+            storage.save(&state).map_err(BindingError::Storage)?;
+        }
         Ok(Self {
             codec,
             redactor,
@@ -1209,11 +1216,8 @@ where
         if active > config.journal_retention_bytes {
             return Err(JournalError::ReservationFailed);
         }
-        while retained_bytes(&candidate) > config.journal_retention_bytes {
-            let Some(sequence) = candidate.entries.keys().next().copied() else {
-                return Err(JournalError::ReservationFailed);
-            };
-            candidate.entries.remove(&sequence);
+        if !make_room(&mut candidate, 0, config) {
+            return Err(JournalError::ReservationFailed);
         }
         candidate.oversize_flag = false;
         let previous = self.config;
@@ -1335,6 +1339,10 @@ where
     ) -> Option<CoreRecoveryOutcome> {
         let mut candidate = self.state.clone();
         candidate.reservations.remove(&sequence)?;
+        let transition = next_transition(&candidate, sequence, TerminalKind::RecoveryCancelled);
+        if !make_room(&mut candidate, transition_charge(&transition), self.config) {
+            return None;
+        }
         publish_transition(&mut candidate, sequence, TerminalKind::RecoveryCancelled);
         self.commit_state(candidate).ok()?;
         Some(CoreRecoveryOutcome {
@@ -1421,7 +1429,13 @@ where
             recovered,
         };
         let terminal_charge = refresh_terminal_charge(&mut terminal)?;
-        if !make_room_delta(candidate, old_charge, terminal_charge, self.config) {
+        let transition = next_transition(candidate, sequence, kind);
+        if !make_room_delta(
+            candidate,
+            old_charge,
+            terminal_charge.saturating_add(transition_charge(&transition)),
+            self.config,
+        ) {
             return Err(JournalError::ReservationFailed);
         }
         candidate.reservations.remove(&sequence);
@@ -1539,14 +1553,14 @@ fn retained_bytes(state: &DurableState) -> u64 {
             .values()
             .map(|record| record.charge)
             .sum::<u64>()
+        + state.transitions.iter().map(transition_charge).sum::<u64>()
 }
 
 fn make_room(state: &mut DurableState, needed: u64, config: JournalConfig) -> bool {
     while retained_bytes(state).saturating_add(needed) > config.journal_retention_bytes {
-        let Some(sequence) = state.entries.keys().next().copied() else {
+        if !evict_oldest_terminal(state) {
             return false;
-        };
-        state.entries.remove(&sequence);
+        }
     }
     true
 }
@@ -1557,27 +1571,60 @@ fn make_room_delta(
     new_charge: u64,
     config: JournalConfig,
 ) -> bool {
-    let mut current = retained_bytes(state).saturating_sub(old_charge);
-    while current.saturating_add(new_charge) > config.journal_retention_bytes {
-        let Some(sequence) = state.entries.keys().next().copied() else {
+    while retained_bytes(state)
+        .saturating_sub(old_charge)
+        .saturating_add(new_charge)
+        > config.journal_retention_bytes
+    {
+        if !evict_oldest_terminal(state) {
             return false;
-        };
-        let Some(entry) = state.entries.remove(&sequence) else {
-            return false;
-        };
-        current = current.saturating_sub(entry.accounted_size);
+        }
     }
     true
 }
 
-fn publish_transition(state: &mut DurableState, sequence: u64, kind: TerminalKind) {
-    let cursor = state.next_cursor;
-    state.next_cursor = state.next_cursor.saturating_add(1);
-    state.transitions.push(TerminalTransition {
-        cursor,
+fn evict_oldest_terminal(state: &mut DurableState) -> bool {
+    let entry = state.entries.keys().next().copied();
+    let transition = state
+        .transitions
+        .first()
+        .map(|item| item.action_obligation_id);
+    match (entry, transition) {
+        (Some(sequence), Some(id)) if id < sequence => {
+            state.transitions.remove(0);
+        }
+        (Some(sequence), _) => {
+            state.entries.remove(&sequence);
+            state
+                .transitions
+                .retain(|item| item.action_obligation_id != sequence);
+        }
+        (None, Some(_)) => {
+            state.transitions.remove(0);
+        }
+        (None, None) => return false,
+    }
+    true
+}
+
+fn transition_charge(transition: &TerminalTransition) -> u64 {
+    serde_json::to_vec(transition)
+        .expect("terminal transition serializes")
+        .len() as u64
+}
+
+fn next_transition(state: &DurableState, sequence: u64, kind: TerminalKind) -> TerminalTransition {
+    TerminalTransition {
+        cursor: state.next_cursor,
         action_obligation_id: sequence,
         kind,
-    });
+    }
+}
+
+fn publish_transition(state: &mut DurableState, sequence: u64, kind: TerminalKind) {
+    let transition = next_transition(state, sequence, kind);
+    state.next_cursor = state.next_cursor.saturating_add(1);
+    state.transitions.push(transition);
 }
 
 fn attachments_from(attachments: &BTreeMap<String, AttachmentState>) -> Vec<ObligationAttachment> {
@@ -1727,6 +1774,64 @@ mod tests {
             InMemoryJournalStorage::new(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn audit_terminal_feed_shares_the_retention_budget_and_keeps_recent_cursors() {
+        let mut journal = binding();
+        for sequence in 1..=200 {
+            let handle = journal.reserve(identity(), vec![1]).unwrap();
+            journal
+                .finalize_rejected(
+                    handle,
+                    RejectionMaterial {
+                        rejection_material: vec![2],
+                    },
+                )
+                .unwrap();
+            let feed_bytes: u64 = journal
+                .state
+                .transitions
+                .iter()
+                .map(|transition| serde_json::to_vec(transition).unwrap().len() as u64)
+                .sum();
+            let entry_bytes: u64 = journal
+                .state
+                .entries
+                .values()
+                .map(|entry| entry.accounted_size)
+                .sum();
+            assert!(entry_bytes + feed_bytes <= journal.config().journal_retention_bytes);
+            assert_eq!(journal.retained_bytes(), entry_bytes + feed_bytes);
+            let recent = journal.terminal_transitions(sequence - 1).unwrap();
+            assert_eq!(recent.len(), 1);
+            assert_eq!(recent[0].action_obligation_id, sequence);
+            assert_eq!(recent[0].cursor, sequence);
+        }
+        assert!(journal.terminal_transitions(0).unwrap().len() < 200);
+    }
+
+    #[test]
+    fn audit_cancelled_feed_is_bounded_without_terminal_records() {
+        let mut journal = binding();
+        for cursor in 1..=200 {
+            journal.reserve(identity(), vec![1]).unwrap();
+            assert_eq!(journal.recover_active().len(), 1);
+            assert!(journal.state.entries.is_empty());
+            let feed_bytes: u64 = journal
+                .state
+                .transitions
+                .iter()
+                .map(|transition| serde_json::to_vec(transition).unwrap().len() as u64)
+                .sum();
+            assert!(feed_bytes <= journal.config().journal_retention_bytes);
+            assert_eq!(journal.terminal_transitions(cursor - 1).unwrap().len(), 1);
+        }
+        let storage = journal.storage.clone();
+        let reopened =
+            JournalBinding::new_without_policies(FixtureCodec, journal.config(), storage).unwrap();
+        assert_eq!(reopened.terminal_transitions(199).unwrap()[0].cursor, 200);
+        assert!(reopened.terminal_transitions(0).unwrap().len() < 200);
     }
 
     #[test]
