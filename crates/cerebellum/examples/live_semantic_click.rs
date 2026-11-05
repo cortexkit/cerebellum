@@ -135,7 +135,11 @@ mod macos_probe {
             browser_exit_observation_deadline_ms: 5_000,
             navigation_settle_deadline_ms: 10_000,
         };
-        let planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config));
+        let planes = Planes::with_browser_config_journaling(
+            Arc::new(HealthState::new()),
+            Some(config),
+            cerebellum::JournalPersistence::Isolated,
+        );
         bind_route(
             &planes,
             TOOL_CHANNEL,
@@ -724,8 +728,10 @@ mod macos_probe {
             origin: Default::default(),
             computer_order: None,
         };
-        let mut audit = cerebellum::computer_capability::production_audit()
-            .map_err(|error| format!("production audit unavailable: {error}"))?;
+        let mut audit = cerebellum::computer_capability::computer_audit(
+            cerebellum::JournalPersistence::Isolated,
+        )
+        .map_err(|error| format!("isolated audit unavailable: {error}"))?;
         let action_obligation_id = audit.journal().next_sequence();
         let probe_single_action_has_no_interrupt =
             cerebellum_computer::platform::process_event::never_cancelled;

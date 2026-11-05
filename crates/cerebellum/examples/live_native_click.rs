@@ -193,7 +193,11 @@ mod macos_probe {
             button.identifier, button.role, button.title
         );
 
-        let planes = Planes::with_browser_config(Arc::new(HealthState::new()), None);
+        let planes = Planes::with_browser_config_journaling(
+            Arc::new(HealthState::new()),
+            None,
+            cerebellum::JournalPersistence::Isolated,
+        );
         bind_routes(&planes).await?;
         let target = mint_target_lease(&planes).await?;
         println!(
@@ -913,8 +917,10 @@ mod macos_probe {
             origin: Default::default(),
             computer_order: None,
         };
-        let mut audit = cerebellum::computer_capability::production_audit()
-            .map_err(|error| format!("production audit unavailable: {error}"))?;
+        let mut audit = cerebellum::computer_capability::computer_audit(
+            cerebellum::JournalPersistence::Isolated,
+        )
+        .map_err(|error| format!("isolated audit unavailable: {error}"))?;
         let action_obligation_id = audit.journal().next_sequence();
         let probe_single_action_has_no_interrupt =
             cerebellum_computer::platform::process_event::never_cancelled;

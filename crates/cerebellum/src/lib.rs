@@ -3266,8 +3266,8 @@ const BROWSER_DRIVE_JOURNAL_MAX_ENTRY_BYTES: u64 = 64 * 1024;
 /// fleet backup, and every test passed. A default that is right for production
 /// and wrong for tests fails in the direction nobody inspects.
 ///
-/// Live probes take `Durable` deliberately: they drive real browsers against
-/// real profiles, so their records describe real activity and belong on disk.
+/// Live probes use `Isolated` too, unless they first require a scratch data
+/// home so a durability probe cannot mix its records with the operator's data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JournalPersistence {
     /// The operator's journal under the data home.

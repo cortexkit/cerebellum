@@ -51,10 +51,12 @@ fn main() {
 
     let runtime = tokio::runtime::Runtime::new().expect("a runtime");
     runtime.block_on(async move {
-        let audit = match cerebellum::computer_capability::production_audit() {
+        let audit = match cerebellum::computer_capability::computer_audit(
+            cerebellum::JournalPersistence::Isolated,
+        ) {
             Ok(audit) => audit,
             Err(reason) => {
-                println!("FAILED: the production audit could not be assembled: {reason}");
+                println!("FAILED: the isolated audit could not be assembled: {reason}");
                 return;
             }
         };

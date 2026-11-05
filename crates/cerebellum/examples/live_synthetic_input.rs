@@ -238,7 +238,11 @@ mod macos_probe {
             browser_exit_observation_deadline_ms: 5_000,
             navigation_settle_deadline_ms: 10_000,
         };
-        let planes = Planes::with_browser_config(Arc::new(HealthState::new()), Some(config));
+        let planes = Planes::with_browser_config_journaling(
+            Arc::new(HealthState::new()),
+            Some(config),
+            cerebellum::JournalPersistence::Isolated,
+        );
         bind_route(
             &planes,
             TOOL_CHANNEL,
