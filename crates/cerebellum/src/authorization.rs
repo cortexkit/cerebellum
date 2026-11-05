@@ -620,6 +620,7 @@ impl GrantStore {
         required: Severity,
         attempted_origin: &str,
         required_hazards: &BTreeSet<HazardClass>,
+        public_document: bool,
     ) -> Option<ActionGrant> {
         let caller = current_standing_caller()?;
         // The request names the agent it acts for; a scope set for another
@@ -630,7 +631,7 @@ impl GrantStore {
         }
         let origin = canonical_grant_origin(attempted_origin)?;
         if let Some(grants) = &self.agent_grants {
-            let used = grants.authorize(
+            let used = grants.authorize_filtered(
                 &caller.holder,
                 GrantDemand::Browser {
                     target: BrowserTarget::AgentProfile,
@@ -638,6 +639,7 @@ impl GrantStore {
                     severity: required,
                     hazards: required_hazards.clone(),
                 },
+                |row| public_document || row.subject != crate::agent_grants::GrantSubject::AllSites,
             )?;
             let row = used.row();
             let mut grant = ActionGrant::new(
@@ -656,12 +658,13 @@ impl GrantStore {
         let GrantHolder::Head { agent_id } = &caller.holder else {
             return None;
         };
-        let row = standing.covering_row(
+        let row = standing.covering_document_row(
             agent_id,
             &origin,
             required,
             required_hazards,
             standing.now_ms(),
+            public_document,
         )?;
         Some(
             ActionGrant::new(
@@ -681,9 +684,11 @@ impl GrantStore {
         required: Severity,
         attempted_origin: &str,
         required_hazards: &BTreeSet<HazardClass>,
+        public_document: bool,
     ) -> Option<ActionGrant> {
         if let Some(signed_in) = &self.signed_in {
-            if public_web_baseline_covers(attempted_origin, required, required_hazards)
+            if public_document
+                && public_web_baseline_covers(attempted_origin, required, required_hazards)
                 && (request.action != Action::Type
                     || !signed_in.is_signed_in(
                         request.bind_identity,
@@ -712,12 +717,25 @@ impl GrantStore {
         required: Severity,
         attempted_origin: &str,
         required_hazards: &BTreeSet<HazardClass>,
+        public_document: bool,
     ) -> Result<ActionGrant, AuthorizationError> {
         if self.agent_grants.is_some() {
             return self
-                .standing_grant(request, required, attempted_origin, required_hazards)
+                .standing_grant(
+                    request,
+                    required,
+                    attempted_origin,
+                    required_hazards,
+                    public_document,
+                )
                 .or_else(|| {
-                    self.baseline_grant(request, required, attempted_origin, required_hazards)
+                    self.baseline_grant(
+                        request,
+                        required,
+                        attempted_origin,
+                        required_hazards,
+                        public_document,
+                    )
                 })
                 .ok_or_else(|| AuthorizationError::NoGrantForAction {
                     attempted_origin: attempted_origin.into(),
@@ -736,9 +754,21 @@ impl GrantStore {
                 | AuthorizationError::InvalidSeverityTier),
             ) => Err(refusal),
             Err(refusal) => self
-                .standing_grant(request, required, attempted_origin, required_hazards)
+                .standing_grant(
+                    request,
+                    required,
+                    attempted_origin,
+                    required_hazards,
+                    public_document,
+                )
                 .or_else(|| {
-                    self.baseline_grant(request, required, attempted_origin, required_hazards)
+                    self.baseline_grant(
+                        request,
+                        required,
+                        attempted_origin,
+                        required_hazards,
+                        public_document,
+                    )
                 })
                 .ok_or(refusal),
         }
@@ -920,6 +950,17 @@ impl GrantStore {
         request: AuthorizationRequest<'_>,
         attempted_origin: &str,
     ) -> Result<AuthorizationDecision, AuthorizationError> {
+        self.authorize_document(request, attempted_origin, true)
+    }
+
+    /// A connected private peer rules out implicit public-web access and grants
+    /// for all sites, but not a person's explicit grant for that site.
+    pub(crate) fn authorize_document(
+        &self,
+        request: AuthorizationRequest<'_>,
+        attempted_origin: &str,
+        public_document: bool,
+    ) -> Result<AuthorizationDecision, AuthorizationError> {
         self.ensure_valid()?;
         let (computed, fingerprint) =
             computed_required_severity(request.action, request.classification)?;
@@ -939,6 +980,7 @@ impl GrantStore {
             effective,
             attempted_origin,
             &required_hazards,
+            public_document,
         )?;
         if let Some(destination) = request
             .classification
@@ -949,6 +991,7 @@ impl GrantStore {
                 effective,
                 destination,
                 &required_hazards,
+                destination != attempted_origin || public_document,
             )?;
         }
         let baseline = self.signed_in.is_some() && grant.id == PUBLIC_WEB_BASELINE;

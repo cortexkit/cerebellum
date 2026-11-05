@@ -685,6 +685,19 @@ impl StandingBrowserGrants {
         required_hazards: &BTreeSet<HazardClass>,
         now_ms: u64,
     ) -> Option<StandingBrowserGrant> {
+        self.covering_document_row(agent_id, origin, required, required_hazards, now_ms, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn covering_document_row(
+        &self,
+        agent_id: &str,
+        origin: &str,
+        required: Severity,
+        required_hazards: &BTreeSet<HazardClass>,
+        now_ms: u64,
+        public_document: bool,
+    ) -> Option<StandingBrowserGrant> {
         let machine = self.machine_uuid.as_deref()?;
         if agent_id.is_empty() {
             return None;
@@ -704,7 +717,8 @@ impl StandingBrowserGrants {
                 StandingSubject::Origin(granted) => *granted == origin,
                 StandingSubject::Domain(domain) => domain_covers(domain, &origin),
                 StandingSubject::AllSites => {
-                    required_hazards.is_empty()
+                    public_document
+                        && required_hazards.is_empty()
                         && row.max_level <= MAX_ALL_SITES_LEVEL
                         && origin_is_public(&origin)
                 }
@@ -988,8 +1002,11 @@ const NON_PUBLIC_DNS_SUFFIXES: &[&str] = &[
 /// Public-web access requires a registrable DNS name under an explicit PSL
 /// rule: single-label names and unlisted suffixes can resolve on local networks,
 /// and public suffixes alone do not identify a site. Raw addresses and service
-/// ports are excluded too. An exact per-site grant can still cover them. DNS
-/// resolution remains subject to the connector's restricted-address policy.
+/// ports are excluded too. An exact per-site grant can still cover them.
+/// Views showing grant options, domain scope and management status use names
+/// because their origins need not be loaded yet. Runtime authorization
+/// and frame reads also require the document's connected-address evidence;
+/// a public-looking name alone cannot cover a known private peer.
 pub fn origin_is_public(origin: &str) -> bool {
     let Some(canonical) = canonical_grant_origin(origin) else {
         return false;

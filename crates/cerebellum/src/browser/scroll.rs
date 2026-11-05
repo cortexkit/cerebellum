@@ -63,7 +63,7 @@ impl BrowserPlane {
         let (operation, source) = self
             .read_live_document(identity, operation, deadline_ms)
             .await?;
-        self.authorize_read(identity, BrowserCapability::Scroll, &source.url)
+        self.authorize_read(identity, BrowserCapability::Scroll, &source)
             .await?;
         let (target, frame) = if let Some(requested) = requested {
             let state = self.state.lock().await;

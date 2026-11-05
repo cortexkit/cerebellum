@@ -1321,6 +1321,7 @@ mod tests {
                 raw_name: None,
                 classification: Ok(Box::new(record)),
                 frame_document: Some(FrameDocument {
+                    network: Default::default(),
                     navigation_revision: 0,
                     frame_id: "payment-frame".into(),
                     parent_id: Some("main".into()),

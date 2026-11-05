@@ -105,6 +105,7 @@ impl Browser {
             .cloned()
             .unwrap_or((1, "about:blank".to_string()));
         CommittedDocument {
+            network: Default::default(),
             security_origin: cerebellum::classification::canonical_origin_from_url(&url)
                 .unwrap_or_else(|| "null".into()),
             url,
@@ -2300,6 +2301,7 @@ async fn baseline_private_frames_are_omitted_until_the_top_page_has_person_permi
         .route(Session::primary("c-baseline-frames", AGENT).asking())
         .await;
     let frame = |id: &str, parent: Option<&str>, origin: &str| FrameDocument {
+        network: Default::default(),
         navigation_revision: 0,
         frame_id: id.into(),
         parent_id: parent.map(str::to_string),

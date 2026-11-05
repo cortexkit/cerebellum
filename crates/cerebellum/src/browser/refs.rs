@@ -241,6 +241,7 @@ mod tests {
             frame_path: vec!["child".into()],
             backend_identity: Some(BackendNodeIdentity::new("target", "child", backend).unwrap()),
             frame_document: Some(FrameDocument {
+                network: Default::default(),
                 navigation_revision: 1,
                 frame_id: "child".into(),
                 parent_id: Some("main".into()),

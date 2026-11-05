@@ -1540,6 +1540,7 @@ mod tests {
 
     fn document(url: &str) -> CommittedDocument {
         CommittedDocument {
+            network: Default::default(),
             security_origin: crate::classification::canonical_origin_from_url(url)
                 .unwrap_or_else(|| "null".into()),
             url: url.into(),
@@ -1552,6 +1553,7 @@ mod tests {
 
     fn frame(url: &str, origin: &str) -> FrameDocument {
         FrameDocument {
+            network: Default::default(),
             navigation_revision: 0,
             frame_id: "child".into(),
             parent_id: Some("main".into()),

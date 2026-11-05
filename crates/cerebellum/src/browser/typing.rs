@@ -171,7 +171,17 @@ impl BrowserPlane {
             request.action = crate::authorization::Action::Type;
             request.signed_in_profile = &profile_name;
             let decision = grants
-                .authorize(request, &origin_from_url(&origin))
+                .authorize_document(
+                    request,
+                    &origin_from_url(&origin),
+                    dispatch
+                        .frame
+                        .as_ref()
+                        .map(|frame| frame.network)
+                        .or_else(|| dispatch.document.as_ref().map(|document| document.network))
+                        .unwrap_or_default()
+                        .is_public(&origin_from_url(&origin)),
+                )
                 .map_err(map_authorization_error)?;
             self.remember_authorization(identity, &decision).await;
             grants.commit(&decision).map_err(|_| {

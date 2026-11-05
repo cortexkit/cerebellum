@@ -183,23 +183,78 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         deadline: Instant,
         clock: &mut C,
     ) -> Result<(), NavigationDriveError> {
+        self.configure_frame_session_tracking(session, deadline, clock, &mut None)
+    }
+
+    pub(super) fn configure_frame_session_tracking<C: NavigationClock>(
+        &mut self,
+        session: &str,
+        deadline: Instant,
+        clock: &mut C,
+        tracking: &mut Option<(&str, &mut Tracker)>,
+    ) -> Result<(), NavigationDriveError> {
         if self.configured_frame_sessions.contains(session) {
             return Ok(());
         }
-        self.command("Target.setAutoAttach", Some(serde_json::json!({"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true}).as_object().unwrap().clone()), Some(session.into()), deadline, None, clock)?;
-        self.command(
-            "Page.enable",
-            None,
-            Some(session.into()),
-            deadline,
-            None,
-            clock,
-        )?;
+        // Mark before issuing commands: their replies can attach more children,
+        // and configuring those children must not recursively configure us.
         self.configured_frame_sessions.insert(session.into());
+        let result = (|| {
+            self.command("Target.setAutoAttach", Some(serde_json::json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true,"filter":[{"type":"iframe","exclude":false},{"exclude":true}]}).as_object().unwrap().clone()), Some(session.into()), deadline,
+                tracking.as_mut().map(|(key, tracker)| (*key, &mut **tracker)), clock)?;
+            for method in ["Page.enable", "Network.enable"] {
+                self.command(
+                    method,
+                    None,
+                    Some(session.into()),
+                    deadline,
+                    tracking
+                        .as_mut()
+                        .map(|(key, tracker)| (*key, &mut **tracker)),
+                    clock,
+                )?;
+            }
+            if self.waiting_frame_sessions.contains(session) {
+                // Observe document responses before letting a newly attached
+                // renderer load, including later navigations inside an out-of-process iframe.
+                self.command(
+                    "Runtime.runIfWaitingForDebugger",
+                    None,
+                    Some(session.into()),
+                    deadline,
+                    tracking
+                        .as_mut()
+                        .map(|(key, tracker)| (*key, &mut **tracker)),
+                    clock,
+                )?;
+                self.waiting_frame_sessions.remove(session);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.configured_frame_sessions.remove(session);
+        }
+        result
+    }
+
+    pub(super) fn configure_waiting_frames<C: NavigationClock>(
+        &mut self,
+        deadline: Instant,
+        clock: &mut C,
+        tracking: &mut Option<(&str, &mut Tracker)>,
+    ) -> Result<(), NavigationDriveError> {
+        while let Some(session) = self
+            .waiting_frame_sessions
+            .iter()
+            .find(|session| !self.configured_frame_sessions.contains(*session))
+            .cloned()
+        {
+            self.configure_frame_session_tracking(&session, deadline, clock, tracking)?;
+        }
         Ok(())
     }
 
-    fn collect_frame_documents(
+    pub(super) fn collect_frame_documents(
         &self,
         tree: &Value,
         parent: Option<&str>,
@@ -238,7 +293,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         } else {
             "null".into()
         };
-        let document = FrameDocument {
+        let mut document = FrameDocument {
+            network: Default::default(),
             navigation_revision: self.frame_revisions.get(&id).copied().unwrap_or(0),
             frame_id: id.clone(),
             parent_id: parent.map(str::to_string),
@@ -250,6 +306,26 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             loader_id: text("loaderId")?,
             url,
             origin,
+        };
+        document.network = if matches!(document.url.as_str(), "about:blank" | "about:srcdoc") {
+            creator
+                .filter(|parent| parent.origin == document.origin)
+                .map(|parent| parent.network)
+                .unwrap_or_else(|| {
+                    self.document_network(
+                        &document.session_id,
+                        &id,
+                        &document.loader_id,
+                        &document.origin,
+                    )
+                })
+        } else {
+            self.document_network(
+                &document.session_id,
+                &id,
+                &document.loader_id,
+                &document.origin,
+            )
         };
         if let Some(index) = documents.iter().position(|d| d.frame_id == id) {
             documents[index] = document;
@@ -307,12 +383,16 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     params.get("sessionId").and_then(Value::as_str),
                 ) {
                     self.frame_sessions.insert(frame.into(), session.into());
+                    if params.get("waitingForDebugger").and_then(Value::as_bool) == Some(true) {
+                        self.waiting_frame_sessions.insert(session.into());
+                    }
                 }
             }
             "Target.detachedFromTarget" => {
                 if let Some(session) = params.get("sessionId").and_then(Value::as_str) {
                     self.frame_sessions.retain(|_, value| value != session);
                     self.configured_frame_sessions.remove(session);
+                    self.waiting_frame_sessions.remove(session);
                     self.focus_emulated_sessions.remove(session);
                 }
             }

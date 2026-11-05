@@ -1507,6 +1507,7 @@ fn collect_frames(
         origin(&url).unwrap_or_else(|_| "null".into())
     };
     frames.push(FrameDocument {
+        network: Default::default(),
         navigation_revision: 0,
         frame_id: id,
         parent_id,
