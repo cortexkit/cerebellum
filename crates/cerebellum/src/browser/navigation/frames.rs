@@ -1,6 +1,44 @@
 use super::*;
 use crate::snapshot_store::FrameDocument;
 
+fn mark_unread_frame(
+    observation: &mut BrowserSnapshotObservation,
+    frame: &FrameDocument,
+    owner: Option<usize>,
+    reason: &str,
+) {
+    observation.ax_truncated = true;
+    observation.refs_truncated = true;
+    // An incomplete embedded document contributes neither text nor refs. Its
+    // owner can contain untagged child AX text, so discard that subtree too.
+    if let Some(index) = owner {
+        let end = observation.records[index + 1..]
+            .iter()
+            .position(|record| record.depth <= observation.records[index].depth)
+            .map_or(observation.records.len(), |offset| index + 1 + offset);
+        let removed: HashSet<_> = observation
+            .records
+            .drain(index..end)
+            .filter_map(|record| record.reference)
+            .collect();
+        observation
+            .refs
+            .retain(|r| !removed.contains(&r.captured.reference));
+        observation.facts.retain(|r, _| !removed.contains(r));
+    }
+    let notice = format!("[embedded frame {} unread: {reason}]", frame.frame_id);
+    observation.records.push(AxRecord {
+        depth: 0,
+        role: state_text::UNREAD_FRAME_ROLE.into(),
+        name: notice.clone(),
+        value: None,
+        reference: None,
+    });
+    if let Some(text) = &mut observation.dom_text {
+        text.push_str(&format!("\n<!-- {notice} -->\n"));
+    }
+}
+
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
     pub fn frame_documents(
         &mut self,
@@ -9,19 +47,29 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
     ) -> Result<Vec<FrameDocument>, NavigationDriveError> {
         let mut clock = SystemNavigationClock;
         let deadline = clock.now() + Duration::from_millis(deadline_ms);
-        self.ensure_attached(context, deadline, &mut clock)?;
+        self.frame_documents_before(context, deadline, &HashSet::new(), &mut clock)
+    }
+
+    fn frame_documents_before<C: NavigationClock>(
+        &mut self,
+        context: &str,
+        deadline: Instant,
+        omitted: &HashSet<String>,
+        clock: &mut C,
+    ) -> Result<Vec<FrameDocument>, NavigationDriveError> {
+        self.ensure_attached(context, deadline, clock)?;
         let attachment = self
             .attachment
             .clone()
             .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Target.attachToTarget"))?;
-        self.configure_frame_session(&attachment.session_id, deadline, &mut clock)?;
+        self.configure_frame_session(&attachment.session_id, deadline, clock)?;
         let tree = self.command(
             "Page.getFrameTree",
             None,
             Some(attachment.session_id.clone()),
             deadline,
             None,
-            &mut clock,
+            clock,
         )?;
         let mut documents = Vec::new();
         self.collect_frame_documents(
@@ -33,6 +81,21 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         )
         .map_err(|error| error.at_step("Page.getFrameTree"))?;
         // Page.getFrameTree on the parent can omit descendants of an OOPIF.
+        // An omitted renderer has no retained content to verify. Do not let
+        // its frame-tree query turn a successful partial read into a timeout.
+        let excluded_sessions: HashSet<_> =
+            self.frame_documents
+                .iter()
+                .filter(|frame| {
+                    omitted.contains(&frame.frame_id) && frame.session_id != attachment.session_id
+                })
+                .map(|frame| frame.session_id.clone())
+                .filter(|session| {
+                    !self.frame_documents.iter().any(|frame| {
+                        &frame.session_id == session && !omitted.contains(&frame.frame_id)
+                    })
+                })
+                .collect();
         let mut queried = HashSet::new();
         // Configuring a child recursively auto-attaches its own OOPIFs. Drain
         // that expanding set rather than taking a one-time list of sessions.
@@ -40,7 +103,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             let mut pending: Vec<_> = self
                 .frame_sessions
                 .values()
-                .filter(|session| !queried.contains(*session))
+                .filter(|session| {
+                    !queried.contains(*session) && !excluded_sessions.contains(*session)
+                })
                 .cloned()
                 .collect();
             pending.sort();
@@ -50,7 +115,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             if queried.len() >= 128 {
                 return Err(NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"));
             }
-            self.configure_frame_session(&session, deadline, &mut clock)?;
+            self.configure_frame_session(&session, deadline, clock)?;
             queried.insert(session.clone());
             let tree = self.command(
                 "Page.getFrameTree",
@@ -58,7 +123,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 Some(session.clone()),
                 deadline,
                 None,
-                &mut clock,
+                clock,
             )?;
             let root = tree
                 .get("frameTree")
@@ -73,6 +138,17 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 .and_then(|d| d.parent_id.clone());
             self.collect_frame_documents(root, parent.as_deref(), &session, &mut documents)
                 .map_err(|error| error.at_step("Page.getFrameTree"))?;
+        }
+        // The parent tree need not name descendants of out-of-process iframes.
+        // Keep omitted identities as unread metadata until fresh discovery.
+        for frame in self
+            .frame_documents
+            .iter()
+            .filter(|frame| omitted.contains(&frame.frame_id))
+        {
+            if !documents.iter().any(|live| live.frame_id == frame.frame_id) {
+                documents.push(frame.clone());
+            }
         }
         let ancestry = documents.clone();
         documents.sort_by_key(|d| {
@@ -296,12 +372,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?;
         let before = self.frame_documents.clone();
         let mut omitted_frames = HashSet::new();
-        // A zoom can include nested frame documents, but each must share one
-        // absolute capture allowance rather than renew it for every frame.
-        let subtree_deadline = subtree.map(|_| {
-            clock.now()
-                + Duration::from_millis(deadline_ms.min(crate::budgets::FRAME_SNAPSHOT_PHASE_MS))
-        });
+        // All documents share the read's deadline. Capture the main document
+        // first and reserve a final slice for its identity recheck; embedded
+        // documents cannot spend that slice or renew the allowance.
+        let allowance =
+            Duration::from_millis(deadline_ms.min(crate::budgets::FRAME_SNAPSHOT_PHASE_MS));
+        let deadline = clock.now() + allowance;
+        let work_deadline =
+            deadline - (allowance / 4).min(Duration::from_millis(crate::budgets::CDP_STEP_MS));
         let result = (|| {
             let main = before
                 .iter()
@@ -367,9 +445,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             let mut observation = self.snapshot_with_clock(
                 context,
                 mode,
-                subtree_deadline
-                    .map(|end| end.saturating_duration_since(clock.now()).as_millis() as u64)
-                    .unwrap_or(deadline_ms),
+                work_deadline
+                    .saturating_duration_since(clock.now())
+                    .as_millis() as u64,
                 epoch.map(|e| (e, main.origin.as_str())),
                 subtree,
                 filled,
@@ -378,7 +456,11 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             for reference in &mut observation.refs {
                 reference.frame_document = Some(main.clone());
             }
-            for frame in before.iter().filter(|f| f.parent_id.is_some()) {
+            for (frame_index, frame) in before
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.parent_id.is_some())
+            {
                 if frame.frame_id == main.frame_id || omitted_frames.contains(&frame.frame_id) {
                     continue;
                 }
@@ -395,8 +477,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     && (observation.records.len() >= MAX_AX_NODES
                         || observation.refs.len() >= MAX_REFS)
                 {
-                    observation.ax_truncated = true;
-                    observation.refs_truncated = true;
+                    mark_unread_frame(&mut observation, frame, None, "capture limit reached");
+                    omitted_frames.insert(frame.frame_id.clone());
                     continue;
                 }
                 if frame
@@ -412,34 +494,39 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .as_ref()
                     .and_then(|id| before.iter().find(|f| &f.frame_id == id))
                     .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?;
-                let deadline = subtree_deadline
-                    .map(|end| snapshot_step_deadline(end, true, clock.now()))
-                    .unwrap_or_else(|| clock.now() + Duration::from_millis(deadline_ms));
+                let remaining = work_deadline.saturating_duration_since(clock.now());
+                let share = (remaining / (before.len() - frame_index) as u32)
+                    .min(Duration::from_millis(crate::budgets::CDP_STEP_MS));
+                let frame_deadline = clock.now() + share;
                 let params = serde_json::json!({"frameId":frame.frame_id})
                     .as_object()
                     .unwrap()
                     .clone();
-                let owner = match self.command(
+                let owner = match self.command_response(
                     "DOM.getFrameOwner",
                     Some(params),
                     Some(parent.session_id.clone()),
-                    deadline,
+                    frame_deadline,
+                    None,
                     None,
                     clock,
                 ) {
-                    Ok(owner) => owner,
-                    Err(NavigationDriveError::NodeUnavailable { .. }) => {
-                        observation.ax_truncated = true;
-                        observation.refs_truncated = true;
-                        omitted_frames.insert(frame.frame_id.clone());
-                        continue;
-                    }
+                    Ok(response) if response.error.is_none() => response.result,
+                    Ok(_) | Err(NavigationDriveError::CommandDeadline { .. }) => None,
+                    // A bad envelope or disconnected transport is not confined
+                    // to one frame. Preserve its producing step and fail closed.
                     Err(error) => return Err(error),
                 };
-                let backend = owner
-                    .get("backendNodeId")
+                let Some(backend) = owner
+                    .as_ref()
+                    .and_then(|owner| owner.get("backendNodeId"))
                     .and_then(Value::as_u64)
-                    .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("DOM.getFrameOwner"))?;
+                    .filter(|backend| *backend > 0)
+                else {
+                    mark_unread_frame(&mut observation, frame, None, "owner lookup failed");
+                    omitted_frames.insert(frame.frame_id.clone());
+                    continue;
+                };
                 let owner_ref = observation
                     .refs
                     .iter()
@@ -476,26 +563,62 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     // A hidden or replaced iframe has no visible owner to insert
                     // its content under. Skip its subtree rather than lose the page.
                     if subtree.is_none() {
-                        observation.ax_truncated = true;
-                        observation.refs_truncated = true;
+                        mark_unread_frame(&mut observation, frame, None, "owner not captured");
                     }
                     omitted_frames.insert(frame.frame_id.clone());
                     continue;
                 };
                 let depth = observation.records[owner_index].depth + 1;
                 self.active_frame = Some(frame.clone());
-                let mut child = self.snapshot_frame_with_clock(
+                let child = self.snapshot_frame_with_clock(
                     context,
                     mode,
-                    subtree_deadline
-                        .map(|end| end.saturating_duration_since(clock.now()).as_millis() as u64)
-                        .unwrap_or(deadline_ms),
+                    frame_deadline
+                        .saturating_duration_since(clock.now())
+                        .as_millis() as u64,
                     epoch.map(|e| (e, frame.origin.as_str())),
                     None,
-                    subtree.is_some(),
+                    true,
                     filled,
                     clock,
-                )?;
+                );
+                let mut child = match child {
+                    Err(error)
+                        if self.transport.is_closed()
+                            || !matches!(
+                                error,
+                                NavigationDriveError::CdpStepFailure { .. }
+                                    | NavigationDriveError::NodeUnavailable { .. }
+                                    | NavigationDriveError::CommandDeadline { .. }
+                            ) =>
+                    {
+                        return Err(error)
+                    }
+                    Ok(child)
+                        if !child.ax_truncated
+                            && !child.refs_truncated
+                            && !child.refs.iter().any(|r| {
+                                matches!(
+                                    r.classification,
+                                    Err(ClassificationUnavailable::DomReadFailed
+                                        | ClassificationUnavailable::DomEnableRefused
+                                        | ClassificationUnavailable::FlattenedDocumentRefused)
+                                )
+                            }) =>
+                    {
+                        child
+                    }
+                    _ => {
+                        mark_unread_frame(
+                            &mut observation,
+                            frame,
+                            Some(owner_index),
+                            "document read failed",
+                        );
+                        omitted_frames.insert(frame.frame_id.clone());
+                        continue;
+                    }
+                };
                 let remaining_nodes = MAX_AX_NODES.saturating_sub(observation.records.len());
                 if child.records.len() > remaining_nodes {
                     child.records.truncate(remaining_nodes);
@@ -530,7 +653,18 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         record.reference = None;
                     }
                 }
-                let offset = observation.refs.len();
+                let offset = observation
+                    .refs
+                    .iter()
+                    .filter_map(|r| {
+                        r.captured
+                            .reference
+                            .strip_prefix('e')?
+                            .parse::<usize>()
+                            .ok()
+                    })
+                    .max()
+                    .unwrap_or(0);
                 let mut names = HashMap::new();
                 for (index, reference) in child.refs.iter_mut().enumerate() {
                     reference.frame_document = Some(frame.clone());
@@ -571,7 +705,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             }
             // Re-read browser identities, not just URLs: a frame can navigate
             // away and back to its original origin while a read is in flight.
-            let after = self.frame_documents(context, deadline_ms)?;
+            let after = self.frame_documents_before(context, deadline, &omitted_frames, clock)?;
             // No content was read from omitted frames. Their disappearance or
             // navigation cannot invalidate content from the retained documents.
             // Descendants of an omitted frame are also outside this observation.
@@ -949,6 +1083,7 @@ mod tests {
         inputs: Vec<(String, f64, f64)>,
         requests: Vec<Value>,
         huge_page: bool,
+        stalled_method: Option<&'static str>,
     }
     fn ax(
         id: &str,
@@ -974,6 +1109,9 @@ mod tests {
             let method = request["method"].as_str().unwrap();
             let cross = session == "cross-session";
             self.requests.push(request.clone());
+            if self.stalled_method == Some(method) && (method == "DOM.getFrameOwner" || cross) {
+                return Ok(());
+            }
             if method == "Input.dispatchMouseEvent" {
                 self.inputs.push((
                     session.into(),
@@ -1118,6 +1256,7 @@ mod tests {
                 inputs: Vec::new(),
                 requests: Vec::new(),
                 huge_page: false,
+                stalled_method: None,
             },
             CdpTransport::new(),
             CdpFrameDecoder::default(),
@@ -1138,6 +1277,143 @@ mod tests {
             raw_role: None,
             raw_name: None,
             classification: Err(ClassificationUnavailable::NotCaptured),
+        }
+    }
+
+    #[test]
+    fn stalled_frame_owner_returns_main_document_on_consecutive_snapshots() {
+        let (mut driver, frames) = fixture();
+        driver.pipe.stalled_method = Some("DOM.getFrameOwner");
+        driver.pipe.requests.clear();
+        let mut clock = super::super::tests::FakeClock::new();
+        for _ in 0..2 {
+            driver.set_read_frames(frames.clone());
+            let started = clock.now();
+            let observation = driver
+                .snapshot_with_clock(
+                    "isolated-fixture",
+                    SnapshotKind::Actionable,
+                    30_000,
+                    Some((7, "http://127.0.0.1:9000/")),
+                    None,
+                    &[],
+                    &mut clock,
+                )
+                .expect("a silent frame owner must not discard the main document");
+            assert!(observation.records.iter().any(|r| r.name == "Same frame"));
+            assert!(observation
+                .records
+                .iter()
+                .any(|r| r.name.contains("frame same") && r.name.contains("unread")));
+            assert!(observation
+                .records
+                .iter()
+                .any(|r| r.name.contains("frame cross") && r.name.contains("unread")));
+            let rendered = state_text::render(&state_text::RenderInput {
+                records: &observation.records,
+                facts: &observation.facts,
+                page_url: "http://127.0.0.1:9000/",
+                snapshot_id: "test-snapshot",
+                filters: &state_text::Filters {
+                    text: Some("Same frame".into()),
+                    roles: Vec::new(),
+                },
+                zoom: None,
+                max_bytes: 1500,
+            });
+            assert!(
+                rendered.text.contains("frame same unread"),
+                "{}",
+                rendered.text
+            );
+            assert!(
+                rendered.text.contains("frame cross unread"),
+                "{}",
+                rendered.text
+            );
+            assert!(observation.ax_truncated && observation.refs_truncated);
+            assert!(
+                clock.now().duration_since(started)
+                    <= Duration::from_millis(crate::budgets::CDP_STEP_MS * 2)
+            );
+            assert_eq!(driver.transport.pending_len(), 0);
+            assert!(
+                !driver
+                    .pipe
+                    .requests
+                    .iter()
+                    .any(|request| request["method"] == "Page.getFrameTree"
+                        && request["sessionId"] == "cross-session"),
+                "an unread renderer must not be queried again during verification"
+            );
+        }
+    }
+
+    #[test]
+    fn stalled_frame_ax_or_dom_read_omits_only_that_document() {
+        for method in [
+            "Accessibility.getRootAXNode",
+            "Accessibility.getChildAXNodes",
+            "DOM.enable",
+            "DOM.getFlattenedDocument",
+        ] {
+            let (mut driver, frames) = fixture();
+            driver.pipe.stalled_method = Some(method);
+            let mut clock = super::super::tests::FakeClock::new();
+            driver.set_read_frames(frames);
+            let started = clock.now();
+            let observation = driver
+                .snapshot_with_clock(
+                    "isolated-fixture",
+                    SnapshotKind::Actionable,
+                    30_000,
+                    Some((7, "http://127.0.0.1:9000/")),
+                    None,
+                    &[],
+                    &mut clock,
+                )
+                .unwrap();
+            assert!(
+                observation.records.iter().any(|r| r.name == "Same button"),
+                "{method}"
+            );
+            assert!(
+                observation
+                    .records
+                    .iter()
+                    .any(|r| r.name.contains("frame cross unread")),
+                "{method}"
+            );
+            assert!(
+                !observation
+                    .records
+                    .iter()
+                    .any(|r| r.name == "Card number" || r.name == "Pay"),
+                "{method}"
+            );
+            assert!(
+                observation
+                    .refs
+                    .iter()
+                    .all(|r| r.frame_document.as_ref().unwrap().frame_id != "cross"),
+                "{method}"
+            );
+            assert!(
+                observation
+                    .refs
+                    .iter()
+                    .find(|r| r.captured.name == "Same button")
+                    .unwrap()
+                    .classification
+                    .is_ok(),
+                "{method}"
+            );
+            assert!(
+                clock.now().duration_since(started)
+                    <= Duration::from_millis(crate::budgets::CDP_STEP_MS),
+                "{method}"
+            );
+            assert_eq!(driver.transport.pending_len(), 0);
         }
     }
 

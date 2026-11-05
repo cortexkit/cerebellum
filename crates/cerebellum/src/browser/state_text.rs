@@ -177,6 +177,10 @@ pub struct RenderInput<'a> {
     pub max_bytes: usize,
 }
 
+// Capture-only records carry omission notices without refs. Keep them in the
+// header so a zoom or text/role filter cannot hide an unread embedded document.
+pub(crate) const UNREAD_FRAME_ROLE: &str = "ck-unread-frame";
+
 #[derive(Debug, Default)]
 pub struct Filters {
     pub text: Option<String>,
@@ -308,6 +312,14 @@ pub fn render(input: &RenderInput<'_>) -> RenderedState {
     };
     if input.filters.narrows() && lines.is_empty() {
         header.push_str("\nNo matches for the requested filters.");
+    }
+    for notice in input
+        .records
+        .iter()
+        .filter(|record| record.role == UNREAD_FRAME_ROLE)
+    {
+        header.push('\n');
+        header.push_str(&one_line(&notice.name));
     }
     if input.zoom.is_none() && !input.filters.narrows() {
         fit_outline(header, lines, &tree, input.max_bytes)
