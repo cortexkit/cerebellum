@@ -14,7 +14,6 @@ use sha2::{Digest, Sha256};
 
 use crate::browser::state_text::{one_line, short_url, NodeFacts};
 use crate::coordinate::ScreenshotSnapshot;
-use crate::journal::redaction::utf8_safe_truncate;
 
 pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 pub const MAX_REFS: usize = 4_096;
@@ -972,13 +971,23 @@ pub fn encode_dom_text(content: &str, max_bytes: usize) -> (String, bool) {
     (output.clone(), output.len() != content.len())
 }
 
+fn utf8_safe_truncate(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    input[..end].to_string()
+}
+
 /// Bound an accessibility field to its byte budget.
 ///
 /// Truncation only.  It is deliberately not named for redaction: the journal's
 /// redaction contract refuses when no policy is bound, precisely so that
 /// shortening a value is never mistaken for removing sensitive material from it.
-/// A caller that needs redacted output wants `journal::redaction`, which fails
-/// closed instead of returning a prefix of the secret.
+/// Redaction policies live in `cerebellum_core::journal::redaction` instead.
 pub fn truncate_ax_field(value: &str, max_bytes: usize) -> String {
     utf8_safe_truncate(value, max_bytes)
 }

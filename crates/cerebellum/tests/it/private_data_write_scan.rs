@@ -212,3 +212,42 @@ fn live_examples_do_not_open_operator_stores() {
         violations.join("\n")
     );
 }
+
+#[test]
+fn obsolete_parallel_policy_implementations_are_absent() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut obsolete = Vec::new();
+    for file in ["journal/snapshots.rs", "journal/redaction.rs"] {
+        if root.join(file).exists() {
+            obsolete.push(file.to_owned());
+        }
+    }
+    for (file, definitions) in [
+        (
+            "authorization.rs",
+            &[
+                "struct DecisionBindings",
+                "struct AuthorizationCommitGuard",
+                "fn select_deterministic_covering_grant",
+                "fn evaluate_origin_scope",
+            ][..],
+        ),
+        (
+            "computer_capability/operator_apps.rs",
+            &["const OPERATOR_WEB_ORIGINS"][..],
+        ),
+    ] {
+        let source = std::fs::read_to_string(root.join(file)).expect("read policy source");
+        let code = source_scan::shipped_code(&source);
+        for definition in definitions {
+            if code.contains(definition) {
+                obsolete.push(format!("{file}: {definition}"));
+            }
+        }
+    }
+    assert!(
+        obsolete.is_empty(),
+        "test-only policy implementations must not shadow the production path:\n{}",
+        obsolete.join("\n")
+    );
+}

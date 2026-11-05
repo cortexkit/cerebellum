@@ -173,13 +173,6 @@ const OPERATOR_APPS: &[OperatorApp] = &[
     },
 ];
 
-/// Web origins the person's browser and the agent's own browser would refuse
-/// for the same reason. Empty: the Alfonso app serves no web interface. An
-/// origin added here must also be checked by both browser planes, which do
-/// not consult this list while it is empty.
-#[allow(dead_code)]
-pub(crate) const OPERATOR_WEB_ORIGINS: &[&str] = &[];
-
 /// Which class of [`OPERATOR_APPS`] `identity`, a bundle identity or an
 /// executable name or path, belongs to, or `None` when it is none of them.
 /// An identity that matches entries of both classes is [`Class::Always`].
@@ -1117,11 +1110,6 @@ mod tests {
         assert!(titled(Some("com.example.Editor"), None).blocked());
         assert!(titled(None, Some("Editor")).blocked());
         assert!(titled(Some("com.example.Editor"), Some("alfonso-desktop")).blocked());
-    }
-
-    #[test]
-    fn the_web_origin_list_is_empty() {
-        assert!(OPERATOR_WEB_ORIGINS.is_empty());
     }
 
     #[test]

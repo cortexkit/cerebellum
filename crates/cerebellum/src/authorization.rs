@@ -520,38 +520,14 @@ impl AuthorizationDecision {
     pub fn action(&self) -> Action {
         self.action
     }
-
-    pub fn evaluate_origin_scope(
-        &self,
-        attempted_origin: &str,
-    ) -> Result<(), AuthorizationDeniedDetail> {
-        evaluate_origin_scope(self, attempted_origin)
-    }
 }
 
-/// A successful dispatch commitment.  Integrations pass this value to the
-/// connector; it carries the exact decision selected before commitment.
+/// A successful dispatch commitment carrying the exact decision accepted by
+/// the grant store at the commit point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationCommitment {
     token: String,
     decision: AuthorizationDecision,
-}
-
-/// A borrowed pre-commit guard that lets a caller construct a decision first
-/// and commit that same decision through the grant store later.
-pub struct AuthorizationCommitGuard<'a> {
-    store: &'a GrantStore,
-    decision: &'a AuthorizationDecision,
-}
-
-impl<'a> AuthorizationCommitGuard<'a> {
-    pub fn new(store: &'a GrantStore, decision: &'a AuthorizationDecision) -> Self {
-        Self { store, decision }
-    }
-
-    pub fn commit(&self) -> Result<AuthorizationCommitment, AuthorizationCommitError> {
-        self.store.commit(self.decision)
-    }
 }
 
 impl AuthorizationCommitment {
@@ -565,13 +541,6 @@ impl AuthorizationCommitment {
 
     pub fn authorization_decision_id(&self) -> &str {
         self.decision.authorization_decision_id()
-    }
-
-    pub fn evaluate_origin_scope(
-        &self,
-        attempted_origin: &str,
-    ) -> Result<(), AuthorizationDeniedDetail> {
-        self.decision.evaluate_origin_scope(attempted_origin)
     }
 }
 
@@ -1053,13 +1022,6 @@ impl GrantStore {
         })
     }
 
-    pub fn commit_decision(
-        &self,
-        decision: &AuthorizationDecision,
-    ) -> Result<AuthorizationCommitment, AuthorizationCommitError> {
-        self.commit(decision)
-    }
-
     fn ensure_valid(&self) -> Result<(), AuthorizationError> {
         if self.invalid {
             Err(AuthorizationError::InvalidGrant)
@@ -1076,38 +1038,6 @@ pub fn authorize(
 ) -> Result<AuthorizationDecision, AuthorizationError> {
     let store = GrantStore::try_new(grants.iter().cloned())?;
     store.authorize(request, attempted_origin)
-}
-
-/// Select one covering grant using a total order independent of provider map
-/// iteration or arrival order.  Grant identity is the primary stable key;
-/// revision and the remaining immutable grant material complete the order.
-pub fn select_covering_grant<'a>(
-    candidates: &'a [ActionGrant],
-    required: Severity,
-    attempted_origin: &str,
-) -> Result<Option<&'a ActionGrant>, AuthorizationError> {
-    select_deterministic_covering_grant(candidates, required, attempted_origin)
-}
-
-pub fn select_deterministic_covering_grant<'a>(
-    candidates: &'a [ActionGrant],
-    required: Severity,
-    attempted_origin: &str,
-) -> Result<Option<&'a ActionGrant>, AuthorizationError> {
-    required.validate()?;
-    let Some(canonical_attempted) = canonical_origin(attempted_origin) else {
-        return Ok(None);
-    };
-    let mut covering = candidates
-        .iter()
-        .filter(|grant| {
-            grant.validate().is_ok()
-                && grant.severity.covers(required)
-                && grant_authorizes_origin(grant, &canonical_attempted)
-        })
-        .collect::<Vec<_>>();
-    covering.sort_by(compare_grants);
-    Ok(covering.into_iter().next())
 }
 
 /// Compute the exact static floor or the single non-type classification-derived
@@ -1294,71 +1224,6 @@ impl AuthorizationDeniedDetail {
     }
 }
 
-pub fn evaluate_origin_scope(
-    decision: &AuthorizationDecision,
-    attempted_origin: &str,
-) -> Result<(), AuthorizationDeniedDetail> {
-    let Some(canonical_attempted) = canonical_origin(attempted_origin) else {
-        return Err(AuthorizationDeniedDetail::OriginScope {
-            attempted_origin: attempted_origin.to_string(),
-            granted_origins: decision.authorized_origins.clone(),
-        });
-    };
-    if decision
-        .authorized_origins
-        .iter()
-        .any(|origin| origin == &canonical_attempted)
-    {
-        Ok(())
-    } else {
-        Err(AuthorizationDeniedDetail::OriginScope {
-            attempted_origin: canonical_attempted,
-            granted_origins: decision.authorized_origins.clone(),
-        })
-    }
-}
-
-/// Retains the unique authorization decision associated with each invocation so
-/// connector transitions can verify which decision authorized them.  A missing
-/// or ambiguous association fails closed.
-#[derive(Debug, Clone, Default)]
-pub struct DecisionBindings {
-    by_invocation: BTreeMap<String, Vec<AuthorizationDecision>>,
-}
-
-impl DecisionBindings {
-    pub fn bind(&mut self, commitment: &AuthorizationCommitment) {
-        self.by_invocation
-            .entry(commitment.decision.invocation_id.clone())
-            .or_default()
-            .push(commitment.decision.clone());
-    }
-
-    pub fn clear_invocation(&mut self, invocation_id: &str) {
-        self.by_invocation.remove(invocation_id);
-    }
-
-    pub fn select_unique(
-        &self,
-        invocation_id: &str,
-    ) -> Result<&AuthorizationDecision, AuthorizationDeniedDetail> {
-        match self.by_invocation.get(invocation_id).map(Vec::as_slice) {
-            Some([decision]) => Ok(decision),
-            Some(_) | None => Err(AuthorizationDeniedDetail::NoGrant),
-        }
-    }
-
-    pub fn select_for_transition(
-        &self,
-        invocation_id: &str,
-        attempted_origin: &str,
-    ) -> Result<&AuthorizationDecision, AuthorizationDeniedDetail> {
-        let decision = self.select_unique(invocation_id)?;
-        evaluate_origin_scope(decision, attempted_origin)?;
-        Ok(decision)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorizationError {
     InvalidSeverityTier,
@@ -1513,19 +1378,14 @@ mod tests {
         let required = Severity::new(COMPOSE, false, false);
         let a = grant("grant-b", 1, &["https://common.test"]);
         let b = grant("grant-a", 1, &["https://common.test"]);
-        let first_candidates = [a.clone(), b.clone()];
-        let second_candidates = [b, a];
-        let first =
-            select_deterministic_covering_grant(&first_candidates, required, "https://common.test")
-                .unwrap()
-                .unwrap();
-        let second = select_deterministic_covering_grant(
-            &second_candidates,
-            required,
-            "https://common.test",
-        )
-        .unwrap()
-        .unwrap();
+        let first_store = GrantStore::new([a.clone(), b.clone()]);
+        let second_store = GrantStore::new([b, a]);
+        let first = first_store
+            .select_covering_grant("conversation", required, "https://common.test")
+            .unwrap();
+        let second = second_store
+            .select_covering_grant("conversation", required, "https://common.test")
+            .unwrap();
         assert_eq!(first.id, "grant-a");
         assert_eq!(first, second);
     }
@@ -1640,41 +1500,6 @@ mod tests {
             .unwrap();
         let commitment = store.commit(&decision).unwrap();
         store.revoke("grant-a").unwrap();
-        assert!(commitment
-            .evaluate_origin_scope("https://allowed.test")
-            .is_ok());
-        assert!(commitment
-            .evaluate_origin_scope("https://other.test")
-            .is_err());
-    }
-
-    #[test]
-    fn origin_scope_denial_preserves_recorded_origin_order() {
-        let store = GrantStore::new([grant(
-            "grant-a",
-            1,
-            &["https://one.test", "https://two.test"],
-        )]);
-        let decision = store
-            .authorize(
-                AuthorizationRequest::navigate(
-                    "conversation",
-                    Severity::new(OBSERVE, false, false),
-                    "invocation-1",
-                    "bind-1",
-                ),
-                "https://one.test",
-            )
-            .unwrap();
-        assert_eq!(
-            decision.evaluate_origin_scope("https://three.test"),
-            Err(AuthorizationDeniedDetail::OriginScope {
-                attempted_origin: "https://three.test".to_string(),
-                granted_origins: vec![
-                    "https://one.test".to_string(),
-                    "https://two.test".to_string()
-                ],
-            })
-        );
+        assert_eq!(commitment.decision(), &decision);
     }
 }

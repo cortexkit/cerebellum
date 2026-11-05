@@ -1,7 +1,6 @@
 use cerebellum::authorization::{
-    effective_severity, target_hazards, Action, ActionGrant, AuthorizationDeniedDetail,
-    AuthorizationError, AuthorizationRequest, GrantStore, HazardClass, Severity, COMPOSE,
-    MUTATE_DURABLE, OBSERVE,
+    effective_severity, target_hazards, Action, ActionGrant, AuthorizationError,
+    AuthorizationRequest, GrantStore, HazardClass, Severity, COMPOSE, MUTATE_DURABLE, OBSERVE,
 };
 use cerebellum::classification::{
     classify_click, AssociatedFormControlInput, ElementClassificationInput, NodeIdentityInput,
@@ -149,7 +148,7 @@ fn activation_target_derivation_covers_composed_descendants_labels_and_disabled_
 }
 
 #[test]
-fn cross_origin_elevation_and_origin_scope_use_immutable_decision() {
+fn cross_origin_elevation_keeps_immutable_grant_decision() {
     let anchor = ElementClassificationInput::new(identity(30), TargetKind::Anchor)
         .destination("http://10.0.0.5/submit");
     let record = classify_click(&NonTypeClassificationInput::new(
@@ -179,14 +178,7 @@ fn cross_origin_elevation_and_origin_scope_use_immutable_decision() {
     assert_eq!(decision.grant_id(), "a");
     let commitment = grants.commit(&decision).unwrap();
     grants.revoke("a").unwrap();
-    assert!(commitment.evaluate_origin_scope("http://10.0.0.5").is_ok());
-    assert_eq!(
-        commitment.evaluate_origin_scope("https://shop.test"),
-        Err(AuthorizationDeniedDetail::OriginScope {
-            attempted_origin: "https://shop.test".to_string(),
-            granted_origins: vec!["http://10.0.0.5".to_string()],
-        })
-    );
+    assert_eq!(commitment.decision(), &decision);
 }
 
 #[test]
