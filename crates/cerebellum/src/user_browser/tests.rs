@@ -117,9 +117,10 @@ struct DoubleState {
     scroll_y: f64,
     /// The top document's height in CSS pixels; 5000 when unset.
     page_height: Option<f64>,
-    /// The page loads 1000 px more content whenever it is scrolled, as an
-    /// infinite feed does.
+    /// The page loads 1000 px more content after a scroll's draw wait, as an
+    /// infinite feed in a background tab does.
     grow_on_scroll: bool,
+    scroll_draw_pending: bool,
     /// Chrome's CDP error for the next plan command with this method.
     fail_method: Option<(&'static str, i64, String)>,
     /// The "Go" button has no type attribute and no form, like the button in
@@ -1009,8 +1010,14 @@ fn execute(
                     None => state.scroll_y + 300.0,
                 };
                 state.scroll_y = target.clamp(0.0, height - 100.0);
-                if state.grow_on_scroll {
-                    state.page_height = Some(height + 1000.0);
+                state.scroll_draw_pending = state.grow_on_scroll;
+                json!({})
+            }
+            "Extension.wait" => {
+                assert_eq!(command["params"], json!({"ms":2000}));
+                if state.scroll_draw_pending {
+                    state.page_height = Some(state.page_height.unwrap_or(5000.0) + 1000.0);
+                    state.scroll_draw_pending = false;
                 }
                 json!({})
             }
@@ -2718,6 +2725,17 @@ async fn user_scroll_moves_the_page_and_the_next_read_still_works() {
     );
     assert!(steps[0].get("frame_id").is_none());
 
+    let plan = sent(&fixture, "cdp").last().unwrap().clone();
+    assert_eq!(
+        plan["commands"],
+        json!([
+            {"method":"Emulation.setFocusEmulationEnabled","params":{"enabled":true}},
+            steps[0],
+            {"method":"Extension.wait","params":{"ms":2000}},
+            {"method":"Page.getLayoutMetrics","params":{}}
+        ])
+    );
+
     // A second scroll needs no new read, and the default amount is 600.
     let (up, _) = fixture.call(1, page_scroll(&tab, "up"), "").await;
     assert_eq!(up["outcome"], "ok", "{up}");
@@ -2736,6 +2754,31 @@ async fn user_scroll_moves_the_page_and_the_next_read_still_works() {
     let (again, cards) = fixture.snapshot(1, &tab, "").await;
     assert_eq!(again["outcome"], "ok", "{again}");
     assert!(cards.is_empty(), "{cards:?}");
+}
+
+/// Feed growth happens during the draw window, not when Chrome acknowledges
+/// the scroll. Both scroll forms must read the final height after that window.
+#[tokio::test]
+async fn user_scroll_reports_page_height_after_the_draw_wait() {
+    for ref_scroll in [false, true] {
+        let fixture = Fixture::new();
+        fixture.state.lock().unwrap().grow_on_scroll = true;
+        let tab = fixture.claim(1).await;
+        let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+        let args = if ref_scroll {
+            json!({"browser":"user","action":"scroll","tab":tab,"ref":reference(&snapshot, "Go")})
+        } else {
+            page_scroll(&tab, "down")
+        };
+        let (reply, _) = fixture.call(1, args, "").await;
+        assert_eq!(reply["outcome"], "ok", "{reply}");
+        assert!(
+            reply["state_text"].as_str().unwrap().contains(
+                "The page grew from 5000 to 6000 px tall during the scroll: more content loaded."
+            ),
+            "ref_scroll={ref_scroll}: {reply}"
+        );
+    }
 }
 
 /// The model reads a scroll's report as plain sentences, not JSON.
@@ -2799,13 +2842,19 @@ async fn user_scroll_brings_a_ref_into_view_in_its_frame() {
         methods,
         [
             "Page.getLayoutMetrics",
+            "Emulation.setFocusEmulationEnabled",
             "DOM.scrollIntoViewIfNeeded",
+            "Extension.wait",
             "Page.getLayoutMetrics"
         ]
     );
-    assert_eq!(steps[1]["params"], json!({"backendNodeId":3}));
-    assert_eq!(steps[1]["frame_id"], "main");
-    assert!(steps[0].get("frame_id").is_none() && steps[2].get("frame_id").is_none());
+    assert_eq!(steps[1]["params"], json!({"enabled":true}));
+    assert_eq!(steps[2]["params"], json!({"backendNodeId":3}));
+    assert_eq!(steps[2]["frame_id"], "main");
+    assert_eq!(steps[3]["params"], json!({"ms":2000}));
+    for index in [0, 1, 3, 4] {
+        assert!(steps[index].get("frame_id").is_none());
+    }
     assert_eq!(plan["interaction_epoch"], 1);
 }
 
@@ -4176,6 +4225,7 @@ fn user_plan_mutation_classification_pins_every_admitted_method() {
         ("Input.insertText", true),
         ("DOM.focus", true),
         ("Emulation.setFocusEmulationEnabled", true),
+        ("Extension.wait", true),
         ("Page.navigate", true),
     ];
     for (method, expected) in methods {

@@ -8,8 +8,16 @@ import { setup } from "./harness.mjs";
 // element into view in its own frame (tested with the frame fixtures in
 // frames.test.mjs). Neither runs page JavaScript or dispatches input events:
 // DOM.scrollIntoViewIfNeeded is already an admitted, input-guarded method.
+// Focus emulation and a local draw wait let background feeds render before
+// the final layout read, without activating the tab.
 const metrics = { method: "Page.getLayoutMetrics", params: {} };
 const pageScroll = { method: "DOM.scrollIntoViewIfNeeded", params: { backendNodeId: 1, rect: { x: 0, y: 600, width: 800, height: 600 } } };
+const scrollPlan = [
+  { method: "Emulation.setFocusEmulationEnabled", params: { enabled: true } },
+  pageScroll,
+  { method: "Extension.wait", params: { ms: 2000 } },
+  metrics,
+];
 
 const sentScrolls = chrome => chrome.calls.filter(call => call[0] === "cdp" && call[2] === "DOM.scrollIntoViewIfNeeded");
 
@@ -27,24 +35,24 @@ test("a page scroll reaches Chrome unchanged and leaves the interaction epoch wh
     }
     return result;
   };
-  const result = await f.run({ ...f.cdp([pageScroll, metrics]), interaction_epoch: epoch });
+  const result = await f.run({ ...f.cdp(scrollPlan), interaction_epoch: epoch });
   assert.equal(result.interaction_epoch, epoch);
-  assert.equal(result.results.length, 2);
+  assert.equal(result.results.length, 4);
   assert.deepEqual(sentScrolls(f.chrome).map(call => [call[1], call[3]]), [[{ tabId: 2 }, pageScroll.params]]);
   assert.equal(await f.epochs.sample(2), epoch);
   // The agent's next scroll and its next read both go ahead under the same epoch.
-  await f.run({ ...f.cdp([pageScroll, metrics]), interaction_epoch: epoch });
+  await f.run({ ...f.cdp(scrollPlan), interaction_epoch: epoch });
   assert.equal((await f.fresh()).interaction_epoch, epoch);
   // The person's own wheel after the scroll's detach still counts, so a
   // further scroll refuses until the agent reads again.
   f.chrome.input(2, { type: "wheel" });
-  await assert.rejects(f.run({ ...f.cdp([pageScroll, metrics]), interaction_epoch: epoch }), { reason: "interaction_epoch_changed" });
+  await assert.rejects(f.run({ ...f.cdp(scrollPlan), interaction_epoch: epoch }), { reason: "interaction_epoch_changed" });
   assert.equal(sentScrolls(f.chrome).length, 2);
 });
 
 test("a scroll needs a read of the tab first", async () => {
   const f = await setup();
-  await assert.rejects(f.run({ ...f.cdp([pageScroll, metrics]), interaction_epoch: 0 }), { reason: "fresh_read_required" });
+  await assert.rejects(f.run({ ...f.cdp(scrollPlan), interaction_epoch: 0 }), { reason: "fresh_read_required" });
   assert.equal(sentScrolls(f.chrome).length, 0);
 });
 
@@ -53,9 +61,9 @@ test("a scroll on a tab this route has not claimed refuses before attaching", as
   await f.fresh();
   const unclaimed = await f.tabs.join(1, "handed");
   f.chrome.calls.length = 0;
-  await assert.rejects(f.run({ ...f.cdp([pageScroll, metrics]), tab: unclaimed.handle, interaction_epoch: 0 }), { reason: "tab_not_claimed" });
+  await assert.rejects(f.run({ ...f.cdp(scrollPlan), tab: unclaimed.handle, interaction_epoch: 0 }), { reason: "tab_not_claimed" });
   const other = { channel: 9, epoch: 4 };
-  await assert.rejects(f.run({ ...f.cdp([pageScroll, metrics]), interaction_epoch: 0 }, other), { reason: "tab_not_claimed" });
+  await assert.rejects(f.run({ ...f.cdp(scrollPlan), interaction_epoch: 0 }, other), { reason: "tab_not_claimed" });
   assert.equal(f.chrome.calls.some(call => call[0] === "attach"), false);
   assert.equal(sentScrolls(f.chrome).length, 0);
 });

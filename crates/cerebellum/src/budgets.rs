@@ -571,6 +571,7 @@ budget!(
         ("committed_document", CDP_STEP_MS, 2),
         ("prepare_frame", FRAME_DISCOVERY_PHASE_MS, 1),
         ("scroll", CDP_STEP_MS, 3),
+        ("draw", 2_000, 1),
         ("journal", STORE_MS, 1),
     ]
 );
@@ -1266,6 +1267,7 @@ mod tests {
                     + COMMITTED_DOCUMENT_MS
                     + FRAME_DISCOVERY_PHASE_MS
                     + 3 * CDP_STEP_MS
+                    + 2_000
                     + STORE_MS,
             ),
             (BROWSER_CLOSE, PREFLIGHT_MS + TEARDOWN_MS + STORE_MS),

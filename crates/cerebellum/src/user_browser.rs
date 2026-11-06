@@ -738,7 +738,7 @@ fn classify_frame_capture<'a>(
 /// can keep running an old unpacked copy that reports the same `version`, and
 /// replies from such a copy must refuse with a reload remedy instead of
 /// failing to decode.
-pub(crate) const EXTENSION_REVISION: u64 = 3;
+pub(crate) const EXTENSION_REVISION: u64 = 4;
 
 const EXTENSION_OUTDATED_REMEDY: &str = "The CortexKit Chrome extension is out of date. Ask the person to reload it in chrome://extensions, then retry.";
 const EXTENSION_NEWER_REMEDY: &str = "The CortexKit Chrome extension is newer than this cerebellum. Ask the person to load the extension copy installed with this cerebellum and reload it in chrome://extensions, or update cerebellum, then retry.";
@@ -4264,6 +4264,9 @@ fn scroll_report(
 /// the root element's box, which starts at the document's origin unless the
 /// page gives `<html>` a margin; the reply reports where the page actually
 /// ended up.
+/// Focus emulation lets a background tab draw without activating it. Keep the
+/// debugger attached for two seconds after scrolling so feeds can load, then
+/// read the resulting height before detach restores normal visibility.
 ///
 /// A scroll only changes what is shown, so like browser:own it needs the
 /// page's tier-1 site grant, the one a snapshot uses. Like other input it
@@ -4308,6 +4311,13 @@ async fn scroll(
         .await?;
     let interaction = Some(snapshot.interaction);
     let metrics = || command("Page.getLayoutMetrics", json!({}));
+    let focus = || {
+        command(
+            "Emulation.setFocusEmulationEnabled",
+            json!({"enabled":true}),
+        )
+    };
+    let draw = || command("Extension.wait", json!({"ms":2000}));
     // Once the scroll step has run, any later failure still reports that
     // the page may have moved.
     let scrolled = |reply: Value| prior_input(reply, true);
@@ -4334,10 +4344,14 @@ async fn scroll(
         step["loader_id"] = json!(frame.loader_id);
         step["session_id"] = json!(frame.session_id);
         let plan = context
-            .cdp(tab, interaction, vec![metrics(), step, metrics()])
+            .cdp(
+                tab,
+                interaction,
+                vec![metrics(), focus(), step, draw(), metrics()],
+            )
             .await?;
         let before = page_position(&plan.results[0]).map_err(scrolled)?;
-        let after = page_position(&plan.results[2]).map_err(scrolled)?;
+        let after = page_position(&plan.results[4]).map_err(scrolled)?;
         (
             format!("Scrolled {reference} into view."),
             before,
@@ -4387,15 +4401,17 @@ async fn scroll(
                 tab,
                 interaction,
                 vec![
+                    focus(),
                     command(
                         "DOM.scrollIntoViewIfNeeded",
                         json!({"backendNodeId":root,"rect":rect}),
                     ),
+                    draw(),
                     metrics(),
                 ],
             )
             .await?;
-        let after = page_position(&plan.results[1]).map_err(scrolled)?;
+        let after = page_position(&plan.results[3]).map_err(scrolled)?;
         (
             format!("Scrolled {direction} {amount} px."),
             before,
