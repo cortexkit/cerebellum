@@ -41,6 +41,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             return;
         };
         self.document_peers
+            .retain(|(_, known_frame, known_loader), _| {
+                known_frame != frame || known_loader != loader
+            });
+        self.document_peers
             .insert((session.into(), frame.into(), loader.into()), address);
         if !address_is_public(address) {
             if let Some(origin) = response
@@ -66,10 +70,16 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 .copied()
         };
         DocumentNetwork {
-            // A document can receive its response in the parent target before
-            // Chrome moves its frame to an out-of-process renderer.
-            remote_ip_address: lookup(session)
-                .or_else(|| self.attachment.as_ref().and_then(|a| lookup(&a.session_id))),
+            // A document can receive its response before moving to another
+            // renderer. Frame and loader identity survive that session change;
+            // each response came from the main page or an attached iframe session.
+            remote_ip_address: lookup(session).or_else(|| {
+                self.document_peers
+                    .iter()
+                    .find_map(|((_, known_frame, known_loader), address)| {
+                        (known_frame == frame && known_loader == loader).then_some(*address)
+                    })
+            }),
             private_origin_seen: classification::canonical_origin_from_url(origin)
                 .is_some_and(|origin| self.private_peer_origins.contains(&origin)),
         }

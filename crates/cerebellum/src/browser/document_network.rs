@@ -23,6 +23,9 @@ impl DocumentNetwork {
                 // into site consent. Retain the name-only rule unless this context
                 // has seen the origin on a private peer. Residual: worker-served
                 // content under a public name never seen private remains public.
+                // Frames are never paused to observe their peer addresses. A first-ever
+                // private out-of-process iframe can remain unknown if its response arrived
+                // before its session was tracked, and keeps the name rule.
                 None => !self.private_origin_seen,
             }
     }

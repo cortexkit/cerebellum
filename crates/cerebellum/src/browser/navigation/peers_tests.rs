@@ -197,52 +197,53 @@ fn connected_private_frames_are_filtered_and_blank_srcdoc_inherit_the_parent_pee
 }
 
 #[test]
-fn oopif_network_observation_is_enabled_before_the_renderer_resumes() {
+fn unpaused_iframe_peer_is_observed_from_its_session_while_idle() {
     let child_reply = |id| json!({"id":id,"sessionId":"child-session","result":{}});
-    let mut child_response = response("child", "child-loader", Some("192.168.1.1"));
-    child_response["sessionId"] = json!("child-session");
     let mut driver = attached_driver([
         json!({"method":"Target.attachedToTarget","sessionId":"session-own","params":{
-            "sessionId":"child-session","waitingForDebugger":true,
+            "sessionId":"child-session","waitingForDebugger":false,
             "targetInfo":{"targetId":"child","type":"iframe"}
         }}),
+        child_reply(1),
         child_reply(2),
         child_reply(3),
-        child_reply(4),
-        child_reply(5),
-        child_response,
-        json!({"id":1,"sessionId":"session-own","result":{"currentIndex":0,"entries":[{"id":1,"url":format!("{ORIGIN}/page")}]}}),
-        json!({"id":6,"sessionId":"session-own","result":{"frameTree":{"frame":{
-            "id":"target-own","loaderId":"root","url":format!("{ORIGIN}/page"),"securityOrigin":ORIGIN
-        }}}}),
     ]);
+    driver.enable_connection_service();
+    assert!(driver.service_connection().unwrap());
+    assert!(
+        driver.pipe.writes.is_empty(),
+        "idle dispatch must not issue commands"
+    );
+    let mut clock = FakeClock::new();
     driver
-        .committed_document_with_clock("route-own", 100, &mut FakeClock::new())
+        .configure_frame_session_tracking(
+            "child-session",
+            clock.now() + Duration::from_millis(100),
+            &mut clock,
+            &mut None,
+        )
         .unwrap();
-    let methods = driver
-        .pipe
-        .writes
-        .iter()
-        .map(|v| v["method"].as_str().unwrap())
-        .collect::<Vec<_>>();
     assert_eq!(
-        methods,
-        [
-            "Page.getNavigationHistory",
-            "Target.setAutoAttach",
-            "Page.enable",
-            "Network.enable",
-            "Runtime.runIfWaitingForDebugger",
-            "Page.getFrameTree"
-        ]
+        driver
+            .pipe
+            .writes
+            .iter()
+            .map(|v| v["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["Target.setAutoAttach", "Page.enable", "Network.enable"]
     );
     assert_eq!(
-        driver.pipe.writes[1]["params"]["waitForDebuggerOnStart"],
-        true
+        driver.pipe.writes[0]["params"]["waitForDebuggerOnStart"],
+        false
     );
+    let mut child_response = response("child", "child-loader", Some("192.168.1.1"));
+    child_response["sessionId"] = json!("child-session");
+    driver.pipe = super::super::tests::FakePipe::with_frames([child_response]);
+    assert!(driver.service_connection().unwrap());
     assert!(!driver
         .document_network("child-session", "child", "child-loader", ORIGIN)
         .is_public(ORIGIN));
+    assert_eq!(driver.pipe.writes.len(), 0);
 }
 
 #[test]
@@ -347,40 +348,148 @@ async fn legacy_all_sites_never_covers_a_connected_private_document() {
 }
 
 #[test]
-fn oopif_attached_after_navigation_ack_resumes_while_waiting_for_load() {
-    let reply = |id| json!({"id":id,"sessionId":"child-session","result":{}});
-    let mut driver = attached_driver([
-        json!({"method":"Target.attachedToTarget","sessionId":"session-own","params":{
-            "sessionId":"child-session","waitingForDebugger":true,
-            "targetInfo":{"targetId":"child","type":"iframe"}
-        }}),
-        reply(1),
-        reply(2),
-        reply(3),
-        reply(4),
-        json!({"method":"Page.loadEventFired","sessionId":"session-own","params":{}}),
-    ]);
-    let mut tracker = Tracker::default();
-    tracker.main_frame_navigated(Some("target-own".into()), format!("{ORIGIN}/page"));
-    let mut clock = FakeClock::new();
-    let deadline = clock.now() + Duration::from_millis(1000);
-    driver
-        .settle_navigation("route-own", &mut tracker, deadline, |_| false, &mut clock)
+fn idle_document_peers_retire_old_loaders_without_forgetting_private_history() {
+    let mut events = Vec::new();
+    for index in 0..300 {
+        let loader = format!("loader-{index}");
+        events.push(response(
+            "target-own",
+            &loader,
+            Some(if index == 0 {
+                "192.168.1.1"
+            } else {
+                "93.184.216.34"
+            }),
+        ));
+        events.push(json!({"method":"Page.frameNavigated","sessionId":"session-own","params":{"frame":{
+            "id":"target-own","loaderId":loader,"url":format!("{ORIGIN}/page"),"securityOrigin":ORIGIN
+        }}}));
+    }
+    let mut driver = attached_driver(events);
+    driver.enable_connection_service();
+    while driver.service_connection().unwrap() {}
+    assert_eq!(driver.document_peers.len(), 1);
+    assert_eq!(driver.private_peer_origins.len(), 1);
+    assert!(driver
+        .document_network("session-own", "target-own", "loader-299", ORIGIN)
+        .is_public(ORIGIN));
+    assert!(!driver
+        .document_network("session-own", "target-own", "unknown-loader", ORIGIN)
+        .is_public(ORIGIN));
+    let metadata = driver.connection_metadata();
+    assert!(metadata.live_records <= 5, "{metadata:?}");
+    assert!(metadata.retained_bytes < 4 * 1024 * 1024, "{metadata:?}");
+}
+
+#[test]
+fn idle_connected_private_commit_requires_permission_at_the_next_read() {
+    let mut events = document_frames(1, "private", Some("127.0.0.1"));
+    events.extend(document_frames(3, "public", Some("93.184.216.34")));
+    let mut driver = attached_driver(events);
+    driver.enable_connection_service();
+    assert!(driver.service_connection().unwrap());
+    assert!(driver.service_connection().unwrap());
+    assert!(driver.pipe.writes.is_empty());
+    let private = driver
+        .committed_document_with_clock("route-own", 100, &mut FakeClock::new())
         .unwrap();
-    assert!(tracker.settled);
+    assert!(matches!(
+        authorize_snapshot(&baseline(), &private),
+        Err(AuthorizationError::NoGrantForAction { .. })
+    ));
+    assert!(driver.service_connection().unwrap());
+    assert!(driver.service_connection().unwrap());
+    let public = driver
+        .committed_document_with_clock("route-own", 100, &mut FakeClock::new())
+        .unwrap();
+    assert!(authorize_snapshot(&baseline(), &public)
+        .unwrap()
+        .is_public_web_baseline());
+}
+
+#[test]
+fn sticky_private_origin_metadata_uses_the_connection_reset_cap_not_eviction() {
+    let mut events = Vec::new();
+    for index in 0..260 {
+        let mut event = response("target-own", &format!("loader-{index}"), Some("127.0.0.1"));
+        event["params"]["response"]["url"] =
+            json!(format!("https://site-{index}.example.com/page"));
+        events.push(event);
+        events.push(json!({"method":"Page.frameNavigated","sessionId":"session-own","params":{"frame":{
+            "id":"target-own","loaderId":format!("loader-{index}"),"url":format!("https://site-{index}.example.com/page")
+        }}}));
+    }
+    let mut driver = attached_driver(events);
+    driver.enable_connection_service();
+    let mut reset = false;
+    loop {
+        match driver.service_connection() {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(NavigationDriveError::ConnectorFailure) => {
+                reset = true;
+                break;
+            }
+            other => panic!("unexpected idle result: {other:?}"),
+        }
+    }
+    assert!(reset);
+    assert!(driver.connection_reset_required);
+    assert!(driver
+        .private_peer_origins
+        .contains("https://site-0.example.com"));
+    assert!(driver.document_peers.len() <= 2);
+    assert!(driver.connection_metadata().live_records > 256);
+}
+
+#[test]
+fn parent_session_peer_survives_an_unpaused_frame_process_swap() {
+    let mut driver = attached_driver([
+        response("child", "child-loader", Some("127.0.0.1")),
+        json!({"method":"Page.frameDetached","sessionId":"session-own","params":{"frameId":"child","reason":"swap"}}),
+        json!({"method":"Target.attachedToTarget","sessionId":"session-own","params":{
+            "sessionId":"child-session","waitingForDebugger":false,"targetInfo":{"targetId":"child","type":"iframe"}
+        }}),
+        json!({"method":"Page.frameNavigated","sessionId":"child-session","params":{"frame":{
+            "id":"child","loaderId":"child-loader","parentId":"target-own","url":format!("{ORIGIN}/frame")
+        }}}),
+    ]);
+    driver.enable_connection_service();
+    while driver.service_connection().unwrap() {}
+    let network = driver.document_network("child-session", "child", "child-loader", ORIGIN);
     assert_eq!(
-        driver
-            .pipe
-            .writes
-            .iter()
-            .map(|v| v["method"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        [
-            "Target.setAutoAttach",
-            "Page.enable",
-            "Network.enable",
-            "Runtime.runIfWaitingForDebugger"
-        ]
+        network.remote_ip_address.map(|ip| ip.to_string()),
+        Some("127.0.0.1".into())
     );
-    assert!(driver.waiting_frame_sessions.is_empty());
+    assert!(!network.is_public(ORIGIN));
+    assert!(driver.pipe.writes.is_empty());
+}
+
+#[test]
+fn child_session_peer_survives_an_unpaused_frame_process_swap() {
+    let attached = |session| {
+        json!({"method":"Target.attachedToTarget","sessionId":"session-own","params":{
+            "sessionId":session,"waitingForDebugger":false,"targetInfo":{"targetId":"child","type":"iframe"}
+        }})
+    };
+    let mut peer = response("child", "child-loader", Some("93.184.216.34"));
+    peer["sessionId"] = json!("old-child");
+    let mut driver = attached_driver([
+        attached("old-child"),
+        peer,
+        json!({"method":"Page.frameDetached","sessionId":"session-own","params":{"frameId":"child","reason":"swap"}}),
+        json!({"method":"Target.detachedFromTarget","sessionId":"session-own","params":{"sessionId":"old-child"}}),
+        attached("new-child"),
+        json!({"method":"Page.frameNavigated","sessionId":"new-child","params":{"frame":{
+            "id":"child","loaderId":"child-loader","parentId":"target-own","url":format!("{ORIGIN}/frame")
+        }}}),
+    ]);
+    driver.enable_connection_service();
+    while driver.service_connection().unwrap() {}
+    let network = driver.document_network("new-child", "child", "child-loader", ORIGIN);
+    assert_eq!(
+        network.remote_ip_address.map(|ip| ip.to_string()),
+        Some("93.184.216.34".into())
+    );
+    assert!(network.is_public(ORIGIN));
 }
