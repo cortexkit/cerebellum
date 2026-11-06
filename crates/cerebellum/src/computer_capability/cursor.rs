@@ -1053,6 +1053,7 @@ impl Coordinator {
         self.end_locked(&notice.agent, &mut drawn);
         drop(drawn);
         self.finish_end(&notice.agent);
+        crate::turn_hints::HINT_GAUGES.matched();
         true
     }
 

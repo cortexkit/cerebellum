@@ -9301,6 +9301,11 @@ fn record_engram_catalog_write() {
 /// - `turnEndedReceived`, `turnEndedRefused`, and `turnEndedMatchedBadge`, the
 ///   process-lifetime counts for the quiet `session.turn_ended` adapter, plus
 ///   `turnEndedLastAtMs`, its last admitted event timestamp or `null`;
+/// - on macOS, the live turn-hint subscription's process-lifetime counts:
+///   `turnHintSubscriptionsOpened`, `turnHintOpenFailures`,
+///   `turnHintSubscriptionsClosed`, `turnHintNoticesReceived` and
+///   `turnHintBadgesEnded`, plus `turnHintActiveBadges` (badges keeping it
+///   open) and `turnHintSubscriptionOpen`;
 /// - `userBrowserConnections` and `userBrowserDisconnects`, how many Chrome
 ///   extension native-host connections were accepted (after the host's hello
 ///   was verified) and how many of them ended; `userBrowserConnectedAtMs` and
@@ -9384,6 +9389,8 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
         };
         metrics.insert("turnEndedLastAtMs".into(), last_at_ms);
         USER_BROWSER_CONNECTION_GAUGES.insert_into(metrics);
+        #[cfg(any(target_os = "macos", test))]
+        crate::turn_hints::HINT_GAUGES.insert_into(metrics);
         metrics.insert(
             "crashReportLeftovers".to_string(),
             serde_json::json!({"removed": counts.removed, "failed": counts.failed}),

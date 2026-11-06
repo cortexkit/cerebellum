@@ -21,6 +21,66 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 const LINGER: Duration = Duration::from_secs(30);
 const RETRY: Duration = Duration::from_secs(1);
 
+/// Process-lifetime counts for the live hint subscription, reported in health
+/// so a live check can tell whether hints arrived and whether the connection
+/// closed when the last badge went idle. Identifier-free by design.
+#[derive(Default)]
+pub(crate) struct HintGauges {
+    opened: std::sync::atomic::AtomicU64,
+    open_failures: std::sync::atomic::AtomicU64,
+    closed: std::sync::atomic::AtomicU64,
+    received: std::sync::atomic::AtomicU64,
+    matched: std::sync::atomic::AtomicU64,
+    open_now: std::sync::atomic::AtomicBool,
+    active_badges: std::sync::atomic::AtomicU64,
+}
+
+pub(crate) static HINT_GAUGES: HintGauges = HintGauges {
+    opened: std::sync::atomic::AtomicU64::new(0),
+    open_failures: std::sync::atomic::AtomicU64::new(0),
+    closed: std::sync::atomic::AtomicU64::new(0),
+    received: std::sync::atomic::AtomicU64::new(0),
+    matched: std::sync::atomic::AtomicU64::new(0),
+    open_now: std::sync::atomic::AtomicBool::new(false),
+    active_badges: std::sync::atomic::AtomicU64::new(0),
+};
+
+impl HintGauges {
+    pub(crate) fn matched(&self) {
+        self.matched
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn insert_into(&self, metrics: &mut serde_json::Map<String, serde_json::Value>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        for (name, value) in [
+            ("turnHintSubscriptionsOpened", self.opened.load(Relaxed)),
+            ("turnHintOpenFailures", self.open_failures.load(Relaxed)),
+            ("turnHintSubscriptionsClosed", self.closed.load(Relaxed)),
+            ("turnHintNoticesReceived", self.received.load(Relaxed)),
+            ("turnHintBadgesEnded", self.matched.load(Relaxed)),
+            ("turnHintActiveBadges", self.active_badges.load(Relaxed)),
+        ] {
+            metrics.insert(name.into(), serde_json::json!(value));
+        }
+        metrics.insert(
+            "turnHintSubscriptionOpen".into(),
+            serde_json::json!(self.open_now.load(Relaxed)),
+        );
+    }
+
+    fn set_connection(&self, connection: &Option<Connection>, was_open: &mut bool) {
+        let open = connection.is_some();
+        if *was_open && !open {
+            self.closed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        *was_open = open;
+        self.open_now
+            .store(open, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub(crate) trait Transport: Send + Sync {
     fn open(&self) -> BoxFuture<'_, Result<Connection, String>>;
 }
@@ -90,6 +150,7 @@ async fn run(
     let mut opening: Option<Opening> = None;
     let mut linger = None;
     let mut retry = None;
+    let mut was_open = false;
     loop {
         let now = Instant::now();
         let was_active = !active.is_empty();
@@ -116,6 +177,10 @@ async fn run(
             opening = Some(Opening(tokio::spawn(async move { transport.open().await })));
             retry = None;
         }
+        HINT_GAUGES.set_connection(&connection, &mut was_open);
+        HINT_GAUGES
+            .active_badges
+            .store(active.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let deadline = active
             .values()
             .copied()
@@ -144,8 +209,18 @@ async fn run(
             } => {
                 opening = None;
                 match result {
-                    Some(Ok(Ok(bus))) => connection = Some(bus),
-                    _ => retry = Some(Instant::now() + RETRY),
+                    Some(Ok(Ok(bus))) => {
+                        HINT_GAUGES
+                            .opened
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        connection = Some(bus);
+                    }
+                    _ => {
+                        HINT_GAUGES
+                            .open_failures
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        retry = Some(Instant::now() + RETRY);
+                    }
                 }
             },
             notice = async {
@@ -155,6 +230,9 @@ async fn run(
                 }
             } => {
                 if let Some(notice) = notice {
+                    HINT_GAUGES
+                        .received
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     receive(notice);
                 } else {
                     connection = None;

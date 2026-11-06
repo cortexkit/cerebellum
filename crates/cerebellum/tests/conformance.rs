@@ -344,6 +344,15 @@ async fn health_check_returns_insulated_report() {
             // The background-mode preview's work counts, beside the other
             // agent-cursor gauges, which only macOS reports.
             #[cfg(target_os = "macos")]
+            for key in [
+                "turnHintSubscriptionsOpened",
+                "turnHintSubscriptionsClosed",
+                "turnHintNoticesReceived",
+                "turnHintBadgesEnded",
+            ] {
+                assert!(obj[key].is_u64(), "metrics include {key}");
+            }
+            #[cfg(target_os = "macos")]
             for key in ["previewCaptureRequests", "previewFramesWritten"] {
                 assert!(obj[key].is_u64(), "metrics include {key}");
             }
