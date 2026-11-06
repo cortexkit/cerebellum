@@ -776,6 +776,11 @@ pub struct DeskState {
     pub selections: Vec<(u64, (usize, usize))>,
     pub accepts_selection: bool,
     pub applies_selection: bool,
+    /// Answer element facts for an element found only in `roots` (its role
+    /// alone), so parent walks over the read tree work. A suite that clears
+    /// `elements` to make facts unreadable must also turn this off, or the
+    /// role-only facts read as a safe element.
+    pub facts_from_roots: bool,
     pub hit_scopes: Vec<HitScope>,
     pub focus_reads: usize,
     /// The target application's focused window: a token and its title.
@@ -849,6 +854,7 @@ impl Desk {
             selections: Vec::new(),
             accepts_selection: true,
             applies_selection: true,
+            facts_from_roots: true,
             hit_scopes: Vec::new(),
             focus_reads: 0,
             window: None,
@@ -976,6 +982,9 @@ impl AppStateSource for Desk {
             .get(&token)
             .map(|element| element.facts.clone())
             .or_else(|| {
+                if !state.facts_from_roots {
+                    return None;
+                }
                 fn role(nodes: &[RawElement], token: u64) -> Option<ElementFacts> {
                     for node in nodes {
                         if token_of(&node.handle) == Some(token) {

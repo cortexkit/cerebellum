@@ -424,7 +424,9 @@ async fn scroll_requires_real_cursor_recipient_and_safe_ax_at_placement() {
                     support::facts("AXSecureTextField", &[])
             }
             _ => {
-                rig.desk.state().elements.clear();
+                let mut desk = rig.desk.state();
+                desk.elements.clear();
+                desk.facts_from_roots = false;
             }
         }
         let reply = rig
@@ -461,7 +463,9 @@ async fn scroll_rechecks_the_current_cursor_and_sensitivity_at_the_post() {
                         support::facts("AXSecureTextField", &[])
                 }
                 _ => {
-                    desk.state().elements.clear();
+                    let mut desk = desk.state();
+                    desk.elements.clear();
+                    desk.facts_from_roots = false;
                 }
             })));
         let reply = rig
