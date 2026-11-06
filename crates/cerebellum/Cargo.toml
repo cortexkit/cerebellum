@@ -153,3 +153,7 @@ required-features = ["desk-probe"]
 [[example]]
 name = "mouse_up_routing_probe"
 required-features = ["desk-probe"]
+
+[[example]]
+name = "cdp_idle_drain"
+test = true
