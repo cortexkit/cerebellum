@@ -996,6 +996,10 @@ mod growth_tests {
         )));
         cerebellum_core::private_fs::create_dir_all(&scratch.0).unwrap();
         let store = Arc::new(PrivateContent::open_at(scratch.0.join(FILE_NAME), 1));
+        // This test is about the size cap, not the write deadline: a loaded
+        // test run can take longer than the production deadline to fsync,
+        // which would fail the store closed for the wrong reason.
+        store.set_write_deadline(crate::test_support::HANG_GUARD);
         let principal = subc_protocol::Principal::Reserved {
             module_id: "prefrontal-core".into(),
         };
