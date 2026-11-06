@@ -197,6 +197,27 @@ pub struct CdpResponse {
     pub abandoned: bool,
 }
 
+/// Conservative capacity accounting for retained JSON, including map nodes.
+/// It measures metadata ownership, not renderer memory or transient decoding.
+pub(crate) fn retained_json_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(s) => 64 + s.capacity(),
+        Value::Array(values) => {
+            64 + values.capacity() * std::mem::size_of::<Value>()
+                + values.iter().map(retained_json_bytes).sum::<usize>()
+        }
+        Value::Object(values) => retained_object_bytes(values),
+        _ => 64,
+    }
+}
+
+pub(crate) fn retained_object_bytes(values: &Map<String, Value>) -> usize {
+    values
+        .iter()
+        .map(|(k, v)| 256 + k.capacity() + retained_json_bytes(v))
+        .sum()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CdpEvent {
     pub method: String,
@@ -239,6 +260,24 @@ pub struct IdentityMap {
     frames: BTreeMap<String, String>,
 }
 impl IdentityMap {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.targets
+            .iter()
+            .map(|(key, a)| {
+                256 + key.capacity()
+                    + a.target_id.capacity()
+                    + a.session_id.capacity()
+                    + a.context_key.capacity()
+                    + a.frame_ids.iter().map(|s| 24 + s.capacity()).sum::<usize>()
+            })
+            .sum::<usize>()
+            + self
+                .sessions
+                .iter()
+                .chain(self.frames.iter())
+                .map(|(k, v)| 128 + k.capacity() + v.capacity())
+                .sum::<usize>()
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -338,6 +377,34 @@ impl Default for CdpTransport {
 }
 
 impl CdpTransport {
+    pub(crate) fn retained_metadata(&self) -> (usize, usize, usize) {
+        let abandoned = self
+            .completed
+            .values()
+            .filter(|c| matches!(c, Completion::Abandoned { .. }))
+            .count();
+        let bytes = self
+            .pending
+            .values()
+            .map(|p| {
+                256 + p.command.method.capacity()
+                    + p.command.session_id.as_ref().map_or(0, String::capacity)
+            })
+            .sum::<usize>()
+            + self
+                .completed
+                .values()
+                .map(|c| {
+                    128 + match c {
+                        Completion::Received => 0,
+                        Completion::Abandoned { session_id } => {
+                            session_id.as_ref().map_or(0, String::capacity)
+                        }
+                    }
+                })
+                .sum::<usize>();
+        (self.pending.len(), abandoned, bytes)
+    }
     pub fn new() -> Self {
         Self {
             next_id: 1,

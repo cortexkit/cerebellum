@@ -246,6 +246,11 @@ pub enum PipeRead {
 }
 
 pub trait CdpPipeIo {
+    /// A readiness-only duplicate. Its owner must never read protocol bytes.
+    #[cfg(unix)]
+    fn readiness(&self) -> io::Result<Option<std::os::fd::OwnedFd>> {
+        Ok(None)
+    }
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()>;
     /// Write before an absolute deadline, or refuse without a blocking write.
     /// Teardown must still be able to kill a browser that stopped reading.
@@ -542,6 +547,10 @@ impl UnixCdpPipe {
 
 #[cfg(unix)]
 impl CdpPipeIo for UnixCdpPipe {
+    fn readiness(&self) -> io::Result<Option<std::os::fd::OwnedFd>> {
+        self.response.try_clone().map(|socket| Some(socket.into()))
+    }
+
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.command.write_all(bytes)
     }

@@ -199,6 +199,14 @@ struct ClosedHandoff {
     outcome: HandoffOutcome,
 }
 
+struct HandoffPollPending<'a>(&'a AtomicBool);
+
+impl Drop for HandoffPollPending<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HandoffState {
     Open(Handoff),
@@ -561,6 +569,31 @@ pub enum BrowserScrollTarget {
 }
 
 pub trait OwnedBrowserProcess: Send {
+    fn connection_quiet_epoch(&self) -> u64 {
+        0
+    }
+    /// A stopped browser alone does not prove its connection owner has stopped
+    /// using the profile. Keep the handle in failed-reap recovery until joined.
+    fn has_unjoined_connection_owner(&self) -> bool {
+        false
+    }
+    fn enable_connection_service(&mut self) {}
+
+    fn connection_metadata(&mut self) -> crate::browser::navigation::ConnectionMetadata {
+        crate::browser::navigation::ConnectionMetadata::default()
+    }
+
+    /// Readiness for the session's sole connection owner, never a second reader.
+    #[cfg(unix)]
+    fn connection_readiness(&self) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+        Ok(None)
+    }
+
+    /// Apply one bounded read turn without a foreground terminal or authority.
+    fn service_connection(&mut self) -> Result<bool, NavigationDriveError> {
+        Err(NavigationDriveError::Unavailable)
+    }
+
     /// Front the process-owned page without exposing a general CDP command seam.
     fn present(
         &mut self,
@@ -1746,6 +1779,9 @@ struct SessionCell {
     wake: Condvar,
     /// LD: the process, and with it the CDP pipe.
     driver: Mutex<Option<Box<dyn OwnedBrowserProcess>>>,
+    #[cfg(unix)]
+    worker: OnceLock<connection_worker::ConnectionWorker>,
+    handoff_poll_pending: AtomicBool,
     /// Set once when the browser is established and never changed, so
     /// shutdown can fire it without taking any lock.
     killer: OnceLock<Arc<dyn BrowserKiller>>,
@@ -1758,6 +1794,38 @@ struct SessionCell {
 }
 
 impl SessionCell {
+    /// A whole handoff job shares one owner turn, not separate mailbox entries
+    /// for cookie names, committed URL and credential-field classification.
+    fn handoff_job<T: Send + 'static>(
+        &self,
+        terminal: Option<Arc<crate::TerminalArbiter>>,
+        call: impl FnOnce(&mut dyn OwnedBrowserProcess) -> T + Send + 'static,
+    ) -> Result<T, NavigationDriveError> {
+        let _scope = DriveScope::enter(terminal, &self.watch);
+        #[cfg(unix)]
+        if let Some(worker) = self.worker.get() {
+            return worker.invoke(false, move |process| {
+                Ok::<_, NavigationDriveError>(call(process))
+            });
+        }
+        let mut driver = self
+            .driver()
+            .map_err(|_| NavigationDriveError::StateUnavailable)?;
+        if !self
+            .meta()
+            .map_err(|_| NavigationDriveError::StateUnavailable)?
+            .admits_calls()
+        {
+            return Err(NavigationDriveError::Unavailable);
+        }
+        Ok(call(
+            driver
+                .as_mut()
+                .ok_or(NavigationDriveError::Unavailable)?
+                .as_mut(),
+        ))
+    }
+
     fn launching(route_key: &str, browser_session_id: String) -> Self {
         Self {
             route_key: route_key.to_string(),
@@ -1785,6 +1853,9 @@ impl SessionCell {
             }),
             wake: Condvar::new(),
             driver: Mutex::new(None),
+            #[cfg(unix)]
+            worker: OnceLock::new(),
+            handoff_poll_pending: AtomicBool::new(false),
             killer: OnceLock::new(),
             exit_probe: OnceLock::new(),
             watch: Arc::new(DriverWatch::default()),
@@ -1843,6 +1914,9 @@ pub struct BrowserSessions {
     /// Where a shutdown teardown that outlives its plan is counted as a
     /// detached worker until it really ends. Unset where no health is kept.
     health: Option<Arc<cerebellum_core::health::HealthState>>,
+    /// Read only at session creation; an established pipe never changes owner.
+    #[cfg(unix)]
+    legacy_ownership: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -1918,14 +1992,28 @@ impl OperationGuard {
 
     /// Run one driver call on this operation's own browser.
     ///
-    /// LD is taken first, with no other lock held; the fence is then checked
-    /// under the meta lock, which is dropped before the call, so the CDP call
-    /// holds this session's LD and nothing else.
+    /// Check the admission fence before handing work to the connection owner.
+    /// Legacy sessions keep the driver mutex across the call. Neither path
+    /// retains a meta or registry lock while waiting for browser work.
     fn drive<T, E>(
         &mut self,
         refused: impl Fn(NavigationDriveError) -> E,
         call: impl FnOnce(&mut dyn OwnedBrowserProcess) -> Result<T, E>,
     ) -> Result<T, E> {
+        #[cfg(unix)]
+        if let Some(worker) = self.cell.worker.get() {
+            let meta = self
+                .cell
+                .meta()
+                .map_err(|_| refused(NavigationDriveError::StateUnavailable))?;
+            if !meta.admits_calls() {
+                return Err(refused(NavigationDriveError::Unavailable));
+            }
+            drop(meta);
+            let mut handle = worker.clone();
+            let _context = DriveScope::enter(self.terminal.clone(), &self.cell.watch);
+            return call(&mut handle);
+        }
         let mut driver = self
             .cell
             .driver()
@@ -2314,6 +2402,32 @@ fn close_open_handoff(
 }
 
 impl BrowserSessions {
+    /// Count-only observation for isolated live probes. The supplied clock runs
+    /// on the owner thread; this performs no browser command or lease renewal.
+    #[doc(hidden)]
+    #[cfg(unix)]
+    pub fn connection_observation_for_test(
+        &self,
+        route: &str,
+        clock: fn() -> u64,
+    ) -> Option<serde_json::Value> {
+        let cell = self.active_cell(route).ok()??;
+        let worker = cell.worker.get()?;
+        let (cpu, metadata) = worker
+            .measure(move |process| (clock(), process.connection_metadata()))
+            .ok()?;
+        let metrics = worker.metrics();
+        Some(json!({"thread_cpu_ns":cpu,"metadata":metadata,
+            "ready_wakes":metrics.ready_wakes.load(Ordering::Relaxed),
+            "longest_quantum_ns":metrics.longest_quantum_ns.load(Ordering::Relaxed),
+            "longest_readable_streak_ns":metrics.longest_readable_streak_ns.load(Ordering::Relaxed)}))
+    }
+    #[doc(hidden)]
+    #[cfg(unix)]
+    pub fn with_continuous_servicing(self, enabled: bool) -> Self {
+        self.legacy_ownership.store(!enabled, Ordering::Release);
+        self
+    }
     /// A handoff that ends without an observed login (it expired, or the
     /// caller closed it) may still have ended signed in: the person can finish
     /// signing in between checks, or on a page the checks do not recognize.
@@ -2613,6 +2727,46 @@ impl BrowserSessions {
             drop(driver);
             return Err(UnestablishedBrowser { process, cleanup });
         }
+        #[cfg(unix)]
+        let process = if !self.legacy_ownership.load(Ordering::Acquire) {
+            let admission = Arc::downgrade(&cell);
+            let failure = Arc::downgrade(&cell);
+            match connection_worker::ConnectionWorker::start(
+                process,
+                Arc::new(move || {
+                    admission
+                        .upgrade()
+                        .is_some_and(|cell| recovered(cell.meta()).admits_calls())
+                }),
+                Arc::new(move || {
+                    if let Some(cell) = failure.upgrade() {
+                        {
+                            let mut meta = recovered(cell.meta());
+                            meta.terminal
+                                .get_or_insert(BrowserSessionTerminalOutcome::ConnectorFailure);
+                            meta.backstop_fired = true;
+                        }
+                        if let Some(killer) = cell.killer.get() {
+                            let _ = killer.kill_exact_generation();
+                        }
+                        cell.notify();
+                    }
+                }),
+            ) {
+                Ok(worker) => {
+                    let _ = cell.worker.set(worker.clone());
+                    Box::new(worker) as Box<dyn OwnedBrowserProcess>
+                }
+                Err(connection_worker::StartFailure::Unsupported(process)) => process,
+                Err(connection_worker::StartFailure::Unavailable(process)) => {
+                    drop(meta);
+                    drop(driver);
+                    return Err(UnestablishedBrowser { process, cleanup });
+                }
+            }
+        } else {
+            process
+        };
         *driver = Some(process);
         if let Some(killer) = killer {
             let _ = cell.killer.set(killer);
@@ -2770,38 +2924,44 @@ impl BrowserSessions {
             self.admit(&cell, &mut meta, true)
         };
 
-        let (opening_cookie_names, saw_credential_field) = {
-            let mut driver = cell.driver().map_err(|_| PresentRefusal::NoSession)?;
-            let process = driver.as_mut().ok_or(PresentRefusal::NoSession)?;
-            let _context = DriveScope::enter(admission.terminal.clone(), &cell.watch);
-            let current_url = process
-                .main_frame_url(route_key, deadline_ms)
-                .map_err(|error| PresentRefusal::PresentFailed {
-                    error_text: navigation_drive_error_text(error),
-                })?;
-            let current_origin = main_frame_origin(&current_url);
-            if current_origin != origin {
-                return Err(PresentRefusal::OriginMismatch { current_origin });
-            }
-            process.present(route_key, deadline_ms).map_err(|error| {
-                PresentRefusal::PresentFailed {
-                    error_text: navigation_drive_error_text(error),
+        let job_route = route_key.to_owned();
+        let job_origin = origin.to_owned();
+        let (opening_cookie_names, saw_credential_field) = cell
+            .handoff_job(admission.terminal.clone(), move |process| {
+                let route_key = job_route.as_str();
+                let origin = job_origin.as_str();
+                let current_url =
+                    process
+                        .main_frame_url(route_key, deadline_ms)
+                        .map_err(|error| PresentRefusal::PresentFailed {
+                            error_text: navigation_drive_error_text(error),
+                        })?;
+                let current_origin = main_frame_origin(&current_url);
+                if current_origin != origin {
+                    return Err(PresentRefusal::OriginMismatch { current_origin });
                 }
-            })?;
-            let cookie_names = process
-                .cookie_names_for_origin(route_key, origin, deadline_ms)
-                .map_err(|error| PresentRefusal::PresentFailed {
-                    error_text: navigation_drive_error_text(error),
+                process.present(route_key, deadline_ms).map_err(|error| {
+                    PresentRefusal::PresentFailed {
+                        error_text: navigation_drive_error_text(error),
+                    }
                 })?;
-            // A quick sign-in can finish before the first background tick. Keep
-            // the credential step seen at handover as the classifier's baseline.
-            // An unreadable field is not evidence of a credential step; later
-            // polls can still observe it without refusing the window handover.
-            let credential_field = process
-                .has_credential_field(route_key, deadline_ms)
-                .unwrap_or(false);
-            (cookie_names, credential_field)
-        };
+                let cookie_names = process
+                    .cookie_names_for_origin(route_key, origin, deadline_ms)
+                    .map_err(|error| PresentRefusal::PresentFailed {
+                        error_text: navigation_drive_error_text(error),
+                    })?;
+                // A quick sign-in can finish before the first background tick. Keep
+                // the credential step seen at handover as the classifier's baseline.
+                // An unreadable field is not evidence of a credential step; later
+                // polls can still observe it without refusing the window handover.
+                let credential_field = process
+                    .has_credential_field(route_key, deadline_ms)
+                    .unwrap_or(false);
+                Ok((cookie_names, credential_field))
+            })
+            .map_err(|error| PresentRefusal::PresentFailed {
+                error_text: navigation_drive_error_text(error),
+            })??;
 
         let mut meta = cell.meta().map_err(|_| PresentRefusal::NoSession)?;
         if !meta.admits_calls() {
@@ -2913,7 +3073,7 @@ impl BrowserSessions {
         let Ok(Some(cell)) = self.active_cell(route_key) else {
             return HandoffPollResult::Gone;
         };
-        let (mut admission, origin, opening_cookie_names, saw_credential_field) = {
+        let (mut admission, origin, opening_cookie_names, saw_credential_field, expires_in_ms) = {
             let Ok(mut meta) = cell.meta() else {
                 return HandoffPollResult::Gone;
             };
@@ -2938,48 +3098,48 @@ impl BrowserSessions {
             let origin = handoff.origin.clone();
             let opening_cookie_names = handoff.opening_cookie_names.clone();
             let saw_credential_field = handoff.saw_credential_field;
+            let expires_in_ms = remaining_ms(handoff.expires_at, clock.now());
             if !meta.admits_calls() {
                 return HandoffPollResult::Gone;
             }
-            meta.lease.renew(clock);
+            if cell
+                .handoff_poll_pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return HandoffPollResult::Open;
+            }
             let admission = self.admit(&cell, &mut meta, false);
             (
                 admission,
                 origin,
                 opening_cookie_names,
                 saw_credential_field,
+                expires_in_ms,
             )
         };
 
-        let (current_cookie_names, main_frame_url, has_credential_field_now) = {
-            let Ok(mut driver) = cell.driver() else {
-                return HandoffPollResult::Gone;
+        let _pending = HandoffPollPending(&cell.handoff_poll_pending);
+        let job_route = route_key.to_owned();
+        let job_origin = origin.clone();
+        let job_cell = Arc::downgrade(&cell);
+        let deadline = Instant::now() + Duration::from_millis(deadline_ms.min(expires_in_ms));
+        let polled = cell.handoff_job(admission.terminal.clone(), move |process| {
+            let remaining = || -> Result<u64, NavigationDriveError> {
+                let cell = job_cell.upgrade().ok_or(NavigationDriveError::Unavailable)?;
+                let meta = cell.meta().map_err(|_| NavigationDriveError::StateUnavailable)?;
+                if !meta.admits_calls() || !matches!(meta.handoff.as_ref(), Some(HandoffState::Open(handoff)) if handoff.generation == generation) {
+                    return Err(NavigationDriveError::Unavailable);
+                }
+                let left = deadline.saturating_duration_since(Instant::now()).as_millis() as u64;
+                if left == 0 { return Err(NavigationDriveError::Unavailable); }
+                Ok(left)
             };
-            let Some(process) = driver.as_mut() else {
-                return HandoffPollResult::Gone;
-            };
-            // The poll runs outside any call, so it has no terminal decision
-            // and is not gated. Its commands are still recorded in flight, so
-            // one that runs past its own cap is caught by the write backstop.
-            let _context = DriveScope::enter(admission.terminal.clone(), &cell.watch);
-            let Ok(current_cookie_names) =
-                process.cookie_names_for_origin(route_key, &origin, deadline_ms)
-            else {
-                return HandoffPollResult::Open;
-            };
-            let Ok(main_frame_url) = process.main_frame_url(route_key, deadline_ms) else {
-                return HandoffPollResult::Open;
-            };
-            let Ok(has_credential_field_now) = process.has_credential_field(route_key, deadline_ms)
-            else {
-                return HandoffPollResult::Open;
-            };
-            (
-                current_cookie_names,
-                main_frame_url,
-                has_credential_field_now,
-            )
-        };
+            let names = process.cookie_names_for_origin(&job_route, &job_origin, remaining()?)?;
+            let url = process.main_frame_url(&job_route, remaining()?)?;
+            let fields = process.has_credential_field(&job_route, remaining()?)?;
+            Ok::<_, NavigationDriveError>((names, url, fields))
+        });
 
         let Ok(mut meta) = cell.meta() else {
             return HandoffPollResult::Gone;
@@ -2991,6 +3151,18 @@ impl BrowserSessions {
         if !still_open || !meta.admits_calls() {
             return HandoffPollResult::Gone;
         }
+        if matches!(meta.handoff.as_ref(), Some(HandoffState::Open(handoff)) if clock.now() >= handoff.expires_at)
+        {
+            if let Some(HandoffState::Open(handoff)) = meta.handoff.as_ref() {
+                self.note_possible_login(handoff);
+            }
+            return close_open_handoff(&mut meta.handoff, HandoffOutcome::Expired)
+                .map_or(HandoffPollResult::Gone, HandoffPollResult::Closed);
+        }
+        let Ok(Ok((current_cookie_names, main_frame_url, has_credential_field_now))) = polled
+        else {
+            return HandoffPollResult::Open;
+        };
         let cookie_names_added = current_cookie_names
             .difference(&opening_cookie_names)
             .count();
@@ -4011,7 +4183,8 @@ impl BrowserSessions {
         process_control_failure: Option<ProcessControlFailure>,
     ) {
         let retain_process = process_control_failure
-            .is_some_and(|failure| failure.step == ProcessControlStep::GenerationUnverified);
+            .is_some_and(|failure| failure.step == ProcessControlStep::GenerationUnverified)
+            || process.has_unjoined_connection_owner();
         let mut process = Some(process);
         // The retained record is built before the registry lock is taken.
         let mut record = recovered(cell.meta()).record(&cell.browser_session_id);
@@ -4077,8 +4250,8 @@ impl BrowserSessions {
         cell.notify();
         self.registry.1.notify_all();
         // Release remaining ownership only after every lock is released. An
-        // unverified child stays in recovery because its destructor can kill and
-        // wait; all other process handles keep their normal destructor cleanup.
+        // unverified child or unjoined connection owner stays in recovery;
+        // all other process handles keep their normal destructor cleanup.
         drop(removed);
         drop(cleanup);
         if retain_process {
@@ -8296,3 +8469,6 @@ mod tests {
         );
     }
 }
+#[doc(hidden)]
+#[cfg(unix)]
+pub mod connection_worker;

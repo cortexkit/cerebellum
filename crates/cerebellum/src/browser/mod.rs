@@ -885,8 +885,116 @@ pub struct Tracker {
     /// Why the committed main-frame navigation failed, when the browser
     /// committed its own error page in place of the requested document.
     main_frame_failure: Option<String>,
+    loader_fence: Option<(u64, Option<String>)>,
+    committed_loader: Option<(String, u64)>,
 }
 impl Tracker {
+    pub(crate) fn begin_loader_fence(&mut self, generation: u64) {
+        self.loader_fence = Some((generation, None));
+    }
+
+    pub(crate) fn expect_loader(&mut self, loader: String) {
+        if self
+            .committed_loader
+            .as_ref()
+            .is_some_and(|(committed, _)| committed != &loader)
+        {
+            let fence = self.loader_fence.clone();
+            let started = self.lifecycle.iter().any(|s| s == "navigation_started");
+            *self = Self::default();
+            self.loader_fence = fence;
+            if started {
+                self.token("navigation_started");
+            }
+        }
+        if let Some((_, expected)) = self.loader_fence.as_mut() {
+            *expected = Some(loader);
+        }
+    }
+
+    pub(crate) fn accepts_loader(&self, loader: Option<&str>) -> bool {
+        self.loader_fence
+            .as_ref()
+            .and_then(|(_, expected)| expected.as_deref())
+            .is_none_or(|expected| loader == Some(expected))
+    }
+
+    pub(crate) fn commit_loader(&mut self, loader: Option<&str>, generation: u64) -> bool {
+        let Some((started, _)) = &self.loader_fence else {
+            return true;
+        };
+        let Some(loader) = loader else { return false };
+        if generation <= *started || !self.accepts_loader(Some(loader)) {
+            return false;
+        }
+        self.committed_loader = Some((loader.to_owned(), generation));
+        self.load_observed = false;
+        self.settled = false;
+        self.quiet_since = None;
+        self.lifecycle
+            .retain(|s| s != "load" && s != "network_quiet");
+        true
+    }
+
+    pub(crate) fn loader_load(&mut self, loader: &str, generation: u64, now: Instant) {
+        if self
+            .loader_fence
+            .as_ref()
+            .is_some_and(|(started, _)| generation > *started)
+            && self.accepts_loader(Some(loader))
+            && self
+                .committed_loader
+                .as_ref()
+                .is_some_and(|(committed, gen)| committed == loader && *gen == generation)
+        {
+            self.load(now);
+        }
+    }
+
+    pub(crate) fn has_loader_fence(&self) -> bool {
+        self.loader_fence.is_some()
+    }
+    pub(crate) fn retained_metadata(&self) -> (usize, usize) {
+        let requests = self.pending_requests.len() + self.document_request_frames.len();
+        let bytes = self
+            .pending_requests
+            .keys()
+            .map(|k| 256 + k.capacity())
+            .sum::<usize>()
+            + self
+                .document_request_frames
+                .iter()
+                .chain(self.pending_document_failures.iter())
+                .map(|(k, v)| 256 + k.capacity() + v.capacity())
+                .sum::<usize>()
+            + self
+                .pending_document_responses
+                .iter()
+                .map(|(k, v)| {
+                    256 + k.capacity()
+                        + crate::cdp::retained_object_bytes(&v.headers)
+                        + v.status_text.capacity()
+                })
+                .sum::<usize>()
+            + self.main_frame_response.as_ref().map_or(0, |v| {
+                crate::cdp::retained_object_bytes(&v.headers) + v.status_text.capacity()
+            })
+            + self
+                .lifecycle
+                .iter()
+                .map(|s| 32 + s.capacity())
+                .sum::<usize>()
+            + [
+                &self.url_final,
+                &self.main_frame_id,
+                &self.main_frame_same_document_url,
+                &self.main_frame_failure,
+            ]
+            .iter()
+            .map(|s| s.as_ref().map_or(0, String::capacity))
+            .sum::<usize>();
+        (requests, bytes)
+    }
     pub fn token(&mut self, token: impl Into<String>) {
         self.lifecycle.push(token.into());
     }
@@ -3151,9 +3259,16 @@ impl BrowserPlane {
         };
         let frames_omitted = frames.len().saturating_sub(readable_frames.len());
         if !frames.is_empty() {
-            session_operation
-                .set_read_frames(readable_frames)
-                .map_err(map_navigation_drive_error)?;
+            let (operation, result) = tokio::task::spawn_blocking(move || {
+                let result = session_operation.set_read_frames(readable_frames);
+                (session_operation, result)
+            })
+            .await
+            .map_err(|_| BrowserError::Internal {
+                reason_code: JournalReasonCode::InternalFailure,
+            })?;
+            session_operation = operation;
+            result.map_err(map_navigation_drive_error)?;
         }
         self.reserve_journal(identity, BrowserCapability::Snapshot, persist_journal)
             .await?;
