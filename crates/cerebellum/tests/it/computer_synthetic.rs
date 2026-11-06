@@ -49,6 +49,8 @@ enum DispatchedCall {
 /// failure paths through the same plane.
 #[derive(Debug)]
 struct Shared {
+    input_desk: Option<Desk>,
+    input_value_override: Option<String>,
     calls: Vec<DispatchedCall>,
     /// When each per-process post reached the driver, on tokio's clock.
     posted_at: Vec<tokio::time::Instant>,
@@ -64,6 +66,8 @@ struct Shared {
 impl Shared {
     fn handle() -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self {
+            input_desk: None,
+            input_value_override: None,
             calls: Vec::new(),
             posted_at: Vec::new(),
             interrupt_after_two: None,
@@ -141,6 +145,23 @@ impl PlatformDriver for SyntheticDriver {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
         let mut shared = self.0.lock().unwrap();
+        if let Some(desk) = &shared.input_desk {
+            let mut state = desk.state();
+            let element = state.elements.get_mut(&2).unwrap();
+            // The fixture editor accepts input only when the entire known
+            // UTF-16 value is selected; a bad range must not look successful.
+            assert_eq!(element.selection, Some((0, 4)));
+            element.value = shared.input_value_override.clone().or_else(|| {
+                Some(match &request.action {
+                    SyntheticAction::TypeText { text } => text.clone(),
+                    SyntheticAction::KeyCombination {
+                        key: SyntheticKey::Backspace,
+                        ..
+                    } => String::new(),
+                    action => panic!("unexpected editor input: {action:?}"),
+                })
+            });
+        }
         shared.calls.push(DispatchedCall::PerPid(request));
         shared.posted_at.push(tokio::time::Instant::now());
         if let Some(posted) = shared.interrupt_after_two.clone() {
@@ -1601,6 +1622,136 @@ async fn typed_text_found_in_what_changed_is_completed() {
     .await;
     assert_eq!(reply["outcome"], "completed", "{reply}");
     assert_eq!(reply["effect_status"], "effect_observed");
+}
+
+fn web_replace_desk() -> Desk {
+    use cerebellum_computer::app_state::source::RawElement;
+    let desk = background(focused_text_desk());
+    let mut state = desk.state();
+    state.roots[0].children = vec![RawElement::fixture(90, "AXWebArea").with_children(vec![
+        RawElement::fixture(2, "AXTextField").titled("Composer"),
+    ])];
+    let field = state.elements.get_mut(&2).unwrap();
+    field.facts.value_settable = true;
+    field.value = Some("a😀b".into());
+    field.selection = Some((1, 0));
+    drop(state);
+    desk
+}
+
+async fn web_replace(plane: &TestPlane, management: &Arc<ManagementPlane>, text: &str) -> Value {
+    let clock = FakeClock::new();
+    let read = serve(
+        plane,
+        "computer.read_state",
+        json!({"target": TARGET_BUNDLE_ID}),
+        management,
+        &clock,
+    )
+    .await;
+    let id = read["state_text"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .find(|line| line.contains("Composer"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    serve(
+        plane,
+        "computer.write_text",
+        json!({"element_id": id, "write_mode": "replace_value", "text": text}),
+        management,
+        &clock,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn web_replace_selects_all_utf16_then_posts_per_process_and_confirms_exact_value() {
+    for text in ["replacement", ""] {
+        let shared = Shared::handle();
+        let desk = web_replace_desk();
+        shared.lock().unwrap().input_desk = Some(desk.clone());
+        let plane = plane_on(&shared, &desk, false);
+        let reply = web_replace(&plane, &granted_management().await, text).await;
+        assert_eq!(reply["outcome"], "completed", "{reply}");
+        assert_eq!(reply["effect_status"], "effect_observed", "{reply}");
+        assert_eq!(desk.state().selections, [(2, (0, 4))]);
+        assert!(
+            desk.state().writes.is_empty(),
+            "web text attribute was written"
+        );
+        assert_eq!(desk.state().elements[&2].value.as_deref(), Some(text));
+        let calls = dispatched_calls(&shared);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(matches!(&calls[0], DispatchedCall::PerPid(_)), "{calls:?}");
+    }
+}
+
+#[tokio::test]
+async fn web_replace_refuses_unverified_selection_without_posting() {
+    for accepted in [true, false] {
+        let shared = Shared::handle();
+        let desk = web_replace_desk();
+        desk.state().applies_selection = false;
+        desk.state().accepts_selection = accepted;
+        let plane = plane_on(&shared, &desk, false);
+        let reply = web_replace(&plane, &granted_management().await, "replacement").await;
+        assert_eq!(reply["outcome"], "web_content_needs_type", "{reply}");
+        assert_eq!(reply["effect_status"], "effect_indeterminate", "{reply}");
+        assert!(dispatched_calls(&shared).is_empty());
+        assert!(desk.state().writes.is_empty());
+        assert_eq!(desk.state().elements[&2].value.as_deref(), Some("a😀b"));
+    }
+}
+
+#[tokio::test]
+async fn web_replace_never_claims_success_when_keys_do_not_replace_the_value() {
+    for appended in [false, true] {
+        let shared = Shared::handle();
+        let desk = web_replace_desk();
+        if appended {
+            let mut state = shared.lock().unwrap();
+            state.input_desk = Some(desk.clone());
+            state.input_value_override = Some("a😀breplacement".into());
+        }
+        let plane = plane_on(&shared, &desk, false);
+        let reply = web_replace(&plane, &granted_management().await, "replacement").await;
+        assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+        assert_eq!(dispatched_calls(&shared).len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn web_replace_refuses_secure_unsettable_or_unfocused_fields_without_selection() {
+    for kind in ["secure", "unsettable", "unfocused"] {
+        let shared = Shared::handle();
+        let desk = web_replace_desk();
+        match kind {
+            "secure" => {
+                desk.state().elements.get_mut(&2).unwrap().facts.subrole =
+                    Some("AXSecureTextField".into())
+            }
+            "unsettable" => {
+                desk.state()
+                    .elements
+                    .get_mut(&2)
+                    .unwrap()
+                    .facts
+                    .value_settable = false
+            }
+            "unfocused" => desk.state().focus = DeskFocus::Nothing,
+            _ => unreachable!(),
+        }
+        let plane = plane_on(&shared, &desk, false);
+        let reply = web_replace(&plane, &granted_management().await, "replacement").await;
+        assert_ne!(reply["outcome"], "completed", "{kind}: {reply}");
+        assert!(dispatched_calls(&shared).is_empty());
+        assert!(desk.state().selections.is_empty());
+        assert!(desk.state().writes.is_empty());
+    }
 }
 
 /// Text the application shows only a few reads after the posts return is

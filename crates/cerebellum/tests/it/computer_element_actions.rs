@@ -1210,35 +1210,41 @@ async fn write(
 
 #[tokio::test]
 async fn web_content_refuses_without_calling_value_or_selection_setter() {
-    for mode in ["replace_value", "insert_at_caret"] {
-        let desk = desk();
-        {
-            let mut state = desk.state();
-            let fields = std::mem::take(&mut state.roots[0].children);
-            state.roots[0].children =
-                vec![RawElement::fixture(90, "AXWebArea").with_children(vec![
-                    RawElement::fixture(91, "AXGroup").with_children(fields),
+    let desk = desk();
+    {
+        let mut state = desk.state();
+        let fields = std::mem::take(&mut state.roots[0].children);
+        state.roots[0].children =
+            vec![RawElement::fixture(90, "AXWebArea")
+                .with_children(vec![
+                    RawElement::fixture(91, "AXGroup").with_children(fields)
                 ])];
-        }
-        let plane = plane(&desk);
-        let management = granted_management().await;
-        let tree = read(&plane, &management).await;
-        let reply = write(
-            &plane,
-            &management,
-            &id_of(&tree, "Composer"),
-            "draft",
-            mode,
-        )
-        .await;
-        assert!(
-            desk.state().writes.is_empty(),
-            "web editor setter was called"
-        );
-        assert_eq!(reply["reason"], "web_content_needs_type", "{reply}");
-        assert_eq!(reply["outcome"], "web_content_needs_type", "{reply}");
-        assert!(reply["remedy"].as_str().unwrap().contains("press_element"));
     }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = read(&plane, &management).await;
+    let reads_before = desk.state().app_reads;
+    let reply = write(
+        &plane,
+        &management,
+        &id_of(&tree, "Composer"),
+        "draft",
+        "insert_at_caret",
+    )
+    .await;
+    assert!(
+        desk.state().writes.is_empty(),
+        "web editor setter was called"
+    );
+    assert_eq!(reply["reason"], "web_content_needs_type", "{reply}");
+    assert_eq!(reply["outcome"], "web_content_needs_type", "{reply}");
+    assert!(desk.state().selections.is_empty());
+    assert_eq!(
+        desk.state().app_reads,
+        reads_before,
+        "refusal reread the whole app"
+    );
+    assert!(reply["remedy"].as_str().unwrap().contains("press_element"));
 }
 
 /// replace_value sets the whole value and is confirmed by reading it back.

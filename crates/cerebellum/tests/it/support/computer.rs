@@ -730,6 +730,7 @@ pub struct DeskState {
     pub dispatched_at: Vec<tokio::time::Instant>,
     pub cursor_visible: bool,
     pub roots: Vec<RawElement>,
+    pub app_reads: usize,
     pub read_error: Option<AppStateReadError>,
     pub read_bound_reached: bool,
     pub unreadable_subtrees: usize,
@@ -772,6 +773,9 @@ pub struct DeskState {
     pub presses: Vec<u64>,
     pub shown_menus: Vec<u64>,
     pub writes: Vec<(u64, TextAttribute)>,
+    pub selections: Vec<(u64, (usize, usize))>,
+    pub accepts_selection: bool,
+    pub applies_selection: bool,
     pub hit_scopes: Vec<HitScope>,
     pub focus_reads: usize,
     /// The target application's focused window: a token and its title.
@@ -820,6 +824,7 @@ impl Desk {
             dispatched_at: Vec::new(),
             cursor_visible: false,
             roots,
+            app_reads: 0,
             read_error: None,
             read_bound_reached: false,
             unreadable_subtrees: 0,
@@ -841,6 +846,9 @@ impl Desk {
             presses: Vec::new(),
             shown_menus: Vec::new(),
             writes: Vec::new(),
+            selections: Vec::new(),
+            accepts_selection: true,
+            applies_selection: true,
             hit_scopes: Vec::new(),
             focus_reads: 0,
             window: None,
@@ -947,7 +955,8 @@ impl AppStateSource for Desk {
         _target: &ProcessGrant,
         _bounds: ReadBounds,
     ) -> Result<RawAppState, AppStateReadError> {
-        let state = self.state();
+        let mut state = self.state();
+        state.app_reads += 1;
         if let Some(error) = state.read_error {
             return Err(error);
         }
@@ -961,11 +970,51 @@ impl AppStateSource for Desk {
 
     fn element_facts(&self, element: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
         let token = token_of(element).ok_or(ElementActionError::Gone)?;
-        self.state()
+        let state = self.state();
+        state
             .elements
             .get(&token)
             .map(|element| element.facts.clone())
+            .or_else(|| {
+                fn role(nodes: &[RawElement], token: u64) -> Option<ElementFacts> {
+                    for node in nodes {
+                        if token_of(&node.handle) == Some(token) {
+                            return Some(ElementFacts {
+                                role: node.role.clone(),
+                                ..ElementFacts::default()
+                            });
+                        }
+                        if let Some(facts) = role(&node.children, token) {
+                            return Some(facts);
+                        }
+                    }
+                    None
+                }
+                role(&state.roots, token)
+            })
             .ok_or(ElementActionError::Gone)
+    }
+
+    fn element_parent(
+        &self,
+        element: &ElementHandle,
+    ) -> Result<Option<ElementHandle>, ElementActionError> {
+        fn parent(nodes: &[RawElement], child: &ElementHandle) -> Option<ElementHandle> {
+            for node in nodes {
+                if node
+                    .children
+                    .iter()
+                    .any(|node| node.handle.same_element(child.as_ref()))
+                {
+                    return Some(node.handle.clone());
+                }
+                if let Some(found) = parent(&node.children, child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Ok(parent(&self.state().roots, element))
     }
 
     fn element_enabled(&self, element: &ElementHandle) -> Option<bool> {
@@ -1028,6 +1077,27 @@ impl AppStateSource for Desk {
             .get(&token)
             .ok_or(ElementActionError::Gone)?
             .selection)
+    }
+
+    fn select_range(
+        &self,
+        element: &ElementHandle,
+        range: (usize, usize),
+    ) -> Result<(), ElementActionError> {
+        let token = token_of(element).ok_or(ElementActionError::Gone)?;
+        let mut state = self.state();
+        state.selections.push((token, range));
+        if !state.accepts_selection {
+            return Err(ElementActionError::UnsupportedOnPlatform);
+        }
+        if state.applies_selection {
+            state
+                .elements
+                .get_mut(&token)
+                .ok_or(ElementActionError::Gone)?
+                .selection = Some(range);
+        }
+        Ok(())
     }
 
     fn write_text(

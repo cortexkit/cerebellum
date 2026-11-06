@@ -660,7 +660,7 @@ where
     }
 
     /// Record what is about to be sent, before it is sent.
-    fn intent(
+    pub(super) fn intent(
         &mut self,
         grant: &ProcessGrant,
         element_id: &str,
@@ -706,14 +706,18 @@ where
             .map_err(|_| IntentRefused::AuditUnavailable)
     }
 
-    fn outcome(&mut self, token: DispatchCommitmentToken, outcome: &str) -> Result<(), ()> {
+    pub(super) fn outcome(
+        &mut self,
+        token: DispatchCommitmentToken,
+        outcome: &str,
+    ) -> Result<(), ()> {
         // The post-action diff also reads the tree and may re-enable a renderer.
         // Finalize after that read so its state change stays on this action's row.
         self.pending = Some((token, outcome.to_string()));
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<(), ()> {
+    pub(super) fn finish(&mut self) -> Result<(), ()> {
         if let Some((role, outcome)) = self.held_refusal.take() {
             self.write_refusal(&role, &outcome)
         } else if let Some((token, outcome)) = self.pending.take() {
@@ -739,7 +743,7 @@ where
 }
 
 /// Why an element action's intent was not committed.
-enum IntentRefused {
+pub(super) enum IntentRefused {
     /// The journal could not record the intent, so nothing is sent.
     AuditUnavailable,
     /// The call was answered before the action could start.
@@ -747,7 +751,7 @@ enum IntentRefused {
 }
 
 impl IntentRefused {
-    fn reply(self) -> Value {
+    pub(super) fn reply(self) -> Value {
         match self {
             Self::AuditUnavailable => audit_unavailable_reply(false),
             Self::Stopped => super::quarantine::stopped_before_dispatch_reply(),
@@ -967,11 +971,7 @@ where
                        it in themselves",
         });
     }
-    let tree = match source.read_app_state(grant, ReadBounds::default()) {
-        Ok(tree) => tree,
-        Err(_) => return stale_element_reply(),
-    };
-    match web_ancestry(&tree.roots, handle, false) {
+    match web_ancestry(source, grant, handle) {
         Some(true) => {
             if journal.refused(&role, "web_content_needs_type").is_err() {
                 return audit_unavailable_reply(false);
@@ -1064,21 +1064,33 @@ where
     reply
 }
 
-/// Find the target in the read tree rather than guessing from its field role:
-/// native and web text fields can expose the same accessibility role.
-fn web_ancestry(
-    nodes: &[cerebellum_computer::app_state::source::RawElement],
+/// Follow only the addressed element's parents. Unlike a whole-app read,
+/// these reads do not enable renderer accessibility through AXManualAccessibility.
+/// Native and web fields can expose the same role, so an unknown or cyclic
+/// ancestry must not be treated as native.
+pub(super) fn web_ancestry(
+    source: &dyn AppStateSource,
+    grant: &ProcessGrant,
     handle: &ElementHandle,
-    inside_web: bool,
 ) -> Option<bool> {
-    for node in nodes {
-        let inside_web = inside_web || node.role.as_deref() == Some("AXWebArea");
-        if node.handle.same_element(handle.as_ref()) {
-            return Some(inside_web);
+    let mut current = handle.clone();
+    let mut visited: Vec<ElementHandle> = Vec::new();
+    for _ in 0..64 {
+        if visited.iter().any(|old| old.same_element(current.as_ref())) {
+            return None;
         }
-        if let Some(found) = web_ancestry(&node.children, handle, inside_web) {
-            return Some(found);
+        let facts = source.element_facts(&current).ok()?;
+        if facts.pid.is_some_and(|pid| pid != grant.pid) {
+            return None;
         }
+        match facts.role.as_deref()? {
+            "AXWebArea" => return Some(true),
+            "AXWindow" | "AXApplication" => return Some(false),
+            _ => {}
+        }
+        let parent = source.element_parent(&current).ok()??;
+        visited.push(current);
+        current = parent;
     }
     None
 }
@@ -1932,7 +1944,9 @@ where
             identity,
             management,
             consent,
-            ..
+            grantee,
+            clock,
+            now_ms,
         } = context;
         let sessions = management.app_state_sessions().clone();
         let conversation_key = identity.conversation_key.clone();
@@ -1987,6 +2001,62 @@ where
         if let Some(mut busy) = work.bind(&self.serializer.quarantine, &grant) {
             admission.decorate(&mut busy);
             return busy;
+        }
+        if parsed.mode == WriteMode::ReplaceValue {
+            let source = self.app_state_source.clone();
+            let check_grant = grant.clone();
+            let check_handle = handle.clone();
+            let check_work = work.clone();
+            let web = tokio::task::spawn_blocking(move || {
+                let _ax = check_work.bound_ax();
+                let facts = source.element_facts(&check_handle).ok()?;
+                (!facts.is_secure())
+                    .then(|| web_ancestry(source.as_ref(), &check_grant, &check_handle))
+                    .flatten()
+            })
+            .await
+            .unwrap_or(None);
+            if web == Some(true) {
+                let replacement = super::web_replace::WebReplacement {
+                    element_id: parsed.element_id.clone(),
+                    handle,
+                    grant: grant.clone(),
+                    text: parsed.text.clone(),
+                };
+                let (capability, mut input) = if parsed.text.is_empty() {
+                    (
+                        ComputerCapability::Keys,
+                        json!({"target": bundle_identity, "keys": ["backspace"]}),
+                    )
+                } else {
+                    (
+                        ComputerCapability::Type,
+                        json!({"target": bundle_identity, "text": parsed.text}),
+                    )
+                };
+                for field in ["zoom", "text_filter", "role_filter"] {
+                    if let Some(value) = arguments.get(field) {
+                        input[field] = value.clone();
+                    }
+                }
+                return super::web_replace::write_reply(
+                    Box::pin(self.serve_synthetic_prepared(
+                        capability,
+                        &input,
+                        super::ServeContext {
+                            cancel,
+                            identity,
+                            management,
+                            consent,
+                            grantee,
+                            clock,
+                            now_ms,
+                        },
+                        Some(replacement),
+                    ))
+                    .await,
+                );
+            }
         }
         let foreground = self
             .front_for_foreground(super::fronting::FrontCall {

@@ -69,6 +69,7 @@ extern "C" {
     ) -> i32;
     fn AXUIElementGetPid(element: CfTypeRef, pid: *mut c_int) -> i32;
     fn AXValueGetValue(value: CfTypeRef, value_type: u32, out: *mut c_void) -> bool;
+    fn AXValueCreate(value_type: u32, value: *const c_void) -> CfTypeRef;
     fn AXValueGetTypeID() -> usize;
 }
 
@@ -382,7 +383,6 @@ pub struct AxElementFacts {
 pub fn element_facts(element: &AxRetainedElement) -> Result<AxElementFacts, AxElementActionError> {
     require_trust()?;
     let pointer = element.as_ptr();
-    prepare_element(pointer);
     bound_messages(pointer);
     let role = match string(pointer, "AXRole") {
         Ok(role) => role,
@@ -524,6 +524,79 @@ pub fn element_selected_range(
     Ok(Some((range.location as usize, range.length as usize)))
 }
 
+/// Select text without bypassing the editor's own input handling. The range
+/// must be settable and must subsequently be verified by the caller.
+pub fn select_element_range(
+    element: &AxRetainedElement,
+    (start, length): (usize, usize),
+) -> Result<(), AxElementActionError> {
+    require_trust()?;
+    let pointer = element.as_ptr();
+    bound_messages(pointer);
+    if !settable(pointer, "AXSelectedTextRange") {
+        return Err(AxElementActionError::Unsupported);
+    }
+    let value = text_range_value((start, length))?;
+    let name = CFString::from_static_str("AXSelectedTextRange");
+    // SAFETY: element, attribute and range value are retained for this call.
+    let code = unsafe {
+        AXUIElementSetAttributeValue(
+            pointer,
+            CFRetained::as_ptr(&name).as_ptr().cast(),
+            CFRetained::as_ptr(&value).as_ptr().cast(),
+        )
+    };
+    if code == AX_ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(classify(code))
+    }
+}
+
+fn text_range_value(
+    (start, length): (usize, usize),
+) -> Result<CFRetained<CFType>, AxElementActionError> {
+    let range = CfRange {
+        location: start
+            .try_into()
+            .map_err(|_| AxElementActionError::Unsupported)?,
+        length: length
+            .try_into()
+            .map_err(|_| AxElementActionError::Unsupported)?,
+    };
+    // SAFETY: range has the CFRange layout and lives through the copying call.
+    let value = unsafe { AXValueCreate(AX_VALUE_CF_RANGE_TYPE, (&range as *const CfRange).cast()) };
+    // SAFETY: Create returns an owned reference, or null on failure.
+    unsafe { owned(value) }.ok_or(AxElementActionError::Unsupported)
+}
+
+#[cfg(test)]
+mod text_range_tests {
+    use super::*;
+
+    #[test]
+    fn selection_ranges_roundtrip_as_cf_ranges_without_accessibility_input() {
+        for range in [(0, 0), (0, 4), (3, 2)] {
+            let value = text_range_value(range).unwrap();
+            let mut read = CfRange::default();
+            // SAFETY: the owned AXValue holds a CFRange and read is writable.
+            assert!(unsafe {
+                AXValueGetValue(
+                    CFRetained::as_ptr(&value).as_ptr().cast(),
+                    AX_VALUE_CF_RANGE_TYPE,
+                    (&mut read as *mut CfRange).cast(),
+                )
+            });
+            assert_eq!(
+                (read.location, read.length),
+                (range.0 as isize, range.1 as isize)
+            );
+        }
+        assert!(text_range_value((usize::MAX, 0)).is_err());
+        assert!(text_range_value((0, usize::MAX)).is_err());
+    }
+}
+
 /// Which text attribute a write sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AxTextAttribute {
@@ -647,7 +720,6 @@ pub fn element_parent(
     element: &AxRetainedElement,
 ) -> Result<Option<AxRetainedElement>, AxElementActionError> {
     require_trust()?;
-    prepare_element(element.as_ptr());
     bound_messages(element.as_ptr());
     match copy(element.as_ptr(), "AXParent") {
         Ok(Some(value)) if is_ax_element(&value) => Ok(Some(AxRetainedElement(value))),
