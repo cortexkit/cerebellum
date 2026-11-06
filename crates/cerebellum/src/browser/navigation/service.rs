@@ -29,6 +29,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let (pending, abandoned, transport_bytes) = self.transport.retained_metadata();
         let (requests, tracker_bytes) = tracker.map_or((0, 0), Tracker::retained_metadata);
         let frames = self.frame_revisions.len().max(self.frame_documents.len());
+        let peer_records = self.document_peers.len() + self.private_peer_origins.len();
         let sessions = self
             .frame_sessions
             .values()
@@ -65,6 +66,20 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .sum::<usize>();
         let bytes = transport_bytes
             + tracker_bytes
+            + self.document_peers.capacity() * 128
+            + self
+                .document_peers
+                .keys()
+                .map(|(session, frame, loader)| {
+                    256 + session.capacity() + frame.capacity() + loader.capacity()
+                })
+                .sum::<usize>()
+            + self.private_peer_origins.capacity() * 64
+            + self
+                .private_peer_origins
+                .iter()
+                .map(|origin| 256 + origin.capacity())
+                .sum::<usize>()
             + frame_bytes
             + self.identities.retained_bytes()
             + self.frame_documents.capacity()
@@ -128,7 +143,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 256 + a.context_key.capacity() + a.target_id.capacity() + a.session_id.capacity()
             });
         let peak = &mut self.metadata_high_water;
-        peak.live_records = peak.live_records.max(frames + sessions);
+        peak.live_records = peak.live_records.max(frames + sessions + peer_records);
         peak.active_requests = peak.active_requests.max(requests);
         peak.preserved_replies = peak.preserved_replies.max(replies + pending);
         peak.unresolved_dialogs = peak
@@ -138,7 +153,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         peak.retained_bytes = peak.retained_bytes.max(bytes);
         // Capacity accounting includes conservative container overhead. Decoder
         // storage and the active snapshot payload have their separate message cap.
-        if frames + sessions > 256
+        if frames + sessions + peer_records > 256
             || requests > MAX_NAVIGATION_REQUEST_RECORDS
             || replies + pending > 16
             || abandoned > 1024
@@ -217,6 +232,24 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .retain(|key, _| !obsolete.contains(key));
         self.frame_documents
             .retain(|f| !obsolete.contains(&f.frame_id));
+        // Keep a response received before this commit only for its exact loader.
+        // Origin history is not evicted: dropping a private sighting would turn
+        // a later unknown-address document back into public browsing.
+        // A renderer swap is not a document removal. Its response can already
+        // have arrived in the parent session before the child target attaches.
+        if event.method != "Page.frameDetached"
+            || params.get("reason").and_then(Value::as_str) != Some("swap")
+        {
+            self.document_peers.retain(|(_, frame_id, loader), _| {
+                !obsolete.contains(frame_id)
+                    || frame_id == id
+                        && event.method == "Page.frameNavigated"
+                        && frame
+                            .and_then(|f| f.get("loaderId"))
+                            .and_then(Value::as_str)
+                            == Some(loader.as_str())
+            });
+        }
         self.read_frames = None;
         self.active_frame = None;
         self.point_frame = None;
@@ -246,6 +279,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             ) {
                 self.frame_documents
                     .push(crate::snapshot_store::FrameDocument {
+                        network: self.document_network(session, id, loader, url),
                         navigation_revision: self.frame_generation,
                         frame_id: id.to_owned(),
                         parent_id: parent,

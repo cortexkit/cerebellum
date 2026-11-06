@@ -307,6 +307,15 @@ impl AgentGrants {
         holder: &GrantHolder,
         demand: GrantDemand,
     ) -> Option<GrantUse> {
+        self.authorize_filtered(holder, demand, |_| true)
+    }
+
+    pub(crate) fn authorize_filtered(
+        self: &Arc<Self>,
+        holder: &GrantHolder,
+        demand: GrantDemand,
+        eligible: impl Fn(&AgentGrant) -> bool,
+    ) -> Option<GrantUse> {
         let rows = self
             .live_rows(Some(holder.agent_id()), self.now_ms())
             .ok()?;
@@ -314,6 +323,7 @@ impl AgentGrants {
             .into_iter()
             .filter(|row| {
                 row.holder == *holder
+                    && eligible(row)
                     && row.is_usable(self.now_ms(), self.machine_uuid.as_deref())
                     && demand.covers(row)
             })

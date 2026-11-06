@@ -4,6 +4,7 @@ mod classification_golden;
 mod classification_index;
 mod fill;
 mod frames;
+mod peers;
 mod scroll;
 mod service;
 #[cfg(test)]
@@ -151,6 +152,7 @@ pub fn committed_document_from(
         .filter(|loader| !loader.is_empty())?
         .to_string();
     Some(crate::snapshot_store::CommittedDocument {
+        network: Default::default(),
         url,
         security_origin: frame_tree
             .get("frameTree")?
@@ -360,6 +362,8 @@ pub struct CdpNavigationDriver<IO> {
     /// than one.
     unclosed_verification_target: Option<String>,
     frame_revisions: HashMap<String, u64>,
+    document_peers: HashMap<(String, String, String), std::net::IpAddr>,
+    private_peer_origins: HashSet<String>,
     frame_sessions: HashMap<String, String>,
     configured_frame_sessions: HashSet<String>,
     focus_emulated_sessions: HashSet<String>,
@@ -429,6 +433,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             verification: None,
             unclosed_verification_target: None,
             frame_revisions: HashMap::new(),
+            document_peers: HashMap::new(),
+            private_peer_origins: HashSet::new(),
             frame_sessions: HashMap::new(),
             configured_frame_sessions: HashSet::new(),
             focus_emulated_sessions: HashSet::new(),
@@ -2898,7 +2904,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let tree = self.command(
             "Page.getFrameTree",
             None,
-            Some(attachment.session_id),
+            Some(attachment.session_id.clone()),
             deadline,
             None,
             clock,
@@ -2911,8 +2917,20 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .and_then(Value::as_str)
             .filter(|loader| !loader.is_empty())
             .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getFrameTree"))?;
-        committed_document_from(&history, &tree)
-            .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getNavigationHistory"))
+        let mut document = committed_document_from(&history, &tree)
+            .ok_or_else(|| NavigationDriveError::CdpFailure.at_step("Page.getNavigationHistory"))?;
+        let frame_id = tree
+            .get("frameTree")
+            .and_then(|tree| tree.pointer("/frame/id"))
+            .and_then(Value::as_str)
+            .unwrap_or(&attachment.target_id);
+        document.network = self.document_network(
+            &attachment.session_id,
+            frame_id,
+            &document.loader_id,
+            &document.url,
+        );
+        Ok(document)
     }
 
     fn navigate_with_clock<C: NavigationClock>(
@@ -2967,21 +2985,11 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             .clone()
             .ok_or(NavigationDriveError::CdpFailure)?;
 
-        self.command(
-            "Page.enable",
-            None,
-            Some(attachment.session_id.clone()),
+        self.configure_frame_session_tracking(
+            &attachment.session_id,
             deadline,
-            None,
             clock,
-        )?;
-        self.command(
-            "Network.enable",
-            None,
-            Some(attachment.session_id.clone()),
-            deadline,
-            None,
-            clock,
+            &mut Some((context_key, tracker)),
         )?;
 
         if self.continuously_serviced {
@@ -3471,6 +3479,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 .map_err(|_| NavigationDriveError::CdpFailure)?;
             let _ = self.transport.pop_event();
             self.observe_frame_session(&event);
+            self.observe_document_peer(&event);
             // Events from the session-verification tab update only that tab's
             // load record; they are never applied to the person's page or to a
             // navigation's tracker.
@@ -3763,6 +3772,19 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                             ),
                             None => tracker.main_frame_navigated(frame_id, url.to_string()),
                         }
+                        tracker.main_frame_network = self.document_network(
+                            session_id,
+                            frame
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&attachment.target_id),
+                            frame.get("loaderId").and_then(Value::as_str).unwrap_or(""),
+                            url,
+                        );
+                        tracker.main_frame_loader_id = frame
+                            .get("loaderId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
                     }
                 }
             }
@@ -3783,6 +3805,18 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                 let Some(frame_id) = params.get("frameId").and_then(Value::as_str) else {
                     return;
                 };
+                if tracker.main_frame_id.as_deref() == Some(frame_id)
+                    && tracker.main_frame_loader_id.as_deref()
+                        == params.get("loaderId").and_then(Value::as_str)
+                {
+                    if let (Some(loader), Some(url)) = (
+                        tracker.main_frame_loader_id.as_deref(),
+                        tracker.url_final.as_deref(),
+                    ) {
+                        tracker.main_frame_network =
+                            self.document_network(session_id, frame_id, loader, url);
+                    }
+                }
                 let Some(response) = params.get("response").and_then(Value::as_object) else {
                     return;
                 };
@@ -9538,6 +9572,7 @@ mod tests {
             json!({"id":3,"sessionId":"session-own","result":{}}),
             json!({"id":4,"sessionId":"session-own","result":{}}),
             json!({"id":5,"sessionId":"session-own","result":{}}),
+            json!({"id":6,"sessionId":"session-own","result":{}}),
         ];
         let mut driver = driver_with_download_denial(frames);
         let mut tracker = Tracker::default();
@@ -9564,6 +9599,7 @@ mod tests {
                 "Browser.setDownloadBehavior",
                 "Target.createTarget",
                 "Target.attachToTarget",
+                "Target.setAutoAttach",
                 "Page.enable",
                 "Network.enable",
                 "Page.navigate",
@@ -9579,6 +9615,7 @@ mod tests {
             json!({"id":3,"sessionId":"session-own","result":{}}),
             json!({"id":4,"sessionId":"session-own","result":{}}),
             json!({"id":5,"sessionId":"session-own","result":{}}),
+            json!({"id":6,"sessionId":"session-own","result":{}}),
             json!({"method":"Network.requestWillBeSent","sessionId":"session-own","params":{}}),
             json!({"method":"Page.frameNavigated","sessionId":"session-own","params":{"frame":{"id":"main","url":"https://requested.example/"}}}),
             json!({"method":"Page.frameNavigated","sessionId":"session-own","params":{"frame":{"id":"main","url":"https://landed.example/final"}}}),
@@ -9619,6 +9656,7 @@ mod tests {
             json!({"id":3,"sessionId":"session-own","result":{}}),
             json!({"id":4,"sessionId":"session-own","result":{}}),
             json!({"id":5,"sessionId":"session-own","result":{}}),
+            json!({"id":6,"sessionId":"session-own","result":{}}),
             json!({"method":"Page.loadEventFired","sessionId":"session-own","params":{}}),
         ];
         let mut driver = driver_with_download_denial(frames);
@@ -9648,6 +9686,7 @@ mod tests {
             json!({"id":3,"sessionId":"session-own","result":{}}),
             json!({"id":4,"sessionId":"session-own","result":{}}),
             json!({"id":5,"sessionId":"session-own","result":{}}),
+            json!({"id":6,"sessionId":"session-own","result":{}}),
         ];
         let mut driver = driver_with_download_denial(frames);
         let mut tracker = Tracker::default();

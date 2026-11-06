@@ -1019,11 +1019,12 @@ fn page_navigate_frames(
         json!({"id":2,"result":{"sessionId":"session-own"}}),
         json!({"id":3,"sessionId":"session-own","result":{}}),
         json!({"id":4,"sessionId":"session-own","result":{}}),
+        json!({"id":5,"sessionId":"session-own","result":{}}),
     ]
     .into_iter()
     .chain(events)
     .chain(std::iter::once(
-        json!({"id":5,"sessionId":"session-own","result":navigate_result}),
+        json!({"id":6,"sessionId":"session-own","result":navigate_result}),
     ))
     .collect()
 }
@@ -1105,7 +1106,7 @@ impl CdpPipeIo for DialogClickPointPipe {
                 self.queue(json!({"id":release_id,"sessionId":"session-own","result":{}}));
                 self.queue(json!({"id":id,"sessionId":"session-own","result":{}}));
             }
-            "Page.enable" | "Network.enable" | "Page.navigate" => {
+            "Target.setAutoAttach" | "Page.enable" | "Network.enable" | "Page.navigate" => {
                 self.queue(json!({"id":id,"sessionId":"session-own","result":{}}));
             }
             other => panic!("unexpected CDP command {other}: {command}"),

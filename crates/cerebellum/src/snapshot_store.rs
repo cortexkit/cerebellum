@@ -133,6 +133,7 @@ impl BackendNodeIdentity {
 /// refs even when Chrome retains a frame id across a renderer replacement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameDocument {
+    pub network: crate::browser::document_network::DocumentNetwork,
     pub navigation_revision: u64,
     pub frame_id: String,
     pub parent_id: Option<String>,
@@ -145,12 +146,14 @@ pub struct FrameDocument {
 impl FrameDocument {
     /// URL and event revision can change on pushState or a fragment navigation.
     /// The loader, session and origin fence the document an input can reach.
+    /// Newly observed peer evidence must not inherit an older public verdict.
     pub fn same_document(&self, other: &Self) -> bool {
         self.frame_id == other.frame_id
             && self.parent_id == other.parent_id
             && self.session_id == other.session_id
             && self.loader_id == other.loader_id
             && self.origin == other.origin
+            && self.network == other.network
     }
 }
 
@@ -265,6 +268,7 @@ impl AxRecord {
 /// the one recorded with its snapshot to the one current at dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedDocument {
+    pub network: crate::browser::document_network::DocumentNetwork,
     /// The committed main-frame URL.
     pub url: String,
     /// The browser's actual security origin, including opaque origins.
@@ -291,6 +295,7 @@ impl CommittedDocument {
     pub fn new(url: impl Into<String>, entry_id: i64, loader_id: impl Into<String>) -> Self {
         Self {
             url: url.into(),
+            network: Default::default(),
             security_origin: "null".into(),
             entry_id,
             history: vec![entry_id],

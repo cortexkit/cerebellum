@@ -342,6 +342,7 @@ fn snapshot_observation(
 struct CommittedPage(Arc<Mutex<PageHistory>>);
 
 struct PageHistory {
+    remote_ip_address: Option<String>,
     /// `(entry id, url, loader id)` per entry.
     entries: Vec<(i64, String, String)>,
     current: usize,
@@ -351,6 +352,7 @@ struct PageHistory {
 impl Default for CommittedPage {
     fn default() -> Self {
         Self(Arc::new(Mutex::new(PageHistory {
+            remote_ip_address: None,
             entries: vec![(1, "about:blank".into(), "loader-1".into())],
             current: 0,
             next_id: 2,
@@ -400,6 +402,7 @@ impl CommittedPage {
         let history = self.0.lock().unwrap();
         let (entry_id, url, loader_id) = history.entries[history.current].clone();
         CommittedDocument {
+            network: Default::default(),
             security_origin: cerebellum::classification::canonical_origin_from_url(&url)
                 .unwrap_or_else(|| "null".into()),
             url,
@@ -3887,6 +3890,22 @@ impl CdpPipeIo for ChromeLikePipe {
             "Page.navigate" => {
                 self.page.commit(command["params"]["url"].as_str().unwrap());
                 self.reply(id, json!({"frameId":MAIN_FRAME}));
+                let address = self.page.0.lock().unwrap().remote_ip_address.clone();
+                if let Some(address) = address {
+                    let document = self.page.document();
+                    let mut event = document_response("document", MAIN_FRAME, &document.url, 200);
+                    event["params"]["loaderId"] = json!(document.loader_id);
+                    event["params"]["response"]["remoteIPAddress"] = json!(address);
+                    self.queue(event);
+                    self.queue(session_event(
+                        "Page.frameNavigated",
+                        json!({"frame":{
+                            "id":MAIN_FRAME,"loaderId":document.loader_id,"url":document.url,
+                            "securityOrigin":document.security_origin
+                        }}),
+                    ));
+                    self.queue(session_event("Page.loadEventFired", json!({})));
+                }
             }
             "Target.createTarget" => {
                 self.queue(json!({"id":id,"result":{"targetId":"target-own"}}));
@@ -4022,6 +4041,14 @@ impl CdpPipeIo for ChromeLikePipe {
                 self.reply(id, json!({}));
             }
             "Page.getNavigationHistory" => {
+                let address = self.page.0.lock().unwrap().remote_ip_address.clone();
+                if let Some(address) = address {
+                    let document = self.page.document();
+                    let mut event = document_response("document", MAIN_FRAME, &document.url, 200);
+                    event["params"]["loaderId"] = json!(document.loader_id);
+                    event["params"]["response"]["remoteIPAddress"] = json!(address);
+                    self.queue(event);
+                }
                 let history = self.page.navigation_history();
                 self.reply(id, history)
             }
@@ -4284,6 +4311,7 @@ impl OwnedBrowserProcess for CdpClickProcess {
                     .as_ref()
                     .and_then(|page| page.frame_origin.as_ref())
                     .map(|origin| cerebellum::snapshot_store::FrameDocument {
+                        network: Default::default(),
                         navigation_revision: 0,
                         frame_id: "cross-frame".into(),
                         parent_id: Some(MAIN_FRAME.into()),
@@ -9401,6 +9429,7 @@ fn frame_fixture() -> Arc<Mutex<FrameFixture>> {
         readable: vec![],
         documents: vec![
             FrameDocument {
+                network: Default::default(),
                 navigation_revision: 0,
                 frame_id: "frame-main".into(),
                 parent_id: None,
@@ -9410,6 +9439,7 @@ fn frame_fixture() -> Arc<Mutex<FrameFixture>> {
                 origin: "https://page.example:8443".into(),
             },
             FrameDocument {
+                network: Default::default(),
                 navigation_revision: 0,
                 frame_id: "payment-frame".into(),
                 parent_id: Some("frame-main".into()),
@@ -10685,4 +10715,178 @@ async fn an_own_browser_screenshot_carries_a_resolvable_handle() {
     assert_eq!(head["length"], shown.len());
     assert_eq!(&resolved.body[4 + head_length..], shown.as_slice());
     let _ = &launcher;
+}
+
+#[tokio::test]
+async fn connected_private_documents_require_site_consent_for_snapshot_and_click() {
+    use cerebellum::agent_grants::{GrantHolder, GrantSubject};
+    use cerebellum::authorization::{with_standing_caller, StandingCaller};
+    use cerebellum::browser::BrowserCapability;
+    let page = CommittedPage::default();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let cfg = config();
+    let mut planes = permission_support::planes(
+        Arc::new(HealthState::new()),
+        Some(cfg.clone()),
+        cerebellum::JournalPersistence::Isolated,
+    );
+    planes.launch_service = Some(Arc::new(CdpClickLauncher {
+        unanswered: None,
+        scenario: ClickScenario::NoNavigation,
+        snapshots: Arc::default(),
+        page: page.clone(),
+        commands: commands.clone(),
+        typing: None,
+    }));
+    launch_at(&planes, &page, CLICK_PAGE_ORIGIN).await;
+    let caller = Some(StandingCaller {
+        holder: GrantHolder::Head {
+            agent_id: "test-project".into(),
+        },
+    });
+    with_standing_caller(caller, async {
+        let identity = route_identity();
+        let store = planes.management.agent_grants();
+        for address in ["192.168.1.1", "127.0.0.1", "::1", "::ffff:192.168.1.1"] {
+            page.commit(&format!("{CLICK_PAGE_ORIGIN}/private"));
+            page.0.lock().unwrap().remote_ip_address = Some(address.into());
+            let refused = planes
+                .browser
+                .dispatch(
+                    &identity,
+                    BrowserCapability::Snapshot,
+                    &json!({"mode":"ax"}),
+                )
+                .await;
+            assert_eq!(
+                refused["detail"]["reason"], "no_grant",
+                "snapshot {address}: {refused}"
+            );
+            assert!(
+                refused["remedy"].as_str().unwrap().contains("open_grant"),
+                "{refused}"
+            );
+            let site = permission_support::seed(
+                store,
+                "test-project",
+                GrantSubject::Origin(CLICK_PAGE_ORIGIN.into()),
+                2,
+                vec![],
+                None,
+                "site-card",
+            );
+            let snapshot = planes
+                .browser
+                .dispatch(
+                    &identity,
+                    BrowserCapability::Snapshot,
+                    &json!({"mode":"ax"}),
+                )
+                .await;
+            assert_eq!(
+                snapshot["outcome"], "ok",
+                "site grant {address}: {snapshot}"
+            );
+            assert!(store.revoke(&site, store.now_ms()).unwrap());
+            let before = commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.as_str() == "Input.dispatchMouseEvent")
+                .count();
+            let refused = planes.browser.dispatch(&identity, BrowserCapability::Click, &json!({
+                "ref":first_ref(&snapshot),"snapshot_id":snapshot["snapshot_id"],
+                "intent":"follow link", "severity":{"tier":2,"credential":false,"financial":false}
+            })).await;
+            assert_eq!(
+                refused["detail"]["reason"], "no_grant",
+                "click {address}: {refused}"
+            );
+            assert_eq!(
+                commands
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c.as_str() == "Input.dispatchMouseEvent")
+                    .count(),
+                before
+            );
+            let all = permission_support::seed(
+                store,
+                "test-project",
+                GrantSubject::AllSites,
+                3,
+                vec![],
+                None,
+                "all-card",
+            );
+            let refused = planes
+                .browser
+                .dispatch(
+                    &identity,
+                    BrowserCapability::Snapshot,
+                    &json!({"mode":"ax"}),
+                )
+                .await;
+            assert_eq!(
+                refused["detail"]["reason"], "no_grant",
+                "all-sites {address}: {refused}"
+            );
+            let screenshot = planes.browser.dispatch(&identity, BrowserCapability::Screenshot, &json!({})).await;
+            assert_eq!(screenshot["detail"]["reason"], "no_grant", "all-sites screenshot {address}: {screenshot}");
+            let click = planes.browser.dispatch(&identity, BrowserCapability::Click, &json!({
+                "ref":first_ref(&snapshot),"snapshot_id":snapshot["snapshot_id"],
+                "intent":"follow link", "severity":{"tier":2,"credential":false,"financial":false}
+            })).await;
+            assert_eq!(click["detail"]["reason"], "no_grant", "all-sites click {address}: {click}");
+
+            assert!(store.revoke(&all, store.now_ms()).unwrap());
+        }
+        page.commit(&format!("{CLICK_PAGE_ORIGIN}/public"));
+        page.0.lock().unwrap().remote_ip_address = Some("93.184.216.34".into());
+        let snapshot = planes
+            .browser
+            .dispatch(
+                &identity,
+                BrowserCapability::Snapshot,
+                &json!({"mode":"ax"}),
+            )
+            .await;
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        let clicked = planes.browser.dispatch(&identity, BrowserCapability::Click, &json!({
+            "ref":first_ref(&snapshot),"snapshot_id":snapshot["snapshot_id"],
+            "intent":"follow public link","severity":{"tier":2,"credential":false,"financial":false}
+        })).await;
+        assert_eq!(clicked["outcome"], "ok", "{clicked}");
+        page.commit(&format!("{CLICK_PAGE_ORIGIN}/rebound"));
+        page.0.lock().unwrap().remote_ip_address = Some("192.168.1.1".into());
+        let rebound = planes
+            .browser
+            .dispatch(
+                &identity,
+                BrowserCapability::Snapshot,
+                &json!({"mode":"ax"}),
+            )
+            .await;
+        assert_eq!(rebound["detail"]["reason"], "no_grant", "{rebound}");
+        page.commit(&format!("{CLICK_PAGE_ORIGIN}/worker"));
+        page.0.lock().unwrap().remote_ip_address = None;
+        let unknown = planes
+            .browser
+            .dispatch(
+                &identity,
+                BrowserCapability::Snapshot,
+                &json!({"mode":"ax"}),
+            )
+            .await;
+        assert_eq!(unknown["detail"]["reason"], "no_grant", "{unknown}");
+        page.0.lock().unwrap().remote_ip_address = Some("192.168.1.1".into());
+        permission_support::seed(store, "test-project", GrantSubject::AllSites, 3, vec![], None, "all-navigation-card");
+        let navigated = planes.browser.dispatch(&identity, BrowserCapability::Navigate, &json!({
+            "url":format!("{CLICK_PAGE_ORIGIN}/navigate-private"), "wait":"settle", "intent":"open page",
+            "severity":{"tier":1,"credential":false,"financial":false}
+        })).await;
+        assert_eq!(navigated["detail"]["reason"], "no_grant", "all-sites navigate: {navigated}");
+    })
+    .await;
 }

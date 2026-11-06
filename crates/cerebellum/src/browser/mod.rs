@@ -5,6 +5,7 @@
 //! Browser-specific state is kept behind a per-context lane so CDP operations
 //! and final verification cannot interleave across invocations.
 
+pub mod document_network;
 pub(crate) mod dom_layout;
 mod dom_values;
 pub mod extraction;
@@ -852,6 +853,7 @@ pub struct MainFrameResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Tracker {
+    pub main_frame_network: document_network::DocumentNetwork,
     pub download_blocked: bool,
     pub url_final: Option<String>,
     pub main_frame_response: Option<MainFrameResponse>,
@@ -861,6 +863,7 @@ pub struct Tracker {
     pub load_observed: bool,
     pending_requests: HashMap<String, (Instant, bool)>,
     main_frame_id: Option<String>,
+    main_frame_loader_id: Option<String>,
     pending_document_responses: HashMap<String, MainFrameResponse>,
     quiet_since: Option<Instant>,
     /// The main frame asked to leave its current document. Set from events a
@@ -1077,6 +1080,8 @@ impl Tracker {
         }
     }
     pub fn main_frame_navigated(&mut self, frame_id: Option<String>, url: String) {
+        self.main_frame_network = Default::default();
+        self.main_frame_loader_id = None;
         self.main_frame_response = frame_id
             .as_ref()
             .and_then(|frame_id| self.pending_document_responses.remove(frame_id));
@@ -1428,7 +1433,7 @@ fn public_read_frames(
                 .parent_id
                 .as_ref()
                 .is_some_and(|parent| readable.iter().any(|allowed| &allowed.frame_id == parent))
-                && crate::browser_standing_grants::origin_is_public(&frame.origin)
+                && frame.network.is_public(&frame.origin)
                 && !readable
                     .iter()
                     .any(|allowed| allowed.frame_id == frame.frame_id)
@@ -2885,6 +2890,31 @@ impl BrowserPlane {
         }
         drive_result.map_err(map_navigation_drive_error)?;
 
+        if let Some(landed_url) = tracker.url_final.as_deref() {
+            let origin = origin_from_url(landed_url);
+            if !tracker.main_frame_network.is_public(&origin)
+                && (tracker.main_frame_network.remote_ip_address.is_some()
+                    || tracker.main_frame_network.private_origin_seen)
+            {
+                let decision = self
+                    .grants
+                    .lock()
+                    .await
+                    .authorize_document(
+                        AuthorizationRequest::navigate(
+                            &identity.conversation_key,
+                            requested_severity,
+                            landed_url,
+                            &identity.agent_project_id,
+                        ),
+                        &origin,
+                        false,
+                    )
+                    .map_err(map_authorization_error)?;
+                self.remember_authorization(identity, &decision).await;
+            }
+        }
+
         let should_settle = wait == crate::browser_session::NavigationWait::Settle;
         let mut response = navigate_reply(&tracker, should_settle);
         let outcome = if response["outcome"] == "ok" {
@@ -3079,8 +3109,9 @@ impl BrowserPlane {
         &self,
         identity: &RouteIdentity,
         capability: BrowserCapability,
-        live_url: &str,
+        document: &CommittedDocument,
     ) -> Result<bool, BrowserError> {
+        let live_url = &document.url;
         let origin = origin_from_url(live_url);
         let grants = self.grants.lock().await;
         let request = if capability == BrowserCapability::Screenshot {
@@ -3096,7 +3127,11 @@ impl BrowserPlane {
                 &identity.agent_project_id,
             )
         };
-        let (error, reason) = match grants.authorize(request, &origin) {
+        let (error, reason) = match grants.authorize_document(
+            request,
+            &origin,
+            document.network.is_public(&origin),
+        ) {
             Ok(decision) => {
                 if grants.commit(&decision).is_ok() {
                     self.remember_authorization(identity, &decision).await;
@@ -3202,7 +3237,7 @@ impl BrowserPlane {
             .read_live_document(identity, session_operation, deadline_ms)
             .await?;
         let baseline_read = self
-            .authorize_read(identity, BrowserCapability::Snapshot, &source_document.url)
+            .authorize_read(identity, BrowserCapability::Snapshot, &source_document)
             .await?;
         let (mut session_operation, fill_mask) = self
             .fill_window_gate(
@@ -3836,13 +3871,14 @@ impl BrowserPlane {
                         .grants
                         .lock()
                         .await
-                        .authorize(
+                        .authorize_document(
                             AuthorizationRequest::snapshot(
                                 &identity.conversation_key,
                                 url_final,
                                 &identity.agent_project_id,
                             ),
                             &landing_origin,
+                            tracker.main_frame_network.is_public(&landing_origin),
                         )
                         .is_ok();
                     object.insert("landing_origin".into(), json!(landing_origin));
@@ -3983,12 +4019,19 @@ impl BrowserPlane {
                 ),
             };
             let origin = origin_from_url(&source_origin);
-            grants.authorize(request, &origin).and_then(|decision| {
-                grants
-                    .commit(&decision)
-                    .map_err(|_| crate::authorization::AuthorizationError::NoGrant)?;
-                Ok(decision)
-            })
+            let network = frame_document
+                .as_ref()
+                .map(|frame| frame.network)
+                .or_else(|| source_document.as_ref().map(|document| document.network))
+                .unwrap_or_default();
+            grants
+                .authorize_document(request, &origin, network.is_public(&origin))
+                .and_then(|decision| {
+                    grants
+                        .commit(&decision)
+                        .map_err(|_| crate::authorization::AuthorizationError::NoGrant)?;
+                    Ok(decision)
+                })
         };
         if let Err(error) = authorization {
             self.unpin_snapshot(identity, snapshot_id).await;
@@ -4190,12 +4233,8 @@ impl BrowserPlane {
         let (session_operation, source_document) = self
             .read_live_document(identity, session_operation, deadline_ms)
             .await?;
-        self.authorize_read(
-            identity,
-            BrowserCapability::Screenshot,
-            &source_document.url,
-        )
-        .await?;
+        self.authorize_read(identity, BrowserCapability::Screenshot, &source_document)
+            .await?;
         let (mut session_operation, _) = self
             .fill_window_gate(
                 identity,
@@ -4504,7 +4543,20 @@ impl BrowserPlane {
                 &classification,
             );
             grants
-                .authorize(request, &origin_from_url(&source_origin))
+                .authorize_document(
+                    request,
+                    &origin_from_url(&source_origin),
+                    frame_document
+                        .as_ref()
+                        .map(|frame| frame.network)
+                        .unwrap_or_else(|| {
+                            source_document
+                                .as_ref()
+                                .map(|document| document.network)
+                                .unwrap_or_default()
+                        })
+                        .is_public(&origin_from_url(&source_origin)),
+                )
                 .and_then(|decision| {
                     grants
                         .commit(&decision)
