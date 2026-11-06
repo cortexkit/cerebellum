@@ -95,7 +95,7 @@ test("terminal read accounting covers frame queries without admitting target mut
     assert.ok(readOnly.includes(method), `${method} must not mark a child read dispatched`);
     assert.equal(classifyCommand({ method, params: {} }), "read");
   }
-  for (const method of ["Input.dispatchMouseEvent", "Input.insertText", "DOM.focus", "DOM.scrollIntoViewIfNeeded", "Runtime.callFunctionOn", "Target.setAutoAttach", "Page.createIsolatedWorld", "DOM.newReadMethod"]) {
+  for (const method of ["Input.dispatchMouseEvent", "Input.insertText", "DOM.focus", "DOM.scrollIntoViewIfNeeded", "Extension.wait", "Runtime.callFunctionOn", "Target.setAutoAttach", "Page.createIsolatedWorld", "DOM.newReadMethod"]) {
     assert.ok(!readOnly.includes(method), `${method} must not become unconditionally read-only`);
   }
 });

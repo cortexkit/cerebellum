@@ -247,6 +247,23 @@ plan; they are not new caller commands and do not extend that deadline.
 - `Runtime.enable`, `Runtime.callFunctionOn` (hash-pinned only, below)
 - `Input.dispatchMouseEvent`, `Input.dispatchKeyEvent`, `Input.insertText`
 - `Emulation.setFocusEmulationEnabled` (only `{enabled:true}`)
+- `Extension.wait` (local pseudo-command, described below)
+
+`Extension.wait` has exactly `params:{ms:<integer>}`, with `ms` from 0 through
+2,000 inclusive. Other values or extra parameters refuse as `invalid_command`
+before attachment; execution also clamps the timer to at most 2,000 ms. It is
+classified as `wait`, not input or a read, returns `{result:{}}`, and sends no
+command to the page. Cancellation, detach, or a connection change wakes it
+immediately; the runner checks liveness and claimed-tab eligibility before
+continuing. It remains absent from `terminal-read-only-methods.json`: time spent
+attached can allow the page to change, so terminal accounting remains mutating.
+
+User-browser scroll plans enable focus emulation immediately before
+`DOM.scrollIntoViewIfNeeded`, then wait 2,000 ms before reading layout metrics.
+The ref form also reads its before-position at the start of the same plan.
+Focus emulation lets a background tab draw and load feed content without
+activating the tab or window. The debugger stays attached through the wait;
+detachment ends focus emulation and restores normal background visibility.
 
 `dom_full` snapshots use `DOM.getOuterHTML` with `backendNodeId` for both the
 document and its outermost content/chrome landmarks. Cerebellum uses the shared

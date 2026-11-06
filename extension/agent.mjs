@@ -65,6 +65,7 @@ export class Agent {
 
   connect(epoch) {
     this.connectionEpoch = epoch;
+    for (const state of this.active) state.cancelWait?.();
     this.claims.clear();
     this.blankNavigations.clear();
     probeReadDiagnostic("baseline_cleared", { reason: "connected", baselineCount: this.baselines.size });
@@ -238,6 +239,7 @@ export class Agent {
   }
 
   async detach(state) {
+    state.cancelWait?.();
     if (!state.attached) return;
     if (state.detaching) return state.detaching;
     state.detaching = Promise.resolve().then(async () => {
@@ -280,6 +282,24 @@ export class Agent {
     try { await this.detach(state); } finally {
       if (!state.attached) this.active.delete(state);
     }
+  }
+
+  async wait(state, milliseconds) {
+    this.alive(state);
+    let timer;
+    try {
+      await new Promise((resolve, reject) => {
+        state.cancelWait = () => reject(new Refusal("cancelled"));
+        // Keep the debugger attached while the renderer draws, without sending
+        // a command to the page. Cleanup wakes the wait without a polling delay.
+        timer = setTimeout(resolve, Math.max(0, Math.min(milliseconds, 2000)));
+      });
+    } finally {
+      clearTimeout(timer);
+      delete state.cancelWait;
+    }
+    await this.guard(state);
+    return {};
   }
 
   async execute(state) {
@@ -410,7 +430,9 @@ export class Agent {
           if (command.params.type === "mouseReleased") state.heldMouse = null;
         }
         let result;
-        if (command.method === "Page.getFrameTree" && !scope) {
+        if (kind === "wait") {
+          result = await this.wait(state, command.params.ms);
+        } else if (command.method === "Page.getFrameTree" && !scope) {
           const observed = await state.frames.read();
           result = { frameTree: observed.tree };
           frameMappings = observed.mappings;

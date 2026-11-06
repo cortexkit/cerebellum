@@ -20,6 +20,10 @@ const INPUT_METHODS = new Set(["Input.dispatchMouseEvent", "Input.dispatchKeyEve
 
 export function classifyCommand(command) {
   if (!command || typeof command.method !== "string" || !command.params || typeof command.params !== "object" || Array.isArray(command.params)) throw new Refusal("invalid_command", "update cerebellum and the extension together");
+  if (command.method === "Extension.wait") {
+    if (Object.keys(command.params).length !== 1 || !Number.isSafeInteger(command.params.ms) || command.params.ms < 0 || command.params.ms > 2000) throw new Refusal("invalid_command", "provide integer ms from 0 to 2000");
+    return "wait";
+  }
   const objectId = command.params.objectId;
   const validObjectId = typeof objectId === "string" && objectId.length > 0 || objectId && typeof objectId === "object" && Number.isInteger(objectId.$result) && objectId.$result >= 0 && Array.isArray(objectId.path) && Object.keys(objectId).every(key => ["$result", "path"].includes(key));
   if (command.method === "Runtime.callFunctionOn" && validObjectId && typeof command.params.functionDeclaration === "string" && command.params.returnByValue === true && Object.keys(command.params).every(key => ["objectId", "functionDeclaration", "returnByValue"].includes(key))) return "input";
