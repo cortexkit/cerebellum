@@ -112,6 +112,7 @@ mod open_app;
 #[cfg(test)]
 mod open_app_tests;
 mod operator_apps;
+mod web_replace;
 #[doc(hidden)]
 pub use operator_apps::development_build_snapshot;
 pub use operator_apps::ExecutableReader;
@@ -2184,6 +2185,17 @@ where
         arguments: &Value,
         context: ServeContext<'_, C>,
     ) -> Value {
+        self.serve_synthetic_prepared(capability, arguments, context, None)
+            .await
+    }
+
+    async fn serve_synthetic_prepared<C: MonotonicClock>(
+        &self,
+        capability: ComputerCapability,
+        arguments: &Value,
+        context: ServeContext<'_, C>,
+        replacement: Option<web_replace::WebReplacement>,
+    ) -> Value {
         // Every refusal returned before the dispatch below is marked as having
         // posted nothing, so a caller knows it can retry it. A refusal left
         // unmarked reads as effect_indeterminate, which is the safe default
@@ -2634,6 +2646,38 @@ where
         // the token, so no audit lock is held across platform work.
         // Also refuses once the badge was ended after it was scheduled.
         let badge_gate = element_actions::BadgeGate::new(work.gate(), watch);
+        if let Some(replacement) = replacement.as_ref() {
+            let source = self.app_state_source.clone();
+            let selection = replacement.clone();
+            let selection_grant = grant.clone();
+            let selection_work = work.clone();
+            let selection_identity = identity.clone();
+            let audit = AuditToken::new(self.audit.clone(), badge_gate.clone());
+            let selected = tokio::task::spawn_blocking(move || {
+                let _ax = selection_work.bound_ax();
+                let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(
+                    selection_grant.pid,
+                    None,
+                );
+                let mut journal = element_actions::ElementJournal::new(
+                    audit,
+                    selection_identity,
+                    ComputerCapability::WriteText,
+                    &selection_grant,
+                );
+                let result = selection.select(source.as_ref(), &selection_grant, &mut journal);
+                if journal.finish().is_err() {
+                    return Err(synthetic_dispatch_refusal(&DispatchError::AuditUnavailable));
+                }
+                result
+            })
+            .await;
+            match selected {
+                Ok(Ok(())) => {}
+                Ok(Err(reply)) => return reply,
+                Err(_) => return unposted(synthetic_dispatch_refusal(&DispatchError::Platform)),
+            }
+        }
         let mut token = AuditToken::new(self.audit.clone(), badge_gate.clone());
         // The keystrokes' own row, reserved next, records any front.
         fronting::action_row_started();
@@ -2798,7 +2842,15 @@ where
                 // Polled up to the row's effect deadline rather than read once:
                 // an application renders typed text some time after the posts
                 // return, and a backgrounded Electron app takes the longest.
-                if let (Some(text), Some(focused)) = (typed_text.as_deref(), focus.as_ref()) {
+                if let Some(replacement) = replacement.as_ref() {
+                    if finished["outcome"] == "delivery_unconfirmed"
+                        && replacement.arrived(source.as_ref(), effect_deadline)
+                    {
+                        finished["outcome"] = json!("completed");
+                        finished["effect_status"] = json!("effect_observed");
+                    }
+                } else if let (Some(text), Some(focused)) = (typed_text.as_deref(), focus.as_ref())
+                {
                     if finished["outcome"] == "delivery_unconfirmed"
                         && keystrokes::await_typed_text(
                             source.as_ref(),

@@ -304,6 +304,14 @@ impl AppStateSource for MacAppStateSource {
         cerebellum_macos::element_selected_range(retained(element)?).map_err(action_error)
     }
 
+    fn select_range(
+        &self,
+        element: &ElementHandle,
+        range: (usize, usize),
+    ) -> Result<(), ElementActionError> {
+        cerebellum_macos::select_element_range(retained(element)?, range).map_err(action_error)
+    }
+
     fn write_text(
         &self,
         element: &ElementHandle,

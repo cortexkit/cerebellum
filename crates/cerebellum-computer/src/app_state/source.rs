@@ -582,6 +582,16 @@ pub trait AppStateSource: Send + Sync {
         Err(ElementActionError::UnsupportedOnPlatform)
     }
 
+    /// Select UTF-16 code units without writing the editor's text. An accepted
+    /// setter is not evidence of selection; callers must read the range back.
+    fn select_range(
+        &self,
+        _element: &ElementHandle,
+        _range: (usize, usize),
+    ) -> Result<(), ElementActionError> {
+        Err(ElementActionError::UnsupportedOnPlatform)
+    }
+
     /// Set one text attribute. `Ok` means the application accepted the
     /// message, not that the text is there.
     fn write_text(
@@ -847,6 +857,20 @@ impl AppStateSource for UnsupportedAppStateSource {
         _bounds: ReadBounds,
     ) -> Result<RawAppState, AppStateReadError> {
         Err(AppStateReadError::UnsupportedOnPlatform)
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_sources_cannot_select_text() {
+        let handle: ElementHandle = std::sync::Arc::new(FixtureElementToken(1));
+        assert_eq!(
+            UnsupportedAppStateSource.select_range(&handle, (0, 4)),
+            Err(ElementActionError::UnsupportedOnPlatform),
+        );
     }
 }
 
