@@ -979,7 +979,7 @@ where
             return json!({
                 "outcome": "web_content_needs_type",
                 "reason": "web_content_needs_type",
-                "remedy": "web editors must be typed into; press_element the field to place the caret, then use type, which appends at the caret and confirms by readback. To replace existing text, clear it first",
+                "remedy": "web editors must be typed into; press_element the field to place the caret, then use type, which appends at the caret and confirms by readback. To replace the whole text, press_element the field, then write_text with write_mode replace_value",
             });
         }
         Some(false) => {}
