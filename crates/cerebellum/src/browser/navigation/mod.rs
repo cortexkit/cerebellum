@@ -5,6 +5,10 @@ mod classification_index;
 mod fill;
 mod frames;
 mod scroll;
+mod service;
+#[cfg(test)]
+mod service_tests;
+pub use service::ConnectionMetadata;
 mod typing;
 pub use capture::SnapshotTimings;
 use classification_index::{classify_refs, CountedNodes, DomClassificationBatch, DomIndexes};
@@ -367,9 +371,47 @@ pub struct CdpNavigationDriver<IO> {
     downloads_denied: bool,
     prefer_bulk_ax: bool,
     last_snapshot_timings: Option<SnapshotTimings>,
+    continuously_serviced: bool,
+    metadata_high_water: ConnectionMetadata,
+    connection_reset_required: bool,
+    frame_generation: u64,
+    live_frame_parents: HashMap<String, Option<String>>,
+    // History API changes invalidate snapshot element references without
+    // replacing a document. Load completion therefore uses document generations,
+    // not reference revisions.
+    frame_document_generations: HashMap<String, u64>,
+    lifecycle_events_enabled: bool,
+    quiet_read_epoch: u64,
 }
 
 impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
+    #[cfg(unix)]
+    pub fn connection_readiness(&self) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+        self.pipe.readiness()
+    }
+
+    /// Idle reads have no tracker, terminal, or authorization context and can
+    /// only apply events and correlate replies, never issue a CDP command.
+    pub fn service_connection(&mut self) -> Result<bool, NavigationDriveError> {
+        debug_assert!(crate::browser_session::drive_context().is_none());
+        self.enforce_metadata_bounds(None)?;
+        Ok(matches!(
+            self.read_turn(None, None, Instant::now())?,
+            ReadTurn::Progress(_)
+        ))
+    }
+
+    pub fn enable_connection_service(&mut self) {
+        self.continuously_serviced = true;
+    }
+
+    pub fn connection_metadata(&self) -> ConnectionMetadata {
+        self.metadata_high_water
+    }
+
+    pub fn connection_quiet_epoch(&self) -> u64 {
+        self.quiet_read_epoch
+    }
     pub fn new(pipe: IO, mut transport: CdpTransport, decoder: CdpFrameDecoder) -> Self {
         // Readiness can observe browser-wide startup events before this route has
         // attached a target. They have no route identity and must not remain in
@@ -398,6 +440,14 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             downloads_denied: false,
             prefer_bulk_ax: true,
             last_snapshot_timings: None,
+            continuously_serviced: false,
+            metadata_high_water: ConnectionMetadata::default(),
+            connection_reset_required: false,
+            frame_generation: 0,
+            live_frame_parents: HashMap::new(),
+            frame_document_generations: HashMap::new(),
+            lifecycle_events_enabled: false,
+            quiet_read_epoch: 0,
         }
     }
 
@@ -1692,6 +1742,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         // Tracked from the press onward: Chrome reports a link click's
         // navigation request before it acknowledges the release.
         let mut tracker = Tracker::default();
+        if self.continuously_serviced {
+            self.enable_lifecycle_events(deadline, clock)?;
+            tracker.begin_loader_fence(self.frame_generation);
+        }
         let mut dialogs = Vec::new();
         let mut press_params = mouse_event_params("mousePressed", position);
         press_params.insert("button".into(), Value::String("left".into()));
@@ -2930,6 +2984,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             clock,
         )?;
 
+        if self.continuously_serviced {
+            self.enable_lifecycle_events(deadline, clock)?;
+            tracker.begin_loader_fence(self.frame_generation);
+        }
         let mut params = Map::new();
         params.insert("url".into(), Value::String(url.to_string()));
         let navigate_result = self.command(
@@ -2959,6 +3017,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             });
         }
 
+        if self.continuously_serviced {
+            if let Some(loader) = navigate_result.get("loaderId").and_then(Value::as_str) {
+                tracker.expect_loader(loader.to_owned());
+            } else {
+                // Same-document navigation has no new loader and must not
+                // borrow the previous document's load token.
+                return Ok(());
+            }
+        }
         if wait == NavigationWait::None {
             return Ok(());
         }
@@ -3367,7 +3434,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             Ok(PipeRead::Bytes(_)) | Ok(PipeRead::Closed) => {
                 return Err(NavigationDriveError::ConnectorFailure)
             }
-            Ok(PipeRead::WouldBlock) => return Ok(ReadTurn::WouldBlock),
+            Ok(PipeRead::WouldBlock) => {
+                self.quiet_read_epoch = self.quiet_read_epoch.saturating_add(1);
+                return Ok(ReadTurn::WouldBlock);
+            }
             Err(_) => return Err(NavigationDriveError::ConnectorFailure),
         };
 
@@ -3436,10 +3506,16 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     }
                 }
             }
+            if self.continuously_serviced && event.method == "Page.javascriptDialogClosed" {
+                self.pending_javascript_dialogs.retain(|dialog| {
+                    Some(dialog.session_id.as_str()) != event.session_id.as_deref()
+                });
+            }
             if let Some((context_key, tracker)) = tracking.as_mut() {
                 self.apply_event(context_key, tracker, &event, observed_at);
             }
         }
+        self.enforce_metadata_bounds(tracking.as_ref().map(|(_, tracker)| &**tracker))?;
         Ok(ReadTurn::Progress(matched))
     }
 
@@ -3498,8 +3574,39 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             return;
         }
 
+        if tracker.has_loader_fence()
+            && matches!(
+                event.method.as_str(),
+                "Network.requestWillBeSent" | "Network.responseReceived"
+            )
+            && !tracker.accepts_loader(
+                event
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("loaderId"))
+                    .and_then(Value::as_str),
+            )
+        {
+            return;
+        }
         match event.method.as_str() {
-            "Page.loadEventFired" => tracker.load(observed_at),
+            "Page.loadEventFired" if !tracker.has_loader_fence() => tracker.load(observed_at),
+            "Page.lifecycleEvent" => {
+                if let Some(params) = event.params.as_ref().filter(|p| {
+                    p.get("name").and_then(Value::as_str) == Some("load")
+                        && p.get("frameId").and_then(Value::as_str)
+                            == Some(attachment.target_id.as_str())
+                }) {
+                    if let Some(loader) = params.get("loaderId").and_then(Value::as_str) {
+                        let generation = self
+                            .frame_document_generations
+                            .get(&attachment.target_id)
+                            .copied()
+                            .unwrap_or(0);
+                        tracker.loader_load(loader, generation, observed_at);
+                    }
+                }
+            }
             "Network.requestWillBeSent" => {
                 // A redirect re-emits this event for the SAME request, carrying
                 // the response that caused the redirect. The original request
@@ -3629,6 +3736,17 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .and_then(|params| params.get("frame"))
                     .and_then(Value::as_object);
                 if let Some(frame) = frame.filter(|frame| !frame.contains_key("parentId")) {
+                    let generation = frame
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| self.frame_document_generations.get(id))
+                        .copied()
+                        .unwrap_or(0);
+                    if !tracker
+                        .commit_loader(frame.get("loaderId").and_then(Value::as_str), generation)
+                    {
+                        return;
+                    }
                     if let Some(url) = frame.get("url").and_then(Value::as_str) {
                         let frame_id = frame.get("id").and_then(Value::as_str).map(str::to_string);
                         // Chrome commits its own error page for a failed

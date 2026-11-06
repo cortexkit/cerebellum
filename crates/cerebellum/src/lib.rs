@@ -8659,11 +8659,18 @@ async fn handle_browser_control(
                 Ok(id) => id,
                 Err(invalid) => return invalid,
             };
-            let result = planes.sessions.close(
-                &accepted.identity.conversation_key,
-                browser_session_id,
-                config,
-            );
+            let sessions = planes.sessions.clone();
+            let route = accepted.identity.conversation_key.clone();
+            let browser_session_id = browser_session_id.to_owned();
+            let config = config.clone();
+            let result = match on_call_blocking_pool(move || {
+                sessions.close(&route, &browser_session_id, &config)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => return json!({"outcome":"internal_failure"}),
+            };
             if result["outcome"] == "closed" {
                 planes.browser.end_context(&accepted.identity, false).await;
             }
@@ -8779,11 +8786,21 @@ async fn handle_browser_control(
                         .await
                         .is_err()
                     {
-                        planes.sessions.teardown_route(
-                            &accepted.identity.conversation_key,
-                            browser_session::BrowserSessionTerminalOutcome::CdpFailure,
-                            config,
-                        );
+                        let sessions = planes.sessions.clone();
+                        let route = accepted.identity.conversation_key.clone();
+                        let config = config.clone();
+                        if on_call_blocking_pool(move || {
+                            sessions.teardown_route(
+                                &route,
+                                browser_session::BrowserSessionTerminalOutcome::CdpFailure,
+                                &config,
+                            )
+                        })
+                        .await
+                        .is_err()
+                        {
+                            return json!({"outcome":"internal_failure"});
+                        }
                         let terminal = planes.sessions.status(
                             &accepted.identity.conversation_key,
                             clock,

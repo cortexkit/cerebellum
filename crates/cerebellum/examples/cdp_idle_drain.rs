@@ -1,9 +1,16 @@
-//! Headless, loopback-only measurement of an unread own-browser CDP connection.
+//! Headless comparison of unread and continuously serviced own-browser CDP.
 //! Run with CK_CHROME=/path/to/chrome cargo run --locked -p cerebellum
 //! --example cdp_idle_drain. CK_IDLE_SECONDS defaults to 10,60,300; a short
 //! override is useful for checking the fixture, not as measurement evidence.
 //! CK_IDLE_PAGE and CK_IDLE_ARM can select a single failed measurement to retry.
 //! Each arm has its own temporary profile and the production pipe and driver.
+//! CK_CDP_SERVICE=1 selects the connection worker before any command is sent;
+//! the default keeps legacy ownership for baseline comparisons. Fixtures use
+//! loopback HTTP with persistent connections. CK_CDP_LIVE_SHAPE=1 additionally
+//! sends browser_use requests through the normal request handler, with an
+//! in-memory journal and a fresh headless profile, on public GitHub/Wikipedia
+//! pages. It also cancels a snapshot while a local page continuously produces
+//! CDP events, measuring reply/cleanup latency without logging page text.
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn main() {
@@ -17,10 +24,17 @@ fn main() -> Result<(), String> {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod probe {
+    mod live_shape {
+        include!("support/cdp_service_shape.rs");
+    }
     use cerebellum::browser::navigation::CdpNavigationDriver;
     use cerebellum::browser::Tracker;
     use cerebellum::browser_launch_readiness::{CdpPipeIo, PipeRead, UnixCdpPipe};
-    use cerebellum::browser_session::NavigationWait;
+    use cerebellum::browser_session::connection_worker::ConnectionWorker;
+    use cerebellum::browser_session::{
+        BrowserExitProbe, BrowserKiller, KillOutcome, NavigationDriveError, NavigationWait,
+        OwnedBrowserProcess, ProcessControlFailure, ProcessControlStep,
+    };
     use cerebellum::cdp::{CdpFrameDecoder, CdpTransport};
     use cerebellum::snapshot_store::SnapshotKind;
     #[cfg(target_os = "linux")]
@@ -36,11 +50,185 @@ mod probe {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const DEADLINE: u64 = 20_000;
+    struct ProbeProcess {
+        driver: CdpNavigationDriver<Pipe>,
+        child: Arc<ProbeChild>,
+    }
+    struct ProbeChild(Mutex<Option<platform::ReleasedChild>>);
+    impl ProbeChild {
+        fn reap(&self) -> Result<(), ProcessControlFailure> {
+            self.0.lock().unwrap().take().map_or(Ok(()), |child| {
+                child
+                    .terminate_and_reap()
+                    .map_err(|_| ProcessControlFailure::new(ProcessControlStep::ReapWait))
+            })
+        }
+    }
+    impl BrowserExitProbe for ProbeChild {
+        fn generation_matches(&self) -> bool {
+            self.0.lock().unwrap().is_some()
+        }
+    }
+    impl BrowserKiller for ProbeChild {
+        fn kill_exact_generation(&self) -> KillOutcome {
+            if self.reap().is_ok() {
+                KillOutcome::Dead
+            } else {
+                KillOutcome::Refused
+            }
+        }
+    }
+    impl OwnedBrowserProcess for ProbeProcess {
+        fn connection_quiet_epoch(&self) -> u64 {
+            self.driver.connection_quiet_epoch()
+        }
+        fn committed_document(
+            &mut self,
+            context: &str,
+            deadline: u64,
+        ) -> Result<cerebellum::snapshot_store::CommittedDocument, NavigationDriveError> {
+            self.driver.committed_document(context, deadline)
+        }
+        fn frame_documents(
+            &mut self,
+            context: &str,
+            deadline: u64,
+        ) -> Result<Vec<cerebellum::snapshot_store::FrameDocument>, NavigationDriveError> {
+            self.driver.frame_documents(context, deadline)
+        }
+        fn set_read_frames(
+            &mut self,
+            frames: Vec<cerebellum::snapshot_store::FrameDocument>,
+        ) -> Result<(), NavigationDriveError> {
+            self.driver.set_read_frames(frames);
+            Ok(())
+        }
+        fn prepare_frame(
+            &mut self,
+            context: &str,
+            frame: &cerebellum::snapshot_store::FrameDocument,
+            deadline: u64,
+        ) -> Result<bool, NavigationDriveError> {
+            self.driver.prepare_frame(context, frame, deadline)
+        }
+        fn snapshot_classified(
+            &mut self,
+            context: &str,
+            mode: SnapshotKind,
+            epoch: u64,
+            origin: &str,
+            deadline: u64,
+        ) -> Result<cerebellum::browser::navigation::BrowserSnapshotObservation, NavigationDriveError>
+        {
+            self.driver
+                .snapshot_classified(context, mode, epoch, origin, deadline)
+        }
+        fn snapshot_subtree_classified(
+            &mut self,
+            context: &str,
+            mode: SnapshotKind,
+            reference: &cerebellum::snapshot_store::RefRecord,
+            epoch: u64,
+            origin: &str,
+            deadline: u64,
+        ) -> Result<cerebellum::browser::navigation::BrowserSnapshotObservation, NavigationDriveError>
+        {
+            self.driver
+                .snapshot_subtree_classified(context, mode, reference, epoch, origin, deadline)
+        }
+        fn enable_connection_service(&mut self) {
+            self.driver.enable_connection_service();
+        }
+        fn connection_readiness(&self) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+            self.driver.connection_readiness()
+        }
+        fn service_connection(&mut self) -> Result<bool, NavigationDriveError> {
+            self.driver.service_connection()
+        }
+        fn connection_metadata(&mut self) -> cerebellum::browser::navigation::ConnectionMetadata {
+            self.driver.connection_metadata()
+        }
+        fn snapshot(
+            &mut self,
+            context: &str,
+            mode: SnapshotKind,
+            deadline: u64,
+        ) -> Result<cerebellum::browser::navigation::BrowserSnapshotObservation, NavigationDriveError>
+        {
+            self.driver.snapshot(context, mode, deadline)
+        }
+        fn navigate(
+            &mut self,
+            context: &str,
+            url: &str,
+            wait: NavigationWait,
+            deadline: u64,
+            tracker: &mut Tracker,
+        ) -> Result<(), NavigationDriveError> {
+            let result = self.driver.navigate(context, url, wait, deadline, tracker);
+            println!(
+                "{}",
+                json!({"navigation_driver":true,"result":format!("{result:?}"),"lifecycle":tracker.lifecycle,"inflight_count":tracker.inflight_count,"settled":tracker.settled,"load_observed":tracker.load_observed,"http_status":tracker.http_status()})
+            );
+            result
+        }
+        fn generation_matches(&self) -> bool {
+            self.child.generation_matches()
+        }
+        fn shutdown_killer(&self) -> Option<Arc<dyn BrowserKiller>> {
+            Some(self.child.clone())
+        }
+        fn exit_probe(&self) -> Option<Arc<dyn BrowserExitProbe>> {
+            Some(self.child.clone())
+        }
+        fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+            self.child.reap()
+        }
+        fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+            Ok(!self.child.generation_matches())
+        }
+        fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+            self.child.reap()
+        }
+        fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+            self.child.reap()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn thread_cpu_ns() -> u64 {
+        unsafe extern "C" {
+            fn clock_gettime_nsec_np(clock: u32) -> u64;
+        }
+        // CLOCK_THREAD_CPUTIME_ID samples this worker, not Chrome or the caller.
+        unsafe { clock_gettime_nsec_np(16) }
+    }
+    #[cfg(target_os = "linux")]
+    fn thread_cpu_ns() -> u64 {
+        #[repr(C)]
+        struct Timespec {
+            seconds: std::ffi::c_long,
+            nanos: std::ffi::c_long,
+        }
+        unsafe extern "C" {
+            fn clock_gettime(clock: std::ffi::c_int, value: *mut Timespec) -> std::ffi::c_int;
+        }
+        let mut value = Timespec {
+            seconds: 0,
+            nanos: 0,
+        };
+        // Linux CLOCK_THREAD_CPUTIME_ID; value is writable for both fields.
+        if unsafe { clock_gettime(3, &mut value) } == 0 {
+            value.seconds as u64 * 1_000_000_000 + value.nanos as u64
+        } else {
+            0
+        }
+    }
     const PAGE: &str = r#"<!doctype html><title>idle fixture</title>
 <h1 id="marker">idle fixture</h1><button>Snapshot marker</button><div id="images"></div>
 <script>
@@ -61,7 +249,7 @@ function image(){const i=new Image(); i.onload=()=>images++; i.src='/image?key='
  document.querySelector('#images').replaceChildren(i);}
 let work=setInterval(()=>{if(busy&&running){for(let i=0;i<4;i++){
  fetch('/poll?key='+key+'&n='+Math.random()).then(r=>r.text()).then(()=>fetches++);image();}
- console.log('idle fixture',performance.now(),'x'.repeat(1024));}},100);
+  console.log('idle fixture',performance.now(),'x'.repeat(1024));}},new URLSearchParams(location.search).has('firehose')?1:100);
 if(busy){for(let i=0;i<32;i++)image(); for(let i=0;i<3;i++){
  const f=document.createElement('iframe');f.src='/frame';document.body.append(f);}}
 </script>"#;
@@ -70,6 +258,7 @@ if(busy){for(let i=0;i<32;i++)image(); for(let i=0;i<3;i++){
     struct Fixture {
         stopped: AtomicBool,
         navigate: AtomicBool,
+        connections: AtomicU64,
         beats: Mutex<Vec<Value>>,
         requests: Mutex<BTreeMap<String, usize>>,
     }
@@ -126,61 +315,77 @@ if(busy){for(let i=0;i<32;i++)image(); for(let i=0;i<3;i++){
     }
 
     fn serve(mut stream: TcpStream, fixtures: &Mutex<BTreeMap<String, Arc<Fixture>>>) {
+        // macOS can inherit the nonblocking listener flag on accepted sockets.
+        // A WouldBlock between requests must not close a persistent connection.
+        if stream.set_nonblocking(false).is_err() {
+            return;
+        }
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.set_nodelay(true);
         let mut bytes = Vec::new();
         let mut chunk = [0; 4096];
-        let header_end = loop {
-            match stream.read(&mut chunk) {
-                Ok(0) | Err(_) => return,
-                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
-            }
-            if let Some(end) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
-                break end + 4;
-            }
-            if bytes.len() > 65536 {
-                return;
-            }
-        };
-        let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
-        let path = headers.split_whitespace().nth(1).unwrap_or("/");
-        let length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap_or(0)
-            .min(65536);
-        while bytes.len() < header_end + length {
-            match stream.read(&mut chunk) {
-                Ok(0) | Err(_) => return,
-                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
-            }
-        }
-        let key = path
-            .split_once('?')
-            .into_iter()
-            .flat_map(|(_, q)| q.split('&'))
-            .find_map(|part| part.strip_prefix("key="))
-            .unwrap_or("");
-        let fixture = fixtures.lock().unwrap().get(key).cloned();
-        let route = path.split('?').next().unwrap_or("/");
-        if let Some(fixture) = &fixture {
-            *fixture
-                .requests
-                .lock()
-                .unwrap()
-                .entry(route.to_string())
-                .or_default() += 1;
-            if matches!(route, "/beat" | "/final") {
-                if let Ok(value) = serde_json::from_slice(&bytes[header_end..header_end + length]) {
-                    fixture.beats.lock().unwrap().push(value);
+        let mut counted_connection = false;
+        // Reuse Chrome's connections: closing every response fills the shared
+        // host's TIME_WAIT table without adding useful CDP traffic.
+        loop {
+            let header_end = loop {
+                if let Some(end) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
+                    break end + 4;
+                }
+                if bytes.len() > 65536 {
+                    return;
+                }
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+            let path = headers.split_whitespace().nth(1).unwrap_or("/");
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0)
+                .min(65536);
+            while bytes.len() < header_end + length {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => bytes.extend_from_slice(&chunk[..n]),
                 }
             }
-        }
-        let (kind, body) = match route {
+            let key = path
+                .split_once('?')
+                .into_iter()
+                .flat_map(|(_, q)| q.split('&'))
+                .find_map(|part| part.strip_prefix("key="))
+                .unwrap_or("");
+            let fixture = fixtures.lock().unwrap().get(key).cloned();
+            let route = path.split('?').next().unwrap_or("/");
+            if let Some(fixture) = &fixture {
+                if !counted_connection {
+                    fixture.connections.fetch_add(1, Ordering::Relaxed);
+                    counted_connection = true;
+                }
+                *fixture
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .entry(route.to_string())
+                    .or_default() += 1;
+                if matches!(route, "/beat" | "/final") {
+                    if let Ok(value) =
+                        serde_json::from_slice(&bytes[header_end..header_end + length])
+                    {
+                        fixture.beats.lock().unwrap().push(value);
+                    }
+                }
+            }
+            let (kind, body) = match route {
             "/busy" | "/quiet" => ("text/html", PAGE.to_string()),
             "/frame" => ("text/html", "<p>local iframe</p>".to_string()),
             "/image" => ("image/svg+xml", "<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><rect width='8' height='8'/></svg>".to_string()),
@@ -195,7 +400,57 @@ if(busy){for(let i=0;i<32;i++)image(); for(let i=0;i<3;i++){
             }
             _ => ("text/plain", "ok".to_string()),
         };
-        let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len());
+            if write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: keep-alive\r\n\r\n{body}", body.len()).is_err() {
+            return;
+        }
+            bytes.drain(..header_end + length);
+        }
+    }
+
+    #[test]
+    fn persistent_fixture_socket_survives_an_idle_nonblocking_accept() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        // Reproduce the accepted descriptor's macOS flag on every test host.
+        server.set_nonblocking(true).unwrap();
+        let fixture = Arc::new(Fixture::default());
+        let state = fixture.clone();
+        let owner = std::thread::spawn(move || {
+            serve(
+                server,
+                &Mutex::new(BTreeMap::from([("reuse".into(), state)])),
+            );
+        });
+        for _ in 0..2 {
+            client.write_all(b"GET /poll?key=reuse HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n").unwrap();
+            let mut reply = Vec::new();
+            let mut byte = [0; 1];
+            loop {
+                assert_eq!(
+                    client.read(&mut byte).unwrap(),
+                    1,
+                    "the server closed an otherwise reusable socket"
+                );
+                reply.push(byte[0]);
+                if reply.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+                assert!(reply.len() < 4096);
+            }
+            assert!(String::from_utf8_lossy(&reply).contains("Connection: keep-alive"));
+            let mut body = [0; 2];
+            client.read_exact(&mut body).unwrap();
+            assert_eq!(&body, b"ok");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(client);
+        owner.join().unwrap();
+        assert_eq!(fixture.connections.load(Ordering::Relaxed), 1);
+        assert_eq!(fixture.requests.lock().unwrap().get("/poll"), Some(&2));
     }
 
     #[derive(Default)]
@@ -216,6 +471,7 @@ if(busy){for(let i=0;i<32;i++)image(); for(let i=0;i<3;i++){
         session: Option<String>,
         control_response: Option<Value>,
         measurement_start: Option<Instant>,
+        commands_sent: u64,
     }
 
     struct Pipe {
@@ -224,9 +480,13 @@ if(busy){for(let i=0;i<32;i++)image(); for(let i=0;i<3;i++){
     }
 
     impl CdpPipeIo for Pipe {
+        fn readiness(&self) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+            self.inner.readiness()
+        }
         fn write_frame(&mut self, bytes: &[u8]) -> std::io::Result<()> {
             if let Ok(value) = serde_json::from_slice::<Value>(&bytes[..bytes.len() - 1]) {
                 let mut meter = self.meter.lock().unwrap();
+                meter.commands_sent += 1;
                 if let Some(id) = value["id"].as_u64() {
                     meter.issued.insert(id);
                 }
@@ -373,7 +633,7 @@ if(busy){for(let i=0;i<32;i++)image(); for(let i=0;i<3;i++){
                 "error":profile.get("error")}})
     }
 
-    fn snapshot(driver: &mut CdpNavigationDriver<Pipe>, marker: &str) -> Value {
+    fn snapshot(driver: &mut dyn OwnedBrowserProcess, marker: &str) -> Value {
         let start = Instant::now();
         match driver.snapshot("probe", SnapshotKind::DomFull, DEADLINE) {
             Ok(observation) => json!({"ms":start.elapsed().as_millis(),"ok":true,
@@ -383,7 +643,7 @@ if(busy){for(let i=0;i<32;i++)image(); for(let i=0;i<3;i++){
         }
     }
 
-    fn navigate(driver: &mut CdpNavigationDriver<Pipe>, url: &str) -> Value {
+    fn navigate(driver: &mut dyn OwnedBrowserProcess, url: &str) -> Value {
         let start = Instant::now();
         let mut tracker = Tracker::default();
         let result = driver.navigate("probe", url, NavigationWait::Settle, DEADLINE, &mut tracker);
@@ -447,22 +707,59 @@ if(busy){for(let i=0;i<32;i++)image(); for(let i=0;i<3;i++){
         drop(child_commands);
         drop(child_responses);
         let pid = browser.generation().pid;
+        let browser = Arc::new(ProbeChild(Mutex::new(Some(browser))));
         let meter = Arc::new(Mutex::new(Meter::default()));
-        let mut drain = Pipe {
-            inner: UnixCdpPipe::new(
-                commands.try_clone().map_err(|e| e.to_string())?,
-                responses.try_clone().map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?,
-            meter: meter.clone(),
+        let continuously_serviced = std::env::var("CK_CDP_SERVICE").as_deref() == Ok("1");
+        let mut drain = if continuously_serviced {
+            None
+        } else {
+            Some(Pipe {
+                inner: UnixCdpPipe::new(
+                    commands.try_clone().map_err(|e| e.to_string())?,
+                    responses.try_clone().map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?,
+                meter: meter.clone(),
+            })
         };
         let pipe = Pipe {
             inner: UnixCdpPipe::new(commands, responses).map_err(|e| e.to_string())?,
             meter: meter.clone(),
         };
         let result = (|| {
-            let mut driver =
-                CdpNavigationDriver::new(pipe, CdpTransport::new(), CdpFrameDecoder::default());
+            let process = Box::new(ProbeProcess {
+                driver: CdpNavigationDriver::new(
+                    pipe,
+                    CdpTransport::new(),
+                    CdpFrameDecoder::default(),
+                ),
+                child: browser.clone(),
+            });
+            if std::env::var("CK_CDP_LIVE_SHAPE").as_deref() == Ok("1") {
+                return live_shape::run(
+                    process,
+                    server,
+                    fixture.clone(),
+                    key.clone(),
+                    meter.clone(),
+                );
+            }
+            let reset = Arc::new(AtomicBool::new(false));
+            let reset_signal = Arc::clone(&reset);
+            let (worker, mut driver): (Option<ConnectionWorker>, Box<dyn OwnedBrowserProcess>) =
+                if continuously_serviced {
+                    let worker = ConnectionWorker::start(
+                        process,
+                        Arc::new(|| true),
+                        Arc::new(move || {
+                            reset_signal.store(true, Ordering::Relaxed);
+                        }),
+                    )
+                    .map_err(|_| "worker startup failed")?;
+                    (Some(worker.clone()), Box::new(worker))
+                } else {
+                    (None, process)
+                };
             let url = format!("http://{}/{page}?key={key}", server.address);
             driver
                 .navigate(
@@ -473,17 +770,58 @@ if(busy){for(let i=0;i<32;i++)image(); for(let i=0;i<3;i++){
                     &mut Tracker::default(),
                 )
                 .map_err(|e| format!("setup navigate: {e:?}"))?;
-            let warm = snapshot(&mut driver, "idle fixture");
+            let warm = snapshot(driver.as_mut(), "idle fixture");
             if warm["ok"] != true {
                 return Err(format!("setup snapshot: {warm}"));
             }
+            if worker.is_some() {
+                std::thread::sleep(if page == "quiet" {
+                    Duration::from_secs(10)
+                } else {
+                    Duration::from_millis(200)
+                });
+            }
+            let cpu_start = worker
+                .as_ref()
+                .map(|w| w.measure(|_| thread_cpu_ns()))
+                .transpose()
+                .map_err(|e| format!("CPU sample: {e:?}"))?;
+            let wakes_start = worker
+                .as_ref()
+                .map_or(0, |w| w.metrics().ready_wakes.load(Ordering::Relaxed));
+            {
+                let mut m = meter.lock().unwrap();
+                m.measuring = true;
+                m.measurement_start = Some(Instant::now());
+                m.counts = Counts::default();
+            }
             let beats_before = fixture.beats.lock().unwrap().len();
+            let connections_before = fixture.connections.load(Ordering::Relaxed);
             fixture.navigate.store(true, Ordering::Relaxed);
             let start = Instant::now();
-            // No CDP read, including a liveness or timer query, occurs here.
+            // Legacy sessions do not read here. Serviced sessions keep their
+            // one owner running; no probe or second reader touches the wire.
             std::thread::sleep(Duration::from_secs(seconds));
             let idle_ms = start.elapsed().as_millis();
+            let cpu_end = worker
+                .as_ref()
+                .map(|w| w.measure(|_| thread_cpu_ns()))
+                .transpose()
+                .map_err(|e| format!("CPU sample: {e:?}"))?;
+            let worker_stats = worker.as_ref().map(|w| {
+                let m = w.metrics();
+                json!({"cpu_ms":cpu_end.unwrap_or(0).saturating_sub(cpu_start.unwrap_or(0)) / 1_000_000,
+                    "cpu_percent":cpu_end.unwrap_or(0).saturating_sub(cpu_start.unwrap_or(0)) as f64 / (idle_ms.max(1) as f64 * 10_000.0),
+                    "ready_wakes":m.ready_wakes.load(Ordering::Relaxed).saturating_sub(wakes_start),
+                    "longest_quantum_ns":m.longest_quantum_ns.load(Ordering::Relaxed),
+                    "longest_readable_streak_ns":m.longest_readable_streak_ns.load(Ordering::Relaxed)})
+            });
+            let idle_counts = {
+                let m = meter.lock().unwrap();
+                json!({"bytes":m.counts.bytes,"events":m.counts.events.values().sum::<usize>(),"methods":m.counts.events})
+            };
             let beats = fixture.beats.lock().unwrap().clone();
+            let connections_at_idle_end = fixture.connections.load(Ordering::Relaxed);
             let requests = fixture.requests.lock().unwrap().clone();
             fixture.stopped.store(true, Ordering::Relaxed);
             // Stop the producers out of band. This does not read CDP and allows
@@ -497,26 +835,42 @@ if(busy){for(let i=0;i<32;i++)image(); for(let i=0;i<3;i++){
             }
             let next = format!("http://{}/next?key={key}", server.address);
             let first = match arm {
-                "snapshot" => snapshot(&mut driver, "idle fixture"),
-                "navigate" => navigate(&mut driver, &next),
+                "snapshot" => snapshot(driver.as_mut(), "idle fixture"),
+                "navigate" => navigate(driver.as_mut(), &next),
                 "drain" => {
-                    // The duplicate is used only after the driver has stopped,
-                    // and the driver is never called again in this trial.
-                    let start = Instant::now();
-                    let mut last = Instant::now();
-                    let mut buffer = [0; 65536];
-                    while start.elapsed() < Duration::from_secs(10)
-                        && last.elapsed() < Duration::from_millis(200)
-                    {
-                        match drain.read(&mut buffer).map_err(|e| e.to_string())? {
-                            PipeRead::Bytes(_) => last = Instant::now(),
-                            PipeRead::WouldBlock => std::thread::sleep(Duration::from_millis(1)),
-                            PipeRead::Closed => {
-                                return Err("Chrome closed pipe during drain".into())
+                    if let Some(worker) = &worker {
+                        let start = Instant::now();
+                        worker
+                            .measure(|p| {
+                                while p.service_connection()? {}
+                                Ok::<_, NavigationDriveError>(())
+                            })
+                            .map_err(|e| format!("drain: {e:?}"))?
+                            .map_err(|e| format!("drain: {e:?}"))?;
+                        json!({"ms":start.elapsed().as_millis(),"quiet_ms":0,"serviced_owner":true})
+                    } else {
+                        let drain = drain.as_mut().ok_or("legacy drain is unavailable")?;
+                        // This duplicate CDP response socket is read only after
+                        // the legacy driver stops, and that driver is never
+                        // called again in this trial.
+                        let start = Instant::now();
+                        let mut last = Instant::now();
+                        let mut buffer = [0; 65536];
+                        while start.elapsed() < Duration::from_secs(10)
+                            && last.elapsed() < Duration::from_millis(200)
+                        {
+                            match drain.read(&mut buffer).map_err(|e| e.to_string())? {
+                                PipeRead::Bytes(_) => last = Instant::now(),
+                                PipeRead::WouldBlock => {
+                                    std::thread::sleep(Duration::from_millis(1))
+                                }
+                                PipeRead::Closed => {
+                                    return Err("Chrome closed pipe during drain".into())
+                                }
                             }
                         }
+                        json!({"ms":start.elapsed().as_millis(),"quiet_ms":last.elapsed().as_millis()})
                     }
-                    json!({"ms":start.elapsed().as_millis(),"quiet_ms":last.elapsed().as_millis()})
                 }
                 _ => unreachable!(),
             };
@@ -527,28 +881,37 @@ if(busy){for(let i=0;i<32;i++)image(); for(let i=0;i<3;i++){
                     "responses":m.counts.responses,"unknown_responses":m.counts.unknown_responses,"first_response":m.counts.first_response})
             };
             let second = match arm {
-                "snapshot" => navigate(&mut driver, &next),
-                "navigate" => snapshot(&mut driver, &key),
+                "snapshot" => navigate(driver.as_mut(), &next),
+                "navigate" => snapshot(driver.as_mut(), &key),
                 _ => Value::Null,
             };
             let verified = if arm == "snapshot" {
-                snapshot(&mut driver, &key)
+                snapshot(driver.as_mut(), &key)
             } else {
                 Value::Null
+            };
+            let metadata = driver.connection_metadata();
+            let memory = if worker.is_some() {
+                driver
+                    .wait_until_reaped()
+                    .map_err(|e| format!("stop worker: {e:?}"))?;
+                Value::Null
+            } else {
+                memory(drain.as_mut().ok_or("legacy memory pipe is unavailable")?)
             };
             println!(
                 "{}",
                 json!({"page":page,"arm":arm,"idle_seconds":seconds,"actual_idle_ms":idle_ms,
                 "buffers":buffers,"warm_snapshot":warm,"producers_stopped":fixture.requests.lock().unwrap().contains_key("/final"),
-                "cdp_memory_after_calls":memory(&mut drain),"rss_limitation":"ps denied by worker sandbox","pid":pid,"beats_before":beats_before,"beats_at_idle_end":beats.len(),
+                "cdp_memory_after_calls":memory,"rss_limitation":"ps denied by worker sandbox","pid":pid,"beats_before":beats_before,"beats_at_idle_end":beats.len(),
+                "continuously_serviced":worker.is_some(),"worker":worker_stats,"metadata_high_water":metadata,"idle_counts":idle_counts,"overload_reset":reset.load(Ordering::Relaxed),"http_keep_alive":true,
+                "connections_before_idle":connections_before,"connections_at_idle_end":connections_at_idle_end,"connections_after_calls":fixture.connections.load(Ordering::Relaxed),
                 "first_beat":beats.first(),"last_beat":beats.last(),"requests_at_idle_end":requests,
                 "counts":counts,"first":first,"second":second,"verified_snapshot":verified})
             );
             Ok(())
         })();
-        let cleanup = browser
-            .terminate_and_reap()
-            .map_err(|e| format!("cleanup: {e:?}"));
+        let cleanup = browser.reap().map_err(|e| format!("cleanup: {e:?}"));
         let _ = std::fs::remove_dir_all(&profile);
         result.and(cleanup)
     }
@@ -572,6 +935,9 @@ if(busy){for(let i=0;i<32;i++)image(); for(let i=0;i<3;i++){
             .map(|s| s.parse().map_err(|e| format!("idle seconds: {e}")))
             .collect::<Result<_, _>>()?;
         let server = Server::start()?;
+        if std::env::var("CK_CDP_LIVE_SHAPE").as_deref() == Ok("1") {
+            return trial(&chrome, &server, "quiet", "live", 0);
+        }
         let only_page = std::env::var("CK_IDLE_PAGE").ok();
         let only_arm = std::env::var("CK_IDLE_ARM").ok();
         if only_page

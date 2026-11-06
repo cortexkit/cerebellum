@@ -209,6 +209,7 @@ impl LoginField {
 }
 
 /// One field to fill, as the snapshot classified it, with its value.
+#[derive(Clone)]
 pub struct FillTarget {
     pub field: LoginField,
     pub identity: BackendNodeIdentity,
@@ -229,7 +230,7 @@ impl fmt::Debug for FillTarget {
 }
 
 /// Everything the browser process needs to check and fill a login.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FillDispatch {
     /// The main-frame document the snapshot was taken from.
     pub document: Option<CommittedDocument>,

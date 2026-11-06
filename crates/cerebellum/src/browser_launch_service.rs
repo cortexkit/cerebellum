@@ -2059,6 +2059,35 @@ fn platform_kill_exact_generation(generation: BrowserProcessGeneration) -> bool 
 }
 
 impl OwnedBrowserProcess for ProductionProcess {
+    fn connection_quiet_epoch(&self) -> u64 {
+        self.driver
+            .as_ref()
+            .map_or(0, |driver| driver.connection_quiet_epoch())
+    }
+    fn enable_connection_service(&mut self) {
+        if let Some(driver) = self.driver.as_mut() {
+            driver.enable_connection_service();
+        }
+    }
+
+    fn connection_metadata(&mut self) -> crate::browser::navigation::ConnectionMetadata {
+        self.driver
+            .as_ref()
+            .map(|driver| driver.connection_metadata())
+            .unwrap_or_default()
+    }
+    fn connection_readiness(&self) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+        self.driver
+            .as_ref()
+            .map_or(Ok(None), |driver| driver.connection_readiness())
+    }
+
+    fn service_connection(&mut self) -> Result<bool, NavigationDriveError> {
+        self.driver
+            .as_mut()
+            .ok_or(NavigationDriveError::Unavailable)?
+            .service_connection()
+    }
     fn release_held_input(&mut self, deadline_ms: u64) -> Result<(), NavigationDriveError> {
         self.driver
             .as_mut()

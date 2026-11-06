@@ -167,6 +167,13 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             (depth, d.frame_id.clone())
         });
         self.frame_documents = documents.clone();
+        if self.continuously_serviced {
+            self.live_frame_parents = documents
+                .iter()
+                .map(|frame| (frame.frame_id.clone(), frame.parent_id.clone()))
+                .collect();
+            self.enforce_metadata_bounds(None)?;
+        }
         Ok(documents)
     }
 
@@ -268,7 +275,9 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         let Some(params) = event.params.as_ref() else {
             return;
         };
-        if matches!(
+        if self.continuously_serviced {
+            self.observe_live_frame(event);
+        } else if matches!(
             event.method.as_str(),
             "Page.frameNavigated" | "Page.navigatedWithinDocument" | "Page.frameDetached"
         ) {
