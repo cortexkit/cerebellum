@@ -73,6 +73,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// wrong. The tests that do assert timing run on a paused clock. A call that
 /// would otherwise sit out the in-call consent wait (120 s) still fails this
 /// bound.
+/// The double's device pixels per CSS pixel. Real Chrome on a Retina display
+/// reports 2, and `DOM.scrollIntoViewIfNeeded` reads its `rect` in device
+/// pixels, so a page scroll that forgets the scale moves half as far.
+const FAKE_DEVICE_SCALE: f64 = 2.0;
 const HANG_GUARD: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
@@ -998,8 +1002,9 @@ fn execute(
                 let target = match command["params"].get("rect") {
                     // The root element sits at the document's origin, and
                     // Chrome aligns a viewport-sized rectangle with the
-                    // 100 px viewport.
-                    Some(rect) => rect["y"].as_f64().unwrap(),
+                    // 100 px viewport. Like Chrome, the double reads the
+                    // rectangle in device pixels, here a 2x display.
+                    Some(rect) => rect["y"].as_f64().unwrap() / FAKE_DEVICE_SCALE,
                     // A ref element 300 px below the top of the viewport.
                     None => state.scroll_y + 300.0,
                 };
@@ -1035,6 +1040,7 @@ fn execute(
                 } else {
                     json!({"cssVisualViewport":{"offsetX":0,"offsetY":0,"pageX":0,"pageY":0,"clientWidth":if state.viewport_changed {200} else {100},"clientHeight":100,"scale":1},
                         "cssLayoutViewport":{"pageX":0,"pageY":state.scroll_y,"clientWidth":100,"clientHeight":100},
+                        "layoutViewport":{"pageX":0,"pageY":state.scroll_y * FAKE_DEVICE_SCALE,"clientWidth":100.0 * FAKE_DEVICE_SCALE,"clientHeight":100.0 * FAKE_DEVICE_SCALE},
                         "cssContentSize":{"x":0,"y":0,"width":100,"height":state.page_height.unwrap_or(5000.0)}})
                 }
             }
@@ -2704,10 +2710,11 @@ async fn user_scroll_moves_the_page_and_the_next_read_still_works() {
     let steps = scroll_steps(&fixture);
     assert_eq!(steps.len(), 1);
     // The root element (the double's first element under the document)
-    // shows a viewport-sized rectangle 400 px further down.
+    // shows a viewport-sized rectangle 400 px further down, sent in device
+    // pixels because that is how Chrome reads the rectangle.
     assert_eq!(
         steps[0]["params"],
-        json!({"backendNodeId":2,"rect":{"x":0.0,"y":400.0,"width":100.0,"height":100.0}})
+        json!({"backendNodeId":2,"rect":{"x":0.0,"y":800.0,"width":200.0,"height":200.0}})
     );
     assert!(steps[0].get("frame_id").is_none());
 
@@ -2723,7 +2730,7 @@ async fn user_scroll_moves_the_page_and_the_next_read_still_works() {
     );
     assert_eq!(
         scroll_steps(&fixture)[1]["params"]["rect"]["y"],
-        json!(-200.0)
+        json!(-400.0)
     );
 
     let (again, cards) = fixture.snapshot(1, &tab, "").await;

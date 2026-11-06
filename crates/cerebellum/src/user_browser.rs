@@ -4151,6 +4151,22 @@ struct PagePosition {
     content_height: f64,
 }
 
+/// Device pixels per CSS pixel, from one `Page.getLayoutMetrics` result: the
+/// layout viewport's width in device pixels over its width in CSS pixels.
+/// This covers both the display's scale and the tab's zoom.
+fn device_pixels_per_css_pixel(metrics: &Value) -> Result<f64, Value> {
+    let device = metrics["layoutViewport"]["clientWidth"].as_f64();
+    let css = metrics["cssLayoutViewport"]["clientWidth"].as_f64();
+    match (device, css) {
+        (Some(device), Some(css))
+            if device.is_finite() && css.is_finite() && css > 0.0 && device > 0.0 =>
+        {
+            Ok(device / css)
+        }
+        _ => Err(refusal("viewport_not_ready")),
+    }
+}
+
 fn page_position(metrics: &Value) -> Result<PagePosition, Value> {
     let number = |value: &Value| {
         value
@@ -4345,6 +4361,7 @@ async fn scroll(
             .await?;
         let root = document_element(&read.results[1])?;
         let before = page_position(&read.results[2])?;
+        let scale = device_pixels_per_css_pixel(&read.results[2])?;
         let direction = args["direction"].as_str().unwrap_or_default();
         let amount = args["amount"].as_u64().unwrap_or(600);
         let distance = amount as f64;
@@ -4355,7 +4372,16 @@ async fn scroll(
             "right" => (distance, 0.0),
             _ => return Err(invalid("direction", "unsupported_value")),
         };
-        let rect = json!({"x":before.x + dx,"y":before.y + dy,"width":before.width,"height":before.height});
+        // Chrome reads this rectangle in device pixels, not CSS pixels: on a
+        // 2x display a CSS-pixel rectangle moved the page about half the
+        // amount, and less on long pages. The scale comes from the same
+        // layout read as the position.
+        let rect = json!({
+            "x": (before.x + dx) * scale,
+            "y": (before.y + dy) * scale,
+            "width": before.width * scale,
+            "height": before.height * scale,
+        });
         let plan = context
             .cdp(
                 tab,
