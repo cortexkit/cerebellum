@@ -29,10 +29,15 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             || serde_json::json!({}),
             |frame| serde_json::json!({"frameId":frame.frame_id}),
         );
-        // A zoom's bulk attempt is capped so a page whose whole tree is too
-        // slow still leaves the incremental subtree walk its own window.
+        // A zoom's bulk attempt leaves the last second of the call to the
+        // incremental subtree walk, so a page whose whole tree is too slow
+        // still answers with a partial zoom. A fixed 2 s cap was too short
+        // live: a long Wikipedia article's tree took longer than that under
+        // load, and the zoom fell back to the slow walk.
         let deadline = if subtree.is_some() {
-            deadline.min(clock.now() + Duration::from_millis(2000))
+            deadline
+                .checked_sub(Duration::from_millis(1000))
+                .map_or(clock.now(), |reserved| reserved.max(clock.now()))
         } else {
             deadline
         };
@@ -195,8 +200,9 @@ mod tests {
         assert_eq!(driver.pipe.writes[0]["params"], json!({}));
     }
 
-    /// A zoom's bulk read gives up after two seconds, so a page whose whole
-    /// tree is too slow still leaves the incremental walk time to answer.
+    /// A zoom's bulk read stops a second before the call's deadline, so a
+    /// page whose whole tree is too slow still leaves the incremental walk
+    /// time to answer.
     #[test]
     fn bulk_ax_zoom_leaves_the_incremental_walk_its_time() {
         let root = raw_node("main", "main", "Main", &[], 2, Some("frame-own"));
@@ -222,7 +228,7 @@ mod tests {
                 &mut clock
             )
             .is_none());
-        assert!(clock.now() - started <= Duration::from_secs(2));
+        assert!(clock.now() - started <= Duration::from_secs(5));
         assert_eq!(driver.transport.pending_len(), 0);
     }
 
