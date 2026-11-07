@@ -4417,6 +4417,11 @@ fn unavailable_position(reason: &str) -> ClickDriveError {
 
 // DOM hit testing takes document coordinates, unlike viewport-relative mouse
 // input. Without the scroll offset a readable below-fold page appears empty.
+// Hit testing stops at user-agent shadow roots: with them included, the centre
+// of an `<input type="submit">`, `button` or `reset` resolves to the control's
+// internal shadow root, which the flattened document never lists, so every
+// click on such a button refused as `target_not_in_document`. Author shadow DOM
+// is still pierced either way.
 fn document_hit_params(
     position: BrowserClickPosition,
     visual: CssVisualViewport,
@@ -4425,7 +4430,7 @@ fn document_hit_params(
         - visual.rect.x_input_css;
     let y = position.y_css + visual.page_y.ok_or(NavigationDriveError::CdpFailure)?
         - visual.rect.y_input_css;
-    Ok(serde_json::json!({"x":hit_test_coordinate(x).map_err(|_| NavigationDriveError::CdpFailure)?,"y":hit_test_coordinate(y).map_err(|_| NavigationDriveError::CdpFailure)?,"includeUserAgentShadowDOM":true}).as_object().unwrap().clone())
+    Ok(serde_json::json!({"x":hit_test_coordinate(x).map_err(|_| NavigationDriveError::CdpFailure)?,"y":hit_test_coordinate(y).map_err(|_| NavigationDriveError::CdpFailure)?,"includeUserAgentShadowDOM":false}).as_object().unwrap().clone())
 }
 
 fn hit_test_coordinate(value: f64) -> Result<i64, ClickDriveError> {

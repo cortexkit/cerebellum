@@ -3694,7 +3694,7 @@ async fn input(
         )
         .map_err(|_| refusal("invalid_coordinates"))?;
         let (x, y) = mapped.tuple();
-        let hit = context.cdp(tab, Some(snapshot.interaction), vec![command("DOM.getNodeForLocation", json!({"x":x.round() as i64,"y":y.round() as i64,"includeUserAgentShadowDOM":true}))]).await?;
+        let hit = context.cdp(tab, Some(snapshot.interaction), vec![command("DOM.getNodeForLocation", json!({"x":x.round() as i64,"y":y.round() as i64,"includeUserAgentShadowDOM":false}))]).await?;
         let frame_id = hit.results[0]["frameId"].as_str().ok_or_else(|| {
             classification_failure(
                 "click_point.hit_frame",
@@ -4663,7 +4663,10 @@ async fn verify_click_position(
     dispatched: bool,
 ) -> Result<(), Value> {
     let (x, y) = position;
-    let result = context.cdp_frame(tab, Some(snapshot.interaction), frame, vec![command("Page.getLayoutMetrics", json!({})), command("DOM.getNodeForLocation", json!({"x":x.round() as i64,"y":y.round() as i64,"includeUserAgentShadowDOM":true}))]).await.map_err(|mut reply| { if dispatched { reply["input_dispatched"] = json!(true); } reply })?;
+    // User-agent shadow roots are excluded for the reason given at the own
+    // browser's `document_hit_params`: an input button's centre would resolve
+    // to its internal shadow root, which the flattened document never lists.
+    let result = context.cdp_frame(tab, Some(snapshot.interaction), frame, vec![command("Page.getLayoutMetrics", json!({})), command("DOM.getNodeForLocation", json!({"x":x.round() as i64,"y":y.round() as i64,"includeUserAgentShadowDOM":false}))]).await.map_err(|mut reply| { if dispatched { reply["input_dispatched"] = json!(true); } reply })?;
     let viewport = &result.results[0]["cssVisualViewport"];
     if snapshot
         .image

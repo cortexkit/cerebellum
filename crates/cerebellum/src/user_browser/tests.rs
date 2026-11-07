@@ -109,6 +109,10 @@ struct DoubleState {
     payment: bool,
     remove_group_on_card: bool,
     foreign_hit: bool,
+    /// Model Chrome hit-testing an `<input type="submit">`: asked to include
+    /// user-agent shadow DOM, it answers the control's internal shadow root,
+    /// a node the flattened document never lists.
+    ua_shadow_hit: bool,
     viewport_changed: bool,
     screenshot_images: std::collections::VecDeque<String>,
     clipped_click: bool,
@@ -1038,6 +1042,12 @@ fn execute(
             "DOM.getFrameOwner" => {
                 json!({"backendNodeId":match command["params"]["frameId"].as_str() { Some("pair-one") => 7, Some("pair-two") => 8, _ => 6 }})
             }
+            "DOM.getNodeForLocation"
+                if state.ua_shadow_hit
+                    && command["params"]["includeUserAgentShadowDOM"] == true =>
+            {
+                json!({"backendNodeId":9003,"frameId":"main"})
+            }
             "DOM.getNodeForLocation" => {
                 json!({"backendNodeId":3,"frameId":if state.foreign_hit || command["frame_id"] == "foreign" { "foreign" } else { "main" }})
             }
@@ -1620,6 +1630,27 @@ async fn a_form_less_untyped_button_click_reuses_the_ordinary_site_grant() {
     assert_eq!(clicked["outcome"], "ok", "{clicked}");
     assert!(cards.is_empty(), "{cards:?}");
     assert_eq!(read_cards[0]["scope"]["severity_tier"], 2);
+}
+
+/// A click on an input button (GitHub's settings "Save changes") verifies its
+/// point against the element itself. Hit testing that includes user-agent
+/// shadow DOM lands on the control's internal shadow root instead, which is
+/// not in the flattened document, so every such click refused as
+/// `target_not_in_document`.
+#[tokio::test]
+async fn a_click_on_an_input_button_verifies_against_the_element_not_its_shadow_root() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    fixture.state.lock().unwrap().ua_shadow_hit = true;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    let (clicked, _) = fixture
+        .call(
+            1,
+            click(&tab, &snapshot, &reference(&snapshot, "Go")),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(clicked["outcome"], "ok", "{clicked}");
 }
 
 #[tokio::test]

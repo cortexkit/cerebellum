@@ -83,7 +83,7 @@ pub async fn exercise(planes: &Planes, pipe: &Pipe, origin: &str) -> Result<(), 
         let metrics = pipe.command("Page.getLayoutMetrics", json!({}))?;
         println!("POINT METRICS: {}", metrics["result"]["cssVisualViewport"]);
         for (source, x, y) in [("viewport", point[0].as_i64().unwrap(), point[1].as_i64().unwrap()), ("document", point[0].as_i64().unwrap(), point[1].as_i64().unwrap() + pipe.evaluate("scrollY")?.as_i64().unwrap())] {
-            println!("POINT HIT {source}: {}", pipe.command("DOM.getNodeForLocation", json!({"x":x,"y":y,"includeUserAgentShadowDOM":true}))?);
+            println!("POINT HIT {source}: {}", pipe.command("DOM.getNodeForLocation", json!({"x":x,"y":y,"includeUserAgentShadowDOM":false}))?);
         }
         let reply = invoke(planes, &mut corr, "browser.click_point", json!({"snapshot_id":screenshot["snapshot_id"],"x_px":point[0],"y_px":point[1],"image_width_px":screenshot["image_width_px"],"image_height_px":screenshot["image_height_px"],"intent":"toggle local styled box","severity":{"tier":2,"credential":false,"financial":false}})).await?;
         let checked = pipe.evaluate("document.getElementById('hidden').checked")?;
