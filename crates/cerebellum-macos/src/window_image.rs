@@ -122,6 +122,12 @@ pub fn encode_scaled_jpeg(
 /// windows of the process, and none of them is what a person means by the
 /// application's window. Reading the list moves nothing and fronts nothing.
 pub fn frontmost_window_id(pid: u32) -> Option<u32> {
+    visible_window_ids(pid)?.into_iter().next()
+}
+
+/// The on-screen ordinary windows a process owns, in front-to-back order.
+/// Reads window numbers only, without titles, images or accessibility content.
+pub fn visible_window_ids(pid: u32) -> Option<Vec<u32>> {
     let windows = CGWindowListCopyWindowInfo(
         CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
         0,
@@ -133,6 +139,7 @@ pub fn frontmost_window_id(pid: u32) -> Option<u32> {
     // SAFETY: the window list is documented as an array of dictionaries keyed
     // by strings; the cast only names that element type for reading.
     let windows: &CFArray<CFDictionary<CFString, CFType>> = unsafe { windows.cast_unchecked() };
+    let mut ids = Vec::new();
     for index in 0..windows.len() {
         let Some(window) = windows.get(index) else {
             continue;
@@ -150,10 +157,27 @@ pub fn frontmost_window_id(pid: u32) -> Option<u32> {
             continue;
         }
         if let Some(id) = number(&number_key) {
-            return Some(id as u32);
+            ids.push(id as u32);
         }
     }
-    None
+    Some(ids)
+}
+
+/// Active display rectangles in the same top-down coordinates as AX frames.
+pub fn display_frames() -> Option<Vec<[f64; 4]>> {
+    Some(
+        diagnostic_display_bounds()?
+            .into_iter()
+            .map(|(rect, _)| {
+                [
+                    rect.origin.x,
+                    rect.origin.y,
+                    rect.size.width,
+                    rect.size.height,
+                ]
+            })
+            .collect(),
+    )
 }
 
 /// Numeric window-server context for a process that capture could not resolve.

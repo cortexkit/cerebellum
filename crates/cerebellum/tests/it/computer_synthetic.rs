@@ -1215,6 +1215,73 @@ fn plane_on(shared: &Arc<Mutex<Shared>>, desk: &Desk, bracket_admitted: bool) ->
     .with_fronting_bracket_admitted(bracket_admitted)
 }
 
+#[tokio::test]
+async fn type_and_keys_report_foreground_and_new_window_facts_without_changing_outcomes() {
+    for action in ["computer.type", "computer.keys"] {
+        let shared = Shared::handle();
+        let desk = focused_text_desk();
+        {
+            let mut state = desk.state();
+            state.visible_windows = Some(vec![1]);
+            state.running = Some(vec![
+                cerebellum_computer::app_state::source::RunningApp {
+                    name: "Finder".into(),
+                    bundle_identity: TARGET_BUNDLE_ID.into(),
+                    pid: grant().pid,
+                    frontmost: true,
+                },
+                cerebellum_computer::app_state::source::RunningApp {
+                    name: "Mail".into(),
+                    bundle_identity: "com.apple.mail".into(),
+                    pid: 999,
+                    frontmost: false,
+                },
+            ]);
+            state.elements.get_mut(&2).unwrap().readbacks =
+                [Some("ab".into()), Some("ahib".into())].into();
+        }
+        let plane = plane_on(&shared, &desk, false);
+        let management = granted_management().await;
+        let clock = FakeClock::new();
+        serve(
+            &plane,
+            "computer.read_state",
+            json!({"target": TARGET_BUNDLE_ID}),
+            &management,
+            &clock,
+        )
+        .await;
+        let changed = desk.clone();
+        desk.state().on_app_read = Some(support::computer::DeskHook(Arc::new(move || {
+            let mut state = changed.state();
+            state.frontmost = Some(999);
+            state.visible_windows = Some(vec![1, 2]);
+        })));
+        let request = if action == "computer.type" {
+            type_request()
+        } else {
+            keys_request(&["shift", "a"])
+        };
+        let reply = serve(&plane, action, request, &management, &clock).await;
+        let expected = if action == "computer.type" {
+            "completed"
+        } else {
+            "delivery_unconfirmed"
+        };
+        assert_eq!(reply["outcome"], expected, "{action}: {reply}");
+        let text = reply["state_text"].as_str().unwrap();
+        assert!(
+            text.contains("This action brought Mail to the front."),
+            "{action}: {reply}"
+        );
+        assert!(
+            text.contains("This action opened a new window in Finder."),
+            "{action}: {reply}"
+        );
+        assert_eq!(dispatched_calls(&shared).len(), 1);
+    }
+}
+
 async fn serve_asking(
     plane: &TestPlane,
     name: &str,

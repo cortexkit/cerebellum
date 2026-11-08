@@ -717,6 +717,11 @@ pub struct DeskState {
     pub pointer_prewarm_error: Option<&'static str>,
     pub on_pointer_prewarm: Option<DeskHook>,
     pub cursor_frame: Option<[f64; 4]>,
+    pub press_frame: Option<[f64; 4]>,
+    pub displays: Option<Vec<[f64; 4]>>,
+    pub visible_windows: Option<Vec<u32>>,
+    /// Run once during the next whole-tree read, including a settle read.
+    pub on_app_read: Option<DeskHook>,
     /// Frames for particular elements, which take the place of
     /// `cursor_frame` for them, so each element's badge aims somewhere of
     /// its own.
@@ -831,6 +836,10 @@ impl Desk {
             pointer_prewarm_error: None,
             on_pointer_prewarm: None,
             cursor_frame: None,
+            press_frame: Some([10.0, 10.0, 30.0, 20.0]),
+            displays: Some(vec![[0.0, 0.0, 1920.0, 1080.0]]),
+            visible_windows: None,
+            on_app_read: None,
             cursor_frames: std::collections::HashMap::new(),
             on_cursor_frame: None,
             cursor_frame_hook_target: None,
@@ -942,6 +951,18 @@ fn utf16_byte_offset(text: &str, utf16: usize) -> usize {
 }
 
 impl AppStateSource for Desk {
+    fn element_frame(&self, _: &ElementHandle) -> Option<[f64; 4]> {
+        self.state().press_frame
+    }
+
+    fn display_frames(&self) -> Option<Vec<[f64; 4]>> {
+        self.state().displays.clone()
+    }
+
+    fn visible_window_numbers(&self, _: &ProcessGrant) -> Option<Vec<u32>> {
+        self.state().visible_windows.clone()
+    }
+
     fn cursor_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {
         let (frame, hook) = {
             let mut state = self.state();
@@ -983,6 +1004,10 @@ impl AppStateSource for Desk {
         _target: &ProcessGrant,
         _bounds: ReadBounds,
     ) -> Result<RawAppState, AppStateReadError> {
+        let hook = self.state().on_app_read.take();
+        if let Some(DeskHook(hook)) = hook {
+            hook();
+        }
         let mut state = self.state();
         state.app_reads += 1;
         if let Some(error) = state.read_error {

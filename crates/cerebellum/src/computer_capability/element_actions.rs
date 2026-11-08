@@ -47,6 +47,7 @@ use cerebellum_core::journal::{
 };
 use serde_json::{json, Value};
 
+use super::action_effects::{append_lines, ActionEffects};
 use super::cursor::{Arrival, BadgeWatch, Landing};
 use crate::computer_grants::{ConsentContext, ConsentRefusal, GrantAdmission};
 use crate::management::ManagementPlane;
@@ -595,6 +596,7 @@ where
     /// that front ended, which is known only after the restore decision.
     held_refusal: Option<(String, String)>,
     hold_refusals: bool,
+    pub(super) effects: ActionEffects,
 }
 
 impl<'a, R, T, S> ElementJournal<'a, R, T, S>
@@ -619,6 +621,7 @@ where
             fronting: None,
             held_refusal: None,
             hold_refusals: false,
+            effects: ActionEffects::default(),
         }
     }
 
@@ -794,6 +797,41 @@ fn is_blocked_menu_item(facts: &ElementFacts) -> bool {
         && facts.title.as_deref().is_some_and(is_session_ending_title)
 }
 
+fn press_available(
+    source: &dyn AppStateSource,
+    facts: &ElementFacts,
+    handle: &ElementHandle,
+    capability: ComputerCapability,
+) -> Result<&'static str, Value> {
+    if is_blocked_menu_item(facts) {
+        return Err(blocked_menu_item_reply());
+    }
+    let action = if facts.actions.iter().any(|action| action == "AXPress") {
+        "AXPress"
+    } else if facts.actions.iter().any(|action| action == "AXShowMenu") {
+        "AXShowMenu"
+    } else {
+        return Err(json!({
+            "outcome": "no_press_action",
+            "reason": "press_not_offered",
+            "remedy": format!(
+                "this element offers {}, not a press; nothing was done and the pointer was not \
+                 used. Choose another element from read_state",
+                describe_actions(&facts.actions)
+            ),
+        }));
+    };
+    if capability == ComputerCapability::PressElement
+        && !super::action_effects::has_screen_position(source, handle)
+    {
+        return Err(json!({
+            "outcome": "no_press_action",
+            "remedy": "this element isn't visible on screen, so its effect can't be seen; nothing was pressed. Call read_state and choose a visible element, or ask the person",
+        }));
+    }
+    Ok(action)
+}
+
 /// Activate one element, preferring a press to opening its menu, and journal
 /// the action sent. The caller adds the observed diff to a completed reply.
 pub(crate) fn press_blocking<R, T, S>(
@@ -813,29 +851,17 @@ where
         _ => return stale_element_reply(),
     };
     let role = journal_role(Some(&facts));
-    if is_blocked_menu_item(&facts) {
-        if journal.refused(&role, "blocked_menu_item").is_err() {
-            return audit_unavailable_reply(false);
+    let action = match press_available(source, &facts, handle, journal.capability) {
+        Ok(action) => action,
+        Err(reply) => {
+            if journal
+                .refused(&role, reply["outcome"].as_str().expect("refusal outcome"))
+                .is_err()
+            {
+                return audit_unavailable_reply(false);
+            }
+            return reply;
         }
-        return blocked_menu_item_reply();
-    }
-    let action = if facts.actions.iter().any(|action| action == "AXPress") {
-        "AXPress"
-    } else if facts.actions.iter().any(|action| action == "AXShowMenu") {
-        "AXShowMenu"
-    } else {
-        if journal.refused(&role, "no_press_action").is_err() {
-            return audit_unavailable_reply(false);
-        }
-        return json!({
-            "outcome": "no_press_action",
-            "reason": "press_not_offered",
-            "remedy": format!(
-                "this element offers {}, not a press; nothing was done and the pointer was not \
-                 used. Choose another element from read_state",
-                describe_actions(&facts.actions)
-            ),
-        });
     };
     // Read just before dispatch, after the checks above: an action on an
     // element the application reports disabled does nothing, and saying so is
@@ -854,10 +880,12 @@ where
         Ok(token) => token,
         Err(refused) => return refused.reply(),
     };
+    journal.effects = ActionEffects::before(source, grant);
     let dispatched = match action {
         "AXShowMenu" => source.show_menu(handle),
         _ => source.press(handle),
     };
+    journal.effects.sample(source, grant);
     let (outcome, reply) = match dispatched {
         Ok(()) => ("completed", json!({"outcome": "completed"})),
         // The action was sent and no answer came back in time: it may have
@@ -1028,10 +1056,13 @@ where
     };
     // One attempt. Whether the application accepted the message or not, the
     // value read back is what decides, and nothing is retried as keystrokes.
+    journal.effects = ActionEffects::before(source, grant);
     let written = source.write_text(handle, attribute, text);
+    journal.effects.sample(source, grant);
     let deadline = Instant::now() + readback_bound;
     let confirmed = written.is_ok()
         && loop {
+            journal.effects.sample(source, grant);
             if matches!(source.text_value(handle), Ok(Some(after)) if after == expected) {
                 break true;
             }
@@ -1232,6 +1263,7 @@ pub(crate) fn settle_and_observe_view(
     expand_menus: bool,
     mut watch: PersonWatch<'_>,
     pressed: Option<PressedElement<'_>>,
+    mut effects: Option<&mut ActionEffects>,
 ) -> Option<SettledView> {
     let deadline = Instant::now() + bound;
     let watched = matches!(watch, PersonWatch::Watched(_));
@@ -1271,6 +1303,9 @@ pub(crate) fn settle_and_observe_view(
         } else {
             source.read_app_state(grant, bounds)
         };
+        if let Some(effects) = effects.as_deref_mut() {
+            effects.sample(source, grant);
+        }
         if person_acted() {
             return None;
         }
@@ -1663,6 +1698,7 @@ where
         // needs it fronts, presses the rest of the batch with the application
         // in front, and makes one restore decision after the last of them.
         let mut batch_ending = None;
+        let mut effects = Vec::new();
         let work = super::quarantine::CallWork::current();
         let mut index = 0;
         'steps: while index < parsed.element_ids.len() {
@@ -1712,6 +1748,11 @@ where
             };
             if done.ending.is_some() {
                 batch_ending = done.ending;
+            }
+            for line in done.effects {
+                if !effects.contains(&line) {
+                    effects.push(line);
+                }
             }
             for (offset, step_reply) in std::iter::once(done.reply).chain(done.later).enumerate() {
                 let step = index + offset;
@@ -1772,6 +1813,7 @@ where
         if let Some(ending) = &batch_ending {
             ending.apply(&mut reply);
         }
+        append_lines(&mut reply, &effects);
         reply
     }
 
@@ -2170,9 +2212,11 @@ where
                     sessions.zoom_expands_menus(&conversation_key, &grant, view.zoom.as_deref()),
                     PersonWatch::NotWatched,
                     None,
+                    Some(&mut journal.effects),
                 );
                 add_diff_view(&mut reply, observed.as_ref(), &view);
             }
+            append_lines(&mut reply, &journal.effects.lines);
             if journal.finish().is_err() {
                 return audit_unavailable_reply(true);
             }
@@ -2330,21 +2374,6 @@ where
         if let Some(busy) = work.bind(&self.serializer.quarantine, &grant) {
             return PressDone::alone(busy);
         }
-        let foreground = self
-            .front_for_foreground(super::fronting::FrontCall {
-                grant: &grant,
-                consent,
-                cancel,
-                management,
-                conversation_key: &identity.conversation_key,
-                input_follows: true,
-            })
-            .await;
-        if let Some(refusal) =
-            foreground.and_then(|front| front.refusal(&management.application_name(&grant)))
-        {
-            return PressDone::alone(refusal);
-        }
         let source = self.app_state_source.clone();
         let settle = settle_bound(capability);
         // Capture the acting agent on the async side: Tokio task-local
@@ -2413,6 +2442,67 @@ where
                 }
             }
         };
+        // Check refusals that cannot benefit from fronting before drawing a
+        // Pressing badge. Recheck at dispatch as the element may change while
+        // the badge travels.
+        let preflight = {
+            let source = source.clone();
+            let grant = grant.clone();
+            let handle = handle.clone();
+            let work = work.clone();
+            let identity = identity.clone();
+            let audit = AuditToken::new(self.audit.clone(), work.gate());
+            tokio::task::spawn_blocking(move || {
+                let _ax = work.bound_ax();
+                let _scope = AccessibilityReadScope::new(grant.pid, None);
+                let mut journal = ElementJournal::new(audit, identity, capability, &grant);
+                let refusal = match source.element_facts(&handle) {
+                    Ok(facts) if facts.pid.is_none_or(|pid| pid == grant.pid) => {
+                        press_available(source.as_ref(), &facts, &handle, capability)
+                            .err()
+                            .map(|reply| {
+                                let role = journal_role(Some(&facts));
+                                if journal
+                                    .refused(
+                                        &role,
+                                        reply["outcome"].as_str().expect("refusal outcome"),
+                                    )
+                                    .is_err()
+                                {
+                                    audit_unavailable_reply(false)
+                                } else {
+                                    reply
+                                }
+                            })
+                    }
+                    _ => Some(stale_element_reply()),
+                };
+                if journal.finish().is_err() {
+                    return Some(audit_unavailable_reply(false));
+                }
+                refusal
+            })
+            .await
+            .unwrap_or_else(|_| Some(audit_unavailable_reply(false)))
+        };
+        if let Some(refusal) = preflight {
+            return PressDone::alone(refusal);
+        }
+        let foreground = self
+            .front_for_foreground(super::fronting::FrontCall {
+                grant: &grant,
+                consent,
+                cancel,
+                management,
+                conversation_key: &identity.conversation_key,
+                input_follows: true,
+            })
+            .await;
+        if let Some(refusal) =
+            foreground.and_then(|front| front.refusal(&management.application_name(&grant)))
+        {
+            return PressDone::alone(refusal);
+        }
         // A press can bring its application forward only when the element
         // reads disabled while the application is in the background, and
         // only in background mode: foreground mode has already brought it
@@ -2533,7 +2623,7 @@ where
             || super::fronting::Fronting::untouched(admission.mode),
             |front| front.fronting,
         );
-        let mut reply = tokio::task::spawn_blocking(move || {
+        let (mut reply, effects) = tokio::task::spawn_blocking(move || {
             let _ax = work.bound_ax();
             let _scope = AccessibilityReadScope::new(grant.pid, reads);
             let mut journal = ElementJournal::new(audit, identity.clone(), capability, &grant);
@@ -2562,20 +2652,24 @@ where
                         element_id: &element_id,
                         handle: &handle,
                     }),
+                    Some(&mut journal.effects),
                 );
                 add_diff_view(&mut reply, observed.as_ref(), &view);
             }
             if journal.finish().is_err() {
-                return audit_unavailable_reply(true);
+                reply = audit_unavailable_reply(true);
             }
-            reply
+            (reply, journal.effects.lines)
         })
         .await
-        .unwrap_or_else(|_| audit_unavailable_reply(true));
+        .unwrap_or_else(|_| (audit_unavailable_reply(true), Vec::new()));
         if let Some(front) = foreground {
             front.fronting.apply(&mut reply);
         }
-        PressDone::alone(reply)
+        PressDone {
+            effects,
+            ..PressDone::alone(reply)
+        }
     }
 }
 
@@ -2587,6 +2681,7 @@ use fronted_press::{FrontedEnding, FrontedPress, PressStep};
 /// forward in a batch, what that fronted run of the batch's presses did.
 struct PressDone {
     reply: Value,
+    effects: Vec<String>,
     /// The replies of the later batch steps the fronted run attempted, in
     /// order; empty for a press that ran alone.
     later: Vec<Value>,
@@ -2599,6 +2694,7 @@ impl PressDone {
     fn alone(reply: Value) -> Self {
         Self {
             reply,
+            effects: Vec::new(),
             later: Vec::new(),
             ending: None,
         }
@@ -2610,6 +2706,7 @@ impl PressDone {
         if let Some(ending) = &self.ending {
             ending.apply(&mut reply);
         }
+        append_lines(&mut reply, &self.effects);
         reply
     }
 }
@@ -2678,6 +2775,12 @@ mod tests {
     }
 
     impl AppStateSource for MenuSource {
+        fn element_frame(&self, _: &ElementHandle) -> Option<[f64; 4]> {
+            Some([10.0, 10.0, 20.0, 20.0])
+        }
+        fn display_frames(&self) -> Option<Vec<[f64; 4]>> {
+            Some(vec![[0.0, 0.0, 100.0, 100.0]])
+        }
         fn read_app_state(
             &self,
             _: &ProcessGrant,

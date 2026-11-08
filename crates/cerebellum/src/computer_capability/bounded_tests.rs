@@ -407,6 +407,15 @@ impl cerebellum_computer::app_state::source::AppStateSource for CountingPresses 
             selected_text_settable: false,
         })
     }
+    fn element_frame(
+        &self,
+        _: &cerebellum_computer::app_state::source::ElementHandle,
+    ) -> Option<[f64; 4]> {
+        Some([10.0, 10.0, 20.0, 20.0])
+    }
+    fn display_frames(&self) -> Option<Vec<[f64; 4]>> {
+        Some(vec![[0.0, 0.0, 100.0, 100.0]])
+    }
     fn press(
         &self,
         _: &cerebellum_computer::app_state::source::ElementHandle,

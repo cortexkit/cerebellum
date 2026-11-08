@@ -254,6 +254,191 @@ fn ids(reply: &Value, field: &str) -> Vec<String> {
 // press_element
 // ---------------------------------------------------------------------------
 
+#[tokio::test]
+async fn a_press_reports_an_application_brought_forward_during_settle() {
+    let desk = desk();
+    desk.state().after_action = Some(after_send());
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let send = id_of(&read(&plane, &management).await, " button Send");
+    let changed = desk.clone();
+    desk.state().on_press = Some(support::computer::DeskHook(Arc::new(move || {
+        let changed = changed.clone();
+        let mut state = changed.state();
+        let settled = changed.clone();
+        state.on_app_read = Some(support::computer::DeskHook(Arc::new(move || {
+            let mut state = settled.state();
+            state.frontmost = Some(999);
+            state.running = Some(vec![running("Mail", "com.apple.mail", 999)]);
+        })));
+    })));
+
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": send}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert!(
+        reply["state_text"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .any(|line| line == "This action brought Mail to the front."),
+        "{reply}"
+    );
+    assert_eq!(desk.state().presses, vec![10]);
+}
+
+async fn assert_invisible_press_refused(frame: Option<[f64; 4]>) {
+    let desk = desk();
+    desk.state().press_frame = frame;
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let send = id_of(&read(&plane, &management).await, " button Send");
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": send}),
+    )
+    .await;
+    assert_eq!(
+        reply["outcome"], "no_press_action",
+        "frame {frame:?}: {reply}"
+    );
+    assert!(
+        reply["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("isn't visible on screen"),
+        "{reply}"
+    );
+    assert!(desk.state().presses.is_empty());
+    assert!(desk.state().shown_menus.is_empty());
+    assert!(desk.state().dispatched_at.is_empty());
+}
+
+#[tokio::test]
+async fn a_press_without_a_frame_dispatches_nothing() {
+    assert_invisible_press_refused(None).await;
+}
+
+#[tokio::test]
+async fn a_press_off_every_display_dispatches_nothing() {
+    assert_invisible_press_refused(Some([2500.0, 10.0, 30.0, 20.0])).await;
+}
+
+#[tokio::test]
+async fn a_press_with_a_zero_size_frame_dispatches_nothing() {
+    assert_invisible_press_refused(Some([10.0, 10.0, 0.0, 20.0])).await;
+}
+
+#[tokio::test]
+async fn a_press_on_a_second_display_with_negative_coordinates_is_allowed() {
+    let desk = desk();
+    {
+        let mut state = desk.state();
+        state.press_frame = Some([-10.0, 10.0, 20.0, 20.0]);
+        state.displays = Some(vec![[-1920.0, 0.0, 1920.0, 1080.0]]);
+        state.after_action = Some(after_send());
+    }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let send = id_of(&read(&plane, &management).await, " button Send");
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": send}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(desk.state().presses, vec![10]);
+    assert!(!reply["state_text"]
+        .as_str()
+        .unwrap()
+        .contains("This action"));
+}
+
+#[tokio::test]
+async fn a_press_batch_keeps_foreground_and_new_window_facts_when_a_later_step_refuses() {
+    let desk = desk();
+    {
+        let mut state = desk.state();
+        state.visible_windows = Some(vec![1]);
+        state.running = Some(vec![
+            running("Finder", TARGET_BUNDLE_ID, grant().pid),
+            running("Mail", "com.apple.mail", 999),
+        ]);
+        state.after_action = Some(after_send());
+    }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = read(&plane, &management).await;
+    let send = id_of(&tree, " button Send");
+    let label = id_of(&tree, " text Hello");
+    let changed = desk.clone();
+    desk.state().on_press = Some(support::computer::DeskHook(Arc::new(move || {
+        let mut state = changed.state();
+        state.frontmost = Some(999);
+        state.visible_windows = Some(vec![1, 2]);
+    })));
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_ids": [send, label]}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "no_press_action", "{reply}");
+    assert_eq!(reply["stopped_at"], 2);
+    let text = reply["state_text"].as_str().unwrap();
+    assert!(
+        text.contains("This action brought Mail to the front."),
+        "{reply}"
+    );
+    assert!(
+        text.contains("This action opened a new window in Finder."),
+        "{reply}"
+    );
+    assert_eq!(desk.state().presses, vec![10]);
+}
+
+#[tokio::test]
+async fn a_write_reports_a_foreground_switch_even_if_the_tree_read_is_unavailable() {
+    let desk = desk();
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let composer = id_of(&read(&plane, &management).await, "Composer");
+    let changed = desk.clone();
+    desk.state().on_app_read = Some(support::computer::DeskHook(Arc::new(move || {
+        let mut state = changed.state();
+        state.frontmost = Some(999);
+        state.running = Some(vec![running("Mail", "com.apple.mail", 999)]);
+        state.read_error =
+            Some(cerebellum_computer::app_state::source::AppStateReadError::Unreadable);
+    })));
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.write_text",
+        json!({"element_id": composer, "text": "new text", "write_mode": "replace_value"}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert!(
+        reply["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("This action brought Mail to the front."),
+        "{reply}"
+    );
+    assert_eq!(desk.state().writes.len(), 1);
+}
+
 /// A live id is pressed through accessibility, and the reply carries the
 /// diff that followed: the label the press made appear is named as added.
 #[tokio::test]
@@ -992,6 +1177,41 @@ async fn a_point_is_hit_tested_in_its_own_application_and_pressed() {
     );
     assert_eq!(ids(&reply, "added").len(), 1, "{reply}");
     assert!(plane.result_schema_findings().is_empty());
+}
+
+#[tokio::test]
+async fn a_point_press_reports_the_application_it_brought_forward() {
+    let desk = desk();
+    {
+        let mut state = desk.state();
+        state.application_hit = Some((10, Some(grant().pid)));
+        state.element_windows.insert(10, 77);
+        state.after_action = Some(after_send());
+        state.running = Some(vec![running("Mail", "com.apple.mail", 999)]);
+    }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let image_id = read_with_image(&plane, &management).await;
+    let changed = desk.clone();
+    desk.state().on_press = Some(support::computer::DeskHook(Arc::new(move || {
+        changed.state().frontmost = Some(999);
+    })));
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_point",
+        json!({"image_id": image_id, "x": 625, "y": 125}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert!(
+        reply["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("This action brought Mail to the front."),
+        "{reply}"
+    );
+    assert_eq!(desk.state().presses, vec![10]);
 }
 
 /// A hit belonging to another process is no hit, and nothing is pressed.
