@@ -2412,7 +2412,10 @@ mod tests {
             let shared = shared.clone();
             move || MacOs26PlatformDriver::default().with_shared_user_idle(shared.clone())
         };
-        let last_post_at = Instant::now()
+        // One fixed instant for both reads: a second `Instant::now()` would
+        // drift under load and turn the exact 5_300 ms below into a flake.
+        let now = Instant::now();
+        let last_post_at = now
             .checked_sub(Duration::from_millis(300))
             .expect("clock past epoch");
         // The first driver finishes a sequence and records it.
@@ -2431,7 +2434,7 @@ mod tests {
             .user_idle
             .lock()
             .expect("estimator lock")
-            .user_idle(IdleReading::Milliseconds(320), Instant::now());
+            .user_idle(IdleReading::Milliseconds(320), now);
         assert_eq!(
             user,
             IdleReading::Milliseconds(5_300),
