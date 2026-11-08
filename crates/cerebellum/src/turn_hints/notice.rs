@@ -26,9 +26,16 @@ pub(crate) struct Notice {
     pub(crate) kind: Kind,
 }
 
+/// The modules that publish turn hints. Pi heads moved into `thalamus-harness`,
+/// and the retired `thalamus-pi` lost its bus permissions. The server refuses a
+/// subscription to a subject the credential doesn't grant, and that refusal
+/// fails the whole open, so a retired publisher left in this list disables
+/// every hint.
+const PUBLISHERS: [&str; 1] = ["thalamus-harness"];
+
 pub(super) fn subjects(names: &AccountNames) -> Result<Vec<String>, String> {
-    let mut subjects = Vec::with_capacity(4);
-    for module in ["thalamus-harness", "thalamus-pi"] {
+    let mut subjects = Vec::with_capacity(PUBLISHERS.len() * 2);
+    for module in PUBLISHERS {
         for kind in [Kind::Started, Kind::Ended] {
             subjects.push(
                 names
@@ -73,7 +80,7 @@ impl Notice {
         if seq.to_string() != sequence {
             return None;
         }
-        for module in ["thalamus-harness", "thalamus-pi"] {
+        for module in PUBLISHERS {
             for kind in [Kind::Started, Kind::Ended] {
                 if event == kind.name()
                     && names.live_subject(module, event, 1).ok()?.as_str() == subject
@@ -123,17 +130,27 @@ mod tests {
     fn keys_are_strict_and_subjects_are_account_scoped() {
         let names = AccountNames::derive("test").unwrap();
         let session = "0123456789abcdef0123456789abcdef";
-        let subject = names.live_subject("thalamus-pi", "turn_ended", 1).unwrap();
+        let subject = names
+            .live_subject("thalamus-harness", "turn_ended", 1)
+            .unwrap();
         for suffix in ["", "-1", "+1", "01", "1:2", "18446744073709551616"] {
             let id = format!("{session}:turn_ended:{suffix}");
             assert!(Notice::parse(&names, &subject, Some(&id), Some("a"), Some(session)).is_none());
         }
         let foreign = AccountNames::derive("other")
             .unwrap()
-            .live_subject("thalamus-pi", "turn_ended", 1)
+            .live_subject("thalamus-harness", "turn_ended", 1)
             .unwrap();
         let id = format!("{session}:turn_ended:1");
         assert!(Notice::parse(&names, &foreign, Some(&id), Some("a"), Some(session)).is_none());
-        assert_eq!(subjects(&names).unwrap().len(), 4);
+        assert_eq!(
+            subjects(&names).unwrap(),
+            [
+                "ck.test.live.thalamus-harness.turn_started.v1",
+                "ck.test.live.thalamus-harness.turn_ended.v1"
+            ]
+        );
+        let retired = names.live_subject("thalamus-pi", "turn_ended", 1).unwrap();
+        assert!(Notice::parse(&names, &retired, Some(&id), Some("a"), Some(session)).is_none());
     }
 }

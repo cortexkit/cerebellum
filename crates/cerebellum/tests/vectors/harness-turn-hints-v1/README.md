@@ -4,8 +4,11 @@
 listener. These are plain core-NATS live hints, not JetStream `event` messages
 and not `session.turn_ended` management requests. No payload body is read.
 
-The two publishers are `thalamus-harness` and `thalamus-pi`. Their `turn_started`
-and `turn_ended` v1 live subjects are derived with `AccountNames::live_subject`.
+The one publisher is `thalamus-harness`, which also hosts Pi heads. Its
+`turn_started` and `turn_ended` v1 live subjects are derived with
+`AccountNames::live_subject`. A hint on the retired `thalamus-pi` subject is
+not accepted: that module lost its bus permissions, and subscribing to it would
+make the server refuse the whole listener connection.
 A hint needs `agent`, `session_ref`, and `Nats-Msg-Id` headers. The key is
 `{session_ref}:{event_name}:{seq}`; its session and event must agree with the
 header and subject. The sequence is a checked canonical unsigned decimal from
