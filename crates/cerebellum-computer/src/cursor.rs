@@ -428,8 +428,8 @@ impl CursorFollow {
 pub enum WindowChange {
     Moved,
     Resized,
-    /// The window closed or its application quit: there is nothing left to
-    /// follow, and the badge stays where it last was.
+    /// The window left the screen (minimized, closed, or its application
+    /// hidden or quit), or cannot be watched safely. Hide its badge at once.
     Gone,
 }
 

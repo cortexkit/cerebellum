@@ -492,10 +492,11 @@ pub trait AppStateSource: Send + Sync {
         None
     }
 
-    /// Report each move or resize of `window`, and its closing or its
-    /// application quitting, to `changed`, from a thread of the platform's
-    /// choosing, until the returned watch is dropped. Event-driven: nothing
-    /// runs between changes. `None` when the platform cannot watch windows.
+    /// Report each move or resize of `window`, and its leaving the screen
+    /// (minimized, closed, or its application hidden or quit), to `changed`,
+    /// from a thread of the platform's choosing, until the returned watch is
+    /// dropped. Event-driven: nothing runs between changes. `None` when the
+    /// platform cannot watch windows.
     fn watch_cursor_window(
         &self,
         _window: &ElementHandle,

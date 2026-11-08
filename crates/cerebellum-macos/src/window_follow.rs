@@ -1,11 +1,12 @@
-//! Watching another application's window move, resize or close, so the agent
-//! cursor's badge can stay on the element it points at.
+//! Watching another application's window move, resize or leave the screen, so
+//! the agent cursor's badge can stay on its element or hide with its window.
 //!
 //! One thread, started the first time a window is watched, runs a Core
 //! Foundation run loop that sleeps until something happens. Each watched
 //! window has its own accessibility observer, whose notifications for that
-//! window (moved, resized, destroyed) wake the thread; a kqueue registered for
-//! each watched application's exit wakes it when the application quits, which
+//! window (moved, resized, minimized, destroyed) and its application (hidden)
+//! wake the thread; a kqueue registered for each watched application's exit
+//! wakes it when the application quits, which
 //! some applications do without reporting their windows destroyed. Nothing
 //! runs between those events: there is no timer and no polling.
 //!
@@ -33,6 +34,37 @@ const AX_ERROR_SUCCESS: i32 = 0;
 const MOVED: &str = "AXMoved";
 const RESIZED: &str = "AXResized";
 const DESTROYED: &str = "AXUIElementDestroyed";
+const MINIATURIZED: &str = "AXWindowMiniaturized";
+const APPLICATION_HIDDEN: &str = "AXApplicationHidden";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotificationTarget {
+    Window,
+    Application,
+}
+
+const NOTIFICATIONS: [(&str, NotificationTarget); 5] = [
+    (MOVED, NotificationTarget::Window),
+    (RESIZED, NotificationTarget::Window),
+    (DESTROYED, NotificationTarget::Window),
+    (MINIATURIZED, NotificationTarget::Window),
+    (APPLICATION_HIDDEN, NotificationTarget::Application),
+];
+
+fn register_notifications(mut add: impl FnMut(&'static str, NotificationTarget) -> bool) -> bool {
+    NOTIFICATIONS
+        .iter()
+        .all(|&(name, target)| add(name, target))
+}
+
+fn notification_change(name: &str) -> Option<AxWindowChange> {
+    match name {
+        MOVED => Some(AxWindowChange::Moved),
+        RESIZED => Some(AxWindowChange::Resized),
+        DESTROYED | MINIATURIZED | APPLICATION_HIDDEN => Some(AxWindowChange::Gone),
+        _ => None,
+    }
+}
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
@@ -54,6 +86,7 @@ extern "C" {
     ) -> i32;
     fn AXObserverGetRunLoopSource(observer: CfTypeRef) -> CfTypeRef;
     fn AXUIElementGetPid(element: CfTypeRef, pid: *mut c_int) -> i32;
+    fn AXUIElementCreateApplication(pid: c_int) -> CfTypeRef;
 }
 
 /// `struct kevent` as the macOS kernel defines it.
@@ -97,8 +130,8 @@ extern "C" {
 pub enum AxWindowChange {
     Moved,
     Resized,
-    /// The window was destroyed or its application quit. The watch reports
-    /// nothing after this.
+    /// The window left the screen, its application quit, or the watch could
+    /// not be installed safely. The watch reports nothing after this.
     Gone,
 }
 
@@ -107,6 +140,7 @@ type Changed = Arc<dyn Fn(AxWindowChange) + Send + Sync>;
 struct Watch {
     observer: CFRetained<CFType>,
     window: AxRetainedElement,
+    application: AxRetainedElement,
     pid: c_int,
     changed: Changed,
 }
@@ -211,11 +245,11 @@ impl Drop for AxWindowWatch {
     }
 }
 
-/// Watch `window` for moves, resizes and its end, reporting each to
+/// Watch `window` for moves, resizes and its leaving the screen, reporting each to
 /// `changed` on the follower thread until the watch is dropped. `None` when
 /// the follower thread cannot run or the window's process cannot be named.
 /// Registering happens on the follower thread, shortly after this returns;
-/// if the accessibility API refuses it there, the watch simply never reports.
+/// if the accessibility API refuses any notification there, it reports `Gone`.
 pub fn watch_window(
     window: &AxRetainedElement,
     changed: Box<dyn Fn(AxWindowChange) + Send + Sync>,
@@ -238,29 +272,51 @@ fn add(id: u64, pid: c_int, window: AxRetainedElement, changed: Changed) {
     let mut observer: CfTypeRef = std::ptr::null();
     // SAFETY: `observer` is writable storage for one owned reference.
     if unsafe { AXObserverCreate(pid, on_notification, &mut observer) } != AX_ERROR_SUCCESS {
+        changed(AxWindowChange::Gone);
         return;
     }
     // SAFETY: a successful create returns one owned reference.
     let Some(observer) = (unsafe { owned(observer) }) else {
+        changed(AxWindowChange::Gone);
         return;
     };
-    let observer_ptr: CfTypeRef = CFRetained::as_ptr(&observer).as_ptr().cast();
-    let mut added = 0;
-    for name in [MOVED, RESIZED, DESTROYED] {
+    // SAFETY: creates an application element for a pid passed by value,
+    // returning one owned reference or null.
+    let Some(application) = (unsafe { owned(AXUIElementCreateApplication(pid)) }) else {
+        changed(AxWindowChange::Gone);
+        return;
+    };
+    let watch = Watch {
+        observer,
+        window,
+        application: AxRetainedElement(application),
+        pid,
+        changed,
+    };
+    let observer = &watch.observer;
+    let observer_ptr: CfTypeRef = CFRetained::as_ptr(observer).as_ptr().cast();
+    let registered = register_notifications(|name, target| {
         let name = CFString::from_static_str(name);
-        // SAFETY: observer, window and name are retained for the call; the
+        // SAFETY: observer, element and name are retained for the call; the
         // refcon is the watch's number, never dereferenced.
         let code = unsafe {
             AXObserverAddNotification(
                 observer_ptr,
-                window.as_ptr(),
+                watch.element(target).as_ptr(),
                 CFRetained::as_ptr(&name).as_ptr().cast(),
                 id as *mut c_void,
             )
         };
-        added += usize::from(code == AX_ERROR_SUCCESS);
-    }
-    if added == 0 {
+        code == AX_ERROR_SUCCESS
+    });
+    // Check after subscribing so a window hidden during installation cannot
+    // fall into the gap before the first notification is observed.
+    if !registered
+        || crate::ax_actions::window_minimized(&watch.window) != Some(false)
+        || crate::ax_actions::application_hidden(&watch.application) != Some(false)
+    {
+        remove_notifications(&watch);
+        (watch.changed)(AxWindowChange::Gone);
         return;
     }
     // SAFETY: the source is owned by the observer, which outlives its use
@@ -270,37 +326,45 @@ fn add(id: u64, pid: c_int, window: AxRetainedElement, changed: Changed) {
         // SAFETY: kCFRunLoopDefaultMode is a constant string Core Foundation
         // exports for the life of the process, so the reference never dangles.
         run_loop.add_source(Some(source), unsafe { kCFRunLoopDefaultMode });
+    } else {
+        remove_notifications(&watch);
+        (watch.changed)(AxWindowChange::Gone);
+        return;
     }
     watch_exit(pid, EV_ADD | EV_ONESHOT);
-    WATCHES.with(|watches| {
-        watches.borrow_mut().insert(
-            id,
-            Watch {
+    WATCHES.with(|watches| watches.borrow_mut().insert(id, watch));
+}
+
+impl Watch {
+    fn element(&self, target: NotificationTarget) -> &AxRetainedElement {
+        match target {
+            NotificationTarget::Window => &self.window,
+            NotificationTarget::Application => &self.application,
+        }
+    }
+}
+
+fn remove_notifications(watch: &Watch) {
+    let observer: CfTypeRef = CFRetained::as_ptr(&watch.observer).as_ptr().cast();
+    for (name, target) in NOTIFICATIONS {
+        let name = CFString::from_static_str(name);
+        // SAFETY: all three are retained for the call.
+        unsafe {
+            AXObserverRemoveNotification(
                 observer,
-                window,
-                pid,
-                changed,
-            },
-        )
-    });
+                watch.element(target).as_ptr(),
+                CFRetained::as_ptr(&name).as_ptr().cast(),
+            )
+        };
+    }
 }
 
 fn remove(id: u64) {
     let Some(watch) = WATCHES.with(|watches| watches.borrow_mut().remove(&id)) else {
         return;
     };
+    remove_notifications(&watch);
     let observer: CfTypeRef = CFRetained::as_ptr(&watch.observer).as_ptr().cast();
-    for name in [MOVED, RESIZED, DESTROYED] {
-        let name = CFString::from_static_str(name);
-        // SAFETY: all three are retained for the call.
-        unsafe {
-            AXObserverRemoveNotification(
-                observer,
-                watch.window.as_ptr(),
-                CFRetained::as_ptr(&name).as_ptr().cast(),
-            )
-        };
-    }
     // SAFETY: the observer owns its run-loop source and is still alive here
     // (it is released only when `watch` drops, after this); the cast only
     // names the source's Core Foundation type.
@@ -373,14 +437,11 @@ unsafe extern "C" fn on_notification(
     // CFString, for the duration of the callback.
     let name = unsafe { &*notification.cast::<CFString>() }.to_string();
     let id = refcon as u64;
-    match name.as_str() {
-        MOVED => report(id, AxWindowChange::Moved),
-        RESIZED => report(id, AxWindowChange::Resized),
-        DESTROYED => {
-            report(id, AxWindowChange::Gone);
+    if let Some(change) = notification_change(&name) {
+        report(id, change);
+        if change == AxWindowChange::Gone {
             remove(id);
         }
-        _ => {}
     }
 }
 
@@ -437,5 +498,63 @@ unsafe extern "C-unwind" fn on_exit(
     // SAFETY: Core Foundation passes the live descriptor this source wraps.
     if let Some(descriptor) = unsafe { descriptor.as_ref() } {
         descriptor.enable_call_backs(kCFFileDescriptorReadCallBack);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notifications_cover_window_lifecycle_and_application_hiding() {
+        let mut registered = Vec::new();
+        assert!(register_notifications(|name, target| {
+            registered.push((name, target));
+            true
+        }));
+        assert_eq!(
+            registered,
+            [
+                ("AXMoved", NotificationTarget::Window),
+                ("AXResized", NotificationTarget::Window),
+                ("AXUIElementDestroyed", NotificationTarget::Window),
+                ("AXWindowMiniaturized", NotificationTarget::Window),
+                ("AXApplicationHidden", NotificationTarget::Application),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_notification_is_required() {
+        for rejected in [
+            "AXMoved",
+            "AXResized",
+            "AXUIElementDestroyed",
+            "AXWindowMiniaturized",
+            "AXApplicationHidden",
+        ] {
+            assert!(
+                !register_notifications(|name, _| name != rejected),
+                "a refused {rejected} subscription must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_or_gone_notifications_end_the_watch() {
+        for name in [
+            "AXWindowMiniaturized",
+            "AXUIElementDestroyed",
+            "AXApplicationHidden",
+        ] {
+            assert_eq!(notification_change(name), Some(AxWindowChange::Gone));
+        }
+        assert_eq!(notification_change("AXMoved"), Some(AxWindowChange::Moved));
+        assert_eq!(
+            notification_change("AXResized"),
+            Some(AxWindowChange::Resized)
+        );
+        assert_eq!(notification_change("AXWindowDeminiaturized"), None);
+        assert_eq!(notification_change("AXApplicationShown"), None);
     }
 }

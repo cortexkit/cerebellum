@@ -873,13 +873,15 @@ impl Coordinator {
                 }
             }),
         );
+        if watch.is_none() {
+            // Without a complete watch we cannot know when the window leaves
+            // the screen. Hide rather than risk leaving a stale badge.
+            self.window_changed(agent, id, WindowChange::Gone);
+            return;
+        }
         let mut follows = self.follows();
         if let Some(follow) = follows.get_mut(agent).filter(|follow| follow.id == id) {
-            if let Some(watch) = watch {
-                follow._watch = Some(watch);
-            } else {
-                follows.remove(agent);
-            }
+            follow._watch = watch;
         }
         // If an end, replacement or Gone report removed the entry during
         // installation, the returned watch is dropped rather than revived.
@@ -895,17 +897,34 @@ impl Coordinator {
     /// A watched window moved, was resized or went away. Called on the
     /// platform's watching thread.
     fn window_changed(&self, agent: &str, id: u64, change: WindowChange) {
-        let current = {
+        if change == WindowChange::Gone {
+            // Use the same lock order as picture publication and turn end.
+            // A late report from an older watch must not hide a newer picture.
+            let mut drawn = self.drawn();
             let mut follows = self.follows();
+            let Some(follow) = follows.get(agent).filter(|follow| follow.id == id) else {
+                return;
+            };
+            let serial = follow.serial;
+            follows.remove(agent);
+            if drawn
+                .tips
+                .get(agent)
+                .is_some_and(|tip| tip.serial == serial)
+            {
+                drawn.tips.remove(agent);
+                self.send_line(CursorLine::Hide(CursorHide::new(agent)));
+            }
+            // No restore notification is watched: a later action may draw a
+            // fresh badge, but restoring the window alone leaves it hidden.
+            return;
+        }
+        let current = {
+            let follows = self.follows();
             let Some(follow) = follows.get(agent).filter(|follow| follow.id == id) else {
                 // A watch already replaced or removed; its report is stale.
                 return;
             };
-            if change == WindowChange::Gone {
-                // Nothing left to follow; the badge stays where it last was.
-                follows.remove(agent);
-                return;
-            }
             (
                 follow.serial,
                 follow.source.clone(),
@@ -2678,6 +2697,7 @@ mod tests {
         watches: std::sync::Mutex<Vec<Report>>,
         live: Arc<std::sync::atomic::AtomicUsize>,
         watch_release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        refuse_watch: std::sync::atomic::AtomicBool,
     }
 
     struct FakeWatch(Arc<std::sync::atomic::AtomicUsize>);
@@ -2700,6 +2720,7 @@ mod tests {
                 watches: std::sync::Mutex::new(Vec::new()),
                 live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 watch_release: std::sync::Mutex::new(None),
+                refuse_watch: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -2778,6 +2799,9 @@ mod tests {
             _: &ElementHandle,
             changed: Box<dyn Fn(WindowChange) + Send + Sync>,
         ) -> Option<Box<dyn CursorWindowWatch>> {
+            if self.refuse_watch.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
             self.watches.lock().unwrap().push(Arc::from(changed));
             self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let held = self.watch_release.lock().unwrap().take();
@@ -3041,13 +3065,84 @@ mod tests {
             })
         );
 
-        // The window closes: nothing is sent, so the badge stays where it
-        // last was, and the watch is released.
+        // A minimized, closed or app-hidden window must not leave its badge
+        // floating over whatever is underneath it.
         geometry.fire(0, WindowChange::Gone);
-        no_line(&mut receiver, "a closed window moved the badge");
+        assert_eq!(hidden(next_line(&mut receiver).await), AGENT);
+        assert!(!cursor.drawn().tips.contains_key(AGENT));
         assert_eq!(geometry.live(), 0, "the closed window's watch was kept");
         geometry.fire(0, WindowChange::Moved);
         no_line(&mut receiver, "a released watch still reported");
+    }
+
+    #[tokio::test]
+    async fn a_followed_window_gone_hides_the_badge_immediately() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let geometry = FollowGeometry::new();
+        schedule_on(&cursor, &geometry, CursorKind::Press);
+        next_line(&mut receiver).await.picture().unwrap();
+        until("installed the window watch", || {
+            cursor
+                .follows()
+                .get(AGENT)
+                .is_some_and(|follow| follow._watch.is_some())
+        })
+        .await;
+
+        geometry.fire(0, WindowChange::Gone);
+        assert_eq!(
+            hidden(
+                receiver
+                    .try_recv()
+                    .expect("window gone must hide immediately")
+            ),
+            AGENT
+        );
+        assert!(!cursor.drawn().tips.contains_key(AGENT));
+        assert!(!cursor.drawn().ended_at.contains_key(AGENT));
+        assert_eq!(geometry.live(), 0);
+        geometry.fire(0, WindowChange::Moved);
+        no_line(&mut receiver, "a restored window revived the badge");
+    }
+
+    #[tokio::test]
+    async fn a_window_watch_registration_failure_hides_the_badge() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let geometry = FollowGeometry::new();
+        geometry
+            .refuse_watch
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        schedule_on(&cursor, &geometry, CursorKind::Press);
+        next_line(&mut receiver).await.picture().unwrap();
+        assert_eq!(hidden(next_line(&mut receiver).await), AGENT);
+        assert!(cursor.follows().is_empty());
+        assert!(!cursor.drawn().tips.contains_key(AGENT));
+        assert_eq!(geometry.live(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_older_window_gone_report_does_not_hide_a_new_picture() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let geometry = FollowGeometry::new();
+        schedule_on(&cursor, &geometry, CursorKind::Press);
+        let first = next_line(&mut receiver).await.picture().unwrap();
+        until("installed the window watch", || {
+            cursor
+                .follows()
+                .get(AGENT)
+                .is_some_and(|follow| follow._watch.is_some())
+        })
+        .await;
+
+        // The new picture is queued before its replacement watch is installed.
+        let mut newer = picture(AGENT);
+        newer.serial = first.serial + 1;
+        cursor.send_unless_ended(newer.clone());
+        next_line(&mut receiver).await.picture().unwrap();
+        geometry.fire(0, WindowChange::Gone);
+        no_line(&mut receiver, "the old window hid a newer picture");
+        assert_eq!(cursor.drawn().tips[AGENT].serial, newer.serial);
+        assert_eq!(geometry.live(), 0);
     }
 
     #[tokio::test]
@@ -3061,6 +3156,7 @@ mod tests {
 
         geometry.fire(0, WindowChange::Gone);
         assert!(!cursor.follows().contains_key(AGENT));
+        assert_eq!(hidden(next_line(&mut receiver).await), AGENT);
         release.send(()).unwrap();
         until("released the closed window's watch", || {
             geometry.live() == 0
