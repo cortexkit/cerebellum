@@ -873,15 +873,18 @@ impl Coordinator {
                 }
             }),
         );
-        if watch.is_none() {
-            // Without a complete watch we cannot know when the window leaves
-            // the screen. Hide rather than risk leaving a stale badge.
-            self.window_changed(agent, id, WindowChange::Gone);
-            return;
-        }
+        // `None` means this platform watches no windows at all (the trait's
+        // default), so there is nothing to follow and the badge keeps its old
+        // place until it fades. A platform that can watch but fails to install
+        // a complete watch reports `Gone` through `changed` instead, which
+        // hides the badge.
         let mut follows = self.follows();
         if let Some(follow) = follows.get_mut(agent).filter(|follow| follow.id == id) {
-            follow._watch = watch;
+            if let Some(watch) = watch {
+                follow._watch = Some(watch);
+            } else {
+                follows.remove(agent);
+            }
         }
         // If an end, replacement or Gone report removed the entry during
         // installation, the returned watch is dropped rather than revived.
@@ -3106,7 +3109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_window_watch_registration_failure_hides_the_badge() {
+    async fn a_platform_without_window_watches_keeps_the_badge_unfollowed() {
         let (cursor, mut receiver) = Coordinator::channel();
         let geometry = FollowGeometry::new();
         geometry
@@ -3114,9 +3117,15 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         schedule_on(&cursor, &geometry, CursorKind::Press);
         next_line(&mut receiver).await.picture().unwrap();
-        assert_eq!(hidden(next_line(&mut receiver).await), AGENT);
-        assert!(cursor.follows().is_empty());
-        assert!(!cursor.drawn().tips.contains_key(AGENT));
+        until("dropped the unwatchable follow", || {
+            cursor.follows().is_empty()
+        })
+        .await;
+        no_line(
+            &mut receiver,
+            "a platform without window watches hid the badge",
+        );
+        assert!(cursor.drawn().tips.contains_key(AGENT));
         assert_eq!(geometry.live(), 0);
     }
 
