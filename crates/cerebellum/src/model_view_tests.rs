@@ -240,6 +240,15 @@ mod computer {
     }
 
     impl AppStateSource for Desk {
+        fn reports_screen_geometry(&self) -> bool {
+            true
+        }
+        fn element_frame(&self, _: &ElementHandle) -> Option<[f64; 4]> {
+            Some([10.0, 10.0, 20.0, 20.0])
+        }
+        fn display_frames(&self) -> Option<Vec<[f64; 4]>> {
+            Some(vec![[0.0, 0.0, 100.0, 100.0]])
+        }
         fn read_app_state(
             &self,
             _target: &ProcessGrant,

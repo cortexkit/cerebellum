@@ -90,6 +90,7 @@ use cerebellum_core::journal::{
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+mod action_effects;
 mod app_use;
 mod app_use_approval;
 pub mod cursor;
@@ -2704,7 +2705,8 @@ where
         let record_hooks = chord_hooks.clone();
         let record_mode = fronting_admission.mode;
         let record_foreground = foreground.map(|front| front.fronting);
-        let (dispatched, bracket, hooked) = tokio::task::spawn_blocking(move || {
+        let effect_grant = grant.clone();
+        let (dispatched, bracket, hooked, mut effects) = tokio::task::spawn_blocking(move || {
             let _ax = dispatch_work.bound_ax();
             // The dispatcher finalizes the keystrokes' row; this says how the
             // action used the front at that moment, once the bracket's own
@@ -2729,19 +2731,27 @@ where
             let posting =
                 own_input.begin_posting(person::last_input_instant(input_source.as_ref()));
             dispatch_work.publish_posting(&own_input, &posting);
+            let mut effects =
+                action_effects::ActionEffects::before(input_source.as_ref(), &effect_grant);
             let dispatched = dispatcher.dispatch(&mut token, identity, request);
             own_input.end_posting(posting);
             // Released first; only then may the previous application come
             // back, since a key still held would land on it.
             let held = settle_held_input(ticket, &dispatched, make_driver.as_ref());
+            effects.sample(input_source.as_ref(), &effect_grant);
             let mut bracket = dispatcher.last_bracket().cloned();
             let hooked = driver_hooks
                 .as_ref()
                 .map(|hooks| fronting::finish_after_release(hooks, held, bracket.as_mut()));
-            (dispatched, bracket, hooked)
+            (dispatched, bracket, hooked, effects)
         })
         .await
-        .unwrap_or((Err(DispatchError::Platform), None, None));
+        .unwrap_or((
+            Err(DispatchError::Platform),
+            None,
+            None,
+            action_effects::ActionEffects::default(),
+        ));
         let mut reply = match dispatched {
             Ok(report) => {
                 let Some(containment_rung) = report.containment.rung() else {
@@ -2837,7 +2847,7 @@ where
             let effect_deadline = element_actions::effect_deadline(capability);
             let mut finished = reply;
             let observe_work = work.clone();
-            reply = tokio::task::spawn_blocking(move || {
+            (reply, effects) = tokio::task::spawn_blocking(move || {
                 let _ax = observe_work.bound_ax();
                 // Polled up to the row's effect deadline rather than read once:
                 // an application renders typed text some time after the posts
@@ -2872,15 +2882,24 @@ where
                     sessions.zoom_expands_menus(&conversation_key, &grant, view.zoom.as_deref()),
                     element_actions::PersonWatch::NotWatched,
                     None,
+                    Some(&mut effects),
                 );
                 element_actions::add_diff_view(&mut finished, observed.as_ref(), &view);
-                finished
+                (finished, effects)
             })
             .await
-            .unwrap_or_else(|_| json!({"outcome": "delivery_unconfirmed"}));
+            .unwrap_or_else(|_| {
+                (
+                    json!({"outcome": "delivery_unconfirmed"}),
+                    action_effects::ActionEffects::default(),
+                )
+            });
         }
         if let Some(fronting) = fronting {
             fronting.apply(&mut reply);
+        }
+        if !unposted_refusal && !badge_gate.refused_for_end() {
+            action_effects::append_lines(&mut reply, &effects.lines);
         }
         admission.decorate(&mut reply);
         reply

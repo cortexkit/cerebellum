@@ -2935,6 +2935,15 @@ async fn person_input_requests_restore_before_a_slow_settle_read() {
         input_at: Arc<StdMutex<Option<u64>>>,
     }
     impl AppStateSource for SlowSettleSource {
+        fn reports_screen_geometry(&self) -> bool {
+            self.desk.reports_screen_geometry()
+        }
+        fn element_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {
+            self.desk.element_frame(element)
+        }
+        fn display_frames(&self) -> Option<Vec<[f64; 4]>> {
+            self.desk.display_frames()
+        }
         fn read_app_state(
             &self,
             target: &ProcessGrant,
@@ -3135,6 +3144,7 @@ mod settle_read_budget {
             false,
             PersonWatch::NotWatched,
             None,
+            None,
         )
         .expect("the changed application is observed")
         .read;
@@ -3167,6 +3177,7 @@ mod settle_read_budget {
             window,
             false,
             PersonWatch::Watched(&mut || false),
+            None,
             None,
         );
         assert!(observed.is_none(), "a partial read is not shown");

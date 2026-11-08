@@ -469,6 +469,29 @@ pub trait AppStateSource: Send + Sync {
         None
     }
 
+    /// Whether this source can determine if an element has an on-screen position.
+    /// Sources without geometry support keep their existing press behavior;
+    /// supporting sources must refuse a press when required geometry is unreadable.
+    fn reports_screen_geometry(&self) -> bool {
+        false
+    }
+
+    /// Live element geometry for deciding whether a press has an on-screen position.
+    fn element_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {
+        self.cursor_frame(element)
+    }
+
+    /// Desktop-coordinate display bounds, or `None` when unavailable.
+    fn display_frames(&self) -> Option<Vec<[f64; 4]>> {
+        None
+    }
+
+    /// On-screen ordinary window numbers for this process, without window content.
+    /// `None` means the platform cannot enumerate them, not an empty desktop.
+    fn visible_window_numbers(&self, _target: &ProcessGrant) -> Option<Vec<u32>> {
+        None
+    }
+
     /// A point in a target window not hidden by another app's normal window.
     /// An exact point wins; otherwise the centre of the element frame's
     /// visible part; with neither, the middle of the window's content.

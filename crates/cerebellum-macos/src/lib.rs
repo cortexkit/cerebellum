@@ -150,7 +150,7 @@ pub use window_image::{
     pointer_probe_own_window_count, pointer_probe_posting_permitted, prepare_pointer_hit_tests,
 };
 #[cfg(target_os = "macos")]
-pub use window_image::{cursor_position, pointer_window_at};
+pub use window_image::{cursor_position, display_frames, pointer_window_at, visible_window_ids};
 #[cfg(any(target_os = "macos", test))]
 mod window_visibility;
 #[cfg(any(target_os = "macos", test))]

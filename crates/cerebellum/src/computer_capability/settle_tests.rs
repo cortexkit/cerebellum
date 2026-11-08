@@ -191,6 +191,7 @@ fn press_reply_with_view(
             element_id: &fleet_id,
             handle: &handle,
         }),
+        None,
     );
     let mut reply = json!({"outcome": "completed"});
     add_diff_view(&mut reply, settled.as_ref(), view);

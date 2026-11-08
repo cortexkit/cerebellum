@@ -367,6 +367,51 @@ async fn with_no_badge_to_draw_the_action_is_sent_at_once() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_refused_press_draws_nothing_and_does_not_wait_for_arrival() {
+    for case in ["no press offered", "no screen position"] {
+        let desk = desk();
+        let base = plane(&desk);
+        let management = granted_management().await;
+        let tree = read(&base, &management).await;
+        {
+            let mut state = desk.state();
+            if case == "no press offered" {
+                state
+                    .elements
+                    .get_mut(&BUTTONS[0].0)
+                    .unwrap()
+                    .facts
+                    .actions
+                    .clear();
+            } else {
+                state.press_frame = None;
+            }
+        }
+        let (cursor, mut pictures) = Coordinator::channel();
+        let plane = base.with_cursor(cursor);
+        let start = Instant::now();
+        let reply = serve(
+            &plane,
+            &management,
+            "computer.press_element",
+            json!({"element_id": id_of(&tree, "One")}),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "no_press_action", "{case}: {reply}");
+        assert!(
+            pictures.try_recv().is_err(),
+            "{case}: a refused press drew a badge"
+        );
+        assert_eq!(
+            Instant::now(),
+            start,
+            "{case}: a refused press waited for arrival"
+        );
+        assert!(desk.state().dispatched_at.is_empty());
+    }
+}
+
 /// A batch presses its elements one by one, each when its own badge has
 /// arrived: the first after the entry, each later one a glide after the one
 /// before, from that element to the next.

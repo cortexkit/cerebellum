@@ -380,6 +380,9 @@ struct CountingPresses(AtomicUsize);
 
 #[cfg(target_os = "macos")]
 impl cerebellum_computer::app_state::source::AppStateSource for CountingPresses {
+    fn reports_screen_geometry(&self) -> bool {
+        true
+    }
     fn read_app_state(
         &self,
         _: &ProcessGrant,
@@ -406,6 +409,15 @@ impl cerebellum_computer::app_state::source::AppStateSource for CountingPresses 
             value_settable: false,
             selected_text_settable: false,
         })
+    }
+    fn element_frame(
+        &self,
+        _: &cerebellum_computer::app_state::source::ElementHandle,
+    ) -> Option<[f64; 4]> {
+        Some([10.0, 10.0, 20.0, 20.0])
+    }
+    fn display_frames(&self) -> Option<Vec<[f64; 4]>> {
+        Some(vec![[0.0, 0.0, 100.0, 100.0]])
     }
     fn press(
         &self,

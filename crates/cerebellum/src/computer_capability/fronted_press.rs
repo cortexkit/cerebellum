@@ -257,7 +257,18 @@ where
         }
         // A later step's badge glides while the step goes ahead; nothing
         // waits for it with the application in front.
-        if let Some(later) = self.later.as_mut() {
+        let handle = &self.steps[step].handle;
+        let can_preview = self.source.element_facts(handle).is_ok_and(|facts| {
+            facts.pid.is_none_or(|pid| pid == self.grant.pid)
+                && super::press_available(
+                    self.source,
+                    &facts,
+                    handle,
+                    self.journals[step].capability,
+                )
+                .is_ok()
+        });
+        if let Some(later) = self.later.as_mut().filter(|_| can_preview) {
             if let Some(badge) = later.badges.get_mut(step - 1).and_then(Option::take) {
                 let _runtime = later.runtime.enter();
                 let _ = later.scheduler.schedule(
@@ -402,6 +413,7 @@ where
         let steps = self.steps;
         let pressed = &steps[step];
         let mut acted = false;
+        let mut effects = std::mem::take(&mut self.journals[step].effects);
         let observed = settle_and_observe_view(
             source,
             sessions,
@@ -417,7 +429,9 @@ where
                 element_id: &pressed.element_id,
                 handle: &pressed.handle,
             }),
+            Some(&mut effects),
         );
+        self.journals[step].effects = effects;
         self.observed[step] = observed;
         if acted {
             self.person_input_in_settle = true;
@@ -769,11 +783,16 @@ where
                 );
             }
             let mut replies = replies.into_iter();
+            let effects = journals
+                .into_iter()
+                .flat_map(|journal| journal.effects.lines)
+                .collect();
             PressDone {
                 reply: replies
                     .next()
                     .unwrap_or_else(|| audit_unavailable_reply(false)),
                 later: replies.collect(),
+                effects,
                 ending: Some(FrontedEnding {
                     fronting,
                     bound_exceeded: report.fronting_bound_exceeded,

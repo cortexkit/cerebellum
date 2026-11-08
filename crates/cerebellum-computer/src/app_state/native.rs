@@ -146,6 +146,15 @@ impl AppStateSource for MacAppStateSource {
     fn cursor_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {
         cerebellum_macos::cursor_element_frame(retained(element).ok()?)
     }
+    fn reports_screen_geometry(&self) -> bool {
+        true
+    }
+    fn display_frames(&self) -> Option<Vec<[f64; 4]>> {
+        cerebellum_macos::display_frames()
+    }
+    fn visible_window_numbers(&self, target: &ProcessGrant) -> Option<Vec<u32>> {
+        cerebellum_macos::visible_window_ids(target.pid)
+    }
 
     fn visible_cursor_point(
         &self,
