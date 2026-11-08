@@ -646,6 +646,9 @@ mod tests {
     }
 
     impl AppStateSource for Desk {
+        fn reports_screen_geometry(&self) -> bool {
+            true
+        }
         fn element_frame(&self, _: &ElementHandle) -> Option<[f64; 4]> {
             Some([10.0, 10.0, 20.0, 20.0])
         }

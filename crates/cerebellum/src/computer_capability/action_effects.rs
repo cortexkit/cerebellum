@@ -35,7 +35,7 @@ impl ActionEffects {
                 if let Ok(apps) = source.running_apps() {
                     if let Some(app) = apps.iter().find(|app| app.pid == after) {
                         self.push(format!(
-                            "This action brought {} to the front.",
+                            "{} came to the front while this action ran.",
                             one_line(&app.name)
                         ));
                     }
@@ -63,7 +63,7 @@ impl ActionEffects {
             if opened {
                 if let Some(name) = &self.target_name {
                     self.push(format!(
-                        "This action opened a new window in {}.",
+                        "A new {} window appeared while this action ran.",
                         one_line(name)
                     ));
                 }
@@ -176,9 +176,9 @@ mod tests {
         assert_eq!(
             effects.lines,
             [
-                "This action brought Mail to the front.",
-                "This action opened a new window in Finder.",
-                "This action brought Finder to the front."
+                "Mail came to the front while this action ran.",
+                "A new Finder window appeared while this action ran.",
+                "Finder came to the front while this action ran."
             ]
         );
     }

@@ -1271,11 +1271,11 @@ async fn type_and_keys_report_foreground_and_new_window_facts_without_changing_o
         assert_eq!(reply["outcome"], expected, "{action}: {reply}");
         let text = reply["state_text"].as_str().unwrap();
         assert!(
-            text.contains("This action brought Mail to the front."),
+            text.contains("Mail came to the front while this action ran."),
             "{action}: {reply}"
         );
         assert!(
-            text.contains("This action opened a new window in Finder."),
+            text.contains("A new Finder window appeared while this action ran."),
             "{action}: {reply}"
         );
         assert_eq!(dispatched_calls(&shared).len(), 1);

@@ -2935,6 +2935,9 @@ async fn person_input_requests_restore_before_a_slow_settle_read() {
         input_at: Arc<StdMutex<Option<u64>>>,
     }
     impl AppStateSource for SlowSettleSource {
+        fn reports_screen_geometry(&self) -> bool {
+            self.desk.reports_screen_geometry()
+        }
         fn element_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {
             self.desk.element_frame(element)
         }

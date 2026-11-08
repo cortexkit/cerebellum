@@ -469,6 +469,13 @@ pub trait AppStateSource: Send + Sync {
         None
     }
 
+    /// Whether this source can determine if an element has an on-screen position.
+    /// Sources without geometry support keep their existing press behavior;
+    /// supporting sources must refuse a press when required geometry is unreadable.
+    fn reports_screen_geometry(&self) -> bool {
+        false
+    }
+
     /// Live element geometry for deciding whether a press has an on-screen position.
     fn element_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {
         self.cursor_frame(element)

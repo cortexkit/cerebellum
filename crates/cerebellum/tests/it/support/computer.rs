@@ -951,6 +951,9 @@ fn utf16_byte_offset(text: &str, utf16: usize) -> usize {
 }
 
 impl AppStateSource for Desk {
+    fn reports_screen_geometry(&self) -> bool {
+        true
+    }
     fn element_frame(&self, _: &ElementHandle) -> Option<[f64; 4]> {
         self.state().press_frame
     }

@@ -255,7 +255,7 @@ fn ids(reply: &Value, field: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_press_reports_an_application_brought_forward_during_settle() {
+async fn a_press_reports_a_foreground_change_during_settle() {
     let desk = desk();
     desk.state().after_action = Some(after_send());
     let plane = plane(&desk);
@@ -286,7 +286,7 @@ async fn a_press_reports_an_application_brought_forward_during_settle() {
             .as_str()
             .unwrap()
             .lines()
-            .any(|line| line == "This action brought Mail to the front."),
+            .any(|line| line == "Mail came to the front while this action ran."),
         "{reply}"
     );
     assert_eq!(desk.state().presses, vec![10]);
@@ -337,6 +337,95 @@ async fn a_press_with_a_zero_size_frame_dispatches_nothing() {
 }
 
 #[tokio::test]
+async fn a_press_on_a_source_without_screen_geometry_support_still_dispatches() {
+    use cerebellum_computer::app_state::source::{
+        AppStateReadError, AppStateSource, ElementActionError, ElementHandle, RawAppState,
+        ReadBounds,
+    };
+
+    struct NoGeometry(Desk);
+    impl AppStateSource for NoGeometry {
+        fn read_app_state(
+            &self,
+            grant: &ProcessGrant,
+            bounds: ReadBounds,
+        ) -> Result<RawAppState, AppStateReadError> {
+            self.0.read_app_state(grant, bounds)
+        }
+        fn element_facts(
+            &self,
+            element: &ElementHandle,
+        ) -> Result<ElementFacts, ElementActionError> {
+            self.0.element_facts(element)
+        }
+        fn press(&self, element: &ElementHandle) -> Result<(), ElementActionError> {
+            self.0.press(element)
+        }
+        fn hardware_input(
+            &self,
+            grant: &ProcessGrant,
+        ) -> Result<(std::time::Instant, Option<std::time::Instant>), ElementActionError> {
+            self.0.hardware_input(grant)
+        }
+        fn time_since_last_input(&self) -> Option<std::time::Duration> {
+            self.0.time_since_last_input()
+        }
+        fn frontmost_pid(&self) -> Option<u32> {
+            self.0.frontmost_pid()
+        }
+        fn focused_element(
+            &self,
+            grant: &ProcessGrant,
+        ) -> Result<Option<ElementHandle>, ElementActionError> {
+            self.0.focused_element(grant)
+        }
+        fn focused_window(
+            &self,
+            grant: &ProcessGrant,
+        ) -> Result<Option<cerebellum_computer::app_state::source::WindowMark>, ElementActionError>
+        {
+            self.0.focused_window(grant)
+        }
+    }
+
+    let desk = desk();
+    desk.state().after_action = Some(after_send());
+    let source = NoGeometry(desk.clone());
+    assert!(!source.reports_screen_geometry());
+    assert!(source.display_frames().is_none());
+    let plane = plane(&desk).with_app_state_source(Arc::new(source));
+    let management = granted_management().await;
+    let send = id_of(&read(&plane, &management).await, " button Send");
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": send}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(desk.state().presses, vec![10]);
+}
+
+#[tokio::test]
+async fn a_geometry_supporting_source_refuses_when_displays_are_unreadable() {
+    let desk = desk();
+    desk.state().displays = None;
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let send = id_of(&read(&plane, &management).await, " button Send");
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": send}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "no_press_action", "{reply}");
+    assert!(desk.state().dispatched_at.is_empty());
+}
+
+#[tokio::test]
 async fn a_press_on_a_second_display_with_negative_coordinates_is_allowed() {
     let desk = desk();
     {
@@ -360,7 +449,7 @@ async fn a_press_on_a_second_display_with_negative_coordinates_is_allowed() {
     assert!(!reply["state_text"]
         .as_str()
         .unwrap()
-        .contains("This action"));
+        .contains("while this action ran."));
 }
 
 #[tokio::test]
@@ -397,11 +486,11 @@ async fn a_press_batch_keeps_foreground_and_new_window_facts_when_a_later_step_r
     assert_eq!(reply["stopped_at"], 2);
     let text = reply["state_text"].as_str().unwrap();
     assert!(
-        text.contains("This action brought Mail to the front."),
+        text.contains("Mail came to the front while this action ran."),
         "{reply}"
     );
     assert!(
-        text.contains("This action opened a new window in Finder."),
+        text.contains("A new Finder window appeared while this action ran."),
         "{reply}"
     );
     assert_eq!(desk.state().presses, vec![10]);
@@ -433,7 +522,7 @@ async fn a_write_reports_a_foreground_switch_even_if_the_tree_read_is_unavailabl
         reply["state_text"]
             .as_str()
             .unwrap()
-            .contains("This action brought Mail to the front."),
+            .contains("Mail came to the front while this action ran."),
         "{reply}"
     );
     assert_eq!(desk.state().writes.len(), 1);
@@ -1180,7 +1269,7 @@ async fn a_point_is_hit_tested_in_its_own_application_and_pressed() {
 }
 
 #[tokio::test]
-async fn a_point_press_reports_the_application_it_brought_forward() {
+async fn a_point_press_reports_a_foreground_change() {
     let desk = desk();
     {
         let mut state = desk.state();
@@ -1208,7 +1297,7 @@ async fn a_point_press_reports_the_application_it_brought_forward() {
         reply["state_text"]
             .as_str()
             .unwrap()
-            .contains("This action brought Mail to the front."),
+            .contains("Mail came to the front while this action ran."),
         "{reply}"
     );
     assert_eq!(desk.state().presses, vec![10]);
