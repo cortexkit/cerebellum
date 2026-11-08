@@ -723,6 +723,13 @@ pub struct DeskState {
     pub cursor_frames: std::collections::HashMap<u64, [f64; 4]>,
     /// Run once, on the next read of an element's frame for the badge.
     pub on_cursor_frame: Option<DeskHook>,
+    /// When set, only this element's geometry read consumes `on_cursor_frame`;
+    /// a previous picture's asynchronous window follower must leave it armed.
+    pub cursor_frame_hook_target: Option<u64>,
+    /// Run once inside the next application-hidden visibility read.
+    pub on_application_hidden: Option<DeskHook>,
+    /// Run once inside the next window-minimized visibility read.
+    pub on_window_minimized: Option<DeskHook>,
     /// Run once, as the next press reaches the desk, after it is recorded.
     pub on_press: Option<DeskHook>,
     /// When each press and write reached the desk, on tokio's clock, so a
@@ -765,6 +772,7 @@ pub struct DeskState {
     pub focused_cursor_window: Option<u64>,
     /// Window elements that read as minimized.
     pub minimized_windows: std::collections::HashSet<u64>,
+    pub application_hidden: Option<bool>,
     /// The topmost on-screen window at any point, unless
     /// `topmost_windows_at` names another one there; `None` when the window
     /// list does not settle it.
@@ -825,6 +833,9 @@ impl Desk {
             cursor_frame: None,
             cursor_frames: std::collections::HashMap::new(),
             on_cursor_frame: None,
+            cursor_frame_hook_target: None,
+            on_application_hidden: None,
+            on_window_minimized: None,
             on_press: None,
             dispatched_at: Vec::new(),
             cursor_visible: false,
@@ -846,6 +857,7 @@ impl Desk {
             cursor_windows: std::collections::HashMap::new(),
             focused_cursor_window: None,
             minimized_windows: std::collections::HashSet::new(),
+            application_hidden: Some(false),
             topmost_window: None,
             topmost_windows_at: Vec::new(),
             presses: Vec::new(),
@@ -933,10 +945,20 @@ impl AppStateSource for Desk {
     fn cursor_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {
         let (frame, hook) = {
             let mut state = self.state();
-            let frame = token_of(element)
+            let token = token_of(element);
+            let frame = token
                 .and_then(|token| state.cursor_frames.get(&token).copied())
                 .or(state.cursor_frame);
-            (frame, state.on_cursor_frame.take())
+            let hook = if state
+                .cursor_frame_hook_target
+                .is_none_or(|target| token == Some(target))
+            {
+                state.cursor_frame_hook_target = None;
+                state.on_cursor_frame.take()
+            } else {
+                None
+            };
+            (frame, hook)
         };
         if let Some(DeskHook(hook)) = hook {
             hook();
@@ -1174,16 +1196,42 @@ impl AppStateSource for Desk {
         element: Option<&ElementHandle>,
     ) -> Option<ElementHandle> {
         let state = self.state();
-        match element {
+        let window = match element {
             Some(element) => state.cursor_windows.get(&token_of(element)?).copied(),
             None => state.focused_cursor_window,
-        }
-        .map(fixture_handle)
+        };
+        // Enabling on-screen fixture pictures also certifies a window when
+        // the test needs no particular window identity. Preview fixtures keep
+        // requiring their explicit window map.
+        window
+            .or_else(|| state.cursor_visible.then_some(u64::MAX))
+            .map(fixture_handle)
     }
 
     fn window_minimized(&self, window: &ElementHandle) -> Option<bool> {
         let token = token_of(window)?;
-        Some(self.state().minimized_windows.contains(&token))
+        let (minimized, hook) = {
+            let mut state = self.state();
+            (
+                state.minimized_windows.contains(&token),
+                state.on_window_minimized.take(),
+            )
+        };
+        if let Some(DeskHook(hook)) = hook {
+            hook();
+        }
+        Some(minimized)
+    }
+
+    fn application_hidden(&self, _: &ProcessGrant) -> Option<bool> {
+        let (hidden, hook) = {
+            let mut state = self.state();
+            (state.application_hidden, state.on_application_hidden.take())
+        };
+        if let Some(DeskHook(hook)) = hook {
+            hook();
+        }
+        hidden
     }
 
     fn topmost_window_at(&self, point: (f64, f64)) -> Option<u32> {

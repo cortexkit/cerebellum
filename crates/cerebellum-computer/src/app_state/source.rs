@@ -559,6 +559,12 @@ pub trait AppStateSource: Send + Sync {
         None
     }
 
+    /// The granted application's live hidden state. Unknown visibility is not
+    /// sufficient to draw a cosmetic badge.
+    fn application_hidden(&self, _target: &ProcessGrant) -> Option<bool> {
+        None
+    }
+
     /// Ask the element to perform its press action.
     fn press(&self, _element: &ElementHandle) -> Result<(), ElementActionError> {
         Err(ElementActionError::UnsupportedOnPlatform)
