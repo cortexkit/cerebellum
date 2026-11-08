@@ -108,8 +108,10 @@ fn desk() -> Desk {
     {
         let mut state = desk.state();
         state.cursor_visible = true;
+        state.cursor_frames.insert(1, [0.0, 0.0, 800.0, 600.0]);
         for (token, _, frame) in BUTTONS.iter().chain([&FIELD]) {
             state.cursor_frames.insert(*token, *frame);
+            state.cursor_windows.insert(*token, 1);
         }
     }
     desk
@@ -355,6 +357,12 @@ async fn with_no_badge_to_draw_the_action_is_sent_at_once() {
             [start],
             "{case}: the press waited for a badge nobody sees"
         );
+        if case == "no geometry" {
+            assert!(matches!(
+                pictures.try_recv().expect("hide any old badge"),
+                CursorLine::Hide(_)
+            ));
+        }
         assert!(pictures.try_recv().is_err(), "{case}: no picture was drawn");
     }
 }
@@ -480,6 +488,59 @@ async fn the_person_acting_while_the_badge_travels_refuses_the_press() {
             "{change}: nothing was pressed"
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_window_leaving_the_screen_while_the_badge_travels_refuses_the_press() {
+    for hidden in [false, true] {
+        let mut rig = rig_with_badge_shown().await;
+        let desk = rig.desk.clone();
+        let (reply, ()) = tokio::join!(
+            serve(
+                &rig.plane,
+                &rig.management,
+                "computer.press_element",
+                json!({"element_id": id_of(&rig.tree, "One")}),
+            ),
+            async {
+                picture(&mut rig.pictures).await;
+                let mut state = desk.state();
+                if hidden {
+                    state.application_hidden = Some(true);
+                } else {
+                    state.minimized_windows.insert(1);
+                }
+            }
+        );
+        assert_eq!(reply["outcome"], "state_changed_by_person", "{reply}");
+        assert_eq!(reply["reason"], "window_changed", "{reply}");
+        assert!(
+            reply["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("left the screen"),
+            "{reply}"
+        );
+        assert!(rig.desk.state().presses.is_empty(), "nothing was pressed");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_already_minimized_target_still_presses_without_a_badge() {
+    let mut rig = rig_with_badge_shown().await;
+    rig.desk.state().minimized_windows.insert(1);
+    let reply = serve(
+        &rig.plane,
+        &rig.management,
+        "computer.press_element",
+        json!({"element_id": id_of(&rig.tree, "One")}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(rig.desk.state().presses, [BUTTONS[0].0]);
+    let line = rig.pictures.try_recv().expect("old badge hidden");
+    assert!(matches!(line, CursorLine::Hide(_)), "{line:?}");
+    assert!(rig.pictures.try_recv().is_err(), "no new picture");
 }
 
 /// The agent's turn ending while its badge travels takes the badge off the

@@ -2204,8 +2204,35 @@ where
         conversation_key: &str,
         grant: &ProcessGrant,
     ) -> Result<(), Held> {
+        let screen_window = arrival.screen_window();
+        let badge = arrival.watch();
         if !badge_landing(arrival, cancel).await? {
             return Ok(());
+        }
+        // A drawn on-screen badge gave the person time to minimize the target
+        // or hide its app. Do not press into the window that has since left.
+        // No-picture actions and background previews keep their usual dispatch.
+        if let Some(window) = screen_window.get() {
+            let source = self.app_state_source.clone();
+            let checked = grant.clone();
+            let window = window.clone();
+            let work = super::quarantine::CallWork::current();
+            let visible = tokio::task::spawn_blocking(move || {
+                let _ax = work.bound_ax();
+                source.application_hidden(&checked) == Some(false)
+                    && source.window_minimized(&window) == Some(false)
+            })
+            .await;
+            if !matches!(visible, Ok(true)) {
+                if let Some(badge) = badge {
+                    badge.hide();
+                }
+                return Err(Held::Refused(json!({
+                    "outcome": "state_changed_by_person",
+                    "reason": "window_changed",
+                    "remedy": "The target window left the screen while the badge travelled, or its visibility could no longer be read. Nothing was sent. Call read_state, then act on what it shows.",
+                })));
+            }
         }
         match self
             .refuse_if_person_changed(management, conversation_key, grant)

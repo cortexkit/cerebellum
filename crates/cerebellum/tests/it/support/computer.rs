@@ -765,6 +765,7 @@ pub struct DeskState {
     pub focused_cursor_window: Option<u64>,
     /// Window elements that read as minimized.
     pub minimized_windows: std::collections::HashSet<u64>,
+    pub application_hidden: Option<bool>,
     /// The topmost on-screen window at any point, unless
     /// `topmost_windows_at` names another one there; `None` when the window
     /// list does not settle it.
@@ -846,6 +847,7 @@ impl Desk {
             cursor_windows: std::collections::HashMap::new(),
             focused_cursor_window: None,
             minimized_windows: std::collections::HashSet::new(),
+            application_hidden: Some(false),
             topmost_window: None,
             topmost_windows_at: Vec::new(),
             presses: Vec::new(),
@@ -1174,16 +1176,25 @@ impl AppStateSource for Desk {
         element: Option<&ElementHandle>,
     ) -> Option<ElementHandle> {
         let state = self.state();
-        match element {
+        let window = match element {
             Some(element) => state.cursor_windows.get(&token_of(element)?).copied(),
             None => state.focused_cursor_window,
-        }
-        .map(fixture_handle)
+        };
+        // Enabling on-screen fixture pictures also certifies a window when
+        // the test needs no particular window identity. Preview fixtures keep
+        // requiring their explicit window map.
+        window
+            .or_else(|| state.cursor_visible.then_some(u64::MAX))
+            .map(fixture_handle)
     }
 
     fn window_minimized(&self, window: &ElementHandle) -> Option<bool> {
         let token = token_of(window)?;
         Some(self.state().minimized_windows.contains(&token))
+    }
+
+    fn application_hidden(&self, _: &ProcessGrant) -> Option<bool> {
+        self.state().application_hidden
     }
 
     fn topmost_window_at(&self, point: (f64, f64)) -> Option<u32> {

@@ -217,6 +217,9 @@ struct Drawn {
     /// ended. A picture scheduled before that end is still reading geometry
     /// and must not bring the badge back once its read finishes.
     ended_at: HashMap<String, u64>,
+    /// Pictures at or below this serial were hidden without ending the turn.
+    /// A delayed geometry read must not resurrect an appearance that went away.
+    hidden_through: HashMap<String, u64>,
     /// Agents whose badges each `(channel, epoch)` route has drawn.
     routes: HashMap<(u16, u32), BTreeSet<String>>,
     /// Which head session drew which agent's badge, least recently drawn
@@ -774,12 +777,22 @@ impl Coordinator {
         element: Option<ElementHandle>,
     ) {
         let agent = &event.agent;
+        #[cfg(target_os = "macos")]
+        let _ax = cerebellum_macos::ax_budget::bound_messages_until(
+            std::time::Instant::now() + READ_BUDGET,
+        );
         if event.resting {
             let current = self
                 .follows()
                 .get(agent)
                 .map(|follow| (follow.id, follow.source.clone(), follow.window.clone()));
             if let Some((id, source, window)) = current {
+                if source.window_minimized(&window) != Some(false)
+                    || source.application_hidden(grant) != Some(false)
+                {
+                    self.hide_picture(agent, event.serial);
+                    return;
+                }
                 // Count from now: the helper restarts its follow offset at
                 // every picture event.
                 let base_window = source.cursor_frame(&window);
@@ -808,6 +821,14 @@ impl Coordinator {
             self.drop_older_follow(agent, event.serial);
             return;
         };
+        // Minimized windows need not expose a frame. Check before geometry,
+        // otherwise their observer's initial Gone report is never reached.
+        if source.window_minimized(&window) != Some(false)
+            || source.application_hidden(grant) != Some(false)
+        {
+            self.hide_picture(agent, event.serial);
+            return;
+        }
         let Some(base_window) = source.cursor_frame(&window) else {
             self.drop_older_follow(agent, event.serial);
             return;
@@ -897,6 +918,38 @@ impl Coordinator {
         }
     }
 
+    /// A cosmetic read could not show its target. Hide the previous picture
+    /// too, but never a newer action's picture or watch. This is not a turn end:
+    /// an action with no badge still runs and later actions may draw again.
+    fn hide_picture(&self, agent: &str, serial: u64) {
+        let mut drawn = self.drawn();
+        let mut follows = self.follows();
+        if follows
+            .get(agent)
+            .is_some_and(|follow| follow.serial <= serial)
+        {
+            follows.remove(agent);
+        }
+        self.hide_picture_locked(agent, serial, &mut drawn);
+    }
+
+    fn hide_picture_locked(&self, agent: &str, serial: u64, drawn: &mut Drawn) {
+        if drawn.hidden_through.len() >= RECORD_CAP && !drawn.hidden_through.contains_key(agent) {
+            drawn.hidden_through.clear();
+        }
+        let hidden = drawn.hidden_through.entry(agent.to_owned()).or_default();
+        *hidden = (*hidden).max(serial);
+        if drawn.tips.get(agent).is_some_and(|tip| tip.serial > serial) {
+            return;
+        }
+        drawn.tips.remove(agent);
+        #[cfg(any(target_os = "macos", test))]
+        if let Some(listener) = self.0.turn_hints.get() {
+            listener.ended(agent);
+        }
+        self.send_line(CursorLine::Hide(CursorHide::new(agent)));
+    }
+
     /// A watched window moved, was resized or went away. Called on the
     /// platform's watching thread.
     fn window_changed(&self, agent: &str, id: u64, change: WindowChange) {
@@ -915,8 +968,14 @@ impl Coordinator {
                 .get(agent)
                 .is_some_and(|tip| tip.serial == serial)
             {
-                drawn.tips.remove(agent);
-                self.send_line(CursorLine::Hide(CursorHide::new(agent)));
+                // Include reads already in flight, even when their picture has
+                // not replaced this tip yet. Only a later action may redraw.
+                let through = self
+                    .0
+                    .serial
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .saturating_sub(1);
+                self.hide_picture_locked(agent, serial.max(through), &mut drawn);
             }
             // No restore notification is watched: a later action may draw a
             // fresh badge, but restoring the window alone leaves it hidden.
@@ -1116,6 +1175,17 @@ impl Coordinator {
     /// nothing will be drawn or there is nothing to wait for.
     fn send_unless_ended(&self, mut event: CursorEvent) -> Option<Sent> {
         let mut drawn = self.drawn();
+        if drawn
+            .hidden_through
+            .get(&event.agent)
+            .is_some_and(|hidden| event.serial <= *hidden)
+            || drawn
+                .tips
+                .get(&event.agent)
+                .is_some_and(|tip| event.serial < tip.serial)
+        {
+            return None;
+        }
         if drawn
             .ended_at
             .get(&event.agent)
@@ -1336,6 +1406,7 @@ impl Coordinator {
                 serial,
             }),
             preview_call: None,
+            screen_window: Arc::default(),
         }
     }
 
@@ -1440,6 +1511,7 @@ impl Coordinator {
                 serial,
             }),
             preview_call: preview.call.clone(),
+            screen_window: Arc::default(),
         };
         let decision = (
             decided,
@@ -1668,38 +1740,46 @@ impl Coordinator {
                 serial,
             }),
             preview_call: None,
+            screen_window: Arc::default(),
         };
+        let screen_window = arrival.screen_window.clone();
         let (queued, cap) = (arrival.queued.clone(), arrival.scheduled + ARRIVAL_CAP);
         tokio::spawn(async move {
             let agent = identity.badge;
+            let read_agent = agent.clone();
             let avatar_agent = identity.avatar_agent;
             let (read_source, read_grant) = (source.clone(), grant.clone());
             let read = tokio::task::spawn_blocking(move || {
+                #[cfg(target_os = "macos")]
+                let _ax = cerebellum_macos::ax_budget::bound_messages_until(
+                    std::time::Instant::now() + READ_BUDGET,
+                );
                 screen_read(
                     read_source.as_ref(),
                     &read_grant,
                     kind,
                     aim,
                     point,
-                    agent,
+                    read_agent,
                     serial,
                 )
             });
             // A read that fails or runs out of time drops `decided`, which
             // tells a waiting action that no badge will be drawn.
-            if let Ok(Ok(Some((event, followed_element)))) =
-                tokio::time::timeout(READ_BUDGET, read).await
-            {
+            if let Ok(Ok(Some(aimed))) = tokio::time::timeout(READ_BUDGET, read).await {
+                let _ = screen_window.set(aimed.window);
                 cursor
                     .draw_on_screen(
-                        event,
-                        followed_element,
+                        aimed.event,
+                        aimed.element,
                         grant,
                         source,
                         avatar_agent,
                         (decided, queued, cap),
                     )
                     .await;
+            } else {
+                cursor.hide_picture(&agent, serial);
             }
         });
         arrival
@@ -1815,6 +1895,9 @@ impl Coordinator {
 /// writing it to the helper, then lasts until that write plus the motion the
 /// line carries. Nothing to see means no wait.
 pub(crate) struct Arrival {
+    /// Set only for on-screen pictures, after visibility is checked. A preview
+    /// may intentionally show a minimized window and must not use this check.
+    screen_window: Arc<OnceLock<ElementHandle>>,
     /// Answers once the picture is written, with the moment its badge
     /// arrives, or with nothing (or is dropped) when no picture will be
     /// drawn.
@@ -1892,6 +1975,11 @@ pub(crate) struct BadgeWatch {
 }
 
 impl BadgeWatch {
+    /// Hide this appearance without ending the agent's turn or a newer badge.
+    pub(super) fn hide(&self) {
+        self.cursor.hide_picture(&self.agent, self.serial);
+    }
+
     /// Whether the agent's badge was ended after this picture was scheduled.
     /// An end before it (the previous turn's) does not count: this picture
     /// draws a new badge.
@@ -1920,6 +2008,7 @@ impl Arrival {
             queued: Arc::default(),
             watch: None,
             preview_call: None,
+            screen_window: Arc::default(),
         }
     }
 
@@ -1927,6 +2016,12 @@ impl Arrival {
     /// whether its badge was ended meanwhile.
     pub(crate) fn watch(&self) -> Option<BadgeWatch> {
         self.watch.clone()
+    }
+
+    /// The window whose visible on-screen picture this action waits for.
+    /// Read the cell after arrival, when the geometry task has filled it.
+    pub(super) fn screen_window(&self) -> Arc<OnceLock<ElementHandle>> {
+        self.screen_window.clone()
     }
 
     /// Wait until the badge is on its target, or until the call must not be
@@ -2034,6 +2129,7 @@ impl Arrival {
             queued: Arc::default(),
             watch: None,
             preview_call: None,
+            screen_window: Arc::default(),
         }
     }
 }
@@ -2069,6 +2165,12 @@ impl Coordinator {
     }
 }
 
+struct ScreenAimed {
+    event: CursorEvent,
+    element: Option<ElementHandle>,
+    window: ElementHandle,
+}
+
 /// The geometry read for an on-screen picture, on a blocking thread: the
 /// picture to send and the element it was aimed at, or `None` when nothing
 /// should be drawn.
@@ -2080,7 +2182,7 @@ fn screen_read(
     point: Option<[f64; 2]>,
     agent: String,
     serial: u64,
-) -> Option<(CursorEvent, Option<ElementHandle>)> {
+) -> Option<ScreenAimed> {
     let mut aimed_handle = aim.preferred;
     let (title, secure, mut frame) = match aimed_handle.as_ref() {
         Some(handle) => {
@@ -2115,8 +2217,18 @@ fn screen_read(
         return None;
     }
     let to = source.visible_cursor_point(grant, point, frame)?;
-    Some((
-        CursorEvent {
+    // CoreGraphics geometry can lag the application's accessibility state. A badge is
+    // cosmetic, so an unreadable minimized/hidden state is not permission to
+    // draw. Without a window we cannot certify its minimized state either.
+    if source.application_hidden(grant) != Some(false) {
+        return None;
+    }
+    let window = source.cursor_window(grant, aimed_handle.as_ref())?;
+    if source.window_minimized(&window) != Some(false) {
+        return None;
+    }
+    Some(ScreenAimed {
+        event: CursorEvent {
             initial: agent.chars().next().unwrap_or('A').to_ascii_uppercase(),
             agent,
             to,
@@ -2131,8 +2243,9 @@ fn screen_read(
             // Chosen when the picture is sent, from where the badge is then.
             motion: PictureMotion::still(),
         },
-        aimed_handle,
-    ))
+        element: aimed_handle,
+        window,
+    })
 }
 
 /// The geometry read for a background-mode badge, on a blocking thread.
@@ -2299,6 +2412,10 @@ impl State {
                 .ended_at
                 .get(&key.0)
                 .is_some_and(|ended| key.1 < *ended)
+                && !drawn
+                    .hidden_through
+                    .get(&key.0)
+                    .is_some_and(|hidden| key.1 <= *hidden)
             {
                 if let Some(listener) = self.turn_hints.get() {
                     listener.drawn(&key.0);
@@ -2406,6 +2523,22 @@ mod tests {
     }
 
     impl AppStateSource for HeldGeometry {
+        fn cursor_window(
+            &self,
+            _: &ProcessGrant,
+            _: Option<&ElementHandle>,
+        ) -> Option<ElementHandle> {
+            Some(cerebellum_computer::app_state::source::RawElement::fixture(0, "AXWindow").handle)
+        }
+
+        fn window_minimized(&self, _: &ElementHandle) -> Option<bool> {
+            Some(false)
+        }
+
+        fn application_hidden(&self, _: &ProcessGrant) -> Option<bool> {
+            Some(false)
+        }
+
         fn read_app_state(
             &self,
             _: &ProcessGrant,
@@ -2496,16 +2629,19 @@ mod tests {
         assert_eq!(runtime_work, "completed");
         // The geometry is still held. Its decision must finish without a
         // picture, rather than merely leaving the helper quiet for a while.
-        assert!(receiver.try_recv().is_err());
         let decision = arrival.decision.expect("a scheduled geometry decision");
-        tokio::time::timeout(HANG_GUARD, async {
-            tokio::select! {
-                result = decision => assert!(result.is_err(), "a timed-out read drops its decision"),
-                line = receiver.recv() => panic!("late geometry reached the helper: {line:?}"),
-            }
-        })
-        .await
-        .expect("the blocked geometry read never reached its deadline");
+        assert!(
+            tokio::time::timeout(HANG_GUARD, decision)
+                .await
+                .expect("the blocked geometry read never reached its deadline")
+                .is_err(),
+            "a timed-out read drops its decision"
+        );
+        assert_eq!(
+            hidden(next_line(&mut receiver).await),
+            "agent",
+            "a skipped read hides any previous badge, never sends a picture"
+        );
         release_tx.send(()).unwrap();
         tokio::time::timeout(HANG_GUARD, finished_rx)
             .await
@@ -2554,6 +2690,7 @@ mod tests {
             queued: Arc::default(),
             watch: None,
             preview_call: None,
+            screen_window: Arc::default(),
         }
         .wait(
             start + Duration::from_secs(10),
@@ -2701,6 +2838,10 @@ mod tests {
         live: Arc<std::sync::atomic::AtomicUsize>,
         watch_release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
         refuse_watch: std::sync::atomic::AtomicBool,
+        minimized: std::sync::Mutex<Option<bool>>,
+        hidden: std::sync::Mutex<Option<bool>>,
+        window_readable: std::sync::atomic::AtomicBool,
+        point_visible: std::sync::atomic::AtomicBool,
     }
 
     struct FakeWatch(Arc<std::sync::atomic::AtomicUsize>);
@@ -2724,6 +2865,10 @@ mod tests {
                 live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 watch_release: std::sync::Mutex::new(None),
                 refuse_watch: std::sync::atomic::AtomicBool::new(false),
+                minimized: std::sync::Mutex::new(Some(false)),
+                hidden: std::sync::Mutex::new(Some(false)),
+                window_readable: std::sync::atomic::AtomicBool::new(true),
+                point_visible: std::sync::atomic::AtomicBool::new(true),
             })
         }
 
@@ -2773,6 +2918,12 @@ mod tests {
         }
         fn cursor_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {
             Some(if element.same_element(self.window.as_ref()) {
+                if !self
+                    .window_readable
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return None;
+                }
                 *self.window_frame.lock().unwrap()
             } else {
                 *self.element_frame.lock().unwrap()
@@ -2785,6 +2936,9 @@ mod tests {
             frame: Option<[f64; 4]>,
         ) -> Option<[f64; 2]> {
             // No point and no frame: the window's middle.
+            if !self.point_visible.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
             Some(point.unwrap_or(match frame {
                 Some([x, y, w, h]) => [x + w / 2.0, y + h / 2.0],
                 None => [500.0, 380.0],
@@ -2813,6 +2967,14 @@ mod tests {
                     .expect("released window watch installation");
             }
             Some(Box::new(FakeWatch(self.live.clone())))
+        }
+
+        fn window_minimized(&self, _: &ElementHandle) -> Option<bool> {
+            *self.minimized.lock().unwrap()
+        }
+
+        fn application_hidden(&self, _: &ProcessGrant) -> Option<bool> {
+            *self.hidden.lock().unwrap()
         }
     }
 
@@ -2861,6 +3023,14 @@ mod tests {
     }
 
     impl AppStateSource for AimedWindowGeometry {
+        fn window_minimized(&self, _: &ElementHandle) -> Option<bool> {
+            Some(false)
+        }
+
+        fn application_hidden(&self, _: &ProcessGrant) -> Option<bool> {
+            Some(false)
+        }
+
         fn read_app_state(
             &self,
             _: &ProcessGrant,
@@ -3076,6 +3246,159 @@ mod tests {
         assert_eq!(geometry.live(), 0, "the closed window's watch was kept");
         geometry.fire(0, WindowChange::Moved);
         no_line(&mut receiver, "a released watch still reported");
+    }
+
+    #[test]
+    fn a_picture_is_skipped_for_minimized_hidden_or_unknown_visibility() {
+        let geometry = FollowGeometry::new();
+        for (minimized, hidden) in [
+            (Some(true), Some(false)),
+            (None, Some(false)),
+            (Some(false), Some(true)),
+            (Some(false), None),
+        ] {
+            *geometry.minimized.lock().unwrap() = minimized;
+            *geometry.hidden.lock().unwrap() = hidden;
+            let read = screen_read(
+                geometry.as_ref(),
+                &grant(),
+                CursorKind::Press,
+                ReadAim {
+                    preferred: Some(geometry.window.clone()),
+                    focused: None,
+                },
+                None,
+                AGENT.into(),
+                1,
+            );
+            assert!(
+                read.is_none(),
+                "drew with minimized={minimized:?}, hidden={hidden:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_skipped_picture_hides_the_previous_windows_badge() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let geometry = FollowGeometry::new();
+        schedule_on(&cursor, &geometry, CursorKind::Press);
+        next_line(&mut receiver).await.picture().unwrap();
+        until("installed the original watch", || geometry.live() == 1).await;
+        geometry
+            .point_visible
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let arrival = cursor.schedule(
+            Identity::for_test(AGENT, None, None),
+            CursorKind::Press,
+            grant(),
+            geometry.clone(),
+            Some(geometry.window.clone()),
+            None,
+        );
+        assert_eq!(
+            arrival
+                .wait(
+                    tokio::time::Instant::now() + HANG_GUARD,
+                    std::future::pending(),
+                    || false
+                )
+                .await,
+            Landing::Arrived { drawn: false }
+        );
+        assert_eq!(hidden(next_line(&mut receiver).await), AGENT);
+        assert!(!cursor.drawn().tips.contains_key(AGENT));
+        assert_eq!(geometry.live(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_already_minimized_follow_hides_even_without_a_window_frame() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let geometry = FollowGeometry::new();
+        *geometry.minimized.lock().unwrap() = Some(true);
+        geometry
+            .window_readable
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let event = picture(AGENT);
+        cursor.send_unless_ended(event.clone());
+        next_line(&mut receiver).await.picture().unwrap();
+        let source: Arc<dyn AppStateSource> = geometry.clone();
+        cursor.follow(&event, &grant(), &source, Some(geometry.window.clone()));
+        assert_eq!(
+            hidden(
+                receiver
+                    .try_recv()
+                    .expect("minimized follow must hide before frame read")
+            ),
+            AGENT
+        );
+        assert!(!cursor.drawn().tips.contains_key(AGENT));
+        assert_eq!(geometry.live(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_window_gone_does_not_allow_an_older_picture_to_revive_the_badge() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let geometry = FollowGeometry::new();
+        let mut delayed = picture(AGENT);
+        delayed.serial = cursor
+            .0
+            .serial
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        schedule_on(&cursor, &geometry, CursorKind::Press);
+        next_line(&mut receiver).await.picture().unwrap();
+        until("installed the watch", || geometry.live() == 1).await;
+        geometry.fire(0, WindowChange::Gone);
+        assert_eq!(hidden(next_line(&mut receiver).await), AGENT);
+        cursor.send_unless_ended(delayed);
+        no_line(
+            &mut receiver,
+            "a pending old picture revived the hidden badge",
+        );
+        assert!(!cursor.drawn().tips.contains_key(AGENT));
+    }
+
+    #[tokio::test]
+    async fn a_window_gone_fences_every_picture_already_scheduled() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let geometry = FollowGeometry::new();
+        schedule_on(&cursor, &geometry, CursorKind::Press);
+        next_line(&mut receiver).await.picture().unwrap();
+        until("installed the watch", || geometry.live() == 1).await;
+        let mut pending = picture(AGENT);
+        pending.serial = cursor
+            .0
+            .serial
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        geometry.fire(0, WindowChange::Gone);
+        assert_eq!(hidden(next_line(&mut receiver).await), AGENT);
+        cursor.send_unless_ended(pending);
+        no_line(
+            &mut receiver,
+            "a read scheduled before Gone revived the badge",
+        );
+        let mut later = picture(AGENT);
+        later.serial = cursor
+            .0
+            .serial
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        cursor.send_unless_ended(later);
+        next_line(&mut receiver)
+            .await
+            .picture()
+            .expect("a later action may draw again");
+    }
+
+    #[tokio::test]
+    async fn an_old_skipped_picture_does_not_hide_a_newer_badge() {
+        let (cursor, mut receiver) = Coordinator::channel();
+        let mut newer = picture(AGENT);
+        newer.serial = 5;
+        cursor.send_unless_ended(newer);
+        next_line(&mut receiver).await.picture().unwrap();
+        cursor.hide_picture(AGENT, 4);
+        no_line(&mut receiver, "an old skipped read hid a newer picture");
+        assert_eq!(cursor.drawn().tips[AGENT].serial, 5);
     }
 
     #[tokio::test]

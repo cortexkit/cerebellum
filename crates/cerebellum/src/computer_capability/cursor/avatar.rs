@@ -560,6 +560,28 @@ mod tests {
 
     struct VisibleGeometry;
     impl cerebellum_computer::app_state::source::AppStateSource for VisibleGeometry {
+        fn cursor_window(
+            &self,
+            _: &cerebellum_computer::platform::ProcessGrant,
+            _: Option<&cerebellum_computer::app_state::source::ElementHandle>,
+        ) -> Option<cerebellum_computer::app_state::source::ElementHandle> {
+            Some(cerebellum_computer::app_state::source::RawElement::fixture(0, "AXWindow").handle)
+        }
+
+        fn window_minimized(
+            &self,
+            _: &cerebellum_computer::app_state::source::ElementHandle,
+        ) -> Option<bool> {
+            Some(false)
+        }
+
+        fn application_hidden(
+            &self,
+            _: &cerebellum_computer::platform::ProcessGrant,
+        ) -> Option<bool> {
+            Some(false)
+        }
+
         fn read_app_state(
             &self,
             _: &cerebellum_computer::platform::ProcessGrant,

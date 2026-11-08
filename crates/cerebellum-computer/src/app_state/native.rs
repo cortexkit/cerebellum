@@ -182,6 +182,13 @@ impl AppStateSource for MacAppStateSource {
         cerebellum_macos::window_minimized(retained(window).ok()?)
     }
 
+    fn application_hidden(&self, target: &ProcessGrant) -> Option<bool> {
+        if verify_grant(target.pid, target) != GrantVerification::Current {
+            return None;
+        }
+        cerebellum_macos::application_is_hidden(target.pid)
+    }
+
     fn watch_cursor_window(
         &self,
         window: &ElementHandle,

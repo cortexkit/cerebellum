@@ -460,6 +460,11 @@ pub(crate) fn application_hidden(application: &AxRetainedElement) -> Option<bool
         .and_then(|value| value.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool))
 }
 
+/// Read the application's hidden state without preparing or activating it.
+pub fn application_is_hidden(pid: u32) -> Option<bool> {
+    application_hidden(&application(pid).ok()?)
+}
+
 /// Ask the element to perform `AXPress`. The pointer is never touched: this
 /// is a message to the application, which runs the element's own handler.
 pub fn press_element(element: &AxRetainedElement) -> Result<(), AxElementActionError> {
