@@ -4,8 +4,8 @@
 //! platform.
 
 use super::element_actions::{
-    add_diff_view, settle_and_observe_view, PersonWatch, PressedElement, CHANGE_UNCONFIRMED,
-    NO_CHANGE_SEEN, PRESSED_ELEMENT_CHANGED,
+    add_diff_view, settle_and_observe_view, EmptyDiff, PersonWatch, PressedElement, SettledView,
+    CHANGE_UNCONFIRMED, NO_CHANGE_SEEN, PRESSED_ELEMENT_CHANGED,
 };
 use super::StateView;
 use crate::browser::state_text::STATE_TEXT_FIELD;
@@ -166,6 +166,15 @@ fn find_id(roots: &[ObservedNode], title: &str) -> Option<String> {
 /// The conversation reads the application as it was before the press, then
 /// presses the Fleet tab; the reply is what the press would carry.
 fn press_reply(app: &ScriptedApp, watch_pressed: bool, bound: Duration) -> Value {
+    press_reply_with_view(app, watch_pressed, bound, &StateView::default())
+}
+
+fn press_reply_with_view(
+    app: &ScriptedApp,
+    watch_pressed: bool,
+    bound: Duration,
+    view: &StateView,
+) -> Value {
     let sessions = AppStateSessions::new();
     let before = sessions.observe(CONVERSATION, &grant(), &tree(BEFORE));
     let fleet_id = find_id(&before.roots, "Fleet").expect("the tab is numbered");
@@ -184,7 +193,7 @@ fn press_reply(app: &ScriptedApp, watch_pressed: bool, bound: Duration) -> Value
         }),
     );
     let mut reply = json!({"outcome": "completed"});
-    add_diff_view(&mut reply, settled.as_ref(), &StateView::default());
+    add_diff_view(&mut reply, settled.as_ref(), view);
     reply
 }
 
@@ -304,5 +313,191 @@ fn a_pressed_element_change_the_read_missed_is_reported() {
         app.whole_reads() < 10,
         "the settle stopped once the element changed: {} reads",
         app.whole_reads()
+    );
+}
+
+fn tab_filter() -> StateView {
+    StateView {
+        roles: vec!["tab".into()],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_filtered_confirmed_empty_press_reports_no_change_seen() {
+    let app = ScriptedApp::new(vec![BEFORE]);
+    let reply = press_reply_with_view(&app, true, Duration::ZERO, &tab_filter());
+    assert!(
+        state_text(&reply).starts_with(&format!("{NO_CHANGE_SEEN}Requested state:\n")),
+        "{reply}"
+    );
+    assert_eq!(reply["state_report"], "filtered_state");
+    assert_eq!(app.whole_reads(), 1, "rendering must not read again");
+}
+
+#[test]
+fn a_filtered_partial_empty_press_reports_change_unconfirmed() {
+    let app = ScriptedApp::new(vec![Moment {
+        complete: false,
+        ..BEFORE
+    }]);
+    let reply = press_reply_with_view(&app, true, Duration::ZERO, &tab_filter());
+    assert!(
+        state_text(&reply).starts_with(&format!("{CHANGE_UNCONFIRMED}Requested state:\n")),
+        "{reply}"
+    );
+    assert!(!state_text(&reply).contains(NO_CHANGE_SEEN), "{reply}");
+}
+
+#[test]
+fn a_filtered_unshown_difference_reports_change_unconfirmed() {
+    let app = ScriptedApp::new(vec![Moment {
+        group_focused: false,
+        ..BEFORE
+    }]);
+    let reply = press_reply_with_view(&app, false, Duration::from_secs(2), &tab_filter());
+    assert!(
+        state_text(&reply).starts_with(CHANGE_UNCONFIRMED),
+        "an unrendered change must not produce a positive count: {reply}"
+    );
+    assert_eq!(app.whole_reads(), 1, "rendering must not read again");
+}
+
+#[test]
+fn a_filtered_press_reports_a_pressed_element_change_the_read_missed() {
+    let app = ScriptedApp::new(vec![Moment {
+        fleet_selected: true,
+        complete: false,
+        tabs_readable: false,
+        ..BEFORE
+    }]);
+    let reply = press_reply_with_view(&app, true, Duration::from_secs(2), &tab_filter());
+    assert!(
+        state_text(&reply).starts_with(&format!("{PRESSED_ELEMENT_CHANGED}Requested state:\n")),
+        "{reply}"
+    );
+    assert_eq!(app.whole_reads(), 1, "rendering must not read again");
+}
+
+#[test]
+fn a_filtered_press_counts_changes_outside_the_requested_slice() {
+    let app = ScriptedApp::new(vec![Moment {
+        fleet_selected: true,
+        ..BEFORE
+    }]);
+    let reply = press_reply_with_view(
+        &app,
+        true,
+        Duration::from_secs(2),
+        &StateView {
+            roles: vec!["text".into()],
+            ..Default::default()
+        },
+    );
+    let text = state_text(&reply);
+    assert!(
+        text.starts_with(
+            "2 lines changed; read_state without a filter to see them all.\nRequested state:\n"
+        ),
+        "both tabs changed even though neither matches: {reply}"
+    );
+    assert!(!text.contains("Fleet"), "{reply}");
+    assert!(!text.contains("Chat"), "{reply}");
+    assert!(!text.contains(CHANGE_UNCONFIRMED), "{reply}");
+    assert_eq!(app.whole_reads(), 1, "rendering must not read again");
+}
+
+#[test]
+fn text_filtered_and_zoomed_empty_press_replies_keep_the_change_status() {
+    for view in [
+        StateView {
+            text: Some("Fleet".into()),
+            ..Default::default()
+        },
+        StateView {
+            zoom: Some("menubar".into()),
+            ..Default::default()
+        },
+    ] {
+        let app = ScriptedApp::new(vec![BEFORE]);
+        let reply = press_reply_with_view(&app, true, Duration::ZERO, &view);
+        assert!(
+            state_text(&reply).starts_with(&format!("{NO_CHANGE_SEEN}Requested state:\n")),
+            "{reply}"
+        );
+        assert_eq!(reply["state_report"], "filtered_state");
+    }
+}
+
+#[test]
+fn a_filtered_capped_diff_counts_omitted_changes_but_not_the_focus_footer() {
+    let sessions = AppStateSessions::new();
+    let large_tree = |label: &str| RawAppState {
+        roots: vec![RawElement::fixture(1, "AXWindow")
+            .titled("Dashboard")
+            .with_children(
+                (0..400)
+                    .map(|index| {
+                        RawElement::fixture(100 + index, "AXButton")
+                            .titled(&format!("{label} {index:03} {}", "x".repeat(160)))
+                    })
+                    .collect(),
+            )],
+        focused: None,
+        unreadable_subtrees: 0,
+        read_bound_reached: false,
+    };
+    sessions.observe(CONVERSATION, &grant(), &large_tree("Before"));
+    let mut read = sessions.observe(CONVERSATION, &grant(), &large_tree("After"));
+    read.focused_element_id = find_id(&read.roots, "Dashboard");
+    let diff = cerebellum_computer::app_state::render::render_diff(
+        &read.roots,
+        &read.diff,
+        read.focused_element_id.as_deref(),
+    );
+    assert!(diff.truncation.is_some(), "the fixture must exceed the cap");
+    let mut reply = json!({});
+    add_diff_view(
+        &mut reply,
+        Some(&SettledView {
+            read,
+            empty_diff: EmptyDiff::Confirmed,
+        }),
+        &StateView {
+            text: Some("Dashboard".into()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        state_text(&reply)
+            .starts_with("400 lines changed; read_state without a filter to see them all.\n"),
+        "{reply}"
+    );
+    assert!(!state_text(&reply).contains(NO_CHANGE_SEEN), "{reply}");
+}
+
+#[test]
+fn a_filtered_removed_line_keeps_the_pressed_element_change_warning() {
+    let sessions = AppStateSessions::new();
+    sessions.observe(CONVERSATION, &grant(), &tree(BEFORE));
+    let mut after = tree(BEFORE);
+    after.roots[0].children.drain(1..3);
+    let read = sessions.observe(CONVERSATION, &grant(), &after);
+    assert_eq!(read.diff.removed.len(), 2);
+    let mut reply = json!({});
+    add_diff_view(
+        &mut reply,
+        Some(&SettledView {
+            read,
+            empty_diff: EmptyDiff::PressedElementChanged,
+        }),
+        &tab_filter(),
+    );
+    assert!(
+        state_text(&reply).starts_with(&format!(
+            "1 line changed; read_state without a filter to see them all.\n\
+             {PRESSED_ELEMENT_CHANGED}Requested state:\n"
+        )),
+        "removed IDs share one diff line, and the missed press still matters: {reply}"
     );
 }
