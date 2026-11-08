@@ -25,6 +25,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Fetch git dependencies with the git CLI so the URL rewrites below apply;
+  # cargo's built-in fetcher ignores git's insteadOf configuration.
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
   # Runs on Linux even though the computer plane targets macOS, and keeps
@@ -88,6 +91,27 @@ jobs:
         with:
           path: cerebellum
 
+      # avatar-svg is a private cortexkit repository pinned as an ssh git
+      # dependency, and the runner has no ssh key. The organisation's
+      # cortexkit-ci GitHub App mints a short-lived read token instead. The
+      # App can read every private cortexkit repository, so the token is
+      # scoped to avatar alone.
+      - name: Mint a read token for the avatar dependency
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CK_CI_APP_ID }}
+          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+          owner: cortexkit
+          repositories: avatar
+
+      - name: Fetch cortexkit git dependencies over HTTPS with that token
+        env:
+          TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          base="https://x-access-token:${TOKEN}@github.com/cortexkit/"
+          git config --global url."$base".insteadOf "ssh://git@github.com/cortexkit/"
+          git config --global --add url."$base".insteadOf "https://github.com/cortexkit/"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
