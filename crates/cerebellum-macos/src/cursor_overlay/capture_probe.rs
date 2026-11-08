@@ -159,14 +159,14 @@ fn capture(mtm: MainThreadMarker, window_id: u32) -> Result<RawCapture, String> 
 }
 
 /// One pattern patch as captured: the colour drawn there and the median of the
-/// pixels sampled around its centre.
+/// pixels sampled across its interior.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct PatchSample {
     expected: [u8; 3],
     /// Red, green, blue and alpha as the capture holds them (not
-    /// un-premultiplied), each the median over the sampled square.
+    /// un-premultiplied), each the median over the interior grid.
     sampled: [u8; 4],
-    /// Every sampled pixel, not only the median, counted as the drawn colour.
+    /// A strict majority of sampled pixels counted as the drawn palette colour.
     matched: bool,
 }
 
@@ -201,7 +201,7 @@ fn pixel_matches(bgra: &[u8], expected: [u8; 3]) -> bool {
 /// Positions are computed in the raster's own pixels from its dimensions.
 /// `capture_window` sizes its output to the source rect in points, so today the
 /// raster has one pixel per point whatever the display's backing scale; a
-/// raster at the backing scale would be read at the same patch centres.
+/// raster at the backing scale is read at the same relative interior positions.
 fn patches(image: &RawCapture, pattern: usize) -> Result<[PatchSample; 4], String> {
     let (width, height) = (image.width, image.height);
     // The source rect is square, so a raster of any other shape, or too small
@@ -212,16 +212,27 @@ fn patches(image: &RawCapture, pattern: usize) -> Result<[PatchSample; 4], Strin
             image.bgra.len()
         ));
     }
-    // About 5x5 pixels at one pixel per point, larger on a larger raster: an
-    // interior square, not an antialiased edge or a single lucky pixel.
-    let radius = (width / 64).max(2);
     Ok(std::array::from_fn(|i| {
         let expected = pattern_colours(pattern)[i];
         // AppKit paints bottom-up; the captured raster is top-down.
-        let x = (2 * (i % 2) + 1) * width / 4;
-        let y = (2 * (1 - i / 2) + 1) * height / 4;
-        let pixels: Vec<&[u8]> = (y - radius..=y + radius)
-            .flat_map(|y| (x - radius..=x + radius).map(move |x| (y * width + x) * 4))
+        let column = i % 2;
+        let row = 1 - i / 2;
+        let left = column * width / 2;
+        let top = row * height / 2;
+        let patch_width = (column + 1) * width / 2 - left;
+        let patch_height = (row + 1) * height / 2 - top;
+        // Split the central 50% of the mapped patch into five cells per axis
+        // and sample their centres (30%, 40%, ..., 70%). Spreading the votes
+        // keeps a small resampled blend from vetoing an otherwise solid fill;
+        // the outer quarter on every side never votes, at any raster scale.
+        let pixels: Vec<&[u8]> = (0..5)
+            .flat_map(|y| {
+                let y = top + (y + 3) * patch_height / 10;
+                (0..5).map(move |x| {
+                    let x = left + (x + 3) * patch_width / 10;
+                    (y * width + x) * 4
+                })
+            })
             .map(|at| &image.bgra[at..at + 4])
             .collect();
         let median = |channel: usize| {
@@ -232,7 +243,8 @@ fn patches(image: &RawCapture, pattern: usize) -> Result<[PatchSample; 4], Strin
         PatchSample {
             expected,
             sampled: [median(2), median(1), median(0), median(3)],
-            matched: pixels.iter().all(|p| pixel_matches(p, expected)),
+            matched: pixels.iter().filter(|p| pixel_matches(p, expected)).count()
+                > pixels.len() / 2,
         }
     }))
 }
@@ -638,7 +650,11 @@ mod tests {
                     if candidate == pattern { 4 } else { 0 }
                 );
             }
-            image.bgra[(32 * 128 + 32) * 4..(32 * 128 + 32) * 4 + 3].fill(0);
+            for y in 16..48 {
+                for x in 16..48 {
+                    image.bgra[(y * 128 + x) * 4..(y * 128 + x) * 4 + 3].fill(0);
+                }
+            }
             assert_eq!(count(&image, pattern), 3);
         }
         image.width = 320;
@@ -681,6 +697,141 @@ mod tests {
             );
         }
         assert_eq!(count(&quadrant_image(128, p3, 0), 2), 0);
+    }
+
+    fn control_with_boundary_blend(side: usize) -> RawCapture {
+        let mut image = quadrant_image(
+            side,
+            [
+                [219, 52, 188],
+                [107, 226, 211],
+                [193, 239, 79],
+                [233, 100, 53],
+            ],
+            255,
+        );
+        // Preserve a resampled boundary blend in the old centre-only sampling
+        // square of the cyan patch. The surrounding interior retains its palette
+        // colour converted to the Display P3 colour space.
+        let radius = (side / 64).max(2);
+        for y in side / 4 - radius..=side / 4 + radius {
+            for x in 3 * side / 4 - radius..=3 * side / 4 + radius {
+                let at = (y * side + x) * 4;
+                image.bgra[at..at + 4].copy_from_slice(&[212, 224, 128, 255]);
+            }
+        }
+        image
+    }
+
+    #[test]
+    fn boundary_blends_do_not_hide_the_control_patch_interiors() {
+        assert!(!pixel_matches(&[212, 224, 128, 255], [23, 229, 211]));
+        for side in [128, 256] {
+            let image = control_with_boundary_blend(side);
+            let samples = patches(&image, 2).unwrap();
+            assert_eq!(matched_count(&samples), 4, "{side}px: {samples:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_central_half_of_each_patch_votes_at_both_capture_scales() {
+        for side in [128, 256] {
+            let mut image = quadrant_image(side, [[128, 224, 212]; 4], 255);
+            let half = side / 2;
+            for (i, [r, g, b]) in [
+                [239, 17, 193],
+                [23, 229, 211],
+                [181, 241, 19],
+                [251, 89, 31],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let left = (i % 2) * half;
+                let top = (i / 2) * half;
+                for y in top + half / 4..top + 3 * half / 4 {
+                    for x in left + half / 4..left + 3 * half / 4 {
+                        let at = (y * side + x) * 4;
+                        image.bgra[at..at + 4].copy_from_slice(&[b, g, r, 255]);
+                    }
+                }
+            }
+            assert_eq!(count(&image, 2), 4, "{side}px");
+        }
+    }
+
+    #[test]
+    fn a_patch_needs_a_strict_majority_of_individually_matching_pixels() {
+        let mut image = quadrant_image(128, [[239, 17, 193]; 4], 255);
+        // Explicit raster positions for the top-left patch's interior grid.
+        let positions: Vec<_> = [19, 25, 32, 38, 44]
+            .into_iter()
+            .flat_map(|y| [19, 25, 32, 38, 44].map(|x| (x, y)))
+            .collect();
+        for &(x, y) in &positions[..12] {
+            let at = (y * 128 + x) * 4;
+            image.bgra[at..at + 3].fill(0);
+        }
+        assert!(patches(&image, 2).unwrap()[2].matched, "13 of 25 votes");
+        let (x, y) = positions[12];
+        let at = (y * 128 + x) * 4;
+        image.bgra[at..at + 3].fill(0);
+        assert!(!patches(&image, 2).unwrap()[2].matched, "12 of 25 votes");
+    }
+
+    #[test]
+    fn a_present_private_pattern_cannot_be_reported_absent() {
+        let observation = |image: &RawCapture, pattern, listed| {
+            let samples = patches(image, pattern).unwrap();
+            WindowObservation {
+                listed,
+                capture: CaptureObservation::Pixels(matched_count(&samples)),
+                samples: samples.to_vec(),
+            }
+        };
+        for side in [128, 256] {
+            let control = observation(&control_with_boundary_blend(side), 2, true);
+            let absent = quadrant_image(side, [[0; 3]; 4], 255);
+            for (pattern, name, quadrants) in [
+                (
+                    0,
+                    "preview",
+                    [
+                        [193, 239, 79],
+                        [233, 100, 53],
+                        [219, 52, 188],
+                        [107, 226, 211],
+                    ],
+                ),
+                (
+                    1,
+                    "badge",
+                    [
+                        [233, 100, 53],
+                        [219, 52, 188],
+                        [107, 226, 211],
+                        [193, 239, 79],
+                    ],
+                ),
+            ] {
+                let mut protected = [
+                    observation(&absent, 0, false),
+                    observation(&absent, 1, false),
+                ];
+                assert!(capture_verdict(&protected, &control).is_ok());
+                let present = quadrant_image(side, quadrants, 255);
+                protected[pattern] = observation(&present, pattern, false);
+                assert!(matches!(
+                    protected[pattern].capture,
+                    CaptureObservation::Pixels(4)
+                ));
+                let reason = capture_verdict(&protected, &control).unwrap_err();
+                assert!(
+                    reason.contains(&format!("{name} private pattern pixels leaked")),
+                    "{reason}"
+                );
+            }
+        }
     }
 
     #[test]
