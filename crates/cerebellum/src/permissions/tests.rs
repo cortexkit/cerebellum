@@ -13,6 +13,8 @@ use std::sync::{
 use subc_protocol::{FrameType, Principal, RouteTarget};
 use tokio::sync::mpsc;
 
+mod durable;
+mod labels;
 mod retained;
 mod routes;
 
@@ -211,6 +213,14 @@ fn vector(name: &str) -> Value {
     )
     .unwrap()
 }
+
+fn served_list_reply() -> Value {
+    serde_json::from_str(include_str!(
+        "../../tests/goldens/permissions-provider-list.json"
+    ))
+    .unwrap()
+}
+
 fn assert_vector(name: &str, mut expected: Value, ty: FrameType, actual: Value) {
     let field = if expected.get("error").is_some() {
         "error"
@@ -231,6 +241,23 @@ fn assert_vector(name: &str, mut expected: Value, ty: FrameType, actual: Value) 
         env!("CARGO_MANIFEST_DIR")
     ))
     .unwrap();
+    if name.starts_with("provider-list") {
+        // The frozen contract examples omit allowed actions in site labels.
+        // Keep their shape, lifetimes and provenance pinned, but compare the
+        // display text against a literal served-reply golden instead.
+        let mut original: Value = serde_json::from_slice(&canonical).unwrap();
+        let served = served_list_reply();
+        for row in original["reply"]["grants"].as_array_mut().unwrap() {
+            let rendered = served["grants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|rendered| rendered["id"] == row["id"])
+                .unwrap();
+            row["subject_label"] = rendered["subject_label"].clone();
+        }
+        canonical = serde_json::to_vec(&original).unwrap();
+    }
     if name == "provider-revoke-refused-agent" {
         // Only reserved:cingulate may call the provider. This frozen vector's
         // message still says "or the local operator's direct route", so compare
@@ -406,7 +433,10 @@ async fn provider_filters_agent_machine_and_target_labels_without_leaking_worker
         ["grt_01", "grt_02", "grt_03", "grt_04", "grt_05", "user"]
     );
     let user = reply["grants"].as_array().unwrap().last().unwrap();
-    assert_eq!(user["subject_label"], "github.com in the person's Chrome");
+    assert_eq!(
+        user["subject_label"],
+        "github.com: read, click, type and make reversible changes in the person's Chrome"
+    );
     assert_eq!(
         user["scope_label"],
         "the site github.com in the person's Chrome"

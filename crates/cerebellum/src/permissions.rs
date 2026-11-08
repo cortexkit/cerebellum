@@ -4,6 +4,7 @@
 use serde_json::{json, Value};
 
 use crate::agent_grants::{AgentGrant, BrowserTarget, GrantHolder, GrantSubject};
+use crate::authorization::{HazardClass, COMPOSE, MUTATE_REVERSIBLE, OBSERVE};
 use crate::{management, AcceptedBindFacts, Frame, ModuleError, Planes};
 
 pub(crate) const CAPABILITY: &str = "permissions/v1";
@@ -179,6 +180,9 @@ fn describe(row: &AgentGrant, management: &management::ManagementPlane) -> Value
     };
     let (scope, subject, label) = match &row.subject {
         GrantSubject::App(bundle) => {
+            // Grants store the app's public identity, not a display name. Use
+            // its running name when available; otherwise keep that identity so
+            // stopped or unreadable apps remain recognisable and revocable.
             let name = management
                 .resolve_process(bundle)
                 .map(|process| management.application_name(&process))
@@ -192,12 +196,12 @@ fn describe(row: &AgentGrant, management: &management::ManagementPlane) -> Value
         ),
         GrantSubject::Origin(site) | GrantSubject::Domain(site) => (
             "site",
-            site.clone(),
-            format!("the site {site} in {browser}"),
+            format!("{site}: {}", browser_access(row)),
+            browser_scope_label(row, format!("the site {site} in {browser}")),
         ),
         GrantSubject::AllSites => (
             "all_sites",
-            "All sites".into(),
+            format!("All sites: {}", browser_access(row)),
             format!("every site in {browser}"),
         ),
     };
@@ -220,6 +224,34 @@ fn describe(row: &AgentGrant, management: &management::ManagementPlane) -> Value
         described["group"] = json!("danger");
     }
     described
+}
+
+fn browser_access(row: &AgentGrant) -> &'static str {
+    // Browser rows are validated before listing: their ceiling is one through
+    // four. Describe that ceiling without exposing internal tier numbers.
+    match row.max_level {
+        OBSERVE => "read",
+        COMPOSE => "read, click and type",
+        MUTATE_REVERSIBLE => "read, click, type and make reversible changes",
+        _ => "read, click, type and make lasting changes",
+    }
+}
+
+fn browser_scope_label(row: &AgentGrant, mut label: String) -> String {
+    let hazards: Vec<_> = HazardClass::ALL
+        .iter()
+        .filter(|hazard| row.hazards.contains(hazard))
+        .map(|hazard| match hazard {
+            HazardClass::CredentialFormSubmit => "sign-in forms",
+            HazardClass::FinancialFormSubmit => "payment forms",
+            HazardClass::UnverifiedFormContents => "forms with unverified contents",
+        })
+        .collect();
+    if !hazards.is_empty() {
+        label.push_str("; consent includes ");
+        label.push_str(&hazards.join(", "));
+    }
+    label
 }
 
 #[cfg(test)]

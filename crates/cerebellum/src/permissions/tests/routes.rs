@@ -66,7 +66,7 @@ async fn cingulate_management_bind_reaches_permissions_list_and_revoke() {
     assert!(!crate::trust_for_principal(&Some(cingulate())).is_first_party());
     let listed = exchange(&planes, CHANNEL, 2, json!({"method":LIST,"params":{}})).await;
     assert_eq!(listed.header.ty, FrameType::Response, "{}", body(&listed));
-    assert_eq!(body(&listed), vector("provider-list")["reply"]);
+    assert_eq!(body(&listed), served_list_reply());
     let revoked = exchange(
         &planes,
         CHANNEL,
