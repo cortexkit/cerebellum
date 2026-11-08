@@ -584,7 +584,11 @@ async fn ending_the_badge_while_it_travels_sends_nothing_and_answers_at_once() {
 async fn ending_the_badge_during_its_geometry_read_sends_nothing() {
     let mut rig = rig_with_badge_shown().await;
     let cursor = rig.cursor.clone();
-    rig.desk.state().on_cursor_frame = Some(DeskHook(Arc::new(move || cursor.end(&agent()))));
+    {
+        let mut state = rig.desk.state();
+        state.cursor_frame_hook_target = Some(BUTTONS[0].0);
+        state.on_cursor_frame = Some(DeskHook(Arc::new(move || cursor.end(&agent()))));
+    }
     let reply = serve(
         &rig.plane,
         &rig.management,
@@ -598,6 +602,77 @@ async fn ending_the_badge_during_its_geometry_read_sends_nothing() {
     // The end's hide, and no picture after it.
     assert!(matches!(rig.pictures.try_recv(), Ok(CursorLine::Hide(_))));
     assert!(rig.pictures.try_recv().is_err(), "the picture was dropped");
+}
+
+/// A previous picture's window follower must not steal an action's frame hook.
+#[test]
+fn a_window_follow_frame_does_not_consume_the_actions_geometry_hook() {
+    let desk = desk();
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = fired.clone();
+    {
+        let mut state = desk.state();
+        state.cursor_frame_hook_target = Some(BUTTONS[0].0);
+        state.on_cursor_frame = Some(DeskHook(Arc::new(move || {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        })));
+    }
+    let source = desk.source();
+    source.cursor_frame(&RawElement::fixture(1, "AXWindow").handle);
+    assert!(
+        !fired.load(std::sync::atomic::Ordering::SeqCst),
+        "the previous badge's follower consumed the action's hook"
+    );
+    source.cursor_frame(&RawElement::fixture(BUTTONS[0].0, "AXButton").handle);
+    assert!(
+        fired.load(std::sync::atomic::Ordering::SeqCst),
+        "the action's geometry must run the hook"
+    );
+}
+
+/// An end inside either visibility read still cancels the scheduled press.
+#[tokio::test(start_paused = true)]
+async fn ending_the_badge_during_its_visibility_read_sends_nothing() {
+    for minimized_read in [false, true] {
+        let desk = desk();
+        let base = plane(&desk);
+        let management = granted_management().await;
+        // Attach the cursor only after this read, so no earlier window-follow
+        // task competes for the press's visibility hook.
+        let tree = read(&base, &management).await;
+        let (cursor, mut pictures) = Coordinator::channel();
+        let plane = base.with_cursor(cursor.clone());
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = fired.clone();
+        let end = DeskHook(Arc::new(move || {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            cursor.end(&agent());
+        }));
+        {
+            let mut state = desk.state();
+            if minimized_read {
+                state.on_window_minimized = Some(end);
+            } else {
+                state.on_application_hidden = Some(end);
+            }
+        }
+        let reply = serve(
+            &plane,
+            &management,
+            "computer.press_element",
+            json!({"element_id": id_of(&tree, "One")}),
+        )
+        .await;
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the visibility read must run the end hook"
+        );
+        assert_eq!(reply["outcome"], "cancelled", "{reply}");
+        assert_eq!(reply["detail"]["dispatched"], false, "{reply}");
+        assert!(desk.state().presses.is_empty(), "nothing was pressed");
+        assert!(matches!(pictures.try_recv(), Ok(CursorLine::Hide(_))));
+        assert!(pictures.try_recv().is_err(), "the picture was dropped");
+    }
 }
 
 /// An end before the action asked for its badge (the previous turn's) does
