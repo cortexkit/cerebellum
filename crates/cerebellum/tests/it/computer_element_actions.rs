@@ -420,6 +420,29 @@ async fn a_press_that_changes_nothing_reports_an_empty_diff() {
     }
 }
 
+#[tokio::test]
+async fn a_filtered_press_that_changes_nothing_reports_no_change_seen() {
+    let desk = desk();
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = read(&plane, &management).await;
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": id_of(&tree, " button Send"), "role_filter": ["button"]}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["state_report"], "filtered_state", "{reply}");
+    let text = reply["state_text"].as_str().unwrap();
+    assert!(
+        text.starts_with("No change seen since the last read.\nRequested state:\n"),
+        "the confirmed empty diff must be disclosed even with a role filter: {reply}"
+    );
+    assert!(text.contains(" button Send"), "{reply}");
+}
+
 /// An id this conversation's session never issued is stale, and nothing is
 /// pressed.
 #[tokio::test]

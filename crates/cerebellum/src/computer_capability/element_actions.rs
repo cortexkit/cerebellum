@@ -1427,7 +1427,7 @@ pub(crate) fn add_diff_view(
         return;
     };
     let observed = &settled.read;
-    use cerebellum_computer::app_state::render::{render_change_report, StateHeader};
+    use cerebellum_computer::app_state::render::{render_change_report, render_diff, StateHeader};
     let rendered = render_change_report(
         &StateHeader {
             app_name: "Application state",
@@ -1456,6 +1456,43 @@ pub(crate) fn add_diff_view(
             (EmptyDiff::PressedElementChanged, false) => text.push_str(PRESSED_ELEMENT_CHANGED),
             (EmptyDiff::Unconfirmed, false) => {}
         }
+    } else if view.zoom.is_some() || !view.roles.is_empty() || view.text.is_some() {
+        // A requested slice can hide every changed line. Use the same settled
+        // read as the ordinary diff, not another read or just the matches.
+        let diff = render_diff(
+            &observed.roots,
+            &observed.diff,
+            observed.focused_element_id.as_deref(),
+        );
+        let status = if diff.text.starts_with(NO_CHANGE_SEEN) {
+            match settled.empty_diff {
+                EmptyDiff::Confirmed => NO_CHANGE_SEEN.to_string(),
+                EmptyDiff::Unconfirmed => CHANGE_UNCONFIRMED.to_string(),
+                EmptyDiff::PressedElementChanged => PRESSED_ELEMENT_CHANGED.to_string(),
+            }
+        } else {
+            // Count change lines, including those omitted by the diff cap,
+            // but not the focused-element footer or the cap disclosure.
+            let changed = diff
+                .text
+                .lines()
+                .filter(|line| {
+                    line.starts_with("+ ")
+                        || line.starts_with("~ ")
+                        || line.starts_with("Removed element IDs: ")
+                })
+                .count()
+                + diff.truncation.map_or(0, |cap| cap.omitted_elements);
+            let lines = if changed == 1 { "line" } else { "lines" };
+            let mut status = format!(
+                "{changed} {lines} changed; read_state without a filter to see them all.\n"
+            );
+            if settled.empty_diff == EmptyDiff::PressedElementChanged {
+                status.push_str(PRESSED_ELEMENT_CHANGED);
+            }
+            status
+        };
+        text.insert_str(0, &status);
     }
     reply[STATE_TEXT_FIELD] = json!(text);
     if let Some(truncation) = rendered.truncation {
