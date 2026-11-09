@@ -123,6 +123,18 @@ fn with_tcc_preflight<T>(answers: [bool; 3], operation: impl FnOnce() -> T) -> R
     Ok(operation())
 }
 
+/// Initialize AppKit for both processes. Only the cursor-on run displays colour
+/// patterns to check that captures exclude the preview and badge panels.
+/// Return whether that optional capture-exclusion check failed.
+fn desk_startup(
+    baseline: bool,
+    bootstrap: impl FnOnce() -> Result<(), String>,
+    exclusion_failed: impl FnOnce() -> bool,
+) -> Result<bool, String> {
+    bootstrap()?;
+    Ok(!baseline && exclusion_failed())
+}
+
 #[cfg(target_os = "macos")]
 fn desk_preflight(operation: impl FnOnce() -> i32) -> i32 {
     #[link(name = "ApplicationServices", kind = "framework")]
@@ -361,7 +373,7 @@ fn needs_front_reply_verdict(reply: &Value) -> Result<(), String> {
     ];
     match expected.iter().find(|(_, actual, want)| *actual != want) {
         Some((name, actual, want)) => Err(format!(
-            "the needs-front chord's {name} was {actual}, expected {want}"
+            "the needs-front chord's {name} was {actual}, expected {want}; reply: {reply}"
         )),
         None => Ok(()),
     }
@@ -371,12 +383,12 @@ fn needs_front_reply_verdict(reply: &Value) -> Result<(), String> {
 /// without fronting anything.
 fn background_reply_verdict(action: &str, reply: &Value) -> Result<(), String> {
     if reply["outcome"] != "completed" {
-        return Err(format!("{action} ended {}", reply["outcome"]));
+        return Err(format!("{action} did not complete; reply: {reply}"));
     }
     match reply.get("fronting") {
         None => Ok(()),
         Some(fronting) if fronting["fronted"] == false => Ok(()),
-        Some(fronting) => Err(format!("{action} fronted its app: {fronting}")),
+        Some(_) => Err(format!("{action} fronted its app; reply: {reply}")),
     }
 }
 
@@ -786,7 +798,7 @@ mod desk {
     }
 
     /// An attended session: the probe's Cingulate carries every question.
-    fn consent() -> ConsentContext {
+    fn consent(carrier: Arc<Allowing>) -> ConsentContext {
         let (drain_sender, drain) = tokio::sync::watch::channel(false);
         std::mem::forget(drain_sender);
         ConsentContext::new(
@@ -795,7 +807,7 @@ mod desk {
                 identity().agent_project_id,
                 false,
             ),
-            Some(Arc::new(Allowing::new()) as Arc<dyn QuestionCarrier>),
+            Some(carrier as Arc<dyn QuestionCarrier>),
             Arc::new(AlwaysOpenRoute),
             drain,
             None,
@@ -1203,18 +1215,26 @@ mod desk {
         // A failed exclusion check still fails the run, but the desk phases
         // below still run: each desk session costs the person's time, so one
         // session should report every check rather than stop at the first.
-        let mut exclusion_failed = false;
-        if !baseline {
-            match cerebellum_macos::probe_overlay_capture_exclusion() {
+        let exclusion_failed = match desk_startup(
+            baseline,
+            cerebellum_macos::prepare_app_use_desk_probe,
+            || match cerebellum_macos::probe_overlay_capture_exclusion() {
                 Ok(report) => {
-                    println!("PASS overlay_single_window_capture_excludes_preview_and_badge_patterns: {report}")
+                    println!("PASS overlay_single_window_capture_excludes_preview_and_badge_patterns: {report}");
+                    false
                 }
                 Err(reason) => {
                     eprintln!("FAIL overlay_single_window_capture_excludes_preview_and_badge_patterns: {reason}");
-                    exclusion_failed = true;
+                    true
                 }
+            },
+        ) {
+            Ok(failed) => failed,
+            Err(reason) => {
+                eprintln!("UNMEASURABLE: cannot initialize desk probe: {reason}");
+                return 2;
             }
-        }
+        };
         println!(
             "TIME BUDGET: at most about {} s (launch {} s, covering the window up to {} s, \
              actions, two idle windows of {} s, teardown)",
@@ -1369,6 +1389,9 @@ mod desk {
     /// time.
     fn baseline_run(executable: &Path) -> Result<u64, String> {
         println!("BASELINE run with the agent cursor off");
+        // The disclaiming launcher made this probe responsible for its own
+        // permissions rather than the terminal's. Ordinary spawning keeps
+        // this probe responsible for the child, so both use the same grants.
         let output = Command::new(executable)
             .args([APPROVAL_FLAG, BASELINE_FLAG])
             .output()
@@ -1402,7 +1425,7 @@ mod desk {
         // both the takeover-dispatch review and the app-use fronting review
         // are bound.
         let review = Some("app-use-desk-probe-unreviewed".to_string());
-        let plane = ComputerPlane::<NativeCaptureBackend, _, _, _, _>::with_synthetic_driver_and_result_schema_enforcement(
+        let plane = Arc::new(ComputerPlane::<NativeCaptureBackend, _, _, _, _>::with_synthetic_driver_and_result_schema_enforcement(
             audit,
             ResultSchemaEnforcement::Withhold,
             move || {
@@ -1412,7 +1435,7 @@ mod desk {
             },
         )
         .with_fronting_bracket_admitted(true)
-        .with_app_use_fronting_admitted(true);
+        .with_app_use_fronting_admitted(true));
         // `agent_cursor: true` for the measured run, `false` for the
         // baseline; a plane's cursor starts disabled.
         let cursor = plane.cursor();
@@ -1420,21 +1443,31 @@ mod desk {
             cursor.enable(true);
         }
         let management = Arc::new(ManagementPlane::new(Arc::new(PlatformResolver::new())));
-        let clock = SystemClock::new();
+        let clock = Arc::new(SystemClock::new());
+        // A temporary front must hand its restore to a terminal arbiter. The
+        // direct plane call alone has no owner for that obligation and refuses.
+        let carrier = Arc::new(Allowing::new());
+        let calls =
+            cerebellum::desk_probe::DeskProbeCalls::default().with_consent_desk(carrier.desk());
         let serve = |name: &'static str, arguments: Value| {
-            let (plane, management, clock) = (&plane, &management, &clock);
-            async move {
+            let (plane, management, clock) = (
+                Arc::clone(&plane),
+                Arc::clone(&management),
+                Arc::clone(&clock),
+            );
+            let carrier = Arc::clone(&carrier);
+            calls.serve(name, move |cancel| async move {
                 plane
                     .serve(
                         servable(name).expect("the capability is served"),
                         &arguments,
                         ServeContext {
-                            cancel: cerebellum::CancelHandle::pending(),
+                            cancel,
                             grantee: "desk-probe",
                             identity: identity(),
-                            management,
-                            consent: consent(),
-                            clock,
+                            management: &management,
+                            consent: consent(carrier),
+                            clock: clock.as_ref(),
                             now_ms: 0,
                         },
                         |_| NativeCaptureBackend::new(Duration::from_secs(10)),
@@ -1443,7 +1476,7 @@ mod desk {
                     .unwrap_or_else(
                         |error| json!({"outcome": "withheld", "error": format!("{error:?}")}),
                     )
-            }
+            })
         };
 
         // The scratch window, read through the plane until it answers.
@@ -1456,7 +1489,7 @@ mod desk {
             if started.elapsed() > LAUNCH_WAIT {
                 eprintln!(
                     "UNMEASURABLE: the scratch window never answered a read: {}",
-                    read["outcome"]
+                    read
                 );
                 return 2;
             }
@@ -1530,7 +1563,7 @@ mod desk {
             }
             None => report.check(
                 "background write_text fronts nothing",
-                Err("no settable text area in the scratch window".into()),
+                Err(format!("no settable text area in the scratch window; initial read: {read}; latest read: {first}")),
             ),
         }
         let helper = cursor.helper_pid_for_probe();
@@ -1709,6 +1742,61 @@ mod tests {
             Ok(17)
         );
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn both_probe_processes_bootstrap_before_any_optional_exclusion_check() {
+        for baseline in [false, true] {
+            let events = std::cell::RefCell::new(Vec::new());
+            let failed = desk_startup(
+                baseline,
+                || {
+                    events.borrow_mut().push("bootstrap");
+                    Ok(())
+                },
+                || {
+                    events.borrow_mut().push("exclusion");
+                    true
+                },
+            )
+            .unwrap();
+            assert_eq!(failed, !baseline);
+            let expected = if baseline {
+                vec!["bootstrap"]
+            } else {
+                vec!["bootstrap", "exclusion"]
+            };
+            assert_eq!(*events.borrow(), expected);
+        }
+    }
+
+    #[test]
+    fn a_bootstrap_failure_prevents_the_exclusion_check_in_either_process() {
+        for baseline in [false, true] {
+            let result = desk_startup(
+                baseline,
+                || Err("no main thread".to_string()),
+                || panic!("exclusion must not run without AppKit"),
+            );
+            assert_eq!(result, Err("no main thread".to_string()));
+        }
+    }
+
+    #[test]
+    fn a_failed_read_reports_the_full_reply_including_the_unreadable_cause() {
+        for unreadable in [
+            json!({"reason": "window_list_unavailable"}),
+            json!({"reason": "generation_unreadable", "pid": 27002}),
+        ] {
+            let read = json!({
+                "outcome": "targets_unreadable",
+                "bundle_identity": "com.apple.TextEdit",
+                "unreadable": unreadable,
+                "remedy": "retry"
+            });
+            let reason = background_reply_verdict("read_state", &read).unwrap_err();
+            assert!(reason.contains(&read.to_string()), "{reason}");
+        }
     }
 
     #[test]

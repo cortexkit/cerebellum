@@ -426,11 +426,24 @@ fn capture_verdict(
     Ok(report)
 }
 
+/// Give both manual desk-probe processes the same AppKit launch context before
+/// they ask ScreenCaptureKit or Accessibility about the scratch application.
+/// This creates no windows and never activates the probe.
+#[doc(hidden)]
+pub fn prepare_app_use_desk_probe() -> Result<(), String> {
+    let mtm = MainThreadMarker::new().ok_or("desk probe must start on the main thread")?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    app.finishLaunching();
+    Ok(())
+}
+
 /// Check the actual preview and badge panels' shareable-window membership and
 /// capture each panel's own ID through production's single-window path. A
 /// separate shareable control must be listed and yield its pattern. Call only
 /// from the manually started app_use_desk_probe example, on the main thread,
-/// after its --approve-desk-probe opt-in and permission preflight.
+/// after its --approve-desk-probe opt-in, permission preflight and
+/// [`prepare_app_use_desk_probe`].
 /// No raster is stored or returned; the report records shareable titles and
 /// owners, capture refusal or the count of non-zero-alpha pixels, and sampled
 /// colours next to those drawn. Listed panels must expose no title and belong
@@ -444,9 +457,6 @@ pub fn probe_overlay_capture_exclusion() -> Result<String, String> {
         return Err("the display is locked or unknown".into());
     }
     let mtm = MainThreadMarker::new().ok_or("pixel probe must run on the main thread")?;
-    let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-    app.finishLaunching();
     let screen = NSScreen::screens(mtm)
         .firstObject()
         .ok_or("no main screen")?;

@@ -52,6 +52,9 @@ pub mod coordinate;
 #[cfg(test)]
 mod cursor_end_tests;
 pub mod custody;
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
+#[doc(hidden)]
+pub mod desk_probe;
 pub mod durable_formats;
 mod egress;
 pub mod flat_tools;
