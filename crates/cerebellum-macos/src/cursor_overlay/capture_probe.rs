@@ -48,6 +48,18 @@ const COLOURS: [[u8; 3]; 4] = [
     [251, 89, 31],
 ];
 
+/// The same four colours converted from sRGB to Display P3, index for index.
+/// A capture taken on a P3 display holds these values rather than the sRGB
+/// ones that were drawn; the second palette colour moves 84 levels in red,
+/// and a real display's profile can move it further (measured: 105). The
+/// `p3_palette_is_the_srgb_palette_converted` test recomputes the table.
+const COLOURS_P3: [[u8; 3]; 4] = [
+    [219, 52, 188],
+    [107, 226, 211],
+    [193, 239, 79],
+    [233, 100, 53],
+];
+
 /// How long the three windows may take to reach the window server's on-screen
 /// list, with the control also on screen in ScreenCaptureKit's list.
 const ON_SCREEN_DEADLINE: Duration = Duration::from_secs(3);
@@ -64,14 +76,14 @@ const POLL: Duration = Duration::from_millis(100);
 ///
 /// The pattern is drawn in sRGB, but the capture may come back in another
 /// colour space: this module's captures are known to pass through a
-/// conversion that mixes channels (see the `source_rect_pattern` test). These
-/// colours are saturated, so a conversion moves them a long way: rendered in
-/// Display P3, the four palette colours land 22, 35, 60 and 84 levels from
-/// their sRGB values, so a tolerance of 20 would miss all four patches on such
-/// a display. The palette colours are at least 152 levels apart from each
-/// other, so a pixel must also be nearer to the expected colour than to any
-/// other palette colour; black, white and mid grey stay out of reach.
-const TOLERANCE: u8 = 96;
+/// conversion that mixes channels (see the `source_rect_pattern` test). Each
+/// palette colour is therefore compared with both its sRGB form and its
+/// Display P3 form (`COLOURS_P3`). A real display's profile still differs from
+/// textbook P3: on Ufuk's display the four patches read 6 to 21 levels from
+/// their P3 forms, so 48 leaves twice that margin. A pixel must also be nearer
+/// to the expected colour than to any other palette colour; black, white and
+/// mid grey stay out of reach (mid grey is 91 levels from P3 magenta).
+const TOLERANCE: u8 = 48;
 /// A pixel less opaque than this is not the opaque fill that was drawn.
 const MIN_ALPHA: u8 = 240;
 
@@ -189,11 +201,14 @@ fn pixel_matches(bgra: &[u8], expected: [u8; 3]) -> bool {
             .max()
             .unwrap_or(0)
     };
-    let own = distance(&expected);
-    own <= TOLERANCE
-        && COLOURS
-            .iter()
-            .all(|other| *other == expected || distance(other) > own)
+    // Judge each palette colour by whichever of its sRGB and Display P3 forms
+    // the pixel is nearer to, so a capture in either colour space matches.
+    let nearest = |index: usize| distance(&COLOURS[index]).min(distance(&COLOURS_P3[index]));
+    let Some(own_index) = COLOURS.iter().position(|colour| *colour == expected) else {
+        return false;
+    };
+    let own = nearest(own_index);
+    own <= TOLERANCE && (0..COLOURS.len()).all(|other| other == own_index || nearest(other) > own)
 }
 
 /// Read the four patches of window pattern `pattern` from a capture.
@@ -485,6 +500,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn p3_palette_is_the_srgb_palette_converted() {
+        let linear = |c: u8| {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let encode = |c: f64| {
+            let c = c.clamp(0.0, 1.0);
+            let v = if c <= 0.003_130_8 {
+                c * 12.92
+            } else {
+                1.055 * c.powf(1.0 / 2.4) - 0.055
+            };
+            (v * 255.0).round() as u8
+        };
+        // Linear sRGB to linear Display P3 (both D65).
+        let m = [
+            [0.822_462_1, 0.177_538_0, 0.0],
+            [0.033_194_1, 0.966_805_8, 0.0],
+            [0.017_082_7, 0.072_397_4, 0.910_519_9],
+        ];
+        for (srgb, p3) in COLOURS.iter().zip(COLOURS_P3) {
+            let l = srgb.map(linear);
+            let converted: [u8; 3] =
+                std::array::from_fn(|i| encode(m[i][0] * l[0] + m[i][1] * l[1] + m[i][2] * l[2]));
+            assert_eq!(converted, p3, "P3 form of {srgb:?}");
+        }
+    }
+
+    #[test]
+    fn the_live_display_p3_capture_matches_every_patch() {
+        // Pixels read on Ufuk's display on 2026-11-09 for the four patches;
+        // the second failed the sRGB-only comparison (105 levels off in red).
+        let live = [
+            [209, 67, 187],
+            [128, 224, 211],
+            [199, 236, 79],
+            [222, 104, 50],
+        ];
+        for (rgb, expected) in live.iter().zip(COLOURS) {
+            let bgra = [rgb[2], rgb[1], rgb[0], 255];
+            assert!(
+                pixel_matches(&bgra, expected),
+                "{rgb:?} should read as {expected:?}"
+            );
+            for other in COLOURS.iter().filter(|c| **c != expected) {
+                assert!(
+                    !pixel_matches(&bgra, *other),
+                    "{rgb:?} must not read as {other:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn single_window_capture_rejects_listed_or_leaking_panels_and_requires_a_visible_control() {
         // The synthetic verdict cases below cannot observe constructor changes.
         // Keep both real panels' privacy policy tied to this capture contract
@@ -717,7 +790,7 @@ mod tests {
         for y in side / 4 - radius..=side / 4 + radius {
             for x in 3 * side / 4 - radius..=3 * side / 4 + radius {
                 let at = (y * side + x) * 4;
-                image.bgra[at..at + 4].copy_from_slice(&[212, 224, 128, 255]);
+                image.bgra[at..at + 4].copy_from_slice(&[128, 128, 128, 255]);
             }
         }
         image
@@ -725,7 +798,8 @@ mod tests {
 
     #[test]
     fn boundary_blends_do_not_hide_the_control_patch_interiors() {
-        assert!(!pixel_matches(&[212, 224, 128, 255], [23, 229, 211]));
+        // A neutral grey stands in for a resampled edge between patches.
+        assert!(!pixel_matches(&[128, 128, 128, 255], [23, 229, 211]));
         for side in [128, 256] {
             let image = control_with_boundary_blend(side);
             let samples = patches(&image, 2).unwrap();

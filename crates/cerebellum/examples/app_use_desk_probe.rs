@@ -824,6 +824,10 @@ mod desk {
     }
 
     pub fn run(baseline: bool) -> i32 {
+        // A failed exclusion check still fails the run, but the desk phases
+        // below still run: each desk session costs the person's time, so one
+        // session should report every check rather than stop at the first.
+        let mut exclusion_failed = false;
         if !baseline {
             match cerebellum_macos::probe_overlay_capture_exclusion() {
                 Ok(report) => {
@@ -831,7 +835,7 @@ mod desk {
                 }
                 Err(reason) => {
                     eprintln!("FAIL overlay_single_window_capture_excludes_preview_and_badge_patterns: {reason}");
-                    return 1;
+                    exclusion_failed = true;
                 }
             }
         }
@@ -954,7 +958,9 @@ mod desk {
             module_ns as f64 / 1e6,
             baseline_ns as f64 / 1e6
         );
-        let mut report = Report { failed: code != 0 };
+        let mut report = Report {
+            failed: code != 0 || exclusion_failed,
+        };
         report.check(
             "module idle CPU within 10% of the agent_cursor false baseline",
             module_idle_verdict(module_ns, baseline_ns),
