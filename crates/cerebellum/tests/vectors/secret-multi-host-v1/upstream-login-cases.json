@@ -1,0 +1,142 @@
+{
+  "cases": [
+    {
+      "case": "login-target-is-not-api-key",
+      "expect": "no_match",
+      "form": "input",
+      "kind": "agent_api_key",
+      "scope": {
+        "rules": [
+          {
+            "host": "*.x.test"
+          }
+        ]
+      },
+      "target": {
+        "origin": "https://a.x.test"
+      }
+    },
+    {
+      "case": "four-origins",
+      "expect": "match",
+      "form": "input",
+      "kind": "site_login",
+      "scope": {
+        "origins": [
+          "https://login0.x.test",
+          "https://login1.x.test",
+          "https://login2.x.test",
+          "https://login3.x.test"
+        ]
+      },
+      "target": {
+        "origin": "https://login3.x.test"
+      }
+    },
+    {
+      "case": "stored-origins-as-sent",
+      "expect": "match",
+      "form": "stored",
+      "kind": "site_login",
+      "scope": {
+        "origins": [
+          "https://x.test:443",
+          "https://y.test"
+        ]
+      },
+      "target": {
+        "origin": "https://x.test"
+      }
+    },
+    {
+      "case": "legacy-login-https://x.test:443",
+      "expect": "match",
+      "form": "input",
+      "kind": "site_login",
+      "scope": {
+        "origin": "https://x.test"
+      },
+      "target": {
+        "origin": "https://x.test:443"
+      }
+    },
+    {
+      "case": "legacy-login-http://x.test",
+      "expect": "no_match",
+      "form": "input",
+      "kind": "site_login",
+      "scope": {
+        "origin": "https://x.test"
+      },
+      "target": {
+        "origin": "http://x.test"
+      }
+    },
+    {
+      "case": "legacy-login-https://y.test",
+      "expect": "no_match",
+      "form": "input",
+      "kind": "site_login",
+      "scope": {
+        "origin": "https://x.test"
+      },
+      "target": {
+        "origin": "https://y.test"
+      }
+    },
+    {
+      "case": "legacy-login-https://x.test:444",
+      "expect": "no_match",
+      "form": "input",
+      "kind": "site_login",
+      "scope": {
+        "origin": "https://x.test"
+      },
+      "target": {
+        "origin": "https://x.test:444"
+      }
+    },
+    {
+      "case": "login-origin-wildcard",
+      "expect": {
+        "scope_refused": "invalid_params"
+      },
+      "form": "input",
+      "kind": "site_login",
+      "scope": {
+        "origins": [
+          "https://*.x.test",
+          "https://y.test"
+        ]
+      }
+    },
+    {
+      "case": "login-origin-path",
+      "expect": {
+        "scope_refused": "invalid_params"
+      },
+      "form": "input",
+      "kind": "site_login",
+      "scope": {
+        "origins": [
+          "https://x.test/",
+          "https://y.test"
+        ]
+      }
+    },
+    {
+      "case": "login-origin-port",
+      "expect": {
+        "scope_refused": "invalid_params"
+      },
+      "form": "input",
+      "kind": "site_login",
+      "scope": {
+        "origins": [
+          "https://x.test:444",
+          "https://y.test"
+        ]
+      }
+    }
+  ]
+}

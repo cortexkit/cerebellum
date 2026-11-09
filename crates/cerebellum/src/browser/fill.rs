@@ -1582,6 +1582,103 @@ mod tests {
         );
     }
 
+    fn assert_login_origin_sent_to_vault(url: &str, expected: &str) {
+        let mut main = document(url);
+        // Keep the browser-reported origin independent of the helper under test.
+        main.security_origin = expected.into();
+        let top = document("https://top.example/signin");
+        let child = frame(url, expected);
+        for origin in [field_origin(None, &main), field_origin(Some(&child), &top)] {
+            let request = SecretUseRequest {
+                name: "work".into(),
+                stamp: json!({"scope_ref": "sc_head"}),
+                origin: origin.unwrap(),
+            };
+            assert_eq!(request.origin.as_bytes(), expected.as_bytes(), "{url}");
+            let encoded = crate::login_capture::secret_use::encode_params(&request);
+            let wire: Value = serde_json::from_slice(&encoded).unwrap();
+            for params in [request.params(), wire] {
+                assert_eq!(
+                    params["target"]["origin"].as_str().unwrap().as_bytes(),
+                    expected.as_bytes(),
+                    "{url}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fill_login_multi_host_fixtures_are_byte_pinned() {
+        use sha2::{Digest, Sha256};
+
+        for (bytes, expected) in [
+            (
+                include_bytes!(
+                    "../../tests/vectors/secret-multi-host-v1/upstream-login-cases.json"
+                )
+                .as_slice(),
+                "9bc6bee78eeea6ae004b021682967871dc8ef261e3daa7b8d3d38d164bcf54b3",
+            ),
+            (
+                include_bytes!(
+                    "../../tests/vectors/secret-multi-host-v1/derived-origin-cases.json"
+                )
+                .as_slice(),
+                "aaf173d271308ac9adb69ca792d983bf68954c5da91d388c39d3ffc0f20c4312",
+            ),
+        ] {
+            assert_eq!(format!("{:x}", Sha256::digest(bytes)), expected);
+        }
+    }
+
+    #[test]
+    fn fill_login_targets_preserve_the_vault_multi_host_vector_origins() {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../tests/vectors/secret-multi-host-v1/upstream-login-cases.json"
+        ))
+        .unwrap();
+        let mut targets = 0;
+        for case in vectors["cases"].as_array().unwrap() {
+            let Some(target) = case.get("target") else {
+                // Scope refusals are vault verdicts, not browser URL refusals.
+                continue;
+            };
+            targets += 1;
+            let url = target["origin"].as_str().unwrap();
+            let expected = match case["case"].as_str().unwrap() {
+                "login-target-is-not-api-key" => "https://a.x.test",
+                "four-origins" => "https://login3.x.test",
+                "stored-origins-as-sent" | "legacy-login-https://x.test:443" => "https://x.test",
+                "legacy-login-https://y.test" => "https://y.test",
+                // Never collapse a non-default port into an origin the vault would match.
+                "legacy-login-https://x.test:444" => "https://x.test:444",
+                "legacy-login-http://x.test" => {
+                    assert_eq!(field_origin(None, &document(url)), Err("origin_not_https"));
+                    continue;
+                }
+                name => panic!("unaccounted login target: {name}"),
+            };
+            assert_login_origin_sent_to_vault(url, expected);
+        }
+        assert_eq!(targets, 7);
+    }
+
+    #[test]
+    fn fill_login_targets_follow_the_derived_multi_host_origin_examples() {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../tests/vectors/secret-multi-host-v1/derived-origin-cases.json"
+        ))
+        .unwrap();
+        let cases = vectors["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 7);
+        for case in cases {
+            assert_login_origin_sent_to_vault(
+                case["input"].as_str().unwrap(),
+                case["canonical_origin"].as_str().unwrap(),
+            );
+        }
+    }
+
     #[test]
     fn released_approval_and_refused_answers_read_as_the_vault_sends_them() {
         let SecretUseAnswer::Released(material) = answer(json!({
