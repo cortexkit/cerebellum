@@ -1,0 +1,40 @@
+{
+  "provenance": "derived from docs/wire-contract-v1.md 'Multi-host secret scopes' at cc7544d7, not vault-published",
+  "cases": [
+    {
+      "case": "explicit-default-port",
+      "input": "https://x.test:443",
+      "canonical_origin": "https://x.test"
+    },
+    {
+      "case": "uppercase-host",
+      "input": "https://X.TEST",
+      "canonical_origin": "https://x.test"
+    },
+    {
+      "case": "www-host",
+      "input": "https://www.x.test",
+      "canonical_origin": "https://www.x.test"
+    },
+    {
+      "case": "apex-host",
+      "input": "https://x.test",
+      "canonical_origin": "https://x.test"
+    },
+    {
+      "case": "trailing-slash",
+      "input": "https://x.test/",
+      "canonical_origin": "https://x.test"
+    },
+    {
+      "case": "path-query-fragment",
+      "input": "https://X.TEST:443/signin?next=%2F#password",
+      "canonical_origin": "https://x.test"
+    },
+    {
+      "case": "non-default-port",
+      "input": "https://X.TEST:444/signin",
+      "canonical_origin": "https://x.test:444"
+    }
+  ]
+}
