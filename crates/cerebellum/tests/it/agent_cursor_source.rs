@@ -155,8 +155,11 @@ fn display_capture_is_absent_and_the_probe_uses_production_single_window_capture
         probe.contains("capture_window("),
         "probe must use production's window capture"
     );
+    // rustfmt may break a method chain across lines, so match the call with
+    // whitespace removed rather than as one literal line.
+    let compact: String = probe.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        probe.contains("content.windows()"),
+        compact.contains("content.windows()"),
         "probe must check the unfiltered shareable window list"
     );
     assert!(
