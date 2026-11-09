@@ -4451,7 +4451,17 @@ async fn input_document(
             observed.interaction_cause.as_deref(),
         ));
     }
-    if observed.committed != snapshot.document {
+    // A page may push or replace history in response to our focus/input. After
+    // this call dispatches input, history alone cannot prove a person intervened.
+    // Keep every other document fact and the interaction epoch strict; before
+    // the first dispatch, history must still match the read.
+    let mut expected = snapshot.document.clone();
+    if dispatched {
+        expected.entry_id = observed.committed.entry_id;
+        expected.current_index = observed.committed.current_index;
+        expected.history.clone_from(&observed.committed.history);
+    }
+    if observed.committed != expected {
         return Err(document_moved(
             dispatched,
             &snapshot.document,
