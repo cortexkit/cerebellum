@@ -2363,8 +2363,13 @@ async fn human_input_before_click_and_between_typing_steps_stops_all_further_inp
             assert_eq!(reply["outcome"], "refused");
             assert_eq!(reply["remedy"], "read again");
         } else {
+            // Only the focus step ran before the person intervened; the text
+            // itself was never inserted, and the remedy says so.
             assert_eq!(reply["outcome"], "outcome_unknown");
-            assert!(reply["remedy"].as_str().unwrap().contains("Do not repeat"));
+            assert!(reply["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("The requested text was not sent"));
         }
         assert_eq!(reply["input_dispatched"], !before);
         assert_eq!(
