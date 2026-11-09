@@ -50,10 +50,13 @@
 //!    (`agent_cursor: false`). The module's idle CPU time in phase 2 must be
 //!    no more than 10% above the baseline's.
 //!
-//! The scratch TextEdit is killed on every exit path: normal return, a failed
-//! check, a panic, and Ctrl-C. The helper ends with the plane. Nothing is
-//! saved. The process exits 0 when every check passes, 1 when one fails and
-//! 2 when the desk cannot be measured (`UNMEASURABLE`).
+//! On normal return, a failed check, a panic, and Ctrl-C, the probe kills the
+//! scratch TextEdit only while it is the unique new pid, its start time is
+//! unchanged, and its main window's AXDocument identifies the private scratch
+//! file. Otherwise it leaves the process running and reports UNMEASURABLE.
+//! The scratch directory is removed at exit. The helper ends with the plane.
+//! The process exits 0 when every check passes, 1 when one fails and 2 when
+//! the desk cannot be measured (`UNMEASURABLE`).
 
 // Other platforms do not run the desk probe: an unapproved run is refused
 // and an approved one reports `UNMEASURABLE: macOS desk required`. The
@@ -170,8 +173,8 @@ fn helper_binary(executable: &Path) -> Option<PathBuf> {
     Some(executable.parent()?.parent()?.join(HELPER_BINARY))
 }
 
-/// Only a unique new pid can belong to the scratch launch. Repeated entries
-/// describe the same process, not additional instances.
+/// A unique new pid is only a candidate: its document must also prove ownership.
+/// Repeated entries describe the same process, not additional instances.
 fn new_scratch_pid(before: &[u32], after: &[u32]) -> Result<u32, usize> {
     let new: std::collections::BTreeSet<_> = after
         .iter()
@@ -185,19 +188,15 @@ fn new_scratch_pid(before: &[u32], after: &[u32]) -> Result<u32, usize> {
     }
 }
 
-fn scratch_launch_command() -> std::process::Command {
+fn scratch_launch_command(document: &Path) -> std::process::Command {
     // LaunchServices supplies the system-app launch context. Keep the new
     // instance inactive but visible, and do not restore the person's documents.
     let mut command = std::process::Command::new("/usr/bin/open");
-    command.args([
-        "-n",
-        "-g",
-        "-a",
-        "TextEdit",
-        "--args",
-        "-ApplePersistenceIgnoreState",
-        "YES",
-    ]);
+    command.args(["-n", "-g", "-a", "TextEdit"]);
+    // open(1) opens file operands in the selected new instance. Everything
+    // after --args is only argv, not a document for LaunchServices to open.
+    command.arg(document);
+    command.args(["--args", "-ApplePersistenceIgnoreState", "YES"]);
     command
 }
 
@@ -208,9 +207,19 @@ struct ScratchProcess {
 }
 
 impl ScratchProcess {
-    /// A missing identity or a different start time must never authorize a kill.
-    fn may_kill(self, current_start_time: Option<u64>) -> bool {
-        self.pid != 0 && current_start_time == Some(self.start_time)
+    /// Newness alone is not ownership: require the private document as well.
+    fn may_kill(
+        self,
+        before: &[u32],
+        after: Option<&[u32]>,
+        current_start_time: Option<u64>,
+        open_document: Option<&str>,
+        scratch_document: &str,
+    ) -> bool {
+        self.pid != 0
+            && after.is_some_and(|after| new_scratch_pid(before, after) == Ok(self.pid))
+            && current_start_time == Some(self.start_time)
+            && open_document == Some(scratch_document)
     }
 }
 
@@ -371,6 +380,24 @@ fn background_reply_verdict(action: &str, reply: &Value) -> Result<(), String> {
     }
 }
 
+fn read_state_outline(reply: &Value) -> Option<&str> {
+    if reply["outcome"] != "completed" {
+        return None;
+    }
+    reply["state_text"].as_str().filter(|text| !text.is_empty())
+}
+
+fn settable_text_area_id(outline: &str) -> Option<&str> {
+    outline.lines().find_map(|line| {
+        let (id, description) = line.trim_start().split_once(' ')?;
+        let states = description.strip_prefix("text area (")?.split_once(')')?.0;
+        states
+            .split(", ")
+            .any(|state| state == "settable")
+            .then_some(id)
+    })
+}
+
 /// One on-screen window as the window server lists it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ListedWindow {
@@ -469,19 +496,114 @@ mod desk {
     const SETTLE: Duration = Duration::from_secs(2);
     const SAMPLE_EVERY: Duration = Duration::from_millis(100);
 
-    /// The scratch TextEdit, killed when dropped.
-    struct Scratch {
+    /// Private files are outside $TMPDIR, where signing can hang on this Mac.
+    struct ScratchFiles {
+        directory: PathBuf,
+        document: PathBuf,
+        document_url: String,
+    }
+
+    impl ScratchFiles {
+        fn create() -> Result<Self, String> {
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+            let mut random = [0_u8; 16];
+            getrandom::getrandom(&mut random).map_err(|error| error.to_string())?;
+            let nonce: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+            let directory = Path::new("/tmp").join(format!("ck-desk-probe-{nonce}"));
+            // Atomic creation refuses existing paths, including symlinks.
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&directory)
+                .map_err(|error| error.to_string())?;
+            let mut files = Self {
+                directory,
+                document: PathBuf::new(),
+                document_url: String::new(),
+            };
+            // TextEdit reports the resolved path (/private/tmp on macOS).
+            files.directory = files
+                .directory
+                .canonicalize()
+                .map_err(|error| error.to_string())?;
+            files.document = files.directory.join(format!("probe-{nonce}.txt"));
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&files.document)
+                .map_err(|error| error.to_string())?;
+            files.document_url = sys::file_url(&files.document)
+                .ok_or("cannot encode the scratch document's file URL")?;
+            Ok(files)
+        }
+
+        fn remove(&self) -> bool {
+            match std::fs::remove_dir_all(&self.directory) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => {
+                    eprintln!("UNMEASURABLE: cannot remove scratch directory: {error}");
+                    false
+                }
+            }
+        }
+    }
+
+    impl Drop for ScratchFiles {
+        fn drop(&mut self) {
+            self.remove();
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScratchIdentity {
         process: ScratchProcess,
+        before: Vec<u32>,
+        files: Arc<ScratchFiles>,
+    }
+
+    /// The scratch TextEdit, signalled only after rechecking ownership.
+    struct Scratch {
+        identity: ScratchIdentity,
+        cleaned_up: bool,
     }
 
     impl Scratch {
         fn pid(&self) -> u32 {
-            self.process.pid
+            self.identity.process.pid
+        }
+
+        fn finish(&mut self) -> bool {
+            let mut pending = SCRATCH_PID.lock().unwrap();
+            let killed = kill(&self.identity);
+            let removed = self.identity.files.remove();
+            self.cleaned_up = true;
+            *pending = None;
+            killed && removed
         }
     }
 
-    fn kill(process: ScratchProcess) -> bool {
-        if !process.may_kill(cerebellum_macos::process_start_time_micros(process.pid)) {
+    fn left_running(pid: u32) {
+        eprintln!("LEFT RUNNING: pid {pid}, not provably the probe's");
+    }
+
+    fn owns_scratch(identity: &ScratchIdentity) -> bool {
+        let document = sys::main_window_document(identity.process.pid);
+        let after = textedit_pids().ok();
+        identity.process.may_kill(
+            &identity.before,
+            after.as_deref(),
+            cerebellum_macos::process_start_time_micros(identity.process.pid),
+            document.as_deref(),
+            &identity.files.document_url,
+        )
+    }
+
+    fn kill(identity: &ScratchIdentity) -> bool {
+        let process = identity.process;
+        if !owns_scratch(identity) {
+            left_running(process.pid);
             return false;
         }
         if !Command::new("/bin/kill")
@@ -489,6 +611,7 @@ mod desk {
             .status()
             .is_ok_and(|status| status.success())
         {
+            left_running(process.pid);
             return false;
         }
         // LaunchServices owns the child, so wait by identity rather than waitpid.
@@ -496,32 +619,29 @@ mod desk {
         let deadline = Instant::now() + LAUNCH_WAIT;
         while Instant::now() < deadline {
             match cerebellum_macos::process_start_time(process.pid) {
-                cerebellum_macos::ProcessStartTime::NoSuchProcess => break,
+                cerebellum_macos::ProcessStartTime::NoSuchProcess => return true,
                 cerebellum_macos::ProcessStartTime::Started(start)
                     if start != process.start_time =>
                 {
-                    break
+                    return true;
                 }
                 _ => std::thread::sleep(SAMPLE_EVERY),
             }
         }
-        true
+        left_running(process.pid);
+        false
     }
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let mut pending = SCRATCH_PID.lock().unwrap();
-            if *pending == Some(self.process) {
-                *pending = None;
-            }
-            if kill(self.process) {
+            if !self.cleaned_up && self.finish() {
                 println!("SCRATCH {} killed", self.pid());
             }
         }
     }
 
-    /// The scratch identity for Ctrl-C; a pid alone may have been reused.
-    static SCRATCH_PID: Mutex<Option<ScratchProcess>> = Mutex::new(None);
+    /// Ctrl-C needs the document proof as well as the process identity.
+    static SCRATCH_PID: Mutex<Option<ScratchIdentity>> = Mutex::new(None);
 
     fn install_interrupt_handler() {
         std::thread::spawn(|| {
@@ -534,12 +654,18 @@ mod desk {
             runtime.block_on(async {
                 if tokio::signal::ctrl_c().await.is_ok() {
                     let mut pending = SCRATCH_PID.lock().unwrap();
-                    if let Some(process) = pending.take() {
-                        if kill(process) {
-                            println!("SCRATCH {} killed after interrupt", process.pid);
+                    let mut code = 130;
+                    if let Some(identity) = pending.take() {
+                        let killed = kill(&identity);
+                        let removed = identity.files.remove();
+                        if killed {
+                            println!("SCRATCH {} killed after interrupt", identity.process.pid);
+                        }
+                        if !killed || !removed {
+                            code = 2;
                         }
                     }
-                    std::process::exit(130);
+                    std::process::exit(code);
                 }
             });
         });
@@ -554,7 +680,8 @@ mod desk {
     }
 
     fn launch_scratch(before: &[u32]) -> Result<Scratch, String> {
-        let status = scratch_launch_command()
+        let files = Arc::new(ScratchFiles::create()?);
+        let status = scratch_launch_command(&files.document)
             .status()
             .map_err(|error| error.to_string())?;
         if !status.success() {
@@ -562,20 +689,42 @@ mod desk {
         }
         let deadline = Instant::now() + LAUNCH_WAIT;
         loop {
-            match new_scratch_pid(before, &textedit_pids()?) {
+            let after = textedit_pids()?;
+            match new_scratch_pid(before, &after) {
                 Ok(pid) => {
                     let start_time = match cerebellum_macos::process_start_time(pid) {
                         cerebellum_macos::ProcessStartTime::Started(start) => start,
                         other => {
-                            return Err(format!("cannot identify scratch pid {pid}: {other:?}"))
+                            left_running(pid);
+                            return Err(format!("cannot identify scratch pid {pid}: {other:?}"));
                         }
                     };
-                    return Ok(Scratch {
+                    let identity = ScratchIdentity {
                         process: ScratchProcess { pid, start_time },
-                    });
+                        before: before.to_vec(),
+                        files,
+                    };
+                    // Verify AXDocument on this pid, not whichever TextEdit the
+                    // bundle resolver might find. LaunchServices is asynchronous.
+                    while Instant::now() < deadline {
+                        if owns_scratch(&identity) {
+                            return Ok(Scratch {
+                                identity,
+                                cleaned_up: false,
+                            });
+                        }
+                        std::thread::sleep(SAMPLE_EVERY);
+                    }
+                    left_running(pid);
+                    return Err("the new TextEdit did not open the scratch document".into());
                 }
                 Err(0) if Instant::now() < deadline => std::thread::sleep(SAMPLE_EVERY),
-                Err(count) => return Err(format!("expected one new TextEdit pid, found {count}")),
+                Err(count) => {
+                    for pid in after.iter().filter(|pid| !before.contains(pid)) {
+                        left_running(*pid);
+                    }
+                    return Err(format!("expected one new TextEdit pid, found {count}"));
+                }
             }
         }
     }
@@ -653,11 +802,13 @@ mod desk {
         )
     }
 
-    /// Process CPU time and the window list, read straight from the system.
+    /// Process CPU time, windows and document ownership, read from the system.
     #[allow(unsafe_code)]
     mod sys {
         use super::super::{cpu_nanos, ListedWindow};
-        use std::ffi::{c_void, CString};
+        use std::ffi::{c_void, CStr, CString};
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Path;
 
         type CfRef = *const c_void;
 
@@ -724,10 +875,36 @@ mod desk {
             fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> CfRef;
         }
 
+        #[link(name = "ApplicationServices", kind = "framework")]
+        extern "C" {
+            fn AXUIElementCreateApplication(pid: i32) -> CfRef;
+            fn AXUIElementGetTypeID() -> usize;
+            fn AXUIElementGetPid(element: CfRef, pid: *mut i32) -> i32;
+            fn AXUIElementSetMessagingTimeout(element: CfRef, timeout: f32) -> i32;
+            fn AXUIElementCopyAttributeValue(
+                element: CfRef,
+                attribute: CfRef,
+                value: *mut CfRef,
+            ) -> i32;
+        }
+
         #[link(name = "CoreFoundation", kind = "framework")]
         extern "C" {
             fn CFStringCreateWithCString(allocator: CfRef, text: *const i8, encoding: u32)
                 -> CfRef;
+            fn CFStringGetTypeID() -> usize;
+            fn CFStringGetLength(string: CfRef) -> isize;
+            fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
+            fn CFStringGetCString(string: CfRef, buffer: *mut i8, size: isize, encoding: u32)
+                -> u8;
+            fn CFURLCreateFromFileSystemRepresentation(
+                allocator: CfRef,
+                buffer: *const u8,
+                length: isize,
+                is_directory: u8,
+            ) -> CfRef;
+            fn CFURLGetTypeID() -> usize;
+            fn CFURLGetString(url: CfRef) -> CfRef;
             fn CFArrayGetCount(array: CfRef) -> isize;
             fn CFArrayGetValueAtIndex(array: CfRef, index: isize) -> CfRef;
             fn CFDictionaryGetValue(dictionary: CfRef, key: CfRef) -> CfRef;
@@ -757,6 +934,100 @@ mod desk {
             let text = CString::new(text).unwrap();
             // SAFETY: a valid NUL-terminated UTF-8 string; returns one retain.
             Owned(unsafe { CFStringCreateWithCString(std::ptr::null(), text.as_ptr(), UTF8) })
+        }
+
+        fn string_text(value: CfRef) -> Option<String> {
+            // SAFETY: non-null CF values can be type-checked before conversion.
+            if value.is_null() || unsafe { CFGetTypeID(value) != CFStringGetTypeID() } {
+                return None;
+            }
+            // SAFETY: the type check established a live CFString.
+            let length = unsafe { CFStringGetLength(value) };
+            if !(0..=16_384).contains(&length) {
+                return None;
+            }
+            // SAFETY: length is a bounded CFString length and UTF8 is valid.
+            let capacity = unsafe { CFStringGetMaximumSizeForEncoding(length, UTF8) } + 1;
+            let mut buffer = vec![0_u8; usize::try_from(capacity).ok()?];
+            // SAFETY: the output buffer has capacity bytes; value is a CFString.
+            if unsafe { CFStringGetCString(value, buffer.as_mut_ptr().cast(), capacity, UTF8) } == 0
+            {
+                return None;
+            }
+            Some(
+                CStr::from_bytes_until_nul(&buffer)
+                    .ok()?
+                    .to_str()
+                    .ok()?
+                    .to_owned(),
+            )
+        }
+
+        pub fn file_url(path: &Path) -> Option<String> {
+            let path = path.as_os_str().as_bytes();
+            // SAFETY: path is readable for its length; returns one owned CFURL.
+            let url = unsafe {
+                CFURLCreateFromFileSystemRepresentation(
+                    std::ptr::null(),
+                    path.as_ptr(),
+                    isize::try_from(path.len()).ok()?,
+                    0,
+                )
+            };
+            if url.is_null() {
+                return None;
+            }
+            let url = Owned(url);
+            // SAFETY: the URL owns the borrowed string until it is copied out.
+            string_text(unsafe { CFURLGetString(url.0) })
+        }
+
+        fn ax_attribute(element: &Owned, name: &str) -> Option<Owned> {
+            let name = string(name);
+            let mut value = std::ptr::null();
+            // SAFETY: callers supply a live AXUIElement; name and out-pointer
+            // are valid. Copy returns one retain count on success.
+            let code = unsafe { AXUIElementCopyAttributeValue(element.0, name.0, &mut value) };
+            (code == 0 && !value.is_null()).then(|| Owned(value))
+        }
+
+        /// Read only this pid's main window; never resolve by bundle or focus.
+        pub fn main_window_document(pid: u32) -> Option<String> {
+            let pid = i32::try_from(pid).ok()?;
+            // SAFETY: creates an owned AX application reference for this pid.
+            let app = unsafe { AXUIElementCreateApplication(pid) };
+            if app.is_null() {
+                return None;
+            }
+            let app = Owned(app);
+            // SAFETY: app is a live AXUIElement. Bound reads of unresponsive apps.
+            if unsafe { AXUIElementSetMessagingTimeout(app.0, 0.5) } != 0 {
+                return None;
+            }
+            let window = ax_attribute(&app, "AXMainWindow")?;
+            // SAFETY: window is a live CF object; check it before AX calls.
+            if unsafe { CFGetTypeID(window.0) != AXUIElementGetTypeID() } {
+                return None;
+            }
+            let mut owner = 0;
+            // SAFETY: window is an AXUIElement and owner is a live output slot.
+            if unsafe { AXUIElementGetPid(window.0, &mut owner) } != 0 || owner != pid {
+                return None;
+            }
+            // SAFETY: window is a live AXUIElement.
+            if unsafe { AXUIElementSetMessagingTimeout(window.0, 0.5) } != 0 {
+                return None;
+            }
+            let document = ax_attribute(&window, "AXDocument")?;
+            // AXDocument normally is a CFString containing a file URL; accept
+            // a CFURL too, without treating a title or a basename as ownership.
+            // SAFETY: document is a live CF value, checked before CFURL access.
+            if unsafe { CFGetTypeID(document.0) == CFURLGetTypeID() } {
+                // SAFETY: document owns the borrowed string during conversion.
+                string_text(unsafe { CFURLGetString(document.0) })
+            } else {
+                string_text(document.0)
+            }
         }
 
         /// The number under `key` in `dictionary`, which is borrowed.
@@ -1012,14 +1283,14 @@ mod desk {
                 return 2;
             }
         };
-        let scratch = match launch_scratch(&before) {
+        let mut scratch = match launch_scratch(&before) {
             Ok(scratch) => scratch,
             Err(error) => {
                 eprintln!("UNMEASURABLE: cannot launch scratch TextEdit: {error}");
                 return 2;
             }
         };
-        *pending = Some(scratch.process);
+        *pending = Some(scratch.identity.clone());
         drop(pending);
         println!(
             "SCRATCH TextEdit pid {}; the person's front app is pid {person}",
@@ -1038,7 +1309,14 @@ mod desk {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(measure(&scratch, person, baseline))
         }));
+        let cleaned_up = scratch.finish();
+        if cleaned_up {
+            println!("SCRATCH {} killed", scratch.pid());
+        }
         drop(scratch);
+        if !cleaned_up {
+            return 2;
+        }
         let code = match outcome {
             Ok(code) => code,
             Err(_) => {
@@ -1172,9 +1450,7 @@ mod desk {
         let started = Instant::now();
         let read = loop {
             let read = serve("computer.read_state", json!({"target": TEXTEDIT_BUNDLE})).await;
-            if read["outcome"] == "completed"
-                && read["tree"].as_str().is_some_and(|t| !t.is_empty())
-            {
+            if read_state_outline(&read).is_some() {
                 break read;
             }
             if started.elapsed() > LAUNCH_WAIT {
@@ -1231,16 +1507,11 @@ mod desk {
             "background read_state fronts nothing",
             background_reply_verdict("read_state", &first),
         );
-        let tree = first["tree"]
-            .as_str()
-            .or(read["tree"].as_str())
+        let tree = read_state_outline(&first)
+            .or_else(|| read_state_outline(&read))
             .unwrap_or_default()
             .to_string();
-        let text_area = tree
-            .lines()
-            .find(|line| line.contains(" text area ") && line.contains("settable"))
-            .and_then(|line| line.split_whitespace().next())
-            .map(str::to_string);
+        let text_area = settable_text_area_id(&tree);
         match text_area {
             Some(element_id) => {
                 let write = serve(
@@ -1450,7 +1721,8 @@ mod tests {
 
     #[test]
     fn scratch_launch_uses_launchservices_without_activating_textedit() {
-        let command = scratch_launch_command();
+        let document = "/private/tmp/ck-desk-probe-abc/probe-abc.txt";
+        let command = scratch_launch_command(Path::new(document));
         assert_eq!(command.get_program(), "/usr/bin/open");
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
@@ -1459,6 +1731,7 @@ mod tests {
                 "-g",
                 "-a",
                 "TextEdit",
+                document,
                 "--args",
                 "-ApplePersistenceIgnoreState",
                 "YES",
@@ -1478,19 +1751,128 @@ mod tests {
         assert_eq!(new_scratch_pid(&[100], &[300, 200, 100]), Err(2));
     }
 
-    #[test]
-    fn scratch_kill_requires_the_original_process_start_time() {
-        let scratch = ScratchProcess {
+    const SCRATCH_DOCUMENT: &str = "file:///private/tmp/ck-desk-probe-abc/probe-abc.txt";
+
+    fn scratch_process() -> ScratchProcess {
+        ScratchProcess {
             pid: 200,
             start_time: 12345,
+        }
+    }
+
+    #[test]
+    fn scratch_kill_accepts_only_the_matching_document() {
+        assert!(scratch_process().may_kill(
+            &[],
+            Some(&[200]),
+            Some(12345),
+            Some(SCRATCH_DOCUMENT),
+            SCRATCH_DOCUMENT,
+        ));
+    }
+
+    #[test]
+    fn scratch_kill_rejects_a_different_document() {
+        assert!(!scratch_process().may_kill(
+            &[],
+            Some(&[200]),
+            Some(12345),
+            Some("file:///private/tmp/someones-document.txt"),
+            SCRATCH_DOCUMENT,
+        ));
+    }
+
+    #[test]
+    fn scratch_kill_rejects_an_unreadable_document() {
+        assert!(!scratch_process().may_kill(
+            &[],
+            Some(&[200]),
+            Some(12345),
+            None,
+            SCRATCH_DOCUMENT,
+        ));
+    }
+
+    #[test]
+    fn scratch_kill_requires_exactly_one_new_textedit_pid() {
+        for after in [None, Some(&[][..]), Some(&[200, 300]), Some(&[300])] {
+            assert!(!scratch_process().may_kill(
+                &[],
+                after,
+                Some(12345),
+                Some(SCRATCH_DOCUMENT),
+                SCRATCH_DOCUMENT,
+            ));
+        }
+        assert!(!scratch_process().may_kill(
+            &[200],
+            Some(&[200]),
+            Some(12345),
+            Some(SCRATCH_DOCUMENT),
+            SCRATCH_DOCUMENT,
+        ));
+    }
+
+    #[test]
+    fn scratch_kill_requires_the_original_process_start_time() {
+        let scratch = scratch_process();
+        let may_kill = |process: ScratchProcess, start| {
+            process.may_kill(
+                &[],
+                Some(&[process.pid]),
+                start,
+                Some(SCRATCH_DOCUMENT),
+                SCRATCH_DOCUMENT,
+            )
         };
-        assert!(scratch.may_kill(Some(12345)));
-        assert!(!scratch.may_kill(Some(12346)), "a reused pid is not ours");
+        assert!(may_kill(scratch, Some(12345)));
+        assert!(!may_kill(scratch, Some(12346)), "a reused pid is not ours");
         assert!(
-            !scratch.may_kill(None),
+            !may_kill(scratch, None),
             "unknown or exited processes must not be killed"
         );
-        assert!(!ScratchProcess { pid: 0, ..scratch }.may_kill(Some(12345)));
+        assert!(!may_kill(ScratchProcess { pid: 0, ..scratch }, Some(12345)));
+    }
+
+    #[test]
+    fn read_state_outline_uses_the_current_reply_field() {
+        let reply = json!({
+            "outcome": "completed",
+            "state_text": "TextEdit — probe-abc.txt\nprobe1 window probe-abc.txt\n",
+            "tree": "obsolete field",
+        });
+        assert_eq!(
+            read_state_outline(&reply),
+            Some("TextEdit — probe-abc.txt\nprobe1 window probe-abc.txt\n")
+        );
+        for reply in [
+            json!({"outcome": "completed", "tree": "obsolete field"}),
+            json!({"outcome": "completed", "state_text": ""}),
+            json!({"outcome": "withheld", "state_text": "not a completed read"}),
+        ] {
+            assert_eq!(read_state_outline(&reply), None);
+        }
+    }
+
+    #[test]
+    fn text_area_lookup_uses_the_renderers_line_grammar() {
+        // The line golden in app_state/tests/mod.rs uses this role, states,
+        // label and value, with a session-generated id in place of probe1.
+        let golden = "  probe1 text area (settable, focused) Message @IceTea, Value: hello";
+        assert_eq!(settable_text_area_id(golden), Some("probe1"));
+        assert_eq!(
+            settable_text_area_id("probe2 text area (settable), Value: hello"),
+            Some("probe2")
+        );
+        for line in [
+            "probe3 button Choose a settable text area here",
+            "probe4 text area (focused) Message, Value: settable",
+            "probe5 text area (not_settable) Message",
+            "probe6 text area (settable-extra) Message",
+            "probe7 text area Message, Value: settable",
+        ] {
+            assert_eq!(settable_text_area_id(line), None, "{line}");
+        }
     }
 
     #[test]
