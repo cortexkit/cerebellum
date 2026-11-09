@@ -156,7 +156,7 @@ async fn a_stopped_type_prints_the_signal_that_stopped_it() {
             .join("\n");
         let expected = [
             "Outcome unknown.",
-            "Input was dispatched and may have taken effect. Do not repeat this action; take a fresh read before deciding what to do next.",
+            "The requested text was not sent. Focus or caret input may have taken effect. Take a fresh read before deciding whether to retry typing.",
             "Input was dispatched to the person's browser.",
             "Reason: state changed by person.",
             signal,

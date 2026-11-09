@@ -345,6 +345,7 @@ struct ShownRef {
     identity: BackendNodeIdentity,
     frame: FrameDocument,
     classification: Option<NonTypeClassificationRecord>,
+    role_name: Option<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -3117,6 +3118,7 @@ async fn capture_attempt(
             snapshot.refs.insert(
                 fresh,
                 ShownRef {
+                    role_name: typing::role_name(nodes, identity.backend_node_id),
                     identity,
                     frame: frame.clone(),
                     classification: reference.classification.ok().map(|record| *record),
@@ -3651,6 +3653,27 @@ async fn input(
     args: &Value,
     current: &Document,
 ) -> Result<Value, Value> {
+    let mut text_attempted = false;
+    let result = input_inner(context, tab, action, args, current, &mut text_attempted).await;
+    result.map_err(|mut reply| {
+        if action == "type" && !text_attempted && reply["input_dispatched"] == true {
+            // Focus and caret events can affect the page, but they do not send
+            // the requested text. Do not discourage a retry as if insertion ran.
+            reply["outcome"] = json!("outcome_unknown");
+            reply["remedy"] = json!("The requested text was not sent. Focus or caret input may have taken effect. Take a fresh read before deciding whether to retry typing.");
+        }
+        reply
+    })
+}
+
+async fn input_inner(
+    context: &Context<'_>,
+    tab: &str,
+    action: &str,
+    args: &Value,
+    current: &Document,
+    text_attempted: &mut bool,
+) -> Result<Value, Value> {
     let snapshot = context
         .target()
         .snapshot(context.route, tab, context.connection, args)?;
@@ -3661,7 +3684,7 @@ async fn input(
     if snapshot.document != current.committed || snapshot.interaction != current.interaction {
         return Err(read_again(false));
     }
-    let (identity, frame, position) = if action == "click_point" {
+    let (mut identity, frame, position) = if action == "click_point" {
         let image = snapshot
             .image
             .as_ref()
@@ -3781,7 +3804,7 @@ async fn input(
             flattened_document(),
         )
         .await?;
-    let (dom_object, classification) = classify_frame_capture(
+    let (dom_object, mut classification) = classify_frame_capture(
         observed.results.last(),
         &identity,
         &frame,
@@ -3941,31 +3964,15 @@ async fn input(
             "DOM.focus",
             json!({"backendNodeId":identity.backend_node_id}),
         ));
-        if args["clear_first"] != true
-            && matches!(
-                classification.effective_input_type.as_deref(),
-                Some("number" | "email")
-            )
-        {
-            // Number and email inputs reject setSelectionRange; move their
-            // caret with a native key after focusing and before inserting text.
-            for event in ["keyDown", "keyUp"] {
-                steps.push(command(
-                    "Input.dispatchKeyEvent",
-                    json!({"type":event,"key":"End","code":"End","windowsVirtualKeyCode":35}),
-                ));
-            }
+        let declaration = if args["clear_first"] == true {
+            functions::SELECT
         } else {
-            let declaration = if args["clear_first"] == true {
-                functions::SELECT
-            } else {
-                functions::APPEND_CARET
-            };
-            steps.push(command(
-                "Runtime.callFunctionOn",
-                json!({"functionDeclaration":declaration,"returnByValue":true}),
-            ));
-        }
+            functions::APPEND_CARET
+        };
+        steps.push(command(
+            "Runtime.callFunctionOn",
+            json!({"functionDeclaration":declaration,"returnByValue":true}),
+        ));
         steps.push(command("Input.insertText", json!({"text":args["text"]})));
     } else {
         let (x, y) = position.unwrap();
@@ -3978,8 +3985,10 @@ async fn input(
     }
     let mut dispatched = false;
     let mut popup = false;
+    let mut after_focus = false;
     let mut steps = steps.into_iter();
     while let Some(step) = steps.next() {
+        let just_focused = std::mem::take(&mut after_focus);
         if !context.granted(&input_origin, severity, &hazards, Some(&once))
             || classification
                 .activation_destination_origin
@@ -3993,7 +4002,7 @@ async fn input(
             reply["input_dispatched"] = json!(dispatched);
             return Err(reply);
         }
-        verify_input(
+        let verification = verify_input(
             context,
             tab,
             &snapshot,
@@ -4002,13 +4011,32 @@ async fn input(
             &classification,
             dispatched,
         )
-        .await
-        .map_err(|mut reply| {
-            if dispatched {
-                reply["input_dispatched"] = json!(true);
+        .await;
+        if let Err(reply) = verification {
+            if !just_focused {
+                return Err(prior_input(reply, dispatched));
             }
-            reply
-        })?;
+            let original = snapshot.refs.get(args["ref"].as_str().unwrap()).unwrap();
+            let Some(replacement) = typing::after_focus(context, tab, &snapshot, original)
+                .await
+                .map_err(|reply| prior_input(reply, dispatched))?
+            else {
+                return Err(prior_input(reply, dispatched));
+            };
+            identity = replacement.identity;
+            classification = replacement.classification.expect("classified replacement");
+            verify_input(
+                context,
+                tab,
+                &snapshot,
+                &frame,
+                &identity,
+                &classification,
+                dispatched,
+            )
+            .await
+            .map_err(|reply| prior_input(reply, dispatched))?;
+        }
         if let Some((x, y)) = position {
             verify_click_position(
                 context,
@@ -4023,12 +4051,36 @@ async fn input(
             .map_err(|reply| prior_input(reply, dispatched))?;
         }
         let commands = if action == "type" && step["method"] == "Runtime.callFunctionOn" {
-            runtime_plan(
-                &identity,
-                step["params"]["functionDeclaration"]
-                    .as_str()
-                    .expect("pinned declaration"),
-            )
+            if args["clear_first"] != true
+                && matches!(
+                    classification.effective_input_type.as_deref(),
+                    Some("number" | "email")
+                )
+            {
+                // Choose the caret operation after any handoff: number and
+                // email inputs reject setSelectionRange, unlike text inputs.
+                vec![
+                    command(
+                        "Emulation.setFocusEmulationEnabled",
+                        json!({"enabled":true}),
+                    ),
+                    command(
+                        "Input.dispatchKeyEvent",
+                        json!({"type":"keyDown","key":"End","code":"End","windowsVirtualKeyCode":35}),
+                    ),
+                    command(
+                        "Input.dispatchKeyEvent",
+                        json!({"type":"keyUp","key":"End","code":"End","windowsVirtualKeyCode":35}),
+                    ),
+                ]
+            } else {
+                runtime_plan(
+                    &identity,
+                    step["params"]["functionDeclaration"]
+                        .as_str()
+                        .expect("pinned declaration"),
+                )
+            }
         } else {
             if action == "type" && step["method"] == "Input.insertText" {
                 let focused = context
@@ -4074,6 +4126,13 @@ async fn input(
             }
             commands
         };
+        let is_focus = action == "type"
+            && commands
+                .iter()
+                .any(|command| command["method"] == "DOM.focus");
+        *text_attempted |= commands
+            .iter()
+            .any(|command| command["method"] == "Input.insertText");
         let outcome = context
             .cdp_frame(tab, Some(snapshot.interaction), &frame, commands)
             .await;
@@ -4087,6 +4146,7 @@ async fn input(
                     return Err(prior_input(refusal("runtime_exception"), true));
                 }
                 dispatched = true;
+                after_focus = is_focus;
                 popup |= result.popup;
             }
             Err(mut reply) => {
@@ -4639,6 +4699,7 @@ fn declared_severity(args: &Value) -> Result<Severity, Value> {
 
 mod agent_enforcement;
 mod functions;
+mod typing;
 
 #[cfg(test)]
 mod tests;
