@@ -98,6 +98,11 @@ struct DoubleState {
     typed_selected: bool,
     typed_caret: usize,
     type_name_after_focus: Option<String>,
+    type_capture_after_focus: Option<(Value, Value)>,
+    type_focused_backend: Option<u64>,
+    type_resolved_backend: u64,
+    type_dom_after_focus_check: Option<Value>,
+    type_focus_checks_before_mutation: usize,
     captures: Vec<String>,
     redirect: Option<String>,
     human_before_input: bool,
@@ -1080,7 +1085,10 @@ fn execute(
             "Page.captureScreenshot" => {
                 json!({"data":state.screenshot_images.pop_front().unwrap_or_else(|| "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".into())})
             }
-            "DOM.resolveNode" => json!({"object":{"objectId":"typed-node"}}),
+            "DOM.resolveNode" => {
+                state.type_resolved_backend = command["params"]["backendNodeId"].as_u64().unwrap();
+                json!({"object":{"objectId":"typed-node"}})
+            }
             "Runtime.callFunctionOn" => {
                 let declaration = command["params"]["functionDeclaration"].as_str().unwrap();
                 if declaration == functions::SELECT {
@@ -1089,7 +1097,17 @@ fn execute(
                     state.typed_selected = false;
                     state.typed_caret = state.typed_value.len();
                 }
-                json!({"result":{"value":true}})
+                let focused = state
+                    .type_focused_backend
+                    .is_none_or(|backend| backend == state.type_resolved_backend);
+                if declaration == functions::HAS_FOCUS {
+                    if state.type_focus_checks_before_mutation > 0 {
+                        state.type_focus_checks_before_mutation -= 1;
+                    } else if let Some(dom) = state.type_dom_after_focus_check.take() {
+                        state.dom_override = Some(dom);
+                    }
+                }
+                json!({"result":{"value":declaration != functions::HAS_FOCUS || focused}})
             }
             "Input.insertText" => {
                 state.inputs.push(method.into());
@@ -1188,6 +1206,10 @@ fn execute(
     // The page reacts after the agent's focus plan has returned, between it
     // and the agent's next plan, as an asynchronous focus handler would.
     if commands.iter().any(|step| step["method"] == "DOM.focus") {
+        if let Some((dom, ax)) = state.type_capture_after_focus.take() {
+            state.dom_override = Some(dom);
+            state.ax_override = Some(ax);
+        }
         if let Some(name) = state.type_name_after_focus.take() {
             let attrs = state.dom_override.as_mut().unwrap()["nodes"][3]["attributes"]
                 .as_array_mut()
@@ -3625,6 +3647,7 @@ mod codemode;
 mod dom_full;
 mod observer_wait;
 mod person_check;
+mod type_replacement;
 
 #[tokio::test]
 async fn same_origin_child_click_routes_to_the_verified_frame_without_a_new_card() {
