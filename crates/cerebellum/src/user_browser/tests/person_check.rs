@@ -1,11 +1,10 @@
 use super::*;
 
 // A page can react to the agent focusing a field before the agent's next
-// typing plan. Each reaction below is a candidate for a type stopped half-way,
-// and each must produce its own refusal cause, so a stopped type on a real page
-// says which signal stopped it.
+// typing plan. History-only reactions may continue; document changes and
+// interaction-epoch signals must stop the type and name the signal.
 
-async fn type_into_reacting_field(reaction: PageReaction) -> (Value, Vec<String>) {
+async fn type_into_reacting_field(reaction: PageReaction) -> (Value, Vec<String>, String) {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
     let (snapshot, _) = fixture.snapshot(1, &tab, "allow_origin_always").await;
@@ -13,16 +12,54 @@ async fn type_into_reacting_field(reaction: PageReaction) -> (Value, Vec<String>
     let (reply, _) = fixture
         .call(
             1,
-            json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot, "Message"),"text":"not typed"}),
+            json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot, "Message"),"text":"rust language"}),
             "allow_30m",
         )
         .await;
-    let inputs = fixture.state.lock().unwrap().inputs.clone();
-    (reply, inputs)
+    let state = fixture.state.lock().unwrap();
+    (reply, state.inputs.clone(), state.typed_value.clone())
 }
 
 #[tokio::test]
-async fn each_page_reaction_to_focus_names_its_own_cause() {
+async fn same_url_history_reactions_to_focus_allow_all_text() {
+    for reaction in [PageReaction::PushSameUrl, PageReaction::ReplaceState] {
+        let (reply, inputs, value) = type_into_reacting_field(reaction).await;
+        assert_eq!(reply["outcome"], "ok", "{reaction:?}: {reply}");
+        assert!(reply.get("reason").is_none(), "{reaction:?}: {reply}");
+        assert_eq!(inputs, ["DOM.focus", "Input.insertText"], "{reaction:?}");
+        assert_eq!(value, "rust language", "{reaction:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_history_change_before_dispatch_still_refuses_all_input() {
+    for during_classification in [false, true] {
+        let fixture = Fixture::new();
+        let tab = fixture.claim(1).await;
+        let (snapshot, _) = fixture.snapshot(1, &tab, "allow_origin_always").await;
+        {
+            let mut state = fixture.state.lock().unwrap();
+            if during_classification {
+                state.history_during_classification = true;
+            } else {
+                state.history = Some(same_url_push_state(state.tabs.get(&tab).unwrap()));
+            }
+        }
+        let (reply, _) = fixture
+            .call(
+                1,
+                json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot, "Message"),"text":"rust language"}),
+                "allow_30m",
+            )
+            .await;
+        assert_eq!(reply["reason"], "state_changed_by_person", "{reply}");
+        assert_eq!(reply["input_dispatched"], false, "{reply}");
+        assert!(fixture.state.lock().unwrap().inputs.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn unsafe_reactions_to_focus_still_stop_before_text_and_name_the_cause() {
     let epoch = |cause: &str| json!({"check":"interaction_epoch","cause":cause});
     let document = |entry: bool, index: bool, length: bool, url: bool| json!({"check":"committed_document","history_entry_changed":entry,"history_index_changed":index,"history_length_changed":length,"url_changed":url,"loader_changed":false});
     for (reaction, reason, detail) in [
@@ -33,9 +70,11 @@ async fn each_page_reaction_to_focus_names_its_own_cause() {
         ),
         (PageReaction::ChildNavigation, "observer_unavailable", None),
         (
-            PageReaction::ReplaceState,
+            PageReaction::Reload,
             "state_changed_by_person",
-            Some(document(true, false, false, false)),
+            Some(
+                json!({"check":"committed_document","history_entry_changed":true,"history_index_changed":false,"history_length_changed":false,"url_changed":false,"loader_changed":true}),
+            ),
         ),
         (
             PageReaction::PushState,
@@ -48,12 +87,22 @@ async fn each_page_reaction_to_focus_names_its_own_cause() {
             Some(epoch("input.keydown.main")),
         ),
         (
+            PageReaction::PersonClick,
+            "state_changed_by_person",
+            Some(epoch("input.pointerdown.main")),
+        ),
+        (
+            PageReaction::PersonScroll,
+            "state_changed_by_person",
+            Some(epoch("input.wheel.main")),
+        ),
+        (
             PageReaction::ForeignCause,
             "state_changed_by_person",
             Some(epoch("unrecognized")),
         ),
     ] {
-        let (reply, inputs) = type_into_reacting_field(reaction).await;
+        let (reply, inputs, value) = type_into_reacting_field(reaction).await;
         assert_eq!(reply["outcome"], "outcome_unknown", "{reaction:?}: {reply}");
         assert_eq!(reply["reason"], reason, "{reaction:?}: {reply}");
         assert_eq!(reply["input_dispatched"], true, "{reaction:?}: {reply}");
@@ -64,6 +113,7 @@ async fn each_page_reaction_to_focus_names_its_own_cause() {
         );
         // The focus step ran; the text was never inserted.
         assert_eq!(inputs, ["DOM.focus"], "{reaction:?}");
+        assert!(value.is_empty(), "{reaction:?}: {value}");
     }
 }
 
@@ -78,8 +128,8 @@ async fn a_stopped_type_prints_the_signal_that_stopped_it() {
             "Signal: input.input.main (a trusted input event in the main frame, outside the agent's own input).",
         ),
         (
-            PageReaction::ReplaceState,
-            "Signal: committed_document (the tab's committed document changed: history entry).",
+            PageReaction::Reload,
+            "Signal: committed_document (the tab's committed document changed: history entry, document loader).",
         ),
         (
             PageReaction::PushState,
@@ -94,7 +144,7 @@ async fn a_stopped_type_prints_the_signal_that_stopped_it() {
             "Signal: unrecognized (the extension sent a code outside the known vocabulary).",
         ),
     ] {
-        let (reply, _) = type_into_reacting_field(reaction).await;
+        let (reply, _, _) = type_into_reacting_field(reaction).await;
         let encoded: Value =
             serde_json::from_slice(&crate::tool_result::encode(reply.clone()).unwrap()).unwrap();
         let text = encoded["content"]

@@ -169,6 +169,8 @@ struct DoubleState {
     /// The navigation history the double reports instead of the tab's single
     /// entry, once a same-document history change replaced it.
     history: Option<Value>,
+    /// Push same-URL history after classification, before the first input step.
+    history_during_classification: bool,
     observer_missing_on_blank: bool,
     observer_continuity: u64,
     metadata_unready: usize,
@@ -198,8 +200,7 @@ struct DoubleState {
     drop_plan_reply_field: Option<&'static str>,
 }
 
-/// What a page does when the agent focuses one of its fields, each a
-/// candidate for a type that the person check stopped half-way.
+/// Page reactions and intervening person input after the agent focuses a field.
 #[derive(Clone, Copy, Debug)]
 enum PageReaction {
     /// `document.execCommand("insertText")`: trusted beforeinput and input.
@@ -210,11 +211,26 @@ enum PageReaction {
     ReplaceState,
     /// `history.pushState` to a new URL.
     PushState,
+    /// `history.pushState` without changing the URL or document loader.
+    PushSameUrl,
+    /// The main document reloads at the same URL.
+    Reload,
     /// Not the page: the person presses a key just then.
     PersonKey,
+    /// Not the page: the person clicks just then.
+    PersonClick,
+    /// Not the page: the person scrolls just then.
+    PersonScroll,
     /// The person presses a key, and the extension names it with text
     /// outside its cause vocabulary.
     ForeignCause,
+}
+
+fn same_url_push_state(tab: &DoubleTab) -> Value {
+    json!({"currentIndex":1,"entries":[
+        {"id":tab.loader,"url":tab.url},
+        {"id":tab.loader + 100,"url":tab.url}
+    ]})
 }
 
 /// `value` (a reply or refusal object) with the double's revision stamp.
@@ -1161,6 +1177,14 @@ fn execute(
     if let Some(cause) = state.interaction_cause {
         reply["interaction_cause"] = json!(cause);
     }
+    if state.history_during_classification
+        && commands
+            .iter()
+            .any(|step| step["method"] == "DOM.getFlattenedDocument")
+    {
+        state.history_during_classification = false;
+        state.history = Some(same_url_push_state(tab));
+    }
     // The page reacts after the agent's focus plan has returned, between it
     // and the agent's next plan, as an asynchronous focus handler would.
     if commands.iter().any(|step| step["method"] == "DOM.focus") {
@@ -1191,9 +1215,25 @@ fn execute(
                     {"id":tab.loader + 100,"url":format!("{}search", tab.url)}
                 ]}));
             }
+            Some(PageReaction::PushSameUrl) => {
+                state.history = Some(same_url_push_state(tab));
+            }
+            Some(PageReaction::Reload) => tab.loader += 1,
             Some(PageReaction::PersonKey) => {
+                // History-only focus reactions must not hide a real epoch signal.
+                state.history = Some(same_url_push_state(tab));
                 tab.interaction += 1;
                 state.interaction_cause = Some("input.keydown.main");
+            }
+            Some(PageReaction::PersonClick) => {
+                state.history = Some(same_url_push_state(tab));
+                tab.interaction += 1;
+                state.interaction_cause = Some("input.pointerdown.main");
+            }
+            Some(PageReaction::PersonScroll) => {
+                state.history = Some(same_url_push_state(tab));
+                tab.interaction += 1;
+                state.interaction_cause = Some("input.wheel.main");
             }
             Some(PageReaction::ForeignCause) => {
                 tab.interaction += 1;
