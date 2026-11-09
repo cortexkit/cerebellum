@@ -28,7 +28,7 @@ use crate::preview_schedule::{OverlayFrame, OverlayPreview, OverlayPreviewMotion
 #[cfg(feature = "desk-probe")]
 mod capture_probe;
 #[cfg(feature = "desk-probe")]
-pub use capture_probe::probe_overlay_capture_exclusion;
+pub use capture_probe::{prepare_app_use_desk_probe, probe_overlay_capture_exclusion};
 // The preview's window: a child module, so it draws the badge and its chip
 // with the same private drawing code as the badge's own panel.
 mod preview_window;
