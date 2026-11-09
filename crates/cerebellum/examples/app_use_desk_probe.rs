@@ -8,7 +8,7 @@
 //! ```text
 //! cargo build -p cerebellum --features desk-probe --bin ck-cerebellum --example app_use_desk_probe
 //! cargo build -p cerebellum-macos --features desk-probe --example disclaim_launch
-//! codesign --force --sign 'Apple Development: YOUR NAME (TEAMID)' --identifier ck-cerebellum target/debug/ck-cerebellum target/debug/examples/app_use_desk_probe
+//! codesign --force --sign 'Apple Development: YOUR NAME (TEAMID)' --identifier ckdev-cerebellum-desk-probe target/debug/ck-cerebellum target/debug/examples/app_use_desk_probe
 //! target/debug/examples/disclaim_launch target/debug/examples/app_use_desk_probe --approve-desk-probe
 //! ```
 //!
@@ -168,6 +168,50 @@ fn desk_preflight(operation: impl FnOnce() -> i32) -> i32 {
 /// build directory that holds this example's `examples/` directory.
 fn helper_binary(executable: &Path) -> Option<PathBuf> {
     Some(executable.parent()?.parent()?.join(HELPER_BINARY))
+}
+
+/// Only a unique new pid can belong to the scratch launch. Repeated entries
+/// describe the same process, not additional instances.
+fn new_scratch_pid(before: &[u32], after: &[u32]) -> Result<u32, usize> {
+    let new: std::collections::BTreeSet<_> = after
+        .iter()
+        .copied()
+        .filter(|pid| !before.contains(pid))
+        .collect();
+    if new.len() == 1 {
+        Ok(*new.first().unwrap())
+    } else {
+        Err(new.len())
+    }
+}
+
+fn scratch_launch_command() -> std::process::Command {
+    // LaunchServices supplies the system-app launch context. Keep the new
+    // instance inactive but visible, and do not restore the person's documents.
+    let mut command = std::process::Command::new("/usr/bin/open");
+    command.args([
+        "-n",
+        "-g",
+        "-a",
+        "TextEdit",
+        "--args",
+        "-ApplePersistenceIgnoreState",
+        "YES",
+    ]);
+    command
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ScratchProcess {
+    pid: u32,
+    start_time: u64,
+}
+
+impl ScratchProcess {
+    /// A missing identity or a different start time must never authorize a kill.
+    fn may_kill(self, current_start_time: Option<u64>) -> bool {
+        self.pid != 0 && current_start_time == Some(self.start_time)
+    }
 }
 
 /// CPU time in nanoseconds from `proc_pid_rusage` time units. On Apple
@@ -386,7 +430,7 @@ mod allowing_cingulate;
 #[cfg(target_os = "macos")]
 mod desk {
     use super::*;
-    use std::process::{Child, Command};
+    use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
@@ -412,7 +456,6 @@ mod desk {
     use subc_protocol::session::{ModuleControlRequest, ModuleControlResponse};
     use subc_protocol::{Flags, Frame, FrameType, Principal, Priority, PROTOCOL_VERSION};
 
-    const TEXTEDIT: &str = "/System/Applications/TextEdit.app/Contents/MacOS/TextEdit";
     const TEXTEDIT_BUNDLE: &str = "com.apple.TextEdit";
     /// The agent the probe acts as; its badge and preview carry this name.
     const AGENT: &str = "desk-probe";
@@ -428,31 +471,57 @@ mod desk {
 
     /// The scratch TextEdit, killed when dropped.
     struct Scratch {
-        child: Child,
+        process: ScratchProcess,
     }
 
     impl Scratch {
         fn pid(&self) -> u32 {
-            self.child.id()
+            self.process.pid
         }
     }
 
-    fn kill(pid: u32) {
-        let _ = Command::new("/bin/kill")
-            .args(["-KILL", &pid.to_string()])
-            .status();
+    fn kill(process: ScratchProcess) -> bool {
+        if !process.may_kill(cerebellum_macos::process_start_time_micros(process.pid)) {
+            return false;
+        }
+        if !Command::new("/bin/kill")
+            .args(["-KILL", &process.pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return false;
+        }
+        // LaunchServices owns the child, so wait by identity rather than waitpid.
+        // The baseline must not begin while the first scratch app is still alive.
+        let deadline = Instant::now() + LAUNCH_WAIT;
+        while Instant::now() < deadline {
+            match cerebellum_macos::process_start_time(process.pid) {
+                cerebellum_macos::ProcessStartTime::NoSuchProcess => break,
+                cerebellum_macos::ProcessStartTime::Started(start)
+                    if start != process.start_time =>
+                {
+                    break
+                }
+                _ => std::thread::sleep(SAMPLE_EVERY),
+            }
+        }
+        true
     }
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            kill(self.child.id());
-            let _ = self.child.wait();
-            println!("SCRATCH {} killed", self.child.id());
+            let mut pending = SCRATCH_PID.lock().unwrap();
+            if *pending == Some(self.process) {
+                *pending = None;
+            }
+            if kill(self.process) {
+                println!("SCRATCH {} killed", self.pid());
+            }
         }
     }
 
-    /// The scratch pid, for the Ctrl-C handler. Zero when none is running.
-    static SCRATCH_PID: Mutex<u32> = Mutex::new(0);
+    /// The scratch identity for Ctrl-C; a pid alone may have been reused.
+    static SCRATCH_PID: Mutex<Option<ScratchProcess>> = Mutex::new(None);
 
     fn install_interrupt_handler() {
         std::thread::spawn(|| {
@@ -464,15 +533,51 @@ mod desk {
             };
             runtime.block_on(async {
                 if tokio::signal::ctrl_c().await.is_ok() {
-                    let pid = *SCRATCH_PID.lock().unwrap();
-                    if pid != 0 {
-                        kill(pid);
-                        println!("SCRATCH {pid} killed after interrupt");
+                    let mut pending = SCRATCH_PID.lock().unwrap();
+                    if let Some(process) = pending.take() {
+                        if kill(process) {
+                            println!("SCRATCH {} killed after interrupt", process.pid);
+                        }
                     }
                     std::process::exit(130);
                 }
             });
         });
+    }
+
+    fn textedit_pids() -> Result<Vec<u32>, String> {
+        Ok(cerebellum_macos::workspace_running_applications()?
+            .into_iter()
+            .filter(|app| app.bundle_identifier == TEXTEDIT_BUNDLE)
+            .map(|app| app.pid)
+            .collect())
+    }
+
+    fn launch_scratch(before: &[u32]) -> Result<Scratch, String> {
+        let status = scratch_launch_command()
+            .status()
+            .map_err(|error| error.to_string())?;
+        if !status.success() {
+            return Err(format!("open exited with {status}"));
+        }
+        let deadline = Instant::now() + LAUNCH_WAIT;
+        loop {
+            match new_scratch_pid(before, &textedit_pids()?) {
+                Ok(pid) => {
+                    let start_time = match cerebellum_macos::process_start_time(pid) {
+                        cerebellum_macos::ProcessStartTime::Started(start) => start,
+                        other => {
+                            return Err(format!("cannot identify scratch pid {pid}: {other:?}"))
+                        }
+                    };
+                    return Ok(Scratch {
+                        process: ScratchProcess { pid, start_time },
+                    });
+                }
+                Err(0) if Instant::now() < deadline => std::thread::sleep(SAMPLE_EVERY),
+                Err(count) => return Err(format!("expected one new TextEdit pid, found {count}")),
+            }
+        }
     }
 
     /// Answers each card with the first choice it offers in the probe's
@@ -897,20 +1002,25 @@ mod desk {
             return 2;
         };
         install_interrupt_handler();
-        // A second TextEdit runs under the person's HOME, so without this it
-        // would reopen their documents from saved window state.
-        let child = match Command::new(TEXTEDIT)
-            .args(["-ApplePersistenceIgnoreState", "YES"])
-            .spawn()
-        {
-            Ok(child) => child,
+        // Hold the interrupt registry until discovery has either registered the
+        // new identity or refused it; Ctrl-C must not skip a pending launch.
+        let mut pending = SCRATCH_PID.lock().unwrap();
+        let before = match textedit_pids() {
+            Ok(before) if before.is_empty() => before,
+            other => {
+                eprintln!("UNMEASURABLE: TextEdit must not be running; cannot establish an empty pid set ({other:?})");
+                return 2;
+            }
+        };
+        let scratch = match launch_scratch(&before) {
+            Ok(scratch) => scratch,
             Err(error) => {
                 eprintln!("UNMEASURABLE: cannot launch scratch TextEdit: {error}");
                 return 2;
             }
         };
-        let scratch = Scratch { child };
-        *SCRATCH_PID.lock().unwrap() = scratch.pid();
+        *pending = Some(scratch.process);
+        drop(pending);
         println!(
             "SCRATCH TextEdit pid {}; the person's front app is pid {person}",
             scratch.pid()
@@ -928,7 +1038,6 @@ mod desk {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             runtime.block_on(measure(&scratch, person, baseline))
         }));
-        *SCRATCH_PID.lock().unwrap() = 0;
         drop(scratch);
         let code = match outcome {
             Ok(code) => code,
@@ -1337,6 +1446,51 @@ mod tests {
             helper_binary(Path::new("/w/target/debug/examples/app_use_desk_probe")),
             Some(PathBuf::from("/w/target/debug/ck-cerebellum"))
         );
+    }
+
+    #[test]
+    fn scratch_launch_uses_launchservices_without_activating_textedit() {
+        let command = scratch_launch_command();
+        assert_eq!(command.get_program(), "/usr/bin/open");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "-n",
+                "-g",
+                "-a",
+                "TextEdit",
+                "--args",
+                "-ApplePersistenceIgnoreState",
+                "YES",
+            ]
+        );
+    }
+
+    #[test]
+    fn scratch_launch_requires_exactly_one_new_textedit_pid() {
+        assert_eq!(new_scratch_pid(&[], &[200]), Ok(200));
+        assert_eq!(new_scratch_pid(&[100], &[100, 200]), Ok(200));
+        assert_eq!(new_scratch_pid(&[100], &[200, 200, 100]), Ok(200));
+        assert_eq!(new_scratch_pid(&[], &[]), Err(0));
+        assert_eq!(new_scratch_pid(&[100], &[100]), Err(0));
+        assert_eq!(new_scratch_pid(&[100], &[]), Err(0));
+        assert_eq!(new_scratch_pid(&[], &[100, 200]), Err(2));
+        assert_eq!(new_scratch_pid(&[100], &[300, 200, 100]), Err(2));
+    }
+
+    #[test]
+    fn scratch_kill_requires_the_original_process_start_time() {
+        let scratch = ScratchProcess {
+            pid: 200,
+            start_time: 12345,
+        };
+        assert!(scratch.may_kill(Some(12345)));
+        assert!(!scratch.may_kill(Some(12346)), "a reused pid is not ours");
+        assert!(
+            !scratch.may_kill(None),
+            "unknown or exited processes must not be killed"
+        );
+        assert!(!ScratchProcess { pid: 0, ..scratch }.may_kill(Some(12345)));
     }
 
     #[test]

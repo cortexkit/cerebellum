@@ -8,14 +8,28 @@ use block2::RcBlock;
 use objc2_foundation::NSError;
 use objc2_screen_capture_kit::SCShareableContent;
 
-/// Every window ScreenCaptureKit offers for capture, as (window ID, on screen).
-fn shareable_windows(timeout: Duration) -> Result<Vec<(u32, bool)>, String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowOwner {
+    pid: i32,
+    name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShareableWindow {
+    id: u32,
+    on_screen: bool,
+    title: Option<String>,
+    owner: Option<WindowOwner>,
+}
+
+/// Copy metadata in the same pass as the IDs, so missing owner information
+/// cannot silently filter a window out of the privacy check.
+fn shareable_windows(timeout: Duration) -> Result<Vec<ShareableWindow>, String> {
     let (sink, delivery) = std::sync::mpsc::channel();
     let handler = RcBlock::new(
         move |content: *mut SCShareableContent, error: *mut NSError| {
             // SAFETY: callback objects remain valid until it returns. Copy only
-            // IDs and on-screen flags, without filtering out windows whose
-            // owner metadata is missing.
+            // owned metadata, without filtering out windows whose owner is missing.
             let result = unsafe {
                 if let Some(error) = error.as_ref() {
                     Err(error.localizedDescription().to_string())
@@ -23,7 +37,15 @@ fn shareable_windows(timeout: Duration) -> Result<Vec<(u32, bool)>, String> {
                     Ok(content
                         .windows()
                         .iter()
-                        .map(|w| (w.windowID(), w.isOnScreen()))
+                        .map(|w| ShareableWindow {
+                            id: w.windowID(),
+                            on_screen: w.isOnScreen(),
+                            title: w.title().map(|title| title.to_string()),
+                            owner: w.owningApplication().map(|app| WindowOwner {
+                                pid: app.processID(),
+                                name: app.applicationName().to_string(),
+                            }),
+                        })
                         .collect())
                 } else {
                     Err("no shareable content or error".to_owned())
@@ -271,12 +293,16 @@ fn matched_count(samples: &[PatchSample]) -> usize {
 #[derive(Debug)]
 enum CaptureObservation {
     Refused(String),
-    Pixels(usize),
+    Pixels {
+        patches: usize,
+        visible_pixels: usize,
+    },
 }
 
 #[derive(Debug)]
 struct WindowObservation {
-    listed: bool,
+    shareable: Vec<ShareableWindow>,
+    on_screen: bool,
     capture: CaptureObservation,
     /// The patches read from the capture; empty when it was refused.
     samples: Vec<PatchSample>,
@@ -285,7 +311,7 @@ struct WindowObservation {
 fn observe(
     mtm: MainThreadMarker,
     window_id: u32,
-    listed: bool,
+    on_screen: bool,
     pattern: usize,
 ) -> Result<WindowObservation, String> {
     let (capture, samples) = match capture(mtm, window_id) {
@@ -294,22 +320,41 @@ fn observe(
         Ok(image) => {
             let samples = patches(&image, pattern)?;
             (
-                CaptureObservation::Pixels(matched_count(&samples)),
+                CaptureObservation::Pixels {
+                    patches: matched_count(&samples),
+                    visible_pixels: visible_pixels(&image),
+                },
                 samples.to_vec(),
             )
         }
     };
     Ok(WindowObservation {
-        listed,
+        shareable: Vec::new(),
+        on_screen,
         capture,
         samples,
     })
 }
 
+fn visible_pixels(image: &RawCapture) -> usize {
+    image
+        .bgra
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| pixel[3] != 0)
+        .count()
+}
+
 fn describe(observation: &WindowObservation) -> String {
     let mut capture = match &observation.capture {
         CaptureObservation::Refused(reason) => format!("refused ({reason})"),
-        CaptureObservation::Pixels(count) => format!("captured {count}/4 pattern patches"),
+        CaptureObservation::Pixels {
+            patches,
+            visible_pixels,
+        } => {
+            format!("captured {patches}/4 pattern patches, {visible_pixels} non-zero-alpha pixels")
+        }
     };
     if !observation.samples.is_empty() {
         let samples: Vec<String> = observation
@@ -325,12 +370,23 @@ fn describe(observation: &WindowObservation) -> String {
             .collect();
         capture.push_str(&format!(" (sampled vs expected: {})", samples.join("; ")));
     }
-    format!("shareable={}, {capture}", observation.listed)
+    let metadata: Vec<_> = observation
+        .shareable
+        .iter()
+        .map(|window| format!("title={:?}, owner={:?}", window.title, window.owner))
+        .collect();
+    format!(
+        "shareable={}, on_screen={}, metadata=[{}], {capture}",
+        !observation.shareable.is_empty(),
+        observation.on_screen,
+        metadata.join("; ")
+    )
 }
 
 fn capture_verdict(
     protected: &[WindowObservation; 2],
     control: &WindowObservation,
+    own_pid: i32,
 ) -> Result<String, String> {
     let report = format!(
         "control: {}; preview: {}; badge: {}",
@@ -338,15 +394,33 @@ fn capture_verdict(
         describe(&protected[0]),
         describe(&protected[1]),
     );
-    if !control.listed || !matches!(control.capture, CaptureObservation::Pixels(4)) {
+    if control.shareable.is_empty()
+        || !matches!(
+            control.capture,
+            CaptureObservation::Pixels { patches: 4, .. }
+        )
+    {
         return Err(format!("capture positive control failed: {report}"));
     }
     for (name, observation) in ["preview", "badge"].into_iter().zip(protected) {
-        if observation.listed {
-            return Err(format!("{name} is listed in SCShareableContent: {report}"));
+        if !observation.on_screen {
+            return Err(format!(
+                "{name} was not confirmed on screen by the window server: {report}"
+            ));
         }
-        if matches!(observation.capture, CaptureObservation::Pixels(count) if count != 0) {
-            return Err(format!("{name} private pattern pixels leaked: {report}"));
+        for window in &observation.shareable {
+            if window.title.as_ref().is_some_and(|title| !title.is_empty()) {
+                return Err(format!("{name} has a non-empty shareable title: {report}"));
+            }
+            if window.owner.as_ref().map(|owner| owner.pid) != Some(own_pid) {
+                return Err(format!(
+                    "{name} shareable owner is not this process: {report}"
+                ));
+            }
+        }
+        if matches!(observation.capture, CaptureObservation::Pixels { visible_pixels, .. } if visible_pixels != 0)
+        {
+            return Err(format!("{name} visible pixels leaked: {report}"));
         }
     }
     Ok(report)
@@ -357,9 +431,10 @@ fn capture_verdict(
 /// separate shareable control must be listed and yield its pattern. Call only
 /// from the manually started app_use_desk_probe example, on the main thread,
 /// after its --approve-desk-probe opt-in and permission preflight.
-/// No raster is stored or returned; the report records refusal versus no pattern,
-/// and for each captured window the median colour of each sampled patch next
-/// to the colour drawn there.
+/// No raster is stored or returned; the report records shareable titles and
+/// owners, capture refusal or the count of non-zero-alpha pixels, and sampled
+/// colours next to those drawn. Listed panels must expose no title and belong
+/// to this process; every panel must be on screen and yield no visible pixels.
 #[doc(hidden)]
 pub fn probe_overlay_capture_exclusion() -> Result<String, String> {
     if !crate::screen_capture_is_permitted() {
@@ -419,26 +494,30 @@ pub fn probe_overlay_capture_exclusion() -> Result<String, String> {
         // its first drawn frame was composited. Wait until the window server
         // lists all three windows on screen and ScreenCaptureKit lists the
         // control on screen, then settle once more before capturing.
-        // A panel listed by ScreenCaptureKit in any read fails the verdict, so
-        // every read counts towards the panels' membership, not only the last.
-        let mut listed_ever = [false; 3];
-        let record = |listed_ever: &mut [bool; 3], shareable: &[(u32, bool)]| {
-            for (listed, id) in listed_ever.iter_mut().zip(&ids) {
-                *listed |= shareable.iter().any(|(window, _)| window == id);
+        // Keep metadata from every read: a later empty title must not erase
+        // a title or wrong owner that was exposed earlier.
+        let mut seen: [Vec<ShareableWindow>; 3] = std::array::from_fn(|_| Vec::new());
+        let record = |seen: &mut [Vec<ShareableWindow>; 3], shareable: &[ShareableWindow]| {
+            for (windows, id) in seen.iter_mut().zip(&ids) {
+                for window in shareable.iter().filter(|window| window.id == *id) {
+                    if !windows.contains(window) {
+                        windows.push(window.clone());
+                    }
+                }
             }
         };
         let on_screen_deadline = Instant::now() + ON_SCREEN_DEADLINE;
-        loop {
+        let on_screen = loop {
             let shareable = on_worker(mtm, || shareable_windows(Duration::from_secs(10)))?;
-            record(&mut listed_ever, &shareable);
-            let all_on_screen = panels
-                .iter()
-                .all(|p| window_listed_on_screen(p.windowNumber()));
+            record(&mut seen, &shareable);
+            let on_screen: [bool; 3] =
+                std::array::from_fn(|i| window_listed_on_screen(panels[i].windowNumber()));
+            let all_on_screen = on_screen.iter().all(|on_screen| *on_screen);
             let control_on_screen = shareable
                 .iter()
-                .any(|&(window, on_screen)| window == ids[2] && on_screen);
+                .any(|window| window.id == ids[2] && window.on_screen);
             if all_on_screen && control_on_screen {
-                break;
+                break on_screen;
             }
             if Instant::now() >= on_screen_deadline {
                 return Err(format!(
@@ -448,7 +527,7 @@ pub fn probe_overlay_capture_exclusion() -> Result<String, String> {
                 ));
             }
             pump(mtm, POLL);
-        }
+        };
         pump(mtm, SETTLE);
 
         // The control must show its whole pattern before anything else is
@@ -457,9 +536,13 @@ pub fn probe_overlay_capture_exclusion() -> Result<String, String> {
         let mut attempts = 0;
         let mut control = loop {
             attempts += 1;
-            let attempt = observe(mtm, ids[2], true, 2)
+            let mut attempt = observe(mtm, ids[2], on_screen[2], 2)
                 .map_err(|e| format!("capture positive control failed: {e}"))?;
-            if matches!(attempt.capture, CaptureObservation::Pixels(4)) {
+            attempt.shareable = seen[2].clone();
+            if matches!(
+                attempt.capture,
+                CaptureObservation::Pixels { patches: 4, .. }
+            ) {
                 break attempt;
             }
             if Instant::now() >= control_deadline {
@@ -475,18 +558,21 @@ pub fn probe_overlay_capture_exclusion() -> Result<String, String> {
         // The panels were ordered in and drawn before the control, so they
         // have had at least the control's time on screen and the same settle.
         let mut protected = [
-            observe(mtm, ids[0], false, 0)?,
-            observe(mtm, ids[1], false, 1)?,
+            observe(mtm, ids[0], on_screen[0], 0)?,
+            observe(mtm, ids[1], on_screen[1], 1)?,
         ];
-        // Read membership once more after the captures, so a panel that joins
-        // the shareable list late is still caught.
+        // Read metadata once more after the captures, so a late title or owner
+        // change is checked too, without a separate metadata enumeration.
         let shareable = on_worker(mtm, || shareable_windows(Duration::from_secs(10)))?;
-        record(&mut listed_ever, &shareable);
-        for (observation, listed) in protected.iter_mut().zip(listed_ever) {
-            observation.listed = listed;
+        record(&mut seen, &shareable);
+        for (observation, windows) in protected.iter_mut().zip(seen) {
+            observation.shareable = windows;
         }
-        control.listed = shareable.iter().any(|(window, _)| *window == ids[2]);
-        capture_verdict(&protected, &control)
+        control.shareable = shareable
+            .into_iter()
+            .filter(|window| window.id == ids[2])
+            .collect();
+        capture_verdict(&protected, &control, std::process::id() as i32)
     })();
     // Cleanup runs on every error path as well as success.
     crate::preview_schedule::PreviewSurface::remove(&mut preview);
@@ -498,6 +584,116 @@ pub fn probe_overlay_capture_exclusion() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const OWN_PID: i32 = 42;
+
+    fn pixels(patches: usize, visible_pixels: usize) -> CaptureObservation {
+        CaptureObservation::Pixels {
+            patches,
+            visible_pixels,
+        }
+    }
+
+    fn observation(listed: bool, capture: CaptureObservation) -> WindowObservation {
+        WindowObservation {
+            shareable: if listed {
+                vec![ShareableWindow {
+                    id: 7,
+                    on_screen: true,
+                    title: Some(String::new()),
+                    owner: Some(WindowOwner {
+                        pid: OWN_PID,
+                        name: "neutral probe".into(),
+                    }),
+                }]
+            } else {
+                Vec::new()
+            },
+            on_screen: true,
+            capture,
+            samples: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_panel_must_be_confirmed_on_screen_even_when_unlisted() {
+        let control = observation(true, pixels(4, 1));
+        for index in 0..2 {
+            let mut panels = [
+                observation(false, pixels(0, 0)),
+                observation(false, pixels(0, 0)),
+            ];
+            assert!(capture_verdict(&panels, &control, OWN_PID).is_ok());
+            panels[index].on_screen = false;
+            assert!(capture_verdict(&panels, &control, OWN_PID)
+                .unwrap_err()
+                .contains("not confirmed on screen"));
+        }
+    }
+
+    #[test]
+    fn a_listed_panel_must_not_expose_a_title() {
+        let control = observation(true, pixels(4, 1));
+        for index in 0..2 {
+            let mut panels = [
+                observation(true, pixels(0, 0)),
+                observation(true, pixels(0, 0)),
+            ];
+            panels[index].shareable[0].title = None;
+            assert!(capture_verdict(&panels, &control, OWN_PID).is_ok());
+            panels[index].shareable[0].title = Some("private document".into());
+            let reason = capture_verdict(&panels, &control, OWN_PID).unwrap_err();
+            assert!(reason.contains("non-empty shareable title"), "{reason}");
+            assert!(reason.contains("private document"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_listed_panel_must_belong_to_this_process() {
+        let control = observation(true, pixels(4, 1));
+        for index in 0..2 {
+            for owner in [
+                None,
+                Some(WindowOwner {
+                    pid: OWN_PID + 1,
+                    name: "another app".into(),
+                }),
+            ] {
+                let mut panels = [
+                    observation(true, pixels(0, 0)),
+                    observation(true, pixels(0, 0)),
+                ];
+                panels[index].shareable[0].owner = owner;
+                assert!(capture_verdict(&panels, &control, OWN_PID)
+                    .unwrap_err()
+                    .contains("owner is not this process"));
+            }
+        }
+    }
+
+    #[test]
+    fn any_non_zero_alpha_pixel_fails_even_outside_the_pattern_samples() {
+        let control = observation(true, pixels(4, 1));
+        for alpha in [1, 239, 255] {
+            for at in [0, 127, 128 * 128 - 1] {
+                let mut image = quadrant_image(128, [[0; 3]; 4], 0);
+                image.bgra[at * 4 + 3] = alpha;
+                let samples = patches(&image, 0).unwrap();
+                assert_eq!(matched_count(&samples), 0);
+                assert_eq!(visible_pixels(&image), 1);
+                for index in 0..2 {
+                    let mut panels = [
+                        observation(false, pixels(0, 0)),
+                        observation(false, pixels(0, 0)),
+                    ];
+                    panels[index].capture = pixels(0, visible_pixels(&image));
+                    assert!(capture_verdict(&panels, &control, OWN_PID)
+                        .unwrap_err()
+                        .contains("visible pixels leaked"));
+                }
+            }
+        }
+    }
 
     #[test]
     fn p3_palette_is_the_srgb_palette_converted() {
@@ -558,10 +754,9 @@ mod tests {
     }
 
     #[test]
-    fn single_window_capture_rejects_listed_or_leaking_panels_and_requires_a_visible_control() {
-        // The synthetic verdict cases below cannot observe constructor changes.
-        // Keep both real panels' privacy policy tied to this capture contract
-        // without creating windows or taking screenshots in a unit test.
+    fn single_window_capture_requires_private_panels_and_a_visible_control() {
+        // Synthetic verdicts cannot observe constructor changes. Keep the real
+        // panels' sharing policy covered without creating windows in a test.
         for (source, constructor) in [
             (include_str!("preview_window.rs"), "impl PreviewWindow {"),
             (include_str!("../cursor_overlay.rs"), "impl Picture {"),
@@ -580,68 +775,46 @@ mod tests {
                 "{constructor} must exclude its panel from capture"
             );
         }
-
-        let observation = |listed, capture| WindowObservation {
-            listed,
-            capture,
-            samples: Vec::new(),
-        };
-        let hidden = || observation(false, CaptureObservation::Pixels(0));
+        let hidden = || observation(false, pixels(0, 0));
         let refused = || observation(false, CaptureObservation::Refused("not shareable".into()));
-        let control = observation(true, CaptureObservation::Pixels(4));
+        let control = observation(true, pixels(4, 128 * 128));
         for panels in [
             [hidden(), hidden()],
             [refused(), hidden()],
             [hidden(), refused()],
             [refused(), refused()],
+            [
+                observation(true, pixels(0, 0)),
+                observation(true, pixels(0, 0)),
+            ],
         ] {
-            let report = capture_verdict(&panels, &control).unwrap();
-            for (name, panel) in ["preview", "badge"].into_iter().zip(&panels) {
-                let expected = match panel.capture {
-                    CaptureObservation::Refused(_) => "refused (not shareable)",
-                    CaptureObservation::Pixels(_) => "captured 0/4 pattern patches",
-                };
-                assert!(report.contains(&format!("{name}: shareable=false, {expected}")));
-            }
-        }
-        for index in 0..2 {
-            for capture in [
-                CaptureObservation::Refused("not shareable".into()),
-                CaptureObservation::Pixels(0),
-                CaptureObservation::Pixels(4),
-            ] {
-                let mut panels = [hidden(), hidden()];
-                panels[index] = observation(true, capture);
-                assert!(capture_verdict(&panels, &control)
-                    .unwrap_err()
-                    .contains("listed in SCShareableContent"));
-            }
-            for count in 1..=4 {
-                let mut panels = [hidden(), hidden()];
-                panels[index] = observation(false, CaptureObservation::Pixels(count));
-                assert!(capture_verdict(&panels, &control)
-                    .unwrap_err()
-                    .contains("private pattern pixels leaked"));
-            }
+            let report = capture_verdict(&panels, &control, OWN_PID).unwrap();
+            assert!(report.contains("owner=Some(WindowOwner { pid: 42, name: \"neutral probe\" })"));
+            assert!(report.contains("title=Some(\"\")"));
         }
         for listed in [false, true] {
             for count in 0..=4 {
                 if listed && count == 4 {
                     continue;
                 }
-                let bad_control = observation(listed, CaptureObservation::Pixels(count));
-                assert!(capture_verdict(&[hidden(), hidden()], &bad_control)
-                    .unwrap_err()
-                    .contains("control failed"));
+                let bad_control = observation(listed, pixels(count, 1));
+                assert!(
+                    capture_verdict(&[hidden(), hidden()], &bad_control, OWN_PID)
+                        .unwrap_err()
+                        .contains("control failed")
+                );
             }
             let bad_control = observation(listed, CaptureObservation::Refused("denied".into()));
-            assert!(capture_verdict(&[hidden(), hidden()], &bad_control)
-                .unwrap_err()
-                .contains("control failed"));
-            // A broken control takes precedence even if a panel also leaks.
+            assert!(
+                capture_verdict(&[hidden(), hidden()], &bad_control, OWN_PID)
+                    .unwrap_err()
+                    .contains("control failed")
+            );
+            // A broken control takes precedence even when a panel also leaks.
             assert!(capture_verdict(
-                &[observation(true, CaptureObservation::Pixels(4)), hidden()],
+                &[observation(true, pixels(4, 1)), hidden()],
                 &bad_control,
+                OWN_PID
             )
             .unwrap_err()
             .contains("control failed"));
@@ -858,14 +1031,14 @@ mod tests {
         let observation = |image: &RawCapture, pattern, listed| {
             let samples = patches(image, pattern).unwrap();
             WindowObservation {
-                listed,
-                capture: CaptureObservation::Pixels(matched_count(&samples)),
+                capture: pixels(matched_count(&samples), visible_pixels(image)),
                 samples: samples.to_vec(),
+                ..observation(listed, pixels(0, 0))
             }
         };
         for side in [128, 256] {
             let control = observation(&control_with_boundary_blend(side), 2, true);
-            let absent = quadrant_image(side, [[0; 3]; 4], 255);
+            let absent = quadrant_image(side, [[0; 3]; 4], 0);
             for (pattern, name, quadrants) in [
                 (
                     0,
@@ -892,16 +1065,16 @@ mod tests {
                     observation(&absent, 0, false),
                     observation(&absent, 1, false),
                 ];
-                assert!(capture_verdict(&protected, &control).is_ok());
+                assert!(capture_verdict(&protected, &control, OWN_PID).is_ok());
                 let present = quadrant_image(side, quadrants, 255);
                 protected[pattern] = observation(&present, pattern, false);
                 assert!(matches!(
                     protected[pattern].capture,
-                    CaptureObservation::Pixels(4)
+                    CaptureObservation::Pixels { patches: 4, .. }
                 ));
-                let reason = capture_verdict(&protected, &control).unwrap_err();
+                let reason = capture_verdict(&protected, &control, OWN_PID).unwrap_err();
                 assert!(
-                    reason.contains(&format!("{name} private pattern pixels leaked")),
+                    reason.contains(&format!("{name} visible pixels leaked")),
                     "{reason}"
                 );
             }
@@ -913,14 +1086,15 @@ mod tests {
         let image = quadrant_image(128, [[0, 0, 0]; 4], 255);
         let samples = patches(&image, 2).unwrap();
         let observation = WindowObservation {
-            listed: true,
-            capture: CaptureObservation::Pixels(matched_count(&samples)),
+            capture: pixels(matched_count(&samples), visible_pixels(&image)),
             samples: samples.to_vec(),
+            ..observation(true, pixels(0, 0))
         };
         let text = describe(&observation);
-        assert!(
-            text.starts_with("shareable=true, captured 0/4 pattern patches (sampled vs expected: ")
-        );
+        assert!(text.starts_with("shareable=true, on_screen=true, metadata=["));
+        assert!(text.contains(
+            "captured 0/4 pattern patches, 16384 non-zero-alpha pixels (sampled vs expected: "
+        ));
         for [r, g, b] in pattern_colours(2) {
             assert!(
                 text.contains(&format!("rgb 0,0,0 alpha 255 vs {r},{g},{b}")),
