@@ -50,6 +50,13 @@ default port. The vault, not cerebellum, decides whether that origin matches.
 
 ## Derived browser examples, not published vault vectors
 
+These rows are cerebellum's own rule and stay here; the vault will not publish
+them. The vault never sees a page URL, only the origin cerebellum sends, and it
+refuses (`invalid_params`) any origin that is not exactly `https://<lowercase
+host>` with an optional port and no path. So an uppercase host or a trailing
+slash reaching the vault is refused, not matched: this normalization is
+required for a fill to work at all (CKCRED, 2026-11-09).
+
 `derived-origin-cases.json` is **derived from docs/wire-contract-v1.md
 'Multi-host secret scopes' at cc7544d7, not vault-published**. The exact tagged
 section is "Multi-host secret scopes (normative extension)". It supplies these
