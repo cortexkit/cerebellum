@@ -912,6 +912,9 @@ fn user_revoke_matches_only_the_callers_holder_target_and_subject() {
             "example.com",
         ),
     ] {
+        // One clock reading: a millisecond tick between two reads would make a
+        // worker grant one millisecond longer than its thirty-minute ceiling.
+        let now = store.now_ms();
         store
             .upsert(
                 AgentGrant {
@@ -920,15 +923,15 @@ fn user_revoke_matches_only_the_callers_holder_target_and_subject() {
                     subject: GrantSubject::Domain(domain.into()),
                     browser_target: Some(target),
                     machine_uuid: "test-machine".into(),
-                    granted_at_ms: store.now_ms(),
-                    expires_at_ms: Some(store.now_ms() + 1_800_000),
+                    granted_at_ms: now,
+                    expires_at_ms: Some(now + 1_800_000),
                     card_ref: Some("card".into()),
                     max_level: 3,
                     hazards: vec![],
                     team_id: None,
                     designated_requirement: None,
                 },
-                store.now_ms(),
+                now,
             )
             .unwrap();
     }
