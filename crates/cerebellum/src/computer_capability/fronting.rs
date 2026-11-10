@@ -1139,8 +1139,13 @@ where
         purpose: FrontingPurpose,
         guards: bool,
     ) -> Result<ObligationParts, PrepareStop> {
-        self.prepare_front_with_authority(call, purpose, guards, TemporaryFrontAuthority::AppUse)
-            .await
+        Box::pin(self.prepare_front_with_authority(
+            call,
+            purpose,
+            guards,
+            TemporaryFrontAuthority::AppUse,
+        ))
+        .await
     }
 
     /// Prepare only a takeover-authorized image or chord bracket. In particular,
@@ -1151,12 +1156,14 @@ where
         purpose: FrontingPurpose,
         admission: &crate::computer_grants::GrantAdmission,
     ) -> Result<ObligationParts, PrepareStop> {
-        self.prepare_front_with_authority(
+        // Preparation contains the lock wait and blocking guard future. Keep
+        // that state off the nested wire handler's debug poll stack.
+        Box::pin(self.prepare_front_with_authority(
             call,
             purpose,
             true,
             TemporaryFrontAuthority::Takeover(admission),
-        )
+        ))
         .await
     }
 

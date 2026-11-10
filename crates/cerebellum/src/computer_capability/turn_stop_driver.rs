@@ -1,4 +1,4 @@
-//! A scripted platform constructed only by the held-key vector fixture. It has
+//! A scripted platform for held-key and temporary-front wire fixtures. It has
 //! no native fallback, so an unexpected operation cannot reach the desktop.
 
 use crate::test_support::HANG_GUARD;
@@ -13,11 +13,22 @@ pub(crate) struct Sequence {
 
 pub(crate) struct Driver {
     sequence: Arc<Sequence>,
+    fronted: Option<Box<super::fronting_tests::FakeDriver>>,
 }
 
 impl Driver {
     pub(crate) fn scripted(sequence: Arc<Sequence>) -> Self {
-        Self { sequence }
+        Self {
+            sequence,
+            fronted: None,
+        }
+    }
+
+    pub(crate) fn fronted(driver: Box<super::fronting_tests::FakeDriver>) -> Self {
+        Self {
+            sequence: Arc::default(),
+            fronted: Some(driver),
+        }
     }
 }
 
@@ -31,6 +42,22 @@ macro_rules! reject {
 }
 
 impl PlatformDriver for Driver {
+    fn accept_fronted_dispatch_hooks(&mut self, hooks: Box<dyn FrontedDispatchHooks>) -> bool {
+        self.fronted
+            .as_mut()
+            .is_some_and(|driver| driver.accept_fronted_dispatch_hooks(hooks))
+    }
+
+    fn dispatch_fronted(
+        &mut self,
+        request: FrontedDispatchRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<cerebellum_computer::dispatch::BracketReport, DriverError> {
+        self.fronted
+            .as_mut()
+            .expect("a fronted wire fixture")
+            .dispatch_fronted(request, cancelled)
+    }
     fn capability_declarations(
         &self,
         _: &CapabilityAdvertisementContext,
@@ -129,11 +156,15 @@ impl PlatformDriver for Driver {
             detection_latency_ms: 1,
         })
     }
-    reject!(
-        observe_effect(
-            request: EffectObservationRequest,
-        ) -> Result<EffectObservationResult, DriverError>
-    );
+    fn observe_effect(
+        &mut self,
+        request: EffectObservationRequest,
+    ) -> Result<EffectObservationResult, DriverError> {
+        self.fronted
+            .as_mut()
+            .expect("a fronted wire fixture")
+            .observe_effect(request)
+    }
     fn verify_attendance(
         &mut self,
         _: AttendancePreconditionRequest,

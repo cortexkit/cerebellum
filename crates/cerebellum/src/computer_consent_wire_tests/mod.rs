@@ -31,7 +31,7 @@ impl management::TargetResolver for Running {
 
 /// Planes with one tool route that declares it can relay a question, and
 /// with `computer.wait` admitted.
-fn planes() -> Planes {
+pub(crate) fn planes() -> Planes {
     computer_grants::tests::CardService::install(planes_without_cards(), CHANNEL, EPOCH)
 }
 

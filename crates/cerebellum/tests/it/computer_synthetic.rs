@@ -16,6 +16,7 @@ use cerebellum::computer_capability::{
 };
 use cerebellum::management::ManagementPlane;
 use cerebellum_computer::capture::InMemoryCaptureBackend;
+use cerebellum_computer::dispatch::{FrontingBracketHost, HardwareInputSnapshot};
 use cerebellum_computer::platform::{
     AccessibilityTreeRequest, AccessibilityTreeResult, AttendancePreconditionRequest,
     AttendancePreconditionResult, CapabilityAdvertisementContext, CapabilityDeclaration,
@@ -26,6 +27,7 @@ use cerebellum_computer::platform::{
     SemanticDispatchRequest, SequencePostFailure, SyntheticAction, SyntheticDispatchRequest,
     SyntheticKey, SyntheticKeyModifiers, BLOCKED_CHORDS,
 };
+use cerebellum_computer::platform::{FrontedDispatchHooks, FrontingRestoreHost, RestoreHostSource};
 use cerebellum_core::clock::FakeClock;
 use cerebellum_core::journal::{
     InMemoryJournalStorage, JournalStorage, LifecycleState, ValidatedSeverityTaxonomy,
@@ -95,15 +97,19 @@ impl Shared {
 
 /// A platform driver that records the synthetic dispatches it is asked for
 /// and answers every observation the dispatch seam makes.
-struct SyntheticDriver(Arc<Mutex<Shared>>);
+struct SyntheticDriver(Arc<Mutex<Shared>>, Option<Box<dyn FrontedDispatchHooks>>);
 
 impl SyntheticDriver {
     fn factory(shared: Arc<Mutex<Shared>>) -> impl Fn() -> SyntheticDriver {
-        move || SyntheticDriver(Arc::clone(&shared))
+        move || SyntheticDriver(Arc::clone(&shared), None)
     }
 }
 
 impl PlatformDriver for SyntheticDriver {
+    fn accept_fronted_dispatch_hooks(&mut self, hooks: Box<dyn FrontedDispatchHooks>) -> bool {
+        self.1 = Some(hooks);
+        true
+    }
     fn take_input_route_evidence(
         &mut self,
     ) -> cerebellum_computer::platform::input_route::InputRouteEvidence {
@@ -221,7 +227,7 @@ impl PlatformDriver for SyntheticDriver {
             SyntheticAction::TypeText { text } => text.chars().count(),
             _ => 1,
         };
-        let mut desk = FrontingDesk {
+        let mut desk = SharedFrontingDesk(Arc::new(Mutex::new(FrontingDesk {
             now: 0,
             frontmost: Some(OTHER_APPLICATION_PID),
             pending: None,
@@ -232,23 +238,38 @@ impl PlatformDriver for SyntheticDriver {
             units_posted: 0,
             image_frontmost: None,
             front_requests: Vec::new(),
-        };
+        })));
         let chunks_started = std::cell::Cell::new(0);
         let scripted_cancel = || {
             chunks_started.set(chunks_started.get() + 1);
             cancelled() || (script.cancel_after_first_chunk && chunks_started.get() > 1)
         };
-        Ok(cerebellum_computer::dispatch::run_fronting_bracket(
-            &mut desk,
-            &mut cerebellum_computer::dispatch::UserIdleEstimator::new(),
-            cerebellum_computer::dispatch::BracketPlan {
-                target_pid: request.synthetic.target.pid,
-                units,
-                maximum_interval_ms: request.maximum_interval_ms,
-                maximum_seize_detection_latency_ms: request.maximum_seize_detection_latency_ms,
-            },
-            &scripted_cancel,
-        ))
+        let plan = cerebellum_computer::dispatch::BracketPlan {
+            target_pid: request.synthetic.target.pid,
+            units,
+            maximum_interval_ms: request.maximum_interval_ms,
+            maximum_seize_detection_latency_ms: request.maximum_seize_detection_latency_ms,
+        };
+        let mut idle = cerebellum_computer::dispatch::UserIdleEstimator::new();
+        Ok(match self.1.take() {
+            Some(mut hooks) => {
+                cerebellum_computer::platform::run_hooked_fronted(
+                    &mut desk,
+                    &mut idle,
+                    plan,
+                    &scripted_cancel,
+                    hooks.as_mut(),
+                    None,
+                )
+                .report
+            }
+            None => cerebellum_computer::dispatch::run_fronting_bracket(
+                &mut desk,
+                &mut idle,
+                plan,
+                &scripted_cancel,
+            ),
+        })
     }
 
     fn read_fronted(
@@ -262,7 +283,7 @@ impl PlatformDriver for SyntheticDriver {
             let shared = self.0.lock().unwrap();
             (shared.fronted.clone(), shared.image_frontmost.clone())
         };
-        let mut desk = FrontingDesk {
+        let mut desk = SharedFrontingDesk(Arc::new(Mutex::new(FrontingDesk {
             now: 0,
             frontmost: Some(OTHER_APPLICATION_PID),
             pending: None,
@@ -273,24 +294,35 @@ impl PlatformDriver for SyntheticDriver {
             units_posted: 0,
             image_frontmost: Some(frontmost),
             front_requests: Vec::new(),
+        })));
+        let plan = cerebellum_computer::dispatch::BracketPlan {
+            target_pid: target.pid,
+            units: 1,
+            maximum_interval_ms: bound,
+            maximum_seize_detection_latency_ms: 50,
         };
-        let report = cerebellum_computer::dispatch::run_fronting_read(
-            &mut desk,
-            &mut cerebellum_computer::dispatch::UserIdleEstimator::new(),
-            cerebellum_computer::dispatch::BracketPlan {
-                target_pid: target.pid,
-                units: 1,
-                maximum_interval_ms: bound,
-                maximum_seize_detection_latency_ms: 50,
-            },
-            cancelled,
-            read,
-        );
+        let mut idle = cerebellum_computer::dispatch::UserIdleEstimator::new();
+        let report = match self.1.take() {
+            Some(mut hooks) => {
+                cerebellum_computer::platform::run_hooked_fronted(
+                    &mut desk,
+                    &mut idle,
+                    plan,
+                    cancelled,
+                    hooks.as_mut(),
+                    Some(read),
+                )
+                .report
+            }
+            None => cerebellum_computer::dispatch::run_fronting_read(
+                &mut desk, &mut idle, plan, cancelled, read,
+            ),
+        };
         self.0
             .lock()
             .unwrap()
             .image_front_requests
-            .extend(desk.front_requests);
+            .extend(desk.0.lock().unwrap().front_requests.clone());
         Ok(report)
     }
 
@@ -478,6 +510,112 @@ impl cerebellum_computer::dispatch::FrontingBracketHost for FrontingDesk {
             generation_verifications: 4,
         })
     }
+}
+
+/// The bracket and its owned cleanup host share the original fake OS clock.
+/// Neither a read callback nor an observer tap is retained by cleanup.
+#[derive(Clone)]
+struct SharedFrontingDesk(Arc<Mutex<FrontingDesk>>);
+
+impl SharedFrontingDesk {
+    fn snapshot(&self) -> Option<HardwareInputSnapshot> {
+        let desk = self.0.lock().unwrap();
+        Some(HardwareInputSnapshot {
+            coverage_start_ms: 0,
+            last_input_ms: (desk.seize_after_first_unit && desk.units_posted > 0)
+                .then_some(desk.now),
+        })
+    }
+}
+
+impl RestoreHostSource for SharedFrontingDesk {
+    fn restore_host(&self) -> Box<dyn FrontingRestoreHost> {
+        Box::new(self.clone())
+    }
+}
+
+impl FrontingRestoreHost for SharedFrontingDesk {
+    fn now_ms(&mut self) -> u64 {
+        self.0.lock().unwrap().now
+    }
+    fn pause_ms(&mut self, milliseconds: u64) {
+        self.0.lock().unwrap().advance(milliseconds);
+    }
+    fn frontmost_pid(&mut self) -> Option<u32> {
+        self.0.lock().unwrap().frontmost
+    }
+    fn request_front(&mut self, pid: u32) -> bool {
+        self.0.lock().unwrap().request_front(pid)
+    }
+    fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
+        self.snapshot()
+    }
+}
+
+impl FrontingBracketHost for SharedFrontingDesk {
+    type Tap = ();
+    fn now_ms(&mut self) -> u64 {
+        self.0.lock().unwrap().now
+    }
+    fn pause_ms(&mut self, milliseconds: u64) {
+        self.0.lock().unwrap().advance(milliseconds);
+    }
+    fn frontmost_pid(&mut self) -> Option<u32> {
+        self.0.lock().unwrap().frontmost
+    }
+    fn request_front(&mut self, pid: u32) -> bool {
+        self.0.lock().unwrap().request_front(pid)
+    }
+    fn our_pid(&self) -> i64 {
+        7
+    }
+    fn create_tap(&mut self) -> Option<()> {
+        Some(())
+    }
+    fn read_idle(&mut self) -> cerebellum_computer::platform::IdleReading {
+        self.0.lock().unwrap().read_idle()
+    }
+    fn drain(&mut self, tap: &()) -> Vec<cerebellum_computer::dispatch::SourcedInputEvent> {
+        self.0.lock().unwrap().drain(tap)
+    }
+    fn post_heartbeat(&mut self) -> cerebellum_computer::dispatch::HeartbeatProbe {
+        self.0.lock().unwrap().post_heartbeat()
+    }
+    fn observe_heartbeat(
+        &mut self,
+        tap: &(),
+        probe: cerebellum_computer::dispatch::HeartbeatProbe,
+        watcher: &mut cerebellum_computer::dispatch::SeizeWatcher,
+    ) -> cerebellum_computer::dispatch::HeartbeatObservation {
+        self.0
+            .lock()
+            .unwrap()
+            .observe_heartbeat(tap, probe, watcher)
+    }
+    fn post_unit(
+        &mut self,
+        index: usize,
+    ) -> Result<cerebellum_computer::dispatch::UnitPosted, SequencePostFailure> {
+        self.0.lock().unwrap().post_unit(index)
+    }
+    fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
+        self.snapshot()
+    }
+}
+
+async fn with_terminal<T>(name: &str, future: impl std::future::Future<Output = T>) -> T {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let request = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        1,
+        1,
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        serde_json::to_vec(&json!({"name":name})).unwrap(),
+    )
+    .unwrap();
+    cerebellum::TerminalArbiter::scope_for_test(request, Box::pin(future)).await
 }
 
 mod image_read;
@@ -1290,8 +1428,9 @@ async fn serve_asking(
     consent: cerebellum::computer_grants::ConsentContext,
 ) -> Value {
     let clock = FakeClock::new();
-    plane
-        .serve(
+    with_terminal(
+        name,
+        plane.serve(
             servable(name).expect("the capability is servable"),
             &arguments,
             ServeContext {
@@ -1304,9 +1443,10 @@ async fn serve_asking(
                 now_ms: 10,
             },
             |_| InMemoryCaptureBackend::default(),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("{name} replied outside its row: {error:?}"))
+        ),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{name} replied outside its row: {error:?}"))
 }
 
 fn background(desk: Desk) -> Desk {
