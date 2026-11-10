@@ -2078,7 +2078,7 @@ where
             return refusal;
         }
         let work = super::quarantine::CallWork::current();
-        if let Some(mut busy) = work.bind(&self.serializer.quarantine, &grant) {
+        if let Some(mut busy) = work.bind(&self.serializer.quarantine, &grant).await {
             admission.decorate(&mut busy);
             return busy;
         }
@@ -2372,7 +2372,7 @@ where
             capability,
         } = call;
         let work = super::quarantine::CallWork::current();
-        if let Some(busy) = work.bind(&self.serializer.quarantine, &grant) {
+        if let Some(busy) = work.bind(&self.serializer.quarantine, &grant).await {
             return PressDone::alone(busy);
         }
         let source = self.app_state_source.clone();

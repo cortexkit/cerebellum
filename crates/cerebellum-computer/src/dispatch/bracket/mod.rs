@@ -89,6 +89,23 @@ pub trait FrontingBracketHost {
     /// Ask the application `pid` runs to become frontmost. `false` when the
     /// request itself was refused.
     fn request_front(&mut self, pid: u32) -> bool;
+    /// Optional diagnostic observation; it never authorizes more action input.
+    fn late_activation_observed(&mut self, _latency_ms: u64) {}
+    /// The action's confirmation wait ended. Later observations belong only
+    /// to cleanup and must not turn the refused action into a confirmed front.
+    fn front_attempt_finished(&mut self) {}
+    /// A hooked caller owns pending-activation cleanup; ordinary hosts use
+    /// the same bounded confirmation-aware decision directly.
+    fn restore_front_attempt(
+        &mut self,
+        previous: u32,
+        target: u32,
+        since: u64,
+        wait_ms: u64,
+        activation_observed: bool,
+    ) -> RestoreOutcome {
+        restore_after_front_attempt(self, previous, target, since, wait_ms, activation_observed)
+    }
     /// Our own pid as input sources carry it.
     fn our_pid(&self) -> i64;
     /// Start watching session input. `None` when no observer can be started.
@@ -438,6 +455,7 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
             }
             host.borrow_mut().pause_ms(FRONTING_POLL_MS);
         }
+        host.borrow_mut().front_attempt_finished();
         if !front_ok {
             report.stop = Some(if cancelled() {
                 BracketStop::Cancelled
@@ -455,6 +473,7 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
                     target: plan.target_pid,
                     fronted_at,
                     bound,
+                    activation_observed: false,
                 },
                 admitted,
                 &mut person_input,
@@ -570,6 +589,7 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
                 target: plan.target_pid,
                 fronted_at,
                 bound,
+                activation_observed: true,
             },
             admitted,
             &mut person_input,
@@ -717,6 +737,20 @@ pub fn run_fronting_read_with<H: FrontingBracketHost>(
         fn request_front(&mut self, pid: u32) -> bool {
             self.host.request_front(pid)
         }
+        fn front_attempt_finished(&mut self) {
+            self.host.front_attempt_finished();
+        }
+        fn restore_front_attempt(
+            &mut self,
+            previous: u32,
+            target: u32,
+            since: u64,
+            wait_ms: u64,
+            activation_observed: bool,
+        ) -> RestoreOutcome {
+            self.host
+                .restore_front_attempt(previous, target, since, wait_ms, activation_observed)
+        }
         fn our_pid(&self) -> i64 {
             self.host.our_pid()
         }
@@ -766,6 +800,7 @@ struct Chunk {
     target: u32,
     fronted_at: u64,
     bound: u64,
+    activation_observed: bool,
 }
 
 /// Put the previous application back and record how long the target was in
@@ -786,6 +821,7 @@ fn restore<H: FrontingBracketHost>(
         target,
         fronted_at,
         bound,
+        activation_observed,
     } = chunk;
     if previous == target {
         report.restore = RestoreStatus::NotNeeded;
@@ -795,13 +831,13 @@ fn restore<H: FrontingBracketHost>(
         return interval;
     }
     let restore_at = host.borrow_mut().now_ms();
-    if admitted {
-        let outcome = restore_after_front(
-            &mut **host.borrow_mut(),
+    if admitted || !activation_observed {
+        let outcome = host.borrow_mut().restore_front_attempt(
             previous,
             target,
             fronted_at,
             bound,
+            activation_observed,
         );
         *person_input |= outcome.person_input_during_fronting;
         if !matches!(outcome.restore, RestoreStatus::SkippedPerson { .. }) {

@@ -1109,3 +1109,30 @@ async fn scope_ended_completion_is_an_error_written_once_before_or_after_flush()
         assert_eq!(completion.body["reason"], "scope_ended");
     }
 }
+
+#[tokio::test]
+async fn unconfirmed_fronting_restore_is_an_error_in_the_delivered_display_record() {
+    let planes = planes();
+    let display = DisplayDouble::new(&["display"]);
+    planes.routes.display.connect(display.clone());
+    let facts = install(&planes);
+    let mut call = request();
+    call["name"] = json!("computer_use");
+    call["arguments"] =
+        json!({"action":"keys", "target":"com.example.Editor", "keys":["command","a"]});
+    planes.routes.display.arm(&frame(call), &facts).unwrap();
+    let reply = cerebellum_computer::audit::FinalFrontingResult::new(json!({
+        "outcome":"restore_failed", "effect_status":"not_dispatched",
+        "fronting":{"fronted":false,"restore":"failed","purpose":"needs_front","mode":"background"}
+    }))
+    .into_value();
+    deliver(&planes, reply).await;
+    display.count(1).await;
+    let writes = display.writes.lock().unwrap();
+    assert_eq!(writes[0].body["outcome"], "error");
+    assert_eq!(writes[0].body["reason"], "restore_failed");
+    assert!(!serde_json::to_string(&writes[0].body)
+        .unwrap()
+        .contains("restored"));
+    cortexkit_role_tool_display::schema::validate_record(&writes[0].body, &schema()).unwrap();
+}

@@ -61,6 +61,9 @@ static PROCESS_FRONTING_LOCK: LazyLock<FrontingLock> =
     LazyLock::new(|| FrontingLock(Arc::default()));
 
 impl FrontingLock {
+    pub(crate) fn domain(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
     pub(crate) fn process_wide() -> Self {
         PROCESS_FRONTING_LOCK.clone()
     }
@@ -256,6 +259,7 @@ impl Fronting {
         if let Some(object) = reply.as_object_mut() {
             object.insert("fronting".into(), self.to_value());
         }
+        *reply = cerebellum_computer::audit::FinalFrontingResult::new(reply.take()).into_value();
     }
 
     /// Whether this says nothing beyond "background mode, nothing to do":
@@ -827,6 +831,12 @@ impl FrontedDispatchHooks for CellHooks {
         }
     }
 
+    fn front_confirmed(&mut self) {
+        if let Some(cell) = self.cell() {
+            cell.front_confirmed();
+        }
+    }
+
     fn decide_restore(&mut self) -> HookedRestore {
         let Some(cell) = self.cell() else {
             return HookedRestore {
@@ -1172,12 +1182,16 @@ pub(crate) fn hooked_fronting(mode: AppUse, purpose: Purpose, end: &HookedEnd) -
         return Fronting::stopped(mode, purpose, FrontingStop::TerminalAlreadyChosen);
     }
     match (&end.cell, end.decided) {
-        (Some(_), Some(decided)) if decided.front_requested => Fronting::temporary(
-            mode,
-            purpose,
-            decided.restore,
-            decided.person_input_during_fronting || end.finished.is_some_and(|(_, input)| input),
-        ),
+        (Some(cell), Some(decided)) if decided.front_requested => Fronting {
+            fronted: cell.was_front_confirmed(),
+            ..Fronting::temporary(
+                mode,
+                purpose,
+                decided.restore,
+                decided.person_input_during_fronting
+                    || end.finished.is_some_and(|(_, input)| input),
+            )
+        },
         (Some(_), Some(_)) => Fronting::stopped(mode, purpose, FrontingStop::CleanupTookObligation),
         _ => Fronting {
             purpose,

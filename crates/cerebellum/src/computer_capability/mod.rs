@@ -90,6 +90,15 @@ use cerebellum_core::journal::{
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+static LATE_FRONTING_JOURNAL_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Process-lifetime count of late focus-cleanup records that could not be
+/// persisted. Health exposes only the count, never journal content or logs.
+pub(crate) fn late_fronting_journal_failures() -> u64 {
+    LATE_FRONTING_JOURNAL_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 mod action_effects;
 mod app_use;
 mod app_use_approval;
@@ -968,6 +977,7 @@ where
         capability: ComputerCapability,
         reply: Value,
     ) -> Result<Value, CapabilityResultValidationError> {
+        let reply = cerebellum_computer::audit::FinalFrontingResult::new(reply).into_value();
         match validate_capability_result(capability.capability_id(), &reply) {
             Ok(()) => Ok(reply),
             Err(error) => {
@@ -1070,6 +1080,24 @@ where
             );
         }
         let terminal = crate::TerminalArbiter::current();
+        if let Some(terminal) = &terminal {
+            terminal.fronting_domain.store(
+                self.fronting_lock.domain(),
+                std::sync::atomic::Ordering::Release,
+            );
+            let audit = Arc::clone(&self.audit);
+            let identity = context.identity.clone();
+            let capability = capability.capability();
+            terminal.set_late_fronting_recorder(Arc::new(move |result| {
+                if lock_audit(&audit)
+                    .record_fronting_cleanup(identity.clone(), capability, result)
+                    .is_err()
+                {
+                    LATE_FRONTING_JOURNAL_FAILURES
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }));
+        }
         let lease =
             self.serializer
                 .quarantine
@@ -1385,7 +1413,7 @@ where
             return locked;
         }
         let work = quarantine::CallWork::current();
-        if let Some(mut busy) = work.bind(&self.serializer.quarantine, &grant) {
+        if let Some(mut busy) = work.bind(&self.serializer.quarantine, &grant).await {
             admission.decorate(&mut busy);
             return busy;
         }
@@ -2126,7 +2154,7 @@ where
             );
             let timeout_ms = parsed.timeout_ms;
             let work = quarantine::CallWork::current();
-            if let Some(busy) = work.bind(&self.serializer.quarantine, &grant) {
+            if let Some(busy) = work.bind(&self.serializer.quarantine, &grant).await {
                 return busy;
             }
             let mut token = AuditToken::new(self.audit.clone(), work.gate());
@@ -2271,7 +2299,7 @@ where
             return unposted(refusal);
         }
         let work = quarantine::CallWork::current();
-        if let Some(mut busy) = work.bind(&self.serializer.quarantine, &grant) {
+        if let Some(mut busy) = work.bind(&self.serializer.quarantine, &grant).await {
             admission.decorate(&mut busy);
             return unposted(busy);
         }

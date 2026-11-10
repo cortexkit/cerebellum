@@ -1773,6 +1773,8 @@ pub trait FrontedDispatchHooks: Send {
     fn begin_front_attempt(&mut self, front_instant_ms: u64) -> bool;
     /// The front request and its wait returned.
     fn front_attempt_returned(&mut self);
+    /// The action observed its target frontmost, not merely a request return.
+    fn front_confirmed(&mut self) {}
     /// Run, or await, the one restore decision.
     fn decide_restore(&mut self) -> HookedRestore;
     /// The bracket ended with `outcome`, whose restore is already the hooked
@@ -1834,6 +1836,10 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
         if self.previous.is_none() {
             self.previous = Some(frontmost);
         }
+        if self.dispatching && frontmost == Some(self.target) {
+            self.hooks.front_confirmed();
+            self.returned();
+        }
         frontmost
     }
     fn request_front(&mut self, pid: u32) -> bool {
@@ -1861,6 +1867,11 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             self.registration = Registration::Registered { prevented: false };
             self.dispatching = true;
             let requested = self.inner.request_front(pid);
+            // A platform can complete activation before its request returns.
+            // Preserve that observation even if input aborts the next poll.
+            if requested && self.inner.frontmost_pid() == Some(pid) {
+                self.hooks.front_confirmed();
+            }
             if !requested {
                 self.returned();
             }
@@ -1878,6 +1889,39 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
     fn our_pid(&self) -> i64 {
         self.inner.our_pid()
     }
+    fn front_attempt_finished(&mut self) {
+        self.returned();
+    }
+    fn restore_front_attempt(
+        &mut self,
+        _previous: u32,
+        _target: u32,
+        _since: u64,
+        _wait_ms: u64,
+        _activation_observed: bool,
+    ) -> crate::dispatch::RestoreOutcome {
+        self.returned();
+        if !matches!(self.registration, Registration::Registered { .. }) {
+            return crate::dispatch::RestoreOutcome {
+                restore: crate::dispatch::RestoreStatus::NotNeeded,
+                person_input_during_fronting: false,
+                finished_at_ms: self.inner.now_ms(),
+            };
+        }
+        let decided = match self.decided {
+            Some(decided) => decided,
+            None => {
+                let decided = self.hooks.decide_restore();
+                self.decided = Some(decided);
+                decided
+            }
+        };
+        crate::dispatch::RestoreOutcome {
+            restore: decided.restore,
+            person_input_during_fronting: decided.person_input_during_fronting,
+            finished_at_ms: self.inner.now_ms(),
+        }
+    }
     fn create_tap(&mut self) -> Option<Self::Tap> {
         self.returned();
         self.inner.create_tap()
@@ -1887,7 +1931,6 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
         self.inner.read_idle()
     }
     fn drain(&mut self, tap: &Self::Tap) -> Vec<crate::dispatch::SourcedInputEvent> {
-        self.returned();
         self.inner.drain(tap)
     }
     fn post_heartbeat(&mut self) -> crate::dispatch::HeartbeatProbe {

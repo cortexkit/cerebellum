@@ -231,8 +231,51 @@ impl ScratchProcess {
         self.pid != 0
             && after.is_some_and(|after| new_scratch_pid(before, after) == Ok(self.pid))
             && current_start_time == Some(self.start_time)
-            && open_document == Some(scratch_document)
+            && open_document.is_some_and(|document| same_document(document, scratch_document))
     }
+}
+
+/// Accept only absolute local file identities, never a title or basename.
+fn document_path(value: &str) -> Option<PathBuf> {
+    let path = if let Some(url) = value.strip_prefix("file://") {
+        if let Some(local) = url.strip_prefix("localhost/") {
+            format!("/{local}")
+        } else if url.starts_with('/') {
+            url.to_owned()
+        } else {
+            return None;
+        }
+    } else {
+        let path = PathBuf::from(value);
+        return path.is_absolute().then_some(path);
+    };
+    let mut decoded = Vec::new();
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let hi = (bytes.next()? as char).to_digit(16)?;
+            let lo = (bytes.next()? as char).to_digit(16)?;
+            decoded.push((hi * 16 + lo) as u8);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    let path = PathBuf::from(String::from_utf8(decoded).ok()?);
+    path.is_absolute().then_some(path)
+}
+
+fn same_document(actual: &str, expected: &str) -> bool {
+    let (Some(actual), Some(expected)) = (document_path(actual), document_path(expected)) else {
+        return false;
+    };
+    // Equal normalized paths can be compared without filesystem access.
+    // Otherwise resolve symlinks, including macOS's /tmp -> /private/tmp.
+    actual == expected
+        || actual
+            .canonicalize()
+            .ok()
+            .zip(expected.canonicalize().ok())
+            .is_some_and(|(actual, expected)| actual == expected)
 }
 
 /// CPU time in nanoseconds from `proc_pid_rusage` time units. On Apple
@@ -314,7 +357,7 @@ struct FrontSample {
 }
 
 /// The person's front app was frontmost in every sample except while the
-/// one needs-front action ran, and samples after that action show it back.
+/// needs-front actions ran, and samples after those actions show it back.
 fn front_app_verdict(samples: &[FrontSample], person: i32) -> Result<(), String> {
     let Some(first) = samples.iter().position(|sample| sample.needs_front) else {
         return Err("no sample was taken while the needs-front action ran".into());
@@ -323,12 +366,6 @@ fn front_app_verdict(samples: &[FrontSample], person: i32) -> Result<(), String>
         .iter()
         .rposition(|sample| sample.needs_front)
         .unwrap_or(first);
-    if samples[first..=last]
-        .iter()
-        .any(|sample| !sample.needs_front)
-    {
-        return Err("the samples show more than one needs-front action".into());
-    }
     if first == 0 {
         return Err("no sample was taken before the needs-front action".into());
     }
@@ -597,25 +634,42 @@ mod desk {
     }
 
     fn left_running(pid: u32) {
-        eprintln!("LEFT RUNNING: pid {pid}, not provably the probe's");
+        eprintln!(
+            "LEFT RUNNING: pid {pid}, not provably the probe's; AX reads: {:?}",
+            sys::window_documents(pid)
+        );
     }
 
-    fn owns_scratch(identity: &ScratchIdentity) -> bool {
-        let document = sys::main_window_document(identity.process.pid);
+    fn scratch_ownership(identity: &ScratchIdentity) -> Result<(), String> {
+        let documents = sys::window_documents(identity.process.pid);
+        let document = documents
+            .as_ref()
+            .ok()
+            .filter(|docs| docs.len() == 1)
+            .and_then(|docs| docs.first());
         let after = textedit_pids().ok();
-        identity.process.may_kill(
+        let start = cerebellum_macos::process_start_time_micros(identity.process.pid);
+        if identity.process.may_kill(
             &identity.before,
             after.as_deref(),
-            cerebellum_macos::process_start_time_micros(identity.process.pid),
-            document.as_deref(),
+            start,
+            document.map(String::as_str),
             &identity.files.document_url,
-        )
+        ) {
+            Ok(())
+        } else {
+            Err(format!("AXWindows/AXDocument={documents:?}; expected={:?}; before={:?}; now={after:?}; start={start:?}, expected_start={}",
+                identity.files.document_url, identity.before, identity.process.start_time))
+        }
     }
 
     fn kill(identity: &ScratchIdentity) -> bool {
         let process = identity.process;
-        if !owns_scratch(identity) {
-            left_running(process.pid);
+        if let Err(evidence) = scratch_ownership(identity) {
+            eprintln!(
+                "LEFT RUNNING: pid {}, not provably the probe's; {evidence}",
+                process.pid
+            );
             return false;
         }
         if !Command::new("/bin/kill")
@@ -719,7 +773,7 @@ mod desk {
                     // Verify AXDocument on this pid, not whichever TextEdit the
                     // bundle resolver might find. LaunchServices is asynchronous.
                     while Instant::now() < deadline {
-                        if owns_scratch(&identity) {
+                        if scratch_ownership(&identity).is_ok() {
                             return Ok(Scratch {
                                 identity,
                                 cleaned_up: false,
@@ -918,6 +972,7 @@ mod desk {
             fn CFURLGetTypeID() -> usize;
             fn CFURLGetString(url: CfRef) -> CfRef;
             fn CFArrayGetCount(array: CfRef) -> isize;
+            fn CFArrayGetTypeID() -> usize;
             fn CFArrayGetValueAtIndex(array: CfRef, index: isize) -> CfRef;
             fn CFDictionaryGetValue(dictionary: CfRef, key: CfRef) -> CfRef;
             fn CFNumberGetValue(number: CfRef, kind: isize, value: *mut c_void) -> u8;
@@ -994,52 +1049,88 @@ mod desk {
             string_text(unsafe { CFURLGetString(url.0) })
         }
 
-        fn ax_attribute(element: &Owned, name: &str) -> Option<Owned> {
-            let name = string(name);
+        fn ax_attribute(element: &Owned, name: &str) -> Result<Owned, String> {
+            let attribute = string(name);
             let mut value = std::ptr::null();
-            // SAFETY: callers supply a live AXUIElement; name and out-pointer
-            // are valid. Copy returns one retain count on success.
-            let code = unsafe { AXUIElementCopyAttributeValue(element.0, name.0, &mut value) };
-            (code == 0 && !value.is_null()).then(|| Owned(value))
+            // SAFETY: element and attribute are live; value is an output slot.
+            let code = unsafe { AXUIElementCopyAttributeValue(element.0, attribute.0, &mut value) };
+            if code == 0 && !value.is_null() {
+                Ok(Owned(value))
+            } else {
+                Err(format!("{name}: AX error {code}, null={}", value.is_null()))
+            }
         }
 
-        /// Read only this pid's main window; never resolve by bundle or focus.
-        pub fn main_window_document(pid: u32) -> Option<String> {
-            let pid = i32::try_from(pid).ok()?;
+        /// Read every window of this pid, including a background document that
+        /// has no AXMainWindow. Any unreadable window leaves ownership unproven.
+        pub fn window_documents(pid: u32) -> Result<Vec<String>, String> {
+            let pid = i32::try_from(pid).map_err(|_| "pid out of range")?;
             // SAFETY: creates an owned AX application reference for this pid.
             let app = unsafe { AXUIElementCreateApplication(pid) };
             if app.is_null() {
-                return None;
+                return Err("AX application is null".into());
             }
             let app = Owned(app);
-            // SAFETY: app is a live AXUIElement. Bound reads of unresponsive apps.
-            if unsafe { AXUIElementSetMessagingTimeout(app.0, 0.5) } != 0 {
-                return None;
+            // SAFETY: app is a live AXUIElement; every message is bounded.
+            let code = unsafe { AXUIElementSetMessagingTimeout(app.0, 0.5) };
+            if code != 0 {
+                return Err(format!("app timeout setup: AX error {code}"));
             }
-            let window = ax_attribute(&app, "AXMainWindow")?;
-            // SAFETY: window is a live CF object; check it before AX calls.
-            if unsafe { CFGetTypeID(window.0) != AXUIElementGetTypeID() } {
-                return None;
+            let windows = ax_attribute(&app, "AXWindows")?;
+            // SAFETY: windows is retained; verify its type before array access.
+            if unsafe { CFGetTypeID(windows.0) != CFArrayGetTypeID() } {
+                return Err("AXWindows is not an array".into());
             }
-            let mut owner = 0;
-            // SAFETY: window is an AXUIElement and owner is a live output slot.
-            if unsafe { AXUIElementGetPid(window.0, &mut owner) } != 0 || owner != pid {
-                return None;
+            let mut documents = Vec::new();
+            // SAFETY: windows was verified as a live CFArray.
+            let count = unsafe { CFArrayGetCount(windows.0) };
+            for index in 0..count {
+                // SAFETY: index is within the live array; retain a window via
+                // its AXWindows owner for the duration of these reads.
+                let window = unsafe { CFArrayGetValueAtIndex(windows.0, index) };
+                if window.is_null() || unsafe { CFGetTypeID(window) != AXUIElementGetTypeID() } {
+                    return Err(format!(
+                        "window {index}: not an AX element; documents={documents:?}"
+                    ));
+                }
+                let mut owner = 0;
+                // SAFETY: window was verified; owner is a live output slot.
+                let code = unsafe { AXUIElementGetPid(window, &mut owner) };
+                if code != 0 || owner != pid {
+                    return Err(format!(
+                        "window {index}: owner={owner}, AX error {code}; documents={documents:?}"
+                    ));
+                }
+                // SAFETY: the live window is kept alive by the array.
+                let code = unsafe { AXUIElementSetMessagingTimeout(window, 0.5) };
+                if code != 0 {
+                    return Err(format!("window {index}: timeout setup AX error {code}"));
+                }
+                let name = string("AXDocument");
+                let mut value = std::ptr::null();
+                // SAFETY: window, attribute and output slot are all live.
+                let code = unsafe { AXUIElementCopyAttributeValue(window, name.0, &mut value) };
+                if code != 0 || value.is_null() {
+                    return Err(format!(
+                        "window {index}: AXDocument error {code}, null={}; documents={documents:?}",
+                        value.is_null()
+                    ));
+                }
+                let document = Owned(value);
+                // SAFETY: document is a live CF value, checked before CFURL access.
+                let text = if unsafe { CFGetTypeID(document.0) == CFURLGetTypeID() } {
+                    // SAFETY: the owning URL remains live during conversion.
+                    string_text(unsafe { CFURLGetString(document.0) })
+                } else {
+                    string_text(document.0)
+                };
+                documents.push(text.ok_or_else(|| {
+                    format!(
+                        "window {index}: AXDocument has unreadable type; documents={documents:?}"
+                    )
+                })?);
             }
-            // SAFETY: window is a live AXUIElement.
-            if unsafe { AXUIElementSetMessagingTimeout(window.0, 0.5) } != 0 {
-                return None;
-            }
-            let document = ax_attribute(&window, "AXDocument")?;
-            // AXDocument normally is a CFString containing a file URL; accept
-            // a CFURL too, without treating a title or a basename as ownership.
-            // SAFETY: document is a live CF value, checked before CFURL access.
-            if unsafe { CFGetTypeID(document.0) == CFURLGetTypeID() } {
-                // SAFETY: document owns the borrowed string during conversion.
-                string_text(unsafe { CFURLGetString(document.0) })
-            } else {
-                string_text(document.0)
-            }
+            Ok(documents)
         }
 
         /// The number under `key` in `dictionary`, which is borrowed.
@@ -1578,23 +1669,32 @@ mod desk {
                 },
             );
         }
-        // The one needs-front action: a Command chord cannot reach an app in
-        // the background. Select-all in the scratch document is harmless.
-        sampler.needs_front.store(true, Ordering::SeqCst);
-        let chord = serve(
-            "computer.keys",
-            json!({"target": TEXTEDIT_BUNDLE, "keys": ["command", "a"]}),
-        )
-        .await;
-        sampler.needs_front.store(false, Ordering::SeqCst);
-        println!(
-            "RECORD needs-front chord reply fronting: {}",
-            chord["fronting"]
-        );
-        report.check(
-            "needs-front chord fronts, sends and restores",
-            needs_front_reply_verdict(&chord),
-        );
+        // Repeated harmless select-all chords expose activation latency, not
+        // just one lucky request. Keep late cleanup clear of a new app call.
+        for attempt in 1..=5 {
+            sampler.needs_front.store(true, Ordering::SeqCst);
+            let chord = serve(
+                "computer.keys",
+                json!({"target": TEXTEDIT_BUNDLE, "keys": ["command", "a"]}),
+            )
+            .await;
+            sampler.needs_front.store(false, Ordering::SeqCst);
+            println!(
+                "RECORD needs-front chord reply fronting: {}",
+                chord["fronting"]
+            );
+            report.check(
+                "needs-front chord fronts, sends and restores",
+                needs_front_reply_verdict(&chord),
+            );
+            tokio::time::sleep(Duration::from_millis(
+                cerebellum::budgets::LATE_ACTIVATION_WATCH_MS + 100,
+            ))
+            .await;
+            for (pid, latency) in cerebellum::desk_probe::take_fronting_landings() {
+                println!("RECORD needs-front attempt {attempt}: pid {pid} pending activation landed {latency} ms after request");
+            }
+        }
         let last = serve("computer.read_state", json!({"target": TEXTEDIT_BUNDLE})).await;
         report.check(
             "background read_state after the chord fronts nothing",
@@ -2038,7 +2138,7 @@ mod tests {
     }
 
     #[test]
-    fn the_front_check_needs_samples_before_during_and_after_one_action() {
+    fn the_front_check_brackets_repeated_actions_without_hiding_between_call_samples() {
         let none_during = [sample(0, PERSON, false), sample(100, PERSON, false)];
         assert!(front_app_verdict(&none_during, PERSON).is_err());
         let none_after = [sample(0, PERSON, false), sample(100, TARGET, true)];
@@ -2052,7 +2152,53 @@ mod tests {
             sample(300, TARGET, true),
             sample(400, PERSON, false),
         ];
-        assert!(front_app_verdict(&two_actions, PERSON).is_err());
+        assert!(front_app_verdict(&two_actions, PERSON).is_ok());
+        let mut late_landing = two_actions;
+        late_landing[2].front = Some(TARGET);
+        assert!(front_app_verdict(&late_landing, PERSON).is_err());
+    }
+
+    #[test]
+    fn scratch_document_matches_local_url_and_path_forms_but_not_remote_or_partial_names() {
+        let url = "file:///private/tmp/private%20scratch/document.txt";
+        assert!(scratch_process().may_kill(
+            &[],
+            Some(&[200]),
+            Some(12345),
+            Some("/private/tmp/private scratch/document.txt"),
+            url
+        ));
+        assert!(same_document(
+            "/private/tmp/private scratch/document.txt",
+            url
+        ));
+        assert!(same_document(
+            "file://localhost/private/tmp/private%20scratch/document.txt",
+            url
+        ));
+        assert!(!same_document(
+            "file://remote/private/tmp/private%20scratch/document.txt",
+            url
+        ));
+        assert!(!same_document("document.txt", url));
+        assert!(!same_document(
+            "file:///private/tmp/private%XXscratch/document.txt",
+            url
+        ));
+        assert!(!same_document(
+            "file:///private/tmp/other/document.txt",
+            url
+        ));
+        assert!(same_document(
+            "/private/tmp/100%/document.txt",
+            "file:///private/tmp/100%25/document.txt"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scratch_document_resolves_the_macos_tmp_alias() {
+        assert!(same_document("file:///tmp", "file:///private/tmp"));
     }
 
     #[test]

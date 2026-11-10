@@ -3122,6 +3122,9 @@ struct RequestCancellationGuard {
 }
 
 impl RequestCancellations {
+    fn namespace(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
     fn register(&self, key: (u16, u32, u64)) -> RequestCancellationGuard {
         let handle = CancelHandle::pending();
         self.0.lock().unwrap().insert(key, handle.clone());
@@ -3135,6 +3138,7 @@ impl RequestCancellations {
         self.0.lock().unwrap().get(&key).cloned()
     }
     fn cancel_route(&self, channel: u16, epoch: u32) {
+        terminal_arbiter::cancel_late_fronting_route(self.namespace(), channel, epoch);
         for ((c, e, _), handle) in self.0.lock().unwrap().iter() {
             if (*c, *e) == (channel, epoch) {
                 handle.stop_terminal(TerminalCause::RouteClosed);
@@ -3144,6 +3148,7 @@ impl RequestCancellations {
     }
 
     fn stop_all(&self, cause: TerminalCause) {
+        terminal_arbiter::cancel_late_fronting_all(self.namespace());
         for handle in self.0.lock().unwrap().values() {
             handle.stop_terminal(cause);
         }
@@ -3937,6 +3942,10 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Cancel => {
+            terminal_arbiter::cancel_late_fronting_request(
+                planes.cancellations.namespace(),
+                (frame.header.channel, frame.header.epoch, frame.header.corr),
+            );
             match (
                 frame.header.channel,
                 planes.cancellations.get((
@@ -9295,6 +9304,8 @@ fn record_engram_catalog_write() {
 ///   backup catalog (`engram-catalog.json`) that failed;
 /// - `auditReservationCleanupFailures`, unused computer reservations whose Drop
 ///   cleanup failed to durably close their journal row;
+/// - `lateFrontingJournalFailures`, late focus-cleanup records that could not
+///   be persisted;
 /// - on macOS, `previewCaptureRequests` and `previewFramesWritten`, how many
 ///   capture requests the background-mode preview has made and how many frame
 ///   lines it has written to the agent-cursor helper since the process
@@ -9337,6 +9348,10 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
         metrics.insert(
             "auditReservationCleanupFailures".into(),
             json!(cerebellum_computer::audit::audit_reservation_cleanup_failures()),
+        );
+        metrics.insert(
+            "lateFrontingJournalFailures".into(),
+            json!(computer_capability::late_fronting_journal_failures()),
         );
         #[cfg(target_os = "macos")]
         {
@@ -15709,6 +15724,14 @@ mod sigterm_listener_tests {
         assert_eq!(
             health_metrics().await["auditReservationCleanupFailures"],
             json!(cerebellum_computer::audit::audit_reservation_cleanup_failures())
+        );
+    }
+
+    #[tokio::test]
+    async fn late_fronting_journal_failures_are_on_the_health_reply() {
+        assert_eq!(
+            health_metrics().await["lateFrontingJournalFailures"],
+            json!(computer_capability::late_fronting_journal_failures())
         );
     }
 }

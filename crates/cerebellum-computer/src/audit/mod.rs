@@ -936,7 +936,7 @@ fn add_route_defaults(bytes: Vec<u8>) -> Vec<u8> {
 /// Aggregate transport facts are flattened alongside the existing outcome.
 /// Old entries have no route facts and decode with zero counts, not invented
 /// evidence of a historical transport.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RecordedActuationOutcome {
     #[serde(flatten)]
     pub outcome: ActuationOutcome,
@@ -947,6 +947,44 @@ pub struct RecordedActuationOutcome {
     /// Absent from older entries and from actions that do not front.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fronting: Option<FrontingRecord>,
+}
+
+/// The only serialization boundary for a result containing fronting evidence.
+/// Its private representation binds the outcome and evidence: a failed-front
+/// result cannot carry a confirmed front, including in nested audit refusals.
+#[derive(Serialize)]
+#[serde(transparent)]
+pub struct FinalFrontingResult(Value);
+
+impl FinalFrontingResult {
+    pub fn new(mut body: Value) -> Self {
+        if body["outcome"] == "fronting_failed" || body["refusal"]["reason"] == "fronting_failed" {
+            if let Some(fronting) = body.get_mut("fronting").and_then(Value::as_object_mut) {
+                fronting.insert("fronted".into(), Value::Bool(false));
+            }
+        }
+        Self(body)
+    }
+
+    pub fn into_value(self) -> Value {
+        self.0
+    }
+}
+
+impl Serialize for RecordedActuationOutcome {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut value = serde_json::to_value(&self.outcome).map_err(serde::ser::Error::custom)?;
+        let routes = serde_json::to_value(&self.routes).map_err(serde::ser::Error::custom)?;
+        value
+            .as_object_mut()
+            .expect("actuation outcome is an object")
+            .extend(routes.as_object().expect("routes are an object").clone());
+        if let Some(fronting) = self.fronting {
+            value["fronting"] =
+                serde_json::to_value(fronting).map_err(serde::ser::Error::custom)?;
+        }
+        FinalFrontingResult::new(value).serialize(serializer)
+    }
 }
 
 /// The setting an action ran under, as a journal row records it.
@@ -1142,6 +1180,76 @@ mod gate_tests {
             custody(),
         )
         .expect("the audit constructs")
+    }
+
+    #[test]
+    fn late_fronting_cleanup_uses_the_existing_journal_reader_and_format() {
+        use cerebellum_core::journal::storage::JournalStorage;
+        let storage = InMemoryJournalStorage::new();
+        let mut audit = ComputerAudit::new(
+            UnavailablePolicy,
+            taxonomy(),
+            JournalConfig {
+                journal_retention_bytes: 200_000,
+                journal_max_entry_bytes: 40_000,
+            },
+            storage.clone(),
+            custody(),
+        )
+        .unwrap();
+        audit.record_fronting_cleanup(
+            journal_identity("principal", "conversation", "project", SessionKind::Primary),
+            ComputerCapability::Keys,
+            serde_json::json!({"cleanup":"restore", "restore":"restored", "activation_latency_ms":800}),
+        ).unwrap();
+        let state = storage.load().unwrap();
+        let bytes = serde_json::to_vec(&state).unwrap();
+        // Open completion JSON uses the existing durable-state reader and
+        // schema; cleanup must not introduce a row kind or journal version.
+        let read: cerebellum_core::journal::DurableState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(read, state);
+        let state_json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(state_json["entries"]["1"]["kind"], "finalized_committed");
+        let exported = audit.journal().export();
+        let row = ComputerJournalCodec::decode_entry(exported.trim().as_bytes()).unwrap();
+        assert_eq!(row["phase"], "finalized");
+        let result_bytes: Vec<u8> =
+            serde_json::from_value(row["completed_result"].clone()).unwrap();
+        let result: Value = serde_json::from_slice(&result_bytes).unwrap();
+        assert_eq!(result["cleanup"], "restore");
+        assert_eq!(result["activation_latency_ms"], 800);
+        assert_eq!(audit.recover_active().len(), 0);
+    }
+
+    #[test]
+    fn failed_front_cannot_serialize_as_confirmed_in_reply_or_audit() {
+        for body in [
+            serde_json::json!({"outcome":"fronting_failed", "fronting":{"fronted":true}}),
+            serde_json::json!({"outcome":"refused", "refusal":{"reason":"fronting_failed"}, "fronting":{"fronted":true}}),
+        ] {
+            let encoded = serde_json::to_value(FinalFrontingResult::new(body)).unwrap();
+            assert_eq!(encoded["fronting"]["fronted"], false);
+        }
+        let recorded = RecordedActuationOutcome {
+            outcome: ActuationOutcome::Refused {
+                refusal: DispatchError::FrontingFailed,
+                abort: None,
+            },
+            routes: Default::default(),
+            fronting: Some(FrontingRecord {
+                mode: FrontingRecordMode::Background,
+                fronted: true,
+                purpose: FrontingRecordPurpose::NeedsFront,
+                restore: FrontingRecordRestore::Failed,
+                not_fronted_reason: None,
+                person_input_during_fronting: false,
+                preview_frames: 0,
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(recorded).unwrap()["fronting"]["fronted"],
+            false
+        );
     }
 
     /// Without a redaction policy, capture is withheld and waiting is not.
@@ -1804,6 +1912,36 @@ where
         self.reservations.remove(&token.action_obligation_id());
         self.consume_terminal_transitions();
         Ok(result)
+    }
+
+    /// Record bounded focus cleanup in the existing computer completion row.
+    /// Cleanup is not a retry of the original actuation; its result is open
+    /// JSON, like other completion material, so older journal readers need
+    /// no new schema version or minimum compatible reader version.
+    pub fn record_fronting_cleanup(
+        &mut self,
+        identity: JournalIdentity,
+        capability: ComputerCapability,
+        result: Value,
+    ) -> Result<Committed, ComputerAuditError> {
+        let dispatch = TypedCaptureDispatch::new(
+            capability,
+            ContainmentRung::GlobalNone,
+            ObservationState::HumanUnobserved,
+        );
+        let handle = self.reserve(identity, dispatch.descriptor.clone())?;
+        let token = self.commit_dispatched(
+            handle,
+            &dispatch.dispatch_material(br#"{"cleanup":"restore"}"#.to_vec()),
+            b"null".to_vec(),
+            None,
+        )?;
+        self.finalize_dispatched(
+            token,
+            serde_json::to_vec(&result)
+                .map_err(|_| ComputerAuditError::Journal(JournalError::CodecFailed))?,
+            Vec::new(),
+        )
     }
 
     pub fn finalize_rejected(
