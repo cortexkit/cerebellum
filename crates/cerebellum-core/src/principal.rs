@@ -75,8 +75,16 @@ pub fn trust_for_principal(principal: &Option<Principal>) -> PrincipalTrust {
 /// loses access, and the failure shows up here as a permission refusal rather
 /// than as a rename. Carry both the old and new ids across a rename, and drop
 /// the old one only once no module registers under it.
-pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] =
-    &["prefrontal-core", "prefrontal-routing", "aft", "broca"];
+///
+/// The routing module is being renamed from `prefrontal-routing` to `striatum`;
+/// both are listed until no module registers as `prefrontal-routing`.
+pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] = &[
+    "prefrontal-core",
+    "prefrontal-routing",
+    "striatum",
+    "aft",
+    "broca",
+];
 
 /// Whether a daemon-spawned module id is a trusted first-party consumer of
 /// cerebellum capabilities.
@@ -166,7 +174,13 @@ mod tests {
     /// could silently revoke that module's first-party admission.
     #[test]
     fn each_dependent_module_is_admitted() {
-        for module_id in ["prefrontal-core", "prefrontal-routing", "aft", "broca"] {
+        for module_id in [
+            "prefrontal-core",
+            "prefrontal-routing",
+            "striatum",
+            "aft",
+            "broca",
+        ] {
             assert_eq!(
                 trust_for_principal(&Some(Principal::Reserved {
                     module_id: module_id.to_string()
@@ -301,6 +315,7 @@ mod tests {
             reserved("aft"),
             reserved("broca"),
             reserved("prefrontal-routing"),
+            reserved("striatum"),
         ];
         for principal in others {
             assert!(trust_for_principal(&principal).is_first_party());
