@@ -748,6 +748,28 @@ impl InputCheck {
     }
 }
 
+/// Every name `classification_changed` can report in `detail.changed_fields`.
+/// The result schema closes the field over this set, so a renamed or added
+/// record field that isn't listed here is withheld rather than sent.
+pub(crate) const CLASSIFICATION_FIELD_NAMES: &[&str] = &[
+    "schema",
+    "node_identity",
+    "activation_target_identity",
+    "document_epoch",
+    "target_kind",
+    "effective_input_type",
+    "activation_invokes_form_submit",
+    "form_owner",
+    "current_top_level_origin",
+    "activation_destination_origin",
+    "target_autocomplete_tokens",
+    "target_password",
+    "associated_form_controls",
+    "required_tier",
+    "credential",
+    "financial",
+];
+
 fn classification_changed(
     expected: &NonTypeClassificationRecord,
     observed: &NonTypeClassificationRecord,

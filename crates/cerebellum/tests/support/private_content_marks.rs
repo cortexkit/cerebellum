@@ -274,6 +274,8 @@ const PERSON_METADATA: &[&str] = &[
     "detail.step",
     "detail.problem",
     "detail.check",
+    // Names from a closed enum of classification record fields, never values.
+    "detail.changed_fields.[]",
     "detail.cause",
     "detail.history_entry_changed",
     "detail.history_index_changed",

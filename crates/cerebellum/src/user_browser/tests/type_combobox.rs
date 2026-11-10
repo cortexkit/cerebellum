@@ -100,9 +100,8 @@ async fn combobox_popup_focus_changes_receive_text_in_the_same_node() {
     let attrs = state.dom_override.as_ref().unwrap()["nodes"][3]["attributes"]
         .as_array()
         .unwrap();
-    assert!(attrs
-        .chunks_exact(2)
-        .any(|pair| pair == ["aria-expanded", "true"]));
+    let (pairs, _) = attrs.as_chunks::<2>();
+    assert!(pairs.iter().any(|pair| pair == &["aria-expanded", "true"]));
 }
 
 #[tokio::test]
@@ -123,7 +122,8 @@ async fn combobox_popup_and_same_url_push_state_after_focus_receive_text() {
 
 fn set_target_attribute(dom: &mut Value, name: &str, value: &str) {
     let attrs = dom["nodes"][3]["attributes"].as_array_mut().unwrap();
-    if let Some(pair) = attrs.chunks_exact_mut(2).find(|pair| pair[0] == name) {
+    let (pairs, _) = attrs.as_chunks_mut::<2>();
+    if let Some(pair) = pairs.iter_mut().find(|pair| pair[0] == name) {
         pair[1] = json!(value);
     } else {
         attrs.extend([json!(name), json!(value)]);

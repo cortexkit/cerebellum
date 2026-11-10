@@ -6103,7 +6103,9 @@ pub(crate) fn user_browser_result_schema(action: &str) -> Value {
                 "detail":{"anyOf":[invalid_request_detail_result_schema(), closed_object(json!({"decision":string_schema()}), &["decision"]),
                     // Classification refusals expose only changed field names,
                     // never their previous or current DOM-derived values.
-                    closed_object(json!({"check":enum_schema(&["pre-dispatch","post-focus","pre-insertion"]),"changed_fields":{"type":"array","items":string_schema()}}), &["check","changed_fields"]),
+                    // The names are the compared record's own field names,
+                    // so the item schema is closed over exactly that set.
+                    closed_object(json!({"check":enum_schema(&["pre-dispatch","post-focus","pre-insertion"]),"changed_fields":{"type":"array","items":enum_schema(crate::user_browser::CLASSIFICATION_FIELD_NAMES)}}), &["check","changed_fields"]),
                     // Why no consent card could be raised, on `consent_unavailable`.
                     closed_object(json!({"reason":string_schema()}), &["reason"]),
                     // A cdp_error refusal names the rejected plan command and
