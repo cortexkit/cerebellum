@@ -735,6 +735,8 @@ pub struct DeskState {
     pub on_application_hidden: Option<DeskHook>,
     /// Run once inside the next window-minimized visibility read.
     pub on_window_minimized: Option<DeskHook>,
+    /// Run once after sampling the next frontmost PID, before returning it.
+    pub on_frontmost_read: Option<DeskHook>,
     /// Run once, as the next press reaches the desk, after it is recorded.
     pub on_press: Option<DeskHook>,
     /// When each press and write reached the desk, on tokio's clock, so a
@@ -846,6 +848,7 @@ impl Desk {
             on_application_hidden: None,
             on_window_minimized: None,
             on_press: None,
+            on_frontmost_read: None,
             dispatched_at: Vec::new(),
             cursor_visible: false,
             roots,
@@ -1324,7 +1327,14 @@ impl AppStateSource for Desk {
     }
 
     fn frontmost_pid(&self) -> Option<u32> {
-        self.state().frontmost
+        let (frontmost, hook) = {
+            let mut state = self.state();
+            (state.frontmost, state.on_frontmost_read.take())
+        };
+        if let Some(hook) = hook {
+            (hook.0)();
+        }
+        frontmost
     }
 
     fn focused_window(

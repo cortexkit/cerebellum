@@ -1566,6 +1566,8 @@ pub trait PlatformDriver {
     /// Post to a target that is not frontmost through a fronting bracket.
     /// Returns the bracket's report however it ended once it started; an
     /// error means it never started.
+    /// Native drivers require restore hooks accepted for this operation via
+    /// [`Self::accept_fronted_dispatch_hooks`], or refuse before any OS call.
     fn dispatch_fronted(
         &mut self,
         _request: FrontedDispatchRequest,
@@ -1577,6 +1579,7 @@ pub trait PlatformDriver {
     }
     /// Run one image read inside the same observed front/restore bracket as keys.
     /// An error means the bracket never started; its callback must not run then.
+    /// Native drivers require the same restore hooks as [`Self::dispatch_fronted`].
     fn read_fronted(
         &mut self,
         _target: &ProcessGrant,

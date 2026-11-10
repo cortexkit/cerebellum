@@ -88,15 +88,11 @@ fn mode_attendance_and_admission_decide_takeover_chords_and_fronting() {
                     AppUse::Foreground => assert!(!bring && !takeover, "{case}"),
                     AppUse::Background => assert!(bring && !takeover, "{case}"),
                 }
-                // With takeover held, only an attended background read runs
-                // the temporary bracket; foreground mode never does.
+                // With takeover held, either mode can run the temporary
+                // bracket when no one-way front occurred, but only attended.
                 let with_takeover = admission(mode, attended, admitted, true);
                 let (_, takeover) = image_fronting(with_takeover, true, false);
-                assert_eq!(
-                    takeover,
-                    mode == AppUse::Background && attended,
-                    "{case} with takeover"
-                );
+                assert_eq!(takeover, attended, "{case} with takeover");
             }
         }
     }
@@ -2151,6 +2147,74 @@ async fn open_app_fronts_a_running_or_launched_app_only_in_foreground_mode() {
 // ---------------------------------------------------------------------------
 // bring_to_front under takeover, through the call's restore obligation
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_foreground_takeover_image_read_owns_and_restores_a_late_activation() {
+    let rig = rig(AppUse::Foreground, mail_desk()).await;
+    let carrier = support::ScriptedCarrier::answering(&["computer_30m"]);
+    rig.management
+        .computer_grants()
+        .require(
+            &crate::computer_grants::GrantNeed::Takeover,
+            &support::relayed(&carrier),
+            &crate::CancelHandle::pending(),
+        )
+        .await
+        .unwrap();
+    let desk = rig.desk.clone();
+    {
+        let mut state = rig.desk.state();
+        state.frontmost = Some(TARGET);
+        // Foreground admission observes the target, then the person switches
+        // away before image capture. That earlier observation owns no bracket.
+        state.on_frontmost_read = Some(support::DeskHook(Arc::new(move || {
+            desk.state().frontmost = Some(PREVIOUS);
+        })));
+    }
+    let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut state = rig.screen.state();
+        state.front_delay_ms = Some(800);
+        state.late_watch_after_ms = 600;
+        state.late_watch_gate = Some(gate.clone());
+    }
+    let terminal = under_terminal();
+    let reply = rig
+        .call_under(
+            &terminal,
+            "computer.read_state",
+            json!({"target": support::TARGET_BUNDLE_ID, "include_image": true,
+                "bring_to_front": true}),
+        )
+        .await;
+    assert_eq!(
+        reply["image_unavailable"]["reason"], "restore_failed",
+        "{reply}"
+    );
+    assert_eq!(reply["fronting"]["mode"], "foreground");
+    assert_eq!(reply["fronting"]["purpose"], "bring_to_front");
+    assert_eq!(rig.screen.log(), ["front:4242"], "no late capture");
+    assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
+    assert!(rig.lock.held(), "the pending restore still owns the lock");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    terminal.set_late_fronting_recorder(Arc::new(move |record| {
+        tx.send(record).unwrap();
+    }));
+    terminal.start_late_fronting(None);
+    gate.store(true, std::sync::atomic::Ordering::Release);
+    let record = tokio::time::timeout(crate::test_support::HANG_GUARD, rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record["restore"], "restored");
+    assert_eq!(record["previous_pid"], PREVIOUS);
+    assert_eq!(record["target_pid"], TARGET);
+    assert_eq!(record["activation_latency_ms"], 800);
+    assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
+    assert_eq!(rig.screen.log(), ["front:4242", "restore:100"]);
+    assert!(!rig.lock.held());
+    assert!(rx.try_recv().is_err(), "one cleanup per activation");
+}
 
 /// Background mode: a `bring_to_front` image read under held takeover fronts
 /// the application, reads it while in front, and puts the previous
