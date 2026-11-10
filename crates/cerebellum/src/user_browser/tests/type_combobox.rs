@@ -83,6 +83,168 @@ async fn type_search(fixture: &Fixture) -> Value {
     fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Search query"),"text":"rust language"}), "allow_30m").await.0
 }
 
+fn add_focus_form_controls(fixture: &Fixture, input_type: &str, autocomplete: Option<&str>) {
+    let mut state = fixture.state.lock().unwrap();
+    let dom = &mut state.type_capture_after_focus.as_mut().unwrap().0;
+    let mut attributes = vec!["type", input_type, "form", "search-form"];
+    if let Some(token) = autocomplete {
+        attributes.extend(["autocomplete", token]);
+    }
+    dom["nodes"].as_array_mut().unwrap().extend([
+        json!({"nodeId":11,"parentId":7,"backendNodeId":11,"nodeType":1,"nodeName":"BUTTON","localName":"button","attributes":["type","button","aria-label","Clear search"]}),
+        json!({"nodeId":12,"parentId":2,"backendNodeId":12,"nodeType":1,"nodeName":"INPUT","localName":"input","attributes":attributes}),
+    ]);
+}
+
+#[tokio::test]
+async fn combobox_focus_adds_harmless_form_controls_and_receives_text() {
+    let fixture = combobox_fixture();
+    add_focus_form_controls(&fixture, "hidden", None);
+    let reply = type_search(&fixture).await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.inputs, ["DOM.focus", "Input.insertText"]);
+    assert_eq!(state.typed_value, "rust language");
+    assert_eq!(state.type_resolved_backend, 4);
+}
+
+#[tokio::test]
+async fn combobox_focus_adds_sensitive_form_controls_and_refuses_text() {
+    for (input_type, autocomplete) in [
+        ("password", None),
+        ("hidden", Some("current-password")),
+        ("hidden", Some("new-password")),
+        ("hidden", Some("cc-number")),
+        ("hidden", Some("one-time-code")),
+    ] {
+        let fixture = combobox_fixture();
+        add_focus_form_controls(&fixture, input_type, autocomplete);
+        let reply = type_search(&fixture).await;
+        assert_eq!(reply["outcome"], "outcome_unknown", "{reply}");
+        assert_eq!(reply["reason"], "classification_changed", "{reply}");
+        assert_eq!(reply["input_dispatched"], true, "{reply}");
+        assert_eq!(
+            reply["detail"],
+            json!({"check":"post-focus","changed_fields":["associated_form_controls"]}),
+            "{input_type}, {autocomplete:?}: {reply}"
+        );
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(state.inputs, ["DOM.focus"]);
+        assert!(state.typed_value.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn combobox_focus_form_controls_do_not_allow_other_record_changes() {
+    let fixture = combobox_fixture();
+    add_focus_form_controls(&fixture, "hidden", None);
+    {
+        let mut state = fixture.state.lock().unwrap();
+        let dom = &mut state.type_capture_after_focus.as_mut().unwrap().0;
+        set_target_attribute(dom, "autocomplete", "on");
+    }
+    let reply = type_search(&fixture).await;
+    assert_eq!(reply["reason"], "classification_changed", "{reply}");
+    assert_eq!(
+        reply["detail"],
+        json!({"check":"post-focus","changed_fields":["target_autocomplete_tokens","associated_form_controls"]})
+    );
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.inputs, ["DOM.focus"]);
+    assert!(state.typed_value.is_empty());
+}
+
+#[tokio::test]
+async fn combobox_focus_form_controls_do_not_hide_person_input() {
+    for reaction in [
+        PageReaction::PersonKey,
+        PageReaction::PersonClick,
+        PageReaction::PersonScroll,
+    ] {
+        let fixture = combobox_fixture();
+        add_focus_form_controls(&fixture, "hidden", None);
+        fixture.state.lock().unwrap().page_reaction = Some(reaction);
+        let reply = type_search(&fixture).await;
+        assert_eq!(reply["outcome"], "outcome_unknown", "{reply}");
+        assert_eq!(reply["reason"], "state_changed_by_person", "{reply}");
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(state.inputs, ["DOM.focus"]);
+        assert!(state.typed_value.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn combobox_focus_form_controls_revalidate_type_eligibility() {
+    for attribute in ["readonly", "disabled", "inert", "name"] {
+        let fixture = combobox_fixture();
+        add_focus_form_controls(&fixture, "hidden", None);
+        {
+            let mut state = fixture.state.lock().unwrap();
+            let dom = &mut state.type_capture_after_focus.as_mut().unwrap().0;
+            set_target_attribute(dom, attribute, "password");
+        }
+        let reply = type_search(&fixture).await;
+        assert_eq!(
+            reply["reason"], "classification_changed",
+            "{attribute}: {reply}"
+        );
+        assert_eq!(
+            reply["detail"],
+            json!({"check":"post-focus","changed_fields":["associated_form_controls"]}),
+            "{attribute}: {reply}"
+        );
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(state.inputs, ["DOM.focus"]);
+        assert!(state.typed_value.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn combobox_form_controls_before_focus_remain_strict() {
+    let fixture = combobox_fixture();
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_origin_always").await;
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.dom_override.as_mut().unwrap()["nodes"].as_array_mut().unwrap().push(
+            json!({"nodeId":11,"parentId":7,"backendNodeId":11,"nodeType":1,"nodeName":"BUTTON","localName":"button","attributes":["type","button"]}),
+        );
+    }
+    let (reply, _) = fixture.call(1, json!({"browser":"user","action":"type","tab":tab,"ref":reference(&snapshot,"Search query"),"text":"rust language"}), "allow_30m").await;
+    assert_eq!(reply["reason"], "classification_changed", "{reply}");
+    assert_eq!(reply["input_dispatched"], false, "{reply}");
+    assert_eq!(
+        reply["detail"],
+        json!({"check":"pre-dispatch","changed_fields":["associated_form_controls"]})
+    );
+    let state = fixture.state.lock().unwrap();
+    assert!(state.inputs.is_empty());
+    assert!(state.typed_value.is_empty());
+}
+
+#[tokio::test]
+async fn combobox_form_controls_after_focus_remain_strict() {
+    let fixture = combobox_fixture();
+    add_focus_form_controls(&fixture, "hidden", None);
+    {
+        let mut state = fixture.state.lock().unwrap();
+        let mut changed = state.type_capture_after_focus.as_ref().unwrap().0.clone();
+        changed["nodes"].as_array_mut().unwrap().push(
+            json!({"nodeId":13,"parentId":7,"backendNodeId":13,"nodeType":1,"nodeName":"BUTTON","localName":"button","attributes":["type","button"]}),
+        );
+        state.type_dom_after_focus_check = Some(changed);
+    }
+    let reply = type_search(&fixture).await;
+    assert_eq!(reply["reason"], "classification_changed", "{reply}");
+    assert_eq!(
+        reply["detail"],
+        json!({"check":"pre-insertion","changed_fields":["associated_form_controls"]})
+    );
+    let state = fixture.state.lock().unwrap();
+    assert_eq!(state.inputs, ["DOM.focus"]);
+    assert!(state.typed_value.is_empty());
+}
+
 #[tokio::test]
 async fn combobox_popup_focus_changes_receive_text_in_the_same_node() {
     let fixture = combobox_fixture();
