@@ -207,11 +207,15 @@ export CEREBELLUM_ELEMENT_ADDRESSED_REVIEW_REVISION="element-addressed-review/v1
 # and the fronting bracket computer.type and computer.keys use to reach an
 # application that is not frontmost (bring it forward for at most 100 ms at a
 # time, post, put the previous application back, under the idle gate and the
-# seize watcher). Minted in subconscious docs/reviews/
-# takeover-dispatch-review-v1.md on ada9eb93 against ck-cerebellum abe8e3a.
+# seize watcher). v2 adds what v1 lacked: the bracket now runs under the
+# process-wide fronting lock, and an activation that lands after the call has
+# replied is put back by a bounded watcher (5 s, only while the person is idle).
+# Minted by SUBC on 2026-11-10 against ck-cerebellum 454cef4b (review record:
+# subconscious .cortexkit/internal-docs/audits/
+# 2026-11-10-takeover-dispatch-review-v2.md); v1@ada9eb93 covered abe8e3a.
 # Without it, type and keys still serve a frontmost target under the input
 # review above, and refuse a background one with keystrokes_need_foreground.
-export CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION="takeover-dispatch-review/v1@ada9eb93"
+export CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION="takeover-dispatch-review/v2@454cef4b"
 
 # Keystrokes posted to one process through the private SkyLight route
 # (SLEventPostToPid), which reaches a background Chromium or Electron app that
