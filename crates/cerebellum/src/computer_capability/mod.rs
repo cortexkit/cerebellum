@@ -1826,8 +1826,8 @@ where
             .state(cerebellum_computer::platform::PermissionService::ScreenRecording)
             == PermissionLiveness::Live;
         // A background `bring_to_front` read under held takeover fronts the
-        // application for the capture. A build admitted to app-use fronting
-        // runs it under the fronting lock and the call's restore obligation.
+        // application for the capture. Takeover has separate admission from
+        // app-use fronting, but shares focus ownership and restore cleanup.
         let mut image_hooks = None;
         let mut image_fronting = None;
         let bring_to_front_now = parsed.include_image
@@ -1835,20 +1835,21 @@ where
             && takeover
             && image_permission_live
             && fronting_admission.mode == cerebellum_core::config::AppUse::Background
-            && self.app_use_fronting_admitted;
+            && self.fronting_bracket_admitted;
         if bring_to_front_now {
+            let call = fronting::FrontCall {
+                grant: &grant,
+                consent: &consent,
+                cancel: &cancel,
+                management,
+                conversation_key: &conversation_key,
+                input_follows: false,
+            };
             match self
-                .prepare_temporary_front(
-                    fronting::FrontCall {
-                        grant: &grant,
-                        consent: &consent,
-                        cancel: &cancel,
-                        management,
-                        conversation_key: &conversation_key,
-                        input_follows: false,
-                    },
+                .prepare_takeover_front(
+                    call,
                     crate::terminal_arbiter::FrontingPurpose::BringToFront,
-                    true,
+                    &admission,
                 )
                 .await
             {
@@ -2546,28 +2547,25 @@ where
             return unposted(reply);
         }
 
-        // A modifier chord to a background application, fronted under the
-        // app grant alone: after the badge has arrived, the fronting lock,
-        // guard (0) and guard (1), and the call's restore obligation. The
-        // bracket then runs the idle gate, registers the obligation and
-        // fronts.
+        // Both temporary chord routes need exclusive focus ownership and a
+        // restore owner before activation, but retain distinct authorization.
         let mut chord_hooks = None;
-        if front_with_app_grant {
-            match self
-                .prepare_temporary_front(
-                    fronting::FrontCall {
-                        grant: &grant,
-                        consent: &consent,
-                        cancel: &cancel,
-                        management,
-                        conversation_key: &identity.conversation_key,
-                        input_follows: true,
-                    },
-                    crate::terminal_arbiter::FrontingPurpose::NeedsFront,
-                    true,
-                )
-                .await
-            {
+        if front_with_app_grant || route == fronting::ChordRoute::TakeoverBracket {
+            let call = fronting::FrontCall {
+                grant: &grant,
+                consent: &consent,
+                cancel: &cancel,
+                management,
+                conversation_key: &identity.conversation_key,
+                input_follows: true,
+            };
+            let purpose = crate::terminal_arbiter::FrontingPurpose::NeedsFront;
+            let prepared = if front_with_app_grant {
+                self.prepare_temporary_front(call, purpose, true).await
+            } else {
+                self.prepare_takeover_front(call, purpose, &admission).await
+            };
+            match prepared {
                 Ok(parts) => chord_hooks = Some(fronting::CellHooks::new(parts)),
                 Err(prepared) => {
                     let mut reply = match (prepared.change, prepared.stop) {

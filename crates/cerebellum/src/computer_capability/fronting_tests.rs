@@ -463,6 +463,10 @@ struct ScreenState {
     front_delay_ms: Option<u64>,
     pending_front_at: Option<u64>,
     late_watch_gate: Option<Arc<std::sync::atomic::AtomicBool>>,
+    late_watch_after_ms: u64,
+    coverage_start_ms: u64,
+    restore_started: Option<Arc<tokio::sync::Notify>>,
+    restore_until: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Every front and restore request, and every post and release, in
     /// order.
     log: Vec<String>,
@@ -517,6 +521,10 @@ impl Screen {
                 front_delay_ms: None,
                 pending_front_at: None,
                 late_watch_gate: None,
+                late_watch_after_ms: 400,
+                coverage_start_ms: 0,
+                restore_started: None,
+                restore_until: None,
                 log: Vec::new(),
                 last_input_ms: None,
                 post_unknown: false,
@@ -572,24 +580,30 @@ impl Screen {
     }
 
     fn snapshot(&self) -> Option<HardwareInputSnapshot> {
-        if !self.state().observer {
+        let state = self.state();
+        if !state.observer {
             return None;
         }
         Some(HardwareInputSnapshot {
-            coverage_start_ms: 0,
-            last_input_ms: self.state().last_input_ms,
+            coverage_start_ms: state.coverage_start_ms,
+            last_input_ms: state.last_input_ms,
         })
     }
 
     fn advance(&self, milliseconds: u64) {
         let gate = {
             let state = self.state();
-            (state.now >= 400)
+            (state.now >= state.late_watch_after_ms)
                 .then(|| state.late_watch_gate.clone())
                 .flatten()
         };
         if let Some(gate) = gate {
+            let end = std::time::Instant::now() + crate::test_support::HANG_GUARD;
             while !gate.load(std::sync::atomic::Ordering::Acquire) {
+                assert!(
+                    std::time::Instant::now() < end,
+                    "late watcher gate timed out"
+                );
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
@@ -638,6 +652,20 @@ impl FrontingRestoreHost for FakeRestore {
         self.0.frontmost()
     }
     fn request_front(&mut self, pid: u32) -> bool {
+        let (started, until) = {
+            let state = self.0.state();
+            (state.restore_started.clone(), state.restore_until.clone())
+        };
+        if let Some(started) = started {
+            started.notify_one();
+        }
+        if let Some(until) = until {
+            let end = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+            while !until.load(std::sync::atomic::Ordering::Acquire) {
+                assert!(std::time::Instant::now() < end, "restore gate timed out");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         self.0.front("restore", pid)
     }
     fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
@@ -786,7 +814,7 @@ impl FrontingBracketHost for FakeBracket {
 
 /// A platform driver over the fake screen. It runs the real hooked bracket
 /// for a fronted chord and the real session for every other front.
-struct FakeDriver {
+pub(crate) struct FakeDriver {
     screen: Screen,
     hooks: Option<Box<dyn FrontedDispatchHooks>>,
     pointer_guard: Option<cerebellum_computer::platform::GlobalPointerGuard>,
@@ -1511,6 +1539,79 @@ async fn a_busy_lock_stops_a_front_at_its_limit_and_never_holds_an_ordinary_pres
 
 fn command_chord() -> Value {
     json!({"keys": ["command", "c"], "target": support::TARGET_BUNDLE_ID})
+}
+
+/// Enter through the frame loop, rather than supplying a task-local terminal
+/// in the fixture. The wire worker must own the takeover chord's restore.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn frame_loop_takeover_chord_registers_cleanup_and_posts_through_the_bracket() {
+    let mut planes = crate::computer_consent_wire_tests::planes();
+    let desk = mail_desk();
+    let screen = Screen::new(&desk);
+    let driver_screen = screen.clone();
+    planes.computer_for_test = Some(Arc::new(
+        ComputerPlane::with_synthetic_driver(
+            computer_audit(crate::JournalPersistence::Isolated).unwrap(),
+            move || {
+                turn_stop_driver::Driver::fronted(Box::new(FakeDriver {
+                    screen: driver_screen.clone(),
+                    hooks: None,
+                    pointer_guard: None,
+                }))
+            },
+        )
+        .with_permission_liveness(support::live_permissions())
+        .with_session_lock_for_test(Some(false))
+        .with_app_state_source(desk.source())
+        .with_app_use(app_use_file(AppUse::Background))
+        .with_fronting_lock(FrontingLock::isolated())
+        .with_fronting_bracket_admitted(true),
+    ));
+    Arc::make_mut(&mut planes.computer_admitted).insert("computer.keys".into());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let facts = planes.routes.get(7, 1).unwrap();
+    let carrier = support::ScriptedCarrier::answering(&["computer_30m"]);
+    let mut consent = support::relayed(&carrier);
+    consent.caller = crate::computer_grants::GrantCaller::new(
+        facts.identity.conversation_key.clone(),
+        facts.identity.agent_project_id.clone(),
+        false,
+    );
+    planes
+        .management
+        .computer_grants()
+        .require(
+            &crate::computer_grants::GrantNeed::Takeover,
+            &consent,
+            &crate::CancelHandle::pending(),
+        )
+        .await
+        .unwrap();
+    let request = subc_protocol::Frame::build_with_version(
+        crate::PROTOCOL_VERSION,
+        subc_protocol::FrameType::Request,
+        crate::wire::control_flags(),
+        7,
+        1,
+        809,
+        serde_json::to_vec(&json!({"name":"computer_use","arguments":{
+            "action":"keys","target":support::TARGET_BUNDLE_ID,"keys":["command","c"]}}))
+        .unwrap(),
+    )
+    .unwrap();
+    crate::handle_frame_for_test(request, &tx, &planes)
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(crate::test_support::HANG_GUARD, rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+    assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
+    assert_eq!(screen.log(), ["front:4242", "post", "restore:100"]);
+    assert!(rx.try_recv().is_err());
 }
 
 /// Background mode: a Command chord to an application in the background
@@ -3375,7 +3476,23 @@ async fn failed_late_fronting_journal_writes_increment_the_quiet_health_counter(
         "commit_dispatch",
         "commit_finalization",
     ] {
-        let rig = rig(AppUse::Background, mail_desk()).await;
+        let rig = rig_admitting(
+            AppUse::Background,
+            mail_desk(),
+            support::granted_management().await,
+            false,
+            true,
+        );
+        let carrier = support::ScriptedCarrier::answering(&["computer_30m"]);
+        rig.management
+            .computer_grants()
+            .require(
+                &crate::computer_grants::GrantNeed::Takeover,
+                &support::relayed(&carrier),
+                &crate::CancelHandle::pending(),
+            )
+            .await
+            .unwrap();
         rig.read().await;
         let terminal = under_terminal();
         let reply = rig

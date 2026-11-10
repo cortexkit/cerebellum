@@ -16,8 +16,9 @@
 //! - and stops at the first that fails, naming why in the reply's
 //!   `fronting.not_fronted_reason`.
 //!
-//! Nothing fronts in an unattended session, or in a build whose release does
-//! not carry the app-use review.
+//! Nothing fronts in an unattended session. Outside app-use admission, only
+//! image and chord brackets authorized by held takeover and the
+//! `takeover-dispatch` review may front.
 
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -1061,6 +1062,14 @@ pub(crate) struct PrepareStop {
     pub(crate) change: Option<cerebellum_computer::app_state::person::PersonChange>,
 }
 
+/// Cleanup ownership does not confer app-use authority. The takeover route
+/// must retain takeover-dispatch admission and its held takeover grant after
+/// waiting for focus ownership.
+enum TemporaryFrontAuthority<'a> {
+    AppUse,
+    Takeover(&'a crate::computer_grants::GrantAdmission),
+}
+
 impl From<FrontingStop> for PrepareStop {
     fn from(stop: FrontingStop) -> Self {
         Self { stop, change: None }
@@ -1071,19 +1080,20 @@ impl From<FrontingStop> for PrepareStop {
 /// was last shown it.
 ///
 /// A conversation that was never shown the target has nothing to compare
-/// against. When `input_follows`, that stops the front with
+/// against. When `require_seen`, that stops the front with
 /// `TargetNotRead`: the front would hand the target input chosen
 /// without ever looking at it, and the person check, which exists to catch a
 /// target that is not what the agent saw, cannot run. A front followed by no
-/// input (a read, `open_app`) goes ahead without one.
+/// input (a read, `open_app`) goes ahead without one. Takeover-authorized
+/// brackets also retain their existing ability to run without a baseline.
 pub(crate) fn target_unchanged_since_seen(
     source: &dyn AppStateSource,
     sessions: &AppStateSessions,
     conversation_key: &str,
     grant: &ProcessGrant,
-    input_follows: bool,
+    require_seen: bool,
 ) -> Result<(), PrepareStop> {
-    if input_follows && sessions.last_seen(conversation_key, grant).is_none() {
+    if require_seen && sessions.last_seen(conversation_key, grant).is_none() {
         return Err(FrontingStop::TargetNotRead.into());
     }
     match super::element_actions::person_change_since_seen(
@@ -1129,12 +1139,74 @@ where
         purpose: FrontingPurpose,
         guards: bool,
     ) -> Result<ObligationParts, PrepareStop> {
+        Box::pin(self.prepare_front_with_authority(
+            call,
+            purpose,
+            guards,
+            TemporaryFrontAuthority::AppUse,
+        ))
+        .await
+    }
+
+    /// Prepare only a takeover-authorized image or chord bracket. In particular,
+    /// obtaining the shared hooks does not enable app-grant-only fronting.
+    pub(crate) async fn prepare_takeover_front(
+        &self,
+        call: FrontCall<'_>,
+        purpose: FrontingPurpose,
+        admission: &crate::computer_grants::GrantAdmission,
+    ) -> Result<ObligationParts, PrepareStop> {
+        // Preparation contains the lock wait and blocking guard future. Keep
+        // that state off the nested wire handler's debug poll stack.
+        Box::pin(self.prepare_front_with_authority(
+            call,
+            purpose,
+            true,
+            TemporaryFrontAuthority::Takeover(admission),
+        ))
+        .await
+    }
+
+    async fn prepare_front_with_authority(
+        &self,
+        call: FrontCall<'_>,
+        purpose: FrontingPurpose,
+        guards: bool,
+        authority: TemporaryFrontAuthority<'_>,
+    ) -> Result<ObligationParts, PrepareStop> {
         let work = super::quarantine::CallWork::current();
         let Some(terminal) = work.terminal.clone() else {
             return Err(FrontingStop::FrontingNotAdmitted.into());
         };
         let lock = self.fronting_lock.take(call.cancel).await?;
-        self.fronting_admission(call.consent, false).may_front()?;
+        // App-use input needs a prior read; takeover brackets historically do
+        // not. Both routes still compare any baseline the conversation has.
+        let require_seen =
+            matches!(&authority, TemporaryFrontAuthority::AppUse) && call.input_follows;
+        match authority {
+            TemporaryFrontAuthority::AppUse => {
+                self.fronting_admission(call.consent, false).may_front()?;
+            }
+            TemporaryFrontAuthority::Takeover(admission) => {
+                if call.consent.unattended {
+                    return Err(FrontingStop::Unattended.into());
+                }
+                if !self.fronting_bracket_admitted {
+                    return Err(FrontingStop::FrontingNotAdmitted.into());
+                }
+                if !call.management.computer_grants().holds(
+                    &call.consent.caller,
+                    &crate::computer_grants::GrantNeed::Takeover,
+                ) {
+                    return Err(FrontingStop::DispatchGateClosed.into());
+                }
+                // Recheck the actual app admission, including one-time consent,
+                // rather than requiring a new standing app grant.
+                if !admission.commit() {
+                    return Err(FrontingStop::DispatchGateClosed.into());
+                }
+            }
+        }
         if work.stopped() {
             return Err(FrontingStop::DispatchGateClosed.into());
         }
@@ -1158,7 +1230,6 @@ where
         let sessions = call.management.app_state_sessions().clone();
         let conversation_key = call.conversation_key.to_owned();
         let grant = call.grant.clone();
-        let input_follows = call.input_follows;
         tokio::task::spawn_blocking(move || {
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
             target_unchanged_since_seen(
@@ -1166,7 +1237,7 @@ where
                 &sessions,
                 &conversation_key,
                 &grant,
-                input_follows,
+                require_seen,
             )
         })
         .await

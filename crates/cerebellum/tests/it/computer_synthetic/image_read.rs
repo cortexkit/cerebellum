@@ -176,8 +176,9 @@ async fn read(
     }
     let carrier = ScriptedCarrier::default();
     let clock = FakeClock::new();
-    let reply = plane
-        .serve(
+    let reply = with_terminal(
+        "computer.read_state",
+        plane.serve(
             servable("computer.read_state").unwrap(),
             &json!({"target":TARGET_BUNDLE_ID,"include_image":true,"bring_to_front":true}),
             ServeContext {
@@ -195,9 +196,10 @@ async fn read(
                 encodes: encodes.clone(),
                 frontmost,
             },
-        )
-        .await
-        .expect("the fronted read passes the closed v21 reply schema");
+        ),
+    )
+    .await
+    .expect("the fronted read passes the closed v21 reply schema");
     assert!(
         carrier.questions().is_empty(),
         "read_state never asks for takeover"

@@ -688,6 +688,20 @@ impl TerminalArbiter {
         CALL_TERMINAL.try_with(Arc::clone).ok()
     }
 
+    /// Give a direct plane fixture the restore owner supplied by production
+    /// route arbitration. Pending activation cleanup keeps that owner after
+    /// the fixture's reply, just as it does after a route reply.
+    #[doc(hidden)]
+    pub async fn scope_for_test<T>(
+        request: Frame,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        let terminal = Arc::new(Self::new(request));
+        let result = CALL_TERMINAL.scope(Arc::clone(&terminal), future).await;
+        terminal.start_late_fronting(None);
+        result
+    }
+
     pub(crate) fn set_late_fronting_recorder(&self, recorder: LateFrontingRecorder) {
         *self.late_fronting_recorder.lock().unwrap() = Some(recorder);
     }
@@ -721,6 +735,13 @@ impl TerminalArbiter {
                 self.late_fronting_recorder.lock().unwrap().clone(),
             );
         }
+    }
+
+    /// Isolate caller fixtures that exercise route-wide cleanup cancellation.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn set_late_fronting_namespace_for_test(&self, namespace: usize) {
+        self.route_namespace
+            .store(namespace, std::sync::atomic::Ordering::Release);
     }
 
     /// The route this call arrived on, as `(channel, epoch)`.
