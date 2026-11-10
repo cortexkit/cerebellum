@@ -723,6 +723,13 @@ impl TerminalArbiter {
         }
     }
 
+    /// Isolate caller fixtures that exercise route-wide cleanup cancellation.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn set_late_fronting_namespace_for_test(&self, namespace: usize) {
+        self.route_namespace
+            .store(namespace, std::sync::atomic::Ordering::Release);
+    }
+
     /// The route this call arrived on, as `(channel, epoch)`.
     pub(crate) fn route(&self) -> (u16, u32) {
         (self.request.header.channel, self.request.header.epoch)

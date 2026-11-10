@@ -463,6 +463,10 @@ struct ScreenState {
     front_delay_ms: Option<u64>,
     pending_front_at: Option<u64>,
     late_watch_gate: Option<Arc<std::sync::atomic::AtomicBool>>,
+    late_watch_after_ms: u64,
+    coverage_start_ms: u64,
+    restore_started: Option<Arc<tokio::sync::Notify>>,
+    restore_until: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Every front and restore request, and every post and release, in
     /// order.
     log: Vec<String>,
@@ -517,6 +521,10 @@ impl Screen {
                 front_delay_ms: None,
                 pending_front_at: None,
                 late_watch_gate: None,
+                late_watch_after_ms: 400,
+                coverage_start_ms: 0,
+                restore_started: None,
+                restore_until: None,
                 log: Vec::new(),
                 last_input_ms: None,
                 post_unknown: false,
@@ -572,24 +580,30 @@ impl Screen {
     }
 
     fn snapshot(&self) -> Option<HardwareInputSnapshot> {
-        if !self.state().observer {
+        let state = self.state();
+        if !state.observer {
             return None;
         }
         Some(HardwareInputSnapshot {
-            coverage_start_ms: 0,
-            last_input_ms: self.state().last_input_ms,
+            coverage_start_ms: state.coverage_start_ms,
+            last_input_ms: state.last_input_ms,
         })
     }
 
     fn advance(&self, milliseconds: u64) {
         let gate = {
             let state = self.state();
-            (state.now >= 400)
+            (state.now >= state.late_watch_after_ms)
                 .then(|| state.late_watch_gate.clone())
                 .flatten()
         };
         if let Some(gate) = gate {
+            let end = std::time::Instant::now() + crate::test_support::HANG_GUARD;
             while !gate.load(std::sync::atomic::Ordering::Acquire) {
+                assert!(
+                    std::time::Instant::now() < end,
+                    "late watcher gate timed out"
+                );
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
@@ -638,6 +652,20 @@ impl FrontingRestoreHost for FakeRestore {
         self.0.frontmost()
     }
     fn request_front(&mut self, pid: u32) -> bool {
+        let (started, until) = {
+            let state = self.0.state();
+            (state.restore_started.clone(), state.restore_until.clone())
+        };
+        if let Some(started) = started {
+            started.notify_one();
+        }
+        if let Some(until) = until {
+            let end = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+            while !until.load(std::sync::atomic::Ordering::Acquire) {
+                assert!(std::time::Instant::now() < end, "restore gate timed out");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         self.0.front("restore", pid)
     }
     fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
@@ -3375,7 +3403,23 @@ async fn failed_late_fronting_journal_writes_increment_the_quiet_health_counter(
         "commit_dispatch",
         "commit_finalization",
     ] {
-        let rig = rig(AppUse::Background, mail_desk()).await;
+        let rig = rig_admitting(
+            AppUse::Background,
+            mail_desk(),
+            support::granted_management().await,
+            false,
+            true,
+        );
+        let carrier = support::ScriptedCarrier::answering(&["computer_30m"]);
+        rig.management
+            .computer_grants()
+            .require(
+                &crate::computer_grants::GrantNeed::Takeover,
+                &support::relayed(&carrier),
+                &crate::CancelHandle::pending(),
+            )
+            .await
+            .unwrap();
         rig.read().await;
         let terminal = under_terminal();
         let reply = rig

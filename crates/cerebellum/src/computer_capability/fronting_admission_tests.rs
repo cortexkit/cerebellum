@@ -304,11 +304,10 @@ async fn without_either_review_a_bring_to_front_read_requests_no_front() {
 }
 
 /// A build carrying the takeover review but not the app-use review: a
-/// `bring_to_front` image read under held takeover runs today's keystroke
-/// bracket, which never takes the fronting lock, so another call holding
-/// the lock does not hold it up.
+/// `bring_to_front` image read still needs held takeover, and now shares the
+/// focus lock so its cleanup cannot restore underneath another front.
 #[tokio::test(start_paused = true)]
-async fn without_the_review_a_bring_to_front_read_runs_the_bracket_without_the_lock() {
+async fn without_the_review_a_bring_to_front_read_stops_when_the_lock_is_busy() {
     let rig = unadmitted(AppUse::Background, mail_desk(), true).await;
     grant_takeover(&rig).await;
     let held = rig
@@ -326,19 +325,18 @@ async fn without_the_review_a_bring_to_front_read_runs_the_bracket_without_the_l
         .await;
     assert_eq!(reply["outcome"], "completed", "{reply}");
     assert!(
-        started.elapsed() < Duration::from_millis(crate::budgets::FRONTING_LOCK_WAIT_MS),
-        "the read waited on the fronting lock: {:?}",
+        started.elapsed() >= Duration::from_millis(crate::budgets::FRONTING_LOCK_WAIT_MS),
+        "the read did not wait for focus ownership: {:?}",
         started.elapsed()
     );
-    // Today's bracket puts the previous application back with a plain
-    // front request.
-    assert_eq!(
-        rig.screen.log(),
-        ["front:4242", "read", "front:100"],
-        "{reply}"
-    );
+    assert_eq!(reply["fronting"]["not_fronted_reason"], "fronting_busy");
+    assert!(reply.get("image").is_none());
+    assert!(rig.screen.log().is_empty(), "{reply}");
     drop(held);
 }
+
+#[path = "legacy_fronting_tests.rs"]
+mod legacy;
 
 /// Prepare a temporary front of the fixture application for the fixture
 /// conversation, as a call served under its own arbiter would.
