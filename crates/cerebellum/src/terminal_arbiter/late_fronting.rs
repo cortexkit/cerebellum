@@ -227,6 +227,8 @@ pub(super) fn start(
     }
     let target = cell.target_pid;
     let previous = cell.previous_pid;
+    #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+    let probe_timing = cell.probe_timing.clone();
     let registered = RegisteredWatch {
         key: (domain, target),
         stop: Arc::clone(&stop),
@@ -245,6 +247,8 @@ pub(super) fn start(
         let mut adapter = RestoreDecisionHost {
             host: host.as_mut(),
             _target: target,
+            #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+            probe_timing: &probe_timing,
         };
         let (mut restore, latency, input) = crate::computer::dispatch::watch_late_activation(
             &mut adapter,
@@ -272,6 +276,10 @@ pub(super) fn start(
                 &|| false,
             );
             restore = final_restore;
+        }
+        #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+        if restore == crate::computer::dispatch::RestoreStatus::Restored {
+            probe_timing.restored();
         }
         // No focus operation follows these drops. Slow audit persistence must
         // not extend the fronting lock or hold up a new call on this app.

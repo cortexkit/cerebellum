@@ -112,6 +112,14 @@ pub fn take_fronting_landings() -> Vec<(u32, u64)> {
     crate::terminal_arbiter::take_landings()
 }
 
+pub use crate::terminal_arbiter::probe_timing::FrontingTiming;
+
+/// Drain passive front/restore confirmations after the probe's cleanup spacing.
+/// These records do not sample the desktop or change the production bound.
+pub fn take_fronting_timings() -> Vec<FrontingTiming> {
+    crate::terminal_arbiter::probe_timing::take_timings()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
