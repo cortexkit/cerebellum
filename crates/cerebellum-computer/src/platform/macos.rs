@@ -1993,6 +1993,15 @@ impl PlatformDriver for MacOs26PlatformDriver {
                 "takeover_dispatch_review_revision is not bound",
             ));
         }
+        // A native bracket must have a caller owning its restore obligation,
+        // even when the target was frontmost at an earlier admission check.
+        let mut hooks = self
+            .fronted_hooks
+            .0
+            .take()
+            .ok_or(DriverError::InvalidRequest(
+                "fronted operation requires restore hooks",
+            ))?;
         let target = &request.synthetic.target;
         target.validate()?;
         let start_time_micros =
@@ -2031,22 +2040,15 @@ impl PlatformDriver for MacOs26PlatformDriver {
             .user_idle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let report = match self.fronted_hooks.0.take() {
-            Some(mut hooks) => {
-                crate::platform::run_hooked_fronted(
-                    &mut host,
-                    &mut user_idle,
-                    plan,
-                    cancelled,
-                    hooks.as_mut(),
-                    None,
-                )
-                .report
-            }
-            None => {
-                crate::dispatch::run_fronting_bracket(&mut host, &mut user_idle, plan, cancelled)
-            }
-        };
+        let report = crate::platform::run_hooked_fronted(
+            &mut host,
+            &mut user_idle,
+            plan,
+            cancelled,
+            hooks.as_mut(),
+            None,
+        )
+        .report;
         self.input_route_evidence = host.transport.evidence;
         Ok(report)
     }
@@ -2066,6 +2068,13 @@ impl PlatformDriver for MacOs26PlatformDriver {
                 "takeover_dispatch_review_revision is not bound",
             ));
         }
+        let mut hooks = self
+            .fronted_hooks
+            .0
+            .take()
+            .ok_or(DriverError::InvalidRequest(
+                "fronted operation requires restore hooks",
+            ))?;
         target.validate()?;
         let generation = target
             .process_generation_evidence
@@ -2109,26 +2118,15 @@ impl PlatformDriver for MacOs26PlatformDriver {
                 read();
             }
         };
-        Ok(match self.fronted_hooks.0.take() {
-            Some(mut hooks) => {
-                crate::platform::run_hooked_fronted(
-                    &mut host,
-                    &mut user_idle,
-                    plan,
-                    cancelled,
-                    hooks.as_mut(),
-                    Some(&mut guarded_read),
-                )
-                .report
-            }
-            None => crate::dispatch::run_fronting_read(
-                &mut host,
-                &mut user_idle,
-                plan,
-                cancelled,
-                &mut guarded_read,
-            ),
-        })
+        Ok(crate::platform::run_hooked_fronted(
+            &mut host,
+            &mut user_idle,
+            plan,
+            cancelled,
+            hooks.as_mut(),
+            Some(&mut guarded_read),
+        )
+        .report)
     }
     fn fronting_session(&mut self) -> Result<Box<dyn FrontingSession>, DriverError> {
         // The same review that admits the keystroke bracket: a front can take
@@ -2319,6 +2317,42 @@ impl PlatformDriver for MacOs26PlatformDriver {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_fronted_operations_require_restore_hooks_before_os_calls() {
+        let mut driver = MacOs26PlatformDriver::default()
+            .with_takeover_dispatch_review_revision(Some("fixture-takeover".into()));
+        let target = ProcessGrant {
+            pid: 42,
+            bundle_identity: "com.example.target".into(),
+            process_generation_evidence: "123".into(),
+        };
+        let expected = DriverError::InvalidRequest("fronted operation requires restore hooks");
+        assert_eq!(
+            driver
+                .read_fronted(&target, 300, &|| false, &mut || {
+                    panic!("unowned read must never run")
+                })
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            driver
+                .dispatch_fronted(
+                    FrontedDispatchRequest {
+                        synthetic: SyntheticDispatchRequest {
+                            target,
+                            action: SyntheticAction::type_text("hi"),
+                        },
+                        maximum_interval_ms: 100,
+                        maximum_seize_detection_latency_ms: 50,
+                    },
+                    &|| false,
+                )
+                .unwrap_err(),
+            expected
+        );
+    }
 
     #[test]
     fn pointer_fronting_requires_its_new_review_and_both_existing_reviews() {

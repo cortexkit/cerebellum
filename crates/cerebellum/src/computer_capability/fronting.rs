@@ -512,22 +512,21 @@ fn takeover_route(admission: Admission) -> ChordRoute {
 }
 
 /// The image read's `(bring_to_front, takeover)` once the mode is applied.
-/// Foreground mode runs no temporary bracket: a read whose one-way front
-/// succeeded ignores `bring_to_front`, and one whose front did not happen
-/// asks for takeover as background mode would. Background mode keeps today's
-/// rule: the bracket runs only under held takeover in an attended session.
+/// A foreground read whose one-way front succeeded ignores `bring_to_front`.
+/// Otherwise either mode needs held takeover in an attended session to run
+/// the temporary bracket, including when the target was already frontmost
+/// at the foreground check but the person switched away before capture.
 pub(crate) fn image_fronting(
     admission: Admission,
     bring_to_front: bool,
     fronted_one_way: bool,
 ) -> (bool, bool) {
-    match admission.mode {
-        AppUse::Foreground => (bring_to_front && !fronted_one_way, false),
-        AppUse::Background => (
-            bring_to_front,
-            bring_to_front && admission.attended && admission.takeover_held,
-        ),
-    }
+    let bring_to_front =
+        bring_to_front && !(admission.mode == AppUse::Foreground && fronted_one_way);
+    (
+        bring_to_front,
+        bring_to_front && admission.attended && admission.takeover_held,
+    )
 }
 
 /// A one-way front that went through.

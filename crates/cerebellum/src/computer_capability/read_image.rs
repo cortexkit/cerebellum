@@ -52,6 +52,10 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     if !plan.bracket_admitted {
         return Err(ImageUnavailable::FrontingUnavailable);
     }
+    let hooks = plan
+        .hooks
+        .as_ref()
+        .ok_or(ImageUnavailable::FrontingUnavailable)?;
     // The declared 300 ms read bound is provisional pending a live measurement
     // by the placed module. Keys retain their independently sized 100 ms bound.
     let bound = cerebellum_computer::platform::vocabulary::frozen_row_bound_ms(
@@ -71,10 +75,8 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     if gate.is_some_and(|gate| !gate.begin_mutation()) {
         return Err(ImageUnavailable::FrontingUnavailable);
     }
-    if let Some(hooks) = &plan.hooks {
-        if !driver.accept_fronted_dispatch_hooks(super::fronting::boxed_hooks(hooks)) {
-            return Err(ImageUnavailable::FrontingUnavailable);
-        }
+    if !driver.accept_fronted_dispatch_hooks(super::fronting::boxed_hooks(hooks)) {
+        return Err(ImageUnavailable::FrontingUnavailable);
     }
     let bracket = driver.read_fronted(
         grant,

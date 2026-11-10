@@ -1825,8 +1825,9 @@ where
             .permissions
             .state(cerebellum_computer::platform::PermissionService::ScreenRecording)
             == PermissionLiveness::Live;
-        // A background `bring_to_front` read under held takeover fronts the
-        // application for the capture. Takeover has separate admission from
+        // A `bring_to_front` read under held takeover may front the application
+        // even in foreground app-use: the person can switch away after the
+        // foreground check and before capture. Takeover has separate admission from
         // app-use fronting, but shares focus ownership and restore cleanup.
         let mut image_hooks = None;
         let mut image_fronting = None;
@@ -1834,7 +1835,6 @@ where
             && bring_to_front
             && takeover
             && image_permission_live
-            && fronting_admission.mode == cerebellum_core::config::AppUse::Background
             && self.fronting_bracket_admitted;
         if bring_to_front_now {
             let call = fronting::FrontCall {
@@ -1894,7 +1894,7 @@ where
                     requested: parsed.include_image,
                     bring_to_front,
                     takeover,
-                    bracket_admitted: self.fronting_bracket_admitted && image_fronting.is_none(),
+                    bracket_admitted: self.fronting_bracket_admitted && image_hooks.is_some(),
                     cancel: Some(cancel),
                     now_ms,
                     gate: None,
