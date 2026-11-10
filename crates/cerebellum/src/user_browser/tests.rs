@@ -3652,6 +3652,7 @@ mod codemode;
 mod dom_full;
 mod observer_wait;
 mod person_check;
+mod type_combobox;
 mod type_replacement;
 
 #[tokio::test]
