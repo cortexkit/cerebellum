@@ -3367,3 +3367,33 @@ async fn a_new_app_call_before_watcher_start_still_ends_the_pending_watch() {
     assert_eq!(rig.screen.log(), ["front:4242"]);
     assert_eq!(rig.screen.state().now, 400);
 }
+
+#[tokio::test]
+async fn failed_late_fronting_journal_writes_increment_the_quiet_health_counter() {
+    for fault in [
+        "advance_allocator",
+        "commit_dispatch",
+        "commit_finalization",
+    ] {
+        let rig = rig(AppUse::Background, mail_desk()).await;
+        rig.read().await;
+        let terminal = under_terminal();
+        let reply = rig
+            .call_under(&terminal, "computer.keys", command_chord())
+            .await;
+        assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
+        let before = super::late_fronting_journal_failures();
+        rig.plane
+            .audit
+            .lock()
+            .unwrap()
+            .journal_mut()
+            .arm_fault(fault, 1);
+        terminal.record_late_fronting_for_test(json!({"cleanup":"restore", "restore":"restored"}));
+        assert_eq!(
+            super::late_fronting_journal_failures(),
+            before + 1,
+            "fault {fault} was not counted"
+        );
+    }
+}

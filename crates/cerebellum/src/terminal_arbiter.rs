@@ -622,6 +622,8 @@ pub(crate) struct TerminalState {
 
 type TerminalHook = Box<dyn FnOnce() + Send>;
 mod late_fronting;
+#[cfg(test)]
+pub(crate) use late_fronting::hold_watch_for_test;
 #[cfg(all(feature = "desk-probe", target_os = "macos"))]
 pub(crate) use late_fronting::take_landings;
 pub(crate) use late_fronting::{
@@ -688,6 +690,15 @@ impl TerminalArbiter {
 
     pub(crate) fn set_late_fronting_recorder(&self, recorder: LateFrontingRecorder) {
         *self.late_fronting_recorder.lock().unwrap() = Some(recorder);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_late_fronting_for_test(&self, result: Value) {
+        self.late_fronting_recorder
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()(result);
     }
 
     pub(crate) fn start_late_fronting(&self, restore: Option<&Arc<RestoreCell>>) {

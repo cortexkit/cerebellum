@@ -139,26 +139,26 @@ impl WorkerLease {
     /// Record the process the call acts on, now that it is known, so a call
     /// naming the application only by pid matches too.
     pub(crate) fn bind(&self, grant: &ProcessGrant) {
-        if let Some(entry) = self
-            .registry
-            .entries
-            .lock()
-            .unwrap()
-            .iter_mut()
-            .find(|entry| entry.id == self.id)
-        {
-            if let Some(terminal) = &entry.terminal {
-                if !crate::terminal_arbiter::cancel_late_fronting_target(
-                    terminal
-                        .fronting_domain
-                        .load(std::sync::atomic::Ordering::Acquire),
-                    grant.pid,
-                ) {
-                    terminal.stop(crate::terminal_arbiter::TerminalCause::Deadline);
-                }
-            }
+        let terminal = {
+            let mut entries = self.registry.entries.lock().unwrap();
+            let Some(entry) = entries.iter_mut().find(|entry| entry.id == self.id) else {
+                return;
+            };
             entry.pid = Some(grant.pid);
             entry.bundle_identity = Some(grant.bundle_identity.clone());
+            entry.terminal.clone()
+        };
+        // The cleanup wait owns no quarantine lock: another application must
+        // still be able to enter, leave, or check this registry immediately.
+        if let Some(terminal) = terminal {
+            if !crate::terminal_arbiter::cancel_late_fronting_target(
+                terminal
+                    .fronting_domain
+                    .load(std::sync::atomic::Ordering::Acquire),
+                grant.pid,
+            ) {
+                terminal.stop(crate::terminal_arbiter::TerminalCause::Deadline);
+            }
         }
     }
 }
@@ -297,13 +297,25 @@ impl CallWork {
 
     /// Record the process this call acts on, and refuse it when a stuck
     /// worker from another call holds that process.
-    pub(crate) fn bind(
+    pub(crate) async fn bind(
         &self,
         quarantine: &ExecutionQuarantine,
         grant: &ProcessGrant,
     ) -> Option<Value> {
         if let Some(lease) = &self.lease {
-            lease.bind(grant);
+            let lease = Arc::clone(lease);
+            let grant = grant.clone();
+            // Every production caller is an async serving task. A condvar
+            // wait belongs on the blocking pool, never a Tokio worker.
+            if tokio::task::spawn_blocking(move || lease.bind(&grant))
+                .await
+                .is_err()
+            {
+                if let Some(terminal) = &self.terminal {
+                    terminal.stop(crate::terminal_arbiter::TerminalCause::Deadline);
+                }
+                return Some(stopped_before_dispatch_reply());
+            }
         }
         quarantine
             .busy(

@@ -292,6 +292,33 @@ pub(super) fn start(
 }
 
 #[cfg(test)]
+pub(crate) struct HeldWatchForTest(RegisteredWatch);
+
+#[cfg(test)]
+impl HeldWatchForTest {
+    pub(crate) fn stopped(&self) -> bool {
+        self.0.stop.load(Ordering::Acquire) != 0
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn hold_watch_for_test(domain: usize, pid: u32) -> HeldWatchForTest {
+    let stop = Arc::new(AtomicU8::new(0));
+    let done = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let key = (domain, pid);
+    WATCHES.lock().unwrap().insert(
+        key,
+        Watch {
+            request: (0, 0, 0),
+            route_namespace: domain,
+            stop: Arc::clone(&stop),
+            done: Arc::clone(&done),
+        },
+    );
+    HeldWatchForTest(RegisteredWatch { key, stop, done })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

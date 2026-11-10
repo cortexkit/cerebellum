@@ -584,3 +584,65 @@ impl cerebellum_computer::platform::PlatformDriver for UnreachableDriver {
         unreachable!()
     }
 }
+
+#[test]
+fn quarantine_checks_do_not_wait_for_another_bind_to_finish_late_cleanup() {
+    let registry = Arc::new(ExecutionQuarantine::default());
+    let call = terminal();
+    let domain = Arc::as_ptr(&registry) as usize;
+    call.fronting_domain.store(domain, Ordering::Release);
+    let watch = crate::terminal_arbiter::hold_watch_for_test(domain, 42);
+    let lease = registry.enter(Some(EDITOR.into()), "computer.keys", Some(call));
+    let binding = std::thread::spawn(move || lease.bind(&grant(42, EDITOR)));
+    let end = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+    while !watch.stopped() && std::time::Instant::now() < end {
+        std::thread::yield_now();
+    }
+    assert!(watch.stopped(), "bind never reached the pending watcher");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let checking = std::thread::spawn(move || {
+        tx.send(registry.busy(None, Some(43), Some(VIEWER)))
+            .unwrap();
+    });
+    let checked = rx.recv_timeout(Duration::from_millis(500));
+    // Release the fake watcher even when the assertion will fail, so the
+    // test's two worker threads never outlive their isolated registry.
+    drop(watch);
+    binding.join().unwrap();
+    checking.join().unwrap();
+    assert_eq!(
+        checked,
+        Ok(None),
+        "an unrelated quarantine lookup waited for cleanup"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn binding_awaits_late_cleanup_without_blocking_the_tokio_worker() {
+    let registry = Arc::new(ExecutionQuarantine::default());
+    let call = terminal();
+    let domain = Arc::as_ptr(&registry) as usize;
+    call.fronting_domain.store(domain, Ordering::Release);
+    let watch = crate::terminal_arbiter::hold_watch_for_test(domain, 42);
+    let lease = registry.enter(
+        Some(EDITOR.into()),
+        "computer.keys",
+        Some(Arc::clone(&call)),
+    );
+    let work = CallWork::new(Some(call), Duration::from_secs(30), Some(lease), None);
+    let binding_registry = Arc::clone(&registry);
+    let binding =
+        tokio::spawn(async move { work.bind(&binding_registry, &grant(42, EDITOR)).await });
+    let end = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+    while !watch.stopped() && std::time::Instant::now() < end {
+        tokio::task::yield_now().await;
+    }
+    assert!(watch.stopped(), "bind never reached the pending watcher");
+    assert!(
+        !binding.is_finished(),
+        "the Tokio worker resumed only after cleanup timed out"
+    );
+    assert_eq!(registry.busy(None, Some(43), Some(VIEWER)), None);
+    drop(watch);
+    assert_eq!(binding.await.unwrap(), None);
+}

@@ -570,7 +570,7 @@ where
         }
         let admission = takeover.admission().clone();
         let work = super::quarantine::CallWork::current();
-        if let Some(mut busy) = work.bind(&self.serializer.quarantine, &target) {
+        if let Some(mut busy) = work.bind(&self.serializer.quarantine, &target).await {
             admission.decorate(&mut busy);
             return busy;
         }

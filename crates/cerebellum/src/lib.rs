@@ -9304,6 +9304,8 @@ fn record_engram_catalog_write() {
 ///   backup catalog (`engram-catalog.json`) that failed;
 /// - `auditReservationCleanupFailures`, unused computer reservations whose Drop
 ///   cleanup failed to durably close their journal row;
+/// - `lateFrontingJournalFailures`, late focus-cleanup records that could not
+///   be persisted;
 /// - on macOS, `previewCaptureRequests` and `previewFramesWritten`, how many
 ///   capture requests the background-mode preview has made and how many frame
 ///   lines it has written to the agent-cursor helper since the process
@@ -9346,6 +9348,10 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
         metrics.insert(
             "auditReservationCleanupFailures".into(),
             json!(cerebellum_computer::audit::audit_reservation_cleanup_failures()),
+        );
+        metrics.insert(
+            "lateFrontingJournalFailures".into(),
+            json!(computer_capability::late_fronting_journal_failures()),
         );
         #[cfg(target_os = "macos")]
         {
@@ -15718,6 +15724,14 @@ mod sigterm_listener_tests {
         assert_eq!(
             health_metrics().await["auditReservationCleanupFailures"],
             json!(cerebellum_computer::audit::audit_reservation_cleanup_failures())
+        );
+    }
+
+    #[tokio::test]
+    async fn late_fronting_journal_failures_are_on_the_health_reply() {
+        assert_eq!(
+            health_metrics().await["lateFrontingJournalFailures"],
+            json!(computer_capability::late_fronting_journal_failures())
         );
     }
 }
