@@ -603,6 +603,17 @@ fn code(value: Option<&Value>) -> Option<String> {
 #[derive(Debug)]
 pub struct CallTicket {
     key: Key,
+    started: std::sync::Arc<CallSnapshot>,
+}
+
+impl CallTicket {
+    pub(crate) fn identity(&self) -> &(String, String) {
+        &self.key
+    }
+
+    pub(crate) fn started(&self) -> &std::sync::Arc<CallSnapshot> {
+        &self.started
+    }
 }
 
 /// What to do with a keyed call.
@@ -1130,21 +1141,20 @@ impl CallRecords {
         if let Err(error) = self.write(&mut inner, &record, now_ms) {
             return Begin::Unavailable(error);
         }
-        inner.entries.insert(
-            key.clone(),
-            Entry {
-                consent_ended: false,
-                held_dispatched: false,
-                record,
-                conversation_key: conversation_key.to_string(),
-                ask_id: None,
-                reply: None,
-                reply_bytes: 0,
-                cached_at: None,
-                late_seq: None,
-            },
-        );
-        Begin::Execute(CallTicket { key })
+        let entry = Entry {
+            consent_ended: false,
+            held_dispatched: false,
+            record,
+            conversation_key: conversation_key.to_string(),
+            ask_id: None,
+            reply: None,
+            reply_bytes: 0,
+            cached_at: None,
+            late_seq: None,
+        };
+        let started = std::sync::Arc::new(entry.snapshot());
+        inner.entries.insert(key.clone(), entry);
+        Begin::Execute(CallTicket { key, started })
     }
 
     /// Record the call's reply. The handler waits for this write before sending
