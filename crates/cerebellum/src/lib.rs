@@ -3122,6 +3122,9 @@ struct RequestCancellationGuard {
 }
 
 impl RequestCancellations {
+    fn namespace(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
     fn register(&self, key: (u16, u32, u64)) -> RequestCancellationGuard {
         let handle = CancelHandle::pending();
         self.0.lock().unwrap().insert(key, handle.clone());
@@ -3135,6 +3138,7 @@ impl RequestCancellations {
         self.0.lock().unwrap().get(&key).cloned()
     }
     fn cancel_route(&self, channel: u16, epoch: u32) {
+        terminal_arbiter::cancel_late_fronting_route(self.namespace(), channel, epoch);
         for ((c, e, _), handle) in self.0.lock().unwrap().iter() {
             if (*c, *e) == (channel, epoch) {
                 handle.stop_terminal(TerminalCause::RouteClosed);
@@ -3144,6 +3148,7 @@ impl RequestCancellations {
     }
 
     fn stop_all(&self, cause: TerminalCause) {
+        terminal_arbiter::cancel_late_fronting_all(self.namespace());
         for handle in self.0.lock().unwrap().values() {
             handle.stop_terminal(cause);
         }
@@ -3937,6 +3942,10 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Cancel => {
+            terminal_arbiter::cancel_late_fronting_request(
+                planes.cancellations.namespace(),
+                (frame.header.channel, frame.header.epoch, frame.header.corr),
+            );
             match (
                 frame.header.channel,
                 planes.cancellations.get((

@@ -968,6 +968,7 @@ where
         capability: ComputerCapability,
         reply: Value,
     ) -> Result<Value, CapabilityResultValidationError> {
+        let reply = cerebellum_computer::audit::FinalFrontingResult::new(reply).into_value();
         match validate_capability_result(capability.capability_id(), &reply) {
             Ok(()) => Ok(reply),
             Err(error) => {
@@ -1070,6 +1071,23 @@ where
             );
         }
         let terminal = crate::TerminalArbiter::current();
+        if let Some(terminal) = &terminal {
+            terminal.fronting_domain.store(
+                self.fronting_lock.domain(),
+                std::sync::atomic::Ordering::Release,
+            );
+            let audit = Arc::clone(&self.audit);
+            let identity = context.identity.clone();
+            let capability = capability.capability();
+            terminal.set_late_fronting_recorder(Arc::new(move |result| {
+                if lock_audit(&audit)
+                    .record_fronting_cleanup(identity.clone(), capability, result)
+                    .is_err()
+                {
+                    eprintln!("late fronting cleanup could not be journaled");
+                }
+            }));
+        }
         let lease =
             self.serializer
                 .quarantine

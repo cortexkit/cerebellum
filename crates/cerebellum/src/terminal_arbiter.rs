@@ -263,6 +263,7 @@ pub struct RestoreCell {
     purpose: FrontingPurpose,
     inner: std::sync::Mutex<RestoreCellInner>,
     changed: std::sync::Condvar,
+    pending_watch: late_fronting::PendingRegistration,
 }
 
 struct RestoreCellInner {
@@ -270,10 +271,17 @@ struct RestoreCellInner {
     host: Option<Box<dyn RestoreHost>>,
     lock: Option<FrontingLockGuard>,
     decided: Option<RestoreDecided>,
+    front_confirmed: bool,
+    pending_since: Option<u64>,
 }
 
 impl RestoreCell {
-    fn new(obligation: RestoreObligation) -> Self {
+    fn new(
+        obligation: RestoreObligation,
+        domain: usize,
+        namespace: usize,
+        request: crate::egress::RequestId,
+    ) -> Self {
         Self {
             previous_pid: obligation.previous_pid,
             target_pid: obligation.target_pid,
@@ -285,8 +293,16 @@ impl RestoreCell {
                 host: Some(obligation.host),
                 lock: Some(obligation.lock),
                 decided: None,
+                front_confirmed: false,
+                pending_since: None,
             }),
             changed: std::sync::Condvar::new(),
+            pending_watch: late_fronting::register_pending(
+                domain,
+                obligation.target_pid,
+                namespace,
+                request,
+            ),
         }
     }
 
@@ -312,6 +328,14 @@ impl RestoreCell {
     pub fn front_attempt_returned(&self) {
         self.inner().attempt.attempt_returned();
         self.changed.notify_all();
+    }
+
+    pub fn front_confirmed(&self) {
+        self.inner().front_confirmed = true;
+    }
+
+    pub fn was_front_confirmed(&self) -> bool {
+        self.inner().front_confirmed
     }
 
     /// The decision, once it has completed.
@@ -360,17 +384,33 @@ impl RestoreCell {
                 }
             }
         };
+        let confirmed = inner.front_confirmed;
         let host = inner.host.take();
         drop(inner);
         let outcome = match host {
             Some(mut host) => {
-                let outcome = crate::computer::dispatch::restore_after_front(
-                    &mut RestoreDecisionHost(host.as_mut()),
+                let outcome = crate::computer::dispatch::restore_after_front_attempt(
+                    &mut RestoreDecisionHost {
+                        host: host.as_mut(),
+                        _target: self.target_pid,
+                    },
                     self.previous_pid,
                     self.target_pid,
                     front_instant_ms,
                     crate::computer::dispatch::RESTORE_WAIT_MS,
+                    confirmed,
                 );
+                if !confirmed
+                    && !matches!(
+                        outcome.restore,
+                        crate::computer::dispatch::RestoreStatus::Restored
+                            | crate::computer::dispatch::RestoreStatus::NotNeeded
+                    )
+                {
+                    let mut inner = self.inner();
+                    inner.pending_since = Some(front_instant_ms);
+                    inner.host = Some(host);
+                }
                 RestoreDecided {
                     restore: outcome.restore,
                     person_input_during_fronting: outcome.person_input_during_fronting,
@@ -432,7 +472,11 @@ impl RestoreCell {
         decided: RestoreDecided,
     ) -> RestoreDecided {
         inner.decided = Some(decided);
-        let lock = inner.lock.take();
+        let lock = if inner.pending_since.is_none() {
+            inner.lock.take()
+        } else {
+            None
+        };
         drop(inner);
         self.changed.notify_all();
         drop(lock);
@@ -451,7 +495,7 @@ impl RestoreCell {
         let fronting = object.entry("fronting").or_insert_with(|| {
             let mut fronting = json!({
                 "mode": self.mode.name(),
-                "fronted": decided.front_requested,
+                "fronted": self.was_front_confirmed(),
                 "purpose": self.purpose.name(),
             });
             if !decided.front_requested {
@@ -493,22 +537,29 @@ impl RestoreCell {
 /// decision runs against. The decision reads the front and the hardware input
 /// timestamps, may request the previous application, and waits; it creates
 /// no input tap and posts no input, so those methods are never reached.
-struct RestoreDecisionHost<'a>(&'a mut dyn RestoreHost);
+struct RestoreDecisionHost<'a> {
+    host: &'a mut dyn RestoreHost,
+    _target: u32,
+}
 
 impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> {
     type Tap = ();
 
     fn now_ms(&mut self) -> u64 {
-        self.0.now_ms()
+        self.host.now_ms()
     }
     fn pause_ms(&mut self, milliseconds: u64) {
-        self.0.pause_ms(milliseconds);
+        self.host.pause_ms(milliseconds);
     }
     fn frontmost_pid(&mut self) -> Option<u32> {
-        self.0.frontmost_pid()
+        self.host.frontmost_pid()
     }
     fn request_front(&mut self, pid: u32) -> bool {
-        self.0.request_front(pid)
+        self.host.request_front(pid)
+    }
+    fn late_activation_observed(&mut self, _latency_ms: u64) {
+        #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+        late_fronting::note_landing(self._target, _latency_ms);
     }
     fn our_pid(&self) -> i64 {
         i64::from(std::process::id())
@@ -545,7 +596,7 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
     fn hardware_input_snapshot(
         &mut self,
     ) -> Option<crate::computer::dispatch::HardwareInputSnapshot> {
-        self.0.hardware_input_snapshot()
+        self.host.hardware_input_snapshot()
     }
 }
 
@@ -570,6 +621,14 @@ pub(crate) struct TerminalState {
 }
 
 type TerminalHook = Box<dyn FnOnce() + Send>;
+mod late_fronting;
+#[cfg(all(feature = "desk-probe", target_os = "macos"))]
+pub(crate) use late_fronting::take_landings;
+pub(crate) use late_fronting::{
+    cancel_late_fronting_all, cancel_late_fronting_request, cancel_late_fronting_route,
+    cancel_late_fronting_target,
+};
+type LateFrontingRecorder = Arc<dyn Fn(Value) + Send + Sync>;
 
 /// One decision shared by the route task and its workers. A worker retains this
 /// handle when detached, but cannot change a terminal that has already won.
@@ -586,6 +645,9 @@ pub struct TerminalArbiter {
     /// computer calls draw badges, so a cancel that finds one here cancelled a
     /// computer call and can hide that agent's badge.
     cursor_agent: std::sync::Mutex<Option<String>>,
+    late_fronting_recorder: std::sync::Mutex<Option<LateFrontingRecorder>>,
+    pub(crate) fronting_domain: std::sync::atomic::AtomicUsize,
+    route_namespace: std::sync::atomic::AtomicUsize,
 }
 
 tokio::task_local! {
@@ -614,11 +676,40 @@ impl TerminalArbiter {
             changed: tokio::sync::Notify::new(),
             consent_desk: std::sync::Mutex::new(None),
             cursor_agent: std::sync::Mutex::new(None),
+            late_fronting_recorder: std::sync::Mutex::new(None),
+            fronting_domain: std::sync::atomic::AtomicUsize::new(0),
+            route_namespace: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     pub fn current() -> Option<Arc<Self>> {
         CALL_TERMINAL.try_with(Arc::clone).ok()
+    }
+
+    pub(crate) fn set_late_fronting_recorder(&self, recorder: LateFrontingRecorder) {
+        *self.late_fronting_recorder.lock().unwrap() = Some(recorder);
+    }
+
+    pub(crate) fn start_late_fronting(&self, restore: Option<&Arc<RestoreCell>>) {
+        let (cell, cause) = {
+            let state = self.state.lock().unwrap();
+            (
+                restore.cloned().or_else(|| state.restore.clone()),
+                state.cause,
+            )
+        };
+        if let Some(cell) = cell {
+            late_fronting::start(
+                &cell,
+                request_id(&self.request),
+                self.fronting_domain
+                    .load(std::sync::atomic::Ordering::Acquire),
+                self.route_namespace
+                    .load(std::sync::atomic::Ordering::Acquire),
+                cause,
+                self.late_fronting_recorder.lock().unwrap().clone(),
+            );
+        }
     }
 
     /// The route this call arrived on, as `(channel, epoch)`.
@@ -782,7 +873,14 @@ impl TerminalArbiter {
             drop(obligation);
             return Err(RestoreRegistrationRefused);
         }
-        let cell = Arc::new(RestoreCell::new(obligation));
+        let cell = Arc::new(RestoreCell::new(
+            obligation,
+            self.fronting_domain
+                .load(std::sync::atomic::Ordering::Acquire),
+            self.route_namespace
+                .load(std::sync::atomic::Ordering::Acquire),
+            request_id(&self.request),
+        ));
         state.restore = Some(Arc::clone(&cell));
         Ok(cell)
     }
@@ -943,6 +1041,10 @@ pub(crate) async fn run_arbitrated_route(
     envelope_end: tokio::time::Instant,
     connection_end: tokio::time::Instant,
 ) {
+    terminal.route_namespace.store(
+        cancellation.registry.namespace(),
+        std::sync::atomic::Ordering::Release,
+    );
     *terminal.consent_desk.lock().unwrap() = Some(Arc::clone(&planes.consent));
     let execution = Arc::new(std::sync::Mutex::new(Some(Arc::clone(&guard))));
     let worker_execution = Arc::clone(&execution);
@@ -1074,6 +1176,7 @@ pub(crate) async fn run_arbitrated_route(
             Some(cell) => Some(finish_restore(Arc::clone(cell), held, suffix_end, &planes).await),
             None => None,
         };
+        terminal.start_late_fronting(restore.as_ref());
         if let Some(held) = held {
             chosen = rebuild_body(chosen, |body| {
                 if body["outcome"] == "dispatch_outcome_unknown" {
@@ -1207,6 +1310,7 @@ fn rebuild_body(frame: Frame, update: impl FnOnce(&mut Value)) -> Frame {
     };
     let mut body = original.clone();
     update(&mut body);
+    let body = cerebellum_computer::audit::FinalFrontingResult::new(body).into_value();
     if body == original {
         return frame;
     }
@@ -2375,6 +2479,7 @@ mod restore_slot_tests {
             screen.log.push("front_returned");
             screen.frontmost = Some(TARGET);
         }
+        cell.front_confirmed();
         cell.front_attempt_returned();
     }
 
@@ -2555,6 +2660,9 @@ mod restore_slot_tests {
         let cell = terminal
             .register_restore(obligation(&screen(false), &releases))
             .unwrap();
+        assert!(cell.begin_front_attempt(0));
+        cell.front_confirmed();
+        cell.front_attempt_returned();
         let failed = RestoreDecided {
             restore: RestoreStatus::Failed {
                 left_in_front: Some(TARGET),
@@ -2645,6 +2753,7 @@ mod restore_slot_tests {
                 .register_restore(obligation(&shared, &releases))
                 .unwrap();
             assert!(cell.begin_front_attempt(0));
+            cell.front_confirmed();
             cell.front_attempt_returned();
             Box::pin(std::future::pending())
         }
@@ -2899,6 +3008,7 @@ mod restore_slot_tests {
                     .register_restore(obligation(&shared, &releases))
                     .unwrap();
                 assert!(cell.begin_front_attempt(0));
+                cell.front_confirmed();
                 cell.front_attempt_returned();
                 assert_eq!(cell.decide().restore, RestoreStatus::Restored);
                 let ok = Frame::build_with_version(

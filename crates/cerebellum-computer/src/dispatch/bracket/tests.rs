@@ -18,6 +18,7 @@ struct FakeDesk {
     frontmost: Option<u32>,
     pending_front: Option<(u32, u64)>,
     front_latency_ms: u64,
+    restore_latency_ms: Option<u64>,
     unit_ms: u64,
     /// Fronting requests for this pid are ignored.
     refuse_front_of: Option<u32>,
@@ -58,6 +59,7 @@ impl FakeDesk {
             frontmost: Some(PREVIOUS),
             pending_front: None,
             front_latency_ms: 5,
+            restore_latency_ms: None,
             unit_ms: 4,
             refuse_front_of: None,
             input_after_units: None,
@@ -129,7 +131,12 @@ impl FrontingBracketHost for FakeDesk {
             // The interval runs from the request, as the bracket counts it.
             self.fronted_since = Some(self.now);
         }
-        self.pending_front = Some((pid, self.now + self.front_latency_ms));
+        let latency = if pid == PREVIOUS {
+            self.restore_latency_ms.unwrap_or(self.front_latency_ms)
+        } else {
+            self.front_latency_ms
+        };
+        self.pending_front = Some((pid, self.now + latency));
         true
     }
     fn our_pid(&self) -> i64 {
@@ -1202,4 +1209,95 @@ fn restore_new_activity_during_final_sampling_leaves_focus_alone() {
         }
     );
     assert_eq!(desk.front_requests, [TARGET]);
+}
+
+#[test]
+fn pending_activation_is_not_restored_just_because_previous_is_still_frontmost() {
+    let mut desk = FakeDesk::new();
+    desk.front_latency_ms = 800;
+    desk.restore_latency_ms = Some(2);
+    desk.request_front(TARGET);
+    desk.advance(100);
+    let reply = restore_after_front_attempt(&mut desk, PREVIOUS, TARGET, 0, 300, false);
+    assert!(matches!(reply.restore, RestoreStatus::Failed { .. }));
+    assert_eq!(desk.now, 400);
+    assert_eq!(desk.front_requests, [TARGET]);
+    let (restore, latency, input) =
+        watch_late_activation(&mut desk, PREVIOUS, TARGET, 0, 5_000, &|| false);
+    assert_eq!(restore, RestoreStatus::Restored);
+    assert_eq!(latency, Some(800));
+    assert!(!input);
+    assert_eq!(desk.frontmost, Some(PREVIOUS));
+    assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
+    assert!(
+        desk.posted.is_empty(),
+        "late cleanup must never post the refused chord"
+    );
+}
+
+#[test]
+fn late_activation_watch_leaves_person_input_and_unknown_coverage_alone() {
+    for unknown in [false, true] {
+        let mut desk = FakeDesk::new();
+        desk.front_latency_ms = 800;
+        desk.request_front(TARGET);
+        desk.advance(800);
+        if unknown {
+            desk.observer_lost = true;
+        } else {
+            desk.hardware_input_ms = Some(500);
+        }
+        let (restore, _, input) =
+            watch_late_activation(&mut desk, PREVIOUS, TARGET, 0, 5_000, &|| false);
+        assert!(matches!(restore, RestoreStatus::SkippedPerson { .. }));
+        assert!(input);
+        assert_eq!(desk.front_requests, [TARGET]);
+        assert_eq!(desk.frontmost, Some(TARGET));
+        assert!(desk.posted.is_empty());
+    }
+}
+
+#[test]
+fn late_activation_watch_has_a_hard_end_and_honors_stop() {
+    for stop in [false, true] {
+        let mut desk = FakeDesk::new();
+        desk.refuse_front_of = Some(TARGET);
+        desk.request_front(TARGET);
+        let (restore, latency, _) =
+            watch_late_activation(&mut desk, PREVIOUS, TARGET, 0, 5_000, &|| stop);
+        assert!(matches!(restore, RestoreStatus::Failed { .. }));
+        assert_eq!(latency, None);
+        assert_eq!(desk.now, if stop { 0 } else { 5_000 });
+        assert_eq!(desk.front_requests, [TARGET]);
+        assert!(desk.posted.is_empty());
+    }
+}
+
+#[test]
+fn unhooked_front_timeout_does_not_claim_a_pending_activation_was_restored() {
+    let mut desk = FakeDesk::new();
+    desk.front_latency_ms = 800;
+    let report = run(&mut desk, 1);
+    assert_eq!(report.stop, Some(BracketStop::FrontFailed));
+    assert!(matches!(report.restore, RestoreStatus::Failed { .. }));
+    assert_eq!(desk.front_requests, [TARGET]);
+    assert!(desk.posted.is_empty());
+}
+
+#[test]
+fn a_timed_out_activation_landing_during_in_call_cleanup_does_not_restore_over_input() {
+    let mut desk = FakeDesk::new();
+    desk.front_latency_ms = 200;
+    desk.request_front(TARGET);
+    desk.advance(200);
+    desk.hardware_input_ms = Some(150);
+    let outcome = restore_after_front_attempt(&mut desk, PREVIOUS, TARGET, 0, 300, false);
+    assert!(matches!(
+        outcome.restore,
+        RestoreStatus::SkippedPerson { .. }
+    ));
+    assert!(outcome.person_input_during_fronting);
+    assert_eq!(desk.front_requests, [TARGET]);
+    assert_eq!(desk.frontmost, Some(TARGET));
+    assert!(desk.posted.is_empty());
 }

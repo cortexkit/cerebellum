@@ -50,6 +50,9 @@ pub const ENABLE_POLL_MS: u64 = 500;
 // Putting the previously frontmost app back has its own accessibility budget,
 // so a call whose work time has run out can still restore.
 pub const RESTORE_AX_MS: u64 = 300;
+// A task for one pending activation, never an idle timer. The desk probe's
+// request-to-landing latency distribution will determine this allowance.
+pub const LATE_ACTIVATION_WATCH_MS: u64 = 5_000;
 pub const SYNTHETIC_POST_PHASE_MS: u64 = 5_000;
 pub const CAPTURE_IMAGE_MS: u64 = 2_000;
 pub const INVENTORY_MS: u64 = 2_000;

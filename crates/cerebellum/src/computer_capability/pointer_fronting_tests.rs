@@ -796,26 +796,32 @@ async fn missing_takeover_or_app_grant_fronts_and_posts_nothing() {
 async fn a_failed_pointer_front_is_bounded_and_posts_nothing() {
     let (rig, image_id) = fixture().await;
     rig.screen.state().comes_forward = false;
+    let terminal = under_terminal();
     let reply = rig
         .call_under(
-            &under_terminal(),
+            &terminal,
             "computer.takeover_click",
             json!({"image_id":image_id,"x":10,"y":20}),
         )
         .await;
-    assert_eq!(reply["outcome"], "not_fronted", "{reply}");
+    assert_eq!(reply["outcome"], "restore_failed", "{reply}");
     assert_eq!(
         reply["fronting"]["not_fronted_reason"], "front_failed",
         "{reply}"
     );
-    assert_eq!(rig.screen.state().now, 300);
+    assert_eq!(reply["fronting"]["fronted"], false);
+    assert_eq!(reply["fronting"]["restore"], "failed");
+    assert_eq!(rig.screen.state().now, 600);
     assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
     assert!(rig
         .screen
         .log()
         .iter()
         .all(|line| line.starts_with("front:") || line.starts_with("restore:")));
-    assert!(!rig.lock.held());
+    assert!(
+        rig.lock.held(),
+        "the unresolved activation still owns cleanup"
+    );
 }
 
 #[tokio::test]

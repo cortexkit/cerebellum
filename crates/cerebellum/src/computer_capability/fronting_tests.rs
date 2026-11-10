@@ -460,6 +460,9 @@ struct ScreenState {
     idle_ms: u64,
     observer: bool,
     comes_forward: bool,
+    front_delay_ms: Option<u64>,
+    pending_front_at: Option<u64>,
+    late_watch_gate: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Every front and restore request, and every post and release, in
     /// order.
     log: Vec<String>,
@@ -511,6 +514,9 @@ impl Screen {
                 idle_ms: OBSERVED_DISPATCH_IDLE_MS + 500,
                 observer: true,
                 comes_forward: true,
+                front_delay_ms: None,
+                pending_front_at: None,
+                late_watch_gate: None,
                 log: Vec::new(),
                 last_input_ms: None,
                 post_unknown: false,
@@ -545,6 +551,12 @@ impl Screen {
         let (comes_forward, enable) = {
             let mut state = self.state();
             state.log.push(format!("{who}:{pid}"));
+            if pid == TARGET {
+                if let Some(delay) = state.front_delay_ms {
+                    state.pending_front_at = Some(state.now + delay);
+                    return true;
+                }
+            }
             (state.comes_forward, state.enable_on_front.clone())
         };
         if comes_forward {
@@ -560,10 +572,40 @@ impl Screen {
     }
 
     fn snapshot(&self) -> Option<HardwareInputSnapshot> {
+        if !self.state().observer {
+            return None;
+        }
         Some(HardwareInputSnapshot {
             coverage_start_ms: 0,
             last_input_ms: self.state().last_input_ms,
         })
+    }
+
+    fn advance(&self, milliseconds: u64) {
+        let gate = {
+            let state = self.state();
+            (state.now >= 400)
+                .then(|| state.late_watch_gate.clone())
+                .flatten()
+        };
+        if let Some(gate) = gate {
+            while !gate.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let landed = {
+            let mut state = self.state();
+            state.now += milliseconds;
+            if state.pending_front_at.is_some_and(|at| at <= state.now) {
+                state.pending_front_at = None;
+                true
+            } else {
+                false
+            }
+        };
+        if landed {
+            self.desk.state().frontmost = Some(TARGET);
+        }
     }
 
     fn probe(&self) -> HeartbeatProbe {
@@ -590,7 +632,7 @@ impl FrontingRestoreHost for FakeRestore {
         self.0.state().now
     }
     fn pause_ms(&mut self, milliseconds: u64) {
-        self.0.state().now += milliseconds;
+        self.0.advance(milliseconds);
     }
     fn frontmost_pid(&mut self) -> Option<u32> {
         self.0.frontmost()
@@ -610,7 +652,7 @@ impl FrontingSession for FakeSession {
         self.0.state().now
     }
     fn pause_ms(&mut self, milliseconds: u64) {
-        self.0.state().now += milliseconds;
+        self.0.advance(milliseconds);
     }
     fn frontmost_pid(&mut self) -> Option<u32> {
         self.0.frontmost()
@@ -674,7 +716,7 @@ impl FrontingBracketHost for FakeBracket {
         self.0.state().now
     }
     fn pause_ms(&mut self, milliseconds: u64) {
-        self.0.state().now += milliseconds;
+        self.0.advance(milliseconds);
     }
     fn frontmost_pid(&mut self) -> Option<u32> {
         self.0.frontmost()
@@ -3198,3 +3240,130 @@ mod settle_read_budget {
 
 #[path = "pointer_fronting_tests.rs"]
 mod pointer_tests;
+
+#[tokio::test]
+async fn a_pending_chord_landing_after_its_reply_only_restores_and_never_posts() {
+    for evidence in ["quiet", "input", "unreadable"] {
+        let rig = rig(AppUse::Background, mail_desk()).await;
+        rig.read().await;
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut state = rig.screen.state();
+            state.front_delay_ms = Some(800);
+            state.late_watch_gate = Some(Arc::clone(&gate));
+        }
+        let terminal = under_terminal();
+        let reply = rig
+            .call_under(&terminal, "computer.keys", command_chord())
+            .await;
+        assert_eq!(reply["outcome"], "restore_failed", "{reply}");
+        assert_eq!(reply["effect_status"], "not_dispatched");
+        assert_eq!(reply["fronting"]["fronted"], false);
+        assert_eq!(reply["fronting"]["restore"], "failed");
+        assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        terminal.set_late_fronting_recorder(Arc::new(move |record| {
+            tx.send(record).unwrap();
+        }));
+        terminal.start_late_fronting(None);
+        {
+            let mut state = rig.screen.state();
+            if evidence == "input" {
+                state.last_input_ms = Some(400);
+            }
+            if evidence == "unreadable" {
+                state.observer = false;
+            }
+        }
+        gate.store(true, std::sync::atomic::Ordering::Release);
+        let record = tokio::time::timeout(crate::test_support::HANG_GUARD, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if evidence == "quiet" {
+            assert_eq!(record["restore"], "restored");
+            assert_eq!(record["activation_latency_ms"], 800);
+            assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
+            assert_eq!(rig.screen.log(), ["front:4242", "restore:100"]);
+        } else {
+            assert_eq!(record["restore"], "skipped_person");
+            assert_eq!(record["person_input_during_fronting"], true);
+            assert_eq!(rig.screen.log(), ["front:4242"]);
+        }
+        assert!(!rig.screen.log().iter().any(|event| event == "post"));
+        // The immutable terminal reply remains honest after late cleanup.
+        assert_eq!(reply["fronting"]["restore"], "failed");
+    }
+}
+
+#[tokio::test]
+async fn late_fronting_route_close_restores_only_with_quiet_known_input_coverage() {
+    for evidence in ["quiet", "input", "unreadable"] {
+        let rig = rig(AppUse::Background, mail_desk()).await;
+        rig.read().await;
+        rig.screen.state().front_delay_ms = Some(800);
+        let terminal = under_terminal();
+        let reply = rig
+            .call_under(&terminal, "computer.keys", command_chord())
+            .await;
+        assert_eq!(reply["fronting"]["restore"], "failed");
+        {
+            let mut state = rig.screen.state();
+            state.now = 800;
+            state.pending_front_at = None;
+            if evidence == "input" {
+                state.last_input_ms = Some(500);
+            }
+            if evidence == "unreadable" {
+                state.observer = false;
+            }
+        }
+        rig.desk.state().frontmost = Some(TARGET);
+        terminal.stop(crate::terminal_arbiter::TerminalCause::RouteClosed);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        terminal.set_late_fronting_recorder(Arc::new(move |record| {
+            tx.send(record).unwrap();
+        }));
+        terminal.start_late_fronting(None);
+        let record = tokio::time::timeout(crate::test_support::HANG_GUARD, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if evidence == "quiet" {
+            assert_eq!(record["restore"], "restored");
+            assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
+        } else {
+            assert_eq!(record["restore"], "skipped_person");
+            assert_eq!(rig.screen.frontmost(), Some(TARGET));
+        }
+        assert!(!rig.screen.log().iter().any(|event| event == "post"));
+    }
+}
+
+#[tokio::test]
+async fn a_new_app_call_before_watcher_start_still_ends_the_pending_watch() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    rig.read().await;
+    rig.screen.state().front_delay_ms = Some(800);
+    let terminal = under_terminal();
+    let reply = rig
+        .call_under(&terminal, "computer.keys", command_chord())
+        .await;
+    assert_eq!(reply["fronting"]["restore"], "failed");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    terminal.set_late_fronting_recorder(Arc::new(move |record| {
+        tx.send(record).unwrap();
+    }));
+    assert!(crate::terminal_arbiter::cancel_late_fronting_target(
+        rig.lock.domain(),
+        TARGET
+    ));
+    terminal.start_late_fronting(None);
+    let record = tokio::time::timeout(crate::test_support::HANG_GUARD, rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record["restore"], "failed");
+    assert_eq!(rig.screen.log(), ["front:4242"]);
+    assert_eq!(rig.screen.state().now, 400);
+}

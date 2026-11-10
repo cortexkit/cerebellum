@@ -106,6 +106,12 @@ impl DeskProbeCalls {
     }
 }
 
+/// Pending activations observed by the bounded cleanup task, with milliseconds
+/// from request to landing. Reading these records does not sample the desktop.
+pub fn take_fronting_landings() -> Vec<(u32, u64)> {
+    crate::terminal_arbiter::take_landings()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

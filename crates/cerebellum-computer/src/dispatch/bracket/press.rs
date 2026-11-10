@@ -149,6 +149,7 @@ pub trait FrontingPressHost: FrontingBracketHost {
     fn begin_front_attempt(&mut self, front_instant_ms: u64) -> bool;
     /// The front request and its wait returned.
     fn front_attempt_returned(&mut self);
+    fn front_confirmed(&mut self) {}
     /// Admit a step while the target is in front. `false` when admitting it
     /// would wait on consent, a lane or a person.
     fn admit_fronted_step(&mut self, step: usize) -> bool;
@@ -566,6 +567,9 @@ fn front_target<H: FrontingPressHost>(
     let requested = host.request_front(plan.target_pid);
     let came_forward =
         requested && wait_for_front(host, plan.target_pid, front_instant_ms, FRONT_WAIT_MS);
+    if came_forward {
+        host.front_confirmed();
+    }
     host.front_attempt_returned();
     if !came_forward {
         return Err(FrontingStop::FrontFailed);

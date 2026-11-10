@@ -137,6 +137,90 @@ pub fn restore_after_front<H: FrontingBracketHost + ?Sized>(
     front_instant_ms: u64,
     wait_ms: u64,
 ) -> RestoreOutcome {
+    restore_after_front_attempt(host, previous, target, front_instant_ms, wait_ms, true)
+}
+
+/// Settle a requested activation before declaring restoration confirmed.
+/// An elapsed fronting wait does not cancel the operating system's request.
+/// Until the target has actually been observed, seeing the previous app is
+/// not evidence that the target cannot still arrive. The watch never posts
+/// input, and consumes the same allowance as the subsequent restore.
+pub fn restore_after_front_attempt<H: FrontingBracketHost + ?Sized>(
+    host: &mut H,
+    previous: u32,
+    target: u32,
+    front_instant_ms: u64,
+    wait_ms: u64,
+    activation_observed: bool,
+) -> RestoreOutcome {
+    restore_attempt(
+        host,
+        previous,
+        target,
+        front_instant_ms,
+        wait_ms,
+        activation_observed,
+        !activation_observed,
+    )
+}
+
+fn restore_attempt<H: FrontingBracketHost + ?Sized>(
+    host: &mut H,
+    previous: u32,
+    target: u32,
+    front_instant_ms: u64,
+    wait_ms: u64,
+    activation_observed: bool,
+    require_quiet: bool,
+) -> RestoreOutcome {
+    let started = host.now_ms();
+    if previous != target && !activation_observed {
+        loop {
+            let frontmost = host.frontmost_pid();
+            let snapshot = host.hardware_input_snapshot();
+            let input = snapshot
+                .and_then(|snapshot| snapshot.last_input_ms)
+                .is_some_and(|last| last >= front_instant_ms);
+            if frontmost == Some(target) {
+                let latency = host.now_ms().saturating_sub(front_instant_ms);
+                host.late_activation_observed(latency);
+            }
+            if require_quiet && input {
+                return RestoreOutcome {
+                    restore: RestoreStatus::SkippedPerson {
+                        now_front: frontmost,
+                    },
+                    person_input_during_fronting: true,
+                    finished_at_ms: host.now_ms(),
+                };
+            }
+            if frontmost == Some(target) {
+                break;
+            }
+            if !snapshot.is_some_and(|snapshot| snapshot.coverage_start_ms <= front_instant_ms)
+                || !matches!(frontmost, Some(pid) if pid == previous)
+            {
+                return RestoreOutcome {
+                    restore: RestoreStatus::SkippedPerson {
+                        now_front: frontmost,
+                    },
+                    person_input_during_fronting: input,
+                    finished_at_ms: host.now_ms(),
+                };
+            }
+            if host.now_ms().saturating_sub(started) >= wait_ms {
+                return RestoreOutcome {
+                    restore: RestoreStatus::Failed {
+                        left_in_front: frontmost,
+                    },
+                    person_input_during_fronting: input,
+                    finished_at_ms: host.now_ms(),
+                };
+            }
+            host.pause_ms(FRONTING_POLL_MS);
+        }
+    }
+    let wait_ms = wait_ms.saturating_sub(host.now_ms().saturating_sub(started));
     if previous == target {
         return RestoreOutcome {
             restore: RestoreStatus::NotNeeded,
@@ -161,6 +245,7 @@ pub fn restore_after_front<H: FrontingBracketHost + ?Sized>(
     };
     if !covered(first_snapshot)
         || !covered(snapshot)
+        || (require_quiet && input)
         || first_front != frontmost
         || first_snapshot != snapshot
     {
@@ -188,6 +273,79 @@ pub fn restore_after_front<H: FrontingBracketHost + ?Sized>(
                 finished_at_ms: host.now_ms(),
             }
         }
+    }
+}
+
+/// Observation-only cleanup for one activation that remained pending at reply
+/// time. It never dispatches the action that timed out. An unavailable input
+/// observer or a gap in its coverage counts as input; focus is left alone.
+pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
+    host: &mut H,
+    previous: u32,
+    target: u32,
+    requested_at: u64,
+    watch_ms: u64,
+    stop: &dyn Fn() -> bool,
+) -> (RestoreStatus, Option<u64>, bool) {
+    let end = requested_at.saturating_add(watch_ms);
+    loop {
+        let front = host.frontmost_pid();
+        let input = hardware_input_since(host.hardware_input_snapshot(), requested_at);
+        let now = host.now_ms();
+        let observed_latency = (front == Some(target)).then(|| now.saturating_sub(requested_at));
+        if let Some(latency) = observed_latency {
+            host.late_activation_observed(latency);
+        }
+        if input {
+            return (
+                RestoreStatus::SkippedPerson { now_front: front },
+                observed_latency,
+                true,
+            );
+        }
+        if front == Some(target) {
+            let latency = now.saturating_sub(requested_at);
+            if stop() || now >= end {
+                return (
+                    RestoreStatus::Failed {
+                        left_in_front: front,
+                    },
+                    Some(latency),
+                    false,
+                );
+            }
+            let result = restore_attempt(
+                host,
+                previous,
+                target,
+                requested_at,
+                RESTORE_WAIT_MS.min(end.saturating_sub(now)),
+                true,
+                true,
+            );
+            return (
+                result.restore,
+                Some(latency),
+                result.person_input_during_fronting,
+            );
+        }
+        if stop() || now >= end {
+            return (
+                RestoreStatus::Failed {
+                    left_in_front: front,
+                },
+                None,
+                false,
+            );
+        }
+        if front != Some(previous) {
+            return (
+                RestoreStatus::SkippedPerson { now_front: front },
+                None,
+                false,
+            );
+        }
+        host.pause_ms(10);
     }
 }
 

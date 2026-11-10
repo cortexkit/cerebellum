@@ -369,6 +369,12 @@ where
             );
         }
     }
+
+    fn front_confirmed(&mut self) {
+        if let Some(cell) = &self.cell {
+            cell.front_confirmed();
+        }
+    }
     fn admit_fronted_step(&mut self, _step: usize) -> bool {
         // Every step of a batch is in the application whose lane the call
         // holds, so only the grant could make a step wait: admitted when it
@@ -679,6 +685,7 @@ where
             let FrontedPressHost {
                 mut journals,
                 decided,
+                cell,
                 change,
                 never_read,
                 press_replies,
@@ -694,12 +701,15 @@ where
                 report.stop = Some(PressRunStop::NotFronted(FrontingStop::TargetNotRead));
             }
             let mut fronting = match decided {
-                Some(decided) if decided.front_requested => Fronting::temporary(
-                    mode,
-                    Purpose::NeedsFront,
-                    decided.restore,
-                    decided.person_input_during_fronting,
-                ),
+                Some(decided) if decided.front_requested => Fronting {
+                    fronted: cell.as_ref().is_some_and(|cell| cell.was_front_confirmed()),
+                    ..Fronting::temporary(
+                        mode,
+                        Purpose::NeedsFront,
+                        decided.restore,
+                        decided.person_input_during_fronting,
+                    )
+                },
                 Some(_) => Fronting::stopped(
                     mode,
                     Purpose::NeedsFront,

@@ -147,6 +147,16 @@ impl WorkerLease {
             .iter_mut()
             .find(|entry| entry.id == self.id)
         {
+            if let Some(terminal) = &entry.terminal {
+                if !crate::terminal_arbiter::cancel_late_fronting_target(
+                    terminal
+                        .fronting_domain
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    grant.pid,
+                ) {
+                    terminal.stop(crate::terminal_arbiter::TerminalCause::Deadline);
+                }
+            }
             entry.pid = Some(grant.pid);
             entry.bundle_identity = Some(grant.bundle_identity.clone());
         }
