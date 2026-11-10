@@ -7273,8 +7273,12 @@ async fn forward_recording_reply(
             // worker completion cannot replace the terminal settlement.
             let calls = Arc::clone(&planes.calls);
             let settlement = journal::call_records::Settlement::from_reply(&out, evidence);
+            // Register before queueing: a caller can withdraw as soon as this
+            // frame is sent, even if the settlement exhausts its wait budget.
+            let transition = planes.call_record_workers.track_settlement(&ticket);
             settle_call_record(planes, move || {
-                calls.settle(ticket, settlement, wall_clock_ms())
+                calls.settle(ticket, settlement, wall_clock_ms());
+                transition.finish();
             })
             .await;
         }
@@ -7429,7 +7433,8 @@ async fn handle_tool_withdraw(
     }
     // Never search other principals' keys: even a refusal would disclose that
     // another carrier has a record with this opaque key.
-    let lookup = planes.calls.lookup_exact(&carrier, &call_key);
+    let lookup =
+        call_record_supervisor::lookup_call_record(planes, carrier.clone(), call_key.clone()).await;
     if let Lookup::Own(snapshot) = &lookup {
         let record_scope = snapshot.scope.as_ref().map(to_wire);
         if let Err(problem) = check_record_scope(record_scope.as_ref(), wire_stamp.as_ref()) {

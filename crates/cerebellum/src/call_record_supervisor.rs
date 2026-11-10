@@ -1,6 +1,7 @@
 //! Bounded admission and settlement for keyed tool calls.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -11,6 +12,13 @@ use crate::{budgets, build_error_frame, journal, wall_clock_ms, Planes};
 pub(crate) struct CallRecordWorkers {
     permits: Arc<tokio::sync::Semaphore>,
     detached: std::sync::atomic::AtomicUsize,
+    settlements: Mutex<HashMap<(String, String), PendingRecordSettlement>>,
+}
+
+#[derive(Clone)]
+struct PendingRecordSettlement {
+    ready: tokio::sync::watch::Receiver<bool>,
+    started: Arc<journal::call_records::CallSnapshot>,
 }
 
 impl Default for CallRecordWorkers {
@@ -20,11 +28,35 @@ impl Default for CallRecordWorkers {
                 budgets::MAX_CALL_RECORD_WORKERS,
             )),
             detached: std::sync::atomic::AtomicUsize::new(0),
+            settlements: Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl CallRecordWorkers {
+    pub(crate) fn track_settlement(
+        self: &Arc<Self>,
+        ticket: &journal::call_records::CallTicket,
+    ) -> CallRecordSettlement {
+        let key = ticket.identity().clone();
+        let (ready, receiver) = tokio::sync::watch::channel(false);
+        self.settlements
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                key.clone(),
+                PendingRecordSettlement {
+                    ready: receiver,
+                    started: ticket.started().clone(),
+                },
+            );
+        CallRecordSettlement {
+            workers: self.clone(),
+            key,
+            ready,
+        }
+    }
+
     pub(crate) fn health_report(&self, mut report: ModuleControlResponse) -> ModuleControlResponse {
         let detached = self.detached.load(std::sync::atomic::Ordering::SeqCst);
         if let ModuleControlResponse::HealthCheck {
@@ -39,6 +71,92 @@ impl CallRecordWorkers {
             }
         }
         report
+    }
+}
+
+/// Published before a terminal frame can escape, including while its write is queued.
+pub(crate) struct CallRecordSettlement {
+    workers: Arc<CallRecordWorkers>,
+    key: (String, String),
+    ready: tokio::sync::watch::Sender<bool>,
+}
+
+impl CallRecordSettlement {
+    pub(crate) fn finish(self) {
+        let _ = self.ready.send(true);
+    }
+}
+
+impl Drop for CallRecordSettlement {
+    fn drop(&mut self) {
+        self.workers
+            .settlements
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.key);
+    }
+}
+
+/// A forwarded reply may precede its record write. Wait for that exact write,
+/// then read the record off the async executor, within one admission deadline.
+pub(crate) async fn lookup_call_record(
+    planes: &Planes,
+    carrier: String,
+    call_key: String,
+) -> journal::call_records::Lookup {
+    use journal::call_records::{CallRecordError, Lookup};
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_millis(budgets::CALL_RECORD_BEGIN_MS);
+    let pending = planes
+        .call_record_workers
+        .settlements
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&(carrier.clone(), call_key.clone()))
+        .cloned();
+    // A timed-out write may hold the record mutex. Keep the initial durable
+    // Started record snapshot so timeout can report uncertainty without waiting
+    // on that mutex or treating an unpersisted consent settlement as proof of no action.
+    let fallback = pending.as_ref().map(|pending| pending.started.clone());
+    let lookup = async {
+        if let Some(mut pending) = pending {
+            pending
+                .ready
+                .wait_for(|finished| *finished)
+                .await
+                .map_err(|_| {
+                    CallRecordError::WriteFailed("call-record settlement did not finish".into())
+                })?;
+        }
+        let permit = planes
+            .call_record_workers
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("call-record pool stays open");
+        let task = CallRecordTask::new(&planes.call_record_workers);
+        let _wait = CallRecordWait(Arc::clone(&task));
+        let calls = planes.calls.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _completion = CallRecordCompletion(task);
+            calls.lookup_exact(&carrier, &call_key)
+        })
+        .await
+        .map_err(|error| {
+            CallRecordError::WriteFailed(format!("call-record lookup failed: {error}"))
+        })
+    };
+    match tokio::time::timeout_at(deadline, lookup).await {
+        Ok(Ok(lookup)) => lookup,
+        Ok(Err(error)) => Lookup::Unavailable(error),
+        Err(_) => match fallback {
+            Some(started) => Lookup::Own((*started).clone()),
+            None => Lookup::Unavailable(CallRecordError::WriteFailed(
+                "call-record lookup timed out".into(),
+            )),
+        },
     }
 }
 
@@ -860,6 +978,139 @@ mod call_record_deadline_tests {
         };
         assert_eq!(reply.readdressed(PROTOCOL_VERSION, 1, 1, 2).body, out.body);
         assert!(frames.try_recv().is_err());
+    }
+
+    fn asked_reply() -> Frame {
+        let mut frame = chosen_reply();
+        frame.body = serde_json::to_vec(&json!({
+            "outcome": "consent_pending", "ask_id": "bounded:card"
+        }))
+        .unwrap();
+        frame
+    }
+
+    fn withdraw_request() -> Frame {
+        let mut frame = request(2);
+        frame.body = serde_json::to_vec(&json!({
+            "name": "tool.withdraw", "arguments": {"call_key": "bounded:call"}
+        }))
+        .unwrap();
+        frame
+    }
+
+    async fn deferred_asked_reply(
+        planes: &Planes,
+        writer: &mpsc::Sender<Frame>,
+    ) -> tokio::sync::OwnedSemaphorePermit {
+        let mut pending = pending(planes);
+        pending
+            .observation
+            .gate_dispatched
+            .store(false, Ordering::SeqCst);
+        let held = planes
+            .call_record_workers
+            .permits
+            .clone()
+            .acquire_many_owned(budgets::MAX_CALL_RECORD_WORKERS as u32)
+            .await
+            .unwrap();
+        // Exhaust the settlement budget while its write is still queued, before
+        // it can take the record mutex. The consent reply must still be sent.
+        forward_recording_reply(asked_reply(), &mut pending, writer, planes)
+            .await
+            .unwrap();
+        assert_eq!(snapshot(planes).state, CallState::Started);
+        held
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn withdrawing_a_forwarded_consent_reply_waits_for_its_record_write() {
+        let (planes, _, _, release) = fixture(2);
+        let (writer, mut frames) = mpsc::channel(8);
+        let held = deferred_asked_reply(&planes, &writer).await;
+        assert_eq!(body(&frames.recv().await.unwrap()), body(&asked_reply()));
+        let withdraw = handle_keyed_tool_request(withdraw_request(), &writer, &planes);
+        tokio::pin!(withdraw);
+        assert!(
+            poll_once(withdraw.as_mut()).is_pending(),
+            "withdraw must not answer already_started while the consent record is queued"
+        );
+        drop(held);
+        without_time_advancing(release.0.entered.notified()).await;
+        assert!(
+            poll_once(withdraw.as_mut()).is_pending(),
+            "withdraw must also wait for the blocked storage write"
+        );
+        release.0.release();
+        without_time_advancing(withdraw).await.unwrap();
+        assert_eq!(
+            body(&frames.recv().await.unwrap()),
+            json!({"answer": "withdrawn"})
+        );
+        assert_eq!(snapshot(&planes).state, CallState::Asked);
+        assert!(planes
+            .call_record_workers
+            .settlements
+            .lock()
+            .unwrap()
+            .is_empty());
+        idle(&planes).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn withdrawing_a_deferred_consent_record_is_bounded_by_one_admission_deadline() {
+        let (planes, memory, _, release) = fixture(2);
+        let (writer, mut frames) = mpsc::channel(8);
+        let held = deferred_asked_reply(&planes, &writer).await;
+        assert_eq!(body(&frames.recv().await.unwrap()), body(&asked_reply()));
+        drop(held);
+        without_time_advancing(release.0.entered.notified()).await;
+        let started = tokio::time::Instant::now();
+        let withdraw = handle_keyed_tool_request(withdraw_request(), &writer, &planes);
+        tokio::pin!(withdraw);
+        assert!(poll_once(withdraw.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(budgets::CALL_RECORD_BEGIN_MS - 1)).await;
+        assert!(poll_once(withdraw.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        without_time_advancing(withdraw).await.unwrap();
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_millis(budgets::CALL_RECORD_BEGIN_MS)
+        );
+        assert_eq!(
+            body(&frames.recv().await.unwrap()),
+            json!({
+                "answer": "already_started", "outcome": "unknown"
+            })
+        );
+        // The storage write still holds the live record mutex. Only Started is
+        // durable, so timeout cannot use the worker's unpersisted Asked state.
+        let recovered = CallRecords::open(
+            Box::new(BlockingStorage {
+                memory,
+                writes: Arc::new(AtomicUsize::new(0)),
+                block_write: usize::MAX,
+                barrier: Arc::new(WriteBarrier::default()),
+            }),
+            0,
+        );
+        assert!(
+            matches!(recovered.lookup_exact(&principal(&planes), "bounded:call"),
+            Lookup::Own(record) if record.state == CallState::Unknown)
+        );
+        release.0.release();
+        without_time_advancing(idle(&planes)).await;
+        without_time_advancing(handle_keyed_tool_request(
+            withdraw_request(),
+            &writer,
+            &planes,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            body(&frames.recv().await.unwrap()),
+            json!({"answer": "withdrawn"})
+        );
     }
 
     #[tokio::test]
