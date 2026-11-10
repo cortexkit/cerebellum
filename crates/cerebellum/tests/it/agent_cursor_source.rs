@@ -97,12 +97,12 @@ fn single_window_capture_probe_module_and_exports_require_the_desk_probe_feature
         ),
         (
             overlay,
-            "pub use capture_probe::{prepare_app_use_desk_probe, probe_overlay_capture_exclusion, with_app_use_desk_probe_run_loop};",
+            "pub use capture_probe::{prepare_app_use_desk_probe, probe_overlay_capture_exclusion, with_app_use_desk_probe_run_loop,};",
             "#[cfg(feature = \"desk-probe\")]",
         ),
         (
             lib,
-            "pub use cursor_overlay::{prepare_app_use_desk_probe, probe_overlay_capture_exclusion, with_app_use_desk_probe_run_loop};",
+            "pub use cursor_overlay::{prepare_app_use_desk_probe, probe_overlay_capture_exclusion, with_app_use_desk_probe_run_loop,};",
             "#[cfg(all(target_os = \"macos\", feature = \"desk-probe\"))]",
         ),
     ] {
