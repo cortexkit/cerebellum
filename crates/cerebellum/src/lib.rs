@@ -7186,6 +7186,13 @@ struct PendingSettlement {
     request: (u16, u32, u64),
 }
 
+#[cfg(test)]
+// Direct-plane fixtures own their commitments too: a detached fixture witness
+// would make concurrently running tool tests lose their proof of no dispatch.
+fn fixture_dispatch_witness() -> cerebellum_core::dispatch_witness::DispatchWitness {
+    cerebellum_core::dispatch_witness::DispatchWitness::armed()
+}
+
 /// Return true for replies sent by `handle_tool_request` before dispatch or
 /// for a provider resource-busy refusal; neither case dispatched the tool.
 fn refused_before_dispatch(reply: &Frame) -> bool {
@@ -7245,6 +7252,16 @@ async fn forward_recording_reply(
         && (out.header.channel, out.header.epoch, out.header.corr) == pending.request;
     if is_reply {
         if let Some(ticket) = pending.ticket.take() {
+            #[cfg(test)]
+            if let Some(before) = planes
+                .call_record_workers
+                .before_settlement
+                .lock()
+                .unwrap()
+                .take()
+            {
+                before();
+            }
             let evidence = journal::call_records::DispatchEvidence {
                 gate_dispatched: pending
                     .observation

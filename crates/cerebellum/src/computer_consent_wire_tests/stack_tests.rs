@@ -106,7 +106,28 @@ fn a_computer_consent_call_fits_half_a_default_thread_stack() {
         .expect("the computer call completed consent and late settlement");
 }
 
+#[tokio::test]
+async fn an_unrelated_fixture_commit_preserves_the_asked_computer_call() {
+    let planes = planes();
+    // Place a direct-plane fixture commit between the keyed call's admission
+    // and settlement. Its witness must not invalidate another call's evidence.
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let other = barrier.clone();
+    *planes.call_record_workers.before_settlement.lock().unwrap() = Some(Box::new(move || {
+        barrier.wait();
+        barrier.wait();
+    }));
+    let commit = std::thread::spawn(move || {
+        other.wait();
+        crate::fixture_dispatch_witness().mark_committed();
+        other.wait();
+    });
+    withdraw_asked_call_and_apply_late_grant(planes).await;
+    commit.join().unwrap();
+}
+
 pub(super) async fn withdraw_asked_call_and_apply_late_grant(planes: Planes) {
+    let unattributed_before = cerebellum_core::dispatch_witness::unattributed_commit_count();
     let (tx, mut rx) = mpsc::channel(8);
     let mut request = wait_request();
     let mut body: Value = serde_json::from_slice(&request.body).unwrap();
@@ -142,7 +163,17 @@ pub(super) async fn withdraw_asked_call_and_apply_late_grant(planes: Planes) {
     .await
     .unwrap();
     let withdrawn: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
-    assert_eq!(withdrawn["answer"], "withdrawn");
+    assert_eq!(
+        withdrawn["answer"],
+        "withdrawn",
+        "lookup observations: {:?}; unattributed commits before={unattributed_before} after={}",
+        planes
+            .call_record_workers
+            .lookup_observations
+            .lock()
+            .unwrap(),
+        cerebellum_core::dispatch_witness::unattributed_commit_count()
+    );
     assert!(planes.consent_test.as_ref().unwrap().answer(
         question.header.corr,
         cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_30m"})),

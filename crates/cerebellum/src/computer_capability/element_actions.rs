@@ -2849,12 +2849,13 @@ mod tests {
             bundle_identity: "com.example.Editor".into(),
             process_generation_evidence: "generation-42".into(),
         };
-        let identity = cerebellum_computer::audit::journal_identity(
+        let mut identity = cerebellum_computer::audit::journal_identity(
             "direct:agent",
             "conversation",
             "project",
             cerebellum_core::identity::SessionKind::Primary,
         );
+        identity.witness = crate::fixture_dispatch_witness();
         let token = AuditToken::new(
             Arc::new(Mutex::new(audit)),
             Arc::new(super::super::quarantine::ArbiterGate(None)),
