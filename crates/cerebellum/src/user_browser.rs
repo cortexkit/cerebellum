@@ -731,6 +731,61 @@ fn classify_frame_capture<'a>(
     Ok((dom, record))
 }
 
+#[derive(Clone, Copy)]
+enum InputCheck {
+    PreDispatch,
+    PostFocus,
+    PreInsertion,
+}
+
+impl InputCheck {
+    fn name(self) -> &'static str {
+        match self {
+            Self::PreDispatch => "pre-dispatch",
+            Self::PostFocus => "post-focus",
+            Self::PreInsertion => "pre-insertion",
+        }
+    }
+}
+
+fn classification_changed(
+    expected: &NonTypeClassificationRecord,
+    observed: &NonTypeClassificationRecord,
+    check: InputCheck,
+) -> Value {
+    let mut changed_fields = Vec::new();
+    // Match PartialEq's closed authorization fields, excluding login hints.
+    // Return only field names: origins, identities and DOM metadata stay private.
+    macro_rules! compare {
+        ($($field:ident),+ $(,)?) => {
+            $(if expected.$field != observed.$field {
+                changed_fields.push(stringify!($field));
+            })+
+        };
+    }
+    compare!(
+        schema,
+        node_identity,
+        activation_target_identity,
+        document_epoch,
+        target_kind,
+        effective_input_type,
+        activation_invokes_form_submit,
+        form_owner,
+        current_top_level_origin,
+        activation_destination_origin,
+        target_autocomplete_tokens,
+        target_password,
+        associated_form_controls,
+        required_tier,
+        credential,
+        financial,
+    );
+    let mut reply = refusal("classification_changed");
+    reply["detail"] = json!({"check":check.name(),"changed_fields":changed_fields});
+    reply
+}
+
 /// The revision of the cerebellum-to-extension contract this build speaks.
 /// The extension stamps its own revision (`EXTENSION_REVISION` in
 /// `extension/revision.mjs`) on every completed reply and every refusal, and
@@ -3817,7 +3872,11 @@ async fn input_inner(
         .and_then(|reference| reference.classification.as_ref())
     {
         if *expected != classification {
-            return Err(refusal("classification_changed"));
+            return Err(classification_changed(
+                expected,
+                &classification,
+                InputCheck::PreDispatch,
+            ));
         }
     }
     if action == "type" {
@@ -3901,7 +3960,7 @@ async fn input_inner(
                 &frame,
                 &identity,
                 &classification,
-                false,
+                InputCheck::PreDispatch,
             )
             .await?;
             let raw = invoke(
@@ -4009,7 +4068,13 @@ async fn input_inner(
             &frame,
             &identity,
             &classification,
-            dispatched,
+            if just_focused {
+                InputCheck::PostFocus
+            } else if dispatched {
+                InputCheck::PreInsertion
+            } else {
+                InputCheck::PreDispatch
+            },
         )
         .await;
         if let Err(reply) = verification {
@@ -4032,7 +4097,7 @@ async fn input_inner(
                 &frame,
                 &identity,
                 &classification,
-                dispatched,
+                InputCheck::PostFocus,
             )
             .await
             .map_err(|reply| prior_input(reply, dispatched))?;
@@ -4107,7 +4172,7 @@ async fn input_inner(
                     &frame,
                     &identity,
                     &classification,
-                    dispatched,
+                    InputCheck::PreInsertion,
                 )
                 .await
                 .map_err(|reply| prior_input(reply, dispatched))?;
@@ -4538,8 +4603,9 @@ async fn verify_input(
     frame: &FrameDocument,
     identity: &BackendNodeIdentity,
     expected: &NonTypeClassificationRecord,
-    dispatched: bool,
+    check: InputCheck,
 ) -> Result<(), Value> {
+    let dispatched = !matches!(check, InputCheck::PreDispatch);
     let observed = input_document(context, tab, snapshot, dispatched).await?;
     if let Some(reason) = observed.unreadable_frames.get(&frame.frame_id) {
         return Err(prior_input(reason.refusal(), dispatched));
@@ -4570,7 +4636,7 @@ async fn verify_input(
         "verify_input.classify_flattened_document",
     )?;
     if record != *expected {
-        let mut reply = refusal("classification_changed");
+        let mut reply = classification_changed(expected, &record, check);
         reply["input_dispatched"] = json!(dispatched);
         return Err(reply);
     }
