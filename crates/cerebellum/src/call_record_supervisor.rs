@@ -13,6 +13,33 @@ pub(crate) struct CallRecordWorkers {
     permits: Arc<tokio::sync::Semaphore>,
     detached: std::sync::atomic::AtomicUsize,
     settlements: Mutex<HashMap<(String, String), PendingRecordSettlement>>,
+    #[cfg(test)]
+    pub(crate) lookup_observations: Mutex<Vec<LookupObservation>>,
+    // A per-Planes barrier seam keeps concurrent fixture commits deterministic.
+    #[cfg(test)]
+    pub(crate) before_settlement: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[cfg(test)]
+pub(crate) struct LookupObservation {
+    pub(crate) pending_found: bool,
+    pub(crate) settlement_confirmed: bool,
+    pub(crate) elapsed: Duration,
+    pub(crate) timed_out: bool,
+    pub(crate) state: Option<journal::call_records::CallState>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for LookupObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LookupObservation")
+            .field("pending_found", &self.pending_found)
+            .field("settlement_confirmed", &self.settlement_confirmed)
+            .field("elapsed", &self.elapsed)
+            .field("timed_out", &self.timed_out)
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -29,6 +56,10 @@ impl Default for CallRecordWorkers {
             )),
             detached: std::sync::atomic::AtomicUsize::new(0),
             settlements: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            lookup_observations: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            before_settlement: Mutex::new(None),
         }
     }
 }
@@ -118,6 +149,12 @@ pub(crate) async fn lookup_call_record(
     // Started record snapshot so timeout can report uncertainty without waiting
     // on that mutex or treating an unpersisted consent settlement as proof of no action.
     let fallback = pending.as_ref().map(|pending| pending.started.clone());
+    #[cfg(test)]
+    let observation_start = std::time::Instant::now();
+    #[cfg(test)]
+    let pending_found = pending.is_some();
+    #[cfg(test)]
+    let settlement_confirmed = std::sync::atomic::AtomicBool::new(false);
     let lookup = async {
         if let Some(mut pending) = pending {
             pending
@@ -127,6 +164,8 @@ pub(crate) async fn lookup_call_record(
                 .map_err(|_| {
                     CallRecordError::WriteFailed("call-record settlement did not finish".into())
                 })?;
+            #[cfg(test)]
+            settlement_confirmed.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let permit = planes
             .call_record_workers
@@ -148,7 +187,24 @@ pub(crate) async fn lookup_call_record(
             CallRecordError::WriteFailed(format!("call-record lookup failed: {error}"))
         })
     };
-    match tokio::time::timeout_at(deadline, lookup).await {
+    let result = tokio::time::timeout_at(deadline, lookup).await;
+    #[cfg(test)]
+    planes
+        .call_record_workers
+        .lookup_observations
+        .lock()
+        .unwrap()
+        .push(LookupObservation {
+            pending_found,
+            settlement_confirmed: settlement_confirmed.load(std::sync::atomic::Ordering::Relaxed),
+            elapsed: observation_start.elapsed(),
+            timed_out: result.is_err(),
+            state: match &result {
+                Ok(Ok(Lookup::Own(record))) => Some(record.state),
+                _ => None,
+            },
+        });
+    match result {
         Ok(Ok(lookup)) => lookup,
         Ok(Err(error)) => Lookup::Unavailable(error),
         Err(_) => match fallback {
