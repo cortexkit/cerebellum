@@ -1,5 +1,39 @@
 use super::*;
 
+pub(super) fn allows_focus_form_controls(
+    dom: &serde_json::Map<String, Value>,
+    identity: &BackendNodeIdentity,
+    expected: &NonTypeClassificationRecord,
+    observed: &NonTypeClassificationRecord,
+) -> bool {
+    let mut updated = expected.clone();
+    updated.associated_form_controls = observed.associated_form_controls.clone();
+    if updated != *observed
+        || observed.associated_form_controls.iter().any(|control| {
+            control.password
+                || control.autocomplete_tokens.iter().any(|token| {
+                    crate::classification::credential_token(token)
+                        || crate::classification::financial_token(token)
+                })
+        })
+        || type_field_refusal(observed).is_some()
+    {
+        return false;
+    }
+    // Focus handlers may add clear buttons or hidden search fields. Recompute
+    // the same type decision used before dispatch; a form-only change must not
+    // hide a newly ineligible or sensitive target, or require a different tier.
+    let Ok(target) = crate::browser::navigation::type_target_from_capture(dom, identity, observed)
+    else {
+        return false;
+    };
+    let decision = target.classification();
+    crate::browser_type::browser_type_dispatch_eligible(&target)
+        && !decision.credential
+        && !decision.financial
+        && decision.required_tier == expected.required_tier
+}
+
 pub(super) fn role_name(nodes: &[Value], backend: u64) -> Option<(String, String)> {
     let node = nodes
         .iter()

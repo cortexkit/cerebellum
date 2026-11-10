@@ -3981,7 +3981,7 @@ async fn input_inner(
                 &snapshot,
                 &frame,
                 &identity,
-                &classification,
+                &mut classification,
                 InputCheck::PreDispatch,
             )
             .await?;
@@ -4089,7 +4089,7 @@ async fn input_inner(
             &snapshot,
             &frame,
             &identity,
-            &classification,
+            &mut classification,
             if just_focused {
                 InputCheck::PostFocus
             } else if dispatched {
@@ -4118,7 +4118,7 @@ async fn input_inner(
                 &snapshot,
                 &frame,
                 &identity,
-                &classification,
+                &mut classification,
                 InputCheck::PostFocus,
             )
             .await
@@ -4193,7 +4193,7 @@ async fn input_inner(
                     &snapshot,
                     &frame,
                     &identity,
-                    &classification,
+                    &mut classification,
                     InputCheck::PreInsertion,
                 )
                 .await
@@ -4624,7 +4624,7 @@ async fn verify_input(
     snapshot: &Snapshot,
     frame: &FrameDocument,
     identity: &BackendNodeIdentity,
-    expected: &NonTypeClassificationRecord,
+    expected: &mut NonTypeClassificationRecord,
     check: InputCheck,
 ) -> Result<(), Value> {
     let dispatched = !matches!(check, InputCheck::PreDispatch);
@@ -4657,7 +4657,11 @@ async fn verify_input(
         snapshot.interaction,
         "verify_input.classify_flattened_document",
     )?;
-    if record != *expected {
+    if record != *expected
+        && !(context.action == "type"
+            && matches!(check, InputCheck::PostFocus)
+            && typing::allows_focus_form_controls(dom, identity, expected, &record))
+    {
         let mut reply = classification_changed(expected, &record, check);
         reply["input_dispatched"] = json!(dispatched);
         return Err(reply);
@@ -4683,6 +4687,11 @@ async fn verify_input(
         }
     }
     input_document(context, tab, snapshot, dispatched).await?;
+    // Only a successful check may advance the baseline. Later pre-insertion
+    // checks still require exact equality with this post-focus record.
+    if record != *expected {
+        *expected = record;
+    }
     Ok(())
 }
 
