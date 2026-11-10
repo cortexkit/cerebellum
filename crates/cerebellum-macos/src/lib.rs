@@ -107,7 +107,9 @@ mod macos;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod preview_schedule;
 #[cfg(all(target_os = "macos", feature = "desk-probe"))]
-pub use cursor_overlay::{prepare_app_use_desk_probe, probe_overlay_capture_exclusion};
+pub use cursor_overlay::{
+    prepare_app_use_desk_probe, probe_overlay_capture_exclusion, with_app_use_desk_probe_run_loop,
+};
 #[cfg(target_os = "macos")]
 pub use cursor_overlay::{
     probe_cursor_hide, probe_cursor_motion, probe_preview_hide, reduce_motion,
@@ -115,6 +117,8 @@ pub use cursor_overlay::{
     OverlayAccent, OverlayColours, OverlayEvent, OverlayGesture, OverlayMessage, PictureTiming,
     PreviewHideProbe, ProbePass, AVATAR_PIXELS,
 };
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
+pub use macos::take_window_list_errors_for_probe;
 #[cfg(target_os = "macos")]
 pub use preview_schedule::{OverlayFrame, OverlayPreview, OverlayPreviewMotion, PreviewFallback};
 #[cfg(target_os = "macos")]

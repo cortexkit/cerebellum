@@ -438,6 +438,79 @@ pub fn prepare_app_use_desk_probe() -> Result<(), String> {
     Ok(())
 }
 
+/// Keep AppKit's main run loop alive while the manual probe waits on async
+/// computer calls. Initializing NSApplication alone does not service framework
+/// callbacks. Both cursor-on and baseline measurements use this same lifecycle.
+#[doc(hidden)]
+pub fn with_app_use_desk_probe_run_loop<T: Send>(
+    operation: impl FnOnce() -> T + Send,
+) -> Result<T, String> {
+    let _mtm = MainThreadMarker::new().ok_or("desk probe must run on the main thread")?;
+    with_probe_worker(operation, || {
+        let interval = Duration::from_millis(50);
+        let handled = objc2_foundation::NSRunLoop::currentRunLoop().runMode_beforeDate(
+            unsafe { NSDefaultRunLoopMode },
+            &NSDate::dateWithTimeIntervalSinceNow(interval.as_secs_f64()),
+        );
+        if !handled {
+            // An empty run loop returns immediately; do not turn the idle
+            // CPU comparison into a measurement of a busy polling loop.
+            std::thread::sleep(interval);
+        }
+    })
+}
+
+fn with_probe_worker<T: Send>(
+    operation: impl FnOnce() -> T + Send,
+    mut pump: impl FnMut(),
+) -> Result<T, String> {
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(operation);
+        while !worker.is_finished() {
+            pump();
+        }
+        worker
+            .join()
+            .map_err(|_| "desk measurement panicked".into())
+    })
+}
+
+#[cfg(test)]
+mod desk_worker_tests {
+    use super::with_probe_worker;
+
+    #[test]
+    fn desk_measurement_runs_off_the_pumping_thread_and_returns_its_result() {
+        let main = std::thread::current().id();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut sender = Some(sender);
+        let mut pumps = 0;
+        let result = with_probe_worker(
+            move || {
+                assert_ne!(std::thread::current().id(), main);
+                receiver.recv().unwrap();
+                42
+            },
+            || {
+                assert_eq!(std::thread::current().id(), main);
+                pumps += 1;
+                if let Some(sender) = sender.take() {
+                    sender.send(()).unwrap();
+                }
+                std::thread::yield_now();
+            },
+        );
+        assert_eq!(result, Ok(42));
+        assert!(pumps > 0);
+    }
+
+    #[test]
+    fn desk_worker_panic_is_reported_without_skipping_the_callers_cleanup() {
+        let result = with_probe_worker(|| panic!("test worker panic"), std::thread::yield_now);
+        assert_eq!(result, Err::<(), _>("desk measurement panicked".into()));
+    }
+}
+
 /// Check the actual preview and badge panels' shareable-window membership and
 /// capture each panel's own ID through production's single-window path. A
 /// separate shareable control must be listed and yield its pattern. Call only

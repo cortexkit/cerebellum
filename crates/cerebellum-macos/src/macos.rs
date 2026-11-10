@@ -861,9 +861,29 @@ pub fn enumerate_windows(timeout: Duration) -> Result<Vec<RawWindow>, String> {
     // below returns.
     unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&handler) };
 
-    delivery
+    let result = delivery
         .wait(timeout)
-        .unwrap_or_else(|| Err(format!("the window list did not arrive within {timeout:?}")))
+        .unwrap_or_else(|| Err(format!("the window list did not arrive within {timeout:?}")));
+    #[cfg(feature = "desk-probe")]
+    if let Err(error) = &result {
+        WINDOW_LIST_ERRORS_FOR_PROBE
+            .lock()
+            .unwrap()
+            .push(error.clone());
+    }
+    result
+}
+
+#[cfg(feature = "desk-probe")]
+static WINDOW_LIST_ERRORS_FOR_PROBE: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Drain original enumeration errors before target resolution discards their
+/// details. Only the manual probe can read these; replies remain unchanged.
+#[cfg(feature = "desk-probe")]
+#[doc(hidden)]
+pub fn take_window_list_errors_for_probe() -> Vec<String> {
+    std::mem::take(&mut *WINDOW_LIST_ERRORS_FOR_PROBE.lock().unwrap())
 }
 
 /// One running application, as the window server lists it.

@@ -33,8 +33,8 @@
 //! app covers the scratch window, and then:
 //!
 //! 1. Active phase, background mode: reads the scratch app, writes a marker
-//!    into its document, sends one Command chord (the one needs-front
-//!    action), and reads again. A sampler reads the frontmost app every
+//!    into its document, sends at least 20 needs-front Command chords,
+//!    and reads again. A sampler reads the frontmost app every
 //!    100 ms. Every sample outside the chord must be the person's front app,
 //!    and the samples after the chord show it restored. The chord's reply
 //!    must report a needs-front front that was restored, and the helper's
@@ -90,6 +90,137 @@ const MODULE_IDLE_CPU_TOLERANCE_PERCENT: u64 = 10;
 const IDLE_COUNTERS: [&str; 2] = ["previewCaptureRequests", "previewFramesWritten"];
 /// The width of a background-mode preview window, in points.
 const PREVIEW_WIDTH: f64 = cerebellum_computer::preview_layout::PREVIEW_WIDTH;
+const NEEDS_FRONT_ATTEMPTS: usize = 20;
+const CANDIDATE_BOUNDS_MS: [u64; 5] = [100, 150, 200, 250, 300];
+
+#[derive(Debug, PartialEq)]
+struct TimingSummary {
+    count: usize,
+    min: f64,
+    median: f64,
+    p90: f64,
+    max: f64,
+}
+
+/// Median averages the middle pair; p90 uses the nearest-rank convention.
+fn timing_summary(values: &[f64]) -> Option<TimingSummary> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let count = sorted.len();
+    let middle = count / 2;
+    let median = if count.is_multiple_of(2) {
+        (sorted[middle - 1] + sorted[middle]) / 2.0
+    } else {
+        sorted[middle]
+    };
+    Some(TimingSummary {
+        count,
+        min: sorted[0],
+        median,
+        p90: sorted[(count * 9).div_ceil(10) - 1],
+        max: sorted[count - 1],
+    })
+}
+
+#[derive(Default)]
+struct AttemptTiming {
+    front_ms: Option<f64>,
+    /// Present only when the chord actually posted and restore was confirmed.
+    bracket_ms: Option<f64>,
+    /// Front confirmation through posting and confirmed restore, same attempt.
+    post_and_restore_ms: Option<f64>,
+    cleanup_only_ms: Option<f64>,
+}
+
+#[derive(Debug, PartialEq)]
+struct BoundCount {
+    bound_ms: u64,
+    measured: usize,
+    estimated: Option<usize>,
+}
+
+/// Candidate bounds are computed, never tried. An estimate combines each
+/// observed front latency with the median measured post-and-restore time.
+fn bound_counts(attempts: &[AttemptTiming], bounds: &[u64]) -> Vec<BoundCount> {
+    let post_and_restore = timing_summary(
+        &attempts
+            .iter()
+            .filter_map(|attempt| attempt.post_and_restore_ms)
+            .collect::<Vec<_>>(),
+    );
+    bounds
+        .iter()
+        .map(|&bound_ms| BoundCount {
+            bound_ms,
+            measured: attempts
+                .iter()
+                .filter_map(|attempt| attempt.bracket_ms)
+                .filter(|&ms| ms <= bound_ms as f64)
+                .count(),
+            estimated: post_and_restore.as_ref().map(|post| {
+                attempts
+                    .iter()
+                    .filter_map(|attempt| attempt.front_ms)
+                    .filter(|&ms| ms + post.median <= bound_ms as f64)
+                    .count()
+            }),
+        })
+        .collect()
+}
+
+fn print_timing_summary(name: &str, values: &[f64]) {
+    match timing_summary(values) {
+        Some(stats) => println!(
+            "SUMMARY {name}: count={} min={:.3} median={:.3} p90={:.3} max={:.3} ms",
+            stats.count, stats.min, stats.median, stats.p90, stats.max
+        ),
+        None => println!("SUMMARY {name}: count=0; no confirmed measurements"),
+    }
+}
+
+fn print_needs_front_summary(attempts: &[AttemptTiming]) {
+    println!("SUMMARY needs-front attempts: {}; production bound unchanged at 100 ms; median averages the middle pair, p90 is nearest-rank", attempts.len());
+    for (name, values) in [
+        (
+            "request→frontmost (in-call or late)",
+            attempts
+                .iter()
+                .filter_map(|a| a.front_ms)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "request→post→confirmed restore (posted brackets only)",
+            attempts.iter().filter_map(|a| a.bracket_ms).collect(),
+        ),
+        (
+            "frontmost→post→confirmed restore",
+            attempts
+                .iter()
+                .filter_map(|a| a.post_and_restore_ms)
+                .collect(),
+        ),
+        (
+            "request→cleanup restore (no completed chord; not a posted bracket)",
+            attempts.iter().filter_map(|a| a.cleanup_only_ms).collect(),
+        ),
+    ] {
+        print_timing_summary(name, &values);
+    }
+    println!("SUMMARY candidate bounds COMPUTED, NOT TRIED: measured counts use only posted+restored brackets; estimates use each front latency + median measured frontmost→post→restore time from a separate distribution (not a replay)");
+    for count in bound_counts(attempts, &CANDIDATE_BOUNDS_MS) {
+        println!(
+            "COMPUTED bound {} ms: measured completed {}/{}; estimated from two measured parts {}/{}",
+            count.bound_ms,
+            count.measured,
+            attempts.len(),
+            count.estimated.map_or_else(|| "unavailable (no posted+restored samples)".into(), |n| n.to_string()),
+            attempts.len()
+        );
+    }
+}
 
 /// Whether the person approved this run on the command line.
 fn approved(arguments: impl IntoIterator<Item = String>) -> bool {
@@ -345,6 +476,14 @@ fn baseline_from_output(output: &str) -> Option<u64> {
         .and_then(|value| value.trim().parse().ok())
 }
 
+/// Re-exec the same signed binary, but give the baseline its own responsibility
+/// identity just like the cursor-on probe. Never fall back to an ordinary spawn.
+fn baseline_launch_command(executable: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(executable.with_file_name("disclaim_launch"));
+    command.arg(executable).args([APPROVAL_FLAG, BASELINE_FLAG]);
+    command
+}
+
 /// One reading of the frontmost app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FrontSample {
@@ -544,6 +683,8 @@ mod desk {
     /// so a hide or a last frame in flight is not counted as idle work.
     const SETTLE: Duration = Duration::from_secs(2);
     const SAMPLE_EVERY: Duration = Duration::from_millis(100);
+    const FRONT_CLEANUP_SPACING: Duration =
+        Duration::from_millis(cerebellum::budgets::LATE_ACTIVATION_WATCH_MS + 100);
 
     /// Private files are outside $TMPDIR, where signing can hang on this Mac.
     struct ScratchFiles {
@@ -1327,11 +1468,19 @@ mod desk {
             }
         };
         println!(
-            "TIME BUDGET: at most about {} s (launch {} s, covering the window up to {} s, \
-             actions, two idle windows of {} s, teardown)",
-            (2 * (LAUNCH_WAIT + COVER_WAIT + IDLE_WINDOW) + Duration::from_secs(30)).as_secs(),
+            "TIME BUDGET: allow about {} s (launch {} s, covering the window up to {} s, \
+             {} needs-front attempts per run with {} ms cleanup spacing, \
+             two idle windows of {} s, teardown)",
+            (2 * (LAUNCH_WAIT
+                + COVER_WAIT
+                + IDLE_WINDOW
+                + FRONT_CLEANUP_SPACING * NEEDS_FRONT_ATTEMPTS as u32)
+                + Duration::from_secs(30))
+            .as_secs(),
             LAUNCH_WAIT.as_secs(),
             COVER_WAIT.as_secs(),
+            NEEDS_FRONT_ATTEMPTS,
+            FRONT_CLEANUP_SPACING.as_millis(),
             IDLE_WINDOW.as_secs()
         );
         if cerebellum_macos::screen_is_locked() != Some(false) {
@@ -1418,7 +1567,9 @@ mod desk {
             }
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.block_on(measure(&scratch, person, baseline))
+            cerebellum_macos::with_app_use_desk_probe_run_loop(|| {
+                runtime.block_on(measure(&scratch, person, baseline))
+            })
         }));
         let cleaned_up = scratch.finish();
         if cleaned_up {
@@ -1429,7 +1580,11 @@ mod desk {
             return 2;
         }
         let code = match outcome {
-            Ok(code) => code,
+            Ok(Ok(code)) => code,
+            Ok(Err(reason)) => {
+                eprintln!("UNMEASURABLE: cannot run desk measurement: {reason}");
+                2
+            }
             Err(_) => {
                 eprintln!("FAIL probe panicked");
                 1
@@ -1480,13 +1635,12 @@ mod desk {
     /// time.
     fn baseline_run(executable: &Path) -> Result<u64, String> {
         println!("BASELINE run with the agent cursor off");
-        // The disclaiming launcher made this probe responsible for its own
-        // permissions rather than the terminal's. Ordinary spawning keeps
-        // this probe responsible for the child, so both use the same grants.
-        let output = Command::new(executable)
-            .args([APPROVAL_FLAG, BASELINE_FLAG])
+        // A plain child has a different responsibility chain from the main
+        // probe. Use the same disclaiming launcher and the same signed binary
+        // instead of relying on macOS's helper-attribution heuristics.
+        let output = baseline_launch_command(executable)
             .output()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("could not run sibling disclaim_launch: {error}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             println!("  baseline: {line}");
@@ -1571,9 +1725,13 @@ mod desk {
         };
 
         // The scratch window, read through the plane until it answers.
+        let _ = cerebellum_macos::take_window_list_errors_for_probe();
         let started = Instant::now();
         let read = loop {
             let read = serve("computer.read_state", json!({"target": TEXTEDIT_BUNDLE})).await;
+            for error in cerebellum_macos::take_window_list_errors_for_probe() {
+                eprintln!("RECORD probe-only ScreenCaptureKit window-list error: {error}");
+            }
             if read_state_outline(&read).is_some() {
                 break read;
             }
@@ -1671,7 +1829,11 @@ mod desk {
         }
         // Repeated harmless select-all chords expose activation latency, not
         // just one lucky request. Keep late cleanup clear of a new app call.
-        for attempt in 1..=5 {
+        // Discard any observations from the preceding background-only calls.
+        let _ = cerebellum::desk_probe::take_fronting_timings();
+        let _ = cerebellum::desk_probe::take_fronting_landings();
+        let mut attempts = Vec::with_capacity(NEEDS_FRONT_ATTEMPTS);
+        for attempt in 1..=NEEDS_FRONT_ATTEMPTS {
             sampler.needs_front.store(true, Ordering::SeqCst);
             let chord = serve(
                 "computer.keys",
@@ -1680,21 +1842,50 @@ mod desk {
             .await;
             sampler.needs_front.store(false, Ordering::SeqCst);
             println!(
-                "RECORD needs-front chord reply fronting: {}",
-                chord["fronting"]
+                "RECORD needs-front attempt {attempt}: outcome={} effect_status={} fronting={}",
+                chord["outcome"], chord["effect_status"], chord["fronting"]
             );
             report.check(
                 "needs-front chord fronts, sends and restores",
                 needs_front_reply_verdict(&chord),
             );
-            tokio::time::sleep(Duration::from_millis(
-                cerebellum::budgets::LATE_ACTIVATION_WATCH_MS + 100,
-            ))
-            .await;
+            tokio::time::sleep(FRONT_CLEANUP_SPACING).await;
             for (pid, latency) in cerebellum::desk_probe::take_fronting_landings() {
                 println!("RECORD needs-front attempt {attempt}: pid {pid} pending activation landed {latency} ms after request");
             }
+            let timings = cerebellum::desk_probe::take_fronting_timings();
+            let mut measured = AttemptTiming::default();
+            match timings.as_slice() {
+                [timing] if timing.target_pid == scratch.pid() => {
+                    measured.front_ms = timing.confirmed_front_ms.or(timing.late_landing_ms);
+                    match timing.confirmed_front_ms {
+                        Some(ms) => println!("RECORD needs-front attempt {attempt}: request→confirmed-frontmost {ms:.3} ms (in call)"),
+                        None => match timing.late_landing_ms {
+                            Some(ms) => println!("RECORD needs-front attempt {attempt}: not confirmed in call; late landing {ms:.3} ms after request"),
+                            None => println!("RECORD needs-front attempt {attempt}: not confirmed in call; no late landing observed"),
+                        },
+                    }
+                    if needs_front_reply_verdict(&chord).is_ok() {
+                        measured.bracket_ms = timing.restore_confirmed_ms;
+                        measured.post_and_restore_ms = timing.confirmed_front_ms.zip(timing.restore_confirmed_ms).map(|(front, restored)| restored - front);
+                    } else {
+                        measured.cleanup_only_ms = timing.restore_confirmed_ms;
+                    }
+                }
+                _ => println!("RECORD needs-front attempt {attempt}: not confirmed in call; timing unavailable (expected one request for scratch pid {}, got {timings:?})", scratch.pid()),
+            }
+            match measured.bracket_ms {
+                Some(ms) => println!("RECORD needs-front attempt {attempt}: whole posted bracket (request→post→restore confirmed) {ms:.3} ms"),
+                None => {
+                    println!("RECORD needs-front attempt {attempt}: whole posted bracket not completed/confirmed");
+                    if let Some(ms) = measured.cleanup_only_ms {
+                        println!("RECORD needs-front attempt {attempt}: cleanup-only request→restore confirmed {ms:.3} ms (not a completed chord)");
+                    }
+                }
+            }
+            attempts.push(measured);
         }
+        print_needs_front_summary(&attempts);
         let last = serve("computer.read_state", json!({"target": TEXTEDIT_BUNDLE})).await;
         report.check(
             "background read_state after the chord fronts nothing",
@@ -2105,6 +2296,21 @@ mod tests {
     }
 
     #[test]
+    fn the_baseline_reexec_uses_the_same_disclaiming_launcher_and_signed_executable() {
+        let executable = Path::new("/tmp/cereb-desk/app_use_desk_probe");
+        let command = baseline_launch_command(executable);
+        assert_eq!(command.get_program(), "/tmp/cereb-desk/disclaim_launch");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                executable.as_os_str(),
+                APPROVAL_FLAG.as_ref(),
+                BASELINE_FLAG.as_ref(),
+            ]
+        );
+    }
+
+    #[test]
     fn the_person_keeps_the_front_except_during_the_one_needs_front_action() {
         let restored = [
             sample(0, PERSON, false),
@@ -2246,4 +2452,129 @@ mod tests {
         assert_eq!(visible_previews(&listed, helper), 1);
         assert_eq!(visible_previews(&listed[1..], helper), 0);
     }
+}
+#[test]
+fn timing_summary_reports_empty_single_even_and_odd_samples() {
+    assert_eq!(timing_summary(&[]), None);
+    assert_eq!(
+        timing_summary(&[17.5]),
+        Some(TimingSummary {
+            count: 1,
+            min: 17.5,
+            median: 17.5,
+            p90: 17.5,
+            max: 17.5,
+        })
+    );
+    assert_eq!(
+        timing_summary(&[30.0, 10.0, 20.0, 40.0]),
+        Some(TimingSummary {
+            count: 4,
+            min: 10.0,
+            median: 25.0,
+            p90: 40.0,
+            max: 40.0,
+        })
+    );
+    assert_eq!(timing_summary(&[30.0, 10.0, 20.0]).unwrap().median, 20.0);
+}
+
+#[test]
+fn timing_summary_p90_is_nearest_rank_for_twenty_unsorted_attempts() {
+    let values = (1..=20).rev().map(f64::from).collect::<Vec<_>>();
+    assert_eq!(
+        timing_summary(&values),
+        Some(TimingSummary {
+            count: 20,
+            min: 1.0,
+            median: 10.5,
+            p90: 18.0,
+            max: 20.0,
+        })
+    );
+    assert!(NEEDS_FRONT_ATTEMPTS >= 20);
+}
+
+#[test]
+fn bound_counts_keep_measured_completions_separate_from_estimated_late_cleanups() {
+    let attempts = [
+        AttemptTiming {
+            front_ms: Some(70.0),
+            bracket_ms: Some(100.0),
+            post_and_restore_ms: Some(30.0),
+            cleanup_only_ms: None,
+        },
+        AttemptTiming {
+            front_ms: Some(80.0),
+            bracket_ms: Some(130.0),
+            post_and_restore_ms: Some(50.0),
+            cleanup_only_ms: None,
+        },
+        // Late fronting and cleanup provide no measured chord completion.
+        AttemptTiming {
+            front_ms: Some(110.0),
+            cleanup_only_ms: Some(140.0),
+            ..AttemptTiming::default()
+        },
+        AttemptTiming {
+            front_ms: Some(260.0),
+            ..AttemptTiming::default()
+        },
+        AttemptTiming::default(),
+    ];
+    assert_eq!(
+        bound_counts(&attempts, &CANDIDATE_BOUNDS_MS),
+        vec![
+            BoundCount {
+                bound_ms: 100,
+                measured: 1,
+                estimated: Some(0)
+            },
+            BoundCount {
+                bound_ms: 150,
+                measured: 2,
+                estimated: Some(3)
+            },
+            BoundCount {
+                bound_ms: 200,
+                measured: 2,
+                estimated: Some(3)
+            },
+            BoundCount {
+                bound_ms: 250,
+                measured: 2,
+                estimated: Some(3)
+            },
+            BoundCount {
+                bound_ms: 300,
+                measured: 2,
+                estimated: Some(4)
+            },
+        ]
+    );
+}
+
+#[test]
+fn bound_counts_without_posted_samples_do_not_invent_a_post_cost() {
+    let attempts = [AttemptTiming {
+        front_ms: Some(80.0),
+        cleanup_only_ms: Some(90.0),
+        ..AttemptTiming::default()
+    }];
+    assert_eq!(
+        bound_counts(&attempts, &[100]),
+        vec![BoundCount {
+            bound_ms: 100,
+            measured: 0,
+            estimated: None
+        }]
+    );
+    assert_eq!(
+        bound_counts(&[], &[100]),
+        vec![BoundCount {
+            bound_ms: 100,
+            measured: 0,
+            estimated: None
+        }]
+    );
 }

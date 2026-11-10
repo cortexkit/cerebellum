@@ -264,6 +264,8 @@ pub struct RestoreCell {
     inner: std::sync::Mutex<RestoreCellInner>,
     changed: std::sync::Condvar,
     pending_watch: late_fronting::PendingRegistration,
+    #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+    probe_timing: probe_timing::ProbeTiming,
 }
 
 struct RestoreCellInner {
@@ -303,6 +305,8 @@ impl RestoreCell {
                 namespace,
                 request,
             ),
+            #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+            probe_timing: probe_timing::ProbeTiming::new(obligation.target_pid),
         }
     }
 
@@ -320,7 +324,14 @@ impl RestoreCell {
     /// the restore host's clock. `false` when cleanup already took the
     /// obligation: the worker must not front.
     pub fn begin_front_attempt(&self, front_instant_ms: u64) -> bool {
-        self.inner().attempt.begin_dispatch(front_instant_ms)
+        let mut inner = self.inner();
+        let began = inner.attempt.begin_dispatch(front_instant_ms);
+        #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+        if began {
+            self.probe_timing.begin();
+        }
+        drop(inner);
+        began
     }
 
     /// The front request and its wait returned. A cleanup that took the
@@ -331,7 +342,11 @@ impl RestoreCell {
     }
 
     pub fn front_confirmed(&self) {
-        self.inner().front_confirmed = true;
+        let mut inner = self.inner();
+        inner.front_confirmed = true;
+        #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+        self.probe_timing.confirmed_front();
+        drop(inner);
     }
 
     pub fn was_front_confirmed(&self) -> bool {
@@ -393,6 +408,8 @@ impl RestoreCell {
                     &mut RestoreDecisionHost {
                         host: host.as_mut(),
                         _target: self.target_pid,
+                        #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+                        probe_timing: &self.probe_timing,
                     },
                     self.previous_pid,
                     self.target_pid,
@@ -400,6 +417,10 @@ impl RestoreCell {
                     crate::computer::dispatch::RESTORE_WAIT_MS,
                     confirmed,
                 );
+                #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+                if outcome.restore == crate::computer::dispatch::RestoreStatus::Restored {
+                    self.probe_timing.restored();
+                }
                 if !confirmed
                     && !matches!(
                         outcome.restore,
@@ -540,6 +561,8 @@ impl RestoreCell {
 struct RestoreDecisionHost<'a> {
     host: &'a mut dyn RestoreHost,
     _target: u32,
+    #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+    probe_timing: &'a probe_timing::ProbeTiming,
 }
 
 impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> {
@@ -560,6 +583,8 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
     fn late_activation_observed(&mut self, _latency_ms: u64) {
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
         late_fronting::note_landing(self._target, _latency_ms);
+        #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+        self.probe_timing.late_landing();
     }
     fn our_pid(&self) -> i64 {
         i64::from(std::process::id())
@@ -622,6 +647,8 @@ pub(crate) struct TerminalState {
 
 type TerminalHook = Box<dyn FnOnce() + Send>;
 mod late_fronting;
+#[cfg(all(feature = "desk-probe", target_os = "macos"))]
+pub(crate) mod probe_timing;
 #[cfg(test)]
 pub(crate) use late_fronting::hold_watch_for_test;
 #[cfg(all(feature = "desk-probe", target_os = "macos"))]
