@@ -3405,7 +3405,11 @@ impl BrowserPlane {
             fill::mask_filled_fields(&mut observation, filled);
         }
         if frames_omitted > 0 {
-            let note = format!("{frames_omitted} embedded frames from a local, private or opaque origin omitted; they need site permission");
+            let note = if frames_omitted == 1 {
+                "1 embedded frame from a local, private or opaque origin omitted; it needs site permission".to_owned()
+            } else {
+                format!("{frames_omitted} embedded frames from a local, private or opaque origin omitted; they need site permission")
+            };
             observation.records.push(AxRecord {
                 depth: 0,
                 role: state_text::UNREAD_FRAME_ROLE.into(),

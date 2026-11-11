@@ -806,7 +806,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     .iter_mut()
                     .find(|record| record.role == state_text::UNREAD_FRAME_ROLE)
                 {
-                    let count = format!("{} embedded frames omitted", omitted_frames.len());
+                    let count = match omitted_frames.len() {
+                        1 => "1 embedded frame omitted".to_owned(),
+                        n => format!("{n} embedded frames omitted"),
+                    };
                     notice.name.push_str(&format!("; {count}"));
                     if let Some(text) = &mut observation.dom_text {
                         text.push_str(&format!("\n<!-- {count} -->\n"));
