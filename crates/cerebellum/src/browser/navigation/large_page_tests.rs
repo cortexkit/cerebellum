@@ -146,7 +146,7 @@ async fn filtered_cut_capture_reports_unsearched_matches() {
     let identity = route();
     let plane = crate::browser::BrowserPlane::new();
     plane.open_context(identity.clone()).await.unwrap();
-    for text in ["more repl", "Comments"] {
+    for query in ["more repl", "Comments"] {
         let (reply, _) = plane
             .retain_text_snapshot_inner(
                 &identity,
@@ -157,7 +157,7 @@ async fn filtered_cut_capture_reports_unsearched_matches() {
                 &observation.facts,
                 None,
                 &state_text::Filters {
-                    text: Some(text.into()),
+                    text: Some(query.into()),
                     roles: vec![],
                 },
                 30_000,
@@ -177,8 +177,9 @@ async fn filtered_cut_capture_reports_unsearched_matches() {
             text.to_lowercase().contains("zoom") && text.contains("container ref"),
             "{text}"
         );
-        assert!(
-            !text.contains("No matches for the requested filters."),
+        assert_eq!(
+            text.contains("No element matched text_filter"),
+            query == "more repl",
             "{text}"
         );
         assert_eq!(reply["truncated"], true);

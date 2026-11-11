@@ -1893,7 +1893,71 @@ async fn snapshot_byte_budget_is_disclosed_as_partial() {
         assert_eq!(snapshot["refs_truncated"], false);
         assert!(snapshot["state_text"].as_str().unwrap().len() <= max_bytes);
         assert!(snapshot["remedy"].as_str().unwrap().contains("partial"));
+        assert!(snapshot["remedy"].as_str().unwrap().contains("max_bytes"));
         assert!(crate::browser::validate_user_browser_result("snapshot", &snapshot).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn unmatched_filters_on_a_complete_user_page_are_explicit() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    fixture.state.lock().unwrap().top_level_only = true;
+    for filter in [
+        json!({"text_filter":"ersion|ifecycle|ncryption|ock"}),
+        json!({"role_filter":["checkbox"]}),
+        json!({"text_filter":"Message","role_filter":["button"]}),
+    ] {
+        let mut args = json!({"browser":"user","action":"snapshot","tab":tab});
+        args.as_object_mut()
+            .unwrap()
+            .extend(filter.as_object().unwrap().clone());
+        let (snapshot, _) = fixture.call(1, args, "allow_30m").await;
+        assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        assert_eq!(snapshot["truncated"], false, "{snapshot}");
+        assert!(
+            snapshot["state_text"]
+                .as_str()
+                .unwrap()
+                .contains("No element matched"),
+            "{snapshot}"
+        );
+        assert!(snapshot.get("remedy").is_none(), "{snapshot}");
+        assert!(crate::browser::validate_user_browser_result("snapshot", &snapshot).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn stale_frame_omission_is_not_an_early_capture_stop() {
+    for mode in ["actionable", "ax", "dom_full"] {
+        let fixture = Fixture::new();
+        let tab = fixture.claim(1).await;
+        fixture.state.lock().unwrap().child_ax_unavailable = true;
+        for max_bytes in [4000, 14000] {
+            let mut args = json!({"browser":"user","action":"snapshot","tab":tab,"mode":mode,"max_bytes":max_bytes});
+            if mode == "actionable" {
+                args["text_filter"] = json!("ersion|ifecycle|ncryption|ock");
+            }
+            let (snapshot, _) = fixture.call(1, args, "allow_30m").await;
+            assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+            let text = snapshot["state_text"].as_str().unwrap();
+            assert!(
+                text.contains("[embedded frame not readable: stale]"),
+                "{snapshot}"
+            );
+            assert_eq!(snapshot["omitted_frames"], 1, "{snapshot}");
+            assert_eq!(snapshot["refs_truncated"], false, "{snapshot}");
+            assert_eq!(snapshot["truncated"], false, "{snapshot}");
+            assert!(!text.contains("Capture stopped early"), "{snapshot}");
+            assert!(snapshot.get("remedy").is_none(), "{snapshot}");
+            if mode == "actionable" {
+                assert!(
+                    text.contains("No element matched text_filter"),
+                    "{snapshot}"
+                );
+            }
+            assert!(crate::browser::validate_user_browser_result("snapshot", &snapshot).is_ok());
+        }
     }
 }
 
@@ -1915,10 +1979,6 @@ async fn filtered_partial_capture_discloses_unsearched_content_in_user_browser()
         assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
         let text = snapshot["state_text"].as_str().unwrap();
         assert!(text.len() <= max_bytes);
-        assert!(
-            !text.contains("No matches for the requested filters."),
-            "{snapshot}"
-        );
         let notice = snapshot["remedy"].as_str().unwrap();
         assert!(
             notice.contains("matches beyond the captured portion were not searched")
@@ -1927,6 +1987,10 @@ async fn filtered_partial_capture_discloses_unsearched_content_in_user_browser()
         );
         if max_bytes == 5000 {
             assert!(text.contains("Capture stopped early"), "{snapshot}");
+            assert!(
+                text.contains("No element matched text_filter"),
+                "{snapshot}"
+            );
         }
         assert_eq!(snapshot["truncated"], true);
     }
@@ -3982,7 +4046,7 @@ async fn ambiguous_child_pair_keeps_top_level_and_normal_child_readable() {
     }
     let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
-    assert_eq!(snapshot["truncated"], true);
+    assert_eq!(snapshot["truncated"], false);
     assert_eq!(snapshot["omitted_frames"], 2);
     let text = snapshot["state_text"].as_str().unwrap();
     assert!(text.contains("Message"));
@@ -4038,7 +4102,7 @@ async fn click_on_a_previously_read_element_in_an_omitted_pair_refuses_ambiguity
     assert_eq!(partial["outcome"], "ok", "{partial}");
     let (zoom, _) = fixture.call(1, json!({"browser":"user","action":"snapshot","tab":tab,"zoom":reference(&before,"pair-one button")}), "allow_30m").await;
     assert_eq!(zoom["outcome"], "ok", "{zoom}");
-    assert_eq!(zoom["truncated"], true);
+    assert_eq!(zoom["truncated"], false);
     assert!(zoom["state_text"]
         .as_str()
         .unwrap()
@@ -4081,7 +4145,7 @@ async fn a_child_changing_again_after_one_retry_is_omitted_from_the_read() {
     fixture.state.lock().unwrap().moving_child = true;
     let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
-    assert_eq!(snapshot["truncated"], true);
+    assert_eq!(snapshot["truncated"], false);
     assert!(snapshot["state_text"].as_str().unwrap().contains("Message"));
     assert!(snapshot["state_text"]
         .as_str()
@@ -4114,7 +4178,7 @@ async fn dom_full_keeps_omission_markers_without_unreadable_child_documents() {
         )
         .await;
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
-    assert_eq!(snapshot["truncated"], true);
+    assert_eq!(snapshot["truncated"], false);
     let text = snapshot["state_text"].as_str().unwrap();
     assert!(text.contains("HTML-main"));
     assert!(text.contains("HTML-foreign"));
@@ -4143,7 +4207,7 @@ async fn a_child_without_an_accessibility_tree_does_not_hide_the_top_page() {
     fixture.state.lock().unwrap().child_ax_unavailable = true;
     let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
-    assert_eq!(snapshot["truncated"], true);
+    assert_eq!(snapshot["truncated"], false);
     let text = snapshot["state_text"].as_str().unwrap();
     assert!(text.contains("Message"));
     assert!(text.contains("[embedded frame not readable: stale]"));
@@ -4157,7 +4221,7 @@ async fn a_child_without_an_accessibility_tree_does_not_hide_the_top_page() {
 }
 
 #[tokio::test]
-async fn an_iframe_owner_without_a_discovered_child_is_marked_partial() {
+async fn an_iframe_owner_without_a_discovered_child_is_marked_unreadable() {
     for mode in ["actionable", "ax", "dom_full"] {
         let fixture = Fixture::new();
         let tab = fixture.claim(1).await;
@@ -4174,7 +4238,7 @@ async fn an_iframe_owner_without_a_discovered_child_is_marked_partial() {
             )
             .await;
         assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
-        assert_eq!(snapshot["truncated"], true, "{snapshot}");
+        assert_eq!(snapshot["truncated"], false, "{snapshot}");
         assert_eq!(snapshot["omitted_frames"], 1);
         let text = snapshot["state_text"].as_str().unwrap();
         assert!(

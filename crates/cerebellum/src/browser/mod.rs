@@ -3405,11 +3405,11 @@ impl BrowserPlane {
             fill::mask_filled_fields(&mut observation, filled);
         }
         if frames_omitted > 0 {
-            let note = "embedded frame from a local, private or opaque origin omitted; it needs site permission";
+            let note = format!("{frames_omitted} embedded frames from a local, private or opaque origin omitted; they need site permission");
             observation.records.push(AxRecord {
                 depth: 0,
-                role: "StaticText".into(),
-                name: note.into(),
+                role: state_text::UNREAD_FRAME_ROLE.into(),
+                name: note.clone(),
                 value: None,
                 reference: None,
             });
@@ -3429,9 +3429,7 @@ impl BrowserPlane {
                 zoom,
                 filters,
                 max_bytes,
-                // Omitted AX subtrees or embedded documents make the
-                // observation partial even when DOM-full text was requested.
-                frames_omitted > 0 || observation.ax_truncated,
+                observation.ax_truncated,
                 observation.refs_truncated,
                 Some(source_document),
             )
@@ -3694,6 +3692,8 @@ impl BrowserPlane {
         );
         if content_incomplete || refs_truncated {
             reply["remedy"] = json!(state_text::capture_cut_notice(filters));
+        } else if encoded_truncated {
+            reply["remedy"] = json!(state_text::BYTE_CUT_NOTICE);
         }
         let ref_count = snapshot.refs.len();
         if let Some(window) = &context.fill_window {
@@ -7067,6 +7067,51 @@ mod tests {
             plane.click(&route, &click(current)).await,
             Err(BrowserError::ElementIntercepted)
         ));
+    }
+
+    #[tokio::test]
+    async fn unmatched_filters_on_a_complete_own_page_are_explicit() {
+        let route = identity();
+        let plane = BrowserPlane::new();
+        plane.open_context(route.clone()).await.unwrap();
+        let (records, refs) = ax_fixture();
+        for filters in [
+            state_text::Filters {
+                text: Some("ersion|ifecycle|ncryption|ock".into()),
+                roles: Vec::new(),
+            },
+            state_text::Filters {
+                text: None,
+                roles: vec!["checkbox".into()],
+            },
+        ] {
+            let (reply, _) = plane
+                .retain_text_snapshot_inner(
+                    &route,
+                    SnapshotKind::Actionable,
+                    &records,
+                    None,
+                    refs.clone(),
+                    &HashMap::new(),
+                    None,
+                    &filters,
+                    4000,
+                    false,
+                    false,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply["truncated"], false, "{reply}");
+            assert!(
+                reply["state_text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("No element matched"),
+                "{reply}"
+            );
+            plane.finish_reply(SNAPSHOT, reply).unwrap();
+        }
     }
 
     /// `max_bytes` bounds the page text in every mode, the reply's copy of a

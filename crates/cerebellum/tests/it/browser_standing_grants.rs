@@ -2348,10 +2348,24 @@ async fn baseline_private_frames_are_omitted_until_the_top_page_has_person_permi
         assert!(!text.contains("Nested public child"), "{snapshot}");
         assert!(text.contains("Public embedded text"), "{snapshot}");
         assert!(
-            text.contains("embedded frame") && text.contains("needs site permission"),
+            text.contains("2 embedded frames") && text.contains("need site permission"),
             "{snapshot}"
         );
-        assert_eq!(snapshot["truncated"], true, "{snapshot}");
+        assert_eq!(snapshot["truncated"], false, "{snapshot}");
+        assert!(!text.contains("Capture stopped early"), "{snapshot}");
+        let capped = fixture
+            .call(
+                &route,
+                "browser.snapshot",
+                json!({"mode":mode,"max_bytes":64}),
+            )
+            .await;
+        assert_authorized(&capped, "byte-capped framed snapshot");
+        assert_eq!(capped["truncated"], true, "{capped}");
+        assert!(
+            capped["remedy"].as_str().unwrap().contains("max_bytes"),
+            "{capped}"
+        );
         let readable = fixture.browser.readable_frames.lock().unwrap();
         assert_eq!(readable.len(), 2);
         assert!(!readable

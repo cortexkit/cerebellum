@@ -205,6 +205,8 @@ impl ClassificationNotices {
     }
 }
 
+pub(crate) const BYTE_CUT_NOTICE: &str = "This snapshot is partial: max_bytes cut the rendered text. Zoom into a container ref or raise max_bytes before assuming absent controls are unavailable.";
+
 pub(crate) fn capture_cut_notice(filters: &Filters) -> String {
     let unsearched = if filters.narrows() {
         "; matches beyond the captured portion were not searched"
@@ -298,6 +300,21 @@ impl Filters {
     fn narrows(&self) -> bool {
         self.text.is_some() || !self.roles.is_empty()
     }
+
+    fn no_match_notice(&self) -> String {
+        let mut filters = Vec::new();
+        if let Some(text) = &self.text {
+            let text = cap_chars(one_line(text), 80);
+            filters.push(format!(
+                "text_filter {text:?} (a literal, case-insensitive substring)"
+            ));
+        }
+        if !self.roles.is_empty() {
+            let roles = cap_chars(one_line(&format!("{:?}", self.roles)), 80);
+            filters.push(format!("role_filter {roles} (case-insensitive roles)"));
+        }
+        format!("No element matched {}", filters.join(" and "))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,14 +403,19 @@ pub fn render_with_capture_status(
         header.push('\n');
         header.push_str(&capture_cut_notice(input.filters));
     }
-    if input.filters.narrows() && lines.is_empty() && !capture_incomplete {
-        header.push_str("\nNo matches for the requested filters.");
+    if input.filters.narrows() && lines.is_empty() {
+        header.push('\n');
+        header.push_str(&input.filters.no_match_notice());
     }
-    for notice in input
-        .records
-        .iter()
-        .filter(|record| record.role == UNREAD_FRAME_ROLE)
-    {
+    // The person's browser places frame markers at their owners. Filtering or
+    // zooming can remove those lines, but must not hide the unread document.
+    for notice in input.records.iter().filter(|record| {
+        record.role == UNREAD_FRAME_ROLE
+            || (record.role == "StaticText"
+                && record.reference.is_none()
+                && record.name.starts_with("[embedded frame not readable:")
+                && !lines.iter().any(|line| line.text.contains(&record.name)))
+    }) {
         header.push('\n');
         header.push_str(&one_line(&notice.name));
     }
@@ -2091,6 +2113,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unmatched_filters_are_disclosed_even_when_capture_stopped_early() {
+        let records = vec![
+            record(0, "RootWebArea", "Settings", Some("e1")),
+            record(1, "heading", "Versioning", Some("e2")),
+            record(1, "button", "Save", Some("e3")),
+        ];
+        for (filters, expected) in [
+            (
+                Filters {
+                    text: Some("ersion|ifecycle|ncryption|ock".into()),
+                    roles: Vec::new(),
+                },
+                "No element matched text_filter \"ersion|ifecycle|ncryption|ock\" (a literal, case-insensitive substring)",
+            ),
+            (
+                Filters {
+                    text: None,
+                    roles: vec!["checkbox".into()],
+                },
+                "No element matched role_filter [\"checkbox\"] (case-insensitive roles)",
+            ),
+            (
+                Filters {
+                    text: Some("Versioning".into()),
+                    roles: vec!["button".into()],
+                },
+                "No element matched text_filter \"Versioning\" (a literal, case-insensitive substring) and role_filter [\"button\"] (case-insensitive roles)",
+            ),
+        ] {
+            for incomplete in [false, true] {
+                let rendered = render_with_capture_status(
+                    &RenderInput {
+                        records: &records,
+                        facts: &HashMap::new(),
+                        page_url: "https://example.com/",
+                        snapshot_id: "s1",
+                        zoom: None,
+                        filters: &filters,
+                        max_bytes: 4_000,
+                    },
+                    incomplete,
+                );
+                assert!(rendered.text.lines().any(|line| line == expected), "{}", rendered.text);
+                assert_eq!(rendered.text.contains("Capture stopped early"), incomplete);
+                assert_eq!(rendered.cut_lines, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn unmatched_filter_echo_is_one_line_and_bounded() {
+        let records = vec![record(0, "RootWebArea", "Page", Some("e1"))];
+        let rendered = filtered(&records, &format!("missing\n{}", "秘密".repeat(100)));
+        let notice = rendered
+            .text
+            .lines()
+            .find(|line| line.starts_with("No element matched"))
+            .expect("missing no-match notice");
+        assert!(notice.contains("missing "));
+        assert!(notice.chars().count() < 180, "{notice}");
+        assert!(!notice.contains(&"秘密".repeat(100)));
+    }
+
+    #[test]
     fn repeated_classification_failures_print_once_and_keep_exceptions() {
         let records = vec![
             record(0, "RootWebArea", "Thread", Some("e1")),
@@ -2405,13 +2491,18 @@ mod tests {
             snapshot_id: "0123456789abcdef0123456789abcdef",
             zoom: None,
             filters: &Filters {
-                text: Some("hidden-secret".into()),
+                text: Some("hidden".into()),
                 roles: Vec::new(),
             },
             max_bytes: 4096,
         });
-        assert!(filtered.text.contains("No matches"), "{}", filtered.text);
+        assert!(
+            filtered.text.contains("No element matched text_filter"),
+            "{}",
+            filtered.text
+        );
         assert!(!filtered.text.contains("hidden-secret"));
+        assert!(filtered.printed_refs.is_empty());
     }
 
     /// A table whose rows hold a link prints a filtered match as it did

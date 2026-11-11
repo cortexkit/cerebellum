@@ -7,8 +7,6 @@ fn mark_unread_frame(
     owner: Option<usize>,
     reason: &str,
 ) {
-    observation.ax_truncated = true;
-    observation.refs_truncated = true;
     // An incomplete embedded document contributes neither text nor refs. Its
     // owner can contain untagged child AX text, so discard that subtree too.
     if let Some(index) = owner {
@@ -528,6 +526,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     && (observation.records.len() >= MAX_AX_NODES
                         || observation.refs.len() >= MAX_REFS)
                 {
+                    observation.ax_truncated |= observation.records.len() >= MAX_AX_NODES;
+                    observation.refs_truncated |= observation.refs.len() >= MAX_REFS;
                     mark_unread_frame(&mut observation, frame, None, "capture limit reached");
                     omitted_frames.insert(frame.frame_id.clone());
                     continue;
@@ -632,6 +632,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     filled,
                     clock,
                 );
+                if let Ok(child) = &child {
+                    observation.ax_truncated |= child.ax_truncated;
+                    observation.refs_truncated |= child.refs_truncated;
+                }
                 let mut child = match child {
                     Err(error)
                         if self.transport.is_closed()
@@ -795,6 +799,19 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                     authorized_origin,
                     live_origin,
                 });
+            }
+            if subtree.is_none() && !omitted_frames.is_empty() {
+                if let Some(notice) = observation
+                    .records
+                    .iter_mut()
+                    .find(|record| record.role == state_text::UNREAD_FRAME_ROLE)
+                {
+                    let count = format!("{} embedded frames omitted", omitted_frames.len());
+                    notice.name.push_str(&format!("; {count}"));
+                    if let Some(text) = &mut observation.dom_text {
+                        text.push_str(&format!("\n<!-- {count} -->\n"));
+                    }
+                }
             }
             Ok(observation)
         })();
@@ -1381,7 +1398,13 @@ mod tests {
                 "{}",
                 rendered.text
             );
-            assert!(observation.ax_truncated && observation.refs_truncated);
+            assert!(!observation.ax_truncated && !observation.refs_truncated);
+            assert!(
+                rendered.text.contains("2 embedded frames omitted"),
+                "{}",
+                rendered.text
+            );
+            assert!(!rendered.text.contains("Capture stopped early"));
             assert!(
                 clock.now().duration_since(started)
                     <= Duration::from_millis(crate::budgets::CDP_STEP_MS * 2)
@@ -1396,6 +1419,27 @@ mod tests {
                         && request["sessionId"] == "cross-session"),
                 "an unread renderer must not be queried again during verification"
             );
+        }
+    }
+
+    #[test]
+    fn unread_frame_preserves_only_real_capture_truncation_flags() {
+        let (_, frames) = fixture();
+        for (ax_truncated, refs_truncated) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut observation = BrowserSnapshotObservation {
+                records: Vec::new(),
+                dom_text: None,
+                refs: Vec::new(),
+                ax_truncated,
+                refs_truncated,
+                facts: HashMap::new(),
+            };
+            mark_unread_frame(&mut observation, &frames[1], None, "owner lookup failed");
+            assert_eq!(observation.ax_truncated, ax_truncated);
+            assert_eq!(observation.refs_truncated, refs_truncated);
+            assert!(observation.records[0].name.contains("owner lookup failed"));
         }
     }
 
