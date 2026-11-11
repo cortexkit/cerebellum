@@ -8406,7 +8406,11 @@ mod tests {
         assert!(!found.text.contains("message"), "{}", found.text);
 
         let none = filtered_fixture(&observation, &url, "no-such-text", 65_536);
-        assert!(none.text.contains("No matches"), "{}", none.text);
+        assert!(
+            none.text.contains("No element matched text_filter"),
+            "{}",
+            none.text
+        );
         let tight = filtered_fixture(&observation, &url, "event", 80);
         assert!(tight.text.len() <= 80, "{}", tight.text);
     }

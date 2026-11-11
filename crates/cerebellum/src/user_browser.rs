@@ -3545,7 +3545,7 @@ async fn capture_attempt(
             filters: &filters,
             max_bytes,
         },
-        ax_truncated || refs_truncated || omitted_frames != 0,
+        ax_truncated || refs_truncated,
     );
     let (text, text_truncated) = if args["mode"] == "dom_full" {
         let mut seen = BTreeSet::new();
@@ -3610,7 +3610,7 @@ async fn capture_attempt(
             rendered.cut_bytes > 0 || rendered.cut_lines > 0,
         )
     };
-    let truncated = ax_truncated || refs_truncated || text_truncated || omitted_frames != 0;
+    let truncated = ax_truncated || refs_truncated || text_truncated;
     context.target().retain(id.clone(), snapshot);
     let mut reply = json!({"browser":"user","outcome":"ok","tab":tab,"snapshot_id":id,"connection_epoch":context.connection,"interaction_epoch":document.interaction,"state_text":text,"input_dispatched":false,"truncated":truncated,"refs_truncated":refs_truncated});
     // A committed document and an unchanged interaction epoch do not establish
@@ -3620,12 +3620,10 @@ async fn capture_attempt(
         reply["omitted_frames"] = json!(omitted_frames);
     }
     reply["settlement_reason"] = json!("Page settlement is not observed on the person's browser.");
-    if ax_truncated || refs_truncated || omitted_frames != 0 {
+    if ax_truncated || refs_truncated {
         reply["remedy"] = json!(state_text::capture_cut_notice(&filters));
     } else if truncated {
-        reply["remedy"] = json!(
-            "This snapshot is partial; read again before assuming absent controls are unavailable."
-        );
+        reply["remedy"] = json!(state_text::BYTE_CUT_NOTICE);
     } else if args["mode"] != "dom_full"
         && records.iter().all(|record| record.role == "RootWebArea")
     {
