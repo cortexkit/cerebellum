@@ -806,7 +806,7 @@ async fn keyed_present_login_ack_and_custodian_isolation() {
     let scratch = Scratch::new();
     let (planes, logged_in) = planes(&scratch, true);
     bind(&planes, 9, reserved("prefrontal-core"), false).await;
-    bind(&planes, 10, reserved("prefrontal-routing"), false).await;
+    bind(&planes, 10, reserved("striatum"), false).await;
     assert_eq!(
         present(&planes, Some("pf:login-1")).await,
         json!({"outcome":"login_pending","origin":ORIGIN,"expires_in_ms":600_000})
@@ -926,7 +926,7 @@ async fn late_results_ack() {
     let scratch = Scratch::new();
     let (planes, _) = planes(&scratch, true);
     bind(&planes, 9, reserved("prefrontal-core"), false).await;
-    bind(&planes, 10, reserved("prefrontal-routing"), false).await;
+    bind(&planes, 10, reserved("striatum"), false).await;
     for key in ["pf:one", "pf:two"] {
         present(&planes, Some(key)).await;
         call(&planes, 9, "browser_use", json!({"action":"resume"})).await;

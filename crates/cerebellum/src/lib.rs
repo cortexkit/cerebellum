@@ -12050,7 +12050,7 @@ mod tests {
             let facts = planes.routes.get(4, 1).unwrap();
             planes.routes.insert(5, 1, AcceptedBindFacts::from_bind(
                 &bind_identity_for_test(),
-                Some(subc_protocol::Principal::Reserved { module_id: "prefrontal-routing".into() }),
+                Some(subc_protocol::Principal::Reserved { module_id: "striatum".into() }),
                 Some(&json!({"agentProjectId":"test-project","sessionKind":"primary","effectiveCapabilityScope":["*"]})),
                 None,
                 &subc_protocol::RouteTarget::ToolProvider { module_id: "cerebellum".into() },

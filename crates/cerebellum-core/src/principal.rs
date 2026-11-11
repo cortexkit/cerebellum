@@ -75,16 +75,7 @@ pub fn trust_for_principal(principal: &Option<Principal>) -> PrincipalTrust {
 /// loses access, and the failure shows up here as a permission refusal rather
 /// than as a rename. Carry both the old and new ids across a rename, and drop
 /// the old one only once no module registers under it.
-///
-/// The routing module is being renamed from `prefrontal-routing` to `striatum`;
-/// both are listed until no module registers as `prefrontal-routing`.
-pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] = &[
-    "prefrontal-core",
-    "prefrontal-routing",
-    "striatum",
-    "aft",
-    "broca",
-];
+pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] = &["prefrontal-core", "striatum", "aft", "broca"];
 
 /// Whether a daemon-spawned module id is a trusted first-party consumer of
 /// cerebellum capabilities.
@@ -174,13 +165,7 @@ mod tests {
     /// could silently revoke that module's first-party admission.
     #[test]
     fn each_dependent_module_is_admitted() {
-        for module_id in [
-            "prefrontal-core",
-            "prefrontal-routing",
-            "striatum",
-            "aft",
-            "broca",
-        ] {
+        for module_id in ["prefrontal-core", "striatum", "aft", "broca"] {
             assert_eq!(
                 trust_for_principal(&Some(Principal::Reserved {
                     module_id: module_id.to_string()
@@ -301,7 +286,12 @@ mod tests {
     /// widening the rule back to "any first-party principal" fails here.
     #[test]
     fn other_first_party_principals_make_no_session_calls() {
-        for retired_id in ["alfonso-core", "prefrontal", "alfonso-routing"] {
+        for retired_id in [
+            "alfonso-core",
+            "prefrontal",
+            "alfonso-routing",
+            "prefrontal-routing",
+        ] {
             assert_eq!(
                 trust_for_principal(&reserved(retired_id)),
                 PrincipalTrust::Untrusted,
@@ -314,7 +304,6 @@ mod tests {
             Some(Principal::Direct),
             reserved("aft"),
             reserved("broca"),
-            reserved("prefrontal-routing"),
             reserved("striatum"),
         ];
         for principal in others {
