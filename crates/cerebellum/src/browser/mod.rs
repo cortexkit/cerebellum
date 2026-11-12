@@ -4960,7 +4960,7 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
         BrowserToolDefinition {
             name: SNAPSHOT,
             description: "Read the page as plain text in state_text: an outline of its landmarks by default, main content first; zoom names one ref to print that element's whole subtree. Use ax or dom_full only when something is missing.",
-            request_schema: json!({"type":"object","properties":{"mode":{"type":"string","enum":["actionable","ax","dom_full"],"default":"actionable"},"text_filter":{"type":"string","maxLength":4096,"description":"Keep label/value matches beneath labelled ancestors. Default mode only."},"role_filter":{"type":"array","items":{"type":"string","minLength":1,"maxLength":128},"minItems":1,"maxItems":16,"description":"Keep matching roles, case-insensitively (button; AXButton also works). Default mode only."},"zoom":{"type":"string","description":"A previously printed ref; prints that element's whole subtree instead of the outline while it exists on the same page. Default mode only."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":65536,"description":"Cap on state_text bytes. When cut, main content is kept before navigation and the last line says what was cut."}},"additionalProperties":false}),
+            request_schema: json!({"type":"object","properties":{"mode":{"type":"string","enum":["actionable","ax","dom_full"],"default":"actionable"},"text_filter":{"type":"string","maxLength":4096,"description":"Literal, case-insensitive label/value substring; keeps labelled ancestors. Default mode only."},"role_filter":{"type":"array","items":{"type":"string","minLength":1,"maxLength":128},"minItems":1,"maxItems":16,"description":"Keep matching roles, case-insensitively (button; AXButton also works). Default mode only."},"zoom":{"type":"string","description":"A previously printed ref; prints that element's whole subtree instead of the outline while it exists on the same page. Default mode only."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":65536,"description":"Cap on state_text bytes. When cut, main content is kept before navigation and the last line says what was cut."}},"additionalProperties":false}),
             result_schema: snapshot_result_schema(),
         },
         BrowserToolDefinition {
@@ -8843,7 +8843,7 @@ mod tests {
         // branches must never change the bytes agents are shown.
         assert_eq!(
             crate::manifest::sha256_hex(&bytes),
-            "b2d46d21d47cfd4ff91322813afd724de226af271eb06f5f4bce179e6e156bdd"
+            "26d4941ed9f8f95aa0d823e45ad8ffc5f9fae85286410d53bf717508a0b2c130"
         );
     }
 
