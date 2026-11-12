@@ -312,6 +312,7 @@ fn desk_preflight(operation: impl FnOnce() -> i32) -> i32 {
 
 /// The module binary to run as the cursor helper: `ck-cerebellum` in the
 /// build directory that holds this example's `examples/` directory.
+/// Standalone examples stay in `<profile>/examples/` when Cargo moves test binaries.
 fn helper_binary(executable: &Path) -> Option<PathBuf> {
     Some(executable.parent()?.parent()?.join(HELPER_BINARY))
 }

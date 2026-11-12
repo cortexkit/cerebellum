@@ -20,6 +20,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
+use subc_protocol::call_mode::CallMode;
+use subc_protocol::scope::{ParentState, ScopeAttributes, ScopeKind, ScopeParent, ScopeStamp};
 
 struct Subject;
 struct Route {
@@ -27,6 +29,8 @@ struct Route {
     channel: u16,
 }
 static NEXT: AtomicU64 = AtomicU64::new(1);
+const OWNER: &str = "reserved:prefrontal-core";
+const HEAD_REF: &str = "conformance-head";
 
 fn frame(channel: u16, body: Value) -> Frame {
     Frame::build_with_version(
@@ -62,37 +66,67 @@ async fn bind_reader_route(
     stamp: &RouteStamp,
     consumer_capabilities: Option<Vec<String>>,
 ) -> Result<Route, HarnessError> {
+    let scope = stamp.scope.as_ref().map(|scope| {
+        ScopeStamp::new(
+            principal(&scope.owner),
+            scope.scope_ref.clone(),
+            scope.scope_epoch,
+            ScopeKind::Ephemeral,
+        )
+        .with_attributes(
+            ScopeAttributes::new()
+                .with_agent_id(Some("conformance".into()))
+                .with_run_id(Some(scope.scope_ref.clone())),
+        )
+        .with_owner_authorized(true)
+        .with_parent(Some(ScopeParent::new(principal(OWNER), HEAD_REF, 1)))
+        .with_parent_state(Some(ParentState::Linked))
+    });
+    bind_route(
+        planes,
+        principal(&stamp.principal),
+        scope,
+        (stamp.principal == "reserved:basal").then_some(CallMode::Codemode),
+        consumer_capabilities,
+    )
+    .await
+}
+
+async fn bind_route(
+    planes: &Arc<Planes>,
+    principal: Principal,
+    scope: Option<ScopeStamp>,
+    call_mode: Option<CallMode>,
+    consumer_capabilities: Option<Vec<String>>,
+) -> Result<Route, HarnessError> {
     let channel = u16::try_from(NEXT.fetch_add(1, Ordering::Relaxed)).unwrap();
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
-        call_mode: None,
+        call_mode,
         route_channel: channel,
         epoch: 3,
         target: RouteTarget::ToolProvider {
             module_id: MODULE_ID.into(),
         },
         identity: BindIdentity::new("conformance", "test-session"),
-        principal: Some(principal(&stamp.principal)),
+        principal: Some(principal),
         consumer_capabilities,
         admission_facts: Some(
             json!({"agentProjectId":"conformance","sessionKind":"primary","effectiveCapabilityScope":["*"],"browserControlOperations":["browser.status"]}),
         ),
-        scope: stamp.scope.as_ref().map(|scope| {
-            subc_protocol::scope::ScopeStamp::new(
-                principal(&scope.owner),
-                scope.scope_ref.clone(),
-                scope.scope_epoch,
-                subc_protocol::scope::ScopeKind::Head,
-            )
-            .with_attributes(subc_protocol::scope::ScopeAttributes::default())
-            .with_owner_authorized(true)
-        }),
+        scope,
     };
     let (tx, mut rx) = mpsc::channel(8);
     cerebellum::handle_frame_for_test(frame(0, serde_json::to_value(bind).unwrap()), &tx, planes)
         .await
         .map_err(|error| HarnessError::new(error.to_string()))?;
-    assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
+    let reply = rx.recv().await.unwrap();
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Response,
+        "bind refused: {}",
+        String::from_utf8_lossy(&reply.body)
+    );
     Ok(Route {
         planes: planes.clone(),
         channel,
@@ -119,7 +153,19 @@ impl Harness for Subject {
             )),
             0,
         ));
-        Ok(Arc::new(planes))
+        let planes = Arc::new(planes);
+        // The suite opens codemode routes as reserved:basal in a run owned by
+        // prefrontal-core. Production requires a live, delegating head route;
+        // the distinct principals exercise carrier custody of late results.
+        let head = ScopeStamp::new(principal(OWNER), HEAD_REF, 1, ScopeKind::Head)
+            .with_attributes(
+                ScopeAttributes::new()
+                    .with_agent_id(Some("conformance".into()))
+                    .with_delegates(true),
+            )
+            .with_owner_authorized(true);
+        bind_route(&planes, principal(OWNER), Some(head), None, None).await?;
+        Ok(planes)
     }
     async fn route(&self, planes: &Arc<Planes>, stamp: &RouteStamp) -> Result<Route, HarnessError> {
         bind_reader_route(planes, stamp, None).await
@@ -196,24 +242,24 @@ impl ToolProviderSubject for Subject {
     }
     fn plain_stamp(&self) -> RouteStamp {
         RouteStamp {
-            principal: "reserved:prefrontal-core".into(),
+            principal: OWNER.into(),
             scope: None,
         }
     }
     fn scoped_principals(&self) -> Option<ScopedPrincipals> {
         Some(ScopedPrincipals {
             scope: ScopeIdentity {
-                owner: "reserved:prefrontal-core".into(),
+                owner: OWNER.into(),
                 scope_ref: "scope".into(),
                 scope_epoch: 1,
             },
             other_scope: ScopeIdentity {
-                owner: "reserved:prefrontal-core".into(),
+                owner: OWNER.into(),
                 scope_ref: "other-scope".into(),
                 scope_epoch: 1,
             },
-            carrier: "reserved:broca".into(),
-            other_carrier: "reserved:aft".into(),
+            carrier: "reserved:basal".into(),
+            other_carrier: OWNER.into(),
         })
     }
     fn catalog_arguments(&self) -> Value {
@@ -250,10 +296,10 @@ async fn tool_provider_role_conforms_on_production_handler() {
     // restricted-mode probe. Unknown bind modes have separate handler tests.
     assert!(report_text.contains("SKIP call_mode_matches_catalog"));
     assert!(report_text.contains("PASS tool_result_v1_valid"));
-    // The catalog serves no system-prompt text. Session actions admit only
-    // reserved:prefrontal-core, whereas the suite's held-action cases need both
-    // a scope owner and a distinct carrier to raise approval-gated actions.
-    // This fixture has no installed browser for a slow cancellable action and
+    assert!(report_text.contains("PASS catalog_schemas_portable"));
+    assert!(report_text.contains("PASS late_results_incarnation_change_refused"));
+    // The catalog serves no system-prompt text. This fixture has no installed
+    // browser for an approval-gated or slow cancellable action and
     // no durable Prepared/Authorized approval states with real process kills.
     // Report those cases as skips, not simulated passes. Scoped withdrawal and
     // login-specific cursor/ack lifecycles have separate handler tests.
