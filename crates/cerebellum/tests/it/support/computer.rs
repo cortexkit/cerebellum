@@ -108,8 +108,10 @@ fn taxonomy() -> ValidatedSeverityTaxonomy {
 
 pub fn identity() -> JournalIdentity {
     JournalIdentity {
-        // Direct-plane fixtures must not count as unowned tool dispatches in
-        // the lib tests that include this shared integration-test support.
+        // These fixtures call the computer plane directly, not through a tool
+        // request, so nothing else owns their dispatch. An armed witness keeps
+        // them out of the process-wide count of unowned commits, which the lib
+        // tests that include this shared support read as evidence.
         witness: cerebellum_core::dispatch_witness::DispatchWitness::armed(),
         principal: "prefrontal".into(),
         conversation_key: "conversation-1".into(),

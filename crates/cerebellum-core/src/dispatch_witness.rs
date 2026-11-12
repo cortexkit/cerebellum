@@ -143,10 +143,13 @@ impl DispatchWitness {
         match &self.0 {
             Kind::Armed(flag) => flag.store(true, Ordering::SeqCst),
             Kind::Detached => {
-                // The dev-dependency feature makes rejection unconditional:
-                // no test ordering or setup flag can leave a fixture unguarded.
-                // Reject before counting so the guard's own panic test cannot
-                // contaminate a concurrently running consent test's evidence.
+                // Test builds (the `test-support` feature, enabled only as a
+                // dev-dependency) refuse a detached commit outright, so no
+                // test ordering or setup step can leave a fixture unguarded.
+                // The refusal comes before the increment below: the
+                // process-wide count of unowned commits is what a concurrent
+                // consent test reads to decide whether its call may have
+                // dispatched, and the guard's own panic test must not move it.
                 #[cfg(feature = "test-support")]
                 self.reject_detached_fixture();
                 UNATTRIBUTED_COMMITS.fetch_add(1, Ordering::SeqCst);
