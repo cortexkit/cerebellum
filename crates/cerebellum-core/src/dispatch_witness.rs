@@ -26,6 +26,34 @@ use std::sync::Arc;
 
 static UNATTRIBUTED_COMMITS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "test-support")]
+thread_local! {
+    static FIXTURE_WITNESS: std::cell::RefCell<Option<DispatchWitness>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Attribute commitments to a fixture while its synchronous constructor runs.
+///
+/// Tests that call legacy constructors without going through a tool request
+/// can own their commitments here, even when the constructor accepts no witness.
+/// Production defaults stay unchanged. Only this thread's constructions inherit
+/// the witness, and unwinding restores the prior scope.
+#[cfg(feature = "test-support")]
+pub fn with_fixture_dispatch_witness<T>(construct: impl FnOnce() -> T) -> T {
+    struct Restore(Option<DispatchWitness>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FIXTURE_WITNESS.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    let prior = FIXTURE_WITNESS.with(|slot| slot.replace(Some(DispatchWitness::armed())));
+    let _restore = Restore(prior);
+    construct()
+}
+
 /// How many dispatch commitments this process made under a detached witness.
 pub fn unattributed_commit_count() -> u64 {
     UNATTRIBUTED_COMMITS.load(Ordering::SeqCst)
@@ -77,6 +105,10 @@ impl DispatchWitness {
     /// tool request, keyed or not, is armed instead, so in a running module a
     /// commit under this witness means a site lost its request's witness.
     pub fn detached() -> Self {
+        #[cfg(feature = "test-support")]
+        if let Some(witness) = FIXTURE_WITNESS.with(|slot| slot.borrow().clone()) {
+            return witness;
+        }
         Self(
             Kind::Detached,
             #[cfg(feature = "test-support")]
@@ -165,3 +197,41 @@ impl PartialEq for DispatchWitness {
 }
 
 impl Eq for DispatchWitness {}
+
+#[cfg(all(test, feature = "test-support"))]
+mod fixture_scope_tests {
+    use super::{with_fixture_dispatch_witness, DispatchWitness};
+
+    fn assert_guard_rejects_detached() {
+        let error = std::panic::catch_unwind(|| DispatchWitness::detached().mark_committed())
+            .expect_err("a detached fixture must still trip the guard");
+        let message = error.downcast_ref::<String>().unwrap();
+        assert!(message.contains("detached dispatch witness committed at"));
+    }
+
+    #[test]
+    fn fixture_scope_does_not_arm_another_thread() {
+        with_fixture_dispatch_witness(|| {
+            let witness = DispatchWitness::detached();
+            witness.mark_committed();
+            assert!(witness.committed());
+            std::thread::spawn(assert_guard_rejects_detached)
+                .join()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn fixture_scope_restores_after_unwind() {
+        let error = std::panic::catch_unwind(|| {
+            with_fixture_dispatch_witness(|| {
+                let witness = DispatchWitness::detached();
+                witness.mark_committed();
+                assert!(witness.committed());
+                panic!("fixture construction failed");
+            });
+        });
+        assert!(error.is_err());
+        assert_guard_rejects_detached();
+    }
+}

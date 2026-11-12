@@ -1197,8 +1197,11 @@ mod gate_tests {
             custody(),
         )
         .unwrap();
+        let mut identity =
+            journal_identity("principal", "conversation", "project", SessionKind::Primary);
+        identity.witness = cerebellum_core::dispatch_witness::DispatchWitness::armed();
         audit.record_fronting_cleanup(
-            journal_identity("principal", "conversation", "project", SessionKind::Primary),
+            identity,
             ComputerCapability::Keys,
             serde_json::json!({"cleanup":"restore", "restore":"restored", "activation_latency_ms":800}),
         ).unwrap();

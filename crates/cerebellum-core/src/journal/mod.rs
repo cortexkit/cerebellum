@@ -1754,7 +1754,7 @@ mod tests {
 
     fn identity() -> JournalIdentity {
         JournalIdentity {
-            witness: crate::dispatch_witness::DispatchWitness::detached(),
+            witness: crate::dispatch_witness::DispatchWitness::armed(),
             principal: "p".to_string(),
             conversation_key: "c".to_string(),
             agent_project_id: "a".to_string(),

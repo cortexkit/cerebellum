@@ -112,11 +112,13 @@ async fn invoke(planes: &Planes, corr: u64, name: &str, arguments: Value) -> Fra
 }
 
 fn route_identity() -> RouteIdentity {
-    RouteIdentity::from_accepted_bind(
+    let mut identity = RouteIdentity::from_accepted_bind(
         &BindIdentity::new("test", "test-session".to_string()),
         &Some(Principal::Direct),
         Some(&json!({"agentProjectId": "test-project", "sessionKind": "primary"})),
-    )
+    );
+    identity.witness = cerebellum_core::dispatch_witness::DispatchWitness::armed();
+    identity
 }
 
 async fn grant_browser(planes: &Planes, origin: &str, hazards: Vec<HazardClass>) {
