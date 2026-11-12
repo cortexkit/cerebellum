@@ -65,8 +65,8 @@ zeroize = "=1.9.1"
 # The tool-provider/v1 contract supplies catalog, pin and late-result types.
 # The conformance companion shares the production protocol version so catalog,
 # schema-pin and late-result checks use the same wire types.
-cortexkit-role-tool-provider = "=0.14.6"
-cortexkit-role-tool-display = "=0.1.3"
+cortexkit-role-tool-provider = "=0.15.6"
+cortexkit-role-tool-display = "=0.1.5"
 getrandom = "=0.2.17"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -92,8 +92,8 @@ cerebellum-linux = { path = "../cerebellum-linux" }
 [dev-dependencies]
 cerebellum-core = { path = "../cerebellum-core", features = ["test-support"] }
 async-trait = "0.1"
-cortexkit-role-tool-provider-conformance = "=0.14.6"
-cortexkit-role-tool-provider = { version = "=0.14.6", features = ["test-vectors"] }
+cortexkit-role-tool-provider-conformance = "=0.15.7"
+cortexkit-role-tool-provider = { version = "=0.15.6", features = ["test-vectors"] }
 tokio = { workspace = true, features = ["test-util"] }
 # The in-process daemon the live tests boot moved out of subc-core when the
 # publishable daemon package was split off; the harness follows the code.
@@ -103,7 +103,7 @@ subc-daemon = { workspace = true, features = ["test-support"] }
 # discarded before it exists. Both crates are already in the graph via subc-daemon.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
-cortexkit-test-support = "=0.1.10"
+cortexkit-test-support = "=0.1.14"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 cerebellum-computer = { path = "../cerebellum-computer", features = ["test-support"] }
