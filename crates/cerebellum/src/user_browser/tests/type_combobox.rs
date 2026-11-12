@@ -474,3 +474,29 @@ async fn classification_changed_reports_every_closed_field_without_values() {
         json!([])
     );
 }
+
+#[tokio::test]
+async fn a_form_control_change_before_click_has_a_snapshot_retry_remedy() {
+    let fixture = combobox_fixture();
+    let tab = fixture.claim(1).await;
+    let (snapshot, _) = fixture.snapshot(1, &tab, "allow_origin_always").await;
+    fixture.state.lock().unwrap().dom_override.as_mut().unwrap()["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"nodeId":11,"parentId":7,"backendNodeId":11,"nodeType":1,"nodeName":"INPUT","localName":"input","attributes":["type","text"]}));
+    let (reply, _) = fixture
+        .call(
+            1,
+            click(&tab, &snapshot, &reference(&snapshot, "Search query")),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(reply["reason"], "classification_changed", "{reply}");
+    assert_eq!(reply["input_dispatched"], false, "{reply}");
+    assert_eq!(
+        reply["detail"],
+        json!({"check":"pre-dispatch","changed_fields":["associated_form_controls"]})
+    );
+    assert_eq!(reply["remedy"], "The form or target changed since the last read. Take a new snapshot, then retry with its snapshot_id and refs.");
+    assert!(fixture.state.lock().unwrap().inputs.is_empty());
+}

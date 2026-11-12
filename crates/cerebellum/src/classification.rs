@@ -951,6 +951,8 @@ fn type_name_tokens(name: &str) -> Vec<String> {
     tokens
 }
 
+pub(crate) const CLASSIFICATION_CHANGED_REMEDY: &str = "The form or target changed since the last read. Take a new snapshot, then retry with its snapshot_id and refs.";
+
 pub(crate) fn type_field_remedy(reason: &str, input_type: &str, user_browser: bool) -> String {
     let action = match reason {
         "credential_field" | "payment_field" if user_browser =>

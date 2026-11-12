@@ -662,7 +662,12 @@ fn opaque(prefix: &str) -> String {
 }
 
 fn refusal(reason: &str) -> Value {
-    json!({"browser":"user", "outcome":"refused", "reason":reason, "input_dispatched":false})
+    let mut reply =
+        json!({"browser":"user", "outcome":"refused", "reason":reason, "input_dispatched":false});
+    if reason == "classification_changed" {
+        reply["remedy"] = json!(crate::classification::CLASSIFICATION_CHANGED_REMEDY);
+    }
+    reply
 }
 
 fn type_field_refusal(record: &NonTypeClassificationRecord) -> Option<Value> {
@@ -1604,8 +1609,8 @@ fn collect_frames(
 
 /// `request` is the inbound call (channel, epoch, corr): its cancellation and
 /// its consent liveness. `route` keys this call's claims, snapshots, refs,
-/// quarantine and extension bookkeeping; for a codemode run it is the head's
-/// route (see `codemode::user_browser_route`).
+/// quarantine and extension bookkeeping; admitted head routes and their runs
+/// use the head's oldest tools route (see `codemode::user_browser_route`).
 pub(crate) async fn serve(
     planes: &Planes,
     facts: &AcceptedBindFacts,

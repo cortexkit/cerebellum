@@ -1641,6 +1641,24 @@ impl RouteBindings {
             })
             .unwrap_or_default()
     }
+
+    /// Exact head-scope routes whose person-browser state ends with that scope.
+    fn user_browser_head_routes_under_scope(
+        &self,
+        key: &scope_watch::ScopeKey,
+    ) -> Vec<user_browser_bridge::Route> {
+        self.inner
+            .read()
+            .expect("route bindings lock poisoned")
+            .iter()
+            .filter(|(_, facts)| {
+                facts.scope.as_ref().is_some_and(|stamp| {
+                    stamp.kind == subc_protocol::scope::ScopeKind::Head && key.names(stamp)
+                })
+            })
+            .map(|(&(channel, epoch), _)| user_browser_bridge::Route { channel, epoch })
+            .collect()
+    }
 }
 
 /// Watch one session scope whose route closed until the daemon says, one way
@@ -1671,6 +1689,12 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
         if scope_watch::classify(answer.as_ref(), key.scope_epoch)
             == scope_watch::ScopeVerdict::Ended
         {
+            // A head may end before every route's GOODBYE arrives. Reuse the
+            // existing route release on both sides of the browser bridge;
+            // uncertain scope answers must leave these claims untouched.
+            for route in planes.routes.user_browser_head_routes_under_scope(&key) {
+                planes.user_browser.goodbye(route);
+            }
             let mut conversations = planes.scopes.finish(&key);
             // A route under the scope whose close has not reached this module
             // yet belongs to the ended session too.
@@ -3861,9 +3885,9 @@ async fn handle_frame(
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => {
-            // Keyed by the closing route itself. A run's user-browser work is
-            // keyed by its head route, so a run's goodbye releases none of the
-            // head's claims or snapshots; the run's in-flight calls end through
+            // Keyed by the closing route itself, not its canonical browser
+            // route. A run or noncanonical head route closing must not release
+            // the head's claims or snapshots; its in-flight calls end through
             // `cancel_route` below.
             planes.user_browser.goodbye(user_browser_bridge::Route {
                 channel: frame.header.channel,
