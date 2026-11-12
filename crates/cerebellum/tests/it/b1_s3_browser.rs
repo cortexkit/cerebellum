@@ -53,11 +53,13 @@ mod busy_dispatch;
 const ONE_BY_ONE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
 fn identity() -> RouteIdentity {
-    RouteIdentity::from_accepted_bind(
+    let mut identity = RouteIdentity::from_accepted_bind(
         &subc_protocol::BindIdentity::new("test", "b1-s3-session"),
         &Some(subc_protocol::Principal::Direct),
         Some(&json!({"agentProjectId": "b1-s3-agent", "sessionKind": "primary"})),
-    )
+    );
+    identity.witness = cerebellum_core::dispatch_witness::DispatchWitness::armed();
+    identity
 }
 
 /// A click whose coordinates came from a differently-sized copy is refused.

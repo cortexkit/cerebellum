@@ -7438,11 +7438,13 @@ mod tests {
     }
 
     fn identity() -> RouteIdentity {
-        RouteIdentity::from_accepted_bind(
+        let mut identity = RouteIdentity::from_accepted_bind(
             &subc_protocol::BindIdentity::new("test", "conversation"),
             &Some(subc_protocol::Principal::Direct),
             Some(&json!({"agentProjectId": "test-project", "sessionKind": "primary"})),
-        )
+        );
+        identity.witness = crate::fixture_dispatch_witness();
+        identity
     }
 
     fn severity() -> Value {

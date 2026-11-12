@@ -203,4 +203,14 @@ pub(super) async fn withdraw_asked_call_and_apply_late_grant(planes: Planes) {
         "no cancelled card or resumed action"
     );
     settle_to(&planes, (0, 0)).await;
+    let unattributed_after = cerebellum_core::dispatch_witness::unattributed_commit_count();
+    assert_eq!(
+        unattributed_after, unattributed_before,
+        "a concurrent fixture committed a detached dispatch witness"
+    );
+    eprintln!(
+        "consent dispatch isolation: test={} before={unattributed_before} after={unattributed_after} delta={}",
+        std::thread::current().name().unwrap_or("unnamed"),
+        unattributed_after - unattributed_before
+    );
 }

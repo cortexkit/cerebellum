@@ -11,6 +11,8 @@ default = []
 # Enables the in-memory identity-resolution observer for conformance tests only.
 # Production builds leave this feature disabled, so no observer code is emitted.
 test-observer = []
+# Reject detached dispatch commitments in downstream fixture tests only.
+test-support = []
 
 [lib]
 name = "cerebellum_core"

@@ -7193,6 +7193,12 @@ fn fixture_dispatch_witness() -> cerebellum_core::dispatch_witness::DispatchWitn
     cerebellum_core::dispatch_witness::DispatchWitness::armed()
 }
 
+#[test]
+#[should_panic(expected = "detached dispatch witness committed at")]
+fn unarmed_lib_fixture_is_rejected_without_test_setup() {
+    cerebellum_core::dispatch_witness::DispatchWitness::detached().mark_committed();
+}
+
 /// Return true for replies sent by `handle_tool_request` before dispatch or
 /// for a provider resource-busy refusal; neither case dispatched the tool.
 fn refused_before_dispatch(reply: &Frame) -> bool {

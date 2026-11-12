@@ -18,6 +18,7 @@ use cerebellum::journal_pin::{
     AbortOutcome, CurrentOpenFacts, CurrentOpenPublication, FactProvenance, JournalPin,
     PreparedOpenRef, SeamViolation, StampedBindFacts,
 };
+use cerebellum_core::dispatch_witness::with_fixture_dispatch_witness;
 
 fn store() -> JournalStore {
     JournalStore::new_in_memory(JournalConfig {
@@ -96,9 +97,10 @@ fn cross_invocation_transition_leaves_journal_byte_identical() {
     let mut pin = pin();
     let inv_a = pin.mint_invocation();
     let inv_b = pin.mint_invocation();
-    let handle_a = pin
-        .reserve(inv_a, Capability::Navigate, &bind_facts(), &publication())
-        .unwrap();
+    let handle_a = with_fixture_dispatch_witness(|| {
+        pin.reserve(inv_a, Capability::Navigate, &bind_facts(), &publication())
+    })
+    .unwrap();
     let token_a = pin.commit_dispatched(inv_a, handle_a, &dispatch()).unwrap();
 
     // The journal is non-empty (a provisional dispatched entry is exportable).
@@ -178,9 +180,10 @@ fn cross_invocation_transition_leaves_journal_byte_identical() {
 fn post_preflight_reservation_failure_blocks_every_later_transition() {
     let mut pin = pin();
     let inv = pin.mint_invocation();
-    let handle = pin
-        .reserve(inv, Capability::Navigate, &bind_facts(), &publication())
-        .unwrap();
+    let handle = with_fixture_dispatch_witness(|| {
+        pin.reserve(inv, Capability::Navigate, &bind_facts(), &publication())
+    })
+    .unwrap();
 
     // A post-preflight marker-establishment failure returns
     // journal_reservation_failed and leaves an UNMARKED orphan. The S7 substrate
@@ -213,9 +216,10 @@ fn post_preflight_reservation_failure_blocks_every_later_transition() {
 fn post_preflight_marked_commit_failure_also_locks_invocation_side() {
     let mut pin = pin();
     let inv = pin.mint_invocation();
-    let handle = pin
-        .reserve(inv, Capability::Navigate, &bind_facts(), &publication())
-        .unwrap();
+    let handle = with_fixture_dispatch_witness(|| {
+        pin.reserve(inv, Capability::Navigate, &bind_facts(), &publication())
+    })
+    .unwrap();
 
     // The dispatch-commitment marker is established but the commit fails.
     pin.store_mut().faults.arm("commit_dispatch", 1);
@@ -248,9 +252,10 @@ fn strict_bind_fact_failure_allocates_no_sequence() {
     // Compatibility-derived provenance is ineligible for a B2A-enabled route.
     let mut facts = bind_facts();
     facts.provenance = FactProvenance::CompatibilityDerived;
-    let err = pin
-        .reserve(inv, Capability::Navigate, &facts, &publication())
-        .unwrap_err();
+    let err = with_fixture_dispatch_witness(|| {
+        pin.reserve(inv, Capability::Navigate, &facts, &publication())
+    })
+    .unwrap_err();
     assert_eq!(err.reason_code, JournalReasonCode::InternalFailure);
     // No sequence was allocated and no journal mutation occurred.
     assert_eq!(pin.store().next_sequence(), next_before);
@@ -259,9 +264,10 @@ fn strict_bind_fact_failure_allocates_no_sequence() {
     // An absent required fact (no project_root fallback) fails the same way.
     let mut facts = bind_facts();
     facts.agent_project_id = String::new();
-    let err = pin
-        .reserve(inv, Capability::Navigate, &facts, &publication())
-        .unwrap_err();
+    let err = with_fixture_dispatch_witness(|| {
+        pin.reserve(inv, Capability::Navigate, &facts, &publication())
+    })
+    .unwrap_err();
     assert_eq!(err.reason_code, JournalReasonCode::InternalFailure);
     assert_eq!(pin.store().next_sequence(), next_before);
 }
@@ -277,18 +283,20 @@ fn stale_current_open_association_fails_before_allocation() {
     let mut stale = publication();
     stale.facts.association_epoch = 5;
     stale.current_association_epoch = 6;
-    let err = pin
-        .reserve(inv, Capability::Navigate, &bind_facts(), &stale)
-        .unwrap_err();
+    let err = with_fixture_dispatch_witness(|| {
+        pin.reserve(inv, Capability::Navigate, &bind_facts(), &stale)
+    })
+    .unwrap_err();
     assert_eq!(err.reason_code, JournalReasonCode::InternalFailure);
     assert_eq!(pin.store().next_sequence(), next_before);
 
     // An invalid association fails the same way.
     let mut invalid = publication();
     invalid.facts.valid = false;
-    let err = pin
-        .reserve(inv, Capability::Navigate, &bind_facts(), &invalid)
-        .unwrap_err();
+    let err = with_fixture_dispatch_witness(|| {
+        pin.reserve(inv, Capability::Navigate, &bind_facts(), &invalid)
+    })
+    .unwrap_err();
     assert_eq!(err.reason_code, JournalReasonCode::InternalFailure);
     assert_eq!(pin.store().next_sequence(), next_before);
 }
@@ -298,9 +306,10 @@ fn corrected_valid_call_allowed_for_rightful_active_invocation() {
     let mut pin = pin();
     let inv_a = pin.mint_invocation();
     let inv_b = pin.mint_invocation();
-    let handle = pin
-        .reserve(inv_a, Capability::Navigate, &bind_facts(), &publication())
-        .unwrap();
+    let handle = with_fixture_dispatch_witness(|| {
+        pin.reserve(inv_a, Capability::Navigate, &bind_facts(), &publication())
+    })
+    .unwrap();
 
     // B's cross-invocation attempt fails closed with no mutation, leaving the
     // reservation still active for its rightful invocation.
@@ -324,9 +333,10 @@ fn corrected_valid_call_allowed_for_rightful_active_invocation() {
 fn launch_is_rejected_before_matching_commitment() {
     let mut pin = pin();
     let inv = pin.mint_invocation();
-    let handle = pin
-        .reserve(inv, Capability::Navigate, &bind_facts(), &publication())
-        .unwrap();
+    let handle = with_fixture_dispatch_witness(|| {
+        pin.reserve(inv, Capability::Navigate, &bind_facts(), &publication())
+    })
+    .unwrap();
 
     // A launch before any durable commitment is a violation and is not observed.
     let err = pin.observe_launch(inv, handle).unwrap_err();
@@ -348,9 +358,10 @@ fn launch_is_rejected_before_matching_commitment() {
 fn final_context_equals_journal_profile_facts() {
     let mut pin = pin();
     let inv = pin.mint_invocation();
-    let handle = pin
-        .reserve(inv, Capability::Navigate, &bind_facts(), &publication())
-        .unwrap();
+    let handle = with_fixture_dispatch_witness(|| {
+        pin.reserve(inv, Capability::Navigate, &bind_facts(), &publication())
+    })
+    .unwrap();
     let token = pin.commit_dispatched(inv, handle, &dispatch()).unwrap();
     let final_context = FinalContextAssociation {
         profile_uuid: Some("final-uuid".to_string()),
@@ -383,9 +394,10 @@ fn final_context_equals_journal_profile_facts() {
 fn exactly_one_abort_attempt_per_associated_no_commit_invocation() {
     let mut pin = pin();
     let inv = pin.mint_invocation();
-    let handle = pin
-        .reserve(inv, Capability::Navigate, &bind_facts(), &publication())
-        .unwrap();
+    let handle = with_fixture_dispatch_witness(|| {
+        pin.reserve(inv, Capability::Navigate, &bind_facts(), &publication())
+    })
+    .unwrap();
 
     // Associate an opaque prepared-open reference (idempotent when repeated).
     pin.associate_prepared_open(inv, handle, PreparedOpenRef("prep-1".to_string()))
@@ -431,9 +443,10 @@ fn exactly_one_abort_attempt_per_associated_no_commit_invocation() {
 fn abort_outcome_requires_a_no_commit_completion() {
     let mut pin = pin();
     let inv = pin.mint_invocation();
-    let handle = pin
-        .reserve(inv, Capability::Navigate, &bind_facts(), &publication())
-        .unwrap();
+    let handle = with_fixture_dispatch_witness(|| {
+        pin.reserve(inv, Capability::Navigate, &bind_facts(), &publication())
+    })
+    .unwrap();
     pin.associate_prepared_open(inv, handle, PreparedOpenRef("prep-1".to_string()))
         .unwrap();
 

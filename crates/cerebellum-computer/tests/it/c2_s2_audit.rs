@@ -109,7 +109,7 @@ fn taxonomy() -> ValidatedSeverityTaxonomy {
 
 fn identity() -> JournalIdentity {
     JournalIdentity {
-        witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
+        witness: cerebellum_core::dispatch_witness::DispatchWitness::armed(),
         principal: "prefrontal".into(),
         conversation_key: "conversation-1".into(),
         agent_project_id: "project-1".into(),
