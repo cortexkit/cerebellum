@@ -2466,7 +2466,7 @@ mod tests {
             max_bytes: 1000,
         });
         assert!(found.printed_refs.contains("e1"), "{}", found.text);
-        assert!(!found.text.contains("No matches"));
+        assert!(!found.text.contains("No element matched"));
     }
 
     #[test]
