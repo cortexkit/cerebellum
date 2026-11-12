@@ -802,6 +802,25 @@ async fn an_attachment_click_is_blocked_without_writing_downloads_even_after_rel
         );
     }
 }
+
+fn assert_frame_omission_without_capture_cut(snapshot: &Value, reason: &str, count: usize) {
+    assert_eq!(snapshot["truncated"], false, "{snapshot}");
+    assert_eq!(snapshot["refs_truncated"], false, "{snapshot}");
+    let text = snapshot["state_text"].as_str().unwrap();
+    assert!(text.contains(&format!("unread: {reason}]")), "{snapshot}");
+    assert!(
+        text.contains(&format!("{count} embedded frames omitted")),
+        "{snapshot}"
+    );
+    assert!(!text.contains("Capture stopped early"), "{snapshot}");
+    assert!(
+        !snapshot["remedy"]
+            .as_str()
+            .is_some_and(|remedy| remedy.contains("Capture stopped early")),
+        "{snapshot}"
+    );
+}
+
 async fn assert_snapshot_step_and_recovery(
     fault: Option<SnapshotFault>,
     hidden_owner: bool,
@@ -826,8 +845,7 @@ async fn assert_snapshot_step_and_recovery(
         // A valid CDP envelope with an unusable owner is confined to that
         // embedded document. Transport/envelope corruption still fails below.
         assert_eq!(refused["outcome"], "ok", "{refused}");
-        assert_eq!(refused["truncated"], true);
-        assert_eq!(refused["refs_truncated"], true);
+        assert_frame_omission_without_capture_cut(&refused, "owner lookup failed", 2);
         let text = refused["state_text"].as_str().unwrap();
         assert!(
             text.contains("Event row") && text.contains("frame frame-child unread"),
@@ -1001,8 +1019,7 @@ async fn snapshot_hidden_iframe_owner_is_omitted_in_a_partial_observation() {
             .dispatch(&route, BrowserCapability::Snapshot, &json!({"mode":mode}))
             .await;
         assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
-        assert_eq!(snapshot["truncated"], true, "{snapshot}");
-        assert_eq!(snapshot["refs_truncated"], true);
+        assert_frame_omission_without_capture_cut(&snapshot, "owner not captured", 2);
         assert!(snapshot["state_text"]
             .as_str()
             .unwrap()
@@ -1237,8 +1254,7 @@ async fn snapshot_vanished_frame_owner_is_omitted_even_when_frame_detaches() {
             .dispatch(&route, BrowserCapability::Snapshot, &json!({"mode":"ax"}))
             .await;
         assert_eq!(snapshot["outcome"], "ok", "{message}: {snapshot}");
-        assert_eq!(snapshot["truncated"], true);
-        assert_eq!(snapshot["refs_truncated"], true);
+        assert_frame_omission_without_capture_cut(&snapshot, "owner lookup failed", 2);
         assert!(snapshot["state_text"]
             .as_str()
             .unwrap()
@@ -1330,7 +1346,7 @@ async fn snapshot_failed_frame_owner_discloses_unread_frame_and_recovers() {
         .dispatch(&route, BrowserCapability::Snapshot, &json!({}))
         .await;
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
-    assert_eq!(snapshot["truncated"], true);
+    assert_frame_omission_without_capture_cut(&snapshot, "owner lookup failed", 2);
     assert!(
         snapshot["state_text"].as_str().unwrap().contains("unread"),
         "{snapshot}"
@@ -1375,10 +1391,22 @@ async fn baseline_private_frame_omission_preserves_busy_page_partial_snapshots()
             .await
             .unwrap();
         assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+        // The main document's vanished row cuts this capture independently of
+        // the embedded documents withheld by the public-web permission rule.
         assert_eq!(snapshot["truncated"], true);
         assert_eq!(snapshot["refs_truncated"], true);
         let text = snapshot["state_text"].as_str().unwrap();
-        assert!(text.contains("needs site permission"), "{snapshot}");
+        assert!(
+            text.contains("2 embedded frames") && text.contains("need site permission"),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("Capture stopped early"),
+            "{snapshot}"
+        );
         if mode != "dom_full" {
             assert!(text.contains("Surviving sibling"), "{snapshot}");
             assert!(!text.contains("Vanished row") && !text.contains("Event row"));
@@ -1398,10 +1426,24 @@ async fn baseline_private_frame_omission_preserves_busy_page_partial_snapshots()
             .await
             .unwrap();
         assert_eq!(recovered["outcome"], "ok", "{recovered}");
+        assert_eq!(recovered["truncated"], false, "{recovered}");
+        assert_eq!(recovered["refs_truncated"], false, "{recovered}");
         assert!(recovered["state_text"]
             .as_str()
             .unwrap()
-            .contains("needs site permission"));
+            .contains("need site permission"));
+        let recovered_text = recovered["state_text"].as_str().unwrap();
+        assert!(recovered_text.contains("2 embedded frames"), "{recovered}");
+        assert!(
+            !recovered_text.contains("Capture stopped early"),
+            "{recovered}"
+        );
+        assert!(
+            !recovered["remedy"]
+                .as_str()
+                .is_some_and(|remedy| remedy.contains("Capture stopped early")),
+            "{recovered}"
+        );
         if mode != "dom_full" {
             assert!(recovered["state_text"]
                 .as_str()

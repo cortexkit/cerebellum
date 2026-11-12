@@ -251,7 +251,10 @@ async fn stable_refs_wire_filters_keep_only_matches_under_ancestors() {
     assert!(text.contains("list Permission list"), "{text}");
     assert!(!text.contains("Permission 18"));
     let empty = call(&planes, "snapshot", json!({"text_filter":"missing"})).await;
-    assert!(empty["state_text"].as_str().unwrap().contains("No matches"));
+    let empty_text = empty["state_text"].as_str().unwrap();
+    assert!(empty_text.lines().any(|line| line == "No element matched text_filter \"missing\" (a literal, case-insensitive substring)"), "{empty}");
+    assert_eq!(empty["truncated"], false, "{empty}");
+    assert!(!empty_text.contains("Capture stopped early"), "{empty}");
 }
 
 #[tokio::test]

@@ -31,9 +31,16 @@ async fn snapshots(planes: &Planes, corr: &mut u64, pipe: &Pipe, name: &str) -> 
         .await?;
         if name == "hidden_oopifs" {
             check_ok(&reply)?;
-            if reply["truncated"] != true || reply["refs_truncated"] != true {
+            let text = reply["state_text"].as_str().unwrap_or_default();
+            if reply["truncated"] != false
+                || reply["refs_truncated"] != false
+                || !text.contains("unread: owner not captured]")
+                || !text.contains("5 embedded frames omitted")
+                || text.contains("Capture stopped early")
+                || reply["remedy"].as_str().is_some_and(|remedy| remedy.contains("Capture stopped early"))
+            {
                 return Err(format!(
-                    "hidden iframe omission was not reported as partial: {reply}"
+                    "hidden iframe omission was not reported separately from capture truncation: {reply}"
                 ));
             }
         }
