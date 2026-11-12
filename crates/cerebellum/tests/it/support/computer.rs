@@ -108,7 +108,9 @@ fn taxonomy() -> ValidatedSeverityTaxonomy {
 
 pub fn identity() -> JournalIdentity {
     JournalIdentity {
-        witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
+        // Direct-plane fixtures must not count as unowned tool dispatches in
+        // the lib tests that include this shared integration-test support.
+        witness: cerebellum_core::dispatch_witness::DispatchWitness::armed(),
         principal: "prefrontal".into(),
         conversation_key: "conversation-1".into(),
         agent_project_id: "project-1".into(),

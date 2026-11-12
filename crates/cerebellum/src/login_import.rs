@@ -1464,7 +1464,8 @@ mod tests {
             Ok(())
         }));
         planes = crate::computer_grants::tests::CardService::install(planes, 4, 1);
-        let facts = planes.routes.get(4, 1).unwrap();
+        let mut facts = planes.routes.get(4, 1).unwrap();
+        facts.identity.witness = crate::fixture_dispatch_witness();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let cancel = crate::CancelHandle::pending();
         let request = crate::computer_grants::tests::with_live(crate::complete_login_import(

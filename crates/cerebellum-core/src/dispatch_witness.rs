@@ -36,8 +36,23 @@ pub fn unattributed_commit_count() -> u64 {
 /// Equality is always true and it is never serialized: it describes the
 /// request in flight, not the identity it rides in, so it must not make two
 /// otherwise equal identities differ or reach a durable record.
-#[derive(Clone, Default)]
-pub struct DispatchWitness(Kind);
+#[derive(Clone)]
+pub struct DispatchWitness(
+    Kind,
+    #[cfg(feature = "test-support")] Option<Arc<FixtureOrigin>>,
+);
+
+#[cfg(feature = "test-support")]
+struct FixtureOrigin {
+    thread: String,
+    backtrace: std::backtrace::Backtrace,
+}
+
+impl Default for DispatchWitness {
+    fn default() -> Self {
+        Self::detached()
+    }
+}
 
 #[derive(Clone, Default)]
 enum Kind {
@@ -50,7 +65,11 @@ enum Kind {
 impl DispatchWitness {
     /// A witness a request's handler reads after the call.
     pub fn armed() -> Self {
-        Self(Kind::Armed(Arc::new(AtomicBool::new(false))))
+        Self(
+            Kind::Armed(Arc::new(AtomicBool::new(false))),
+            #[cfg(feature = "test-support")]
+            None,
+        )
     }
 
     /// A witness nobody reads: for a commitment made outside any tool
@@ -58,7 +77,17 @@ impl DispatchWitness {
     /// tool request, keyed or not, is armed instead, so in a running module a
     /// commit under this witness means a site lost its request's witness.
     pub fn detached() -> Self {
-        Self(Kind::Detached)
+        Self(
+            Kind::Detached,
+            #[cfg(feature = "test-support")]
+            Some(Arc::new(FixtureOrigin {
+                thread: std::thread::current()
+                    .name()
+                    .unwrap_or("unnamed")
+                    .to_owned(),
+                backtrace: std::backtrace::Backtrace::force_capture(),
+            })),
+        )
     }
 
     /// A witness for a commitment no tool request's settlement depends on:
@@ -67,16 +96,27 @@ impl DispatchWitness {
     /// commits are neither attributed nor counted as unattributed, so they do
     /// not make concurrent calls read as "may have run".
     pub fn outside_tool_calls() -> Self {
-        Self(Kind::OutsideToolCalls)
+        Self(
+            Kind::OutsideToolCalls,
+            #[cfg(feature = "test-support")]
+            None,
+        )
     }
 
     /// Record that a dispatch was committed for this request. Call it at
     /// every commit point, detached or not: a detached witness counts the
     /// commit as one no request can claim.
+    #[cfg_attr(feature = "test-support", track_caller)]
     pub fn mark_committed(&self) {
         match &self.0 {
             Kind::Armed(flag) => flag.store(true, Ordering::SeqCst),
             Kind::Detached => {
+                // The dev-dependency feature makes rejection unconditional:
+                // no test ordering or setup flag can leave a fixture unguarded.
+                // Reject before counting so the guard's own panic test cannot
+                // contaminate a concurrently running consent test's evidence.
+                #[cfg(feature = "test-support")]
+                self.reject_detached_fixture();
                 UNATTRIBUTED_COMMITS.fetch_add(1, Ordering::SeqCst);
             }
             Kind::OutsideToolCalls => {}
@@ -86,6 +126,19 @@ impl DispatchWitness {
     /// Whether a dispatch was committed for this request.
     pub fn committed(&self) -> bool {
         matches!(&self.0, Kind::Armed(flag) if flag.load(Ordering::SeqCst))
+    }
+
+    #[cfg(feature = "test-support")]
+    #[track_caller]
+    fn reject_detached_fixture(&self) {
+        let origin = self.1.as_ref().expect("detached witness has its origin");
+        panic!(
+            "detached dispatch witness committed at {}; fixture created by {}:\n{}\ncommit stack:\n{}",
+            std::panic::Location::caller(),
+            origin.thread,
+            origin.backtrace,
+            std::backtrace::Backtrace::force_capture(),
+        );
     }
 }
 

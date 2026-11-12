@@ -90,6 +90,7 @@ resvg = "0.44"
 cerebellum-linux = { path = "../cerebellum-linux" }
 
 [dev-dependencies]
+cerebellum-core = { path = "../cerebellum-core", features = ["test-support"] }
 async-trait = "0.1"
 cortexkit-role-tool-provider-conformance = "=0.14.6"
 cortexkit-role-tool-provider = { version = "=0.14.6", features = ["test-vectors"] }
