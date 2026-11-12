@@ -407,8 +407,10 @@ pub fn render_with_capture_status(
         header.push('\n');
         header.push_str(&input.filters.no_match_notice());
     }
-    // The person's browser places frame markers at their owners. Filtering or
-    // zooming can remove those lines, but must not hide the unread document.
+    // Each unread-frame notice sits in the outline where its iframe element
+    // is, so a filter or zoom can drop it with the surrounding lines. Repeat
+    // every notice in the header so the reader still learns that an embedded
+    // document was not read.
     for notice in input.records.iter().filter(|record| {
         record.role == UNREAD_FRAME_ROLE
             || (record.role == "StaticText"
