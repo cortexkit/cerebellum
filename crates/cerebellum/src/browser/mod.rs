@@ -365,6 +365,9 @@ impl BrowserError {
             } => {
                 "this ref came from an older snapshot without browser node identity; omit zoom to read the current outline"
             }
+            Self::StaleSnapshot { reason_code: "classification_changed" } => {
+                crate::classification::CLASSIFICATION_CHANGED_REMEDY
+            }
             Self::StaleSnapshot { .. } => {
                 "take a snapshot again and use only its new snapshot_id and refs"
             }
@@ -7924,7 +7927,12 @@ mod tests {
         let plane = BrowserPlane::new();
         let identity = identity();
         let mut sampled = std::collections::BTreeSet::new();
-        for error in every_browser_error() {
+        for error in every_browser_error()
+            .into_iter()
+            .chain([BrowserError::StaleSnapshot {
+                reason_code: "classification_changed",
+            }])
+        {
             // Fill-login refusals keep their own wording in browser/fill.rs,
             // which names the saved-login flow the agent is already in.
             if matches!(error, BrowserError::FillRefused(_)) {
@@ -7944,6 +7952,22 @@ mod tests {
             BROWSER_ERROR_VARIANTS - 1,
             "scan every non-fill BrowserError variant: {sampled:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn classification_changed_has_a_snapshot_retry_remedy() {
+        let plane = BrowserPlane::new();
+        let reply = plane
+            .result(
+                &identity(),
+                Err(BrowserError::StaleSnapshot {
+                    reason_code: "classification_changed",
+                }),
+            )
+            .await;
+        assert_eq!(reply["outcome"], "stale_snapshot", "{reply}");
+        assert_eq!(reply["detail"]["reason_code"], "classification_changed");
+        assert_eq!(reply["remedy"], "The form or target changed since the last read. Take a new snapshot, then retry with its snapshot_id and refs.");
     }
 
     /// One name per `BrowserError` variant. The match has no catch-all, so a

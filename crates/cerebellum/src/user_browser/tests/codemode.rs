@@ -186,6 +186,299 @@ async fn a_run_acts_on_the_tab_its_head_claimed() {
 }
 
 #[tokio::test]
+async fn a_run_acts_on_a_tab_claimed_on_its_heads_newer_tools_route() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(2).await;
+    let (snapshot, _) = fixture.snapshot(2, &tab, "allow_30m").await;
+    bind_run(&fixture, false).await;
+    let reply = fixture
+        .finish(start_run(
+            &fixture,
+            click(&tab, &snapshot, &reference(&snapshot, "Go")),
+            None,
+        ))
+        .await;
+    assert_eq!(structured(&reply)["outcome"], "ok", "{reply}");
+    assert_eq!(
+        fixture
+            .planes
+            .user_browser
+            .target()
+            .state()
+            .claims
+            .get(&tab),
+        Some(&HEAD)
+    );
+    assert!(!fixture.state.lock().unwrap().inputs.is_empty());
+}
+
+#[tokio::test]
+async fn other_scopes_and_unattested_routes_cannot_borrow_a_heads_tab() {
+    for change in [
+        "owner",
+        "ref",
+        "epoch",
+        "worker",
+        "flow",
+        "unscoped",
+        "unauthorized",
+        "unattested",
+        "principal",
+    ] {
+        let fixture = Fixture::new();
+        let tab = fixture.claim(1).await;
+        let mut facts = fixture.planes.routes.get(2, 1).unwrap();
+        let mut scope = facts.scope.clone().unwrap();
+        match change {
+            "owner" => {
+                scope.owner = subc_protocol::Principal::Reserved {
+                    module_id: "another-owner".into(),
+                }
+            }
+            "ref" => scope.scope_ref = "other-head".into(),
+            "epoch" => scope.scope_epoch += 1,
+            "worker" => {
+                scope.kind = ScopeKind::Worker;
+                scope.parent = Some(ScopeParent::new(core(), "card-tests", 1));
+                scope.parent_state = Some(ParentState::Linked);
+            }
+            "flow" => scope.attributes.flow_id = Some("flow".into()),
+            "unauthorized" => scope.owner_authorized = false,
+            "unattested" => {}
+            "principal" => {
+                facts.principal = Some(subc_protocol::Principal::Reserved {
+                    module_id: "basal".into(),
+                })
+            }
+            "unscoped" => {}
+            _ => unreachable!(),
+        }
+        facts = facts.with_scope((change != "unscoped").then_some(scope));
+        if change == "unattested" {
+            facts.agent_project_id_attested = false;
+        }
+        // An identical conversation label must not bridge distinct authorities.
+        facts.identity.conversation_key = fixture
+            .planes
+            .routes
+            .get(1, 1)
+            .unwrap()
+            .identity
+            .conversation_key;
+        fixture.planes.routes.insert(2, 1, facts);
+        assert_eq!(
+            crate::codemode::user_browser_route(&fixture.planes, 2, 1).unwrap(),
+            Route {
+                channel: 2,
+                epoch: 1
+            },
+            "{change}"
+        );
+        let (reply, _) = fixture.snapshot(2, &tab, "allow_30m").await;
+        // Worker and flow admission can refuse before the tab-ownership check.
+        assert_ne!(reply["outcome"], "ok", "{change}: {reply}");
+        assert!(fixture.state.lock().unwrap().inputs.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_noncanonical_head_route_goodbye_keeps_claims_and_refs_for_the_run() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(2).await;
+    let (snapshot, _) = fixture.snapshot(2, &tab, "allow_30m").await;
+    bind_run(&fixture, false).await;
+    goodbye(&fixture, 2).await;
+    assert_eq!(
+        fixture
+            .planes
+            .user_browser
+            .target()
+            .state()
+            .claims
+            .get(&tab),
+        Some(&HEAD)
+    );
+    let reply = fixture
+        .finish(start_run(
+            &fixture,
+            click(&tab, &snapshot, &reference(&snapshot, "Go")),
+            None,
+        ))
+        .await;
+    assert_eq!(structured(&reply)["outcome"], "ok", "{reply}");
+}
+
+#[tokio::test]
+async fn closing_the_canonical_head_route_requires_a_new_claim_on_the_remaining_route() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(2).await;
+    let (snapshot, _) = fixture.snapshot(2, &tab, "allow_30m").await;
+    bind_run(&fixture, false).await;
+    goodbye(&fixture, HEAD.channel).await;
+    {
+        let state = fixture.planes.user_browser.target().state();
+        assert!(!state.claims.contains_key(&tab));
+        assert!(!state
+            .snapshots
+            .contains_key(snapshot["snapshot_id"].as_str().unwrap()));
+    }
+    for reply in [
+        fixture.snapshot(2, &tab, "allow_30m").await.0,
+        structured(
+            &fixture
+                .finish(start_run(&fixture, snapshot_args(&tab), None))
+                .await,
+        )
+        .clone(),
+    ] {
+        assert_eq!(reply["reason"], "tab_not_claimed_by_route", "{reply}");
+    }
+    let reclaimed = fixture.claim(2).await;
+    assert_eq!(reclaimed, tab);
+    assert_eq!(
+        fixture
+            .planes
+            .user_browser
+            .target()
+            .state()
+            .claims
+            .get(&tab),
+        Some(&Route {
+            channel: 2,
+            epoch: 1
+        })
+    );
+    let reply = fixture
+        .finish(start_run(&fixture, snapshot_args(&tab), None))
+        .await;
+    assert_eq!(structured(&reply)["outcome"], "ok", "{reply}");
+}
+
+#[tokio::test]
+async fn only_a_definitive_head_scope_end_releases_its_claims_and_refs() {
+    for status in ["ended", "unreadable", "uncertain"] {
+        let fixture = Fixture::new();
+        let tab = fixture.claim(2).await;
+        let (snapshot, _) = fixture.snapshot(2, &tab, "allow_30m").await;
+        let key = crate::scope_watch::ScopeKey::from_stamp(
+            fixture
+                .planes
+                .routes
+                .get(1, 1)
+                .unwrap()
+                .scope
+                .as_ref()
+                .unwrap(),
+        );
+        // A separate head with the same conversation label must retain its tab.
+        let mut other = fixture.planes.routes.get(2, 1).unwrap();
+        other.scope.as_mut().unwrap().scope_ref = "other-head".into();
+        fixture.planes.routes.insert(3, 1, other);
+        let mut other_tab = fixture.state.lock().unwrap().tabs[&tab].clone();
+        other_tab.owner = None;
+        fixture
+            .state
+            .lock()
+            .unwrap()
+            .tabs
+            .insert("other-tab".into(), other_tab);
+        let (claimed, _) = fixture
+            .call(
+                3,
+                json!({"browser":"user","action":"claim_tab","tab":"other-tab"}),
+                "allow_30m",
+            )
+            .await;
+        assert_eq!(claimed["outcome"], "ok", "{claimed}");
+
+        let (writer, mut replies) = mpsc::channel(8);
+        let close =
+            Frame::build(FrameType::Goodbye, crate::control_flags(), 2, 1, 0, vec![]).unwrap();
+        crate::handle_frame_for_test(close, &writer, &fixture.planes)
+            .await
+            .unwrap();
+        let question = tokio::time::timeout(HANG_GUARD, replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let body: Value = serde_json::from_slice(&question.body).unwrap();
+        assert_eq!(body["op"], "scope.describe");
+        assert_eq!(body["ref"], "card-tests");
+        let (ty, answer) = match status {
+            "unreadable" => (
+                FrameType::Error,
+                json!({"code":"unavailable","message":"try again"}),
+            ),
+            "uncertain" => (
+                FrameType::Response,
+                json!({"op":"scope.describe","status":"not_live","daemon_incarnation":"test","owner_synced":false,"owner_configured":true}),
+            ),
+            _ => (
+                FrameType::Response,
+                json!({"op":"scope.describe","status":"ended","scope_epoch":1,"daemon_incarnation":"test","owner_synced":true,"owner_configured":true}),
+            ),
+        };
+        let response = Frame::build(
+            ty,
+            crate::control_flags(),
+            0,
+            0,
+            question.header.corr,
+            serde_json::to_vec(&answer).unwrap(),
+        )
+        .unwrap();
+        crate::handle_frame_for_test(response, &writer, &fixture.planes)
+            .await
+            .unwrap();
+        until_frozen(|| fixture.planes.scopes.conversations(&key).is_empty()).await;
+        {
+            let state = fixture.planes.user_browser.target().state();
+            assert_eq!(
+                state.claims.contains_key(&tab),
+                status != "ended",
+                "{status}"
+            );
+            assert_eq!(
+                state
+                    .snapshots
+                    .contains_key(snapshot["snapshot_id"].as_str().unwrap()),
+                status != "ended",
+                "{status}"
+            );
+            assert_eq!(
+                state.claims.get("other-tab"),
+                Some(&Route {
+                    channel: 3,
+                    epoch: 1
+                })
+            );
+        }
+        let (read, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+        if status == "ended" {
+            assert_eq!(read["reason"], "tab_not_claimed_by_route", "{read}");
+            // The extension processed the existing Goodbye before this inventory.
+            let (inventory, _) = fixture
+                .call(3, json!({"browser":"user","action":"status"}), "deny")
+                .await;
+            assert!(
+                inventory["tabs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["tab"] == tab && row["claim"] == "unclaimed_handed"),
+                "{inventory}"
+            );
+            let state = fixture.state.lock().unwrap();
+            assert!(state.tabs[&tab].group);
+            assert!(state.tabs[&tab].handed);
+            assert!(state.tabs[&tab].owner.is_none());
+        } else {
+            assert_eq!(read["outcome"], "ok", "{status}: {read}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_tab_the_run_claims_is_still_the_heads_after_the_run_route_goodbye() {
     let fixture = Fixture::new();
     bind_run(&fixture, false).await;
@@ -429,7 +722,7 @@ async fn a_run_is_held_back_by_a_quarantine_on_its_heads_tab() {
     stuck.finish(false);
     // The head's own call on that tab is refused, and the run's call is
     // refused the same way.
-    for (channel, corr) in [(HEAD.channel, 901), (RUN, 902)] {
+    for (channel, corr) in [(HEAD.channel, 901), (RUN, 902), (2, 903)] {
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),

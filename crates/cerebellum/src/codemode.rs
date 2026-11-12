@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use subc_protocol::scope::{ParentState, ScopeKind, ScopeStamp};
+use subc_protocol::scope::{ParentState, ScopeKind, ScopeParent, ScopeStamp};
 use subc_protocol::Principal;
 
 type CallKey = (String, String);
@@ -310,10 +310,10 @@ pub(crate) fn live_head(
 }
 
 /// The route whose claims, snapshots, element refs and quarantine a request on
-/// (`channel`, `epoch`) uses in the person's own Chrome. A run acts as its
-/// head, so a tab the head claimed is the run's to use, and a tab the run
-/// claims stays with the head after the run's route closes. Any other route
-/// is its own key.
+/// (`channel`, `epoch`) uses in the person's own Chrome. Direct admitted head
+/// calls and that head's runs share its oldest tools route. Other scopes keep
+/// their inbound route key; neither conversation identity nor relay origin
+/// confers access to a head's tabs.
 pub(crate) fn user_browser_route(
     planes: &crate::Planes,
     channel: u16,
@@ -323,13 +323,48 @@ pub(crate) fn user_browser_route(
     let Some(facts) = planes.routes.get(channel, epoch) else {
         return Ok(own);
     };
-    if live_head(planes, &facts)?.is_none() {
-        return Ok(own);
+    let run = live_head(planes, &facts)?.is_some();
+    let heads = if run {
+        planes
+            .routes
+            .head_routes(facts.scope.as_ref().expect("admitted run stamp"))?
+    } else {
+        let Some(scope) = admitted_head_scope(&facts) else {
+            return Ok(own);
+        };
+        if planes.scopes.is_superseded(scope) {
+            return Ok(own);
+        }
+        planes.routes.routes_under_head(&ScopeParent::new(
+            scope.owner.clone(),
+            scope.scope_ref.clone(),
+            scope.scope_epoch,
+        ))
+    };
+    match head_tools_route(&heads) {
+        Some(route) => Ok(route),
+        None if run => Err(ParentRefusal::NoHeadToolsRoute),
+        None => Ok(own),
     }
-    let heads = planes
-        .routes
-        .head_routes(facts.scope.as_ref().expect("admitted run stamp"))?;
-    head_tools_route(&heads).ok_or(ParentRefusal::NoHeadToolsRoute)
+}
+
+/// Keep direct head calls and linked runs behind the same admission checks.
+fn admitted_head_scope(facts: &AcceptedBindFacts) -> Option<&ScopeStamp> {
+    let core = Principal::Reserved {
+        module_id: "prefrontal-core".into(),
+    };
+    facts.scope.as_ref().filter(|stamp| {
+        stamp.kind == ScopeKind::Head
+            && stamp.owner_authorized
+            && stamp.owner == core
+            && stamp.attributes.run_id.is_none()
+            && stamp.attributes.flow_id.is_none()
+            && facts.principal.as_ref() == Some(&core)
+            && facts.agent_project_id_attested
+            && facts.session_kind_attested
+            && stamp.attributes.agent_id.as_deref()
+                == Some(facts.identity.agent_project_id.as_str())
+    })
 }
 
 /// One bound route of a run's head.
@@ -340,16 +375,14 @@ struct HeadRoute {
     facts: AcceptedBindFacts,
 }
 
-/// Which of a head's routes keeps its user-browser work: the route its own
-/// `browser_use` calls arrive on, where its claims and snapshots live.
+/// Which of a head's routes keeps its user-browser work, regardless of which
+/// route carried the direct call or linked run.
 ///
 /// Only a tools-surface route can be that route, since management routes never
 /// serve `browser_use`. Among tools routes the oldest-bound one is chosen.
-/// The route carrying the head's own browser calls is opened before any run
-/// starts and stays open, while other tools routes under the same head scope
-/// are newer: short-lived ones opened to read the catalog or answer a single
-/// request, or a replacement briefly overlapping an old route across a
-/// reconnect. Channel numbers say nothing about which is which.
+/// Closing that route releases its claims. A later call resolves the remaining
+/// oldest route and must claim again; ownership is never transferred on close.
+/// Channel numbers say nothing about which route was bound first.
 fn head_tools_route(heads: &[HeadRoute]) -> Option<crate::user_browser_bridge::Route> {
     heads
         .iter()
@@ -375,27 +408,18 @@ impl RouteBindings {
             return Err(ParentRefusal::NotLinked);
         }
         let parent = run.parent.as_ref().ok_or(ParentRefusal::NoLiveHead)?;
-        let core = Principal::Reserved {
-            module_id: "prefrontal-core".into(),
-        };
+        Ok(self.routes_under_head(parent))
+    }
+
+    fn routes_under_head(&self, parent: &ScopeParent) -> Vec<HeadRoute> {
         let routes = self.inner.read().expect("route bindings lock poisoned");
         let mut heads = routes
             .iter()
             .filter(|(_, facts)| {
-                facts.scope.as_ref().is_some_and(|stamp| {
+                admitted_head_scope(facts).is_some_and(|stamp| {
                     stamp.owner == parent.owner
                         && stamp.scope_ref == parent.scope_ref
                         && stamp.scope_epoch == parent.scope_epoch
-                        && stamp.kind == ScopeKind::Head
-                        && stamp.owner_authorized
-                        && stamp.owner == core
-                        && stamp.attributes.run_id.is_none()
-                        && stamp.attributes.flow_id.is_none()
-                        && facts.principal.as_ref() == Some(&core)
-                        && facts.agent_project_id_attested
-                        && facts.session_kind_attested
-                        && stamp.attributes.agent_id.as_deref()
-                            == Some(facts.identity.agent_project_id.as_str())
                 })
             })
             .map(|(&(channel, epoch), facts)| HeadRoute {
@@ -407,6 +431,6 @@ impl RouteBindings {
         // A head may have both management and tool routes. Choose consistently;
         // they name the same head context, not whichever hash entry happens first.
         heads.sort_by_key(|head| head.route);
-        Ok(heads)
+        heads
     }
 }

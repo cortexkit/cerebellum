@@ -334,6 +334,15 @@ impl Fixture {
         Self::with_cingulate(None)
     }
 
+    /// Give an isolation test a second head, rather than another route of the first.
+    fn separate_head(&self, channel: u16) {
+        let mut facts = self.planes.routes.get(channel, 1).unwrap();
+        let mut scope = facts.scope.clone().unwrap();
+        scope.scope_ref = "other-head".into();
+        facts = facts.with_scope(Some(scope));
+        self.planes.routes.insert(channel, 1, facts);
+    }
+
     /// A fixture whose site cards go to `script` instead of the answering
     /// [`SiteCingulate`].
     fn scripted(script: &Arc<ScriptedCingulate>) -> Self {
@@ -540,7 +549,13 @@ impl Fixture {
                         }
                     }
                     MessageBody::Goodbye { route } => {
-                        release_double(&mut worker_state.lock().unwrap(), route)
+                        // Goodbye releases ownership, unlike explicit close:
+                        // handed tabs keep their group membership and handles.
+                        for tab in worker_state.lock().unwrap().tabs.values_mut() {
+                            if tab.owner == Some(route) {
+                                tab.owner = None;
+                            }
+                        }
                     }
                     MessageBody::Cancel => {
                         worker_state.lock().unwrap().cancels += 1;
@@ -2233,6 +2248,7 @@ async fn observer_continuity_loss_requires_a_new_read_not_a_person_change() {
 #[tokio::test]
 async fn status_maps_handed_inventory_to_public_claim_labels_before_and_after_claim() {
     let fixture = Fixture::new();
+    fixture.separate_head(2);
     let owned = fixture.claim(1).await;
     let handed = "dragged-opaque-handle";
     {
@@ -2294,6 +2310,7 @@ async fn status_maps_handed_inventory_to_public_claim_labels_before_and_after_cl
 #[tokio::test]
 async fn handed_tab_claims_refs_and_snapshots_are_route_tab_and_epoch_scoped() {
     let fixture = Fixture::new();
+    fixture.separate_head(2);
     let (unclaimed, _) = fixture.snapshot(1, "handed", "allow_30m").await;
     assert_eq!(unclaimed["reason"], "tab_not_claimed_by_route");
     let tab = fixture.claim(1).await;
@@ -3026,6 +3043,7 @@ async fn user_scroll_brings_a_ref_into_view_in_its_frame() {
 #[tokio::test]
 async fn user_scroll_refuses_before_scrolling() {
     let fixture = Fixture::new();
+    fixture.separate_head(2);
     let tab = fixture.claim(1).await;
     let (mixed, _) = fixture
         .call(
