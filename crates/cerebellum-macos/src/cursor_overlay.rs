@@ -13,9 +13,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crate::cursor_geometry::{
-    appkit_rect_to_global, chip_at, display_at, layout, panel_origin_for_tip, snap_tip,
-    swing_panel, turn_point, view_point, Display, Layout, Rect, CHIP_DIAMETER, CHIP_RIM, CHIP_RING,
-    LABEL_HEIGHT, LABEL_MAX_WIDTH, LABEL_PADDING, OUTLINE, POINTER, POINTER_CORNER,
+    appkit_rect_to_global, chip_at, display_at, layout_frame, panel_origin_for_tip, snap_tip,
+    swing_panel, turn_point, view_point, BodySide, Display, Layout, Rect, CHIP_DIAMETER, CHIP_RIM,
+    CHIP_RING, LABEL_HEIGHT, LABEL_MAX_WIDTH, LABEL_PADDING, OUTLINE, POINTER, POINTER_CORNER,
 };
 use crate::cursor_schedule::{
     avatar_change, begin_picture, entry_frame, sooner_wait, ActivityChange, ActivityGate,
@@ -168,6 +168,8 @@ define_class!(
 struct Scene {
     /// The pointer's tip.
     tip: [f64; 2],
+    side: BodySide,
+    chip_shift: [f64; 2],
     /// The landing animation's scale, applied about the tip.
     scale: f64,
     /// Where a first appearance is: the chip's size and place, and how far
@@ -193,6 +195,8 @@ impl Default for Scene {
     fn default() -> Self {
         Self {
             tip: [0.0, 0.0],
+            side: BodySide::default(),
+            chip_shift: [0.0; 2],
             scale: 1.0,
             entry: EntryFrame::REST,
             rotation: 0.0,
@@ -352,13 +356,22 @@ fn draw_badge(scene: &Scene, avatar: Option<&NSImage>) {
     let (chip_centre, chip_diameter) = chip_at(entry.chip);
     // The rim and ring keep their proportion to the chip as it grows.
     let chip_scale = scale * chip_diameter / CHIP_DIAMETER;
-    draw_chip(at(chip_centre), chip_scale, accent, avatar);
+    let chip_centre = scene.side.point(chip_centre);
+    draw_chip(
+        at([
+            chip_centre[0] + scene.chip_shift[0],
+            chip_centre[1] + scene.chip_shift[1],
+        ]),
+        chip_scale,
+        accent,
+        avatar,
+    );
 
     // The pointer grows about the tip as it comes in, so the tip stays put.
     let pointer_scale = scale * entry.pointer_scale();
     let rotation = scene.rotation;
     let at = |p: [f64; 2]| {
-        let p = turn_point(p, rotation);
+        let p = scene.side.point(turn_point(p, rotation));
         NSPoint::new(tip[0] + p[0] * pointer_scale, tip[1] - p[1] * pointer_scale)
     };
     with_group_alpha(entry.pointer * scene.pointer_alpha, || {
@@ -562,6 +575,11 @@ impl Fields {
         scene.entry = entry;
         self.badge.ivars().scene.set(scene);
         let (centre, diameter) = chip_at(entry.chip);
+        let centre = scene.side.point(centre);
+        let centre = [
+            centre[0] + scene.chip_shift[0],
+            centre[1] + scene.chip_shift[1],
+        ];
         let chip_scale = scale * diameter / CHIP_DIAMETER;
         // The initial grows and shrinks with the chip, and only an entry
         // changes the chip's size, so the font is rarely set.
@@ -786,6 +804,8 @@ impl Picture {
             layout: Layout {
                 panel: Rect::new(0.0, 0.0, 48.0, 48.0),
                 label: None,
+                side: Default::default(),
+                chip_shift: [0.0; 2],
             },
             label_size: None,
             window: None,
@@ -831,7 +851,7 @@ impl Picture {
         (self.displays, self.primary_height) = read_displays(mtm);
         // The module's motion, from wherever this badge really is: its entry
         // or glide ends exactly when the module sends the action.
-        let (to, first) = begin_picture(
+        let (_, first) = begin_picture(
             &mut self.appearance,
             &mut self.motion,
             PictureAim {
@@ -852,28 +872,17 @@ impl Picture {
         };
         self.recolour(mtm, accent, now, !first);
 
-        let display = display_at(to, &self.displays);
-        let tip = snap_tip(to, display.map_or(1.0, |d| d.scale));
-        let screen = display.map_or(Rect::new(-1e6, -1e6, 2e6, 2e6), |d| d.visible);
         let label = event
             .label
             .filter(|text| event.gesture != OverlayGesture::Read && !text.is_empty());
         let label_size = label.as_deref().map(|text| self.fields.measure_label(text));
         self.label_size = label_size;
         self.window = event.window;
-        self.layout = layout(
-            tip,
-            event
-                .window
-                .map_or(screen, |[x, y, w, h]| Rect::new(x, y, w, h)),
-            label_size,
-            screen,
-            self.appearance.entering(),
-        );
         self.last_scale = 1.0;
         // An action during an entry keeps the entry where it is.
         let entry = self.appearance.frame(now);
         self.last_entry = entry;
+        self.relayout(self.motion.current(), entry, self.last_scale);
         self.fit_panel(self.motion.hand(), entry);
         self.place(self.motion.current());
         if first {
@@ -892,7 +901,9 @@ impl Picture {
     fn fit_panel(&mut self, hand: bool, entry: EntryFrame) {
         self.hand_panel = hand;
         self.panel_rect = if hand {
-            swing_panel(self.layout.panel)
+            self.layout
+                .side
+                .rect(swing_panel(self.layout.side.rect(self.layout.panel)))
         } else {
             self.layout.panel
         };
@@ -901,6 +912,10 @@ impl Picture {
         // The panel's origin depends on its size, so it must be set again.
         self.last_origin = None;
         let label = if hand { None } else { self.layout.label };
+        let mut scene = self.fields.ivars_scene();
+        scene.side = self.layout.side;
+        scene.chip_shift = self.layout.chip_shift;
+        self.fields.badge.ivars().scene.set(scene);
         self.fields.apply(
             view_point(self.panel_rect, [0.0, 0.0]),
             label.map(|label| view_rect(self.panel_rect, label)),
@@ -924,8 +939,34 @@ impl Picture {
             .motion
             .on_follow(offset, now, self.appearance.entering())
         {
+            if self.relayout(self.motion.current(), self.last_entry, self.last_scale) {
+                self.fit_panel(self.motion.hand(), self.last_entry);
+            }
             self.place(self.motion.current());
         }
+    }
+
+    /// Use the same side decision at the current tip for events, every glide
+    /// frame, and window-follow reports. The destination never pre-flips a
+    /// badge that is still at the start of its flight.
+    fn relayout(&mut self, point: [f64; 2], entry: EntryFrame, scale: f64) -> bool {
+        let display = display_at(point, &self.displays);
+        let tip = snap_tip(point, display.map_or(1.0, |d| d.scale));
+        let screen = display.map_or(Rect::new(-1e6, -1e6, 2e6, 2e6), |d| d.visible);
+        let placed = layout_frame(
+            tip,
+            self.window
+                .map_or(screen, |[x, y, w, h]| Rect::new(x, y, w, h)),
+            self.label_size,
+            screen,
+            entry.chip,
+            scale,
+            self.layout.side,
+        );
+        let changed = placed != self.layout;
+        self.layout = placed;
+        self.motion.set_body_side(placed.side);
+        changed
     }
 
     /// Move the panel so the tip sits on `point`, snapped to the device-pixel
@@ -948,18 +989,7 @@ impl Picture {
     fn tick(&mut self, now: Instant, alpha: f64, motion: CursorMotion) -> PictureNeed {
         let frame = self.motion.frame(now, &motion);
         let entry = self.appearance.frame(now);
-        let display = display_at(frame.tip, &self.displays);
-        let screen = display.map_or(Rect::new(-1e6, -1e6, 2e6, 2e6), |d| d.visible);
-        let placed = layout(
-            frame.tip,
-            self.window
-                .map_or(screen, |[x, y, w, h]| Rect::new(x, y, w, h)),
-            self.label_size,
-            screen,
-            self.appearance.entering(),
-        );
-        let changed = placed != self.layout;
-        self.layout = placed;
+        let changed = self.relayout(frame.tip, entry, frame.scale);
         if changed || frame.hand != self.hand_panel {
             self.last_scale = frame.scale;
             self.last_entry = entry;
@@ -973,7 +1003,7 @@ impl Picture {
             self.last_scale = frame.scale;
             self.last_entry = entry;
         }
-        let hand = (frame.rotation, frame.pointer_alpha);
+        let hand = (self.motion.rotation(), frame.pointer_alpha);
         if hand != self.last_hand {
             self.fields.set_hand(hand.0, hand.1);
             self.last_hand = hand;
@@ -1726,12 +1756,22 @@ pub fn render_cursor_gallery_png(
         .filter(|text| shot.gesture != OverlayGesture::Read && !text.is_empty())
         .map(|text| fields.measure_label(text));
     let screen = Rect::new(0.0, 0.0, width, height);
-    let placed = layout(tip, screen, label, screen, false);
+    let placed = layout_frame(
+        tip,
+        screen,
+        label,
+        screen,
+        entry.chip,
+        shot.scale,
+        BodySide::default(),
+    );
     // The scene itself is the "panel": a rectangle relative to the tip that
     // covers the whole scene.
     let scene = Rect::new(-tip[0], -tip[1], width, height);
     let flip = |r: [f64; 4]| rect(r[0], height - r[1] - r[3], r[2], r[3]);
     fields.badge.ivars().scene.set(Scene {
+        side: placed.side,
+        chip_shift: placed.chip_shift,
         backdrop: Some(Backdrop {
             dark: shot.dark,
             target: shot.target.map(flip),
