@@ -981,9 +981,13 @@ mod desk {
         }
     }
 
+    /// The probe's calls stand in for tool requests, so each gets an armed
+    /// witness as the tool handler gives every request. A detached witness
+    /// would mark the probe's own dispatches as unattributed, and builds
+    /// with `test-support` (which examples get) refuse such a commit.
     fn identity() -> JournalIdentity {
         JournalIdentity {
-            witness: cerebellum_core::dispatch_witness::DispatchWitness::detached(),
+            witness: cerebellum_core::dispatch_witness::DispatchWitness::armed(),
             principal: "desk-probe".into(),
             conversation_key: "app-use-desk-probe".into(),
             agent_project_id: AGENT.into(),
