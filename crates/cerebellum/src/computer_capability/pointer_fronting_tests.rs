@@ -50,6 +50,12 @@ impl RestoreHostSource for PointerHost {
 
 impl FrontingBracketHost for PointerHost {
     type Tap = ();
+    fn measured_restore_latency_ms(&mut self) -> Option<u64> {
+        self.base.measured_restore_latency_ms()
+    }
+    fn record_restore_latency_ms(&mut self, milliseconds: u64) {
+        self.base.record_restore_latency_ms(milliseconds);
+    }
     fn now_ms(&mut self) -> u64 {
         self.base.now_ms()
     }

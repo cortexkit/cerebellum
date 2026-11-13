@@ -463,6 +463,9 @@ struct ScreenState {
     coverage_start_ms: u64,
     restore_started: Option<Arc<tokio::sync::Notify>>,
     restore_until: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Isolated predictor evidence; ordinary scenarios start with a known
+    /// zero-cost fake restore, while cold-start tests clear it explicitly.
+    measured_restore_ms: Option<u64>,
     /// Every front and restore request, and every post and release, in
     /// order.
     log: Vec<String>,
@@ -530,6 +533,7 @@ impl Screen {
                 coverage_start_ms: 0,
                 restore_started: None,
                 restore_until: None,
+                measured_restore_ms: Some(0),
                 log: Vec::new(),
                 last_input_ms: None,
                 post_unknown: false,
@@ -768,6 +772,12 @@ impl RestoreHostSource for FakeBracket {
 
 impl FrontingBracketHost for FakeBracket {
     type Tap = ();
+    fn measured_restore_latency_ms(&mut self) -> Option<u64> {
+        self.0.state().measured_restore_ms
+    }
+    fn record_restore_latency_ms(&mut self, milliseconds: u64) {
+        self.0.state().measured_restore_ms = Some(milliseconds);
+    }
     fn now_ms(&mut self) -> u64 {
         self.0.state().now
     }
@@ -1663,6 +1673,39 @@ async fn a_background_command_chord_fronts_posts_and_restores() {
     assert!(
         !rig.lock.held(),
         "released when the restore decision completed"
+    );
+}
+
+#[tokio::test]
+async fn a_cold_hooked_chord_refuses_not_dispatched_and_a_retry_posts() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    rig.read().await;
+    rig.screen.state().measured_restore_ms = None;
+    let reply = rig
+        .call_under(&under_terminal(), "computer.keys", command_chord())
+        .await;
+    assert_eq!(reply["outcome"], "fronting_bound_exceeded", "{reply}");
+    assert_eq!(reply["effect_status"], "not_dispatched", "{reply}");
+    assert_eq!(reply["posts_returned"], 0, "{reply}");
+    assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
+    assert_eq!(rig.screen.log(), ["front:4242", "restore:100"]);
+    assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
+    assert!(!rig.lock.held());
+
+    let retry = rig
+        .call_under(&under_terminal(), "computer.keys", command_chord())
+        .await;
+    assert_eq!(retry["outcome"], "delivery_unconfirmed", "{retry}");
+    assert_eq!(retry["fronting"]["restore"], "restored", "{retry}");
+    assert_eq!(
+        rig.screen.log(),
+        [
+            "front:4242",
+            "restore:100",
+            "front:4242",
+            "post",
+            "restore:100"
+        ],
     );
 }
 

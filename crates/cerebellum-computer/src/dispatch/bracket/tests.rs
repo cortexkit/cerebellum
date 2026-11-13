@@ -22,6 +22,9 @@ struct FakeDesk {
     pending_front: Option<(u32, u64)>,
     front_latency_ms: u64,
     restore_latency_ms: Option<u64>,
+    /// Callers with registered restore cleanup give it a separate allowance.
+    restore_wait_ms: Option<u64>,
+    restore_latencies: latency::RestoreLatencies,
     unit_ms: u64,
     /// Fronting requests for this pid are ignored.
     refuse_front_of: Option<u32>,
@@ -69,12 +72,18 @@ struct FakeDesk {
 
 impl FakeDesk {
     fn new() -> Self {
+        // Most scenarios start with a warm predictor. Each desk owns its
+        // history so parallel tests never share process-wide measurements.
+        let mut restore_latencies = latency::RestoreLatencies::new();
+        restore_latencies.record(5);
         Self {
             now: 0,
             frontmost: Some(PREVIOUS),
             pending_front: None,
             front_latency_ms: 5,
             restore_latency_ms: None,
+            restore_wait_ms: None,
+            restore_latencies,
             unit_ms: 4,
             refuse_front_of: None,
             input_after_units: None,
@@ -180,6 +189,23 @@ impl FrontingBracketHost for FakeDesk {
         self.pending_front = Some((pid, self.now + latency));
         true
     }
+    fn restore_front_attempt(
+        &mut self,
+        previous: u32,
+        target: u32,
+        since: u64,
+        wait_ms: u64,
+        activation_observed: bool,
+    ) -> RestoreOutcome {
+        let wait_ms = self.restore_wait_ms.unwrap_or(wait_ms);
+        restore_after_front_attempt(self, previous, target, since, wait_ms, activation_observed)
+    }
+    fn measured_restore_latency_ms(&mut self) -> Option<u64> {
+        self.restore_latencies.maximum()
+    }
+    fn record_restore_latency_ms(&mut self, milliseconds: u64) {
+        self.restore_latencies.record(milliseconds);
+    }
     fn our_pid(&self) -> i64 {
         OUR_PID
     }
@@ -278,6 +304,7 @@ fn run(desk: &mut FakeDesk, units: usize) -> BracketReport {
 #[test]
 fn already_frontmost_units_still_report_their_bound_overrun() {
     let mut desk = FakeDesk::new();
+    desk.restore_latencies = latency::RestoreLatencies::new();
     desk.set_frontmost(TARGET);
     desk.unit_ms = 101;
     let report = run(&mut desk, 1);
@@ -423,6 +450,109 @@ fn a_front_slower_than_the_bound_posts_nothing() {
     assert_eq!(desk.frontmost, Some(PREVIOUS));
 }
 
+#[test]
+fn a_measured_slow_restore_refuses_the_next_call_before_posting() {
+    let mut desk = FakeDesk::new();
+    desk.front_latency_ms = 25;
+    desk.restore_latency_ms = Some(124);
+    desk.restore_wait_ms = Some(RESTORE_WAIT_MS);
+    let mut warmup = plan(1);
+    warmup.maximum_interval_ms = 500;
+    let first = run_fronting_bracket_with(
+        &mut desk,
+        &mut UserIdleEstimator::new(),
+        warmup,
+        admitted(),
+        &|| false,
+    );
+    assert_eq!(first.report.units_posted, 1);
+    assert_eq!(first.report.slowest_restore_ms, 124);
+    assert_eq!(first.report.restore, RestoreStatus::Restored);
+    desk.posted.clear();
+    desk.front_requests.clear();
+
+    let next = run_admitted(&mut desk, 1);
+    assert_eq!(next.report.stop, Some(BracketStop::BoundExceeded));
+    assert_eq!(next.report.units_posted, 0);
+    assert_eq!(next.report.posts_returned, 0);
+    assert!(desk.posted.is_empty());
+    assert_eq!(desk.front_requests, vec![TARGET, PREVIOUS]);
+    assert_eq!(next.report.restore, RestoreStatus::Restored);
+    assert_eq!(desk.frontmost, Some(PREVIOUS));
+}
+
+#[test]
+fn a_cold_predictor_refuses_before_posting_and_learns_for_a_retry() {
+    let mut desk = FakeDesk::new();
+    desk.restore_latencies = latency::RestoreLatencies::new();
+    desk.front_latency_ms = 25;
+    desk.restore_latency_ms = Some(10);
+    let first = run_admitted(&mut desk, 1);
+    assert_eq!(first.report.stop, Some(BracketStop::BoundExceeded));
+    assert_eq!(first.report.units_posted, 0);
+    assert_eq!(first.report.posts_returned, 0);
+    assert!(desk.posted.is_empty());
+    assert_eq!(desk.front_requests, vec![TARGET, PREVIOUS]);
+    assert_eq!(first.report.restore, RestoreStatus::Restored);
+    assert_eq!(desk.measured_restore_latency_ms(), Some(10));
+
+    let retry = run_admitted(&mut desk, 1);
+    assert_eq!(retry.report.stop, None);
+    assert_eq!(retry.report.units_posted, 1);
+    assert!(retry.report.held(100));
+}
+
+#[test]
+fn a_slow_restore_ages_out_after_eight_later_refused_call_restores() {
+    let mut desk = FakeDesk::new();
+    desk.restore_latencies.record(1046);
+    desk.restore_latency_ms = Some(4);
+    for later_restore in 1..=8 {
+        let outcome = run_admitted(&mut desk, 1);
+        assert_eq!(outcome.report.stop, Some(BracketStop::BoundExceeded));
+        assert_eq!(outcome.report.units_posted, 0);
+        assert_eq!(outcome.report.restore, RestoreStatus::Restored);
+        assert_eq!(desk.frontmost, Some(PREVIOUS));
+        assert_eq!(
+            desk.measured_restore_latency_ms(),
+            Some(if later_restore < 8 { 1046 } else { 4 }),
+        );
+    }
+    assert!(desk.posted.is_empty());
+    let retry = run_admitted(&mut desk, 1);
+    assert_eq!(retry.report.stop, None);
+    assert_eq!(retry.report.units_posted, 1);
+    assert!(retry.report.held(100));
+}
+
+#[test]
+fn skipped_restores_do_not_age_samples_and_failed_waits_are_not_fast_samples() {
+    let mut desk = FakeDesk::new();
+    desk.restore_latencies = latency::RestoreLatencies::new();
+    for _ in 0..8 {
+        remember_restore(&mut desk, RestoreStatus::Restored, 124);
+    }
+    for _ in 0..8 {
+        remember_restore(&mut desk, RestoreStatus::NotNeeded, 0);
+        remember_restore(
+            &mut desk,
+            RestoreStatus::SkippedPerson {
+                now_front: Some(THIRD),
+            },
+            0,
+        );
+    }
+    assert_eq!(desk.measured_restore_latency_ms(), Some(124));
+    remember_restore(
+        &mut desk,
+        RestoreStatus::Failed {
+            left_in_front: Some(TARGET),
+        },
+        10,
+    );
+    assert_eq!(desk.measured_restore_latency_ms(), Some(RESTORE_WAIT_MS));
+}
+
 /// Every unit posted, and only putting the previous application back ran
 /// past the bound. The keystrokes were delivered, so this is not a stop: a
 /// stop becomes a refusal on the wire, and a refusal for keystrokes that
@@ -461,6 +591,12 @@ fn a_post_failure_is_reported_with_what_it_left_held() {
         }
         fn request_front(&mut self, pid: u32) -> bool {
             self.0.request_front(pid)
+        }
+        fn measured_restore_latency_ms(&mut self) -> Option<u64> {
+            self.0.measured_restore_latency_ms()
+        }
+        fn record_restore_latency_ms(&mut self, milliseconds: u64) {
+            self.0.record_restore_latency_ms(milliseconds);
         }
         fn our_pid(&self) -> i64 {
             OUR_PID
@@ -535,6 +671,12 @@ impl FrontingBracketHost for FailingDesk {
     }
     fn request_front(&mut self, pid: u32) -> bool {
         self.desk.request_front(pid)
+    }
+    fn measured_restore_latency_ms(&mut self) -> Option<u64> {
+        self.desk.measured_restore_latency_ms()
+    }
+    fn record_restore_latency_ms(&mut self, milliseconds: u64) {
+        self.desk.record_restore_latency_ms(milliseconds);
     }
     fn our_pid(&self) -> i64 {
         OUR_PID

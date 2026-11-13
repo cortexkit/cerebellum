@@ -1916,6 +1916,12 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
     fn front_attempt_finished(&mut self) {
         self.returned();
     }
+    fn measured_restore_latency_ms(&mut self) -> Option<u64> {
+        self.inner.measured_restore_latency_ms()
+    }
+    fn record_restore_latency_ms(&mut self, milliseconds: u64) {
+        self.inner.record_restore_latency_ms(milliseconds);
+    }
     fn restore_front_attempt(
         &mut self,
         _previous: u32,
@@ -2508,6 +2514,9 @@ mod hooked_fronted_tests {
         /// Hook calls, in order.
         hooks: Vec<&'static str>,
         fail_post_holding_keys: bool,
+        /// Known warm restore cost on this screen's fake clock, never shared
+        /// with another test's screen or the production process-wide cache.
+        measured_restore_ms: u64,
     }
 
     type Shared = Arc<Mutex<Screen>>;
@@ -2545,6 +2554,12 @@ mod hooked_fronted_tests {
 
     impl FrontingBracketHost for Desk {
         type Tap = ();
+        fn measured_restore_latency_ms(&mut self) -> Option<u64> {
+            Some(self.0.lock().unwrap().measured_restore_ms)
+        }
+        fn record_restore_latency_ms(&mut self, milliseconds: u64) {
+            self.0.lock().unwrap().measured_restore_ms = milliseconds;
+        }
         fn now_ms(&mut self) -> u64 {
             self.0.lock().unwrap().now
         }
@@ -2657,9 +2672,19 @@ mod hooked_fronted_tests {
     }
 
     fn run(register: bool, begin: bool, fail: bool) -> (crate::dispatch::BracketOutcome, Shared) {
+        run_with_restore_cost(register, begin, fail, 0)
+    }
+
+    fn run_with_restore_cost(
+        register: bool,
+        begin: bool,
+        fail: bool,
+        measured_restore_ms: u64,
+    ) -> (crate::dispatch::BracketOutcome, Shared) {
         let screen: Shared = Arc::new(Mutex::new(Screen {
             frontmost: Some(PREVIOUS),
             fail_post_holding_keys: fail,
+            measured_restore_ms,
             ..Screen::default()
         }));
         let mut hooks = Hooks {
@@ -2709,6 +2734,28 @@ mod hooked_fronted_tests {
         assert_eq!(screen.requests, [("bracket", TARGET)], "no restore request");
         assert!(!screen.hooks.contains(&"decide"), "{:?}", screen.hooks);
         assert!(outcome.deferred_restore.is_some());
+    }
+
+    #[test]
+    fn separate_fake_screens_keep_their_restore_predictions_in_either_order() {
+        for costs in [[124, 0], [0, 124]] {
+            for cost in costs {
+                let (outcome, screen) = run_with_restore_cost(true, true, false, cost);
+                let screen = screen.lock().unwrap();
+                assert_eq!(outcome.report.restore, RestoreStatus::Restored);
+                assert_eq!(
+                    screen.requests,
+                    [("bracket", TARGET), ("restore_host", PREVIOUS)]
+                );
+                if cost == 0 {
+                    assert_eq!(outcome.report.stop, None);
+                    assert_eq!(outcome.report.units_posted, 1);
+                } else {
+                    assert_eq!(outcome.report.stop, Some(BracketStop::BoundExceeded));
+                    assert_eq!(outcome.report.units_posted, 0);
+                }
+            }
+        }
     }
 
     #[test]
