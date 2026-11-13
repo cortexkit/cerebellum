@@ -23,15 +23,15 @@ const COMPUTER_ROW: &str = include_str!("../../resources/tool-views/computer-row
 const COMPUTER_PAGE: &str = include_str!("../../resources/tool-views/computer-page.ui");
 
 /// The tool catalog the templates are written against, as `occipital-check
-/// --catalog` prints it. Catalog 1.1 changed digest before it shipped (Slots now
-/// take their widths first in a row), and the display server refuses a template
-/// naming the old one.
+/// --catalog` prints it. Catalog 1.1 has had more than one digest while it grew
+/// (only additions, so templates check and draw the same), and the display
+/// server refuses a template naming a retired one.
 const TOOL_CATALOG_DIGEST: &str =
-    "sha256:9a23139f4f1f48d6ed366a4a48b9221b1e5ac0ccd87473c0b241b8a37a876fbf";
+    "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4";
 
 /// Raised whenever a template changes. A pin's record schema and reads never
 /// change; the display server replaces a kept view only at a higher revision.
-pub(crate) const TEMPLATE_REVISION: u64 = 2;
+pub(crate) const TEMPLATE_REVISION: u64 = 3;
 
 fn template(profile: &str, source: &str) -> Value {
     json!({
