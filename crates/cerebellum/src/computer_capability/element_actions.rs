@@ -806,17 +806,24 @@ fn press_available(
     if is_blocked_menu_item(facts) {
         return Err(blocked_menu_item_reply());
     }
+    // On ordinary content AXShowMenu opens a context menu, not the element's
+    // primary action. Use it only for controls whose role is to open a menu.
     let action = if facts.actions.iter().any(|action| action == "AXPress") {
         "AXPress"
-    } else if facts.actions.iter().any(|action| action == "AXShowMenu") {
+    } else if matches!(
+        facts.role.as_deref(),
+        Some("AXPopUpButton" | "AXMenuButton" | "AXComboBox")
+    ) && facts.actions.iter().any(|action| action == "AXShowMenu")
+    {
         "AXShowMenu"
     } else {
         return Err(json!({
             "outcome": "no_press_action",
             "reason": "press_not_offered",
             "remedy": format!(
-                "this element offers {}, not a press; nothing was done and the pointer was not \
-                 used. Choose another element from read_state",
+                "this element offers {}, not a press for this role; nothing was done and the \
+                 pointer was not used. Choose a nearby element that offers AXPress, or call \
+                 read_state for a fresh read",
                 describe_actions(&facts.actions)
             ),
         }));
@@ -2758,6 +2765,7 @@ mod tests {
     use std::sync::Mutex;
 
     struct MenuSource {
+        role: Option<&'static str>,
         actions: Vec<String>,
         calls: Mutex<Vec<&'static str>>,
         enabled: bool,
@@ -2767,6 +2775,7 @@ mod tests {
     impl MenuSource {
         fn new(actions: &[&str]) -> Self {
             Self {
+                role: Some("AXPopUpButton"),
                 actions: actions.iter().map(|action| (*action).into()).collect(),
                 calls: Mutex::new(Vec::new()),
                 enabled: true,
@@ -2795,7 +2804,7 @@ mod tests {
 
         fn element_facts(&self, _: &ElementHandle) -> Result<ElementFacts, ElementActionError> {
             Ok(ElementFacts {
-                role: Some("AXPopUpButton".into()),
+                role: self.role.map(str::to_owned),
                 actions: self.actions.clone(),
                 ..Default::default()
             })
@@ -2870,10 +2879,32 @@ mod tests {
 
     #[test]
     fn a_menu_only_element_dispatches_show_menu() {
-        let source = MenuSource::new(&["AXShowMenu", "AXScrollToVisible"]);
-        let reply = press_fixture(&source);
-        assert_eq!(reply["outcome"], "completed", "{reply}");
-        assert_eq!(*source.calls.lock().unwrap(), ["AXShowMenu"]);
+        for role in ["AXPopUpButton", "AXMenuButton", "AXComboBox"] {
+            let mut source = MenuSource::new(&["AXShowMenu", "AXScrollToVisible"]);
+            source.role = Some(role);
+            let reply = press_fixture(&source);
+            assert_eq!(reply["outcome"], "completed", "{role}: {reply}");
+            assert_eq!(*source.calls.lock().unwrap(), ["AXShowMenu"]);
+        }
+    }
+
+    #[test]
+    fn a_context_menu_only_element_is_not_pressed() {
+        for role in [
+            Some("AXStaticText"),
+            Some("AXGroup"),
+            Some("AXButton"),
+            Some("AXLink"),
+            Some("AXUnknown"),
+            None,
+        ] {
+            let mut source = MenuSource::new(&["AXShowMenu"]);
+            source.role = role;
+            let reply = press_fixture(&source);
+            assert_eq!(reply["outcome"], "no_press_action", "{role:?}: {reply}");
+            assert_eq!(reply["reason"], "press_not_offered", "{reply}");
+            assert!(source.calls.lock().unwrap().is_empty(), "{role:?}");
+        }
     }
 
     #[test]
