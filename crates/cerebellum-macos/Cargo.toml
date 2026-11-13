@@ -10,7 +10,7 @@ description = "Raw macOS framework readings for ck-cerebellum. One of two seam c
 default = []
 # Exposes permission-skip helpers only when a dependent test target opts in.
 test-support = []
-# Display-capture experiment for the manually started desk probe only.
+# Manually started desk probes only; forbidden with a signing-topology revision.
 desk-probe = []
 # Acceptance probes only. release-build.sh binds the signing-topology revision,
 # which makes compilation reject this weaker parent identity in shipped builds.
@@ -62,6 +62,11 @@ test = true
 [[example]]
 name = "disclaim_launch"
 path = "examples/disclaim_launch.rs"
+required-features = ["desk-probe"]
+
+[[example]]
+name = "peer_identity"
+path = "examples/peer_identity.rs"
 required-features = ["desk-probe"]
 
 # Framework bindings are needed only where the frameworks exist. On every other
