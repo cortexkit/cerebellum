@@ -64,6 +64,8 @@ struct CfDictionaryValueCallbacks {
 #[link(name = "Security", kind = "framework")]
 extern "C" {
     static kSecGuestAttributePid: CfStringRef;
+    #[cfg(feature = "desk-probe")]
+    static kSecGuestAttributeAudit: CfStringRef;
     static kSecCodeInfoIdentifier: CfStringRef;
     static kSecCodeInfoTeamIdentifier: CfStringRef;
     static kSecCodeInfoFlags: CfStringRef;
@@ -118,6 +120,8 @@ extern "C" {
     ) -> CfDictionaryRef;
     fn CFDictionaryGetValue(dictionary: CfDictionaryRef, key: *const c_void) -> CfTypeRef;
     fn CFRelease(value: CfTypeRef);
+    #[cfg(feature = "desk-probe")]
+    fn CFDataCreate(allocator: *const c_void, bytes: *const u8, length: isize) -> CfTypeRef;
 }
 
 /// A framework object this module owns one reference to, released on drop so
@@ -377,6 +381,48 @@ fn check_requirement(pid: u32, requirement: &str) -> Result<RequirementCheck, Co
         ERR_SEC_CS_NO_SUCH_CODE => Err(CodeSigningError::NoSuchCode(status)),
         other => Ok(RequirementCheck::NotSatisfied(other)),
     }
+}
+
+/// The candidate intentionally uses the entire kernel token, including pidversion,
+/// rather than converting it to a pid and losing its identity across an exec.
+#[cfg(feature = "desk-probe")]
+pub(crate) fn audit_token_satisfies_requirement(
+    token: [u32; 8],
+    requirement: &str,
+) -> Result<RequirementCheck, CodeSigningError> {
+    // SAFETY: audit_token_t is eight native-endian u32s; CFData copies the bytes.
+    let data = Owned::adopt(unsafe { CFDataCreate(std::ptr::null(), token.as_ptr().cast(), 32) })
+        .ok_or(CodeSigningError::NoSuchCode(-1))?;
+    let keys = [unsafe { kSecGuestAttributeAudit }];
+    let values = [data.get()];
+    // SAFETY: one live key and one live data value; the dictionary retains both.
+    let attributes = Owned::adopt(unsafe {
+        CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        )
+    })
+    .ok_or(CodeSigningError::NoSuchCode(-1))?;
+    let mut code = std::ptr::null();
+    // SAFETY: the kernel code host receives the full audit token as CFData.
+    let status =
+        unsafe { SecCodeCopyGuestWithAttributes(std::ptr::null(), attributes.get(), 0, &mut code) };
+    let code = match Owned::adopt(code) {
+        Some(code) if status == 0 => code,
+        _ => return Err(CodeSigningError::NoSuchCode(status)),
+    };
+    let compiled = compiled_requirement(requirement)?;
+    // SAFETY: both owned Security.framework objects remain live during validation.
+    let status = unsafe { SecCodeCheckValidity(code.get(), 0, compiled.get()) };
+    Ok(if status == 0 {
+        RequirementCheck::Satisfied
+    } else {
+        RequirementCheck::NotSatisfied(status)
+    })
 }
 
 fn compiled_requirement(requirement: &str) -> Result<Owned, CodeSigningError> {

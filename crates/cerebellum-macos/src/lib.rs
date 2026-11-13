@@ -32,6 +32,13 @@ const _: () = assert!(
     "chrome-for-testing-parent-probe is forbidden in attested release builds"
 );
 
+// Desk-only identifiers must never become identities in a staged release.
+#[cfg(feature = "desk-probe")]
+const _: () = assert!(
+    option_env!("CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION").is_none(),
+    "desk-probe is forbidden in attested release builds"
+);
+
 // Pure Rust, so its tests run on every host.
 pub mod ax_budget;
 // The accessibility traversal is compiled for unit tests on every host, so its
@@ -60,6 +67,8 @@ mod event_tap;
 mod input;
 #[cfg(target_os = "macos")]
 mod launch;
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
+pub mod peer_identity_probe;
 #[cfg(any(target_os = "macos", all(unix, test)))]
 mod pinned_executable;
 #[cfg(target_os = "macos")]
@@ -227,9 +236,9 @@ pub use input::{
 #[cfg(target_os = "macos")]
 pub use launch::{
     executed_image_identity, process_descriptors, spawn_barred, spawn_barred_cursor,
-    spawn_barred_stdin, terminate_exact_generation, BarredChild, ExecutedImageIdentity,
-    ImageIdentityError, ProcessControlError, ProcessGeneration, ReleasedChild, SpawnError,
-    TerminationOutcome,
+    spawn_barred_socket, spawn_barred_stdin, terminate_exact_generation, BarredChild,
+    ExecutedImageIdentity, ImageIdentityError, ProcessControlError, ProcessGeneration,
+    ReleasedChild, SpawnError, TerminationOutcome,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{

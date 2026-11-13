@@ -383,6 +383,24 @@ impl BarredChild {
         self.generation
     }
 
+    /// Give the desk probe's accomplice a copy of the guardian command pipe.
+    /// Ordinary launchers must keep the release authority in `BarredChild`.
+    #[cfg(feature = "desk-probe")]
+    pub fn desk_probe_release_command(&self) -> Result<OwnedFd, SpawnError> {
+        duplicate_descriptor(
+            self.command
+                .as_ref()
+                .ok_or(SpawnError::InvalidDescriptor)?
+                .as_raw_fd(),
+        )
+    }
+
+    /// The exec attack replaces the owner; its stand-in must reap the guardian.
+    #[cfg(feature = "desk-probe")]
+    pub fn desk_probe_guardian_pid(&self) -> u32 {
+        self.guardian_pid as u32
+    }
+
     /// Release this exact generation once. The guardian resumes the target only
     /// after receiving the explicit byte; closing the descriptor means death,
     /// not success.
@@ -525,7 +543,7 @@ fn spawn_barred_with_responsibility(
         cdp_command_read_fd,
         cdp_response_write_fd,
         disclaim,
-        false,
+        ChannelMode::Cdp,
     )
 }
 
@@ -546,7 +564,7 @@ pub fn spawn_barred_stdin(
         read.as_raw_fd(),
         unused_write.as_raw_fd(),
         true,
-        true,
+        ChannelMode::Stdin,
     )?;
     drop((read, unused_read, unused_write));
     Ok((child, write))
@@ -572,9 +590,38 @@ pub fn spawn_barred_cursor(
         read.as_raw_fd(),
         reply_write.as_raw_fd(),
         true,
-        true,
+        ChannelMode::Stdin,
     )?;
     Ok((child, write, reply_read))
+}
+
+/// One unnamed socket pair, with only the helper's end inherited on fd 3.
+/// The helper starts disclaimed and suspended, with an empty environment and
+/// all standard streams on /dev/null. Verify its mapped image before release
+/// and before sending any request through the returned launcher end.
+pub fn spawn_barred_socket(
+    executable: &Path,
+    arguments: &[OsString],
+) -> Result<(BarredChild, std::os::unix::net::UnixStream), SpawnError> {
+    let (launcher, helper) =
+        std::os::unix::net::UnixStream::pair().map_err(|error| SpawnError::Pipe(error.kind()))?;
+    let child = spawn_barred_impl(
+        executable,
+        arguments,
+        &[],
+        helper.as_raw_fd(),
+        helper.as_raw_fd(),
+        true,
+        ChannelMode::Socket,
+    )?;
+    Ok((child, launcher))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChannelMode {
+    Cdp,
+    Stdin,
+    Socket,
 }
 
 fn spawn_barred_impl(
@@ -584,14 +631,14 @@ fn spawn_barred_impl(
     cdp_command_read_fd: RawFd,
     cdp_response_write_fd: RawFd,
     disclaim: bool,
-    stdin_mode: bool,
+    channel: ChannelMode,
 ) -> Result<BarredChild, SpawnError> {
     if !executable.is_absolute() {
         return Err(SpawnError::InvalidExecutable);
     }
     if cdp_command_read_fd < 0
         || cdp_response_write_fd < 0
-        || cdp_command_read_fd == cdp_response_write_fd
+        || (cdp_command_read_fd == cdp_response_write_fd && channel != ChannelMode::Socket)
     {
         return Err(SpawnError::InvalidDescriptor);
     }
@@ -633,7 +680,7 @@ fn spawn_barred_impl(
         command_source.as_raw_fd(),
         response_source.as_raw_fd(),
         disclaim,
-        stdin_mode,
+        channel,
     )?;
 
     // `posix_spawn` may enter framework and libc initialization, so it must run
@@ -869,22 +916,22 @@ fn prepare_spawn(
     command_source: RawFd,
     response_source: RawFd,
     disclaim: bool,
-    stdin_mode: bool,
+    channel: ChannelMode,
 ) -> Result<(PosixSpawnFileActions, PosixSpawnAttr), SpawnError> {
     let mut actions: PosixSpawnFileActions = std::ptr::null_mut();
     let mut attributes: PosixSpawnAttr = std::ptr::null_mut();
     let mut status = unsafe { posix_spawn_file_actions_init(&mut actions) };
-    if status == 0 && !stdin_mode {
+    if status == 0 && channel != ChannelMode::Stdin {
         status = unsafe { posix_spawn_file_actions_adddup2(&mut actions, command_source, 3) };
     }
-    if status == 0 {
+    if status == 0 && channel != ChannelMode::Socket {
         status = unsafe { posix_spawn_file_actions_adddup2(&mut actions, response_source, 4) };
     }
     // Standard descriptors are opened fresh on /dev/null in the child rather
     // than inherited, so nothing the browser prints reaches this process's own
     // streams. Descriptors a file action opens survive CLOEXEC_DEFAULT.
     for (fd, flags) in [(0, O_RDONLY), (1, O_WRONLY), (2, O_WRONLY)] {
-        if fd == 0 && stdin_mode {
+        if fd == 0 && channel == ChannelMode::Stdin {
             continue;
         }
         if status == 0 {
@@ -893,10 +940,15 @@ fn prepare_spawn(
             };
         }
     }
-    if status == 0 && stdin_mode {
+    if status == 0 && channel == ChannelMode::Stdin {
         status = unsafe { posix_spawn_file_actions_adddup2(&mut actions, command_source, 0) };
     }
-    for fd in if stdin_mode { [0, 4] } else { [3, 4] } {
+    let inherited: &[RawFd] = match channel {
+        ChannelMode::Cdp => &[3, 4],
+        ChannelMode::Stdin => &[0, 4],
+        ChannelMode::Socket => &[3],
+    };
+    for &fd in inherited {
         if status == 0 {
             status = unsafe { posix_spawn_file_actions_addinherit_np(&mut actions, fd) };
         }
@@ -1225,6 +1277,112 @@ mod tests {
             &bytes,
             0o700,
         )
+    }
+
+    #[test]
+    fn socket_helper_is_barred_and_inherits_only_its_socket_and_no_launcher_environment() {
+        use std::io::{Read, Write};
+        let _serial = serialize_launch_fixtures();
+        let executable = relocated_test_executable();
+        let (child, mut socket) = spawn_barred_socket(
+            &executable,
+            &[
+                "--ignored".into(),
+                "--exact".into(),
+                "launch::tests::socket_observer_reports_isolation".into(),
+                "--test-threads=1".into(),
+            ],
+        )
+        .expect("spawn socket observer");
+        let mut descriptors = process_descriptors(child.generation().pid).unwrap();
+        descriptors.sort_unstable();
+        assert_eq!(descriptors, [0, 1, 2, 3]);
+        socket.set_nonblocking(true).unwrap();
+        assert_eq!(
+            socket.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let child = child.release().expect("release socket observer");
+        let mut byte = [0];
+        socket.read_exact(&mut byte).expect("first byte");
+        assert_eq!(byte, *b"H");
+        socket.write_all(b"G").unwrap();
+        let mut report = [0; 2];
+        socket.read_exact(&mut report).expect("isolation report");
+        let mut environment_names = String::new();
+        socket.read_to_string(&mut environment_names).unwrap();
+        assert_eq!(
+            report,
+            [1, 1],
+            "no launcher environment and null stdio required; names={environment_names}"
+        );
+        child.wait().expect("reap socket observer");
+    }
+
+    #[test]
+    fn socket_helper_with_unexpected_mapped_identity_is_killed_without_release_or_request() {
+        use std::io::Read;
+        let _serial = serialize_launch_fixtures();
+        let executable = relocated_test_executable();
+        let (child, mut socket) =
+            spawn_barred_socket(&executable, &[]).expect("spawn barred test image");
+        let generation = child.generation();
+        assert_ne!(
+            crate::code_satisfies_requirement(
+                generation.pid,
+                "identifier \"not-the-expected-helper\" and anchor apple generic",
+                Duration::from_secs(5),
+            )
+            .expect("evaluate mapped image"),
+            crate::RequirementCheck::Satisfied,
+        );
+        child.terminate_and_reap().expect("kill unreleased image");
+        assert_reaped_by_launcher(generation.pid);
+        assert_eq!(socket.read(&mut [0]).expect("closed helper socket"), 0);
+    }
+
+    #[test]
+    #[ignore = "launched by the isolated socket-helper test"]
+    fn socket_observer_reports_isolation() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let null = fs::metadata("/dev/null").unwrap();
+        let stdio_null = (0..=2).all(|fd| {
+            // SAFETY: standard descriptors remain borrowed for this short reading.
+            let file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+            let metadata = file.metadata().unwrap();
+            let access = unsafe { fcntl(fd, F_GETFL) } & O_ACCMODE;
+            metadata.file_type().is_char_device()
+                && metadata.rdev() == null.rdev()
+                && access == if fd == 0 { 0 } else { 1 }
+        });
+        // SAFETY: the socket launch contract gives this child ownership of fd 3.
+        let mut socket = unsafe { std::os::unix::net::UnixStream::from_raw_fd(3) };
+        socket.write_all(b"H").unwrap();
+        let mut byte = [0];
+        socket.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"G");
+        socket
+            .write_all(&[
+                // CoreFoundation creates this setting during process startup,
+                // after exec; it is not an inherited launcher credential.
+                u8::from(std::env::vars_os().all(|(name, _)| name == "__CF_USER_TEXT_ENCODING")),
+                u8::from(stdio_null),
+            ])
+            .unwrap();
+        socket
+            .write_all(
+                std::env::vars_os()
+                    .map(|(name, _)| name.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(",")
+                    .as_bytes(),
+            )
+            .unwrap();
     }
 
     #[test]
