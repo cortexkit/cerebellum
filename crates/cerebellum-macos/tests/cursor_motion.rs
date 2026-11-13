@@ -22,7 +22,7 @@
 //! thread of its own, so `main` stands in for the harness and prints ok,
 //! SKIPPED, or FAILED.
 //!
-//! A badge is visible in the middle of the main display for about three
+//! A badge is visible in the middle of the main display for about four
 //! seconds. It is the helper's own click-through, non-activating panel, so it
 //! never takes focus or receives a click.
 
@@ -157,11 +157,11 @@ fn check(probe: &cerebellum_macos::MotionProbe, run: &str, with_activity: bool) 
         .collect();
     between.dedup();
     let landed = glide.last().copied();
-    let followed = passes
+    let follow: Vec<_> = passes
         .iter()
         .filter(|pass| pass.at_ms >= probe.follow_sent_ms && pass.at_ms < probe.hide_sent_ms)
-        .filter_map(|pass| pass.tip)
-        .next_back();
+        .collect();
+    let followed = follow.iter().filter_map(|pass| pass.tip).next_back();
     let held_at_rest = passes
         .iter()
         .filter(|pass| !pass.frame_wait && pass.activity_held)
@@ -206,6 +206,36 @@ fn check(probe: &cerebellum_macos::MotionProbe, run: &str, with_activity: bool) 
         probe.to[0] + probe.follow_offset[0],
         probe.to[1] + probe.follow_offset[1],
     ];
+    let return_due_ms = probe.follow_sent_ms + probe.follow_quiet_ms;
+    // While the window is moving the avatar holds still and only its
+    // pointer swings. The return must wake the idle loop without a new event.
+    let quiet: Vec<_> = follow
+        .iter()
+        .filter(|pass| pass.at_ms < return_due_ms)
+        .collect();
+    if quiet.is_empty() || quiet.iter().any(|pass| pass.tip != Some(probe.to)) {
+        failures
+            .push("a window-follow report moved the avatar before the quiet period ended".into());
+    }
+    if !quiet
+        .iter()
+        .any(|pass| !pass.frame_wait && !pass.activity_held)
+    {
+        failures.push("the loop did not rest without animation activity before the return".into());
+    }
+    let mut returning: Vec<_> = follow
+        .iter()
+        .filter(|pass| pass.at_ms >= return_due_ms)
+        .filter_map(|pass| pass.tip)
+        .filter(|tip| *tip != probe.to && *tip != expected)
+        .collect();
+    returning.dedup();
+    if returning.len() < 8 {
+        failures.push(format!(
+            "the window-follow return jumped or never ran: only {} intermediate positions",
+            returning.len()
+        ));
+    }
     if followed != Some(expected) {
         failures.push(format!(
             "a window-follow report moved the tip to {followed:?}, not {expected:?}"

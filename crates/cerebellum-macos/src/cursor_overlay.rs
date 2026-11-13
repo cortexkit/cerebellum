@@ -1565,7 +1565,7 @@ pub struct ProbePass {
     pub frame_wait: bool,
     /// The animation activity was held during that wait.
     pub activity_held: bool,
-    /// Where the probe picture's tip was drawn, if it was live.
+    /// The live picture's resting-tip anchor, not the swinging pointer's tip.
     pub tip: Option<[f64; 2]>,
 }
 
@@ -1590,6 +1590,8 @@ pub struct MotionProbe {
     /// When a window-follow report of `follow_offset` was sent.
     pub follow_sent_ms: f64,
     pub follow_offset: [f64; 2],
+    /// How long the window must stay still before the return glide starts.
+    pub follow_quiet_ms: f64,
     /// When the picture was hidden.
     pub hide_sent_ms: f64,
 }
@@ -1600,7 +1602,7 @@ pub struct MotionProbe {
 /// turns), an entry, a 400-point glide, a window-follow report and a hide.
 /// Every pass of the loop is recorded, so the caller can read the real frame
 /// intervals and where the badge was drawn. Must run on the main thread. A
-/// badge is visible on the main display for about three seconds; it never
+/// badge is visible on the main display for about four seconds; it never
 /// takes focus and ignores the mouse, like the real one.
 ///
 /// `hold_activity: false` runs without the animation activity, to show what
@@ -1620,10 +1622,17 @@ pub fn probe_cursor_motion(
     ];
     let from = [centre[0] - 200.0, centre[1] - 50.0];
     let to = [centre[0] + 120.0, centre[1] + 190.0];
-    let follow_offset = [40.0, 30.0];
+    let follow_offset: [f64; 2] = [40.0, 30.0];
     // The probe stands in for the module: the entry at its usual length, and
     // the glide at the length the supplied curve gives for that distance.
     let glide_ms = (motion.duration_ms)((to[0] - from[0]).hypot(to[1] - from[1]), false);
+    let follow_ms = (motion.duration_ms)(follow_offset[0].hypot(follow_offset[1]), false);
+    // A follow first swings the pointer around the stationary avatar. Leave
+    // time for the window's quiet period and the return flight, then a margin
+    // for scheduling, so hiding the picture cannot cut that flight short.
+    let follow_wait = crate::cursor_schedule::WINDOW_QUIET
+        + Duration::from_secs_f64(follow_ms / 1000.0)
+        + Duration::from_millis(500);
     let event = move |serial: u64, at: [f64; 2]| {
         OverlayMessage::Show(Box::new(OverlayEvent {
             agent: PROBE_AGENT.into(),
@@ -1670,7 +1679,7 @@ pub fn probe_cursor_motion(
                 window: None,
             })
             .ok()?;
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(follow_wait);
         let hide_sent_ms = since(Instant::now());
         sender
             .send(OverlayMessage::Hide {
@@ -1699,6 +1708,7 @@ pub fn probe_cursor_motion(
         to,
         follow_sent_ms,
         follow_offset,
+        follow_quiet_ms: crate::cursor_schedule::WINDOW_QUIET.as_secs_f64() * 1000.0,
         hide_sent_ms,
     })
 }
