@@ -1020,6 +1020,9 @@ where
                     }
                 },
                 purpose: crate::terminal_arbiter::FrontingPurpose::NeedsFront,
+                // Takeover pointer fronts restore only through the route
+                // admitted under `takeover_dispatch_review_revision`.
+                restore_fallback: false,
             });
             (
                 Some(hooks),

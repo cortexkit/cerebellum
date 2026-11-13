@@ -1845,6 +1845,7 @@ fn cleanup_before_the_front_leaves_the_worker_unfronted() {
         target_name: "Mail".into(),
         mode: crate::terminal_arbiter::FrontingMode::Background,
         purpose: crate::terminal_arbiter::FrontingPurpose::NeedsFront,
+        restore_fallback: true,
     });
     let mut cleanup_first = CleanupFirst(hooks.clone());
     let outcome = cerebellum_computer::platform::run_hooked_fronted(

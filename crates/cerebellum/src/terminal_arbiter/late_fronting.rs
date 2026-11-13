@@ -257,7 +257,7 @@ pub(super) fn start(
             target,
             since,
             budgets::LATE_ACTIVATION_WATCH_MS,
-            already_restored,
+            crate::computer::dispatch::LateWatch::WholeWindow { already_restored },
             &|| stop.load(Ordering::Acquire) != 0,
         );
         // Route close ends the task too, but first puts back a target that
@@ -275,7 +275,7 @@ pub(super) fn start(
                 target,
                 since,
                 budgets::LATE_ACTIVATION_WATCH_MS,
-                false,
+                crate::computer::dispatch::LateWatch::FirstAttempt,
                 &|| false,
             );
             restore = final_restore;

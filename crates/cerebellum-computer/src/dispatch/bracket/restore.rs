@@ -297,13 +297,15 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
 /// action gave up. It never dispatches the action that timed out.
 ///
 /// It watches until `watch_ms` after `requested_at`, the front request.
-/// Whenever the target is in front and no person input has arrived since the
-/// front, it asks for the previous application back, both ways (as
-/// `request_restore` does), and asks again after any request that did not take
-/// effect. After a restore it keeps watching, so an activation that lands a
-/// second time is put back too. `already_restored` says the call itself
-/// already put back a landing it did not see through, so the watch starts
-/// with the previous application restored.
+/// With [`LateWatch::WholeWindow`], whenever the target is in front and no
+/// person input has arrived since the front, it asks for the previous
+/// application back, both ways (as `request_restore` does), and asks again
+/// after any request that did not take effect. After a restore it keeps
+/// watching, so an activation that lands a second time is put back too.
+/// With [`LateWatch::FirstAttempt`] it makes at most one restore attempt and
+/// returns as soon as that attempt ends, or at once when the target is not
+/// in front, so a caller that must end quickly is held for one restore wait
+/// at most.
 ///
 /// It stops at the first person input, and an unavailable input observer or
 /// a gap in its coverage counts as input: focus is then left alone, unless
@@ -320,13 +322,19 @@ pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
     target: u32,
     requested_at: u64,
     watch_ms: u64,
-    already_restored: bool,
+    watch: LateWatch,
     stop: &dyn Fn() -> bool,
 ) -> (RestoreStatus, Option<u64>, bool) {
     let end = requested_at.saturating_add(watch_ms);
     let mut first_landing = None;
     let mut target_was_front = false;
-    let mut restored = already_restored;
+    let mut restored = matches!(
+        watch,
+        LateWatch::WholeWindow {
+            already_restored: true
+        }
+    );
+    let first_attempt_only = watch == LateWatch::FirstAttempt;
     loop {
         let front = host.frontmost_pid();
         let input = hardware_input_since(host.hardware_input_snapshot(), requested_at);
@@ -352,15 +360,17 @@ pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
                 true,
             );
         }
-        if stop() || now >= end {
-            let restore = if restored {
+        let settled = || {
+            if restored {
                 RestoreStatus::Restored
             } else {
                 RestoreStatus::Failed {
                     left_in_front: front,
                 }
-            };
-            return (restore, first_landing, false);
+            }
+        };
+        if stop() || now >= end || (first_attempt_only && front == Some(previous)) {
+            return (settled(), first_landing, false);
         }
         if target_front {
             let result = restore_attempt(
@@ -372,6 +382,13 @@ pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
                 true,
                 true,
             );
+            if first_attempt_only {
+                return (
+                    result.restore,
+                    first_landing,
+                    result.person_input_during_fronting,
+                );
+            }
             match result.restore {
                 RestoreStatus::Restored => {
                     restored = true;
@@ -396,6 +413,19 @@ pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
         }
         host.pause_ms(10);
     }
+}
+
+/// How long a late watch goes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LateWatch {
+    /// The ordinary late watch: to the end of its window, putting the
+    /// previous application back after every landing. `already_restored`
+    /// says the call itself already put back a landing it did not see
+    /// through, so the watch starts with the previous application back.
+    WholeWindow { already_restored: bool },
+    /// One restore attempt for a target already in front, for a caller that
+    /// is shutting down and must not wait out the window.
+    FirstAttempt,
 }
 
 /// What a restore request puts back, and the evidence that must still hold
