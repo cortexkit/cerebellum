@@ -1475,6 +1475,65 @@ async fn a_secure_focused_field_refuses_keystrokes_before_anything_is_posted() {
     assert!(plane.result_schema_findings().is_empty());
 }
 
+/// A lone navigation key types nothing and cannot paste, so a secure field
+/// focused in the target does not hold it back; every key that edits, types
+/// or can paste still refuses.
+#[tokio::test]
+async fn a_lone_navigation_key_skips_the_secure_field_check_and_editing_keys_keep_it() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    desk.state().elements.get_mut(&2).unwrap().facts.subrole = Some("AXSecureTextField".into());
+    let plane = plane_on(&shared, &desk, true);
+    let management = granted_management().await;
+    let navigation: [&[&str]; 6] = [
+        &["escape"],
+        &["up_arrow"],
+        &["tab"],
+        &["shift", "tab"],
+        &["home"],
+        &["page_down"],
+    ];
+    for keys in navigation {
+        let reply = serve(
+            &plane,
+            "computer.keys",
+            keys_request(keys),
+            &management,
+            &FakeClock::new(),
+        )
+        .await;
+        assert_ne!(
+            reply["outcome"], "secure_field_refused",
+            "{keys:?}: {reply}"
+        );
+    }
+    assert_eq!(dispatched_calls(&shared).len(), navigation.len());
+    let editing: [&[&str]; 6] = [
+        &["return"],
+        &["backspace"],
+        &["forward_delete"],
+        &["a"],
+        &["command", "v"],
+        &["shift", "up_arrow"],
+    ];
+    for keys in editing {
+        let reply = serve(
+            &plane,
+            "computer.keys",
+            keys_request(keys),
+            &management,
+            &FakeClock::new(),
+        )
+        .await;
+        assert_eq!(
+            reply["outcome"], "secure_field_refused",
+            "{keys:?}: {reply}"
+        );
+        assert_eq!(reply["reason"], "secure_field_focused");
+    }
+    assert_eq!(dispatched_calls(&shared).len(), navigation.len());
+}
+
 /// A focus that cannot be read cannot be shown not to be secure, so the
 /// check fails closed.
 #[tokio::test]

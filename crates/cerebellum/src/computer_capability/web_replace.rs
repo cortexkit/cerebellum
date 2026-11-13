@@ -142,9 +142,19 @@ impl WebReplacement {
 
     /// Exact value equality also covers clearing a nonempty selection. Merely
     /// finding the requested substring would accept an accidental append.
-    pub(super) fn arrived(&self, source: &dyn AppStateSource, bound: Duration) -> bool {
+    /// Stops polling once `stopped` answers true: the call has been answered
+    /// and nobody reads the confirmation.
+    pub(super) fn arrived(
+        &self,
+        source: &dyn AppStateSource,
+        bound: Duration,
+        stopped: &dyn Fn() -> bool,
+    ) -> bool {
         let deadline = Instant::now() + bound;
         loop {
+            if stopped() {
+                return false;
+            }
             if source.text_value(&self.handle).ok().flatten().as_ref() == Some(&self.text) {
                 return true;
             }

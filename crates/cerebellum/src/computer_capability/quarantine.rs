@@ -214,6 +214,7 @@ pub(crate) struct CallWork {
     parked: Arc<Mutex<Duration>>,
     lease: Option<Arc<WorkerLease>>,
     permits: Option<Arc<CallPermits>>,
+    disclosures: Arc<Mutex<Vec<String>>>,
 }
 
 tokio::task_local! {
@@ -235,6 +236,7 @@ impl CallWork {
             parked: Arc::new(Mutex::new(Duration::ZERO)),
             lease,
             permits,
+            disclosures: Arc::default(),
         }
     }
 
@@ -328,6 +330,17 @@ impl CallWork {
 
     pub(crate) fn permits(&self) -> Option<&Arc<CallPermits>> {
         self.permits.as_ref()
+    }
+
+    /// Keep a line for the call's reply that says something the call
+    /// noticed and acted on, such as the application moving its own focus.
+    pub(crate) fn disclose(&self, line: String) {
+        self.disclosures.lock().unwrap().push(line);
+    }
+
+    /// The lines kept by [`Self::disclose`], once.
+    pub(crate) fn take_disclosures(&self) -> Vec<String> {
+        std::mem::take(&mut *self.disclosures.lock().unwrap())
     }
 
     /// Publish an open posting interval to the call's terminal decision, so

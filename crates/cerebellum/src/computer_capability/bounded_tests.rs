@@ -646,3 +646,315 @@ async fn binding_awaits_late_cleanup_without_blocking_the_tokio_worker() {
     drop(watch);
     assert_eq!(binding.await.unwrap(), None);
 }
+
+/// An application whose field never shows the typed text and whose every
+/// read is slow, standing in for a backgrounded Electron app after a long
+/// `type`: what a worker finds once its call has already been answered.
+struct NeverShowsText {
+    reads: AtomicUsize,
+    text_reads: AtomicUsize,
+}
+
+impl cerebellum_computer::app_state::source::AppStateSource for NeverShowsText {
+    fn read_app_state(
+        &self,
+        _: &ProcessGrant,
+        _: cerebellum_computer::app_state::source::ReadBounds,
+    ) -> Result<
+        cerebellum_computer::app_state::source::RawAppState,
+        cerebellum_computer::app_state::source::AppStateReadError,
+    > {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        Ok(cerebellum_computer::app_state::source::RawAppState {
+            roots: Vec::new(),
+            focused: None,
+            unreadable_subtrees: 0,
+            read_bound_reached: false,
+        })
+    }
+
+    fn text_value(
+        &self,
+        _: &cerebellum_computer::app_state::source::ElementHandle,
+    ) -> Result<Option<String>, cerebellum_computer::app_state::source::ElementActionError> {
+        self.text_reads.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(String::new()))
+    }
+}
+
+/// Once the call has been answered, the readback that would confirm typed
+/// text stops at its next poll instead of running to its deadline: until it
+/// returns, the worker keeps the application marked busy for every call.
+#[test]
+fn typed_text_readback_stops_once_the_call_is_answered() {
+    let source = NeverShowsText {
+        reads: AtomicUsize::new(0),
+        text_reads: AtomicUsize::new(0),
+    };
+    let focus = super::keystrokes::TargetFocus {
+        handle: Arc::new(cerebellum_computer::app_state::source::FixtureElementToken(
+            1,
+        )),
+        before: Some(String::new()),
+    };
+    let call = terminal();
+    let gate = quarantine::ArbiterGate(Some(call.clone()));
+    let stopped = || cerebellum_computer::dispatch::MutationGate::stopped(&gate);
+    let stopper = {
+        let call = call.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            call.stop(TerminalCause::Cancelled);
+        })
+    };
+    let started = std::time::Instant::now();
+    let confirmed = super::keystrokes::await_typed_text(
+        &source,
+        &focus,
+        "hello",
+        Duration::from_secs(5),
+        &stopped,
+    );
+    stopper.join().unwrap();
+    assert!(!confirmed);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the readback ran {:?} past an answered call",
+        started.elapsed()
+    );
+}
+
+/// The settle after a `type` or `keys` reads nothing once the call has been
+/// answered; with the call still open it reads as before.
+#[test]
+fn the_keystroke_settle_reads_nothing_once_the_call_is_answered() {
+    use super::element_actions::{settle_and_observe_view, PersonWatch};
+    use cerebellum_computer::app_state::session::AppStateSessions;
+    let target = grant(42, EDITOR);
+    for answered in [false, true] {
+        let source = NeverShowsText {
+            reads: AtomicUsize::new(0),
+            text_reads: AtomicUsize::new(0),
+        };
+        let sessions = AppStateSessions::new();
+        let stopped = || answered;
+        let started = std::time::Instant::now();
+        let settled = settle_and_observe_view(
+            &source,
+            &sessions,
+            "conversation",
+            &target,
+            Duration::from_secs(3),
+            false,
+            PersonWatch::StopWhen(&stopped),
+            None,
+            None,
+        );
+        let reads = source.reads.load(Ordering::SeqCst);
+        if answered {
+            assert!(settled.is_none());
+            assert_eq!(reads, 0, "an answered call's settle read the app");
+            assert!(started.elapsed() < Duration::from_millis(500));
+        } else {
+            assert!(settled.is_some());
+            assert!(reads >= 1);
+        }
+    }
+}
+
+/// An application whose focused element, focused window, frontmost state
+/// and hardware-input observer the test sets.
+struct FocusDesk {
+    focused: AtomicUsize,
+    window_title: std::sync::Mutex<String>,
+    frontmost: std::sync::Mutex<Option<u32>>,
+    hardware: std::sync::Mutex<Result<(std::time::Instant, Option<std::time::Instant>), ()>>,
+}
+
+impl FocusDesk {
+    fn new(covered_since: std::time::Instant) -> Self {
+        Self {
+            focused: AtomicUsize::new(1),
+            window_title: std::sync::Mutex::new("General".into()),
+            frontmost: std::sync::Mutex::new(Some(42)),
+            hardware: std::sync::Mutex::new(Ok((covered_since, None))),
+        }
+    }
+}
+
+impl cerebellum_computer::app_state::source::AppStateSource for FocusDesk {
+    fn read_app_state(
+        &self,
+        _: &ProcessGrant,
+        _: cerebellum_computer::app_state::source::ReadBounds,
+    ) -> Result<
+        cerebellum_computer::app_state::source::RawAppState,
+        cerebellum_computer::app_state::source::AppStateReadError,
+    > {
+        Ok(cerebellum_computer::app_state::source::RawAppState {
+            roots: Vec::new(),
+            focused: None,
+            unreadable_subtrees: 0,
+            read_bound_reached: false,
+        })
+    }
+
+    fn focused_element(
+        &self,
+        _: &ProcessGrant,
+    ) -> Result<
+        Option<cerebellum_computer::app_state::source::ElementHandle>,
+        cerebellum_computer::app_state::source::ElementActionError,
+    > {
+        Ok(Some(Arc::new(
+            cerebellum_computer::app_state::source::FixtureElementToken(
+                self.focused.load(Ordering::SeqCst) as u64,
+            ),
+        )))
+    }
+
+    fn element_facts(
+        &self,
+        _: &cerebellum_computer::app_state::source::ElementHandle,
+    ) -> Result<
+        cerebellum_computer::app_state::source::ElementFacts,
+        cerebellum_computer::app_state::source::ElementActionError,
+    > {
+        Ok(cerebellum_computer::app_state::source::ElementFacts {
+            role: Some("AXTextArea".into()),
+            title: Some("Message #general".into()),
+            ..Default::default()
+        })
+    }
+
+    fn focused_window(
+        &self,
+        _: &ProcessGrant,
+    ) -> Result<
+        Option<cerebellum_computer::app_state::source::WindowMark>,
+        cerebellum_computer::app_state::source::ElementActionError,
+    > {
+        Ok(Some(cerebellum_computer::app_state::source::WindowMark {
+            handle: Arc::new(cerebellum_computer::app_state::source::FixtureElementToken(
+                100,
+            )),
+            title: Some(self.window_title.lock().unwrap().clone()),
+        }))
+    }
+
+    fn frontmost_pid(&self) -> Option<u32> {
+        *self.frontmost.lock().unwrap()
+    }
+
+    fn hardware_input(
+        &self,
+        _: &ProcessGrant,
+    ) -> Result<
+        (std::time::Instant, Option<std::time::Instant>),
+        cerebellum_computer::app_state::source::ElementActionError,
+    > {
+        (*self.hardware.lock().unwrap()).map_err(|()| {
+            cerebellum_computer::app_state::source::ElementActionError::UnsupportedOnPlatform
+        })
+    }
+}
+
+/// The conversation has read the desk; then `change` is applied and the
+/// check before the next action is asked.
+fn person_check_after(
+    change: impl FnOnce(&FocusDesk),
+) -> (
+    Result<super::element_actions::PersonCheck, ()>,
+    cerebellum_computer::app_state::session::AppStateSessions,
+    FocusDesk,
+) {
+    use cerebellum_computer::app_state::person::SeenMarks;
+    let target = grant(42, EDITOR);
+    let desk = FocusDesk::new(std::time::Instant::now());
+    let sessions = cerebellum_computer::app_state::session::AppStateSessions::new();
+    sessions.observe(
+        "conversation",
+        &target,
+        &cerebellum_computer::app_state::source::RawAppState {
+            roots: Vec::new(),
+            focused: None,
+            unreadable_subtrees: 0,
+            read_bound_reached: false,
+        },
+    );
+    sessions.remember_seen("conversation", &target, SeenMarks::read(&desk, &target));
+    change(&desk);
+    let checked = super::element_actions::person_check_before_action(
+        &desk,
+        &sessions,
+        "conversation",
+        &target,
+    );
+    (checked, sessions, desk)
+}
+
+/// The application moved its own focus (Discord after a server switch) while
+/// in front, and the observer saw no input at all: the action goes ahead,
+/// says where focus went, and the next check compares against the new focus.
+#[test]
+fn an_app_only_focus_move_proceeds_with_one_disclosed_line() {
+    use super::element_actions::PersonCheck;
+    let (checked, sessions, desk) = person_check_after(|desk| {
+        desk.focused.store(2, Ordering::SeqCst);
+    });
+    match checked {
+        Ok(PersonCheck::AppMovedFocus(line)) => assert_eq!(
+            line,
+            "Focus moved to \"Message #general\" on its own since your last read."
+        ),
+        other => panic!("an app-only focus move refused: {other:?}"),
+    }
+    let again = super::element_actions::person_check_before_action(
+        &desk,
+        &sessions,
+        "conversation",
+        &grant(42, EDITOR),
+    );
+    assert!(matches!(again, Ok(PersonCheck::Unchanged)), "{again:?}");
+}
+
+/// The same focus move refuses when anything weakens the evidence that the
+/// person did not cause it: hardware input since the read, a changed window,
+/// an observer gap or outage, or a target in the background.
+#[test]
+fn a_focus_move_refuses_unless_the_app_is_in_front_and_provably_untouched() {
+    use super::element_actions::PersonCheck;
+    use cerebellum_computer::app_state::person::PersonChange;
+    let cases: [(&str, fn(&FocusDesk)); 5] = [
+        ("a hardware key since the read", |desk| {
+            desk.hardware.lock().unwrap().as_mut().unwrap().1 = Some(std::time::Instant::now());
+        }),
+        ("a window change", |desk| {
+            *desk.window_title.lock().unwrap() = "Delete Server?".into();
+        }),
+        ("an observer that restarted after the read", |desk| {
+            desk.hardware.lock().unwrap().as_mut().unwrap().0 = std::time::Instant::now();
+        }),
+        ("an observer outage", |desk| {
+            *desk.hardware.lock().unwrap() = Err(());
+        }),
+        ("a background target", |desk| {
+            *desk.frontmost.lock().unwrap() = Some(7);
+        }),
+    ];
+    for (name, weaken) in cases {
+        let (checked, _, _) = person_check_after(|desk| {
+            std::thread::sleep(Duration::from_millis(2));
+            desk.focused.store(2, Ordering::SeqCst);
+            weaken(desk);
+        });
+        let refused = matches!(
+            checked,
+            Ok(PersonCheck::Changed(
+                PersonChange::FocusChanged | PersonChange::WindowChanged
+            ))
+        );
+        assert!(refused, "{name}: {checked:?}");
+    }
+}

@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cerebellum_computer::app_state::person::{person_change, PersonChange, SeenMarks};
+use cerebellum_computer::app_state::person::{person_change, PersonChange, Reading, SeenMarks};
 use cerebellum_computer::app_state::render::is_session_ending_title;
 use cerebellum_computer::app_state::session::{Adoption, AppStateSessions, SessionRead};
 
@@ -228,6 +228,100 @@ pub(crate) fn person_change_since_seen(
         },
         None => Err(()),
     }
+}
+
+/// What the check before an element or keystroke action found.
+#[derive(Debug)]
+pub(crate) enum PersonCheck {
+    /// Nothing changed since the conversation last saw the application.
+    Unchanged,
+    /// The person may have used the application: refuse.
+    Changed(PersonChange),
+    /// Only the application's focused element moved, and nobody touched a
+    /// key, button or scroll wheel since the marks were taken: the
+    /// application moved its own focus, often in answer to the agent's own
+    /// last action. The marks are refreshed; the line says where focus went.
+    AppMovedFocus(String),
+}
+
+/// [`person_change_since_seen`] for the check made before an element or
+/// keystroke action, which also tells an application's own focus move from
+/// the person's.
+///
+/// A changed focused element counts as the application's own move only when
+/// all of these hold: the focused window is the same one with the same title
+/// (a new window can be a dialog the agent has not seen), the application is
+/// frontmost, the hardware-input observer has covered the whole interval
+/// since the marks were taken without a gap, and it saw no key, button or
+/// scroll input in that interval. Anything less refuses as before.
+pub(crate) fn person_check_before_action(
+    source: &dyn AppStateSource,
+    sessions: &AppStateSessions,
+    conversation_key: &str,
+    grant: &ProcessGrant,
+) -> Result<PersonCheck, ()> {
+    let Some(seen) = sessions.last_seen(conversation_key, grant) else {
+        return Ok(PersonCheck::Unchanged);
+    };
+    let now = SeenMarks::read(source, grant);
+    match person_change(&seen, &now, false, None) {
+        Some(PersonChange::FocusChanged) => {
+            // Compared with the new focused element in place of the old one,
+            // so only the window is left to differ.
+            let window_only = SeenMarks {
+                focused: now.focused.clone(),
+                ..seen.clone()
+            };
+            let unchanged_window = person_change(&window_only, &now, false, None).is_none();
+            let unobserved_interval = source.frontmost_pid() == Some(grant.pid)
+                && matches!(
+                    source.hardware_input(grant),
+                    Ok((since, latest))
+                        if since <= seen.at && latest.is_none_or(|at| at <= seen.at)
+                );
+            if !(unchanged_window && unobserved_interval) {
+                return Ok(PersonCheck::Changed(PersonChange::FocusChanged));
+            }
+            let line = focus_moved_line(source, &now);
+            sessions.remember_seen(conversation_key, grant, now);
+            Ok(PersonCheck::AppMovedFocus(line))
+        }
+        Some(change) => Ok(PersonCheck::Changed(change)),
+        None => match source.frontmost_pid() {
+            Some(pid) if pid != grant.pid => Ok(PersonCheck::Unchanged),
+            Some(_) => match source.hardware_input(grant) {
+                Ok((since, latest)) if since <= seen.at => {
+                    Ok(person_change(&seen, &now, true, latest)
+                        .map_or(PersonCheck::Unchanged, PersonCheck::Changed))
+                }
+                _ => Err(()),
+            },
+            None => Err(()),
+        },
+    }
+}
+
+/// The reply line for an application's own focus move, naming the element
+/// that now has focus by its title, or by its role when it has none.
+fn focus_moved_line(source: &dyn AppStateSource, now: &SeenMarks) -> String {
+    let facts = match &now.focused {
+        Reading::Read(Some(handle)) => source.element_facts(handle).ok(),
+        _ => None,
+    };
+    let title = facts
+        .as_ref()
+        .and_then(|facts| facts.title.as_deref())
+        .map(cerebellum_computer::app_state::render::one_line)
+        .filter(|title| !title.is_empty());
+    let element = match (
+        title,
+        facts.as_ref().and_then(|facts| facts.role.as_deref()),
+    ) {
+        (Some(title), _) => format!("\"{title}\""),
+        (None, Some(role)) => format!("a {}", role.strip_prefix("AX").unwrap_or(role)),
+        (None, None) => "another element".to_string(),
+    };
+    format!("Focus moved to {element} on its own since your last read.")
 }
 
 fn blocked_menu_item_reply() -> Value {
@@ -1195,6 +1289,12 @@ pub(crate) enum PersonWatch<'a> {
     /// before and after every read and answers `true` once the person has
     /// acted; the settle then returns at once so the caller can restore.
     Watched(&'a mut dyn FnMut() -> bool),
+    /// Not in front, as [`Self::NotWatched`], but the call may be answered
+    /// while the settle runs. The closure is asked before and after every
+    /// read and answers `true` once the call has been stopped; the settle then
+    /// returns `None` without reading again, so an answered call's worker
+    /// does not keep its application marked busy.
+    StopWhen(&'a dyn Fn() -> bool),
 }
 
 /// The element an action pressed, watched while the settle waits.
@@ -1271,6 +1371,7 @@ pub(crate) fn settle_and_observe_view(
     let mut person_acted = || match &mut watch {
         PersonWatch::NotWatched => false,
         PersonWatch::Watched(acted) => acted(),
+        PersonWatch::StopWhen(stopped) => stopped(),
     };
     let before = sessions.latest(conversation_key, grant);
     let had_baseline = before.is_some();
@@ -2308,15 +2409,19 @@ where
         let checked = grant.clone();
         let change = tokio::task::spawn_blocking(move || {
             let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(checked.pid, None);
-            person_change_since_seen(source.as_ref(), &sessions, &conversation_key, &checked)
+            person_check_before_action(source.as_ref(), &sessions, &conversation_key, &checked)
         })
         .await;
         match change {
-            Ok(Ok(Some(change))) => Some(state_changed_by_person_reply(
+            Ok(Ok(PersonCheck::Changed(change))) => Some(state_changed_by_person_reply(
                 &management.application_name(grant),
                 change,
             )),
-            Ok(Ok(None)) => None,
+            Ok(Ok(PersonCheck::Unchanged)) => None,
+            Ok(Ok(PersonCheck::AppMovedFocus(line))) => {
+                super::quarantine::CallWork::current().disclose(line);
+                None
+            }
             _ => Some(json!({
                 "outcome": "observer_unavailable",
                 "reason": "hardware_input_observer_unavailable",
