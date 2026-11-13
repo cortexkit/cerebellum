@@ -203,7 +203,7 @@ fn print_needs_front_summary(attempts: &[AttemptTiming]) {
                 .collect(),
         ),
         (
-            "request→cleanup restore (no completed chord; not a posted bracket)",
+            "request→cleanup restore (no posted chord confirmed)",
             attempts.iter().filter_map(|a| a.cleanup_only_ms).collect(),
         ),
     ] {
@@ -212,7 +212,7 @@ fn print_needs_front_summary(attempts: &[AttemptTiming]) {
     println!("SUMMARY candidate bounds COMPUTED, NOT TRIED: measured counts use only posted+restored brackets; estimates use each front latency + median measured frontmost→post→restore time from a separate distribution (not a replay)");
     for count in bound_counts(attempts, &CANDIDATE_BOUNDS_MS) {
         println!(
-            "COMPUTED bound {} ms: measured completed {}/{}; estimated from two measured parts {}/{}",
+            "COMPUTED bound {} ms: measured posted+restored {}/{}; estimated from two measured parts {}/{}",
             count.bound_ms,
             count.measured,
             attempts.len(),
@@ -477,6 +477,20 @@ fn baseline_from_output(output: &str) -> Option<u64> {
         .and_then(|value| value.trim().parse().ok())
 }
 
+/// Forward each line as it arrives; retain only the baseline's CPU measurement.
+fn stream_baseline(
+    reader: impl std::io::BufRead,
+    mut emit: impl FnMut(&str),
+) -> Result<Option<u64>, String> {
+    let mut idle_ns = None;
+    for line in reader.lines() {
+        let line = line.map_err(|error| format!("reading baseline output: {error}"))?;
+        emit(&line);
+        idle_ns = idle_ns.or_else(|| baseline_from_output(&line));
+    }
+    Ok(idle_ns)
+}
+
 /// Re-exec the same signed binary, but give the baseline its own responsibility
 /// identity just like the cursor-on probe. Never fall back to an ordinary spawn.
 fn baseline_launch_command(executable: &Path) -> std::process::Command {
@@ -525,12 +539,21 @@ fn front_app_verdict(samples: &[FrontSample], person: i32) -> Result<(), String>
     }
 }
 
-/// The needs-front chord fronted the app for itself and put the person's
-/// app back.
+/// A posted chord is deliberately unconfirmed: the keys contract does not
+/// claim its effect was observed. The fronting bracket must still be held.
 fn needs_front_reply_verdict(reply: &Value) -> Result<(), String> {
     let fronting = &reply["fronting"];
     let expected = [
-        ("outcome", &reply["outcome"], Value::from("completed")),
+        (
+            "outcome",
+            &reply["outcome"],
+            Value::from("delivery_unconfirmed"),
+        ),
+        (
+            "target_fronted",
+            &reply["target_fronted"],
+            Value::from(true),
+        ),
         (
             "fronting.mode",
             &fronting["mode"],
@@ -548,12 +571,64 @@ fn needs_front_reply_verdict(reply: &Value) -> Result<(), String> {
             Value::from("restored"),
         ),
     ];
-    match expected.iter().find(|(_, actual, want)| *actual != want) {
-        Some((name, actual, want)) => Err(format!(
-            "the needs-front chord's {name} was {actual}, expected {want}; reply: {reply}"
-        )),
-        None => Ok(()),
+    let mut failures = expected
+        .iter()
+        .filter(|(_, actual, want)| *actual != want)
+        .map(|(name, actual, want)| format!("{name} was {actual}, expected {want}"))
+        .collect::<Vec<_>>();
+    if let Some(reason) = reply.get("containment_forfeited_because") {
+        failures.push(format!(
+            "containment_forfeited_because was {reason}, expected absent"
+        ));
     }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the needs-front chord's {}; reply: {reply}",
+            failures.join("; ")
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TextSelection {
+    start: usize,
+    length: usize,
+    text_length: usize,
+}
+
+/// AX ranges and CFString lengths both count UTF-16 code units, not bytes.
+fn selection_line(
+    attempt: usize,
+    before: &Result<TextSelection, String>,
+    after: &Result<TextSelection, String>,
+) -> String {
+    let range = |sample: &Result<TextSelection, String>| match sample {
+        Ok(sample) => format!("{}:{}", sample.start, sample.length),
+        Err(_) => "unreadable".into(),
+    };
+    let length = |sample: &Result<TextSelection, String>| match sample {
+        Ok(sample) => sample.text_length.to_string(),
+        Err(_) => "unreadable".into(),
+    };
+    let mut line = format!(
+        "RECORD needs-front attempt {attempt}: selection before={} after={} length={}→{} (UTF-16; start:length)",
+        range(before), range(after), length(before), length(after)
+    );
+    let failures = [("before", before), ("after", after)]
+        .into_iter()
+        .filter_map(|(when, sample)| {
+            sample
+                .as_ref()
+                .err()
+                .map(|reason| format!("{when}: {}", reason.replace(['\r', '\n'], " ")))
+        })
+        .collect::<Vec<_>>();
+    if !failures.is_empty() {
+        line.push_str(&format!("; selection unreadable: {}", failures.join("; ")));
+    }
+    line
 }
 
 /// A background-mode action that is not a needs-front action completed
@@ -763,6 +838,11 @@ mod desk {
     impl Scratch {
         fn pid(&self) -> u32 {
             self.identity.process.pid
+        }
+
+        fn selection(&self) -> Result<TextSelection, String> {
+            scratch_ownership(&self.identity)?;
+            sys::text_selection(self.pid(), &self.identity.files.document_url)
         }
 
         fn finish(&mut self) -> bool {
@@ -1017,7 +1097,7 @@ mod desk {
     /// Process CPU time, windows and document ownership, read from the system.
     #[allow(unsafe_code)]
     mod sys {
-        use super::super::{cpu_nanos, ListedWindow};
+        use super::super::{cpu_nanos, same_document, ListedWindow, TextSelection};
         use std::ffi::{c_void, CStr, CString};
         use std::os::unix::ffi::OsStrExt;
         use std::path::Path;
@@ -1098,6 +1178,9 @@ mod desk {
                 attribute: CfRef,
                 value: *mut CfRef,
             ) -> i32;
+            fn AXValueGetTypeID() -> usize;
+            fn AXValueGetType(value: CfRef) -> u32;
+            fn AXValueGetValue(value: CfRef, kind: u32, output: *mut c_void) -> u8;
         }
 
         #[link(name = "CoreFoundation", kind = "framework")]
@@ -1126,6 +1209,7 @@ mod desk {
             fn CFNumberGetTypeID() -> usize;
             fn CFDictionaryGetTypeID() -> usize;
             fn CFRelease(value: CfRef);
+            fn CFRetain(value: CfRef) -> CfRef;
         }
 
         const UTF8: u32 = 0x0800_0100;
@@ -1204,6 +1288,176 @@ mod desk {
                 Ok(Owned(value))
             } else {
                 Err(format!("{name}: AX error {code}, null={}", value.is_null()))
+            }
+        }
+
+        /// Retain children while traversing only this pid's bounded AX tree.
+        fn ax_elements(element: &Owned, name: &str, pid: i32) -> Result<Vec<Owned>, String> {
+            let attribute = string(name);
+            let mut value = std::ptr::null();
+            // SAFETY: element, attribute and output slot are live.
+            let code = unsafe { AXUIElementCopyAttributeValue(element.0, attribute.0, &mut value) };
+            // Leaf elements need not expose AXChildren.
+            if name == "AXChildren" && matches!(code, -25205 | -25212) {
+                return Ok(Vec::new());
+            }
+            if code != 0 || value.is_null() {
+                return Err(format!("{name}: AX error {code}, null={}", value.is_null()));
+            }
+            let array = Owned(value);
+            // SAFETY: array is live and checked before CFArray access.
+            if unsafe { CFGetTypeID(array.0) != CFArrayGetTypeID() } {
+                return Err(format!("{name} is not an array"));
+            }
+            // SAFETY: array is a live CFArray.
+            let count = unsafe { CFArrayGetCount(array.0) };
+            if !(0..=128).contains(&count) {
+                return Err(format!(
+                    "{name} has {count} elements, outside traversal limit"
+                ));
+            }
+            let mut elements = Vec::new();
+            for index in 0..count {
+                // SAFETY: index is in bounds and array owns each borrowed value.
+                let child = unsafe { CFArrayGetValueAtIndex(array.0, index) };
+                if child.is_null() || unsafe { CFGetTypeID(child) != AXUIElementGetTypeID() } {
+                    return Err(format!("{name}[{index}] is not an AX element"));
+                }
+                let mut owner = 0;
+                // SAFETY: child is a live AX element and owner is an output slot.
+                let code = unsafe { AXUIElementGetPid(child, &mut owner) };
+                if code != 0 || owner != pid {
+                    return Err(format!("{name}[{index}]: owner={owner}, AX error {code}"));
+                }
+                // SAFETY: child is live; retain it beyond array's lifetime.
+                let child = Owned(unsafe { CFRetain(child) });
+                // SAFETY: child is a retained AX element; bound each message.
+                let code = unsafe { AXUIElementSetMessagingTimeout(child.0, 0.5) };
+                if code != 0 {
+                    return Err(format!("{name}[{index}]: timeout setup AX error {code}"));
+                }
+                elements.push(child);
+            }
+            Ok(elements)
+        }
+
+        #[repr(C)]
+        #[derive(Default)]
+        struct CfRange {
+            location: isize,
+            length: isize,
+        }
+
+        fn selected_range(element: &Owned) -> Result<TextSelection, String> {
+            const CF_RANGE: u32 = 4;
+            let selection = ax_attribute(element, "AXSelectedTextRange")?;
+            // SAFETY: selection is live; validate both its CF and AX value types.
+            if unsafe {
+                CFGetTypeID(selection.0) != AXValueGetTypeID()
+                    || AXValueGetType(selection.0) != CF_RANGE
+            } {
+                return Err("AXSelectedTextRange is not a CFRange AXValue".into());
+            }
+            let mut range = CfRange::default();
+            // SAFETY: the AXValue holds a CFRange and the output has that layout.
+            if unsafe {
+                AXValueGetValue(selection.0, CF_RANGE, (&mut range as *mut CfRange).cast())
+            } == 0
+            {
+                return Err("AXSelectedTextRange could not be decoded".into());
+            }
+            let value = ax_attribute(element, "AXValue")?;
+            // SAFETY: value is live and checked before CFString access.
+            if unsafe { CFGetTypeID(value.0) != CFStringGetTypeID() } {
+                return Err("text area's AXValue is not a string".into());
+            }
+            // SAFETY: value is a live CFString; its length uses UTF-16 units.
+            let text_length = unsafe { CFStringGetLength(value.0) };
+            let start = usize::try_from(range.location).map_err(|_| "negative selection start")?;
+            let length = usize::try_from(range.length).map_err(|_| "negative selection length")?;
+            let text_length = usize::try_from(text_length).map_err(|_| "negative text length")?;
+            if start
+                .checked_add(length)
+                .is_none_or(|end| end > text_length)
+            {
+                return Err(format!(
+                    "selection {start}:{length} exceeds text length {text_length}"
+                ));
+            }
+            Ok(TextSelection {
+                start,
+                length,
+                text_length,
+            })
+        }
+
+        fn find_text_areas(
+            element: &Owned,
+            pid: i32,
+            depth: usize,
+            remaining: &mut usize,
+            found: &mut Vec<TextSelection>,
+        ) -> Result<(), String> {
+            if depth > 12 || *remaining == 0 {
+                return Err("scratch AX tree exceeds depth/node limit".into());
+            }
+            *remaining -= 1;
+            let role = ax_attribute(element, "AXRole")?;
+            if string_text(role.0).as_deref() == Some("AXTextArea") {
+                found.push(selected_range(element)?);
+            } else {
+                for child in ax_elements(element, "AXChildren", pid)? {
+                    find_text_areas(&child, pid, depth + 1, remaining, found)?;
+                }
+            }
+            Ok(())
+        }
+
+        /// Read the selection without focusing, fronting or changing any AX value.
+        pub fn text_selection(pid: u32, expected_document: &str) -> Result<TextSelection, String> {
+            let pid = i32::try_from(pid).map_err(|_| "pid out of range")?;
+            // SAFETY: creates an owned application reference for the scratch pid.
+            let app = unsafe { AXUIElementCreateApplication(pid) };
+            if app.is_null() {
+                return Err("AX application is null".into());
+            }
+            let app = Owned(app);
+            // SAFETY: app is a live AX element; bound its messages.
+            let code = unsafe { AXUIElementSetMessagingTimeout(app.0, 0.5) };
+            if code != 0 {
+                return Err(format!("app timeout setup: AX error {code}"));
+            }
+            let windows = ax_elements(&app, "AXWindows", pid)?;
+            let [window] = windows.as_slice() else {
+                return Err(format!(
+                    "expected one scratch window, found {}",
+                    windows.len()
+                ));
+            };
+            let document = ax_attribute(window, "AXDocument")?;
+            // SAFETY: document is live and checked before CFURL access.
+            let document = if unsafe { CFGetTypeID(document.0) == CFURLGetTypeID() } {
+                // SAFETY: the URL keeps its borrowed string live during conversion.
+                string_text(unsafe { CFURLGetString(document.0) })
+            } else {
+                string_text(document.0)
+            };
+            if !document
+                .as_deref()
+                .is_some_and(|doc| same_document(doc, expected_document))
+            {
+                return Err(format!(
+                    "window AXDocument {document:?} is not the scratch document"
+                ));
+            }
+            let mut found = Vec::new();
+            find_text_areas(window, pid, 0, &mut 128, &mut found)?;
+            match found.as_slice() {
+                [selection] => Ok(*selection),
+                _ => Err(format!(
+                    "expected one scratch AXTextArea, found {}",
+                    found.len()
+                )),
             }
         }
 
@@ -1449,6 +1703,21 @@ mod desk {
     }
 
     pub fn run(baseline: bool) -> i32 {
+        if baseline {
+            println!(
+                "RECORD baseline startup: screen-recording preflight={}",
+                cerebellum_macos::screen_capture_is_permitted()
+            );
+            match cerebellum_macos::enumerate_windows(Duration::from_secs(2)) {
+                Ok(windows) => println!(
+                    "RECORD baseline startup: direct window-list count={}",
+                    windows.len()
+                ),
+                Err(reason) => {
+                    println!("RECORD baseline startup: direct window-list error={reason}")
+                }
+            }
+        }
         // A failed exclusion check still fails the run, but the desk phases
         // below still run: each desk session costs the person's time, so one
         // session should report every check rather than stop at the first.
@@ -1639,25 +1908,45 @@ mod desk {
     /// Run this probe again with the agent cursor off and read its idle CPU
     /// time.
     fn baseline_run(executable: &Path) -> Result<u64, String> {
+        use std::io::BufReader;
+        use std::process::Stdio;
+
         println!("BASELINE run with the agent cursor off");
         // A plain child has a different responsibility chain from the main
         // probe. Use the same disclaiming launcher and the same signed binary
         // instead of relying on macOS's helper-attribution heuristics.
-        let output = baseline_launch_command(executable)
-            .output()
+        let mut child = baseline_launch_command(executable)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|error| format!("could not run sibling disclaim_launch: {error}"))?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            println!("  baseline: {line}");
-        }
-        if !output.status.success() {
+        let stdout = child.stdout.take().expect("piped baseline stdout");
+        let stderr = child.stderr.take().expect("piped baseline stderr");
+        // Drain both pipes concurrently so neither can stall the child. Forward
+        // lines immediately, preserving their timing for the outer log reader.
+        let out = std::thread::spawn(move || {
+            stream_baseline(BufReader::new(stdout), |line| {
+                println!("  baseline: {line}")
+            })
+        });
+        let err = std::thread::spawn(move || {
+            stream_baseline(BufReader::new(stderr), |line| {
+                eprintln!("  baseline stderr: {line}")
+            })
+        });
+        let status = child.wait();
+        let stdout = out.join().map_err(|_| "baseline stdout reader panicked")?;
+        let stderr = err.join().map_err(|_| "baseline stderr reader panicked")?;
+        let status = status.map_err(|error| format!("waiting for baseline: {error}"))?;
+        let idle_ns = stdout?;
+        stderr?;
+        if !status.success() {
             return Err(format!(
-                "exit {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
+                "exit {:?}; see streamed baseline stdout/stderr above",
+                status.code(),
             ));
         }
-        baseline_from_output(&stdout).ok_or_else(|| format!("no {BASELINE_LINE} line"))
+        idle_ns.ok_or_else(|| format!("no {BASELINE_LINE} line"))
     }
 
     /// Every phase against the scratch app. Returns the process exit code.
@@ -1839,6 +2128,7 @@ mod desk {
         let _ = cerebellum::desk_probe::take_fronting_landings();
         let mut attempts = Vec::with_capacity(NEEDS_FRONT_ATTEMPTS);
         for attempt in 1..=NEEDS_FRONT_ATTEMPTS {
+            let selection_before = scratch.selection();
             sampler.needs_front.store(true, Ordering::SeqCst);
             let chord = serve(
                 "computer.keys",
@@ -1846,6 +2136,11 @@ mod desk {
             )
             .await;
             sampler.needs_front.store(false, Ordering::SeqCst);
+            let selection_after = scratch.selection();
+            println!(
+                "{}",
+                selection_line(attempt, &selection_before, &selection_after)
+            );
             println!(
                 "RECORD needs-front attempt {attempt}: outcome={} effect_status={} fronting={}",
                 chord["outcome"], chord["effect_status"], chord["fronting"]
@@ -1873,7 +2168,10 @@ mod desk {
                             None => println!("RECORD needs-front attempt {attempt}: not confirmed in call; no late landing observed"),
                         },
                     }
-                    if needs_front_reply_verdict(&chord).is_ok() {
+                    // Exceeding the request-to-restore time bound after posting
+                    // fails the verdict, but the timing is still a posted
+                    // bracket, not cleanup of an unposted chord.
+                    if chord["outcome"] == "delivery_unconfirmed" {
                         measured.bracket_ms = timing.restore_confirmed_ms;
                         measured.post_and_restore_ms = timing.confirmed_front_ms.zip(timing.restore_confirmed_ms).map(|(front, restored)| restored - front);
                     } else {
@@ -1885,9 +2183,9 @@ mod desk {
             match measured.bracket_ms {
                 Some(ms) => println!("RECORD needs-front attempt {attempt}: whole posted bracket (request→post→restore confirmed) {ms:.3} ms"),
                 None => {
-                    println!("RECORD needs-front attempt {attempt}: whole posted bracket not completed/confirmed");
+                    println!("RECORD needs-front attempt {attempt}: no posted+restored bracket confirmed");
                     if let Some(ms) = measured.cleanup_only_ms {
-                        println!("RECORD needs-front attempt {attempt}: cleanup-only request→restore confirmed {ms:.3} ms (not a completed chord)");
+                        println!("RECORD needs-front attempt {attempt}: cleanup-only request→restore confirmed {ms:.3} ms (no posted chord confirmed)");
                     }
                 }
             }
@@ -2418,7 +2716,7 @@ mod tests {
     #[test]
     fn the_chord_must_report_a_needs_front_front_that_was_restored() {
         let fronting = |restore: &str, purpose: &str| {
-            json!({"outcome": "completed", "fronting": {
+            json!({"outcome": "delivery_unconfirmed", "target_fronted": true, "fronting": {
                 "mode": "background", "fronted": true, "purpose": purpose, "restore": restore,
             }})
         };
@@ -2430,6 +2728,152 @@ mod tests {
             "mode": "background", "fronted": true, "purpose": "needs_front", "restore": "restored",
         }});
         assert!(needs_front_reply_verdict(&refused).is_err());
+    }
+
+    fn held_chord() -> Value {
+        json!({
+            "outcome": "delivery_unconfirmed",
+            "target_fronted": true,
+            "fronting": {
+                "mode": "background", "purpose": "needs_front",
+                "fronted": true, "restore": "restored"
+            }
+        })
+    }
+
+    #[test]
+    fn needs_front_accepts_the_posted_keys_contract_without_claiming_completion() {
+        assert_eq!(needs_front_reply_verdict(&held_chord()), Ok(()));
+        let mut completed = held_chord();
+        completed["outcome"] = json!("completed");
+        assert!(needs_front_reply_verdict(&completed)
+            .unwrap_err()
+            .contains("outcome was \"completed\", expected \"delivery_unconfirmed\""));
+    }
+
+    #[test]
+    fn needs_front_names_every_missing_or_wrong_bracket_condition() {
+        for (pointer, wrong, field) in [
+            ("/outcome", json!("fronting_failed"), "outcome"),
+            ("/target_fronted", json!(false), "target_fronted"),
+            ("/fronting/mode", json!("foreground"), "fronting.mode"),
+            ("/fronting/purpose", json!("other"), "fronting.purpose"),
+            ("/fronting/fronted", json!(false), "fronting.fronted"),
+            (
+                "/fronting/restore",
+                json!("skipped_person"),
+                "fronting.restore",
+            ),
+        ] {
+            let mut reply = held_chord();
+            *reply.pointer_mut(pointer).unwrap() = wrong;
+            let error = needs_front_reply_verdict(&reply).unwrap_err();
+            assert!(error.contains(&format!("{field} was")), "{error}");
+            *reply.pointer_mut(pointer).unwrap() = Value::Null;
+            let error = needs_front_reply_verdict(&reply).unwrap_err();
+            assert!(error.contains(&format!("{field} was null")), "{error}");
+        }
+        let missing = needs_front_reply_verdict(&json!({})).unwrap_err();
+        for field in [
+            "outcome",
+            "target_fronted",
+            "fronting.fronted",
+            "fronting.restore",
+        ] {
+            assert!(missing.contains(&format!("{field} was null")), "{missing}");
+        }
+        for reason in [json!("fronting_bound_exceeded"), Value::Null] {
+            let mut reply = held_chord();
+            reply["containment_forfeited_because"] = reason;
+            assert!(needs_front_reply_verdict(&reply)
+                .unwrap_err()
+                .contains("containment_forfeited_because was"));
+        }
+    }
+
+    #[test]
+    fn selection_line_reports_both_ranges_and_utf16_text_lengths() {
+        let before = Ok(TextSelection {
+            start: 2,
+            length: 0,
+            text_length: 23,
+        });
+        let after = Ok(TextSelection {
+            start: 0,
+            length: 23,
+            text_length: 23,
+        });
+        assert_eq!(selection_line(12, &before, &after),
+            "RECORD needs-front attempt 12: selection before=2:0 after=0:23 length=23→23 (UTF-16; start:length)");
+        let changed = Ok(TextSelection {
+            start: 0,
+            length: 24,
+            text_length: 24,
+        });
+        assert!(selection_line(13, &after, &changed).contains("length=23→24"));
+    }
+
+    #[test]
+    fn selection_line_reports_unreadable_sides_with_reasons_on_one_line() {
+        let before = Err("scratch AXTextArea not found\nAXChildren unavailable".into());
+        let after = Ok(TextSelection {
+            start: 0,
+            length: 23,
+            text_length: 23,
+        });
+        assert_eq!(selection_line(3, &before, &after),
+            "RECORD needs-front attempt 3: selection before=unreadable after=0:23 length=unreadable→23 (UTF-16; start:length); selection unreadable: before: scratch AXTextArea not found AXChildren unavailable");
+        let failed_after = Err("AXSelectedTextRange: AX error -25212".into());
+        assert_eq!(selection_line(4, &after, &failed_after),
+            "RECORD needs-front attempt 4: selection before=0:23 after=unreadable length=23→unreadable (UTF-16; start:length); selection unreadable: after: AXSelectedTextRange: AX error -25212");
+        let both = selection_line(5, &before, &failed_after);
+        assert!(both.contains("before=unreadable after=unreadable length=unreadable→unreadable"));
+        assert!(both.contains("; after: AXSelectedTextRange: AX error -25212"));
+        assert_eq!(both.lines().count(), 1);
+    }
+
+    #[test]
+    fn baseline_stream_emits_each_line_before_reading_the_next() {
+        use std::cell::RefCell;
+        use std::io::{BufReader, Read};
+        use std::rc::Rc;
+
+        struct Output {
+            emitted: Rc<RefCell<Vec<String>>>,
+            chunk: usize,
+        }
+        impl Read for Output {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                assert_eq!(self.emitted.borrow().len(), self.chunk);
+                let chunks: [&[u8]; 3] = [
+                    b"starting\n",
+                    b"BASELINE_MODULE_IDLE_CPU_NS=123\n",
+                    b"done\n",
+                ];
+                let Some(chunk) = chunks.get(self.chunk) else {
+                    return Ok(0);
+                };
+                buffer[..chunk.len()].copy_from_slice(chunk);
+                self.chunk += 1;
+                Ok(chunk.len())
+            }
+        }
+        let emitted = Rc::new(RefCell::new(Vec::new()));
+        let output = Output {
+            emitted: emitted.clone(),
+            chunk: 0,
+        };
+        assert_eq!(
+            stream_baseline(BufReader::new(output), |line| emitted
+                .borrow_mut()
+                .push(line.into())),
+            Ok(Some(123))
+        );
+        assert_eq!(
+            *emitted.borrow(),
+            ["starting", "BASELINE_MODULE_IDLE_CPU_NS=123", "done"]
+        );
+        assert_eq!(stream_baseline(&b"no marker\n"[..], |_| {}), Ok(None));
     }
 
     #[test]
