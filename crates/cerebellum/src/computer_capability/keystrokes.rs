@@ -403,7 +403,33 @@ pub(crate) fn typed_text_arrived(
     let Ok(Some(after)) = source.text_value(&focus.handle) else {
         return false;
     };
-    changed_part(before, &after).is_some_and(|inserted| inserted.contains(text))
+    inserted_text_arrived(before, &after, text)
+}
+
+fn inserted_text_arrived(before: &str, after: &str, text: &str) -> bool {
+    changed_part(before, after).is_some_and(|inserted| inserted.contains(text))
+}
+
+fn inserted_text_reversed(before: &str, after: &str, text: &str) -> bool {
+    let reversed: String = text.chars().rev().collect();
+    reversed != text && changed_part(before, after) == Some(reversed.as_str())
+}
+
+/// A diagnostic only: an exact reversed insertion is not successful delivery.
+/// Missing or placeholder-only AX values cannot establish this diagnosis.
+pub(crate) fn typed_text_reversed(
+    source: &dyn AppStateSource,
+    focus: &TargetFocus,
+    text: &str,
+) -> bool {
+    let Some(before) = focus.before.as_deref() else {
+        return false;
+    };
+    source
+        .text_value(&focus.handle)
+        .ok()
+        .flatten()
+        .is_some_and(|after| inserted_text_reversed(before, &after, text))
 }
 
 /// Poll [`typed_text_arrived`] until it holds, `deadline` passes or `stopped`
@@ -463,8 +489,35 @@ pub(crate) fn changed_part<'a>(before: &str, after: &'a str) -> Option<&'a str> 
 }
 
 #[cfg(test)]
+#[path = "typing_pacing_tests.rs"]
+mod pacing_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reversed_typed_text_is_diagnosed_but_never_confirmed() {
+        for (before, after, text) in [
+            ("", "eerht kcehc egdab", "badge check three"),
+            ("prefix[]suffix", "prefix[🦀ba]suffix", "ab🦀"),
+        ] {
+            assert!(!inserted_text_arrived(before, after, text));
+            assert!(inserted_text_reversed(before, after, text));
+        }
+        assert!(!inserted_text_reversed("", "abba", "abba"));
+        assert!(!inserted_text_reversed(
+            "Search CortexKit",
+            "Search CortexKit",
+            "badge"
+        ));
+        assert!(!inserted_text_reversed("", "unrelated", "badge"));
+        assert!(inserted_text_arrived(
+            "",
+            "badge check three",
+            "badge check three"
+        ));
+    }
 
     /// A bracket that posted every unit but held the target in front past the
     /// bound reports the keystrokes as delivered with the overrun named, never
