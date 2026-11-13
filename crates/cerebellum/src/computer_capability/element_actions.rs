@@ -822,7 +822,7 @@ fn press_available(
             "reason": "press_not_offered",
             "remedy": format!(
                 "this element offers {}, not a press for this role; nothing was done and the \
-                 pointer was not used. Choose a nearby element that offers AXPress, or call \
+                 pointer was not used. Choose a nearby element that can be pressed, or call \
                  read_state for a fresh read",
                 describe_actions(&facts.actions)
             ),

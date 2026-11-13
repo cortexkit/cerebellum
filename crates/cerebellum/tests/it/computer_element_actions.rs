@@ -892,7 +892,7 @@ async fn pressing_a_context_menu_only_element_refuses_without_dispatch() {
         assert_eq!(reply["reason"], "press_not_offered", "{reply}");
         let remedy = reply["remedy"].as_str().unwrap();
         assert!(
-            remedy.contains("nearby element that offers AXPress"),
+            remedy.contains("nearby element that can be pressed"),
             "{reply}"
         );
         assert!(remedy.contains("read_state for a fresh read"), "{reply}");
