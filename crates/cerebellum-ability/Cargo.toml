@@ -1,0 +1,12 @@
+[package]
+name = "cerebellum-ability"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Platform-neutral personal-data ability contracts and normalization"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = "0.22"

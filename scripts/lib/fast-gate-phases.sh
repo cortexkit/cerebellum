@@ -10,13 +10,13 @@ require_part_host() {
 
 mac_package() {
   case "$1" in
-    cerebellum|cerebellum-computer|cerebellum-macos|cerebellum-native-host) return 0 ;;
+    cerebellum|cerebellum-ability|cerebellum-computer|cerebellum-macos|cerebellum-native-host) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 select_mac_plan() {
-  # These binaries contain platform-gated tests that Linux cannot execute.
+  # Keep native platform tests and the shared ability contract on macOS.
   # Keep the original diff scope; script-only changes need no native rebuild.
   local package suite
   local mac_packages=() mac_libs=() mac_suites=()

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/cerebellum",
+    "crates/cerebellum-ability",
     "crates/cerebellum-bridge-protocol",
     "crates/cerebellum-core",
     "crates/cerebellum-computer",

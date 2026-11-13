@@ -293,13 +293,13 @@ linux_mode() {
 mac_mode() {
   uname() { echo Darwin; }
   require_part_host mac && ! require_part_host linux || return 1
-  packages=(cerebellum cerebellum-core cerebellum-computer cerebellum-macos cerebellum-native-host)
-  lib_packages=(cerebellum cerebellum-core cerebellum-computer cerebellum-macos)
-  suites=(cerebellum-core:it cerebellum:it cerebellum-macos:preview_hide)
+  packages=(cerebellum cerebellum-ability cerebellum-core cerebellum-computer cerebellum-macos cerebellum-native-host)
+  lib_packages=(cerebellum cerebellum-ability cerebellum-core cerebellum-computer cerebellum-macos)
+  suites=(cerebellum-core:it cerebellum:it cerebellum-ability:model cerebellum-macos:preview_hide)
   select_mac_plan
-  [ "${packages[*]}" = 'cerebellum cerebellum-computer cerebellum-macos cerebellum-native-host' ] || return 1
-  [ "${lib_packages[*]}" = 'cerebellum cerebellum-computer cerebellum-macos' ] || return 1
-  [ "${suites[*]}" = 'cerebellum:it cerebellum-macos:preview_hide' ] || return 1
+  [ "${packages[*]}" = 'cerebellum cerebellum-ability cerebellum-computer cerebellum-macos cerebellum-native-host' ] || return 1
+  [ "${lib_packages[*]}" = 'cerebellum cerebellum-ability cerebellum-computer cerebellum-macos' ] || return 1
+  [ "${suites[*]}" = 'cerebellum:it cerebellum-ability:model cerebellum-macos:preview_hide' ] || return 1
   packages=(cerebellum-linux)
   lib_packages=(cerebellum-core)
   suites=(cerebellum-core:it)
