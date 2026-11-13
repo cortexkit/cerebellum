@@ -382,9 +382,9 @@ where
                 tokio::task::spawn_blocking(move || {
                     let _permit = hold;
                     let listed = source.installed_apps(std::time::Duration::from_secs(1));
-                    super::open_app::resolve_installed(&target.target, &listed.apps)
+                    super::open_app::resolve_installed(&target.target, &listed.apps, &*source)
                         .ok()
-                        .map(|app| app.bundle_identity)
+                        .map(|resolved| resolved.app.bundle_identity)
                 })
                 .await
                 .ok()
@@ -407,9 +407,9 @@ where
         tokio::task::spawn_blocking(move || {
             let _permit = hold;
             let listed = source.installed_apps(std::time::Duration::from_secs(1));
-            super::open_app::resolve_installed(&target, &listed.apps)
+            super::open_app::resolve_installed(&target, &listed.apps, &*source)
                 .ok()
-                .map(|app| app.bundle_identity)
+                .map(|resolved| resolved.app.bundle_identity)
         })
         .await
         .ok()
@@ -936,6 +936,8 @@ mod tests {
             name: name.into(),
             bundle_identity: bundle_identity.into(),
             path: std::path::PathBuf::from(format!("/fixture/{name}.app")),
+            version: None,
+            build_version: None,
         }
     }
     fn bind(planes: &Planes, channel: u16, session: &str) {

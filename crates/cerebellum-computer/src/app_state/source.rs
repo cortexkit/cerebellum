@@ -742,6 +742,24 @@ pub trait AppStateSource: Send + Sync {
         Err(AppStateReadError::UnsupportedOnPlatform)
     }
 
+    /// Kernel process generations and executable paths for this bundle identity.
+    /// Unlike display names, these can distinguish installed copies.
+    fn running_app_instances(
+        &self,
+        _bundle: &str,
+    ) -> Result<Vec<RunningAppInstance>, AppStateReadError> {
+        Err(AppStateReadError::UnsupportedOnPlatform)
+    }
+
+    /// Observe only this process generation; never launch a replacement.
+    fn opened_running_app(
+        &self,
+        _app: &InstalledApp,
+        _process: &ProcessGrant,
+    ) -> Result<OpenedApp, OpenAppError> {
+        Err(OpenAppError::Failed)
+    }
+
     /// Read only installed bundle names and identities, stopping at the deadline.
     fn installed_apps(&self, _timeout: Duration) -> InstalledApps {
         InstalledApps {
@@ -820,6 +838,14 @@ pub struct InstalledApp {
     pub name: String,
     pub bundle_identity: String,
     pub path: std::path::PathBuf,
+    pub version: Option<String>,
+    pub build_version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunningAppInstance {
+    pub process: ProcessGrant,
+    pub executable_path: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]

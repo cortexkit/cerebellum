@@ -2088,6 +2088,8 @@ fn installed_desk(already_running: bool) -> support::Desk {
             name: "Safari".into(),
             bundle_identity: support::TARGET_BUNDLE_ID.into(),
             path: PathBuf::from("/Applications/Safari.app"),
+            version: None,
+            build_version: None,
         }];
         state.opened.already_running = already_running;
         state.opened.has_window = true;

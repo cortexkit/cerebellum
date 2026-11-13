@@ -492,9 +492,58 @@ impl AppStateSource for MacAppStateSource {
                     name: app.name,
                     bundle_identity: app.bundle_identifier,
                     path: app.path,
+                    version: app.version,
+                    build_version: app.build_version,
                 })
                 .collect(),
         }
+    }
+
+    fn running_app_instances(
+        &self,
+        bundle: &str,
+    ) -> Result<Vec<super::source::RunningAppInstance>, AppStateReadError> {
+        cerebellum_macos::running_application_instances(bundle)
+            .map_err(|_| AppStateReadError::Unreadable)
+            .map(|instances| {
+                instances
+                    .into_iter()
+                    .map(|instance| super::source::RunningAppInstance {
+                        process: ProcessGrant {
+                            pid: instance.pid,
+                            bundle_identity: bundle.into(),
+                            process_generation_evidence: instance.start_time_micros.to_string(),
+                        },
+                        executable_path: instance.executable_path,
+                    })
+                    .collect()
+            })
+    }
+
+    fn opened_running_app(
+        &self,
+        app: &super::source::InstalledApp,
+        process: &ProcessGrant,
+    ) -> Result<super::source::OpenedApp, super::source::OpenAppError> {
+        let start = process
+            .process_generation_evidence
+            .parse()
+            .map_err(|_| super::source::OpenAppError::Failed)?;
+        let opened = cerebellum_macos::inspect_running_application(
+            &app.path,
+            &app.bundle_identity,
+            process.pid,
+            start,
+        )
+        .map_err(|_| super::source::OpenAppError::Failed)?;
+        Ok(super::source::OpenedApp {
+            pid: opened.pid,
+            already_running: true,
+            has_window: opened.has_window,
+            frontmost: opened.frontmost,
+            process_started_ms: opened.process_started_ms,
+            first_window_ms: opened.first_window_ms,
+        })
     }
 
     fn bundle_signature(

@@ -4,6 +4,7 @@
 
 use super::*;
 use cerebellum_computer::app_state::source::InstalledApp;
+use cerebellum_computer::platform::ProcessGrant;
 use cerebellum_core::journal::{InMemoryJournalStorage, JournalConfig};
 use std::time::Duration;
 use subc_protocol::{Flags, Frame, FrameType, Priority, PROTOCOL_VERSION};
@@ -22,6 +23,8 @@ fn installed(name: &str, bundle: &str) -> InstalledApp {
         name: name.into(),
         bundle_identity: bundle.into(),
         path: std::path::PathBuf::from(format!("/Applications/{name}.app")),
+        version: None,
+        build_version: None,
     }
 }
 
@@ -242,11 +245,23 @@ async fn open_app_ambiguous_name_lists_candidates_without_launching() {
         installed("Editor", "com.one.Editor"),
         installed("Editor", "com.two.Editor"),
     ];
+    desk.state().installed.apps[0].version = Some("2.0".into());
+    desk.state().installed.apps[1].version = Some("1.0".into());
+    desk.state().running_instances =
+        vec![cerebellum_computer::app_state::source::RunningAppInstance {
+            process: ProcessGrant {
+                bundle_identity: "com.one.Editor".into(),
+                ..support::grant()
+            },
+            executable_path: "/Applications/Editor.app/Contents/MacOS/Editor".into(),
+        }];
     for complete in [true, false] {
         desk.state().installed.complete = complete;
         let (reply, questions) = wire(&planes, "open_app", json!({"target":"Editor"})).await;
         assert_eq!(reply["outcome"], "ambiguous_app", "{reply}");
-        assert_eq!(reply["remedy"], "several installed applications match; use a unique app identity (a bundle id on macOS; duplicate installations must be removed or renamed)");
+        let remedy = reply["remedy"].as_str().unwrap();
+        assert!(remedy.contains("Use a unique app identity"));
+        assert!(remedy.contains("/Applications/Editor.app"));
         assert_eq!(
             reply["installed_list"],
             if complete { "complete" } else { "partial" }
@@ -277,6 +292,190 @@ async fn open_app_already_running_and_window_timeout_are_disclosed() {
     assert_eq!(questions, 0);
     assert_eq!(reply["outcome"], "launched_no_window", "{reply}");
     assert_eq!(reply["has_window"], false);
+}
+
+fn duplicate_copies() -> Vec<InstalledApp> {
+    let mut current = installed("Safari", "com.apple.Safari");
+    current.version = Some("0.20.23".into());
+    let mut stale = current.clone();
+    stale.path = "/Users/fixture/Applications/Safari.app".into();
+    stale.version = Some("0.17.0".into());
+    vec![current, stale]
+}
+
+#[tokio::test]
+async fn open_app_one_running_copy_wins_without_launching() {
+    let (planes, desk, _) = rig();
+    let copies = duplicate_copies();
+    // The older copy is running: process identity, not version, wins.
+    let executable_path = copies[1].path.join("Contents/MacOS/Safari");
+    desk.state().installed.apps = copies;
+    desk.state().running_instances =
+        vec![cerebellum_computer::app_state::source::RunningAppInstance {
+            process: support::grant(),
+            executable_path,
+        }];
+    for target in ["Safari", "com.apple.Safari"] {
+        let (reply, _) = wire(&planes, "open_app", json!({"target":target})).await;
+        assert_eq!(reply["outcome"], "already_running", "{reply}");
+        assert_eq!(reply["pid"], support::grant().pid);
+    }
+    assert!(desk.state().opens.is_empty());
+    assert_eq!(
+        desk.state().observed_processes,
+        [support::grant(), support::grant()]
+    );
+}
+
+#[tokio::test]
+async fn open_app_no_running_copy_opens_highest_numeric_version_by_path() {
+    let (planes, desk, _) = rig();
+    let mut copies = duplicate_copies();
+    copies[0].version = Some("1.9.99".into());
+    copies[1].version = Some("1.10.0".into());
+    let selected = copies[1].path.clone();
+    desk.state().installed.apps = copies;
+    let (reply, _) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(reply["outcome"], "launched", "{reply}");
+    assert_eq!(desk.state().opened_paths, [selected]);
+}
+
+#[tokio::test]
+async fn open_app_duplicate_versions_fall_back_to_build_numbers() {
+    let (planes, desk, _) = rig();
+    let mut copies = duplicate_copies();
+    copies[0].version = None;
+    copies[0].build_version = Some("99.2".into());
+    copies[1].version = Some("unparseable".into());
+    copies[1].build_version = Some("100.1".into());
+    let selected = copies[1].path.clone();
+    desk.state().installed.apps = copies;
+    let (reply, _) = wire(&planes, "open_app", json!({"target":"com.apple.Safari"})).await;
+    assert_eq!(reply["outcome"], "launched", "{reply}");
+    assert_eq!(desk.state().opened_paths, [selected]);
+}
+
+#[tokio::test]
+async fn open_app_equal_or_unparseable_versions_refuse_with_actionable_remedy() {
+    for versions in [
+        ("1", "1.0.0"),
+        ("1.0", "1.0"),
+        ("1.0", "bad"),
+        ("1.0", "1..0"),
+    ] {
+        let (planes, desk, _) = rig();
+        let mut copies = duplicate_copies();
+        copies[0].version = Some(versions.0.into());
+        copies[1].version = Some(versions.1.into());
+        if versions.0 == versions.1 {
+            // Build numbers do not break a tie between valid release versions.
+            copies[0].build_version = Some("100".into());
+            copies[1].build_version = Some("200".into());
+        }
+        desk.state().installed.apps = copies.clone();
+        let (reply, questions) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+        assert_eq!(reply["outcome"], "ambiguous_app", "{reply}");
+        let remedy = reply["remedy"].as_str().unwrap();
+        for app in copies {
+            assert!(remedy.contains(app.path.to_str().unwrap()), "{reply}");
+            assert!(remedy.contains(app.version.as_deref().unwrap()), "{reply}");
+        }
+        assert!(remedy.contains("Ask the person"));
+        assert_eq!(reply["candidates"][0].as_object().unwrap().len(), 2);
+        assert_eq!(questions, 0);
+        assert!(desk.state().opens.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn open_app_two_running_copies_refuse_even_with_unique_highest_version() {
+    let (planes, desk, _) = rig();
+    let copies = duplicate_copies();
+    desk.state().installed.apps = copies.clone();
+    desk.state().running_instances = copies
+        .iter()
+        .enumerate()
+        .map(|(index, app)| {
+            let mut process = support::grant();
+            process.pid += index as u32;
+            cerebellum_computer::app_state::source::RunningAppInstance {
+                process,
+                executable_path: app.path.join("Contents/MacOS/Safari"),
+            }
+        })
+        .collect();
+    let (reply, questions) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(reply["outcome"], "ambiguous_app", "{reply}");
+    assert_eq!(questions, 0);
+    assert!(desk.state().opens.is_empty());
+    assert!(desk.state().observed_processes.is_empty());
+}
+
+#[tokio::test]
+async fn open_app_running_process_outside_candidate_bundles_cannot_win() {
+    let (planes, desk, _) = rig();
+    desk.state().installed.apps = duplicate_copies();
+    desk.state().running_instances =
+        vec![cerebellum_computer::app_state::source::RunningAppInstance {
+            process: support::grant(),
+            executable_path: "/Applications/Safari.app-other/Contents/MacOS/Safari".into(),
+        }];
+    let (reply, questions) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(reply["outcome"], "ambiguous_app", "{reply}");
+    assert_eq!(questions, 0);
+    assert!(desk.state().opens.is_empty());
+}
+
+#[tokio::test]
+async fn open_app_first_action_refuses_a_differently_signed_older_process() {
+    let (mut planes, desk, _) = rig();
+    let copies = duplicate_copies();
+    let older_path = copies[1].path.clone();
+    desk.state().installed.apps = copies;
+    let (opened, questions) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(opened["outcome"], "launched", "{opened}");
+    assert_eq!(questions, 1);
+    let grants = planes.management.computer_grants().clone();
+    planes.management = Arc::new(crate::management::ManagementPlane::with_computer_grants(
+        Arc::new(support::FixedWithCode(
+            cerebellum_computer::platform::TargetResolution::Resolved(support::grant()),
+            support::InjectedCode::new(Ok(support::team_identity("OLDERTEAM1"))),
+        )),
+        grants,
+    ));
+    // Model a stale launch result reporting the older copy's process. Its
+    // signer must be admitted independently on the first action, not inherited
+    // from the approved on-disk bundle with the same app identity.
+    desk.state().running_instances =
+        vec![cerebellum_computer::app_state::source::RunningAppInstance {
+            process: support::grant(),
+            executable_path: older_path.join("Contents/MacOS/Safari"),
+        }];
+    planes.computer = Ok(Arc::new(
+        ComputerPlane::with_synthetic_driver_and_result_schema_enforcement(
+            super::computer_audit(crate::JournalPersistence::Isolated).unwrap(),
+            ResultSchemaEnforcement::Withhold,
+            NativeComputerPlatformDriver::default,
+        )
+        .with_permission_liveness(super::live_for_test())
+        .with_session_lock_for_test(Some(false))
+        .with_app_state_source(desk.source()),
+    ));
+    planes.computer_admitted = Arc::new(["computer.read_state".to_string()].into());
+    let (reply, questions) = wire_with_decision(
+        &planes,
+        "read_state",
+        json!({"target":"com.apple.Safari"}),
+        "deny",
+    )
+    .await;
+    assert_eq!(reply["outcome"], "consent_denied", "{reply}");
+    assert_eq!(
+        questions, 1,
+        "the launch grant must not authorize a different signer"
+    );
+    assert_eq!(desk.state().app_reads, 0);
+    assert_eq!(desk.state().opens.len(), 1);
 }
 
 #[tokio::test]
