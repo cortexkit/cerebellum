@@ -8,7 +8,8 @@
 //! wake the thread; a kqueue registered for each watched application's exit
 //! wakes it when the application quits, which
 //! some applications do without reporting their windows destroyed. Nothing
-//! runs between those events: there is no timer and no polling.
+//! runs here between those events. If an application refuses a visibility
+//! notification, the caller polls only that state while its badge is shown.
 //!
 //! Every observer is created, used and released on that one thread, so a
 //! notification can never race the removal of its watch. Each notification
@@ -18,7 +19,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use objc2_core_foundation::{
@@ -51,10 +52,20 @@ const NOTIFICATIONS: [(&str, NotificationTarget); 5] = [
     (APPLICATION_HIDDEN, NotificationTarget::Application),
 ];
 
-fn register_notifications(mut add: impl FnMut(&'static str, NotificationTarget) -> bool) -> bool {
-    NOTIFICATIONS
-        .iter()
-        .all(|&(name, target)| add(name, target))
+fn register_notifications(
+    mut add: impl FnMut(&'static str, NotificationTarget) -> bool,
+) -> Option<u8> {
+    let mut poll = 0;
+    for (name, target) in NOTIFICATIONS {
+        if !add(name, target) {
+            match name {
+                MINIATURIZED => poll |= 1,
+                APPLICATION_HIDDEN => poll |= 2,
+                _ => return None,
+            }
+        }
+    }
+    Some(poll)
 }
 
 fn notification_change(name: &str) -> Option<AxWindowChange> {
@@ -236,11 +247,23 @@ fn on_follower(work: impl FnOnce() + Send + 'static) -> bool {
 
 /// A running watch. Dropping it removes the window's observer.
 #[derive(Debug)]
-pub struct AxWindowWatch(u64);
+pub struct AxWindowWatch {
+    id: u64,
+    poll: Arc<AtomicU8>,
+}
+
+impl AxWindowWatch {
+    /// States without a working notification subscription: minimized, hidden.
+    /// Both are checked while asynchronous registration is still pending.
+    pub fn poll_visibility(&self) -> (bool, bool) {
+        let poll = self.poll.load(Ordering::Acquire);
+        (poll & 1 != 0, poll & 2 != 0)
+    }
+}
 
 impl Drop for AxWindowWatch {
     fn drop(&mut self) {
-        let id = self.0;
+        let id = self.id;
         on_follower(move || remove(id));
     }
 }
@@ -249,7 +272,8 @@ impl Drop for AxWindowWatch {
 /// `changed` on the follower thread until the watch is dropped. `None` when
 /// the follower thread cannot run or the window's process cannot be named.
 /// Registering happens on the follower thread, shortly after this returns;
-/// if the accessibility API refuses any notification there, it reports `Gone`.
+/// if a required move/resize/destroy subscription fails, it reports `Gone`.
+/// Visibility subscription failures instead require polling by the caller.
 pub fn watch_window(
     window: &AxRetainedElement,
     changed: Box<dyn Fn(AxWindowChange) + Send + Sync>,
@@ -262,13 +286,15 @@ pub fn watch_window(
     let id = NEXT_WATCH.fetch_add(1, Ordering::Relaxed);
     let window = AxRetainedElement(window.0.clone());
     let changed: Changed = Arc::from(changed);
-    if !on_follower(move || add(id, pid, window, changed)) {
+    let poll = Arc::new(AtomicU8::new(3));
+    let registration = poll.clone();
+    if !on_follower(move || add(id, pid, window, changed, registration)) {
         return None;
     }
-    Some(AxWindowWatch(id))
+    Some(AxWindowWatch { id, poll })
 }
 
-fn add(id: u64, pid: c_int, window: AxRetainedElement, changed: Changed) {
+fn add(id: u64, pid: c_int, window: AxRetainedElement, changed: Changed, poll: Arc<AtomicU8>) {
     let mut observer: CfTypeRef = std::ptr::null();
     // SAFETY: `observer` is writable storage for one owned reference.
     if unsafe { AXObserverCreate(pid, on_notification, &mut observer) } != AX_ERROR_SUCCESS {
@@ -311,7 +337,7 @@ fn add(id: u64, pid: c_int, window: AxRetainedElement, changed: Changed) {
     });
     // Check after subscribing so a window hidden during installation cannot
     // fall into the gap before the first notification is observed.
-    if !registered
+    if registered.is_none()
         || crate::ax_actions::window_minimized(&watch.window) != Some(false)
         || crate::ax_actions::application_hidden(&watch.application) != Some(false)
     {
@@ -319,6 +345,7 @@ fn add(id: u64, pid: c_int, window: AxRetainedElement, changed: Changed) {
         (watch.changed)(AxWindowChange::Gone);
         return;
     }
+    poll.store(registered.unwrap_or(3), Ordering::Release);
     // SAFETY: the source is owned by the observer, which outlives its use
     // here; the cast only names its Core Foundation type.
     let source = unsafe { &*AXObserverGetRunLoopSource(observer_ptr).cast::<CFRunLoopSource>() };
@@ -508,10 +535,13 @@ mod tests {
     #[test]
     fn notifications_cover_window_lifecycle_and_application_hiding() {
         let mut registered = Vec::new();
-        assert!(register_notifications(|name, target| {
-            registered.push((name, target));
-            true
-        }));
+        assert_eq!(
+            register_notifications(|name, target| {
+                registered.push((name, target));
+                true
+            }),
+            Some(0)
+        );
         assert_eq!(
             registered,
             [
@@ -525,19 +555,25 @@ mod tests {
     }
 
     #[test]
-    fn every_notification_is_required() {
-        for rejected in [
-            "AXMoved",
-            "AXResized",
-            "AXUIElementDestroyed",
-            "AXWindowMiniaturized",
-            "AXApplicationHidden",
-        ] {
+    fn geometry_notifications_are_required_but_visibility_refusals_request_polling() {
+        for rejected in ["AXMoved", "AXResized", "AXUIElementDestroyed"] {
             assert!(
-                !register_notifications(|name, _| name != rejected),
+                register_notifications(|name, _| name != rejected).is_none(),
                 "a refused {rejected} subscription must fail closed"
             );
         }
+        assert_eq!(
+            register_notifications(|name, _| name != MINIATURIZED),
+            Some(1)
+        );
+        assert_eq!(
+            register_notifications(|name, _| name != APPLICATION_HIDDEN),
+            Some(2)
+        );
+        assert_eq!(
+            register_notifications(|name, _| name != MINIATURIZED && name != APPLICATION_HIDDEN),
+            Some(3)
+        );
     }
 
     #[test]

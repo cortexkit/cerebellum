@@ -49,6 +49,12 @@ extern "C" {
         attribute: CfTypeRef,
         value: *mut CfTypeRef,
     ) -> i32;
+    fn AXUIElementCopyParameterizedAttributeValue(
+        element: CfTypeRef,
+        attribute: CfTypeRef,
+        parameter: CfTypeRef,
+        value: *mut CfTypeRef,
+    ) -> i32;
     fn AXUIElementSetAttributeValue(
         element: CfTypeRef,
         attribute: CfTypeRef,
@@ -179,6 +185,73 @@ pub fn cursor_element_frame(element: &AxRetainedElement) -> Option<[f64; 4]> {
         return None;
     }
     Some([origin[0], origin[1], extent[0], extent[1]])
+}
+
+/// Read-only selection bounds for a keyboard badge. Unsupported ranges or
+/// parameterized attributes leave the caller's frame-centre fallback intact.
+/// No text value is read, and each message uses the caller's AX deadline.
+pub fn cursor_caret_frame(element: &AxRetainedElement) -> Option<[f64; 4]> {
+    require_trust().ok()?;
+    let pointer = element.as_ptr();
+    bound_messages(pointer);
+    let range = copy(pointer, "AXSelectedTextRange").ok()??;
+    // SAFETY: the retained value must be an AXValue before it is decoded.
+    if unsafe { CFGetTypeID(CFRetained::as_ptr(&range).as_ptr().cast()) != AXValueGetTypeID() } {
+        return None;
+    }
+    let mut selected = CfRange::default();
+    // SAFETY: CFRange is two signed machine words; the decoder checks its type.
+    if !unsafe {
+        AXValueGetValue(
+            CFRetained::as_ptr(&range).as_ptr().cast(),
+            AX_VALUE_CF_RANGE_TYPE,
+            (&mut selected as *mut CfRange).cast(),
+        )
+    } || selected.location < 0
+        || selected.length < 0
+    {
+        return None;
+    }
+    if crate::ax_budget::remaining().is_some_and(|left| left.is_zero()) {
+        return None;
+    }
+    bound_messages(pointer);
+    let attribute = CFString::from_static_str("AXBoundsForRange");
+    let mut bounds: CfTypeRef = std::ptr::null();
+    // SAFETY: element, attribute and range are retained; bounds receives one
+    // owned reference. This API queries geometry and changes no selection.
+    let code = unsafe {
+        AXUIElementCopyParameterizedAttributeValue(
+            pointer,
+            CFRetained::as_ptr(&attribute).as_ptr().cast(),
+            CFRetained::as_ptr(&range).as_ptr().cast(),
+            &mut bounds,
+        )
+    };
+    if code != AX_ERROR_SUCCESS {
+        return None;
+    }
+    // SAFETY: a successful Copy returns one owned reference.
+    let bounds = unsafe { owned(bounds) }?;
+    // SAFETY: only AXValues may be passed to AXValueGetValue.
+    if unsafe { CFGetTypeID(CFRetained::as_ptr(&bounds).as_ptr().cast()) != AXValueGetTypeID() } {
+        return None;
+    }
+    let mut frame = [0.0f64; 4];
+    // SAFETY: CGRect is four doubles; AXValue type 3 checks that layout.
+    if !unsafe {
+        AXValueGetValue(
+            CFRetained::as_ptr(&bounds).as_ptr().cast(),
+            3,
+            frame.as_mut_ptr().cast(),
+        )
+    } || !frame.iter().all(|v| v.is_finite())
+        || frame[2] < 0.0
+        || frame[3] <= 0.0
+    {
+        return None;
+    }
+    Some(frame)
 }
 
 /// The window `element` sits in, for following it while the agent cursor

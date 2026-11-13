@@ -448,9 +448,16 @@ pub enum HitScope {
     SystemWide,
 }
 
-/// A running watch on one window for a cosmetic picture. It has no methods:
-/// dropping it stops the watch and releases everything it holds.
-pub trait CursorWindowWatch: Send {}
+/// A running watch on one window for a cosmetic picture. Dropping it stops
+/// the watch and releases everything it holds.
+pub trait CursorWindowWatch: Send {
+    /// Visibility states whose notifications are unavailable (minimized,
+    /// application hidden). The badge owner polls only these states, and only
+    /// while the badge remains visible. Most watches need no polling.
+    fn poll_visibility(&self) -> (bool, bool) {
+        (false, false)
+    }
+}
 
 /// Reads an application's state and acts on its elements. One implementation
 /// per platform, and a fixture for tests.
@@ -466,6 +473,11 @@ pub trait AppStateSource: Send + Sync {
     }
     /// Best-effort geometry for a cosmetic picture. No values are read.
     fn cursor_frame(&self, _element: &ElementHandle) -> Option<[f64; 4]> {
+        None
+    }
+    /// Read-only AX selection bounds for the focused keyboard target. A zero
+    /// width caret is valid; unsupported or unreadable geometry returns none.
+    fn cursor_caret_frame(&self, _element: &ElementHandle) -> Option<[f64; 4]> {
         None
     }
 

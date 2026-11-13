@@ -16,9 +16,9 @@ use crate::login_capture::vault::{ClaustrumVault, CookieVault};
 
 const FETCH_BUDGET: Duration = Duration::from_secs(1);
 const CACHE_CAPACITY: usize = 32;
-/// Agents whose avatar colour is remembered: one per badge the helper can
+/// Agents whose avatar is remembered: one per badge the helper can
 /// draw at once, which is far more agents than one person runs together.
-const TINT_CAPACITY: usize = 64;
+const AGENT_CAPACITY: usize = 64;
 static MALFORMED_ROWS: AtomicU64 = AtomicU64::new(0);
 static READ_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
@@ -199,10 +199,10 @@ impl Cache {
 pub(crate) struct Avatars {
     route: Arc<dyn CookieVault>,
     cache: Mutex<Cache>,
-    /// Each agent's latest avatar colour, so its next badge, even after a
-    /// hide, is drawn in that colour from the start instead of waiting for
-    /// the avatar to be fetched again.
-    tints: Mutex<VecDeque<(String, Option<AvatarTint>)>>,
+    /// Keep each agent's last good raster as well as its tint. Avatar reads
+    /// may fail or arrive late; neither should replace a known avatar with
+    /// the fallback initial on the next action.
+    agents: Mutex<VecDeque<(String, Rendered)>>,
     slots: Arc<tokio::sync::Semaphore>,
 }
 
@@ -219,32 +219,31 @@ impl Avatars {
         Self {
             route,
             cache: Mutex::new(Cache::default()),
-            tints: Mutex::new(VecDeque::new()),
+            agents: Mutex::new(VecDeque::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
 
-    /// The colour `agent`'s avatar was last read as: `None` until it has
-    /// been, and `Some(None)` for an avatar with no colourful pixels.
-    pub(super) fn known_tint(&self, agent: &str) -> Option<Option<AvatarTint>> {
-        self.tints
+    /// The last successful identity read, retained across transient misses.
+    pub(super) fn known_avatar(&self, agent: &str) -> Option<Rendered> {
+        self.agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .find(|(known, _)| known == agent)
-            .map(|(_, tint)| *tint)
+            .map(|(_, rendered)| rendered.clone())
     }
 
-    fn remember_tint(&self, agent: &str, tint: Option<AvatarTint>) {
-        let mut tints = self
-            .tints
+    fn remember(&self, agent: &str, rendered: Rendered) {
+        let mut agents = self
+            .agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        tints.retain(|(known, _)| known != agent);
-        if tints.len() == TINT_CAPACITY {
-            tints.pop_front();
+        agents.retain(|(known, _)| known != agent);
+        if agents.len() == AGENT_CAPACITY {
+            agents.pop_front();
         }
-        tints.push_back((agent.to_owned(), tint));
+        agents.push_back((agent.to_owned(), rendered));
     }
 
     pub(super) async fn fetch_and_render(self: &Arc<Self>, agent: &str) -> Option<Rendered> {
@@ -270,7 +269,7 @@ impl Avatars {
         .await
         .ok()
         .flatten()?;
-        self.remember_tint(agent, rendered.tint);
+        self.remember(agent, rendered.clone());
         Some(rendered)
     }
 }
@@ -278,6 +277,16 @@ impl Avatars {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn each_agents_last_good_avatar_is_remembered_between_actions() {
+        let avatars = source(None, true);
+        let good = Cache::default().render(&fixture("agent-a")).unwrap();
+        avatars.remember("agent-a", good.clone());
+        assert!(avatars.fetch_and_render("agent-a").await.is_none());
+        assert_eq!(avatars.known_avatar("agent-a"), Some(good));
+        assert_eq!(avatars.known_avatar("agent-b"), None);
+    }
     use crate::login_capture::vault::{BoxFuture, VaultReachError, VaultRoute};
     use crate::test_support::HANG_GUARD;
 
@@ -636,6 +645,21 @@ mod tests {
             }
         });
         receiver
+    }
+
+    #[tokio::test]
+    async fn a_new_action_starts_with_the_cached_avatar_even_when_the_refetch_fails() {
+        let avatars = source(None, true);
+        let good = Cache::default().render(&fixture("agent-a")).unwrap();
+        avatars.remember("agent-a", good.clone());
+        let mut events = scheduled(avatars).await;
+        let next = events.recv().await.unwrap();
+        assert!(!next.avatar_update);
+        assert_eq!(next.avatar_rgba, Some(good.pixels));
+        assert!(
+            events.recv().await.is_none(),
+            "a failed read sends no downgrade"
+        );
     }
 
     #[tokio::test]

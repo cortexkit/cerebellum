@@ -153,6 +153,7 @@ fn agent_cursor() {
                     agent: follow.agent,
                     serial: follow.serial,
                     offset: follow.offset,
+                    window: follow.window,
                 },
                 CursorLine::Picture(event) => {
                     // The agent's colours come from its avatar; until that
@@ -175,6 +176,7 @@ fn agent_cursor() {
                             initial: event.initial,
                             to: event.to,
                             target: event.target,
+                            window: event.window,
                             resting: event.resting,
                             label: event.label,
                             gesture: match event.kind {

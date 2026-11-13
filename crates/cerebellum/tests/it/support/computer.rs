@@ -721,6 +721,8 @@ pub struct DeskState {
     pub pointer_prewarm_error: Option<&'static str>,
     pub on_pointer_prewarm: Option<DeskHook>,
     pub cursor_frame: Option<[f64; 4]>,
+    /// Emulate a window that supports geometry notifications but not minimize.
+    pub cursor_poll_minimized: bool,
     pub press_frame: Option<[f64; 4]>,
     pub displays: Option<Vec<[f64; 4]>>,
     pub visible_windows: Option<Vec<u32>>,
@@ -848,6 +850,7 @@ impl Desk {
             pointer_prewarm_error: None,
             on_pointer_prewarm: None,
             cursor_frame: None,
+            cursor_poll_minimized: false,
             press_frame: Some([10.0, 10.0, 30.0, 20.0]),
             displays: Some(vec![[0.0, 0.0, 1920.0, 1080.0]]),
             visible_windows: None,
@@ -982,6 +985,23 @@ impl AppStateSource for Desk {
 
     fn visible_window_numbers(&self, _: &ProcessGrant) -> Option<Vec<u32>> {
         self.state().visible_windows.clone()
+    }
+
+    fn watch_cursor_window(
+        &self,
+        _: &ElementHandle,
+        _: Box<dyn Fn(cerebellum_computer::cursor::WindowChange) + Send + Sync>,
+    ) -> Option<Box<dyn cerebellum_computer::app_state::source::CursorWindowWatch>> {
+        struct MissingMinimize;
+        impl cerebellum_computer::app_state::source::CursorWindowWatch for MissingMinimize {
+            fn poll_visibility(&self) -> (bool, bool) {
+                (true, false)
+            }
+        }
+        self.state().cursor_poll_minimized.then(|| {
+            Box::new(MissingMinimize)
+                as Box<dyn cerebellum_computer::app_state::source::CursorWindowWatch>
+        })
     }
 
     fn cursor_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {

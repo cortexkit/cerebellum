@@ -63,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             initial: 'F',
             to: point,
             target: None,
+            window: None,
             resting: false,
             label: Some("Focus probe".into()),
             kind: CursorKind::Press,
