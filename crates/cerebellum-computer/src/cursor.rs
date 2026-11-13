@@ -79,8 +79,12 @@ pub struct CursorEvent {
     /// Where the pointer's tip goes, in global top-down screen points.
     pub to: [f64; 2],
     /// The acted-on element's frame (x, y, width, height), when one is known.
-    /// The label pill is placed so it never covers this rectangle.
+    /// Used to follow the element when its window moves, not to place the label.
     pub target: Option<[f64; 4]>,
+    /// The target window in global top-down points. Older senders may omit it;
+    /// the helper then confines the label to the screen alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<[f64; 4]>,
     /// `to` is only a place to appear (the window's content centre), not a
     /// target: a cursor that is already showing stays where it is.
     pub resting: bool,
@@ -168,6 +172,9 @@ impl CursorEvent {
         self.to.iter().all(|v| v.is_finite())
             && self
                 .target
+                .is_none_or(|frame| frame.iter().all(|v| v.is_finite()))
+            && self
+                .window
                 .is_none_or(|frame| frame.iter().all(|v| v.is_finite()))
             && self
                 .avatar_rgba
@@ -401,7 +408,7 @@ const MAX_FOLLOW_OFFSET: f64 = 100_000.0;
 
 /// The element under one agent's badge moved because its window was moved or
 /// resized, so the badge moves with it. It names the agent, the picture event
-/// it belongs to, and a distance; nothing about the element or its window.
+/// it belongs to, a distance, and the window's new bounds for label containment.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CursorFollow {
@@ -413,6 +420,8 @@ pub struct CursorFollow {
     /// A total rather than a step, so a report lost on a full pipe is made
     /// good by the next one.
     pub offset: [f64; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<[f64; 4]>,
 }
 
 impl CursorFollow {
@@ -420,6 +429,9 @@ impl CursorFollow {
         self.offset
             .iter()
             .all(|v| v.is_finite() && v.abs() <= MAX_FOLLOW_OFFSET)
+            && self
+                .window
+                .is_none_or(|frame| frame.iter().all(|v| v.is_finite()))
     }
 }
 
@@ -1180,6 +1192,7 @@ mod tests {
             initial: 'A',
             to: [1.0, 2.0],
             target: None,
+            window: None,
             resting: false,
             label: None,
             kind: CursorKind::Press,
@@ -1325,6 +1338,7 @@ mod tests {
             initial: 'A',
             to: [1.0, 2.0],
             target: Some([0.0, 0.0, 20.0, 20.0]),
+            window: None,
             resting: false,
             label: label(CursorKind::Type, Some("Message"), false),
             kind: CursorKind::Type,
@@ -1380,11 +1394,12 @@ mod tests {
     }
 
     #[test]
-    fn follow_line_names_only_agent_serial_and_offset_and_refuses_extras() {
+    fn follow_line_accepts_legacy_geometry_and_refuses_extras() {
         let line = CursorLine::Follow(CursorFollow {
             agent: "agent-a".into(),
             serial: 4,
             offset: [120.0, -30.5],
+            window: None,
         });
         let encoded = line.encode_line().unwrap();
         assert_eq!(
@@ -1406,6 +1421,7 @@ mod tests {
                 agent: "a".into(),
                 serial: 1,
                 offset,
+                window: None,
             });
             assert!(!line.valid());
             assert!(line.encode_line().is_none());
@@ -1467,6 +1483,7 @@ mod tests {
             initial: 'A',
             to: [1.0, 2.0],
             target: None,
+            window: None,
             resting: false,
             label: None,
             kind: CursorKind::Press,
@@ -1504,12 +1521,43 @@ mod tests {
         assert!(event.encode_line().is_none());
     }
 
+    #[test]
+    fn window_bounds_on_pictures_are_optional_and_reject_non_finite_geometry() {
+        let mut event = sample_picture();
+        let old = serde_json::to_value(&event).unwrap();
+        assert!(old.get("window").is_none());
+        assert_eq!(
+            serde_json::from_value::<CursorEvent>(old).unwrap().window,
+            None
+        );
+        event.window = Some([-1200.0, -800.0, 700.0, 500.0]);
+        assert_eq!(
+            serde_json::from_slice::<CursorEvent>(&event.encode_line().unwrap())
+                .unwrap()
+                .window,
+            event.window
+        );
+        event.window = Some([0.0, 0.0, f64::INFINITY, 500.0]);
+        assert!(!event.valid());
+        let follow = CursorLine::Follow(CursorFollow {
+            agent: "agent-a".into(),
+            serial: 0,
+            offset: [1.0, 2.0],
+            window: Some([-1200.0, -800.0, 700.0, 500.0]),
+        });
+        assert_eq!(
+            serde_json::from_slice::<CursorLine>(&follow.encode_line().unwrap()).unwrap(),
+            follow
+        );
+    }
+
     fn sample_picture() -> CursorEvent {
         CursorEvent {
             agent: "agent-a".into(),
             initial: 'A',
             to: [1.0, 2.0],
             target: Some([0.0, 0.0, 20.0, 20.0]),
+            window: None,
             resting: false,
             label: label(CursorKind::Press, Some("Send"), false),
             kind: CursorKind::Press,
@@ -1568,6 +1616,7 @@ mod tests {
                     agent: "agent-a".into(),
                     serial: 3,
                     offset: [1.0, 2.0],
+                    window: None,
                 }),
             ),
             ("preview", CursorLine::Preview(sample_preview())),

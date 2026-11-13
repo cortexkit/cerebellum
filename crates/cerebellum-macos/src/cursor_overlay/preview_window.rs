@@ -356,8 +356,11 @@ impl PreviewWindow {
         }
         self.initial
             .setStringValue(&NSString::from_str(&identity.initial.to_string()));
-        self.initial.setHidden(identity.avatar.is_some());
-        *self.view.ivars().avatar.borrow_mut() = identity.avatar;
+        if let Some(avatar) = identity.avatar {
+            *self.view.ivars().avatar.borrow_mut() = Some(avatar);
+        }
+        self.initial
+            .setHidden(self.view.ivars().avatar.borrow().is_some());
         if let Some(mut scene) = self.scene() {
             scene.accent = self.accent_now(mtm);
             self.set_scene(scene);

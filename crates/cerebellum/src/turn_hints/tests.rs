@@ -89,6 +89,7 @@ fn draw(cursor: &Coordinator) {
         initial: 'A',
         to: [1.0, 1.0],
         target: None,
+        window: None,
         resting: true,
         label: None,
         kind: CursorKind::Reading,

@@ -14,13 +14,13 @@ use std::time::{Duration, Instant};
 
 use crate::cursor_geometry::{
     appkit_rect_to_global, chip_at, display_at, layout, panel_origin_for_tip, snap_tip,
-    swing_panel, target_rect, turn_point, view_point, Display, Layout, Rect, CHIP_DIAMETER,
-    CHIP_RIM, CHIP_RING, LABEL_HEIGHT, LABEL_MAX_WIDTH, LABEL_PADDING, OUTLINE, POINTER,
-    POINTER_CORNER,
+    swing_panel, turn_point, view_point, Display, Layout, Rect, CHIP_DIAMETER, CHIP_RIM, CHIP_RING,
+    LABEL_HEIGHT, LABEL_MAX_WIDTH, LABEL_PADDING, OUTLINE, POINTER, POINTER_CORNER,
 };
 use crate::cursor_schedule::{
-    begin_picture, entry_frame, sooner_wait, ActivityChange, ActivityGate, Appearance, BadgeMotion,
-    ColourFade, Colours, CursorSchedule, EntryFrame, PictureAim, PictureNeed, PictureStep, Wait,
+    avatar_change, begin_picture, entry_frame, sooner_wait, ActivityChange, ActivityGate,
+    Appearance, BadgeMotion, ColourFade, Colours, CursorSchedule, EntryFrame, PictureAim,
+    PictureNeed, PictureStep, Wait,
 };
 pub use crate::cursor_schedule::{CursorMotion, PictureTiming};
 use crate::preview_schedule::{OverlayFrame, OverlayPreview, OverlayPreviewMotion, Previews};
@@ -81,8 +81,10 @@ pub struct OverlayEvent {
     pub accent_known: bool,
     /// The tip's destination, global top-down points.
     pub to: [f64; 2],
-    /// The acted-on element's frame; the label never covers it.
+    /// The acted-on element's frame. Label layout deliberately does not use it.
     pub target: Option<[f64; 4]>,
+    /// The target window bounds, in global top-down points.
+    pub window: Option<[f64; 4]>,
     /// `to` is only somewhere to appear: a shown cursor stays where it is.
     pub resting: bool,
     pub label: Option<String>,
@@ -137,6 +139,7 @@ pub enum OverlayMessage {
         agent: String,
         serial: u64,
         offset: [f64; 2],
+        window: Option<[f64; 4]>,
     },
     /// Show or retarget one agent's background-mode preview. It takes the
     /// agent's badge off the real screen: in background mode the badge moves
@@ -487,6 +490,7 @@ struct Fields {
     /// The initial's current font size; it changes only while an entry
     /// grows or shrinks the chip.
     initial_font: Cell<f64>,
+    avatar_pixels: RefCell<Option<Vec<u8>>>,
 }
 
 impl Fields {
@@ -496,6 +500,7 @@ impl Fields {
             msg_send![super(this), initWithFrame: frame]
         };
         let initial = text_field(mtm, &badge, INITIAL_FONT_SIZE, true);
+        initial.setHidden(false);
         initial.setAlignment(NSTextAlignment::Center);
         let label = text_field(mtm, &badge, 12.0, false);
         Self {
@@ -503,6 +508,7 @@ impl Fields {
             initial,
             label,
             initial_font: Cell::new(INITIAL_FONT_SIZE),
+            avatar_pixels: RefCell::new(None),
         }
     }
 
@@ -532,9 +538,17 @@ impl Fields {
     }
 
     fn set_avatar(&self, pixels: Option<&[u8]>) {
-        let image = pixels.and_then(avatar_image);
-        self.initial.setHidden(image.is_some());
-        *self.badge.ivars().image.borrow_mut() = image;
+        let known = self.avatar_pixels.borrow();
+        let Some(pixels) = avatar_change(known.as_deref(), pixels) else {
+            return;
+        };
+        let Some(image) = avatar_image(pixels) else {
+            return;
+        };
+        drop(known);
+        *self.avatar_pixels.borrow_mut() = Some(pixels.to_vec());
+        self.initial.setHidden(true);
+        *self.badge.ivars().image.borrow_mut() = Some(image);
         self.badge.setNeedsDisplay(true);
     }
 
@@ -702,6 +716,8 @@ struct Picture {
     colours: ColourFade,
     /// The resting badge's layout for the latest event.
     layout: Layout,
+    label_size: Option<[f64; 2]>,
+    window: Option<[f64; 4]>,
     /// The panel in use: the resting layout's, or a larger one that holds a
     /// pointer swinging around the chip.
     panel_rect: Rect,
@@ -771,6 +787,8 @@ impl Picture {
                 panel: Rect::new(0.0, 0.0, 48.0, 48.0),
                 label: None,
             },
+            label_size: None,
+            window: None,
             panel_rect: Rect::new(0.0, 0.0, 48.0, 48.0),
             hand_panel: false,
             displays: Vec::new(),
@@ -806,7 +824,9 @@ impl Picture {
     fn update(&mut self, mtm: MainThreadMarker, event: OverlayEvent, now: Instant) {
         self.serial = event.serial;
         self.initial = event.initial;
-        self.fields.set_avatar(event.avatar_rgba.as_deref());
+        if let Some(pixels) = event.avatar_rgba.as_deref() {
+            self.fields.set_avatar(Some(pixels));
+        }
         self.fields.set_initial(event.initial);
         (self.displays, self.primary_height) = read_displays(mtm);
         // The module's motion, from wherever this badge really is: its entry
@@ -839,9 +859,13 @@ impl Picture {
             .label
             .filter(|text| event.gesture != OverlayGesture::Read && !text.is_empty());
         let label_size = label.as_deref().map(|text| self.fields.measure_label(text));
+        self.label_size = label_size;
+        self.window = event.window;
         self.layout = layout(
             tip,
-            target_rect(tip, event.target),
+            event
+                .window
+                .map_or(screen, |[x, y, w, h]| Rect::new(x, y, w, h)),
             label_size,
             screen,
             self.appearance.entering(),
@@ -889,9 +913,12 @@ impl Picture {
     /// badge moves with the window at once; otherwise the chip holds still
     /// and the pointer turns toward where the element now is, and the next
     /// frame draws that.
-    fn follow(&mut self, serial: u64, offset: [f64; 2], now: Instant) {
+    fn follow(&mut self, serial: u64, offset: [f64; 2], window: Option<[f64; 4]>, now: Instant) {
         if serial != self.serial {
             return;
+        }
+        if let Some(window) = window {
+            self.window = Some(window);
         }
         if self
             .motion
@@ -921,7 +948,19 @@ impl Picture {
     fn tick(&mut self, now: Instant, alpha: f64, motion: CursorMotion) -> PictureNeed {
         let frame = self.motion.frame(now, &motion);
         let entry = self.appearance.frame(now);
-        if frame.hand != self.hand_panel {
+        let display = display_at(frame.tip, &self.displays);
+        let screen = display.map_or(Rect::new(-1e6, -1e6, 2e6, 2e6), |d| d.visible);
+        let placed = layout(
+            frame.tip,
+            self.window
+                .map_or(screen, |[x, y, w, h]| Rect::new(x, y, w, h)),
+            self.label_size,
+            screen,
+            self.appearance.entering(),
+        );
+        let changed = placed != self.layout;
+        self.layout = placed;
+        if changed || frame.hand != self.hand_panel {
             self.last_scale = frame.scale;
             self.last_entry = entry;
             self.fit_panel(frame.hand, entry);
@@ -1042,6 +1081,7 @@ pub fn probe_cursor_hide(motion: CursorMotion) -> Result<HideProbe, String> {
                 screen.y + screen.height / 2.0,
             ],
             target: None,
+            window: None,
             resting: true,
             label: None,
             gesture: OverlayGesture::Read,
@@ -1337,11 +1377,12 @@ fn run_cursor_loop(
                         agent,
                         serial,
                         offset,
+                        window,
                     }) => {
                         // Never creates or revives a picture, and never
                         // restarts its idle clock: the agent did nothing.
                         if let Some(picture) = pictures.picture_for_update(&agent) {
-                            picture.follow(serial, offset, Instant::now());
+                            picture.follow(serial, offset, window, Instant::now());
                         }
                     }
                     Ok(OverlayMessage::Show(event)) => {
@@ -1561,6 +1602,7 @@ pub fn probe_cursor_motion(
             accent_known: true,
             to: at,
             target: None,
+            window: None,
             resting: false,
             label: None,
             gesture: OverlayGesture::Read,
@@ -1595,6 +1637,7 @@ pub fn probe_cursor_motion(
                 agent: PROBE_AGENT.into(),
                 serial: 2,
                 offset: follow_offset,
+                window: None,
             })
             .ok()?;
         std::thread::sleep(Duration::from_millis(500));
@@ -1683,7 +1726,7 @@ pub fn render_cursor_gallery_png(
         .filter(|text| shot.gesture != OverlayGesture::Read && !text.is_empty())
         .map(|text| fields.measure_label(text));
     let screen = Rect::new(0.0, 0.0, width, height);
-    let placed = layout(tip, target_rect(tip, shot.target), label, screen, false);
+    let placed = layout(tip, screen, label, screen, false);
     // The scene itself is the "panel": a rectangle relative to the tip that
     // covers the whole scene.
     let scene = Rect::new(-tip[0], -tip[1], width, height);

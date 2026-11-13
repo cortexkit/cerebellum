@@ -571,6 +571,47 @@ async fn a_window_leaving_the_screen_while_the_badge_travels_refuses_the_press()
 }
 
 #[tokio::test(start_paused = true)]
+async fn refusing_the_minimize_notification_keeps_the_badge_but_minimizing_during_glide_refuses() {
+    let mut rig = rig_with_badge_shown().await;
+    rig.desk.state().cursor_poll_minimized = true;
+    for title in ["One", "Two"] {
+        let reply = serve(
+            &rig.plane,
+            &rig.management,
+            "computer.press_element",
+            json!({"element_id": id_of(&rig.tree, title)}),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "completed", "{reply}");
+        let event = picture(&mut rig.pictures).await;
+        assert_eq!(
+            event.motion.style,
+            cerebellum_computer::cursor::MotionStyle::Glide
+        );
+    }
+    let before = rig.desk.state().presses.len();
+    let desk = rig.desk.clone();
+    let (reply, ()) = tokio::join!(
+        serve(
+            &rig.plane,
+            &rig.management,
+            "computer.press_element",
+            json!({"element_id": id_of(&rig.tree, "One")})
+        ),
+        async {
+            picture(&mut rig.pictures).await;
+            desk.state().minimized_windows.insert(1);
+        }
+    );
+    assert_eq!(reply["outcome"], "state_changed_by_person", "{reply}");
+    assert_eq!(
+        rig.desk.state().presses.len(),
+        before,
+        "the minimized target was not pressed"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_already_minimized_target_still_presses_without_a_badge() {
     let mut rig = rig_with_badge_shown().await;
     rig.desk.state().minimized_windows.insert(1);

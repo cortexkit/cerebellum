@@ -32,6 +32,15 @@ pub(crate) struct FrameClock {
     shown_ms: f64,
 }
 
+/// A missing avatar is an incomplete identity read, not a request to clear a
+/// known raster. Identical pixels need no new image or drawing transition.
+pub(crate) fn avatar_change<'a>(
+    known: Option<&[u8]>,
+    update: Option<&'a [u8]>,
+) -> Option<&'a [u8]> {
+    update.filter(|pixels| Some(*pixels) != known)
+}
+
 impl FrameClock {
     pub(crate) fn start(now: Instant) -> Self {
         Self {
@@ -915,6 +924,19 @@ pub(crate) fn sooner_wait(a: Wait, b: Wait) -> Wait {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_avatar_survives_actions_without_a_raster_and_unchanged_identity_does_not_redraw() {
+        let avatar = [10, 20, 30, 255];
+        assert_eq!(avatar_change(None, Some(&avatar)), Some(avatar.as_slice()));
+        assert_eq!(avatar_change(Some(&avatar), None), None);
+        assert_eq!(avatar_change(Some(&avatar), Some(&avatar)), None);
+        let newer = [30, 20, 10, 255];
+        assert_eq!(
+            avatar_change(Some(&avatar), Some(&newer)),
+            Some(newer.as_slice())
+        );
+    }
 
     const SECOND: Duration = Duration::from_secs(1);
 

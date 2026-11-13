@@ -135,9 +135,6 @@ pub(crate) const LABEL_PADDING: f64 = 10.0;
 const LABEL_GAP: f64 = 6.0;
 /// Room around the drawing for the soft drop shadow.
 const SHADOW_MARGIN: f64 = 8.0;
-/// The label must not touch the area right around a bare point either, so a
-/// pointed-at pixel with no element frame still gets this much clear space.
-const POINT_TARGET: f64 = 12.0;
 
 /// Where the chip's centre is and how large it is, relative to the tip, for
 /// an entry progress in [0, 1]: at 0 it is `ENTRY_CHIP_SCALE` times its
@@ -230,37 +227,37 @@ pub(crate) fn snap_tip(point: [f64; 2], scale: f64) -> [f64; 2] {
     ]
 }
 
-/// What the label must stay off: the element's frame, or a small square around
-/// a bare point.
-pub(crate) fn target_rect(tip: [f64; 2], frame: Option<[f64; 4]>) -> Rect {
-    frame
-        .map(|[x, y, width, height]| Rect::new(x, y, width, height))
-        .filter(|frame| frame.valid())
-        .unwrap_or(Rect::new(
-            tip[0] - POINT_TARGET / 2.0,
-            tip[1] - POINT_TARGET / 2.0,
-            POINT_TARGET,
-            POINT_TARGET,
-        ))
-}
-
-/// Where the label pill goes, in global points, or `None` when no candidate
-/// fits. The pill never covers the target or the pointer and chip, and stays
-/// inside the screen's visible area. It prefers the side next to the chip, then
-/// the other side of the tip, then below or above the target.
+/// Where the label pill goes, in global points. The window and the screen
+/// bound it, but the badge alone anchors it: a large accessibility element
+/// must not push the label away from the badge. A narrow window truncates the
+/// label, and a window too small for a pill shows none.
 pub(crate) fn label_rect(
     tip: [f64; 2],
     size: [f64; 2],
-    target: Rect,
+    window: Rect,
     screen: Rect,
 ) -> Option<Rect> {
     let [width, height] = size;
     if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
         return None;
     }
+    let bounds = Rect::new(
+        window.x.max(screen.x),
+        window.y.max(screen.y),
+        window.right().min(screen.right()) - window.x.max(screen.x),
+        window.bottom().min(screen.bottom()) - window.y.max(screen.y),
+    );
+    if !bounds.valid() || bounds.height < height || !bounds.contains_point(tip) {
+        return None;
+    }
+    let width = width.min(bounds.width);
+    if width <= 2.0 * LABEL_PADDING {
+        return None;
+    }
     let badge = badge_bounds().offset(tip);
-    let beside_y = tip[1] + CHIP_CENTER[1] - height / 2.0;
-    let along_x = (tip[0] + LABEL_GAP).clamp(screen.x, (screen.right() - width).max(screen.x));
+    let beside_y =
+        (tip[1] + CHIP_CENTER[1] - height / 2.0).clamp(bounds.y, bounds.bottom() - height);
+    let along_x = (badge.x + LABEL_GAP).clamp(bounds.x, bounds.right() - width);
     let candidates = [
         Rect::new(badge.right() + LABEL_GAP, beside_y, width, height),
         Rect::new(
@@ -269,22 +266,12 @@ pub(crate) fn label_rect(
             width,
             height,
         ),
-        Rect::new(
-            along_x,
-            target.bottom().max(badge.bottom()) + LABEL_GAP,
-            width,
-            height,
-        ),
-        Rect::new(
-            along_x,
-            target.y.min(badge.y) - LABEL_GAP - height,
-            width,
-            height,
-        ),
+        Rect::new(along_x, badge.bottom() + LABEL_GAP, width, height),
+        Rect::new(along_x, badge.y - LABEL_GAP - height, width, height),
     ];
-    candidates.into_iter().find(|label| {
-        screen.contains_rect(*label) && !label.intersects(target) && !label.intersects(badge)
-    })
+    candidates
+        .into_iter()
+        .find(|label| bounds.contains_rect(*label) && !label.intersects(badge))
 }
 
 /// Everything the picture draws, relative to the tip. The panel is aligned to
@@ -301,13 +288,13 @@ pub(crate) struct Layout {
 /// resting badge either way, since it only fades in as the chip settles.
 pub(crate) fn layout(
     tip: [f64; 2],
-    target: Rect,
+    window: Rect,
     label_size: Option<[f64; 2]>,
     screen: Rect,
     entering: bool,
 ) -> Layout {
     let label = label_size
-        .and_then(|size| label_rect(tip, size, target, screen))
+        .and_then(|size| label_rect(tip, size, window, screen))
         .map(|label| label.offset([-tip[0], -tip[1]]));
     let badge = if entering {
         badge_bounds().union(chip_bounds(0.0))
@@ -478,7 +465,7 @@ mod tests {
         let tip = snap_tip(requested, display.scale);
         let layout = layout(
             tip,
-            target_rect(tip, frame),
+            frame.map_or(display.visible, |[x, y, w, h]| Rect::new(x, y, w, h)),
             Some([120.0, LABEL_HEIGHT]),
             display.visible,
             entering,
@@ -599,8 +586,8 @@ mod tests {
         assert_eq!(chip_at(1.0), (CHIP_CENTER, CHIP_DIAMETER));
         assert_eq!(chip_at(f64::NAN), (CHIP_CENTER, CHIP_DIAMETER));
         let tip = [600.0, 400.0];
-        let entering = layout(tip, target_rect(tip, None), None, screen(), true);
-        let resting = layout(tip, target_rect(tip, None), None, screen(), false);
+        let entering = layout(tip, screen(), None, screen(), true);
+        let resting = layout(tip, screen(), None, screen(), false);
         for step in 0..=20 {
             let chip = chip_bounds(f64::from(step) / 20.0);
             assert!(
@@ -619,72 +606,73 @@ mod tests {
     }
 
     #[test]
-    fn label_never_covers_the_target_and_stays_on_screen() {
+    fn label_stays_beside_the_badge_inside_the_window_and_screen() {
         let size = [150.0, LABEL_HEIGHT];
         let mut placed = 0;
-        // Targets of every shape, near every edge: list rows, a whole text
-        // area, tiny buttons, and bare points.
-        for (tip, frame) in [
-            ([110.0, 300.0], Some([20.0, 286.0, 180.0, 28.0])),
-            ([600.0, 500.0], Some([200.0, 200.0, 800.0, 600.0])),
-            ([1700.0, 1070.0], Some([1690.0, 1060.0, 30.0, 20.0])),
-            ([5.0, 30.0], Some([0.0, 25.0, 12.0, 12.0])),
-            ([864.0, 540.0], None),
-            ([1725.0, 600.0], None),
-            ([2.0, 1080.0], None),
-            ([864.0, 26.0], Some([0.0, 25.0, 1728.0, 1059.0])),
+        for (tip, window) in [
+            ([110.0, 300.0], Rect::new(20.0, 200.0, 500.0, 200.0)),
+            ([600.0, 500.0], Rect::new(200.0, 200.0, 800.0, 600.0)),
+            ([1700.0, 1070.0], screen()),
+            ([5.0, 30.0], screen()),
+            ([864.0, 540.0], screen()),
+            ([1725.0, 600.0], screen()),
+            ([2.0, 1080.0], screen()),
+            ([864.0, 26.0], screen()),
         ] {
             let tip = snap_tip(tip, 2.0);
-            let target = target_rect(tip, frame);
-            let Some(label) = label_rect(tip, size, target, screen()) else {
-                // No room anywhere is allowed (the target fills the screen);
-                // covering it is not.
-                continue;
-            };
+            let label = label_rect(tip, size, window, screen()).expect("room beside the badge");
             placed += 1;
-            assert!(!label.intersects(target), "{label:?} covers {target:?}");
             assert!(
                 !label.intersects(badge_bounds().offset(tip)),
                 "{label:?} covers the pointer"
             );
             assert!(screen().contains_rect(label), "{label:?} leaves the screen");
+            assert!(window.contains_rect(label), "{label:?} leaves the window");
+            assert!((label.y - tip[1]).abs() < 60.0, "label detached: {label:?}");
         }
-        assert_eq!(placed, 7, "only the full-screen target leaves no room");
+        assert_eq!(placed, 8);
     }
 
     #[test]
     fn label_prefers_beside_the_chip_then_the_side_with_room() {
         let size = [150.0, LABEL_HEIGHT];
         let tip = [600.0, 400.0];
-        let beside = label_rect(tip, size, target_rect(tip, None), screen()).unwrap();
+        let beside = label_rect(tip, size, screen(), screen()).unwrap();
         assert_eq!(beside.x, tip[0] + badge_bounds().right() + 6.0);
         assert_eq!(beside.y + beside.height / 2.0, tip[1] + CHIP_CENTER[1]);
         // Against the right edge, the label moves to the tip's left.
         let tip = [1700.0, 400.0];
-        let left = label_rect(tip, size, target_rect(tip, None), screen()).unwrap();
+        let left = label_rect(tip, size, screen(), screen()).unwrap();
         assert!(left.right() < tip[0], "{left:?}");
-        // A tall list row near the left edge blocks both sides; the label
-        // drops below the row and the chip rather than covering the row.
+        // A narrow window leaves room only under the badge. The label stays
+        // local even when the focused accessibility element fills the window.
         let tip = [110.0, 300.0];
-        let row = target_rect(tip, Some([20.0, 278.0, 180.0, 44.0]));
-        let below = label_rect(tip, size, row, screen()).unwrap();
-        assert!(below.y >= row.bottom() && below.y >= tip[1] + badge_bounds().bottom());
+        let window = Rect::new(100.0, 250.0, 160.0, 150.0);
+        let below = label_rect(tip, size, window, screen()).unwrap();
+        assert_eq!(below.y, tip[1] + badge_bounds().bottom() + LABEL_GAP);
+        assert!(window.contains_rect(below));
+    }
+
+    #[test]
+    fn label_flips_at_window_edges_on_a_negative_origin_display() {
+        let window = Rect::new(-1800.0, -900.0, 700.0, 500.0);
+        let screen = displays()[1].visible;
+        let tip = [-1120.0, -880.0];
+        let label = label_rect(tip, [220.0, LABEL_HEIGHT], window, screen).unwrap();
+        assert!(label.right() < tip[0]);
+        assert!(window.contains_rect(label));
+        assert!(screen.contains_rect(label));
+        assert!((label.y - tip[1]).abs() < 60.0);
     }
 
     #[test]
     fn panel_encloses_the_drawing_and_its_shadow() {
         let tip = [600.0, 400.0];
-        let with_label = layout(
-            tip,
-            target_rect(tip, None),
-            Some([150.0, 20.0]),
-            screen(),
-            false,
-        );
+        let with_label = layout(tip, screen(), Some([150.0, 20.0]), screen(), false);
         let label = with_label.label.unwrap();
         assert!(with_label.panel.contains_rect(label));
         assert!(with_label.panel.contains_rect(badge_bounds()));
-        let bare = layout(tip, target_rect(tip, None), None, screen(), false);
+        let bare = layout(tip, screen(), None, screen(), false);
         assert_eq!(bare.label, None);
         assert!(bare.panel.contains_rect(badge_bounds()));
         assert!(bare.panel.width < with_label.panel.width);
@@ -704,12 +692,19 @@ mod tests {
     }
 
     #[test]
-    fn malformed_frames_fall_back_to_the_point() {
+    fn malformed_label_sizes_are_omitted_and_scale_falls_back() {
         let tip = [50.0, 60.0];
         let point = Rect::new(44.0, 54.0, 12.0, 12.0);
-        assert_eq!(target_rect(tip, Some([0.0, 0.0, 0.0, 10.0])), point);
-        assert_eq!(target_rect(tip, Some([f64::NAN, 0.0, 5.0, 10.0])), point);
         assert_eq!(label_rect(tip, [f64::NAN, 20.0], point, screen()), None);
+        assert_eq!(
+            label_rect(
+                [5.0, 50.0],
+                [150.0, LABEL_HEIGHT],
+                Rect::new(0.0, 25.0, 10.0, 100.0),
+                screen()
+            ),
+            None
+        );
         assert_eq!(snap_tip([10.3, 10.6], f64::NAN), [10.0, 10.0]);
     }
 
@@ -766,7 +761,7 @@ mod tests {
     #[test]
     fn the_swing_panel_holds_the_pointer_at_every_angle() {
         let tip = [600.0, 400.0];
-        let resting = layout(tip, target_rect(tip, None), None, screen(), false).panel;
+        let resting = layout(tip, screen(), None, screen(), false).panel;
         let panel = swing_panel(resting);
         assert!(panel.contains_rect(resting));
         for v in [panel.x, panel.y, panel.width, panel.height] {

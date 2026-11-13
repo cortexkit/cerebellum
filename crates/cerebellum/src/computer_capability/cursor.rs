@@ -411,6 +411,16 @@ struct Follow {
     /// Dropping it removes the observer: on a hide, a new target, or the
     /// window closing. Absent only while the observer is being installed.
     _watch: Option<Box<dyn CursorWindowWatch>>,
+    poll: Option<VisibilityPoll>,
+}
+
+/// A hidden or replaced badge must not leave a visibility timer running.
+struct VisibilityPoll(tokio::task::AbortHandle);
+
+impl Drop for VisibilityPoll {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Preferred element for a read picture and the focused element to use when
@@ -849,6 +859,7 @@ impl Coordinator {
             // The frame the picture itself was drawn from, read with it.
             base_element: event.target,
             _watch: None,
+            poll: None,
         };
         {
             // Publish before installing the observer: it can report as soon
@@ -907,8 +918,94 @@ impl Coordinator {
                 follows.remove(agent);
             }
         }
+        let needs_poll = follows.get(agent).is_some_and(|follow| {
+            follow.id == id
+                && follow
+                    ._watch
+                    .as_ref()
+                    .is_some_and(|watch| watch.poll_visibility() != (false, false))
+        });
+        drop(follows);
+        if needs_poll {
+            self.start_visibility_poll(agent, id, grant.clone());
+        }
         // If an end, replacement or Gone report removed the entry during
         // installation, the returned watch is dropped rather than revived.
+    }
+
+    fn start_visibility_poll(&self, agent: &str, id: u64, grant: ProcessGrant) {
+        let state = Arc::downgrade(&self.0);
+        let polled = agent.to_owned();
+        let task = tokio::spawn(async move {
+            loop {
+                let expires = state.upgrade().and_then(|state| {
+                    Coordinator(state).drawn().tips.get(&polled).map(|tip| {
+                        tip.sent + Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS)
+                    })
+                });
+                let Some(expires) = expires else { return };
+                // The last wake is exactly the helper's idle-removal deadline,
+                // not a later periodic tick that could outlive the picture.
+                tokio::time::sleep_until(
+                    expires.min(tokio::time::Instant::now() + Duration::from_millis(250)),
+                )
+                .await;
+                let Some(state) = state.upgrade() else { return };
+                let cursor = Coordinator(state);
+                let current = cursor
+                    .follows()
+                    .get(&polled)
+                    .filter(|follow| follow.id == id)
+                    .map(|follow| {
+                        (
+                            follow.serial,
+                            follow.source.clone(),
+                            follow.window.clone(),
+                            follow
+                                ._watch
+                                .as_ref()
+                                .map_or((false, false), |watch| watch.poll_visibility()),
+                        )
+                    });
+                let Some((serial, source, window, (minimized, hidden))) = current else {
+                    return;
+                };
+                if !minimized && !hidden {
+                    return;
+                }
+                let showing = cursor.drawn().tips.get(&polled).is_some_and(|tip| {
+                    tokio::time::Instant::now().saturating_duration_since(tip.sent)
+                        < Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS)
+                });
+                if !showing {
+                    let mut follows = cursor.follows();
+                    if follows.get(&polled).is_some_and(|follow| follow.id == id) {
+                        follows.remove(&polled);
+                    }
+                    return;
+                }
+                let checked = grant.clone();
+                let visible = tokio::task::spawn_blocking(move || {
+                    #[cfg(target_os = "macos")]
+                    let _ax = cerebellum_macos::ax_budget::bound_messages_until(
+                        Instant::now() + READ_BUDGET,
+                    );
+                    (!minimized || source.window_minimized(&window) == Some(false))
+                        && (!hidden || source.application_hidden(&checked) == Some(false))
+                })
+                .await;
+                if !matches!(visible, Ok(true)) {
+                    cursor.hide_picture(&polled, serial);
+                    return;
+                }
+            }
+        });
+        let mut follows = self.follows();
+        if let Some(follow) = follows.get_mut(agent).filter(|follow| follow.id == id) {
+            follow.poll = Some(VisibilityPoll(task.abort_handle()));
+        } else {
+            task.abort();
+        }
     }
 
     fn drop_older_follow(&self, agent: &str, serial: u64) {
@@ -1021,6 +1118,7 @@ impl Coordinator {
                 agent: agent.to_owned(),
                 serial,
                 offset,
+                window: Some(now_window),
             }));
         // Released first: the record's lock is always taken before this one.
         drop(follows);
@@ -1657,6 +1755,7 @@ impl Coordinator {
                     // Ignored for a badge inside a preview.
                     to: [0.0, 0.0],
                     target: None,
+                    window: None,
                     resting: true,
                     label: None,
                     kind,
@@ -1805,7 +1904,10 @@ impl Coordinator {
         let event = {
             let mut event = event;
             if let (Some(agent), Some(avatars)) = (avatar_agent.as_deref(), self.0.avatars.get()) {
-                event.avatar_tint = avatars.known_tint(agent).flatten();
+                if let Some(known) = avatars.known_avatar(agent) {
+                    event.avatar_rgba = Some(known.pixels);
+                    event.avatar_tint = known.tint;
+                }
             }
             event
         };
@@ -1873,6 +1975,7 @@ impl Coordinator {
                 initial: 'A',
                 to: [0.0, 0.0],
                 target: None,
+                window: None,
                 resting: true,
                 label: None,
                 kind: CursorKind::Reading,
@@ -2216,7 +2319,6 @@ fn screen_read(
     if point.is_none() && frame.is_none() && matches!(kind, CursorKind::Press | CursorKind::Write) {
         return None;
     }
-    let to = source.visible_cursor_point(grant, point, frame)?;
     // CoreGraphics geometry can lag the application's accessibility state. A badge is
     // cosmetic, so an unreadable minimized/hidden state is not permission to
     // draw. Without a window we cannot certify its minimized state either.
@@ -2227,14 +2329,19 @@ fn screen_read(
     if source.window_minimized(&window) != Some(false) {
         return None;
     }
+    let window_frame = source.cursor_frame(&window);
+    let point = point.or_else(|| keyboard_caret(source, kind, aimed_handle.as_ref(), window_frame));
+    let to = source.visible_cursor_point(grant, point, frame)?;
     Some(ScreenAimed {
         event: CursorEvent {
             initial: agent.chars().next().unwrap_or('A').to_ascii_uppercase(),
             agent,
             to,
             target: frame,
+            window: window_frame,
             resting: point.is_none() && frame.is_none(),
-            label: label(kind, title.as_deref(), secure),
+            // Without window bounds a pill cannot be safely confined to it.
+            label: window_frame.and_then(|_| label(kind, title.as_deref(), secure)),
             kind,
             serial,
             avatar_rgba: None,
@@ -2246,6 +2353,35 @@ fn screen_read(
         element: aimed_handle,
         window,
     })
+}
+
+/// A keyboard action's preferred handle is its focused element, never an
+/// arbitrary ancestor. Even a large web area may expose selection bounds;
+/// accept them only wholly inside the same window, otherwise use its frame.
+fn keyboard_caret(
+    source: &dyn AppStateSource,
+    kind: CursorKind,
+    focused: Option<&ElementHandle>,
+    window: Option<[f64; 4]>,
+) -> Option<[f64; 2]> {
+    if !matches!(kind, CursorKind::Type | CursorKind::Keys) {
+        return None;
+    }
+    let [wx, wy, ww, wh] = window?;
+    let [x, y, w, h] = source.cursor_caret_frame(focused?)?;
+    if ![wx, wy, ww, wh, x, y, w, h].iter().all(|v| v.is_finite())
+        || ww <= 0.0
+        || wh <= 0.0
+        || w < 0.0
+        || h <= 0.0
+        || x < wx
+        || y < wy
+        || x + w > wx + ww
+        || y + h > wy + wh
+    {
+        return None;
+    }
+    Some([x + w / 2.0, y + h / 2.0])
 }
 
 /// The geometry read for a background-mode badge, on a blocking thread.
@@ -2294,6 +2430,8 @@ fn background_read(
         (_, None) => label(kind, None, false),
     };
     let target = frame.and_then(|frame| window.visible_target(frame));
+    let point =
+        point.or_else(|| keyboard_caret(source, kind, aim.preferred.as_ref(), Some(window.bounds)));
     let to = match point.and_then(|point| window.relative(point)) {
         Some(tip) => Some((tip, target.unwrap_or(tip))),
         None => target.map(|target| (target, target)),
@@ -2833,6 +2971,7 @@ mod tests {
         window: ElementHandle,
         window_frame: std::sync::Mutex<[f64; 4]>,
         element_frame: std::sync::Mutex<[f64; 4]>,
+        caret: std::sync::Mutex<Option<[f64; 4]>>,
         /// Every watch's report callback, in the order they were created.
         watches: std::sync::Mutex<Vec<Report>>,
         live: Arc<std::sync::atomic::AtomicUsize>,
@@ -2842,10 +2981,15 @@ mod tests {
         hidden: std::sync::Mutex<Option<bool>>,
         window_readable: std::sync::atomic::AtomicBool,
         point_visible: std::sync::atomic::AtomicBool,
+        poll_visibility: std::sync::atomic::AtomicBool,
     }
 
-    struct FakeWatch(Arc<std::sync::atomic::AtomicUsize>);
-    impl CursorWindowWatch for FakeWatch {}
+    struct FakeWatch(Arc<std::sync::atomic::AtomicUsize>, bool);
+    impl CursorWindowWatch for FakeWatch {
+        fn poll_visibility(&self) -> (bool, bool) {
+            (self.1, self.1)
+        }
+    }
     impl Drop for FakeWatch {
         fn drop(&mut self) {
             self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -2861,6 +3005,7 @@ mod tests {
                 .handle,
                 window_frame: std::sync::Mutex::new([100.0, 80.0, 800.0, 600.0]),
                 element_frame: std::sync::Mutex::new([400.0, 120.0, 90.0, 22.0]),
+                caret: std::sync::Mutex::new(None),
                 watches: std::sync::Mutex::new(Vec::new()),
                 live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 watch_release: std::sync::Mutex::new(None),
@@ -2869,6 +3014,7 @@ mod tests {
                 hidden: std::sync::Mutex::new(Some(false)),
                 window_readable: std::sync::atomic::AtomicBool::new(true),
                 point_visible: std::sync::atomic::AtomicBool::new(true),
+                poll_visibility: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -2915,6 +3061,9 @@ mod tests {
         }
         fn cursor_label(&self, _: &ElementHandle) -> Option<(Option<String>, bool)> {
             Some((Some("Date Added".into()), false))
+        }
+        fn cursor_caret_frame(&self, _: &ElementHandle) -> Option<[f64; 4]> {
+            *self.caret.lock().unwrap()
         }
         fn cursor_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {
             Some(if element.same_element(self.window.as_ref()) {
@@ -2966,7 +3115,11 @@ mod tests {
                 held.recv_timeout(HANG_GUARD)
                     .expect("released window watch installation");
             }
-            Some(Box::new(FakeWatch(self.live.clone())))
+            Some(Box::new(FakeWatch(
+                self.live.clone(),
+                self.poll_visibility
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            )))
         }
 
         fn window_minimized(&self, _: &ElementHandle) -> Option<bool> {
@@ -3162,6 +3315,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn keyboard_badges_prefer_readable_carets_inside_the_window_and_fall_back_to_the_field() {
+        let geometry = FollowGeometry::new();
+        let focus =
+            cerebellum_computer::app_state::source::RawElement::fixture(2, "AXTextField").handle;
+        for kind in [CursorKind::Type, CursorKind::Keys] {
+            for (caret, expected) in [
+                (Some([410.0, 123.0, 0.0, 16.0]), [410.0, 131.0]),
+                (None, [445.0, 131.0]),
+                (Some([20.0, 20.0, 0.0, 16.0]), [445.0, 131.0]),
+                (Some([410.0, 123.0, f64::NAN, 16.0]), [445.0, 131.0]),
+            ] {
+                *geometry.caret.lock().unwrap() = caret;
+                let aimed = screen_read(
+                    geometry.as_ref(),
+                    &grant(),
+                    kind,
+                    ReadAim {
+                        preferred: Some(focus.clone()),
+                        focused: None,
+                    },
+                    None,
+                    AGENT.into(),
+                    0,
+                )
+                .unwrap();
+                assert_eq!(aimed.event.to, expected, "{kind:?}, {caret:?}");
+                assert_eq!(aimed.event.window, Some([100.0, 80.0, 800.0, 600.0]));
+            }
+        }
+        *geometry.element_frame.lock().unwrap() = [-100.0, -100.0, 2000.0, 2000.0];
+        *geometry.caret.lock().unwrap() = Some([410.0, 123.0, 0.0, 16.0]);
+        assert_eq!(
+            keyboard_caret(
+                geometry.as_ref(),
+                CursorKind::Keys,
+                Some(&focus),
+                Some([100.0, 80.0, 800.0, 600.0])
+            ),
+            Some([410.0, 131.0])
+        );
+        assert_eq!(
+            keyboard_caret(
+                geometry.as_ref(),
+                CursorKind::Press,
+                Some(&focus),
+                Some([100.0, 80.0, 800.0, 600.0])
+            ),
+            None
+        );
+        geometry
+            .window_readable
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let aimed = screen_read(
+            geometry.as_ref(),
+            &grant(),
+            CursorKind::Keys,
+            ReadAim {
+                preferred: Some(focus),
+                focused: None,
+            },
+            None,
+            AGENT.into(),
+            0,
+        )
+        .unwrap();
+        assert!(
+            aimed.event.label.is_none(),
+            "unreadable window bounds cannot contain a pill"
+        );
+    }
+
     async fn next_line(receiver: &mut mpsc::Receiver<CursorLine>) -> CursorLine {
         next_line_for(receiver, "a cursor line").await
     }
@@ -3214,6 +3439,7 @@ mod tests {
                 agent: AGENT.into(),
                 serial: picture.serial,
                 offset: [120.0, -40.0],
+                window: Some([220.0, 40.0, 800.0, 600.0]),
             })
         );
         until("finished installing the watch", || {
@@ -3235,6 +3461,7 @@ mod tests {
                 agent: AGENT.into(),
                 serial: picture.serial,
                 offset: [90.0, -40.0],
+                window: Some([160.0, 40.0, 860.0, 600.0]),
             })
         );
 
@@ -3431,6 +3658,74 @@ mod tests {
         no_line(&mut receiver, "a restored window revived the badge");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn visibility_polling_keeps_visible_badges_and_stops_on_hide_or_idle() {
+        for idle in [false, true] {
+            let (cursor, mut receiver) = Coordinator::channel();
+            let geometry = FollowGeometry::new();
+            geometry
+                .poll_visibility
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            schedule_on(&cursor, &geometry, CursorKind::Type);
+            next_line(&mut receiver).await.picture().unwrap();
+            until("installed fallback poll", || {
+                cursor
+                    .follows()
+                    .get(AGENT)
+                    .is_some_and(|follow| follow.poll.is_some())
+            })
+            .await;
+            let poll = cursor.follows()[AGENT].poll.as_ref().unwrap().0.clone();
+            tokio::time::advance(Duration::from_millis(500)).await;
+            assert!(
+                cursor.drawn().tips.contains_key(AGENT),
+                "a refused notification is not a hidden window"
+            );
+            if idle {
+                tokio::time::advance(Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS))
+                    .await;
+            } else {
+                cursor.hide_picture(AGENT, 0);
+            }
+            until("no visibility poll survives its badge", || {
+                poll.is_finished()
+            })
+            .await;
+            assert!(cursor.follows().is_empty());
+            assert_eq!(geometry.live(), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn visibility_polling_hides_minimized_hidden_and_unreadable_windows() {
+        for state in [Some(true), None] {
+            for hide_app in [false, true] {
+                let (cursor, mut receiver) = Coordinator::channel();
+                let geometry = FollowGeometry::new();
+                geometry
+                    .poll_visibility
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                schedule_on(&cursor, &geometry, CursorKind::Type);
+                next_line(&mut receiver).await.picture().unwrap();
+                until("installed fallback poll", || {
+                    cursor
+                        .follows()
+                        .get(AGENT)
+                        .is_some_and(|follow| follow.poll.is_some())
+                })
+                .await;
+                if hide_app {
+                    *geometry.hidden.lock().unwrap() = state;
+                } else {
+                    *geometry.minimized.lock().unwrap() = state;
+                }
+                tokio::time::advance(Duration::from_millis(250)).await;
+                assert_eq!(hidden(next_line(&mut receiver).await), AGENT);
+                assert_eq!(geometry.live(), 0);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_platform_without_window_watches_keeps_the_badge_unfollowed() {
         let (cursor, mut receiver) = Coordinator::channel();
@@ -3590,6 +3885,7 @@ mod tests {
             initial: 'A',
             to: [1.0, 1.0],
             target: None,
+            window: None,
             resting: false,
             label: None,
             kind: CursorKind::Press,
@@ -3859,6 +4155,7 @@ mod tests {
             initial: 'A',
             to: [10.0, 10.0],
             target: None,
+            window: None,
             resting: false,
             label: None,
             kind: CursorKind::Press,
@@ -4735,6 +5032,7 @@ mod helper_transport {
                             initial: 'A',
                             to: [10.0, 20.0],
                             target: None,
+                            window: None,
                             resting: true,
                             label: None,
                             kind: CursorKind::Reading,
