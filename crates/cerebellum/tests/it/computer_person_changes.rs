@@ -336,11 +336,37 @@ async fn a_press_after_the_person_moved_focus_is_refused_and_nothing_is_pressed(
     let rig = rig().await;
     let send = rig.read().await;
 
-    rig.desk.state().focus = DeskFocus::Element(11);
+    // The person clicks another field: focus moves, with hardware input.
+    {
+        let mut state = rig.desk.state();
+        state.focus = DeskFocus::Element(11);
+        state.input.push((0, Instant::now()));
+    }
     let reply = rig.press(&send).await;
 
     assert_person_refusal(&reply, "focus_changed");
     assert!(rig.presses().is_empty(), "pressed {:?}", rig.presses());
+}
+
+/// The application moves its own focus while in front and nobody touches a
+/// key, button or scroll wheel: the press goes ahead, and its reply says
+/// where focus went.
+#[tokio::test]
+async fn an_app_only_focus_move_lets_the_press_through_and_says_so() {
+    let rig = rig().await;
+    let send = rig.read().await;
+
+    rig.desk.state().focus = DeskFocus::Element(11);
+    let reply = rig.press(&send).await;
+
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(rig.presses(), vec![SEND]);
+    let text = reply["state_text"].as_str().unwrap_or_default();
+    assert!(
+        text.lines().any(|line| line.starts_with("Focus moved to ")
+            && line.ends_with(" on its own since your last read.")),
+        "{reply}"
+    );
 }
 
 #[tokio::test]
@@ -440,7 +466,11 @@ async fn a_press_with_nothing_changed_since_the_read_is_allowed() {
 async fn after_the_refusal_a_read_lets_the_press_through() {
     let rig = rig().await;
     let send = rig.read().await;
-    rig.desk.state().focus = DeskFocus::Element(11);
+    {
+        let mut state = rig.desk.state();
+        state.focus = DeskFocus::Element(11);
+        state.input.push((0, Instant::now()));
+    }
 
     assert_person_refusal(&rig.press(&send).await, "focus_changed");
     // A refusal shows the agent no new state, so it does not reset what the

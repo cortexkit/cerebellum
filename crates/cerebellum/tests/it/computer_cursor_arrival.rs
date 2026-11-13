@@ -519,7 +519,9 @@ async fn the_person_acting_while_the_badge_travels_refuses_the_press() {
                     // The person's hardware (pid 0), after the read.
                     state.input.push((0, std::time::Instant::now()));
                 } else {
+                    // The person clicks the field: focus moves, with input.
                     state.focus = DeskFocus::Element(FIELD.0);
+                    state.input.push((0, std::time::Instant::now()));
                 }
             }
         );

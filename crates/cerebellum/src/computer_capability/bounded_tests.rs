@@ -926,7 +926,8 @@ fn an_app_only_focus_move_proceeds_with_one_disclosed_line() {
 fn a_focus_move_refuses_unless_the_app_is_in_front_and_provably_untouched() {
     use super::element_actions::PersonCheck;
     use cerebellum_computer::app_state::person::PersonChange;
-    let cases: [(&str, fn(&FocusDesk)); 5] = [
+    type Weakening = (&'static str, fn(&FocusDesk));
+    let cases: [Weakening; 5] = [
         ("a hardware key since the read", |desk| {
             desk.hardware.lock().unwrap().as_mut().unwrap().1 = Some(std::time::Instant::now());
         }),
