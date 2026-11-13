@@ -118,6 +118,40 @@ impl FocusRefusal {
     }
 }
 
+/// Whether a keystroke action must pass the secure-field focus check before
+/// it is posted. Only a single navigation key with no modifier can skip it
+/// (Shift is allowed with Tab alone, for Shift+Tab): Escape, the four arrows,
+/// Tab, Home, End, Page Up and Page Down produce no characters and cannot
+/// paste, so they cannot put a secret into a field. Return, Delete and
+/// Backspace edit what is there, any character key types, and Command,
+/// Control or Option chords can paste (Command+V), so all of those keep the
+/// check, as does typed text.
+pub(crate) fn needs_secure_field_check(
+    action: &cerebellum_computer::platform::SyntheticAction,
+) -> bool {
+    use cerebellum_computer::platform::{SyntheticAction, SyntheticKey};
+    let SyntheticAction::KeyCombination { key, modifiers } = action else {
+        return true;
+    };
+    let navigation = matches!(
+        key,
+        SyntheticKey::Escape
+            | SyntheticKey::LeftArrow
+            | SyntheticKey::RightArrow
+            | SyntheticKey::UpArrow
+            | SyntheticKey::DownArrow
+            | SyntheticKey::Tab
+            | SyntheticKey::Home
+            | SyntheticKey::End
+            | SyntheticKey::PageUp
+            | SyntheticKey::PageDown
+    );
+    let other_modifier =
+        modifiers.command || modifiers.control || modifiers.option || modifiers.windows;
+    let shift_allowed = !modifiers.shift || *key == SyntheticKey::Tab;
+    !(navigation && !other_modifier && shift_allowed)
+}
+
 /// Read the target application's own focused element and refuse a secure
 /// one. `Ok(None)` requires a complete fallback read with no focused element:
 /// an unreadable or cut tree cannot establish the absence of a secure field.
@@ -372,19 +406,26 @@ pub(crate) fn typed_text_arrived(
     changed_part(before, &after).is_some_and(|inserted| inserted.contains(text))
 }
 
-/// Poll [`typed_text_arrived`] until it holds or `deadline` passes, checking
-/// at least once. The posts returning says nothing about when the application
-/// renders them, so a single read taken at once reports text that is about to
-/// appear as unconfirmed.
+/// Poll [`typed_text_arrived`] until it holds, `deadline` passes or `stopped`
+/// answers true, checking at least once unless already stopped. The posts
+/// returning says nothing about when the application renders them, so a
+/// single read taken at once reports text that is about to appear as
+/// unconfirmed. Once the call has been answered (`stopped`), nobody reads the
+/// confirmation, and polling on would keep the application marked busy for
+/// every later call.
 pub(crate) fn await_typed_text(
     source: &dyn AppStateSource,
     focus: &TargetFocus,
     text: &str,
     deadline: std::time::Duration,
+    stopped: &dyn Fn() -> bool,
 ) -> bool {
     const POLL: std::time::Duration = std::time::Duration::from_millis(50);
     let until = std::time::Instant::now() + deadline;
     loop {
+        if stopped() {
+            return false;
+        }
         if typed_text_arrived(source, focus, text) {
             return true;
         }

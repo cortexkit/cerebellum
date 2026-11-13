@@ -1112,6 +1112,7 @@ where
             Some(lease),
             Some(Arc::new(permits)),
         );
+        let disclosures = work.clone();
         let _lane = admitted.lane;
         // A locked screen hides application interfaces and cannot admit a new
         // launch either, so no call may mistake hidden windows for an
@@ -1276,6 +1277,10 @@ where
         if let (Some(name), Some(object)) = (matched_app, reply.as_object_mut()) {
             object.insert("matched_app".into(), json!(name));
         }
+        // What the call noticed and went ahead on, such as the application
+        // moving its own focus since the last read, is said on the reply.
+        action_effects::append_lines(&mut reply, &disclosures.take_disclosures());
+        drop(disclosures);
         // The background-mode preview did not track this action: three other
         // agents' previews were showing, or the action went ahead of its
         // badge at the cap. Only the actions that show a preview say so.
@@ -2378,10 +2383,17 @@ where
         // element must be readable and must not be a secure field. Asked of
         // the target rather than of the frontmost application, because the
         // keystrokes go to the target whichever application is in front.
+        // A lone navigation key types nothing and cannot paste, so it skips
+        // the check, and with it a full read of an application that reports
+        // no focused element, such as a menu in a backgrounded web app.
         let source = self.app_state_source.clone();
         let focus_grant = grant.clone();
         let focus_work = work.clone();
+        let check_focus = keystrokes::needs_secure_field_check(&parsed.action);
         let focus = tokio::task::spawn_blocking(move || {
+            if !check_focus {
+                return Ok(None);
+            }
             let _ax = focus_work.bound_ax();
             keystrokes::read_target_focus(source.as_ref(), &focus_grant)
         })
@@ -2875,12 +2887,16 @@ where
             let observe_work = work.clone();
             (reply, effects) = tokio::task::spawn_blocking(move || {
                 let _ax = observe_work.bound_ax();
+                // Once the call has been answered, its reply is out and this
+                // worker only keeps the application marked busy: stop polling
+                // and reading at the next check rather than finishing either.
+                let stopped = || observe_work.stopped();
                 // Polled up to the row's effect deadline rather than read once:
                 // an application renders typed text some time after the posts
                 // return, and a backgrounded Electron app takes the longest.
                 if let Some(replacement) = replacement.as_ref() {
                     if finished["outcome"] == "delivery_unconfirmed"
-                        && replacement.arrived(source.as_ref(), effect_deadline)
+                        && replacement.arrived(source.as_ref(), effect_deadline, &stopped)
                     {
                         finished["outcome"] = json!("completed");
                         finished["effect_status"] = json!("effect_observed");
@@ -2893,6 +2909,7 @@ where
                             focused,
                             text,
                             effect_deadline,
+                            &stopped,
                         )
                     {
                         finished["outcome"] = json!("completed");
@@ -2906,7 +2923,7 @@ where
                     &grant,
                     settle,
                     sessions.zoom_expands_menus(&conversation_key, &grant, view.zoom.as_deref()),
-                    element_actions::PersonWatch::NotWatched,
+                    element_actions::PersonWatch::StopWhen(&stopped),
                     None,
                     Some(&mut effects),
                 );

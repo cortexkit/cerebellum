@@ -3526,8 +3526,9 @@ mod cached_element_tests {
 
             /// The calls made per event, in order: a generation read before
             /// the visibility read, another immediately before the post.
+            /// The calls made for each event, each ending with its post.
             fn calls_per_event(&self) -> Vec<&[&'static str]> {
-                self.calls.chunks(4).collect()
+                self.calls.split_inclusive(|call| *call == "post").collect()
             }
         }
 
@@ -3764,10 +3765,17 @@ mod cached_element_tests {
                 crate::platform::containment::IdentityAtomicBinding::Atomic,
                 "every returned post needs both generation checks"
             );
-            for per_event in transport.calls_per_event() {
+            // The window list is read before the first post only: a Visible
+            // reading stands for the rest of a short sequence. The generation
+            // is still read twice before every post.
+            for (index, per_event) in transport.calls_per_event().into_iter().enumerate() {
+                let expected: &[&str] = if index == 0 {
+                    &["generation", "visibility", "generation", "post"]
+                } else {
+                    &["generation", "generation", "post"]
+                };
                 assert_eq!(
-                    per_event,
-                    &["generation", "visibility", "generation", "post"],
+                    per_event, expected,
                     "an event was posted without a fresh generation read before it"
                 );
             }

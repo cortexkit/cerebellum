@@ -5,8 +5,7 @@
 //! selected transport even when that transport reports failure. That ownership
 //! boundary makes retrying the same event through another transport impossible.
 
-#[cfg(target_os = "macos")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -153,11 +152,75 @@ pub fn route_event_to_process<T: PerProcessEventTransport>(
     event: T::Event,
     transport: &mut T,
 ) -> Result<(PostCallMade, u64), ProcessEventRefusal> {
+    route_event_with_visibility(target, event, transport, &mut VisibilityMemo::uncached())
+}
+
+/// How long one input sequence may rely on an earlier reading that the window
+/// server lists the target. Reading the window list is a full window-server
+/// query (about 150 ms on a busy desktop) and typing posts two events per
+/// character, so reading it before every post made typing take roughly 300 ms
+/// per character. The process-generation checks, which are what tie each post
+/// to the granted process, still run before every post.
+pub const VISIBLE_READING_MAX_AGE: Duration = Duration::from_secs(1);
+
+/// The last time this sequence read the target as listed by the window
+/// server. Only a `Visible` reading is remembered: a target that was not
+/// listed, or a list that could not be read, is read again at the next post.
+pub struct VisibilityMemo {
+    max_age: Duration,
+    visible_at: Option<Instant>,
+}
+
+impl VisibilityMemo {
+    /// Remember a `Visible` reading for at most `max_age`.
+    pub fn new(max_age: Duration) -> Self {
+        Self {
+            max_age,
+            visible_at: None,
+        }
+    }
+
+    /// Read the window list before every post.
+    pub fn uncached() -> Self {
+        Self::new(Duration::ZERO)
+    }
+
+    fn read<T: PerProcessEventTransport>(
+        &mut self,
+        transport: &mut T,
+        pid: u32,
+    ) -> WindowServerVisibility {
+        self.read_at(Instant::now(), || transport.window_server_visibility(pid))
+    }
+
+    fn read_at(
+        &mut self,
+        now: Instant,
+        read: impl FnOnce() -> WindowServerVisibility,
+    ) -> WindowServerVisibility {
+        if self
+            .visible_at
+            .is_some_and(|at| now.saturating_duration_since(at) < self.max_age)
+        {
+            return WindowServerVisibility::Visible;
+        }
+        let reading = read();
+        self.visible_at = (reading == WindowServerVisibility::Visible).then_some(now);
+        reading
+    }
+}
+
+fn route_event_with_visibility<T: PerProcessEventTransport>(
+    target: ProcessEventTarget,
+    event: T::Event,
+    transport: &mut T,
+    visibility: &mut VisibilityMemo,
+) -> Result<(PostCallMade, u64), ProcessEventRefusal> {
     let mut verifications = 0_u64;
     require_exact_generation(target, transport.process_generation(target.pid))?;
     verifications += 1;
 
-    match transport.window_server_visibility(target.pid) {
+    match visibility.read(transport, target.pid) {
         WindowServerVisibility::Visible => {}
         WindowServerVisibility::NotVisible => {
             return Err(ProcessEventRefusal::NotVisibleToWindowServer)
@@ -184,7 +247,10 @@ pub fn route_event_to_process<T: PerProcessEventTransport>(
 /// generation is re-verified immediately before EVERY post. A check at the
 /// top of a five-event drag would not cover the fifth event: the process can
 /// be replaced while the sequence is in flight, and only a post-time reading
-/// separates the granted process from whoever inherited its pid.
+/// separates the granted process from whoever inherited its pid. The
+/// window-server listing, by contrast, is a slow query that says nothing about
+/// which process holds the pid, so one sequence reuses a `Visible` reading
+/// for up to [`VISIBLE_READING_MAX_AGE`].
 ///
 /// On a mid-sequence failure the sequence does not silently stop. Posted
 /// presses whose paired release is still in hand are released best-effort
@@ -201,12 +267,12 @@ pub fn post_event_sequence<T: PerProcessEventTransport>(
     transport: &mut T,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<SequencePostReport, SequencePostFailure> {
+    let mut visibility = VisibilityMemo::new(VISIBLE_READING_MAX_AGE);
     post_guarded_event_sequence(steps, cancelled, |_, event, recovery| {
         transport.set_recovery(recovery);
         match event {
-            Some(event) => {
-                route_event_to_process(target, event, transport).map(|(_, checks)| checks)
-            }
+            Some(event) => route_event_with_visibility(target, event, transport, &mut visibility)
+                .map(|(_, checks)| checks),
             None => Ok(0),
         }
     })
@@ -864,7 +930,9 @@ mod tests {
             assert_eq!(report.posts_returned, 3);
             // The generation is read once before the visibility read and again
             // immediately before EVERY post — the check covering the first event
-            // of a drag says nothing about the process at the fifth.
+            // of a drag says nothing about the process at the fifth. The window
+            // list is read once: a `Visible` reading stands for the rest of a
+            // sequence that runs inside `VISIBLE_READING_MAX_AGE`.
             assert_eq!(
                 transport.calls,
                 vec![
@@ -876,14 +944,12 @@ mod tests {
                         event: FakeEvent(1),
                     },
                     Call::ReadGeneration,
-                    Call::ReadVisibility,
                     Call::ReadGeneration,
                     Call::Post {
                         pid: PID,
                         event: FakeEvent(2),
                     },
                     Call::ReadGeneration,
-                    Call::ReadVisibility,
                     Call::ReadGeneration,
                     Call::Post {
                         pid: PID,
@@ -891,7 +957,106 @@ mod tests {
                     },
                 ]
             );
+            assert_eq!(report.generation_verifications, 6);
         }
+    }
+
+    /// A 300-character `type` posts 600 events. Reading the window list before
+    /// each of them made typing take about 300 ms per character on a busy
+    /// desktop; one sequence now reads it a handful of times at most, while
+    /// every post keeps both of its generation checks.
+    #[test]
+    fn a_long_typed_sequence_reads_the_window_list_a_handful_of_times() {
+        const EVENTS: usize = 600;
+        let mut transport = FakeTransport::new(
+            std::iter::repeat_n(current(), 2 * EVENTS),
+            WindowServerVisibility::Visible,
+            std::iter::repeat_n(Ok(PostCallMade::public_core_graphics()), EVENTS),
+        );
+        let steps = (0..EVENTS)
+            .map(|index| SyntheticStep {
+                event: FakeEvent((index % 251) as u8),
+                role: if index % 2 == 0 {
+                    SyntheticStepRole::Press
+                } else {
+                    SyntheticStepRole::Release
+                },
+            })
+            .collect();
+        let report = post_event_sequence(target(), steps, &mut transport, &never_cancelled)
+            .expect("a fully routed sequence completes");
+        assert_eq!(report.posts_returned, EVENTS as u64);
+        assert_eq!(report.generation_verifications, 2 * EVENTS as u64);
+        let visibility_reads = transport
+            .calls
+            .iter()
+            .filter(|call| **call == Call::ReadVisibility)
+            .count();
+        assert!(
+            (1..=5).contains(&visibility_reads),
+            "{visibility_reads} window-list reads for {EVENTS} posts"
+        );
+    }
+
+    /// Only `Visible` is remembered, and only for the bound: a target that was
+    /// not listed or a list that could not be read is read again.
+    #[test]
+    fn only_a_visible_reading_is_remembered_and_only_for_its_bound() {
+        let start = Instant::now();
+        let mut memo = VisibilityMemo::new(Duration::from_secs(1));
+        let mut reads = 0;
+        let mut read = |memo: &mut VisibilityMemo, at, answer: WindowServerVisibility| {
+            memo.read_at(at, || {
+                reads += 1;
+                answer
+            })
+        };
+        for answer in [
+            WindowServerVisibility::NotVisible,
+            WindowServerVisibility::Unreadable("timed out".into()),
+        ] {
+            assert_eq!(read(&mut memo, start, answer.clone()), answer);
+        }
+        assert_eq!(
+            read(&mut memo, start, WindowServerVisibility::Visible),
+            WindowServerVisibility::Visible
+        );
+        // Inside the bound the earlier reading stands, whatever a read would say.
+        assert_eq!(
+            read(
+                &mut memo,
+                start + Duration::from_millis(999),
+                WindowServerVisibility::NotVisible
+            ),
+            WindowServerVisibility::Visible
+        );
+        // At the bound the list is read again, and a refusal is not remembered.
+        assert_eq!(
+            read(
+                &mut memo,
+                start + Duration::from_secs(1),
+                WindowServerVisibility::NotVisible
+            ),
+            WindowServerVisibility::NotVisible
+        );
+        assert_eq!(
+            read(
+                &mut memo,
+                start + Duration::from_secs(1),
+                WindowServerVisibility::NotVisible
+            ),
+            WindowServerVisibility::NotVisible
+        );
+        assert_eq!(reads, 5);
+        let mut uncached = VisibilityMemo::uncached();
+        let mut uncached_reads = 0;
+        for _ in 0..3 {
+            uncached.read_at(start, || {
+                uncached_reads += 1;
+                WindowServerVisibility::Visible
+            });
+        }
+        assert_eq!(uncached_reads, 3);
     }
 
     #[test]
