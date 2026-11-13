@@ -28,6 +28,7 @@
 //! application back under a held modifier. Without admission a bracket
 //! behaves as it always has.
 
+mod latency;
 mod press;
 mod reason;
 mod restore;
@@ -112,6 +113,17 @@ pub trait FrontingBracketHost {
         activation_observed: bool,
     ) -> RestoreOutcome {
         restore_after_front_attempt(self, previous, target, since, wait_ms, activation_observed)
+    }
+    /// The largest of the last eight restore costs in this process, shared
+    /// across calls and targets. Hosts with an isolated clock may keep their
+    /// own samples instead.
+    fn measured_restore_latency_ms(&mut self) -> Option<u64> {
+        latency::measured_restore_latency_ms()
+    }
+    /// Retain a completed restore's cost, or a conservative timeout cost.
+    /// Skipped restores and already-frontmost targets supply no sample.
+    fn record_restore_latency_ms(&mut self, milliseconds: u64) {
+        latency::record_restore_latency_ms(milliseconds);
     }
     /// Our own pid as input sources carry it.
     fn our_pid(&self) -> i64;
@@ -488,18 +500,29 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
             break;
         }
 
-        // Before any restore has been timed, coming forward is the best
-        // guide to how long going back will take.
         let front_latency = host.borrow_mut().now_ms().saturating_sub(fronted_at);
         let mut chunk_units = 0;
         let mut stop = None;
         while next_unit < plan.units {
             let now = host.borrow_mut().now_ms();
             let elapsed = now.saturating_sub(fronted_at);
-            // What the next unit and the restore after it are expected to
-            // cost, from the slowest of each seen so far.
-            let expected =
-                elapsed + report.slowest_unit_ms + report.slowest_restore_ms.max(front_latency);
+            // Without a restore measurement, reserve the full restore allowance.
+            // The person's app may return more slowly than the target fronts.
+            // A refused first call still restores and learns its cost.
+            let restore_latency = if previous == plan.target_pid {
+                0
+            } else {
+                host.borrow_mut()
+                    .measured_restore_latency_ms()
+                    .unwrap_or(RESTORE_WAIT_MS)
+            };
+            let expected = elapsed
+                .saturating_add(report.slowest_unit_ms)
+                .saturating_add(
+                    restore_latency
+                        .max(report.slowest_restore_ms)
+                        .max(front_latency),
+                );
             if expected > bound {
                 if chunk_units == 0 {
                     stop = Some(BracketStop::BoundExceeded);
@@ -680,12 +703,18 @@ pub fn finish_deferred_restore<H: FrontingBracketHost>(
         };
         return;
     }
+    let restore_at = host.now_ms();
     let restored = restore_after_front(
         host,
         deferred.previous,
         deferred.target,
         deferred.front_instant_ms,
         wait_ms,
+    );
+    remember_restore(
+        host,
+        restored.restore,
+        restored.finished_at_ms.saturating_sub(restore_at),
     );
     outcome.person_input_during_fronting |= restored.person_input_during_fronting;
     outcome.report.longest_fronted_interval_ms = outcome.report.longest_fronted_interval_ms.max(
@@ -760,6 +789,12 @@ pub fn run_fronting_read_with<H: FrontingBracketHost>(
         ) -> RestoreOutcome {
             self.host
                 .restore_front_attempt(previous, target, since, wait_ms, activation_observed)
+        }
+        fn measured_restore_latency_ms(&mut self) -> Option<u64> {
+            self.host.measured_restore_latency_ms()
+        }
+        fn record_restore_latency_ms(&mut self, milliseconds: u64) {
+            self.host.record_restore_latency_ms(milliseconds);
         }
         fn our_pid(&self) -> i64 {
             self.host.our_pid()
@@ -855,6 +890,11 @@ fn restore<H: FrontingBracketHost>(
                 .slowest_restore_ms
                 .max(outcome.finished_at_ms.saturating_sub(restore_at));
         }
+        remember_restore(
+            *host.borrow_mut(),
+            outcome.restore,
+            outcome.finished_at_ms.saturating_sub(restore_at),
+        );
         let interval = outcome.finished_at_ms.saturating_sub(fronted_at);
         report.longest_fronted_interval_ms = report.longest_fronted_interval_ms.max(interval);
         report.restore = outcome.restore;
@@ -878,7 +918,24 @@ fn restore<H: FrontingBracketHost>(
             left_in_front: host.borrow_mut().frontmost_pid(),
         }
     };
+    remember_restore(
+        *host.borrow_mut(),
+        report.restore,
+        now.saturating_sub(restore_at),
+    );
     interval
+}
+
+/// A failed wait is only a lower bound on restore cost, not evidence of a
+/// fast restore. Reserve at least the normal cleanup allowance after one.
+fn remember_restore<H: FrontingBracketHost>(host: &mut H, status: RestoreStatus, elapsed: u64) {
+    match status {
+        RestoreStatus::Restored => host.record_restore_latency_ms(elapsed),
+        RestoreStatus::Failed { .. } => {
+            host.record_restore_latency_ms(elapsed.max(RESTORE_WAIT_MS));
+        }
+        RestoreStatus::NotNeeded | RestoreStatus::SkippedPerson { .. } => {}
+    }
 }
 
 #[cfg(test)]

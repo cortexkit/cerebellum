@@ -1916,6 +1916,12 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
     fn front_attempt_finished(&mut self) {
         self.returned();
     }
+    fn measured_restore_latency_ms(&mut self) -> Option<u64> {
+        self.inner.measured_restore_latency_ms()
+    }
+    fn record_restore_latency_ms(&mut self, milliseconds: u64) {
+        self.inner.record_restore_latency_ms(milliseconds);
+    }
     fn restore_front_attempt(
         &mut self,
         _previous: u32,
