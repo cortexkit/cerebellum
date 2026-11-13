@@ -8,14 +8,17 @@ pub mod contacts;
 pub mod cursor;
 pub mod events;
 pub mod filter;
+pub mod ical;
 pub mod ids;
 pub mod items;
 pub mod order;
 pub mod page;
+pub mod recurrence;
 pub mod schema;
 pub mod scope;
 pub mod time;
 pub mod tokens;
+pub mod vcard;
 
 pub use items::{Item, ItemKind};
 pub use schema::{validate_args, ValidatedArgs};
