@@ -2765,7 +2765,9 @@ where
                 // fronted dispatch, so nothing is fronted without the hooks.
                 driver.accept_fronted_dispatch_hooks(fronting::boxed_hooks(hooks));
             }
-            let mut dispatcher = Dispatcher::new(driver, &cancelled);
+            let mut dispatcher = Dispatcher::new(driver, &cancelled).with_typing_interval(
+                std::time::Duration::from_millis(crate::budgets::TYPE_CHARACTER_INTERVAL_MS),
+            );
             let posting =
                 own_input.begin_posting(person::last_input_instant(input_source.as_ref()));
             dispatch_work.publish_posting(&own_input, &posting);
@@ -2891,6 +2893,7 @@ where
                 // worker only keeps the application marked busy: stop polling
                 // and reading at the next check rather than finishing either.
                 let stopped = || observe_work.stopped();
+                let mut reversed = false;
                 // Polled up to the row's effect deadline rather than read once:
                 // an application renders typed text some time after the posts
                 // return, and a backgrounded Electron app takes the longest.
@@ -2915,6 +2918,9 @@ where
                         finished["outcome"] = json!("completed");
                         finished["effect_status"] = json!("effect_observed");
                     }
+                    if finished["outcome"] == "delivery_unconfirmed" && !stopped() {
+                        reversed = keystrokes::typed_text_reversed(source.as_ref(), focused, text);
+                    }
                 }
                 let observed = element_actions::settle_and_observe_view(
                     source.as_ref(),
@@ -2928,6 +2934,11 @@ where
                     Some(&mut effects),
                 );
                 element_actions::add_diff_view(&mut finished, observed.as_ref(), &view);
+                if reversed {
+                    action_effects::append_lines(&mut finished, &[
+                        "The text arrived out of order (reversed); delivery is unconfirmed. Read the field before retrying.".to_owned(),
+                    ]);
+                }
                 (finished, effects)
             })
             .await
@@ -4084,9 +4095,15 @@ fn parse_type_request(object: &serde_json::Map<String, Value>) -> Result<ParsedS
         // be a handler reporting an action it never performed.
         return Err(invalid_synthetic_request("text", "empty_value"));
     }
-    // The frozen request schema bounds the text at 4096 characters.
-    if text.chars().count() > 4_096 {
-        return Err(invalid_synthetic_request("text", "exceeds_maximum"));
+    // The frozen schema stays at 4096; the paced runtime limit also leaves
+    // room for readback before the caller cancels its request.
+    if text.chars().count() > crate::budgets::TYPE_MAX_CHARACTERS {
+        let mut refused = invalid_synthetic_request("text", "exceeds_maximum");
+        refused["remedy"] = json!(format!(
+            "Type at most {} characters per call; split longer text into several calls.",
+            crate::budgets::TYPE_MAX_CHARACTERS,
+        ));
+        return Err(refused);
     }
     // Unicode typing follows the target's own insertion-point convention,
     // which replaces an active selection as ordinary typing does. Choosing
@@ -5219,8 +5236,7 @@ mod synthetic_parse_tests {
         }
     }
 
-    /// The frozen bound is enforced at parse: 4096 characters of text, and no
-    /// empty text.
+    /// Text beyond the frozen schema bound and empty text are both refused.
     #[test]
     fn the_frozen_request_bounds_are_enforced() {
         let long = "a".repeat(4_097);
@@ -5236,6 +5252,37 @@ mod synthetic_parse_tests {
             )
             .is_err(),
             "an empty type plans no events and must not report success"
+        );
+    }
+
+    #[test]
+    fn paced_type_runtime_limit_counts_unicode_characters() {
+        let limit = crate::budgets::TYPE_MAX_CHARACTERS;
+        let accepted = "🦀".repeat(limit);
+        assert!(parse(
+            ComputerCapability::Type,
+            json!({"target": "editor", "text": accepted})
+        )
+        .is_ok());
+        let refused = parse(
+            ComputerCapability::Type,
+            json!({"target": "editor", "text": "🦀".repeat(limit + 1)}),
+        )
+        .unwrap_err();
+        assert_eq!(refused["outcome"], "invalid_request");
+        assert_eq!(refused["field"], "text");
+        assert_eq!(refused["reason"], "exceeds_maximum");
+        assert!(refused["remedy"]
+            .as_str()
+            .unwrap()
+            .contains(&limit.to_string()));
+        let reply = synthetic_wire_envelope(refused);
+        assert!(
+            cerebellum_computer::platform::vocabulary::validate_capability_result(
+                "computer.type",
+                &reply
+            )
+            .is_ok()
         );
     }
 

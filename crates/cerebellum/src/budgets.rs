@@ -54,6 +54,15 @@ pub const RESTORE_AX_MS: u64 = 300;
 // request-to-landing latency distribution will determine this allowance.
 pub const LATE_ACTIVATION_WATCH_MS: u64 = 5_000;
 pub const SYNTHETIC_POST_PHASE_MS: u64 = 5_000;
+// Controlled editors need time to commit a change before the next character.
+// Twenty milliseconds leaves more than one 60-Hz render frame between pairs.
+pub const TYPE_CHARACTER_INTERVAL_MS: u64 = 20;
+// Callers cancel around 60 seconds. Leave time for admission, the keyboard
+// action's cursor badge to arrive and readback, and reserve the existing
+// posting overhead in addition to pacing.
+pub const TYPE_POST_PHASE_MS: u64 = 45_000;
+pub const TYPE_MAX_CHARACTERS: usize =
+    ((TYPE_POST_PHASE_MS - SYNTHETIC_POST_PHASE_MS) / TYPE_CHARACTER_INTERVAL_MS) as usize;
 pub const CAPTURE_IMAGE_MS: u64 = 2_000;
 pub const INVENTORY_MS: u64 = 2_000;
 pub const OPEN_APP_LAUNCH_MS: u64 = 120_000;
@@ -278,6 +287,7 @@ budget!(
         ("fronting_lock", FRONTING_LOCK_WAIT_MS, 1),
         ("front", FRONT_WAIT_MS, 1),
         ("write", AX_STEP_MS, 1),
+        ("web_post", TYPE_POST_PHASE_MS, 1),
         ("read_back", AX_STEP_MS, 1),
         ("settle", COMPUTER_SETTLE_MS, 1),
         ("observe", COMPUTER_OBSERVE_MS, 1),
@@ -295,7 +305,7 @@ budget!(
         ("front", FRONT_WAIT_MS, 1),
         ("fronting", FRONTING_BRACKET_MS, 1),
         ("focus", AX_STEP_MS, 1),
-        ("post", SYNTHETIC_POST_PHASE_MS, 1),
+        ("post", TYPE_POST_PHASE_MS, 1),
         ("read_back", AX_STEP_MS, 1),
         ("settle", COMPUTER_SETTLE_MS, 1),
         ("observe", COMPUTER_OBSERVE_MS, 1),
@@ -1085,6 +1095,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paced_text_limit_reserves_posting_overhead_within_45_seconds() {
+        assert_eq!(TYPE_MAX_CHARACTERS, 2_000);
+        let longest_pacing = (TYPE_MAX_CHARACTERS as u64 - 1) * TYPE_CHARACTER_INTERVAL_MS;
+        assert!(longest_pacing + SYNTHETIC_POST_PHASE_MS <= TYPE_POST_PHASE_MS);
+        const {
+            assert!(TYPE_POST_PHASE_MS <= 45_000);
+            assert!(
+                TYPE_POST_PHASE_MS
+                    + CURSOR_ARRIVAL_MS
+                    + AX_STEP_MS
+                    + COMPUTER_SETTLE_MS
+                    + COMPUTER_OBSERVE_MS
+                    + RELEASE_BUDGET_MS
+                    < 60_000
+            );
+        }
+        assert_eq!(COMPUTER_REPLY_MAX_MS, 687_601);
+    }
+
+    #[test]
     fn every_budget_is_the_const_sum_of_its_phases() {
         for entry in COMPUTER_ACTIONS
             .iter()
@@ -1198,6 +1228,7 @@ mod tests {
                     + FRONTING_LOCK_WAIT_MS
                     + FRONT_WAIT_MS
                     + 3 * AX_STEP_MS
+                    + TYPE_POST_PHASE_MS
                     + COMPUTER_SETTLE_MS
                     + COMPUTER_OBSERVE_MS
                     + STORE_MS,
@@ -1210,7 +1241,7 @@ mod tests {
                     + FRONT_WAIT_MS
                     + 3 * AX_STEP_MS
                     + FRONTING_BRACKET_MS
-                    + SYNTHETIC_POST_PHASE_MS
+                    + TYPE_POST_PHASE_MS
                     + COMPUTER_SETTLE_MS
                     + COMPUTER_OBSERVE_MS
                     + 2 * STORE_MS,

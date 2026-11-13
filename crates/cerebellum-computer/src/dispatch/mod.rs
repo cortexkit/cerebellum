@@ -602,6 +602,7 @@ pub struct Dispatcher<'a, D> {
     trace: Vec<DispatchPhase>,
     last_observed_abort: Option<AbortDecision>,
     last_bracket: Option<BracketReport>,
+    typing_interval: std::time::Duration,
 }
 
 #[derive(Debug)]
@@ -637,7 +638,14 @@ impl<'a, D> Dispatcher<'a, D> {
             trace: Vec::new(),
             last_observed_abort: None,
             last_bracket: None,
+            typing_interval: std::time::Duration::ZERO,
         }
+    }
+
+    /// Set the per-process text cadence without slowing chords or releases.
+    pub fn with_typing_interval(mut self, interval: std::time::Duration) -> Self {
+        self.typing_interval = interval;
+        self
     }
 
     /// What the last dispatch's fronting bracket did, whatever the dispatch
@@ -1193,7 +1201,11 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                 }
                 let cancelled = self.cancelled;
                 let stopped = || cancelled() || audit.mutation_stopped();
-                let result = match self.driver.dispatch_per_pid(synthetic, &stopped) {
+                let result = match self.driver.dispatch_per_pid_paced(
+                    synthetic,
+                    self.typing_interval,
+                    &stopped,
+                ) {
                     Ok(result) => {
                         self.finalize_audit_outcome(
                             audit,

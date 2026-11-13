@@ -173,9 +173,19 @@ const WINDOW_LIST_READ_TIMEOUT: Duration = Duration::from_millis(1_000);
 /// transport: grant parsing, translation, routing, and mid-sequence recovery
 /// are identical either way, and the transport is the only part that touches
 /// the window server.
+#[cfg(test)]
 fn dispatch_synthetic_to_pid(
     request: &SyntheticDispatchRequest,
     transport: &mut impl PerProcessEventTransport<Event = cerebellum_macos::OwnedCgEvent>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<DispatchResult, DriverError> {
+    dispatch_synthetic_to_pid_paced(request, transport, Duration::ZERO, cancelled)
+}
+
+fn dispatch_synthetic_to_pid_paced(
+    request: &SyntheticDispatchRequest,
+    transport: &mut impl PerProcessEventTransport<Event = cerebellum_macos::OwnedCgEvent>,
+    character_interval: Duration,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<DispatchResult, DriverError> {
     // The grant records the kernel start time of the process it was made
@@ -194,8 +204,15 @@ fn dispatch_synthetic_to_pid(
         pid: request.target.pid,
         start_time_micros,
     };
-    let report = post_event_sequence(target, steps, transport, cancelled)
-        .map_err(DriverError::SyntheticDispatchFailed)?;
+    let interval = if matches!(request.action, SyntheticAction::TypeText { .. }) {
+        character_interval
+    } else {
+        Duration::ZERO
+    };
+    let report = super::process_event::post_event_sequence_paced(
+        target, steps, interval, transport, cancelled,
+    )
+    .map_err(DriverError::SyntheticDispatchFailed)?;
     Ok(DispatchResult {
         // The post calls returned, and that is ALL this says: the post call
         // is void, so receipt — let alone effect — is for effect observation
@@ -1788,6 +1805,15 @@ impl PlatformDriver for MacOs26PlatformDriver {
         request: SyntheticDispatchRequest,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
+        self.dispatch_per_pid_paced(request, Duration::ZERO, cancelled)
+    }
+
+    fn dispatch_per_pid_paced(
+        &mut self,
+        request: SyntheticDispatchRequest,
+        character_interval: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<DispatchResult, DriverError> {
         if !super::DOWN_GESTURE_RECOVERY_MEASURED
             && matches!(
                 request.action,
@@ -1807,7 +1833,12 @@ impl PlatformDriver for MacOs26PlatformDriver {
         } else {
             MacOsPerProcessEventTransport::new(WINDOW_LIST_READ_TIMEOUT)
         };
-        let result = dispatch_synthetic_to_pid(&request, &mut transport, cancelled);
+        let result = dispatch_synthetic_to_pid_paced(
+            &request,
+            &mut transport,
+            character_interval,
+            cancelled,
+        );
         self.input_route_evidence = transport.evidence;
         result
     }

@@ -133,6 +133,10 @@ pub trait PerProcessEventTransport {
     type Event;
 
     fn set_recovery(&mut self, _recovery: bool) {}
+    /// Wait between complete character pairs, never before a held-key release.
+    fn wait_between_characters(&mut self, interval: Duration) {
+        std::thread::sleep(interval);
+    }
     fn process_generation(&mut self, pid: u32) -> ProcessGenerationReading;
     fn window_server_visibility(&mut self, pid: u32) -> WindowServerVisibility;
     fn post_to_pid(
@@ -267,13 +271,36 @@ pub fn post_event_sequence<T: PerProcessEventTransport>(
     transport: &mut T,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<SequencePostReport, SequencePostFailure> {
+    post_event_sequence_paced(target, steps, Duration::ZERO, transport, cancelled)
+}
+
+/// Post character pairs with a minimum gap after each completed pair. The
+/// caller supplies a nonzero interval only for text, not chords or pointers.
+/// Waiting happens before cancellation and identity checks, and recovery
+/// releases bypass the wait entirely.
+pub fn post_event_sequence_paced<T: PerProcessEventTransport>(
+    target: ProcessEventTarget,
+    steps: Vec<SyntheticStep<T::Event>>,
+    character_interval: Duration,
+    transport: &mut T,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SequencePostReport, SequencePostFailure> {
+    let character_starts: Vec<bool> = steps
+        .iter()
+        .map(|step| step.role == SyntheticStepRole::Press)
+        .collect();
     let mut visibility = VisibilityMemo::new(VISIBLE_READING_MAX_AGE);
-    post_guarded_event_sequence(steps, cancelled, |_, event, recovery| {
+    post_guarded_event_sequence(steps, cancelled, |index, event, recovery| {
         transport.set_recovery(recovery);
         match event {
             Some(event) => route_event_with_visibility(target, event, transport, &mut visibility)
                 .map(|(_, checks)| checks),
-            None => Ok(0),
+            None => {
+                if index > 0 && character_starts[index] && !character_interval.is_zero() {
+                    transport.wait_between_characters(character_interval);
+                }
+                Ok(0)
+            }
         }
     })
     .map_err(|failure| SequencePostFailure {

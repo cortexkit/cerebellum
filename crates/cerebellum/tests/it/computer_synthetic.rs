@@ -56,6 +56,7 @@ struct Shared {
     calls: Vec<DispatchedCall>,
     /// When each per-process post reached the driver, on tokio's clock.
     posted_at: Vec<tokio::time::Instant>,
+    typing_intervals: Vec<std::time::Duration>,
     interrupt_after_two: Option<Arc<tokio::sync::Notify>>,
     per_pid: Result<DispatchResult, DriverError>,
     global: Result<DispatchResult, DriverError>,
@@ -72,6 +73,7 @@ impl Shared {
             input_value_override: None,
             calls: Vec::new(),
             posted_at: Vec::new(),
+            typing_intervals: Vec::new(),
             interrupt_after_two: None,
             per_pid: Ok(DispatchResult {
                 accepted_by_platform: true,
@@ -197,6 +199,20 @@ impl PlatformDriver for SyntheticDriver {
             }));
         }
         shared.per_pid.clone()
+    }
+
+    fn dispatch_per_pid_paced(
+        &mut self,
+        request: SyntheticDispatchRequest,
+        character_interval: std::time::Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<DispatchResult, DriverError> {
+        self.0
+            .lock()
+            .unwrap()
+            .typing_intervals
+            .push(character_interval);
+        self.dispatch_per_pid(request, cancelled)
     }
 
     fn dispatch_global(
@@ -1890,6 +1906,85 @@ async fn typed_text_found_in_what_changed_is_completed() {
     assert_eq!(reply["effect_status"], "effect_observed");
 }
 
+#[tokio::test]
+async fn paced_type_accepts_its_runtime_boundary_and_refuses_before_posting_above_it() {
+    let limit = cerebellum::budgets::TYPE_MAX_CHARACTERS;
+    for count in [limit, limit + 1] {
+        let shared = Shared::handle();
+        let desk = focused_text_desk();
+        let plane = plane_on(&shared, &desk, false);
+        let reply = serve(
+            &plane,
+            "computer.type",
+            json!({
+                "target": TARGET_BUNDLE_ID, "text": "🦀".repeat(count),
+            }),
+            &granted_management().await,
+            &FakeClock::new(),
+        )
+        .await;
+        if count == limit {
+            assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+            assert_eq!(dispatched_calls(&shared).len(), 1);
+            assert_eq!(
+                shared.lock().unwrap().typing_intervals,
+                [std::time::Duration::from_millis(
+                    cerebellum::budgets::TYPE_CHARACTER_INTERVAL_MS
+                )]
+            );
+        } else {
+            assert_eq!(reply["outcome"], "invalid_request", "{reply}");
+            assert_eq!(reply["effect_status"], "not_dispatched");
+            assert_eq!(reply["field"], "text");
+            assert_eq!(reply["reason"], "exceeds_maximum");
+            assert!(reply["remedy"]
+                .as_str()
+                .unwrap()
+                .contains(&limit.to_string()));
+            assert!(dispatched_calls(&shared).is_empty());
+        }
+        assert!(desk.state().selections.is_empty());
+        assert!(desk.state().writes.is_empty());
+        assert!(plane.result_schema_findings().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn reversed_type_readback_is_unconfirmed_and_reports_out_of_order_text() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    {
+        let mut state = desk.state();
+        let field = state.elements.get_mut(&2).unwrap();
+        field.readbacks = [Some(String::new())].into();
+        field.value = Some("eerht kcehc egdab".into());
+    }
+    let plane = plane_on(&shared, &desk, false);
+    let reply = serve(
+        &plane,
+        "computer.type",
+        json!({
+            "target": TARGET_BUNDLE_ID, "text": "badge check three",
+        }),
+        &granted_management().await,
+        &FakeClock::new(),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+    assert_eq!(reply["effect_status"], "effect_indeterminate");
+    assert!(
+        reply["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("out of order (reversed)"),
+        "{reply}"
+    );
+    assert_eq!(dispatched_calls(&shared).len(), 1);
+    assert!(desk.state().selections.is_empty());
+    assert!(desk.state().writes.is_empty());
+    assert!(plane.result_schema_findings().is_empty());
+}
+
 fn web_replace_desk() -> Desk {
     use cerebellum_computer::app_state::source::RawElement;
     let desk = background(focused_text_desk());
@@ -1953,6 +2048,42 @@ async fn web_replace_selects_all_utf16_then_posts_per_process_and_confirms_exact
         let calls = dispatched_calls(&shared);
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert!(matches!(&calls[0], DispatchedCall::PerPid(_)), "{calls:?}");
+    }
+}
+
+#[tokio::test]
+async fn paced_web_replacement_refuses_above_the_runtime_cap_without_selecting() {
+    let limit = cerebellum::budgets::TYPE_MAX_CHARACTERS;
+    for count in [limit, limit + 1] {
+        let shared = Shared::handle();
+        let desk = web_replace_desk();
+        shared.lock().unwrap().input_desk = Some(desk.clone());
+        let plane = plane_on(&shared, &desk, false);
+        let text = "🦀".repeat(count);
+        let reply = web_replace(&plane, &granted_management().await, &text).await;
+        if count == limit {
+            assert_eq!(reply["outcome"], "completed", "{reply}");
+            assert_eq!(dispatched_calls(&shared).len(), 1);
+            assert_eq!(desk.state().selections, [(2, (0, 4))]);
+            assert_eq!(
+                desk.state().elements[&2].value.as_deref(),
+                Some(text.as_str())
+            );
+        } else {
+            assert_eq!(reply["outcome"], "invalid_request", "{reply}");
+            // write_text has no not_dispatched status in its frozen schema;
+            // the adapter preserves the no-post evidence in the remedy.
+            assert_eq!(reply["effect_status"], "effect_indeterminate");
+            assert!(reply["remedy"].as_str().unwrap().contains("not_dispatched"));
+            assert_eq!(reply["field"], "text");
+            assert_eq!(reply["reason"], "exceeds_maximum");
+            assert!(dispatched_calls(&shared).is_empty());
+            assert!(desk.state().selections.is_empty());
+            assert_eq!(desk.state().elements[&2].selection, Some((1, 0)));
+            assert_eq!(desk.state().elements[&2].value.as_deref(), Some("a😀b"));
+        }
+        assert!(desk.state().writes.is_empty());
+        assert!(plane.result_schema_findings().is_empty());
     }
 }
 

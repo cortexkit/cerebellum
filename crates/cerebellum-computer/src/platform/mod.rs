@@ -1542,6 +1542,16 @@ pub trait PlatformDriver {
         request: SyntheticDispatchRequest,
         _cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError>;
+    /// Deliver text with the caller's character cadence. Drivers without a
+    /// per-event text transport retain their existing dispatch behaviour.
+    fn dispatch_per_pid_paced(
+        &mut self,
+        request: SyntheticDispatchRequest,
+        _character_interval: std::time::Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<DispatchResult, DriverError> {
+        self.dispatch_per_pid(request, cancelled)
+    }
     fn dispatch_global(
         &mut self,
         request: GlobalDispatchRequest,
