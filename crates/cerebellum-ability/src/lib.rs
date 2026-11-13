@@ -6,11 +6,13 @@
 pub mod caps;
 pub mod contacts;
 pub mod cursor;
+pub mod emlx;
 pub mod events;
 pub mod filter;
 pub mod ical;
 pub mod ids;
 pub mod items;
+pub mod mime;
 pub mod order;
 pub mod page;
 pub mod recurrence;
@@ -18,6 +20,7 @@ pub mod schema;
 pub mod scope;
 pub mod time;
 pub mod tokens;
+pub mod typedstream;
 pub mod vcard;
 
 pub use items::{Item, ItemKind};
