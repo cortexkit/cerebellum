@@ -249,6 +249,8 @@ impl PlatformDriver for SyntheticDriver {
             pending: None,
             refuse_front_of: script.refuse_restore.then_some(OTHER_APPLICATION_PID),
             front_latency_ms: script.front_latency_ms.unwrap_or(2),
+            restore_latency_ms: script.restore_latency_ms,
+            measured_restore_ms: script.measured_restore_ms,
             unit_failure: script.unit_failure.clone(),
             seize_after_first_unit: script.seize_after_first_unit,
             units_posted: 0,
@@ -305,6 +307,8 @@ impl PlatformDriver for SyntheticDriver {
             pending: None,
             refuse_front_of: script.refuse_restore.then_some(OTHER_APPLICATION_PID),
             front_latency_ms: script.front_latency_ms.unwrap_or(2),
+            restore_latency_ms: script.restore_latency_ms,
+            measured_restore_ms: script.measured_restore_ms,
             unit_failure: None,
             seize_after_first_unit: false,
             units_posted: 0,
@@ -412,8 +416,13 @@ impl PlatformDriver for SyntheticDriver {
 struct FrontingScript {
     refuse_restore: bool,
     cancel_after_first_chunk: bool,
+    /// Prior restore evidence on this fake desk; ordinary dispatch scenarios
+    /// start warm so their post/restore assertions do not test cold admission.
+    measured_restore_ms: u64,
     /// How long a fronting request takes to take effect; 2 ms when unset.
     front_latency_ms: Option<u64>,
+    /// A restore may be slower than both the front and its prior measurement.
+    restore_latency_ms: Option<u64>,
     /// When set, every unit post fails this way instead of succeeding.
     unit_failure: Option<SequencePostFailure>,
     /// When set, input from another process shows up once a unit has been
@@ -434,6 +443,8 @@ struct FrontingDesk {
     pending: Option<(u32, u64)>,
     refuse_front_of: Option<u32>,
     front_latency_ms: u64,
+    restore_latency_ms: Option<u64>,
+    measured_restore_ms: u64,
     unit_failure: Option<SequencePostFailure>,
     seize_after_first_unit: bool,
     units_posted: usize,
@@ -458,6 +469,12 @@ impl FrontingDesk {
 
 impl cerebellum_computer::dispatch::FrontingBracketHost for FrontingDesk {
     type Tap = ();
+    fn measured_restore_latency_ms(&mut self) -> Option<u64> {
+        Some(self.measured_restore_ms)
+    }
+    fn record_restore_latency_ms(&mut self, milliseconds: u64) {
+        self.measured_restore_ms = milliseconds;
+    }
     fn now_ms(&mut self) -> u64 {
         self.now
     }
@@ -470,7 +487,12 @@ impl cerebellum_computer::dispatch::FrontingBracketHost for FrontingDesk {
     fn request_front(&mut self, pid: u32) -> bool {
         self.front_requests.push(pid);
         if self.refuse_front_of != Some(pid) {
-            self.pending = Some((pid, self.now + self.front_latency_ms));
+            let latency = if pid == OTHER_APPLICATION_PID {
+                self.restore_latency_ms.unwrap_or(self.front_latency_ms)
+            } else {
+                self.front_latency_ms
+            };
+            self.pending = Some((pid, self.now + latency));
         }
         true
     }
@@ -570,6 +592,15 @@ impl FrontingRestoreHost for SharedFrontingDesk {
 
 impl FrontingBracketHost for SharedFrontingDesk {
     type Tap = ();
+    fn measured_restore_latency_ms(&mut self) -> Option<u64> {
+        self.0.lock().unwrap().measured_restore_latency_ms()
+    }
+    fn record_restore_latency_ms(&mut self, milliseconds: u64) {
+        self.0
+            .lock()
+            .unwrap()
+            .record_restore_latency_ms(milliseconds);
+    }
     fn now_ms(&mut self) -> u64 {
         self.0.lock().unwrap().now
     }
@@ -1778,6 +1809,40 @@ async fn a_background_target_with_the_takeover_grant_is_posted_through_the_brack
     assert!(carrier.questions().is_empty());
 }
 
+#[tokio::test]
+async fn separate_fake_desks_keep_their_restore_predictions_in_either_order() {
+    let management = granted_management().await;
+    grant_takeover(&management).await;
+    for costs in [[124, 0], [0, 124]] {
+        for cost in costs {
+            let shared = Shared::handle();
+            shared.lock().unwrap().fronted.measured_restore_ms = cost;
+            let desk = background(focused_text_desk());
+            let plane = plane_on(&shared, &desk, true);
+            let reply = serve_asking(
+                &plane,
+                "computer.keys",
+                keys_request(&["command", "a"]),
+                &management,
+                relayed(&ScriptedCarrier::default()),
+            )
+            .await;
+            if cost == 0 {
+                assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+                assert_eq!(reply["target_fronted"], true, "{reply}");
+                assert!(matches!(
+                    &dispatched_calls(&shared)[..],
+                    [DispatchedCall::Fronted(_)]
+                ));
+            } else {
+                assert_eq!(reply["outcome"], "fronting_bound_exceeded", "{reply}");
+                assert_eq!(reply["effect_status"], "not_dispatched", "{reply}");
+                assert_eq!(reply["posts_returned"], 0, "{reply}");
+            }
+        }
+    }
+}
+
 /// A frontmost target is posted to per process, and no takeover question is
 /// raised even in a build that could ask one.
 #[tokio::test]
@@ -1810,9 +1875,14 @@ async fn a_frontmost_target_is_posted_per_process_without_a_takeover_question() 
 #[tokio::test]
 async fn a_chord_whose_restore_overran_the_bound_is_reported_delivered_not_refused() {
     let shared = Shared::handle();
-    // Front and restore each take 49 ms: the chord fits the prediction, and
-    // the whole interval (49 + 3 + 49) runs past the 100 ms bound.
-    shared.lock().unwrap().fronted.front_latency_ms = Some(49);
+    // Prior restores cost 25 ms, so the chord fits the warm prediction. The
+    // next restore takes 124 ms instead and overruns after the chord landed.
+    {
+        let mut state = shared.lock().unwrap();
+        state.fronted.front_latency_ms = Some(25);
+        state.fronted.measured_restore_ms = 25;
+        state.fronted.restore_latency_ms = Some(124);
+    }
     let desk = background(focused_text_desk());
     let plane = plane_on(&shared, &desk, true);
     let management = granted_management().await;
