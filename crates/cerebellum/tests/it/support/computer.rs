@@ -721,7 +721,7 @@ pub struct DeskState {
     pub pointer_prewarm_error: Option<&'static str>,
     pub on_pointer_prewarm: Option<DeskHook>,
     pub cursor_frame: Option<[f64; 4]>,
-    /// Emulate a window that supports geometry notifications but not minimize.
+    /// Emulate a window that sends geometry notifications but none for its minimized state.
     pub cursor_poll_minimized: bool,
     pub press_frame: Option<[f64; 4]>,
     pub displays: Option<Vec<[f64; 4]>>,
