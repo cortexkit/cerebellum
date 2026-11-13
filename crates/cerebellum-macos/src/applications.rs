@@ -19,6 +19,8 @@ pub struct InstalledApplication {
     pub name: String,
     pub bundle_identifier: String,
     pub path: PathBuf,
+    pub version: Option<String>,
+    pub build_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -225,6 +227,8 @@ fn metadata(path: &Path) -> Result<InstalledApplication, String> {
             name,
             bundle_identifier,
             path: path.to_owned(),
+            version: string("CFBundleShortVersionString"),
+            build_version: string("CFBundleVersion"),
         })
     })
 }
@@ -325,6 +329,87 @@ pub struct ApplicationOpenResult {
     pub first_window_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RunningApplicationInstance {
+    pub pid: u32,
+    pub start_time_micros: u64,
+    pub executable_path: PathBuf,
+}
+
+/// Bind each executable read to a kernel process generation, not a display name.
+pub fn running_application_instances(
+    bundle: &str,
+) -> Result<Vec<RunningApplicationInstance>, String> {
+    workspace_running_applications()?
+        .into_iter()
+        .filter(|app| app.bundle_identifier.eq_ignore_ascii_case(bundle))
+        .map(|app| {
+            let start_time_micros =
+                crate::process_start_time_micros(app.pid).ok_or("process_identity_unavailable")?;
+            let executable_path = crate::process_executable_path(app.pid)
+                .ok()
+                .flatten()
+                .ok_or("process_executable_unavailable")?
+                .canonicalize()
+                .map_err(|_| "process_executable_unavailable")?;
+            if crate::process_start_time_micros(app.pid) != Some(start_time_micros) {
+                return Err("process_generation_changed".into());
+            }
+            Ok(RunningApplicationInstance {
+                pid: app.pid,
+                start_time_micros,
+                executable_path,
+            })
+        })
+        .collect()
+}
+
+fn verify_bundle_process(path: &Path, pid: u32, start_time_micros: u64) -> Result<(), String> {
+    if crate::process_start_time_micros(pid) != Some(start_time_micros) {
+        return Err("process_generation_changed".into());
+    }
+    let executable = crate::process_executable_path(pid)
+        .ok()
+        .flatten()
+        .ok_or("process_executable_unavailable")?;
+    let path = path.canonicalize().map_err(|_| "invalid_bundle_path")?;
+    let executable = executable
+        .canonicalize()
+        .map_err(|_| "process_executable_unavailable")?;
+    if !executable.starts_with(&path) || executable == path {
+        return Err("process_outside_selected_bundle".into());
+    }
+    if crate::process_start_time_micros(pid) != Some(start_time_micros) {
+        return Err("process_generation_changed".into());
+    }
+    Ok(())
+}
+
+/// Observe an already selected process without asking the OS to open anything.
+pub fn inspect_running_application(
+    path: &Path,
+    bundle: &str,
+    pid: u32,
+    start_time_micros: u64,
+) -> Result<ApplicationOpenResult, String> {
+    let running = running_application_instances(bundle)?;
+    if !matches!(running.as_slice(), [instance] if instance.pid == pid && instance.start_time_micros == start_time_micros)
+    {
+        return Err("running_application_changed".into());
+    }
+    let has_window = process_has_window(pid);
+    verify_bundle_process(path, pid, start_time_micros)?;
+    Ok(ApplicationOpenResult {
+        pid,
+        already_running: true,
+        has_window,
+        frontmost: crate::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok())
+            == Some(pid),
+        process_started_ms: 0,
+        first_window_ms: has_window.then_some(0),
+    })
+}
+
 /// Open the exact selected URL. The completion pid, not a shell child or a
 /// guessed name match, identifies the process whose first window is awaited.
 pub fn open_application(
@@ -357,19 +442,79 @@ pub fn open_application_with_url(
     window_timeout: Duration,
     ready_timeout: Duration,
 ) -> Result<ApplicationOpenResult, String> {
+    open_application_with_url_checked(
+        path,
+        bundle,
+        page_url,
+        activates,
+        process_timeout,
+        window_timeout,
+        ready_timeout,
+        None,
+    )
+}
+
+/// Deliver a URL by bundle path, refusing to label a replacement process as already running.
+#[allow(clippy::too_many_arguments)]
+pub fn open_running_application_with_url(
+    path: &Path,
+    bundle: &str,
+    page_url: &str,
+    pid: u32,
+    start_time_micros: u64,
+    process_timeout: Duration,
+    window_timeout: Duration,
+    ready_timeout: Duration,
+) -> Result<ApplicationOpenResult, String> {
+    open_application_with_url_checked(
+        path,
+        bundle,
+        Some(page_url),
+        false,
+        process_timeout,
+        window_timeout,
+        ready_timeout,
+        Some((pid, start_time_micros)),
+    )
+}
+
+fn verify_running_snapshot(
+    running: &[RunningApplicationInstance],
+    expected: (u32, u64),
+) -> Result<(), String> {
+    if matches!(running, [instance] if (instance.pid, instance.start_time_micros) == expected) {
+        Ok(())
+    } else {
+        Err("running_application_changed".into())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_application_with_url_checked(
+    path: &Path,
+    bundle: &str,
+    page_url: Option<&str>,
+    activates: bool,
+    process_timeout: Duration,
+    window_timeout: Duration,
+    ready_timeout: Duration,
+    expected: Option<(u32, u64)>,
+) -> Result<ApplicationOpenResult, String> {
     let started = Instant::now();
     let ready_deadline = started + ready_timeout;
-    let running = workspace_running_applications()?;
-    let matching: Vec<_> = running
-        .iter()
-        .filter(|app| app.bundle_identifier == bundle)
-        .collect();
+    let matching = running_application_instances(bundle)?;
+    if let Some(expected) = expected {
+        verify_running_snapshot(&matching, expected)?;
+    }
     if matching.len() > 1 {
         return Err("multiple_running_instances".into());
     }
     let already_running = !matching.is_empty();
+    if let Some(instance) = matching.first() {
+        verify_bundle_process(path, instance.pid, instance.start_time_micros)?;
+    }
     let pid = if page_url.is_none() && !matching.is_empty() {
-        let app = matching[0];
+        let app = &matching[0];
         app.pid
     } else {
         let (tx, rx) = mpsc::sync_channel(1);
@@ -418,6 +563,16 @@ pub fn open_application_with_url(
         ))
         .map_err(|_| "process_timeout")??
     };
+    let start_time_micros =
+        crate::process_start_time_micros(pid).ok_or("process_identity_unavailable")?;
+    if matching.first().is_some_and(|instance| {
+        instance.pid != pid || instance.start_time_micros != start_time_micros
+    }) {
+        return Err("process_generation_changed".into());
+    }
+    // LaunchServices can reuse another installation despite an exact URL.
+    // Never report that process as the selected, signer-approved bundle.
+    verify_bundle_process(path, pid, start_time_micros)?;
     let process_started_ms = started.elapsed().as_millis() as u64;
     let now = Instant::now();
     let deadline = now + bounded_wait(now, window_timeout, ready_deadline);
@@ -432,6 +587,10 @@ pub fn open_application_with_url(
             Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
         );
     };
+    verify_bundle_process(path, pid, start_time_micros)?;
+    if let Some(expected) = expected {
+        verify_running_snapshot(&running_application_instances(bundle)?, expected)?;
+    }
     Ok(ApplicationOpenResult {
         pid,
         already_running,
@@ -634,5 +793,55 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn selected_bundle_process_requires_both_containment_and_same_generation() {
+        let pid = std::process::id();
+        let start = crate::process_start_time_micros(pid).unwrap();
+        let executable = crate::process_executable_path(pid).unwrap().unwrap();
+        let parent = executable.parent().unwrap();
+        assert!(verify_bundle_process(parent, pid, start).is_ok());
+        assert_eq!(
+            verify_bundle_process(parent, pid, start + 1).unwrap_err(),
+            "process_generation_changed"
+        );
+        assert_eq!(
+            verify_bundle_process(&parent.join("other-copy.app"), pid, start).unwrap_err(),
+            "invalid_bundle_path"
+        );
+        assert_eq!(
+            verify_bundle_process(Path::new(env!("CARGO_MANIFEST_DIR")), pid, start).unwrap_err(),
+            "process_outside_selected_bundle"
+        );
+    }
+
+    #[test]
+    fn installed_metadata_reads_both_version_keys() {
+        let root = std::env::temp_dir().join(format!("ck-app-versions-{}", std::process::id()));
+        let contents = root.join("Versioned.app/Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        std::fs::write(contents.join("Info.plist"), "<plist><dict><key>CFBundleIdentifier</key><string>com.example.Versioned</string><key>CFBundleShortVersionString</key><string>0.20.23</string><key>CFBundleVersion</key><string>1234.5</string></dict></plist>").unwrap();
+        let app = metadata(&root.join("Versioned.app")).unwrap();
+        assert_eq!(app.version.as_deref(), Some("0.20.23"));
+        assert_eq!(app.build_version.as_deref(), Some("1234.5"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn running_url_snapshot_rejects_new_or_reused_processes() {
+        let original = RunningApplicationInstance {
+            pid: 42,
+            start_time_micros: 123,
+            executable_path: "/Applications/Fixture.app/Contents/MacOS/Fixture".into(),
+        };
+        let expected = (original.pid, original.start_time_micros);
+        assert!(verify_running_snapshot(std::slice::from_ref(&original), expected).is_ok());
+        let mut additional = original.clone();
+        additional.pid += 1;
+        assert!(verify_running_snapshot(&[original.clone(), additional], expected).is_err());
+        let mut replacement = original;
+        replacement.start_time_micros += 1;
+        assert!(verify_running_snapshot(&[replacement], expected).is_err());
+        assert!(verify_running_snapshot(&[], expected).is_err());
     }
 }

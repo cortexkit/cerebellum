@@ -73,6 +73,8 @@ fn installed(name: &str, bundle_identity: &str) -> InstalledApp {
         name: name.into(),
         bundle_identity: bundle_identity.into(),
         path: std::path::PathBuf::from(format!("/Applications/{name}.app")),
+        version: None,
+        build_version: None,
     }
 }
 

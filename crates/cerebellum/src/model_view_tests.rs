@@ -236,6 +236,8 @@ mod computer {
             name: name.into(),
             bundle_identity: bundle_identity.into(),
             path: format!("/Applications/{name}.app").into(),
+            version: None,
+            build_version: None,
         }
     }
 

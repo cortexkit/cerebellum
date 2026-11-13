@@ -6,6 +6,7 @@ use crate::computer_grants::{AppCode, AppIdentity, AppIdentityUnreadable, GrantN
 use crate::open_app_history::{AppKey, Observation, Outcome};
 use cerebellum_computer::app_state::source::OpenAppError;
 use cerebellum_computer::app_state::source::{InstalledApp, InstalledApps};
+use cerebellum_computer::platform::ProcessGrant;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -66,8 +67,14 @@ where
             tokio::task::spawn_blocking(move || source.installed_apps(Duration::from_secs(2)))
                 .await
                 .unwrap_or_default();
+        let source = self.app_state_source.clone();
+        let apps = listed.apps.clone();
+        let target = request.target.clone();
+        let resolved = tokio::task::spawn_blocking(move || resolve_installed(&target, &apps, &*source))
+            .await
+            .unwrap_or_else(|_| Err(json!({"outcome":"launch_failed", "remedy":"Application inventory could not be checked; retry list_apps before opening the app"})));
         let mut reply = self
-            .serve_installed_open_app(&request, &listed, context)
+            .serve_installed_open_app(&request, &listed, resolved, context)
             .await;
         // Unreadable bundles elsewhere do not invalidate a found target: its
         // bytes still need a signer-bound grant naming that application. Disclose
@@ -84,10 +91,11 @@ where
         &self,
         request: &OpenRequest,
         listed: &InstalledApps,
+        resolved: Result<ResolvedInstalled, Value>,
         context: ServeContext<'_, C>,
     ) -> Value {
-        let app = match resolve_installed(&request.target, &listed.apps) {
-            Ok(app) => app,
+        let ResolvedInstalled { app, running } = match resolved {
+            Ok(resolved) => resolved,
             Err(mut reply) => {
                 if !listed.complete && reply["outcome"] == "no_installed_app_named" {
                     reply["remedy"] = json!("the application may be in the unreadable part of the installed inventory; restore access and retry, or use the exact name or app identity (a bundle id on macOS) of an app shown by list_apps");
@@ -214,6 +222,16 @@ where
                     return Err(OpenAppError::Failed);
                 }
             }
+            if let Some(process) = running {
+                // A URL is still an instruction when the app is running. Bind
+                // delivery to the selected path and generation, and disclose
+                // any replacement instead of claiming it was already running.
+                return if let Some(url) = url {
+                    source.open_running_app_url(&launching, &process, &url, bounds)
+                } else {
+                    source.opened_running_app(&launching, &process)
+                };
+            }
             // URL revalidation can refuse before any launch call. Keep that
             // out of history, while still counting a worker failure after the
             // platform was asked to open the app as a real launch attempt.
@@ -246,7 +264,7 @@ where
             Err(OpenAppError::TimedOut) => {
                 observation.timeout_floor_ms = Some(bounds.ready_timeout.as_millis() as u64);
             }
-            Err(OpenAppError::Failed) => {}
+            Err(OpenAppError::Failed | OpenAppError::RunningChanged) => {}
         }
         let mut reply = match opened {
             Ok(opened) => json!({
@@ -258,6 +276,9 @@ where
             }
             Err(OpenAppError::Failed) => {
                 json!({"outcome":"launch_failed", "remedy":"On macOS, LaunchServices could not open the application; list_apps before retrying because the application may still start"})
+            }
+            Err(OpenAppError::RunningChanged) => {
+                json!({"outcome":"launch_failed", "remedy":"The running application changed or an additional process appeared while delivering the URL. The URL may have been delivered and another copy may have started; use list_apps and read_state before retrying."})
             }
         };
         // Foreground mode brings the opened application to the front through
@@ -384,10 +405,16 @@ fn admit_url(url: &str, registered: &[String], bundle: &str) -> Result<(), Value
     )
 }
 
+pub(super) struct ResolvedInstalled {
+    pub app: InstalledApp,
+    pub running: Option<ProcessGrant>,
+}
+
 pub(super) fn resolve_installed(
     target: &str,
     apps: &[InstalledApp],
-) -> Result<InstalledApp, Value> {
+    source: &dyn AppStateSource,
+) -> Result<ResolvedInstalled, Value> {
     let wanted = target.trim();
     let by_id: Vec<_> = apps
         .iter()
@@ -401,12 +428,106 @@ pub(super) fn resolve_installed(
         by_id
     };
     match matches.as_slice() {
-        [app] => Ok((*app).clone()),
+        [app] => Ok(ResolvedInstalled {
+            app: (*app).clone(),
+            running: None,
+        }),
         [] => Err(
             json!({"outcome":"no_installed_app_named", "target":wanted, "remedy":"list_apps shows installed applications; use an exact name or app identity (a bundle id on macOS)"}),
         ),
-        _ => Err(
-            json!({"outcome":"ambiguous_app", "target":wanted, "candidates":matches.iter().map(|app| json!({"name":app.name,"bundle_identity":app.bundle_identity})).collect::<Vec<_>>(), "remedy":"several installed applications match; use a unique app identity (a bundle id on macOS; duplicate installations must be removed or renamed)"}),
-        ),
+        _ => {
+            let same_bundle = matches.iter().all(|app| {
+                app.bundle_identity
+                    .eq_ignore_ascii_case(&matches[0].bundle_identity)
+            });
+            if same_bundle {
+                if let Ok(running) = source.running_app_instances(&matches[0].bundle_identity) {
+                    match running.as_slice() {
+                        [instance] => {
+                            let copies: Vec<_> = matches
+                                .iter()
+                                .filter(|app| {
+                                    let path = app
+                                        .path
+                                        .canonicalize()
+                                        .unwrap_or_else(|_| app.path.clone());
+                                    instance.executable_path.starts_with(&path)
+                                        && instance.executable_path != path
+                                })
+                                .collect();
+                            if let [app] = copies.as_slice() {
+                                return Ok(ResolvedInstalled {
+                                    app: (***app).clone(),
+                                    running: Some(instance.process.clone()),
+                                });
+                            }
+                        }
+                        [] => {
+                            let versions: Option<Vec<_>> =
+                                matches.iter().map(|app| app_version(app)).collect();
+                            if let Some(versions) = versions {
+                                let best = versions.iter().max().expect("nonempty candidates");
+                                let newest: Vec<_> = matches
+                                    .iter()
+                                    .zip(&versions)
+                                    .filter(|(_, version)| *version == best)
+                                    .collect();
+                                if let [(app, _)] = newest.as_slice() {
+                                    return Ok(ResolvedInstalled {
+                                        app: (**app).clone(),
+                                        running: None,
+                                    });
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let copies = matches
+                .iter()
+                .map(|app| {
+                    format!(
+                        "{} (version {}; build {})",
+                        app.path.display(),
+                        app.version.as_deref().unwrap_or("unknown"),
+                        app.build_version.as_deref().unwrap_or("unknown")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let remedy = if same_bundle {
+                format!("Multiple copies of this app are installed ({copies}). Ask the person to close extra running copies or remove the copy they don't use, then retry.")
+            } else {
+                format!("Several installed applications share this name ({copies}). Use a unique app identity (a bundle id on macOS), or ask the person which app they mean.")
+            };
+            Err(
+                json!({"outcome":"ambiguous_app", "target":wanted, "candidates":matches.iter().map(|app| json!({"name":app.name,"bundle_identity":app.bundle_identity})).collect::<Vec<_>>(), "remedy":remedy}),
+            )
+        }
     }
+}
+
+fn app_version(app: &InstalledApp) -> Option<Vec<u64>> {
+    fn parse(version: &str) -> Option<Vec<u64>> {
+        let mut parts: Vec<_> = version
+            .split('.')
+            .map(|part| {
+                if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                    None
+                } else {
+                    part.parse().ok()
+                }
+            })
+            .collect::<Option<_>>()?;
+        // Missing trailing parts have value zero: 1, 1.0 and 1.0.0 tie.
+        while parts.last() == Some(&0) {
+            parts.pop();
+        }
+        Some(parts)
+    }
+    app.version
+        .as_deref()
+        .and_then(parse)
+        .or_else(|| app.build_version.as_deref().and_then(parse))
 }

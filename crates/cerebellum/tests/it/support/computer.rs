@@ -814,6 +814,12 @@ pub struct DeskState {
     /// name is matched against; `None` when the list cannot be read.
     pub running: Option<Vec<cerebellum_computer::app_state::source::RunningApp>>,
     pub installed: cerebellum_computer::app_state::source::InstalledApps,
+    pub running_instances: Vec<cerebellum_computer::app_state::source::RunningAppInstance>,
+    pub opened_paths: Vec<std::path::PathBuf>,
+    pub observed_processes: Vec<ProcessGrant>,
+    pub running_instances_after_url:
+        Option<Vec<cerebellum_computer::app_state::source::RunningAppInstance>>,
+    pub opened_url_paths: Vec<std::path::PathBuf>,
     pub signature: Option<cerebellum_computer::app_state::source::BundleSignature>,
     pub opens: Vec<cerebellum_computer::app_state::source::OpenAppBounds>,
     pub url_schemes: Vec<String>,
@@ -900,6 +906,11 @@ impl Desk {
                 apple_anchored: false,
             }),
             opens: Vec::new(),
+            running_instances: Vec::new(),
+            opened_paths: Vec::new(),
+            observed_processes: Vec::new(),
+            running_instances_after_url: None,
+            opened_url_paths: Vec::new(),
             url_schemes: Vec::new(),
             url_schemes_after_read: None,
             opened_urls: Vec::new(),
@@ -1407,7 +1418,7 @@ impl AppStateSource for Desk {
 
     fn open_app(
         &self,
-        _app: &cerebellum_computer::app_state::source::InstalledApp,
+        app: &cerebellum_computer::app_state::source::InstalledApp,
         bounds: cerebellum_computer::app_state::source::OpenAppBounds,
     ) -> Result<
         cerebellum_computer::app_state::source::OpenedApp,
@@ -1415,7 +1426,79 @@ impl AppStateSource for Desk {
     > {
         let mut state = self.state();
         state.opens.push(bounds);
+        state.opened_paths.push(app.path.clone());
         state.open_error.map_or(Ok(state.opened), Err)
+    }
+
+    fn running_app_instances(
+        &self,
+        bundle: &str,
+    ) -> Result<Vec<cerebellum_computer::app_state::source::RunningAppInstance>, AppStateReadError>
+    {
+        Ok(self
+            .state()
+            .running_instances
+            .iter()
+            .filter(|instance| {
+                instance
+                    .process
+                    .bundle_identity
+                    .eq_ignore_ascii_case(bundle)
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn opened_running_app(
+        &self,
+        app: &cerebellum_computer::app_state::source::InstalledApp,
+        process: &ProcessGrant,
+    ) -> Result<
+        cerebellum_computer::app_state::source::OpenedApp,
+        cerebellum_computer::app_state::source::OpenAppError,
+    > {
+        let mut state = self.state();
+        if !state.running_instances.iter().any(|instance| {
+            instance.process == *process && instance.executable_path.starts_with(&app.path)
+        }) {
+            return Err(cerebellum_computer::app_state::source::OpenAppError::Failed);
+        }
+        state.observed_processes.push(process.clone());
+        Ok(cerebellum_computer::app_state::source::OpenedApp {
+            pid: process.pid,
+            already_running: true,
+            ..state.opened
+        })
+    }
+
+    fn open_running_app_url(
+        &self,
+        app: &cerebellum_computer::app_state::source::InstalledApp,
+        process: &ProcessGrant,
+        url: &str,
+        bounds: cerebellum_computer::app_state::source::OpenAppBounds,
+    ) -> Result<
+        cerebellum_computer::app_state::source::OpenedApp,
+        cerebellum_computer::app_state::source::OpenAppError,
+    > {
+        assert!(!bounds.activates);
+        let opened = self.opened_running_app(app, process)?;
+        let mut state = self.state();
+        state.opened_urls.push(url.into());
+        state.opened_url_paths.push(app.path.clone());
+        if let Some(instances) = state.running_instances_after_url.take() {
+            state.running_instances = instances;
+        }
+        let matching: Vec<_> = state
+            .running_instances
+            .iter()
+            .filter(|instance| instance.process.bundle_identity == app.bundle_identity)
+            .collect();
+        if !matches!(matching.as_slice(), [instance] if instance.process == *process && instance.executable_path.starts_with(&app.path))
+        {
+            return Err(cerebellum_computer::app_state::source::OpenAppError::RunningChanged);
+        }
+        Ok(opened)
     }
 
     fn bundle_url_schemes(
