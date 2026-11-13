@@ -4,9 +4,14 @@
 //! ordering and caps. It never opens a store or chooses permissions.
 
 pub mod caps;
+pub mod contacts;
+pub mod cursor;
+pub mod events;
+pub mod filter;
 pub mod ids;
 pub mod items;
 pub mod order;
+pub mod page;
 pub mod schema;
 pub mod scope;
 pub mod tokens;

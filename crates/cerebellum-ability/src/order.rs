@@ -15,15 +15,43 @@ pub fn sort_items(op: &Operation, items: &mut [Item]) -> Result<(), ValidationEr
             "item kind does not match operation",
         ));
     }
-    let descending = matches!(
-        op.item_kind,
-        ItemKind::Conversation | ItemKind::Message | ItemKind::MailSummary | ItemKind::MailMessage
-    );
     items.sort_by(|a, b| {
-        compare_optional(primary_key(a), primary_key(b), descending)
-            .then_with(|| a.id().as_bytes().cmp(b.id().as_bytes()))
+        compare_parts(op.item_kind, primary_key(a), a.id(), primary_key(b), b.id())
     });
     Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SortKey {
+    pub time_ms: Option<i64>,
+    pub id: String,
+}
+
+pub(crate) fn sort_key(item: &Item) -> SortKey {
+    SortKey {
+        time_ms: primary_key(item),
+        id: item.id().to_owned(),
+    }
+}
+
+/// Cursor seeking and sorting must use the same null and tie-break rules.
+pub(crate) fn compare_keys(kind: ItemKind, a: &SortKey, b: &SortKey) -> Ordering {
+    compare_parts(kind, a.time_ms, &a.id, b.time_ms, &b.id)
+}
+
+fn compare_parts(
+    kind: ItemKind,
+    a_time: Option<i64>,
+    a_id: &str,
+    b_time: Option<i64>,
+    b_id: &str,
+) -> Ordering {
+    let descending = matches!(
+        kind,
+        ItemKind::Conversation | ItemKind::Message | ItemKind::MailSummary | ItemKind::MailMessage
+    );
+    compare_optional(a_time, b_time, descending).then_with(|| a_id.as_bytes().cmp(b_id.as_bytes()))
 }
 
 fn primary_key(item: &Item) -> Option<i64> {
