@@ -505,6 +505,8 @@ impl BadgeMotion {
         }
     }
 
+    // Only the macOS overlay draws the pointer, so other hosts never read it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn rotation(&self) -> f64 {
         self.rotation
     }
