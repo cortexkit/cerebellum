@@ -10,6 +10,9 @@ const TARGET: u32 = 200;
 const PREVIOUS: u32 = 100;
 const THIRD: u32 = 300;
 const OUR_PID: i64 = 7;
+const WHOLE_WINDOW: LateWatch = LateWatch::WholeWindow {
+    already_restored: false,
+};
 
 /// A desktop on a fake clock. A fronting request takes effect after
 /// `front_latency_ms`; each unit takes `unit_ms` to post.
@@ -50,6 +53,18 @@ struct FakeDesk {
     lose_observer_on_second_sample: bool,
     switch_on_second_sample: bool,
     input_on_second_sample: bool,
+    /// This many requests to bring `PREVIOUS` back are ignored, as an
+    /// application that does not answer the first route does.
+    ignored_restores: usize,
+    /// Whether the second route brings `PREVIOUS` back.
+    fallback_restores: bool,
+    /// Every request made the second way, in order.
+    fallback_requests: Vec<u32>,
+    /// The target comes to the front again at each of these instants, as
+    /// an activation the platform delivers more than once does.
+    landings_at: Vec<u64>,
+    /// Hardware input arrives at this instant.
+    input_at: Option<u64>,
 }
 
 impl FakeDesk {
@@ -79,6 +94,11 @@ impl FakeDesk {
             lose_observer_on_second_sample: false,
             switch_on_second_sample: false,
             input_on_second_sample: false,
+            ignored_restores: 0,
+            fallback_restores: false,
+            fallback_requests: Vec::new(),
+            landings_at: Vec::new(),
+            input_at: None,
         }
     }
 
@@ -89,6 +109,14 @@ impl FakeDesk {
                 self.set_frontmost(pid);
                 self.pending_front = None;
             }
+        }
+        let now = self.now;
+        if self.landings_at.first().is_some_and(|at| *at <= now) {
+            self.landings_at.remove(0);
+            self.set_frontmost(TARGET);
+        }
+        if self.input_at.is_some_and(|at| at <= now) {
+            self.hardware_input_ms = self.input_at.take();
         }
     }
 
@@ -127,6 +155,10 @@ impl FrontingBracketHost for FakeDesk {
         if self.refuse_front_of == Some(pid) {
             return true;
         }
+        if pid == PREVIOUS && self.ignored_restores > 0 {
+            self.ignored_restores -= 1;
+            return true;
+        }
         if pid == TARGET {
             // The interval runs from the request, as the bracket counts it.
             self.fronted_since = Some(self.now);
@@ -136,6 +168,15 @@ impl FrontingBracketHost for FakeDesk {
         } else {
             self.front_latency_ms
         };
+        self.pending_front = Some((pid, self.now + latency));
+        true
+    }
+    fn request_front_fallback(&mut self, pid: u32) -> bool {
+        self.fallback_requests.push(pid);
+        if !self.fallback_restores {
+            return false;
+        }
+        let latency = self.restore_latency_ms.unwrap_or(self.front_latency_ms);
         self.pending_front = Some((pid, self.now + latency));
         true
     }
@@ -1223,7 +1264,9 @@ fn pending_activation_is_not_restored_just_because_previous_is_still_frontmost()
     assert_eq!(desk.now, 400);
     assert_eq!(desk.front_requests, [TARGET]);
     let (restore, latency, input) =
-        watch_late_activation(&mut desk, PREVIOUS, TARGET, 0, 5_000, &|| false);
+        watch_late_activation(&mut desk, PREVIOUS, TARGET, 0, 5_000, WHOLE_WINDOW, &|| {
+            false
+        });
     assert_eq!(restore, RestoreStatus::Restored);
     assert_eq!(latency, Some(800));
     assert!(!input);
@@ -1248,7 +1291,9 @@ fn late_activation_watch_leaves_person_input_and_unknown_coverage_alone() {
             desk.hardware_input_ms = Some(500);
         }
         let (restore, _, input) =
-            watch_late_activation(&mut desk, PREVIOUS, TARGET, 0, 5_000, &|| false);
+            watch_late_activation(&mut desk, PREVIOUS, TARGET, 0, 5_000, WHOLE_WINDOW, &|| {
+                false
+            });
         assert!(matches!(restore, RestoreStatus::SkippedPerson { .. }));
         assert!(input);
         assert_eq!(desk.front_requests, [TARGET]);
@@ -1264,12 +1309,183 @@ fn late_activation_watch_has_a_hard_end_and_honors_stop() {
         desk.refuse_front_of = Some(TARGET);
         desk.request_front(TARGET);
         let (restore, latency, _) =
-            watch_late_activation(&mut desk, PREVIOUS, TARGET, 0, 5_000, &|| stop);
+            watch_late_activation(&mut desk, PREVIOUS, TARGET, 0, 5_000, WHOLE_WINDOW, &|| {
+                stop
+            });
         assert!(matches!(restore, RestoreStatus::Failed { .. }));
         assert_eq!(latency, None);
         assert_eq!(desk.now, if stop { 0 } else { 5_000 });
         assert_eq!(desk.front_requests, [TARGET]);
         assert!(desk.posted.is_empty());
+    }
+}
+
+/// A desk run where the target's activation landed 109 ms after the
+/// request, past the 100 ms bound, and the person's application did not
+/// answer the request to come back, neither in the call nor in the late
+/// watch. The second route must put it back, with no person input.
+#[test]
+fn a_late_landing_whose_restore_request_is_ignored_is_put_back_the_second_way() {
+    let mut desk = FakeDesk::new();
+    desk.front_latency_ms = 109;
+    desk.restore_latency_ms = Some(20);
+    desk.ignored_restores = usize::MAX;
+    desk.fallback_restores = true;
+    desk.request_front(TARGET);
+    desk.advance(100);
+    let reply = restore_after_front_attempt(&mut desk, PREVIOUS, TARGET, 0, 300, false);
+    // The late watch follows every landing the call did not see through, as
+    // the terminal arbiter starts it.
+    let already_restored = reply.restore == RestoreStatus::Restored;
+    let (restore, _, input) = watch_late_activation(
+        &mut desk,
+        PREVIOUS,
+        TARGET,
+        0,
+        5_000,
+        LateWatch::WholeWindow { already_restored },
+        &|| false,
+    );
+    assert_eq!(desk.frontmost, Some(PREVIOUS), "the person's app is back");
+    assert_eq!(reply.restore, RestoreStatus::Restored);
+    assert_eq!(restore, RestoreStatus::Restored);
+    assert!(!input);
+    assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
+    assert_eq!(desk.fallback_requests, [PREVIOUS]);
+    assert!(desk.posted.is_empty());
+}
+
+#[test]
+fn late_watch_keeps_asking_until_the_previous_application_comes_back() {
+    let mut desk = FakeDesk::new();
+    desk.front_latency_ms = 800;
+    desk.restore_latency_ms = Some(20);
+    // The first three requests are ignored, and there is no second route.
+    desk.ignored_restores = 3;
+    desk.request_front(TARGET);
+    desk.advance(400);
+    let (restore, latency, input) =
+        watch_late_activation(&mut desk, PREVIOUS, TARGET, 0, 5_000, WHOLE_WINDOW, &|| {
+            false
+        });
+    assert_eq!(restore, RestoreStatus::Restored);
+    assert_eq!(latency, Some(800));
+    assert!(!input);
+    assert_eq!(desk.frontmost, Some(PREVIOUS));
+    assert_eq!(
+        desk.front_requests,
+        [TARGET, PREVIOUS, PREVIOUS, PREVIOUS, PREVIOUS]
+    );
+    assert_eq!(desk.fallback_requests, [PREVIOUS, PREVIOUS, PREVIOUS]);
+    assert!(desk.posted.is_empty());
+}
+
+#[test]
+fn late_watch_puts_back_an_activation_that_lands_twice() {
+    for already_restored in [false, true] {
+        let mut desk = FakeDesk::new();
+        desk.restore_latency_ms = Some(20);
+        if already_restored {
+            // The call saw the landing and put it back itself.
+            desk.landings_at = vec![460];
+        } else {
+            desk.front_latency_ms = 800;
+            desk.request_front(TARGET);
+            desk.landings_at = vec![1_500];
+        }
+        desk.advance(400);
+        let (restore, _, input) = watch_late_activation(
+            &mut desk,
+            PREVIOUS,
+            TARGET,
+            0,
+            5_000,
+            LateWatch::WholeWindow { already_restored },
+            &|| false,
+        );
+        // Play the rest of the window on the desk, watched or not.
+        while desk.now < 5_000 {
+            desk.advance(10);
+        }
+        assert_eq!(
+            desk.frontmost,
+            Some(PREVIOUS),
+            "second landing put back (already restored: {already_restored})"
+        );
+        assert_eq!(restore, RestoreStatus::Restored);
+        assert!(!input);
+        let restores = desk
+            .front_requests
+            .iter()
+            .filter(|pid| **pid == PREVIOUS)
+            .count();
+        assert_eq!(restores, if already_restored { 1 } else { 2 });
+        assert!(desk.posted.is_empty());
+    }
+}
+
+#[test]
+fn late_watch_leaves_a_later_landing_alone_after_person_input() {
+    let mut desk = FakeDesk::new();
+    desk.front_latency_ms = 800;
+    desk.restore_latency_ms = Some(20);
+    desk.input_at = Some(1_000);
+    desk.landings_at = vec![1_500];
+    desk.request_front(TARGET);
+    desk.advance(400);
+    let (restore, latency, input) =
+        watch_late_activation(&mut desk, PREVIOUS, TARGET, 0, 5_000, WHOLE_WINDOW, &|| {
+            false
+        });
+    assert_eq!(restore, RestoreStatus::Restored);
+    assert_eq!(latency, Some(800));
+    assert!(
+        !input,
+        "the input came after the restore, in the person's app"
+    );
+    assert!(desk.now < 1_500, "the watch ended at the person's input");
+    while desk.now < 5_000 {
+        desk.advance(10);
+    }
+    assert_eq!(desk.frontmost, Some(TARGET));
+    assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
+}
+
+#[test]
+fn the_route_close_watch_makes_one_restore_attempt_and_returns() {
+    for answered in [true, false] {
+        let mut desk = FakeDesk::new();
+        desk.restore_latency_ms = Some(20);
+        if !answered {
+            desk.ignored_restores = usize::MAX;
+        }
+        desk.request_front(TARGET);
+        desk.advance(800);
+        // A further landing the ordinary watch would wait for.
+        desk.landings_at = vec![1_500];
+        let (restore, latency, input) = watch_late_activation(
+            &mut desk,
+            PREVIOUS,
+            TARGET,
+            0,
+            5_000,
+            LateWatch::FirstAttempt,
+            &|| false,
+        );
+        assert!(!input);
+        assert_eq!(latency, Some(800));
+        if answered {
+            assert_eq!(restore, RestoreStatus::Restored);
+            assert_eq!(desk.frontmost, Some(PREVIOUS));
+        } else {
+            assert!(matches!(restore, RestoreStatus::Failed { .. }));
+        }
+        assert!(
+            desk.now <= 800 + RESTORE_WAIT_MS + FRONTING_POLL_MS,
+            "held for one restore wait at most, not the window: {}",
+            desk.now
+        );
+        assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
     }
 }
 

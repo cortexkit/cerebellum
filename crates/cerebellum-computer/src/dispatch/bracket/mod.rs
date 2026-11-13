@@ -89,6 +89,13 @@ pub trait FrontingBracketHost {
     /// Ask the application `pid` runs to become frontmost. `false` when the
     /// request itself was refused.
     fn request_front(&mut self, pid: u32) -> bool;
+    /// A second way to ask for `pid` to come to the front, used by a restore
+    /// only when [`Self::request_front`] has not taken effect within
+    /// [`RESTORE_FALLBACK_AFTER_MS`]. `false` when the host has none or the
+    /// request was refused.
+    fn request_front_fallback(&mut self, _pid: u32) -> bool {
+        false
+    }
     /// Optional diagnostic observation; it never authorizes more action input.
     fn late_activation_observed(&mut self, _latency_ms: u64) {}
     /// The action's confirmation wait ended. Later observations belong only
@@ -736,6 +743,9 @@ pub fn run_fronting_read_with<H: FrontingBracketHost>(
         }
         fn request_front(&mut self, pid: u32) -> bool {
             self.host.request_front(pid)
+        }
+        fn request_front_fallback(&mut self, pid: u32) -> bool {
+            self.host.request_front_fallback(pid)
         }
         fn front_attempt_finished(&mut self) {
             self.host.front_attempt_finished();

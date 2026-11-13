@@ -191,7 +191,7 @@ pub(super) fn start(
     cause: Option<TerminalCause>,
     recorder: Option<LateFrontingRecorder>,
 ) {
-    let (mut host, lock, since) = {
+    let (mut host, lock, since, already_restored) = {
         let mut inner = cell.inner();
         let Some(since) = inner.pending_since.take() else {
             return;
@@ -199,7 +199,8 @@ pub(super) fn start(
         let Some(host) = inner.host.take() else {
             return;
         };
-        (host, inner.lock.take(), since)
+        let already_restored = std::mem::take(&mut inner.pending_restored);
+        (host, inner.lock.take(), since, already_restored)
     };
     let stop = Arc::clone(&cell.pending_watch.stop);
     match cause {
@@ -256,6 +257,7 @@ pub(super) fn start(
             target,
             since,
             budgets::LATE_ACTIVATION_WATCH_MS,
+            crate::computer::dispatch::LateWatch::WholeWindow { already_restored },
             &|| stop.load(Ordering::Acquire) != 0,
         );
         // Route close ends the task too, but first puts back a target that
@@ -273,6 +275,7 @@ pub(super) fn start(
                 target,
                 since,
                 budgets::LATE_ACTIVATION_WATCH_MS,
+                crate::computer::dispatch::LateWatch::FirstAttempt,
                 &|| false,
             );
             restore = final_restore;

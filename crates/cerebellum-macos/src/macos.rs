@@ -929,6 +929,45 @@ fn activation_policy_is_regular(pid: i32) -> Option<bool> {
     })
 }
 
+/// Ask AppKit to activate the application `pid` runs, with all its windows
+/// brought forward, but only while that pid still belongs to the process that
+/// started at `start_time_micros`.
+///
+/// A second route to the front beside the accessibility request
+/// [`crate::request_frontmost`]: an application whose own accessibility
+/// server ignores that request, or that comes active without raising its
+/// windows over the one that was just in front, can still be put back this
+/// way. Like that request it is answered asynchronously, and the system may
+/// decline it, so the caller watches the frontmost application to learn
+/// whether it took effect. `false` when the pid now belongs to another
+/// process (or none), when no running application has it, or when the system
+/// refused to send the request.
+pub fn activate_application(pid: u32, start_time_micros: u64) -> bool {
+    use objc2::msg_send;
+    use objc2::runtime::AnyClass;
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // Checked immediately before the request, so a pid reused since the
+    // front by some other application is never activated in its place.
+    if process_start_time_micros(pid) != Some(start_time_micros) {
+        return false;
+    }
+    let Some(class) = AnyClass::get(c"NSRunningApplication") else {
+        return false;
+    };
+    objc2::rc::autoreleasepool(|_| {
+        // SAFETY: a documented class method taking a pid_t; it returns nil or
+        // an NSRunningApplication, which `Retained` takes ownership of.
+        let application: Option<Retained<NSRunningApplication>> =
+            unsafe { msg_send![class, runningApplicationWithProcessIdentifier: raw_pid] };
+        application.is_some_and(|application| {
+            application.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows)
+        })
+    })
+}
+
 /// One application as the window server lists it: pid, bundle identifier and
 /// name, copied out of the completion callback.
 type ListedApplication = (u32, String, String);

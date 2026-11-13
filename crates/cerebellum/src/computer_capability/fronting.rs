@@ -650,25 +650,35 @@ pub(crate) fn absorb_own_front(
 }
 
 /// A platform restore host as the terminal arbiter's [`RestoreHost`].
-pub(crate) struct PlatformRestoreHost(pub(crate) Box<dyn FrontingRestoreHost>);
+pub(crate) struct PlatformRestoreHost {
+    pub(crate) host: Box<dyn FrontingRestoreHost>,
+    /// Whether a restore may also ask the platform's second route to the
+    /// front. Only app-use fronts allow it; takeover fronts restore only
+    /// through the accessibility request that the review bound as
+    /// `takeover_dispatch_review_revision` admitted.
+    pub(crate) fallback: bool,
+}
 
 impl RestoreHost for PlatformRestoreHost {
     fn now_ms(&mut self) -> u64 {
-        self.0.now_ms()
+        self.host.now_ms()
     }
     fn pause_ms(&mut self, milliseconds: u64) {
-        self.0.pause_ms(milliseconds);
+        self.host.pause_ms(milliseconds);
     }
     fn frontmost_pid(&mut self) -> Option<u32> {
-        self.0.frontmost_pid()
+        self.host.frontmost_pid()
     }
     fn request_front(&mut self, pid: u32) -> bool {
-        self.0.request_front(pid)
+        self.host.request_front(pid)
+    }
+    fn request_front_fallback(&mut self, pid: u32) -> bool {
+        self.fallback && self.host.request_front_fallback(pid)
     }
     fn hardware_input_snapshot(
         &mut self,
     ) -> Option<cerebellum_computer::dispatch::HardwareInputSnapshot> {
-        self.0.hardware_input_snapshot()
+        self.host.hardware_input_snapshot()
     }
 }
 
@@ -700,6 +710,11 @@ pub(crate) struct ObligationParts {
     pub(crate) target_name: String,
     pub(crate) mode: FrontingMode,
     pub(crate) purpose: FrontingPurpose,
+    /// The restore may use the platform's second route to the front when
+    /// the first has not taken effect. Set for app-use fronts only: a
+    /// takeover front keeps the single restore route admitted under
+    /// `takeover_dispatch_review_revision`.
+    pub(crate) restore_fallback: bool,
 }
 
 impl ObligationParts {
@@ -713,6 +728,13 @@ impl ObligationParts {
         host: Box<dyn FrontingRestoreHost>,
     ) -> Option<Arc<RestoreCell>> {
         let lock = self.lock.take()?;
+        let mut host = host;
+        if self.restore_fallback {
+            // The restore host's second route to the front only ever
+            // activates this process, so a pid reused meanwhile is never
+            // brought forward.
+            host.remember_previous(previous);
+        }
         self.terminal
             .register_restore(RestoreObligation {
                 previous_pid: previous,
@@ -721,7 +743,10 @@ impl ObligationParts {
                 mode: self.mode,
                 purpose: self.purpose,
                 lock,
-                host: Box::new(PlatformRestoreHost(host)),
+                host: Box::new(PlatformRestoreHost {
+                    host,
+                    fallback: self.restore_fallback,
+                }),
             })
             .ok()
     }
@@ -1182,6 +1207,7 @@ where
         // not. Both routes still compare any baseline the conversation has.
         let require_seen =
             matches!(&authority, TemporaryFrontAuthority::AppUse) && call.input_follows;
+        let restore_fallback = matches!(&authority, TemporaryFrontAuthority::AppUse);
         match authority {
             TemporaryFrontAuthority::AppUse => {
                 self.fronting_admission(call.consent, false).may_front()?;
@@ -1218,6 +1244,7 @@ where
                 AppUse::Background => FrontingMode::Background,
             },
             purpose,
+            restore_fallback,
         };
         if !guards {
             return Ok(parts);

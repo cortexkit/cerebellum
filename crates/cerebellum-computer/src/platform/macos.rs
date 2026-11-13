@@ -702,6 +702,19 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
 /// `Send` and can run on a cleanup thread.
 struct MacRestoreHost {
     started: Instant,
+    /// The application a restore puts back, as `(pid, start time)`, once
+    /// the obligation names it; the second route to the front refuses any
+    /// other process.
+    previous: Option<(u32, u64)>,
+}
+
+impl MacRestoreHost {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            previous: None,
+        }
+    }
 }
 
 impl FrontingRestoreHost for MacRestoreHost {
@@ -721,6 +734,19 @@ impl FrontingRestoreHost for MacRestoreHost {
         cerebellum_macos::request_frontmost(pid).is_ok()
     }
 
+    fn remember_previous(&mut self, pid: u32) {
+        self.previous = cerebellum_macos::process_start_time_micros(pid).map(|start| (pid, start));
+    }
+
+    fn request_front_fallback(&mut self, pid: u32) -> bool {
+        match self.previous {
+            Some((previous, start)) if previous == pid => {
+                cerebellum_macos::activate_application(pid, start)
+            }
+            _ => false,
+        }
+    }
+
     fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot> {
         let (coverage_start, last_input) =
             cerebellum_macos::SessionEventTap::hardware_input_snapshot()?;
@@ -734,9 +760,7 @@ impl FrontingRestoreHost for MacRestoreHost {
 
 impl RestoreHostSource for MacBracketHost {
     fn restore_host(&self) -> Box<dyn FrontingRestoreHost> {
-        Box::new(MacRestoreHost {
-            started: self.started,
-        })
+        Box::new(MacRestoreHost::new(self.started))
     }
 }
 
@@ -814,16 +838,11 @@ impl FrontingSession for MacFrontingSession {
     }
 
     fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot> {
-        MacRestoreHost {
-            started: self.started,
-        }
-        .hardware_input_snapshot()
+        MacRestoreHost::new(self.started).hardware_input_snapshot()
     }
 
     fn restore_host(&self) -> Box<dyn FrontingRestoreHost> {
-        Box::new(MacRestoreHost {
-            started: self.started,
-        })
+        Box::new(MacRestoreHost::new(self.started))
     }
 
     fn user_idle(&self) -> Arc<Mutex<UserIdleEstimator>> {
