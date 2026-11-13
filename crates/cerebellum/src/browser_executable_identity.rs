@@ -522,23 +522,82 @@ mod tests {
             .expect("sleeper recorded its pid")
             .trim()
             .parse::<u32>()
-            .expect("sleeper pid")
-            .to_string();
+            .expect("sleeper pid");
         std::fs::remove_file(pid_file).expect("remove sleeper pid file");
-        // Clean up even when the assertion fails, so a regression run cannot
-        // leave another ten-minute sleeper behind.
-        let alive = std::process::Command::new("/bin/kill")
-            .args(["-0", &pid])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .expect("probe sleeper pid")
-            .success();
-        if alive {
-            let _ = std::process::Command::new("/bin/kill")
-                .args(["-KILL", &pid])
-                .status();
+        // SIGKILL is sent before the refusal, but the child still needs to be
+        // scheduled to exit. Observe that exit under the shared hang guard.
+        let deadline = std::time::Instant::now() + HANG_GUARD;
+        while verifier_is_running(pid) {
+            if std::time::Instant::now() >= deadline {
+                // Do not leave a ten-minute sleeper behind on failure.
+                let _ = std::process::Command::new("/bin/kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+                panic!("the timed-out verifier left sleep pid {pid} running past HANG_GUARD");
+            }
+            std::thread::sleep(VERIFIER_POLL_INTERVAL);
         }
-        assert!(!alive, "the timed-out verifier left sleep pid {pid} alive");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn verifier_is_running(pid: u32) -> bool {
+        // The timeout only polls once to reap. An exit after that poll can
+        // leave a zombie, for which kill -0 still succeeds despite no code
+        // running and no open descriptors remaining.
+        match cerebellum_macos::process_owner(pid) {
+            cerebellum_macos::ProcessOwner::Running { zombie, .. } => !zombie,
+            cerebellum_macos::ProcessOwner::NoSuchProcess => false,
+            state => panic!("cannot read verifier pid {pid} state: {state:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_killed_but_unreaped_verifier_is_not_still_running() {
+        use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+        use std::os::unix::process::ExitStatusExt;
+
+        let mut sleeper = std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn sleeper");
+        let pid = sleeper.id();
+        assert!(verifier_is_running(pid), "a live sleeper must be detected");
+        sleeper.kill().expect("send SIGKILL to sleeper");
+
+        // Keep the child unreaped until its state has been inspected. This
+        // reproduces a verifier exiting after the timeout's last try_wait.
+        let deadline = std::time::Instant::now() + HANG_GUARD;
+        loop {
+            if waitid(
+                WaitId::Pid(Pid::from_child(&sleeper)),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+            )
+            .expect("observe sleeper exit without reaping")
+            .is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the killed sleeper did not exit before HANG_GUARD"
+            );
+            std::thread::sleep(VERIFIER_POLL_INTERVAL);
+        }
+        let exists = std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .expect("probe unreaped sleeper pid")
+            .success();
+        let running = verifier_is_running(pid);
+        // Reap before asserting so a failing regression test leaves no zombie.
+        let status = sleeper.wait().expect("reap killed sleeper");
+        assert_eq!(status.signal(), Some(9), "the sleeper died from SIGKILL");
+        assert!(exists, "the unreaped sleeper must still have a pid");
+        assert!(
+            !running,
+            "the killed, unreaped verifier pid {pid} is not running"
+        );
     }
 
     #[cfg(target_os = "macos")]
