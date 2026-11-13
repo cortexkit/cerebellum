@@ -54,12 +54,16 @@ pub const RESTORE_AX_MS: u64 = 300;
 // request-to-landing latency distribution will determine this allowance.
 pub const LATE_ACTIVATION_WATCH_MS: u64 = 5_000;
 pub const SYNTHETIC_POST_PHASE_MS: u64 = 5_000;
-// Controlled editors need time to commit a change before the next character.
-// Twenty milliseconds leaves more than one 60-Hz render frame between pairs.
+// An editor whose content is controlled by page script (Discord's search box,
+// for one) re-renders after each character; a character that arrives before
+// that render lands at the caret's old position, so fast typing comes out
+// reversed. Twenty milliseconds leaves more than one 60-Hz render frame
+// between character pairs.
 pub const TYPE_CHARACTER_INTERVAL_MS: u64 = 20;
-// Callers cancel around 60 seconds. Leave time for admission, the keyboard
-// action's cursor badge to arrive and readback, and reserve the existing
-// posting overhead in addition to pacing.
+// Callers give up on a call after about 60 seconds. The typing itself must
+// leave room within that for admission, the on-screen agent cursor gliding to
+// the field before the first key, and reading the field back afterwards, so
+// pacing plus the existing posting overhead get 45 seconds.
 pub const TYPE_POST_PHASE_MS: u64 = 45_000;
 pub const TYPE_MAX_CHARACTERS: usize =
     ((TYPE_POST_PHASE_MS - SYNTHETIC_POST_PHASE_MS) / TYPE_CHARACTER_INTERVAL_MS) as usize;

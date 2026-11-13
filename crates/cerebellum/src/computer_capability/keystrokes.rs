@@ -416,7 +416,7 @@ fn inserted_text_reversed(before: &str, after: &str, text: &str) -> bool {
 }
 
 /// A diagnostic only: an exact reversed insertion is not successful delivery.
-/// Missing or placeholder-only AX values cannot establish this diagnosis.
+/// Missing or placeholder-only accessibility values cannot establish this diagnosis.
 pub(crate) fn typed_text_reversed(
     source: &dyn AppStateSource,
     focus: &TargetFocus,
