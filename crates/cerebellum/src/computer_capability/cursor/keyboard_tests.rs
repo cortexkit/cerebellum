@@ -13,6 +13,7 @@ const CLICK: [f64; 2] = [200.0, 515.0];
 
 struct Geometry {
     window: ElementHandle,
+    window_frame: std::sync::Mutex<Option<[f64; 4]>>,
     focus: std::sync::Mutex<Option<[f64; 4]>>,
     caret: std::sync::Mutex<Option<[f64; 4]>>,
 }
@@ -32,7 +33,7 @@ impl AppStateSource for Geometry {
 
     fn cursor_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {
         if element.same_element(self.window.as_ref()) {
-            Some(WINDOW)
+            *self.window_frame.lock().unwrap()
         } else {
             *self.focus.lock().unwrap()
         }
@@ -104,6 +105,7 @@ impl Rig {
             receiver,
             geometry: Arc::new(Geometry {
                 window: RawElement::fixture(100, "AXWindow").handle,
+                window_frame: std::sync::Mutex::new(Some(WINDOW)),
                 focus: std::sync::Mutex::new(Some(INPUT)),
                 caret: std::sync::Mutex::new(None),
             }),
@@ -159,11 +161,15 @@ impl Rig {
                         if kind == CursorKind::Type {
                             assert_eq!(
                                 event.label.as_deref(),
-                                Some(if focused {
-                                    "Typing in Message"
-                                } else {
-                                    "Typing in"
-                                })
+                                self.geometry
+                                    .window_frame
+                                    .lock()
+                                    .unwrap()
+                                    .map(|_| if focused {
+                                        "Typing in Message"
+                                    } else {
+                                        "Typing in"
+                                    })
                             );
                         }
                         let tip = self.cursor.drawn().tips[AGENT].place();
@@ -296,6 +302,25 @@ async fn keyboard_without_a_prior_press_aims_at_a_small_field() {
                 rig.picture(kind, true).await,
                 rig.position([280.0, 515.0]),
                 "{background}, {kind:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn keyboard_can_aim_at_a_small_field_without_window_bounds() {
+    for kind in [CursorKind::Type, CursorKind::Keys] {
+        for clicked in [false, true] {
+            let mut rig = Rig::new(false);
+            if clicked {
+                rig.picture(CursorKind::Press, true).await;
+            }
+            *rig.geometry.window_frame.lock().unwrap() = None;
+            *rig.geometry.focus.lock().unwrap() = Some([500.0, 200.0, 200.0, 30.0]);
+            assert_eq!(
+                rig.picture(kind, true).await,
+                [600.0, 215.0],
+                "{kind:?}, {clicked}"
             );
         }
     }

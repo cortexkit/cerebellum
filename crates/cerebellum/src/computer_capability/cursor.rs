@@ -2460,21 +2460,26 @@ fn keyboard_focus(
     if !matches!(kind, CursorKind::Type | CursorKind::Keys) || point.is_some() {
         return None;
     }
-    let plausible = frame.zip(window).filter(|(frame, window)| {
+    let plausible = frame.filter(|frame| {
         let [_, _, w, h] = *frame;
-        let [_, _, ww, wh] = *window;
         // Geometry is deliberately conservative: allow wide and multiline
         // inputs, but not an editor-sized web area or a window-sized container.
-        frame.iter().chain(window).all(|v| v.is_finite())
+        // A small readable field does not require window bounds; those bounds
+        // only add a relative-area check when they are available.
+        frame.iter().all(|v| v.is_finite())
             && w > 0.0
             && h > 0.0
             && h <= 160.0
-            && ww > 0.0
-            && wh > 0.0
-            && w * h <= ww * wh / 4.0
+            && window.is_none_or(|window| {
+                let [_, _, ww, wh] = window;
+                window.iter().all(|v| v.is_finite())
+                    && ww > 0.0
+                    && wh > 0.0
+                    && w * h <= ww * wh / 4.0
+            })
     });
     Some(match plausible {
-        Some((frame, _)) => KeyboardFocus::Field(frame),
+        Some(frame) => KeyboardFocus::Field(frame),
         None => KeyboardFocus::Keep,
     })
 }
