@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::cursor_geometry::{aim_rotation, shortest_turn, wrap_angle, CHIP_CENTER};
+use crate::cursor_geometry::{aim_rotation, shortest_turn, wrap_angle, BodySide, CHIP_CENTER};
 
 const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const MAX_PICTURES: usize = 64;
@@ -404,8 +404,8 @@ pub(crate) struct MotionEvent {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct MotionFrame {
     /// Where the tip of the standard resting badge would be: the panel is
-    /// placed for it, and the chip's centre is this plus `CHIP_CENTER`
-    /// whatever the pointer does.
+    /// placed for it, and the chip's centre is this plus the body side's
+    /// reflection of `CHIP_CENTER`, whatever the pointer does.
     pub tip: [f64; 2],
     /// How far the pointer is turned about the chip's centre from its
     /// resting direction, radians; exactly 0 in the resting badge.
@@ -453,6 +453,7 @@ pub(crate) struct BadgeMotion {
     /// The pointer's rotation on the latest frame drawn: where a new turn
     /// starts from, so the pointer never jumps.
     rotation: f64,
+    side: BodySide,
 }
 
 impl BadgeMotion {
@@ -469,6 +470,7 @@ impl BadgeMotion {
             follow: FollowOffset::default(),
             hand: Hand::Off,
             rotation: 0.0,
+            side: BodySide::default(),
         }
     }
 
@@ -481,6 +483,30 @@ impl BadgeMotion {
     /// The pointer is off its resting place.
     pub(crate) fn hand(&self) -> bool {
         !matches!(self.hand, Hand::Off)
+    }
+
+    /// The layout owns edge avoidance. Keep aiming in the same reflected
+    /// coordinate space the drawing uses, including while a window moves.
+    pub(crate) fn set_body_side(&mut self, side: BodySide) {
+        if side == self.side {
+            return;
+        }
+        self.side = side;
+        if let Hand::Swinging {
+            ref mut from,
+            ref mut to,
+            ..
+        } = self.hand
+        {
+            let target = side.point([self.to[0] - self.current[0], self.to[1] - self.current[1]]);
+            self.rotation = aim_rotation(CHIP_CENTER, target).unwrap_or(0.0);
+            *from = self.rotation;
+            *to = self.rotation;
+        }
+    }
+
+    pub(crate) fn rotation(&self) -> f64 {
+        self.rotation
     }
 
     /// An agent event arrived. Answers the tip's destination, which the
@@ -547,10 +573,9 @@ impl BadgeMotion {
         // Only the target moves; the chip stays where it was last drawn.
         shift(&mut self.to);
         self.settles = false;
-        let chip = [
-            self.current[0] + CHIP_CENTER[0],
-            self.current[1] + CHIP_CENTER[1],
-        ];
+        let target = self
+            .side
+            .point([self.to[0] - self.current[0], self.to[1] - self.current[1]]);
         let to = if self.reduce {
             // Reduce Motion: no swing; the pointer is hidden instead.
             0.0
@@ -562,7 +587,7 @@ impl BadgeMotion {
                 Hand::Swinging { to, .. } => to,
                 _ => self.rotation,
             };
-            aim_rotation(chip, self.to).map_or(previous, |aim| {
+            aim_rotation(CHIP_CENTER, target).map_or(previous, |aim| {
                 self.rotation + shortest_turn(self.rotation, aim)
             })
         };
@@ -1622,6 +1647,89 @@ mod tests {
             scale: 1.0,
             alpha: 1.0,
             need: PictureNeed::Rest,
+        }
+    }
+
+    #[test]
+    fn every_glide_frame_selects_its_body_side_before_landing_at_the_corner() {
+        use crate::cursor_geometry::{layout_frame, Rect};
+        let screen = Rect::new(0.0, 25.0, 1728.0, 1059.0);
+        let start = Instant::now();
+        let mut motion = resting_badge(start, false);
+        let target = [1698.0, 1054.0];
+        motion.on_event(aim(target, false), start);
+        let mut side = BodySide::default();
+        let mut flips = [0; 2];
+        let mut flipped_in_flight = false;
+        for step in 0..30 {
+            let frame = motion.frame(start + FRAME * step, &CURVES);
+            let placed = layout_frame(
+                frame.tip,
+                screen,
+                Some([150.0, 24.0]),
+                screen,
+                1.0,
+                frame.scale,
+                side,
+            );
+            flips[0] += u32::from(side.left != placed.side.left);
+            flips[1] += u32::from(side.above != placed.side.above);
+            side = placed.side;
+            motion.set_body_side(side);
+            let centre = add(frame.tip, side.point(CHIP_CENTER));
+            let body = Rect::new(centre[0] - 19.5, centre[1] - 19.5, 39.0, 39.0);
+            assert!(screen.contains_rect(body), "frame {step}: {body:?}");
+            if let Some(label) = placed.label {
+                assert!(!label.offset(frame.tip).intersects(body));
+            }
+            if frame.tip != target && side.left && side.above {
+                flipped_in_flight = true;
+            }
+        }
+        assert_eq!(motion.current(), target);
+        assert_eq!(flips, [1, 1], "each axis flips once, not again on arrival");
+        assert!(flipped_in_flight);
+    }
+
+    #[test]
+    fn window_follow_aims_from_the_reflected_chip_then_returns_to_the_target() {
+        let start = Instant::now();
+        for side in [
+            BodySide {
+                left: true,
+                above: false,
+            },
+            BodySide {
+                left: false,
+                above: true,
+            },
+            BodySide {
+                left: true,
+                above: true,
+            },
+        ] {
+            let mut motion = resting_badge(start, false);
+            motion.set_body_side(side);
+            let centre = add(START, side.point(CHIP_CENTER));
+            let moved = start + SECOND;
+            motion.on_follow(DRAG, moved, false);
+            let (frames, _) = frames_until_still(&mut motion, moved);
+            for frame in &frames {
+                assert_eq!(
+                    add(frame.tip, side.point(CHIP_CENTER)),
+                    centre,
+                    "the chip chased the window"
+                );
+            }
+            let last = frames.last().unwrap();
+            let tip = add(last.tip, side.point(turn_point([0.0, 0.0], last.rotation)));
+            let to_tip = [tip[0] - centre[0], tip[1] - centre[1]];
+            let target = add(START, DRAG);
+            let to_target = [target[0] - centre[0], target[1] - centre[1]];
+            assert!((to_tip[0] * to_target[1] - to_tip[1] * to_target[0]).abs() < 1e-6);
+            assert!(to_tip[0] * to_target[0] + to_tip[1] * to_target[1] > 0.0);
+            let (frames, _) = frames_until_still(&mut motion, moved + WINDOW_QUIET);
+            assert_eq!(*frames.last().unwrap(), resting_on(target));
         }
     }
 

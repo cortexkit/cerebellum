@@ -136,6 +136,89 @@ const LABEL_GAP: f64 = 6.0;
 /// Room around the drawing for the soft drop shadow.
 const SHADOW_MARGIN: f64 = 8.0;
 
+/// Reflections about the target tip. Only positions and the pointer glyph are
+/// reflected; the avatar image and label text always remain upright.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct BodySide {
+    pub left: bool,
+    pub above: bool,
+}
+
+impl BodySide {
+    pub(crate) fn point(self, [x, y]: [f64; 2]) -> [f64; 2] {
+        [
+            if self.left { -x } else { x },
+            if self.above { -y } else { y },
+        ]
+    }
+
+    pub(crate) fn rect(self, rect: Rect) -> Rect {
+        Rect::new(
+            if self.left { -rect.right() } else { rect.x },
+            if self.above { -rect.bottom() } else { rect.y },
+            rect.width,
+            rect.height,
+        )
+    }
+
+    /// Keep the current side until it no longer fits. Return to the usual
+    /// down-right side only with eight points to spare, so subpixel window
+    /// movement around an edge cannot flip the badge on alternate frames.
+    pub(crate) fn choose(self, tip: [f64; 2], window: Rect, screen: Rect) -> Self {
+        // Reserve the four-percent landing swell before the glide arrives,
+        // rather than flipping for the first time during the landing frame.
+        let body = chip_bounds(1.0);
+        let near = body.x * 0.9;
+        let far = body.right() * 1.04;
+        let choose_axis = |tip: f64, low: f64, high: f64, wlow: f64, whigh: f64, flipped| {
+            let fits = |flip: bool, low: f64, high: f64, margin: f64| {
+                let (start, end) = if flip { (-far, -near) } else { (near, far) };
+                tip + start >= low + margin && tip + end <= high - margin
+            };
+            // The visible screen is mandatory; the target window is preferred
+            // only if at least one side can hold the whole body there.
+            let window_fits = fits(false, wlow.max(low), whigh.min(high), 0.0)
+                || fits(true, wlow.max(low), whigh.min(high), 0.0);
+            // Losing the last sliver of window room must not reset a flipped
+            // badge to the default screen side, then flip it back on the next
+            // report that restores that sliver. Hold it while it fits screen.
+            if !window_fits && flipped && fits(true, low, high, 0.0) {
+                return true;
+            }
+            let (low, high) = if window_fits {
+                (wlow.max(low), whigh.min(high))
+            } else {
+                (low, high)
+            };
+            if fits(false, low, high, if flipped { 8.0 } else { 0.0 }) {
+                false
+            } else if fits(flipped, low, high, 0.0) {
+                flipped
+            } else {
+                fits(true, low, high, 0.0)
+            }
+        };
+        Self {
+            left: choose_axis(
+                tip[0],
+                screen.x,
+                screen.right(),
+                window.x,
+                window.right(),
+                self.left,
+            ),
+            above: choose_axis(
+                tip[1],
+                screen.y,
+                screen.bottom(),
+                window.y,
+                window.bottom(),
+                self.above,
+            ),
+        }
+    }
+}
+
 /// Where the chip's centre is and how large it is, relative to the tip, for
 /// an entry progress in [0, 1]: at 0 it is `ENTRY_CHIP_SCALE` times its
 /// resting size and centred on the tip itself, at 1 it is at rest. Both move
@@ -231,11 +314,24 @@ pub(crate) fn snap_tip(point: [f64; 2], scale: f64) -> [f64; 2] {
 /// bound it, but the badge alone anchors it: a large accessibility element
 /// must not push the label away from the badge. A narrow window truncates the
 /// label, and a window too small for a pill shows none.
+#[cfg(test)]
 pub(crate) fn label_rect(
     tip: [f64; 2],
     size: [f64; 2],
     window: Rect,
     screen: Rect,
+) -> Option<Rect> {
+    let side = BodySide::default().choose(tip, window, screen);
+    label_rect_on_side(tip, size, window, screen, side, side.rect(badge_bounds()))
+}
+
+fn label_rect_on_side(
+    tip: [f64; 2],
+    size: [f64; 2],
+    window: Rect,
+    screen: Rect,
+    side: BodySide,
+    badge: Rect,
 ) -> Option<Rect> {
     let [width, height] = size;
     if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
@@ -254,18 +350,13 @@ pub(crate) fn label_rect(
     if width <= 2.0 * LABEL_PADDING {
         return None;
     }
-    let badge = badge_bounds().offset(tip);
-    let beside_y =
-        (tip[1] + CHIP_CENTER[1] - height / 2.0).clamp(bounds.y, bounds.bottom() - height);
+    let badge = badge.offset(tip);
+    let centre = side.point(CHIP_CENTER);
+    let beside_y = (tip[1] + centre[1] - height / 2.0).clamp(bounds.y, bounds.bottom() - height);
     let along_x = (badge.x + LABEL_GAP).clamp(bounds.x, bounds.right() - width);
     let candidates = [
         Rect::new(badge.right() + LABEL_GAP, beside_y, width, height),
-        Rect::new(
-            tip[0] - OUTLINE - LABEL_GAP - width,
-            beside_y,
-            width,
-            height,
-        ),
+        Rect::new(badge.x - LABEL_GAP - width, beside_y, width, height),
         Rect::new(along_x, badge.bottom() + LABEL_GAP, width, height),
         Rect::new(along_x, badge.y - LABEL_GAP - height, width, height),
     ];
@@ -281,11 +372,14 @@ pub(crate) fn label_rect(
 pub(crate) struct Layout {
     pub panel: Rect,
     pub label: Option<Rect>,
+    pub side: BodySide,
+    /// Additional movement of the entry chip, before landing scale, to keep
+    /// its oversized circle inside the visible screen without moving the tip.
+    pub chip_shift: [f64; 2],
 }
 
-/// `entering` makes the panel large enough for the whole entry, whose chip
-/// starts at twice its size around the tip; the label is placed for the
-/// resting badge either way, since it only fades in as the chip settles.
+/// A resting layout, or the first frame of an entry, for geometry tests.
+#[cfg(test)]
 pub(crate) fn layout(
     tip: [f64; 2],
     window: Rect,
@@ -293,13 +387,85 @@ pub(crate) fn layout(
     screen: Rect,
     entering: bool,
 ) -> Layout {
+    layout_frame(
+        tip,
+        window,
+        label_size,
+        screen,
+        if entering { 0.0 } else { 1.0 },
+        1.0,
+        BodySide::default(),
+    )
+}
+
+pub(crate) fn layout_frame(
+    tip: [f64; 2],
+    window: Rect,
+    label_size: Option<[f64; 2]>,
+    screen: Rect,
+    chip_progress: f64,
+    scale: f64,
+    previous: BodySide,
+) -> Layout {
+    let side = previous.choose(tip, window, screen);
+    let (centre, diameter) = chip_at(chip_progress);
+    let centre = side.point(centre);
+    let radius = (diameter / 2.0 + CHIP_RIM) * scale;
+    let mut chip_shift = [0.0; 2];
+    if chip_progress < 1.0 {
+        let fit = |centre: f64, low: f64, high: f64, wlow: f64, whigh: f64| {
+            let (low, high) = if whigh.min(high) - wlow.max(low) >= 2.0 * radius {
+                (wlow.max(low), whigh.min(high))
+            } else {
+                (low, high)
+            };
+            // Leave a subpixel sliver for the round trip through tip-relative
+            // coordinates: floating-point cancellation must not put the rim
+            // a fraction beyond the boundary after drawing reconstructs it.
+            let inset = 1e-6;
+            if high - low >= 2.0 * (radius + inset) {
+                centre.clamp(low + radius + inset, high - radius - inset)
+            } else {
+                (low + high) / 2.0
+            }
+        };
+        chip_shift = [
+            (fit(
+                tip[0] + centre[0] * scale,
+                screen.x,
+                screen.right(),
+                window.x,
+                window.right(),
+            ) - tip[0])
+                / scale
+                - centre[0],
+            (fit(
+                tip[1] + centre[1] * scale,
+                screen.y,
+                screen.bottom(),
+                window.y,
+                window.bottom(),
+            ) - tip[1])
+                / scale
+                - centre[1],
+        ];
+    }
+    let chip = Rect::new(
+        (centre[0] + chip_shift[0]) * scale - radius,
+        (centre[1] + chip_shift[1]) * scale - radius,
+        2.0 * radius,
+        2.0 * radius,
+    );
+    // Use the actual animated circle for exclusion. The resting bounds also
+    // reserve the pointer and keep the pill anchored as the entry shrinks.
+    let badge = side.rect(badge_bounds()).union(chip);
     let label = label_size
-        .and_then(|size| label_rect(tip, size, window, screen))
+        .and_then(|size| label_rect_on_side(tip, size, window, screen, side, badge))
         .map(|label| label.offset([-tip[0], -tip[1]]));
-    let badge = if entering {
-        badge_bounds().union(chip_bounds(0.0))
+    let badge = if chip_progress < 1.0 {
+        badge.union(chip_bounds(0.0))
     } else {
-        badge_bounds()
+        badge
     };
     let drawn = label.map_or(badge, |label| badge.union(label));
     let x = (drawn.x - SHADOW_MARGIN).floor();
@@ -312,6 +478,8 @@ pub(crate) fn layout(
             (drawn.bottom() + SHADOW_MARGIN).ceil() - y,
         ),
         label,
+        side,
+        chip_shift,
     }
 }
 
@@ -605,6 +773,170 @@ mod tests {
         Rect::new(0.0, 25.0, 1728.0, 1059.0)
     }
 
+    fn edge_body(tip: [f64; 2]) -> (Layout, Rect) {
+        let placed = layout(tip, screen(), Some([150.0, LABEL_HEIGHT]), screen(), false);
+        let body = placed.side.rect(chip_bounds(1.0)).offset(tip);
+        assert!(
+            screen().contains_rect(body),
+            "body {body:?} leaves the screen"
+        );
+        let label = placed.label.expect("room for the label beside the body");
+        assert!(!label.offset(tip).intersects(body));
+        assert!(screen().contains_rect(label.offset(tip)));
+        assert_eq!(
+            landed_tip(tip, None).0,
+            tip,
+            "flipping must not move the tip"
+        );
+        (placed, body)
+    }
+
+    #[test]
+    fn right_edge_body_is_fully_visible_left_of_the_tip() {
+        let tip = [screen().right() - 30.0, 400.0];
+        let (_, body) = edge_body(tip);
+        assert!(body.right() < tip[0]);
+    }
+
+    #[test]
+    fn bottom_edge_body_is_fully_visible_above_the_tip() {
+        let tip = [600.0, screen().bottom() - 30.0];
+        let (_, body) = edge_body(tip);
+        assert!(body.bottom() < tip[1]);
+    }
+
+    #[test]
+    fn bottom_right_body_is_fully_visible_above_and_left_of_the_tip() {
+        let tip = [screen().right() - 30.0, screen().bottom() - 30.0];
+        let (_, body) = edge_body(tip);
+        assert!(body.right() < tip[0] && body.bottom() < tip[1]);
+    }
+
+    #[test]
+    fn mid_screen_body_keeps_its_original_offset_and_label() {
+        let tip = [600.0, 400.0];
+        let (placed, body) = edge_body(tip);
+        assert_eq!(body, Rect::new(610.5, 410.5, 39.0, 39.0));
+        assert_eq!(
+            placed.label,
+            Some(Rect::new(55.5, 18.0, 150.0, LABEL_HEIGHT))
+        );
+    }
+
+    #[test]
+    fn every_entry_frame_at_the_right_edge_keeps_the_circle_and_label_clear() {
+        let tip = [screen().right() - 30.0, 400.0];
+        let mut side = BodySide::default();
+        for step in 0..=100 {
+            let progress = f64::from(step) / 100.0;
+            let placed = layout_frame(
+                tip,
+                screen(),
+                Some([150.0, LABEL_HEIGHT]),
+                screen(),
+                progress,
+                1.0,
+                side,
+            );
+            side = placed.side;
+            let (centre, diameter) = chip_at(progress);
+            let centre = side.point(centre);
+            let radius = diameter / 2.0 + CHIP_RIM;
+            let body = Rect::new(
+                centre[0] + placed.chip_shift[0] - radius,
+                centre[1] + placed.chip_shift[1] - radius,
+                radius * 2.0,
+                radius * 2.0,
+            );
+            assert!(
+                screen().contains_rect(body.offset(tip)),
+                "step {step}: {body:?}"
+            );
+            assert!(placed.panel.contains_rect(body));
+            if let Some(label) = placed.label {
+                assert!(
+                    !label.intersects(body),
+                    "step {step}: label {label:?}, body {body:?}"
+                );
+                assert!(screen().contains_rect(label.offset(tip)));
+            }
+        }
+    }
+
+    #[test]
+    fn side_selection_prefers_the_window_but_never_leaves_the_screen() {
+        let tip = [600.0, 400.0];
+        let window = Rect::new(300.0, 100.0, 330.0, 330.0);
+        let placed = layout(tip, window, Some([120.0, LABEL_HEIGHT]), screen(), false);
+        assert_eq!(
+            placed.side,
+            BodySide {
+                left: true,
+                above: true
+            }
+        );
+        assert!(window.contains_rect(placed.side.rect(chip_bounds(1.0)).offset(tip)));
+        // A small target window cannot contain either side: use screen room,
+        // and omit a pill rather than covering the avatar.
+        let tiny = Rect::new(595.0, 395.0, 10.0, 10.0);
+        let placed = layout(tip, tiny, Some([120.0, LABEL_HEIGHT]), screen(), false);
+        assert_eq!(placed.side, BodySide::default());
+        assert_eq!(placed.label, None);
+    }
+
+    #[test]
+    fn edge_hysteresis_survives_jitter_then_returns_to_the_default_side() {
+        let mut side = BodySide::default();
+        for x in [1677.0, 1676.0, 1677.0, 1676.0, 1670.0] {
+            side = side.choose([x, 400.0], screen(), screen());
+            assert!(side.left, "flipped back too early at {x}");
+        }
+        side = side.choose([1668.0, 400.0], screen(), screen());
+        assert!(!side.left);
+        let mut side = BodySide::default();
+        for y in [1033.0, 1032.0, 1033.0, 1026.0] {
+            side = side.choose([600.0, y], screen(), screen());
+            assert!(side.above, "flipped back too early at {y}");
+        }
+        assert!(!side.choose([600.0, 1024.0], screen(), screen()).above);
+        // Neither side fits the window on alternating reports. Falling back
+        // to screen bounds must not clear the window's side decision.
+        let mut side = BodySide::default();
+        for left in [548.0, 549.0, 548.0, 549.0] {
+            side = side.choose(
+                [600.0, 400.0],
+                Rect::new(left, 200.0, 630.0 - left, 400.0),
+                screen(),
+            );
+            assert!(side.left, "window fallback flickered at {left}");
+        }
+    }
+
+    #[test]
+    fn all_four_reflections_keep_the_pointer_tip_and_point_away_from_the_body() {
+        for side in [
+            BodySide::default(),
+            BodySide {
+                left: true,
+                above: false,
+            },
+            BodySide {
+                left: false,
+                above: true,
+            },
+            BodySide {
+                left: true,
+                above: true,
+            },
+        ] {
+            assert_eq!(side.point(POINTER[0]), [0.0, 0.0]);
+            let centre = side.point(CHIP_CENTER);
+            let notch = side.point(POINTER[2]);
+            assert!(centre[0] * notch[0] > 0.0 && centre[1] * notch[1] > 0.0);
+            assert!(notch[0].abs() < centre[0].abs() && notch[1].abs() < centre[1].abs());
+        }
+    }
+
     #[test]
     fn label_stays_beside_the_badge_inside_the_window_and_screen() {
         let size = [150.0, LABEL_HEIGHT];
@@ -623,7 +955,12 @@ mod tests {
             let label = label_rect(tip, size, window, screen()).expect("room beside the badge");
             placed += 1;
             assert!(
-                !label.intersects(badge_bounds().offset(tip)),
+                !label.intersects(
+                    BodySide::default()
+                        .choose(tip, window, screen())
+                        .rect(badge_bounds())
+                        .offset(tip)
+                ),
                 "{label:?} covers the pointer"
             );
             assert!(screen().contains_rect(label), "{label:?} leaves the screen");
