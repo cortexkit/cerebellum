@@ -214,11 +214,6 @@ where
         let launch_work = work.clone();
         let opened = tokio::task::spawn_blocking(move || {
             let _ax = launch_work.bound_ax();
-            if let Some(process) = running {
-                // Selection already found this copy running. If that generation
-                // exits during consent, do not silently launch another one.
-                return source.opened_running_app(&launching, &process);
-            }
             if let Some(url) = url.as_deref() {
                 // Consent can outlive a bundle update. Re-read the declarations
                 // immediately before dispatch, just as the signer is rechecked.
@@ -226,6 +221,16 @@ where
                 if admit_url(url, &schemes, &launching.bundle_identity).is_err() {
                     return Err(OpenAppError::Failed);
                 }
+            }
+            if let Some(process) = running {
+                // A URL is still an instruction when the app is running. Bind
+                // delivery to the selected path and generation, and disclose
+                // any replacement instead of claiming it was already running.
+                return if let Some(url) = url {
+                    source.open_running_app_url(&launching, &process, &url, bounds)
+                } else {
+                    source.opened_running_app(&launching, &process)
+                };
             }
             // URL revalidation can refuse before any launch call. Keep that
             // out of history, while still counting a worker failure after the
@@ -259,7 +264,7 @@ where
             Err(OpenAppError::TimedOut) => {
                 observation.timeout_floor_ms = Some(bounds.ready_timeout.as_millis() as u64);
             }
-            Err(OpenAppError::Failed) => {}
+            Err(OpenAppError::Failed | OpenAppError::RunningChanged) => {}
         }
         let mut reply = match opened {
             Ok(opened) => json!({
@@ -271,6 +276,9 @@ where
             }
             Err(OpenAppError::Failed) => {
                 json!({"outcome":"launch_failed", "remedy":"On macOS, LaunchServices could not open the application; list_apps before retrying because the application may still start"})
+            }
+            Err(OpenAppError::RunningChanged) => {
+                json!({"outcome":"launch_failed", "remedy":"The running application changed or an additional process appeared while delivering the URL. The URL may have been delivered and another copy may have started; use list_apps and read_state before retrying."})
             }
         };
         // Foreground mode brings the opened application to the front through

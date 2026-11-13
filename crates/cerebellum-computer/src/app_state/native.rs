@@ -546,6 +546,45 @@ impl AppStateSource for MacAppStateSource {
         })
     }
 
+    fn open_running_app_url(
+        &self,
+        app: &super::source::InstalledApp,
+        process: &ProcessGrant,
+        url: &str,
+        bounds: super::source::OpenAppBounds,
+    ) -> Result<super::source::OpenedApp, super::source::OpenAppError> {
+        let start = process
+            .process_generation_evidence
+            .parse()
+            .map_err(|_| super::source::OpenAppError::Failed)?;
+        let opened = cerebellum_macos::open_running_application_with_url(
+            &app.path,
+            &app.bundle_identity,
+            url,
+            process.pid,
+            start,
+            bounds.process_timeout,
+            bounds.window_timeout,
+            bounds.ready_timeout,
+        )
+        .map_err(|error| match error.as_str() {
+            "running_application_changed"
+            | "process_generation_changed"
+            | "process_outside_selected_bundle"
+            | "multiple_running_instances" => super::source::OpenAppError::RunningChanged,
+            "process_timeout" => super::source::OpenAppError::TimedOut,
+            _ => super::source::OpenAppError::Failed,
+        })?;
+        Ok(super::source::OpenedApp {
+            pid: opened.pid,
+            already_running: opened.already_running,
+            has_window: opened.has_window,
+            frontmost: opened.frontmost,
+            process_started_ms: opened.process_started_ms,
+            first_window_ms: opened.first_window_ms,
+        })
+    }
+
     fn bundle_signature(
         &self,
         app: &super::source::InstalledApp,

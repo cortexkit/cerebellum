@@ -328,6 +328,77 @@ async fn open_app_one_running_copy_wins_without_launching() {
 }
 
 #[tokio::test]
+async fn open_app_running_copy_url_is_delivered_by_its_path_without_activation() {
+    let (planes, desk, _) = rig();
+    let copies = duplicate_copies();
+    let running_path = copies[1].path.clone();
+    desk.state().installed.apps = copies;
+    desk.state().url_schemes = vec!["fixture-page".into()];
+    desk.state().running_instances =
+        vec![cerebellum_computer::app_state::source::RunningAppInstance {
+            process: support::grant(),
+            executable_path: running_path.join("Contents/MacOS/Safari"),
+        }];
+    let url = "fixture-page:settings";
+    let (reply, questions) = wire(&planes, "open_app", json!({"target":"Safari", "url":url})).await;
+    assert_eq!(reply["outcome"], "already_running", "{reply}");
+    assert_eq!(reply["pid"], support::grant().pid);
+    assert_eq!(questions, 1);
+    assert_eq!(desk.state().opened_urls, [url]);
+    assert_eq!(desk.state().opened_url_paths, [running_path]);
+    assert!(desk.state().opens.is_empty());
+}
+
+#[tokio::test]
+async fn open_app_running_copy_url_reports_new_or_replaced_process() {
+    for replacement in [false, true] {
+        let (planes, desk, _) = rig();
+        let copies = duplicate_copies();
+        let original = cerebellum_computer::app_state::source::RunningAppInstance {
+            process: support::grant(),
+            executable_path: copies[1].path.join("Contents/MacOS/Safari"),
+        };
+        let mut changed = original.clone();
+        if replacement {
+            changed
+                .process
+                .process_generation_evidence
+                .push_str("-replacement");
+            desk.state().running_instances_after_url = Some(vec![changed]);
+        } else {
+            changed.process.pid += 1;
+            changed.executable_path = copies[0].path.join("Contents/MacOS/Safari");
+            desk.state().running_instances_after_url = Some(vec![original.clone(), changed]);
+        }
+        desk.state().installed.apps = copies;
+        desk.state().running_instances = vec![original];
+        desk.state().url_schemes = vec!["fixture-page".into()];
+        let (reply, _) = wire(
+            &planes,
+            "open_app",
+            json!({"target":"Safari", "url":"fixture-page:settings"}),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "launch_failed", "{reply}");
+        assert!(
+            reply["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("additional process appeared"),
+            "{reply}"
+        );
+        assert!(
+            reply["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("URL may have been delivered"),
+            "{reply}"
+        );
+        assert_eq!(desk.state().opened_urls.len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn open_app_no_running_copy_opens_highest_numeric_version_by_path() {
     let (planes, desk, _) = rig();
     let mut copies = duplicate_copies();

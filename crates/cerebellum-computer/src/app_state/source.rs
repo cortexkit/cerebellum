@@ -760,6 +760,18 @@ pub trait AppStateSource: Send + Sync {
         Err(OpenAppError::Failed)
     }
 
+    /// Deliver to this exact bundle and process generation without activation.
+    /// A replacement or additional process must not be reported as already running.
+    fn open_running_app_url(
+        &self,
+        _app: &InstalledApp,
+        _process: &ProcessGrant,
+        _url: &str,
+        _bounds: OpenAppBounds,
+    ) -> Result<OpenedApp, OpenAppError> {
+        Err(OpenAppError::Failed)
+    }
+
     /// Read only installed bundle names and identities, stopping at the deadline.
     fn installed_apps(&self, _timeout: Duration) -> InstalledApps {
         InstalledApps {
@@ -900,6 +912,7 @@ pub struct OpenedApp {
 pub enum OpenAppError {
     TimedOut,
     Failed,
+    RunningChanged,
 }
 
 /// The reader for a platform with none: every read is refused by name.

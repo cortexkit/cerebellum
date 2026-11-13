@@ -442,9 +442,70 @@ pub fn open_application_with_url(
     window_timeout: Duration,
     ready_timeout: Duration,
 ) -> Result<ApplicationOpenResult, String> {
+    open_application_with_url_checked(
+        path,
+        bundle,
+        page_url,
+        activates,
+        process_timeout,
+        window_timeout,
+        ready_timeout,
+        None,
+    )
+}
+
+/// Deliver a URL by bundle path, refusing to label a replacement process as already running.
+#[allow(clippy::too_many_arguments)]
+pub fn open_running_application_with_url(
+    path: &Path,
+    bundle: &str,
+    page_url: &str,
+    pid: u32,
+    start_time_micros: u64,
+    process_timeout: Duration,
+    window_timeout: Duration,
+    ready_timeout: Duration,
+) -> Result<ApplicationOpenResult, String> {
+    open_application_with_url_checked(
+        path,
+        bundle,
+        Some(page_url),
+        false,
+        process_timeout,
+        window_timeout,
+        ready_timeout,
+        Some((pid, start_time_micros)),
+    )
+}
+
+fn verify_running_snapshot(
+    running: &[RunningApplicationInstance],
+    expected: (u32, u64),
+) -> Result<(), String> {
+    if matches!(running, [instance] if (instance.pid, instance.start_time_micros) == expected) {
+        Ok(())
+    } else {
+        Err("running_application_changed".into())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_application_with_url_checked(
+    path: &Path,
+    bundle: &str,
+    page_url: Option<&str>,
+    activates: bool,
+    process_timeout: Duration,
+    window_timeout: Duration,
+    ready_timeout: Duration,
+    expected: Option<(u32, u64)>,
+) -> Result<ApplicationOpenResult, String> {
     let started = Instant::now();
     let ready_deadline = started + ready_timeout;
     let matching = running_application_instances(bundle)?;
+    if let Some(expected) = expected {
+        verify_running_snapshot(&matching, expected)?;
+    }
     if matching.len() > 1 {
         return Err("multiple_running_instances".into());
     }
@@ -527,6 +588,9 @@ pub fn open_application_with_url(
         );
     };
     verify_bundle_process(path, pid, start_time_micros)?;
+    if let Some(expected) = expected {
+        verify_running_snapshot(&running_application_instances(bundle)?, expected)?;
+    }
     Ok(ApplicationOpenResult {
         pid,
         already_running,
@@ -761,5 +825,23 @@ mod tests {
         assert_eq!(app.version.as_deref(), Some("0.20.23"));
         assert_eq!(app.build_version.as_deref(), Some("1234.5"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn running_url_snapshot_rejects_new_or_reused_processes() {
+        let original = RunningApplicationInstance {
+            pid: 42,
+            start_time_micros: 123,
+            executable_path: "/Applications/Fixture.app/Contents/MacOS/Fixture".into(),
+        };
+        let expected = (original.pid, original.start_time_micros);
+        assert!(verify_running_snapshot(std::slice::from_ref(&original), expected).is_ok());
+        let mut additional = original.clone();
+        additional.pid += 1;
+        assert!(verify_running_snapshot(&[original.clone(), additional], expected).is_err());
+        let mut replacement = original;
+        replacement.start_time_micros += 1;
+        assert!(verify_running_snapshot(&[replacement], expected).is_err());
+        assert!(verify_running_snapshot(&[], expected).is_err());
     }
 }

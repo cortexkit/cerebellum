@@ -47,9 +47,10 @@ mod ax_state;
 #[cfg(target_os = "macos")]
 pub use applications::{
     application_url_schemes, inspect_running_application, installed_applications, open_application,
-    open_application_with_url, responsible_pid, running_application_instances,
-    workspace_running_applications, ApplicationOpenResult, InstalledApplication,
-    InstalledApplicationList, InstalledInventoryFailure, RunningApplicationInstance,
+    open_application_with_url, open_running_application_with_url, responsible_pid,
+    running_application_instances, workspace_running_applications, ApplicationOpenResult,
+    InstalledApplication, InstalledApplicationList, InstalledInventoryFailure,
+    RunningApplicationInstance,
 };
 #[cfg(target_os = "macos")]
 mod code_signing;
