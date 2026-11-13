@@ -2762,8 +2762,16 @@ async fn posted_when_the_badge_arrives(action: &str, arguments: Value) {
     let clock = FakeClock::new();
     let shared = Shared::handle();
     let desk = focused_text_desk();
-    desk.state().cursor_frame = Some([100.0, 60.0, 80.0, 20.0]);
-    desk.state().cursor_visible = true;
+    {
+        let mut state = desk.state();
+        state.cursor_frame = Some([100.0, 60.0, 80.0, 20.0]);
+        state.cursor_visible = true;
+        // Keep the window's bounds independent of the field as focus moves.
+        // The generic frame fallback would otherwise make the window field-sized.
+        state.cursor_frames.insert(1, [0.0, 0.0, 1000.0, 800.0]);
+        state.cursor_windows.extend([(1, 1), (2, 1)]);
+        state.focused_cursor_window = Some(1);
+    }
     let (cursor, mut pictures) = Coordinator::channel();
     // Foreground mode: the on-screen badge is what is checked here.
     let plane = plane_with(&shared)

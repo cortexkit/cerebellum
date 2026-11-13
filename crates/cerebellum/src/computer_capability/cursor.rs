@@ -283,6 +283,15 @@ struct Aim<'a> {
 }
 
 impl Drawn {
+    fn shown(&self, agent: &str, space: Space, now: tokio::time::Instant) -> Option<[f64; 2]> {
+        let gone_after = Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS);
+        self.tips
+            .get(agent)
+            .filter(|tip| tip.space == space)
+            .filter(|tip| now.saturating_duration_since(tip.sent) < gone_after)
+            .map(Tip::place)
+    }
+
     /// Choose the motion for a picture about to be sent to the helper, and
     /// the record of where its badge will then be. Nothing is recorded yet:
     /// `keep` does that once the picture is really on its way.
@@ -300,13 +309,7 @@ impl Drawn {
         now: tokio::time::Instant,
         reduce_motion: bool,
     ) -> (PictureMotion, Tip) {
-        let gone_after = Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS);
-        let shown = self
-            .tips
-            .get(aim.agent)
-            .filter(|tip| tip.space == aim.space)
-            .filter(|tip| now.saturating_duration_since(tip.sent) < gone_after)
-            .map(Tip::place);
+        let shown = self.shown(aim.agent, aim.space, now);
         let to = match (aim.resting, shown) {
             (true, Some(resting)) => resting,
             _ => aim.to,
@@ -473,10 +476,32 @@ struct PreviewAimed {
     /// The badge's tip and the element's visible centre, both as positions
     /// in the window from 0 to 1; `None` for no motion.
     to: Option<([f64; 2], [f64; 2])>,
+    keyboard_focus: Option<KeyboardFocus>,
     label: Option<String>,
     /// The application bundle's path, for the icon shown in place of a
     /// frame; `None` when it cannot be found.
     icon_path: Option<String>,
+}
+
+impl PreviewAimed {
+    fn placement(
+        &self,
+        drawn: &Drawn,
+        agent: &str,
+        now: tokio::time::Instant,
+    ) -> Option<([f64; 2], [f64; 2])> {
+        let shown = drawn.shown(
+            agent,
+            Space::Preview {
+                window: self.window.id,
+            },
+            now,
+        );
+        if self.keyboard_focus.is_some_and(|focus| focus.rests(shown)) {
+            return shown.map(|point| (point, point)).or(self.to);
+        }
+        self.to
+    }
 }
 
 /// Whose preview `draw_in_preview` draws, and for which action.
@@ -1271,7 +1296,16 @@ impl Coordinator {
     /// Send a scheduled picture unless its agent was ended after it was
     /// scheduled. Answers how an action waits for its badge, or `None` when
     /// nothing will be drawn or there is nothing to wait for.
-    fn send_unless_ended(&self, mut event: CursorEvent) -> Option<Sent> {
+    #[cfg(test)]
+    fn send_unless_ended(&self, event: CursorEvent) -> Option<Sent> {
+        self.send_aimed(event, None)
+    }
+
+    fn send_aimed(
+        &self,
+        mut event: CursorEvent,
+        keyboard_focus: Option<KeyboardFocus>,
+    ) -> Option<Sent> {
         let mut drawn = self.drawn();
         if drawn
             .hidden_through
@@ -1292,6 +1326,9 @@ impl Coordinator {
             return None;
         }
         let now = tokio::time::Instant::now();
+        if let Some(focus) = keyboard_focus {
+            event.resting |= focus.rests(drawn.shown(&event.agent, Space::Screen, now));
+        }
         let (motion, tip) = drawn.aim(
             &Aim {
                 agent: &event.agent,
@@ -1695,6 +1732,7 @@ impl Coordinator {
                 worker.release_unshown(&agent);
                 return;
             }
+            let to = aimed.placement(&drawn, &agent, now);
             let outcome = worker.show(PreviewRequest {
                 agent: agent.clone(),
                 target: grant,
@@ -1720,7 +1758,7 @@ impl Coordinator {
                     if let Some(call) = &call {
                         call.showing(&worker, &agent);
                     }
-                    match aimed.to.filter(|_| !icon) {
+                    match to.filter(|_| !icon) {
                         Some((to, target)) => self.send_preview_motion(
                             &mut drawn,
                             CursorPreviewMotion {
@@ -1866,16 +1904,9 @@ impl Coordinator {
             // A read that fails or runs out of time drops `decided`, which
             // tells a waiting action that no badge will be drawn.
             if let Ok(Ok(Some(aimed))) = tokio::time::timeout(READ_BUDGET, read).await {
-                let _ = screen_window.set(aimed.window);
+                let _ = screen_window.set(aimed.window.clone());
                 cursor
-                    .draw_on_screen(
-                        aimed.event,
-                        aimed.element,
-                        grant,
-                        source,
-                        avatar_agent,
-                        (decided, queued, cap),
-                    )
+                    .draw_on_screen(aimed, grant, source, avatar_agent, (decided, queued, cap))
                     .await;
             } else {
                 cursor.hide_picture(&agent, serial);
@@ -1889,13 +1920,18 @@ impl Coordinator {
     /// the agent's avatar.
     async fn draw_on_screen(
         &self,
-        event: CursorEvent,
-        followed_element: Option<ElementHandle>,
+        aimed: ScreenAimed,
         grant: ProcessGrant,
         source: Arc<dyn AppStateSource>,
         avatar_agent: Option<String>,
         (decided, queued, cap): Decision,
     ) {
+        let ScreenAimed {
+            event,
+            element: followed_element,
+            keyboard_focus,
+            ..
+        } = aimed;
         #[cfg(not(target_os = "macos"))]
         let _ = &avatar_agent;
         // A badge for an agent whose avatar colour is already known
@@ -1913,7 +1949,7 @@ impl Coordinator {
         };
         // Its own task: the wait for the write must not hold up the
         // window watch or the avatar below.
-        let sent = self.send_unless_ended(event.clone());
+        let sent = self.send_aimed(event.clone(), keyboard_focus);
         tokio::spawn(self.clone().decide(decided, sent, queued, cap));
         // Off the read's deadline: following the window is a nicety
         // that must never hold up or drop the picture itself.
@@ -2270,6 +2306,7 @@ impl Coordinator {
 
 struct ScreenAimed {
     event: CursorEvent,
+    keyboard_focus: Option<KeyboardFocus>,
     element: Option<ElementHandle>,
     window: ElementHandle,
 }
@@ -2333,6 +2370,7 @@ fn screen_read(
     let point = point.or_else(|| keyboard_caret(source, kind, aimed_handle.as_ref(), window_frame));
     let to = source.visible_cursor_point(grant, point, frame)?;
     Some(ScreenAimed {
+        keyboard_focus: keyboard_focus(kind, point, frame, window_frame),
         event: CursorEvent {
             initial: agent.chars().next().unwrap_or('A').to_ascii_uppercase(),
             agent,
@@ -2357,7 +2395,7 @@ fn screen_read(
 
 /// A keyboard action's preferred handle is its focused element, never an
 /// arbitrary ancestor. Even a large web area may expose selection bounds;
-/// accept them only wholly inside the same window, otherwise use its frame.
+/// accept them only wholly inside the same window.
 fn keyboard_caret(
     source: &dyn AppStateSource,
     kind: CursorKind,
@@ -2382,6 +2420,68 @@ fn keyboard_caret(
         return None;
     }
     Some([x + w / 2.0, y + h / 2.0])
+}
+
+/// Without a caret, a large accessibility container is not evidence that
+/// typing moved away from the last clicked input. Small fields can establish
+/// a new target when focus moves, but never recenter a badge already on them.
+#[derive(Clone, Copy)]
+enum KeyboardFocus {
+    Keep,
+    Field([f64; 4]),
+}
+
+impl KeyboardFocus {
+    fn rests(self, shown: Option<[f64; 2]>) -> bool {
+        match self {
+            Self::Keep => true,
+            Self::Field([x, y, w, h]) => {
+                shown.is_some_and(|[px, py]| px >= x && px <= x + w && py >= y && py <= y + h)
+            }
+        }
+    }
+
+    fn relative(self, [x, y, w, h]: [f64; 4]) -> Self {
+        match self {
+            Self::Keep => Self::Keep,
+            Self::Field([fx, fy, fw, fh]) => {
+                Self::Field([(fx - x) / w, (fy - y) / h, fw / w, fh / h])
+            }
+        }
+    }
+}
+
+fn keyboard_focus(
+    kind: CursorKind,
+    point: Option<[f64; 2]>,
+    frame: Option<[f64; 4]>,
+    window: Option<[f64; 4]>,
+) -> Option<KeyboardFocus> {
+    if !matches!(kind, CursorKind::Type | CursorKind::Keys) || point.is_some() {
+        return None;
+    }
+    let plausible = frame.filter(|frame| {
+        let [_, _, w, h] = *frame;
+        // Geometry is deliberately conservative: allow wide and multiline
+        // inputs, but not an editor-sized web area or a window-sized container.
+        // A small readable field does not require window bounds; those bounds
+        // only add a relative-area check when they are available.
+        frame.iter().all(|v| v.is_finite())
+            && w > 0.0
+            && h > 0.0
+            && h <= 160.0
+            && window.is_none_or(|window| {
+                let [_, _, ww, wh] = window;
+                window.iter().all(|v| v.is_finite())
+                    && ww > 0.0
+                    && wh > 0.0
+                    && w * h <= ww * wh / 4.0
+            })
+    });
+    Some(match plausible {
+        Some(frame) => KeyboardFocus::Field(frame),
+        None => KeyboardFocus::Keep,
+    })
 }
 
 /// The geometry read for a background-mode badge, on a blocking thread.
@@ -2437,6 +2537,8 @@ fn background_read(
         None => target.map(|target| (target, target)),
     };
     Some(PreviewAimed {
+        keyboard_focus: keyboard_focus(kind, point, frame, Some(window.bounds))
+            .map(|focus| focus.relative(window.bounds)),
         window,
         to,
         label,
@@ -2629,6 +2731,9 @@ impl Coordinator {
         self.0.settled.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
+
+#[cfg(test)]
+mod keyboard_tests;
 
 #[cfg(test)]
 mod tests {
