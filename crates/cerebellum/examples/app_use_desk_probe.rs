@@ -1862,6 +1862,9 @@ mod desk {
             let mut measured = AttemptTiming::default();
             match timings.as_slice() {
                 [timing] if timing.target_pid == scratch.pid() => {
+                    for line in timing.record_lines(attempt) {
+                        println!("{line}");
+                    }
                     measured.front_ms = timing.confirmed_front_ms.or(timing.late_landing_ms);
                     match timing.confirmed_front_ms {
                         Some(ms) => println!("RECORD needs-front attempt {attempt}: request→confirmed-frontmost {ms:.3} ms (in call)"),

@@ -428,10 +428,6 @@ impl RestoreCell {
                     crate::computer::dispatch::RESTORE_WAIT_MS,
                     confirmed,
                 );
-                #[cfg(all(feature = "desk-probe", target_os = "macos"))]
-                if outcome.restore == crate::computer::dispatch::RestoreStatus::Restored {
-                    self.probe_timing.restored();
-                }
                 // An activation the action never confirmed is always left to
                 // the late watch, even one restored here: the same activation
                 // can land again after this decision.
@@ -592,12 +588,25 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
         self.host.pause_ms(milliseconds);
     }
     fn frontmost_pid(&mut self) -> Option<u32> {
+        #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+        {
+            let frontmost = self.host.frontmost_pid();
+            self.probe_timing.frontmost_observed(frontmost);
+            frontmost
+        }
+        #[cfg(not(all(feature = "desk-probe", target_os = "macos")))]
         self.host.frontmost_pid()
     }
     fn request_front(&mut self, pid: u32) -> bool {
+        #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+        self.probe_timing
+            .restore_requested(pid, probe_timing::RestoreRoute::AxFrontmost);
         self.host.request_front(pid)
     }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
+        #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+        self.probe_timing
+            .restore_requested(pid, probe_timing::RestoreRoute::Fallback);
         self.host.request_front_fallback(pid)
     }
     fn late_activation_observed(&mut self, _latency_ms: u64) {

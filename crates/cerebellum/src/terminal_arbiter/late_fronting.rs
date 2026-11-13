@@ -281,9 +281,7 @@ pub(super) fn start(
             restore = final_restore;
         }
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
-        if restore == crate::computer::dispatch::RestoreStatus::Restored {
-            probe_timing.restored();
-        }
+        probe_timing.watch_finished(restore);
         // No focus operation follows these drops. Slow audit persistence must
         // not extend the fronting lock or hold up a new call on this app.
         drop(_lock);
