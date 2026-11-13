@@ -496,6 +496,15 @@ struct ScreenState {
     /// The person presses a key, which the run's own observer drains at its
     /// next check.
     person_key_pending: bool,
+    /// This many requests to bring an application other than the target to
+    /// the front are ignored, as an application that does not answer the
+    /// first route does.
+    restores_ignored: usize,
+    /// Whether the restore host's second route to the front works.
+    fallback_works: bool,
+    /// The target comes to the front again at each of these instants, as an
+    /// activation delivered more than once does.
+    landings_at: Vec<u64>,
 }
 
 #[derive(Clone)]
@@ -534,6 +543,9 @@ impl Screen {
                 release_until: None,
                 log_release_end: false,
                 person_key_pending: false,
+                restores_ignored: 0,
+                fallback_works: false,
+                landings_at: Vec::new(),
             })),
             desk: desk.clone(),
         }
@@ -606,11 +618,16 @@ impl Screen {
         let landed = {
             let mut state = self.state();
             state.now += milliseconds;
-            if state.pending_front_at.is_some_and(|at| at <= state.now) {
+            let now = state.now;
+            let relanded = state.landings_at.first().is_some_and(|at| *at <= now);
+            if relanded {
+                state.landings_at.remove(0);
+            }
+            if state.pending_front_at.is_some_and(|at| at <= now) {
                 state.pending_front_at = None;
                 true
             } else {
-                false
+                relanded
             }
         };
         if landed {
@@ -662,7 +679,22 @@ impl FrontingRestoreHost for FakeRestore {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+        {
+            let mut state = self.0.state();
+            if pid != TARGET && state.restores_ignored > 0 {
+                state.restores_ignored -= 1;
+                state.log.push(format!("restore:{pid}"));
+                return true;
+            }
+        }
         self.0.front("restore", pid)
+    }
+    fn request_front_fallback(&mut self, pid: u32) -> bool {
+        if self.0.state().fallback_works {
+            return self.0.front("fallback", pid);
+        }
+        self.0.state().log.push(format!("fallback:{pid}"));
+        false
     }
     fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
         self.0.snapshot()
@@ -3533,6 +3565,89 @@ async fn a_new_app_call_before_watcher_start_still_ends_the_pending_watch() {
     assert_eq!(record["restore"], "failed");
     assert_eq!(rig.screen.log(), ["front:4242"]);
     assert_eq!(rig.screen.state().now, 400);
+}
+
+/// Serve a needs-front chord whose front lands 109 ms after its request,
+/// past the 100 ms bound, then run the late watch the route starts after
+/// the reply, and return the reply and the watch's audit record.
+async fn chord_landing_after_its_bound(
+    rig: &Rig,
+    configure: impl FnOnce(&mut ScreenState),
+) -> (Value, Value) {
+    rig.read().await;
+    {
+        let mut state = rig.screen.state();
+        state.front_delay_ms = Some(109);
+        configure(&mut state);
+    }
+    let terminal = under_terminal();
+    let reply = rig
+        .call_under(&terminal, "computer.keys", command_chord())
+        .await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    terminal.set_late_fronting_recorder(Arc::new(move |record| {
+        tx.send(record).unwrap();
+    }));
+    terminal.start_late_fronting(None);
+    let record = tokio::time::timeout(crate::test_support::HANG_GUARD, rx.recv())
+        .await
+        .expect("a late watch follows a landing the call never confirmed")
+        .unwrap();
+    (reply, record)
+}
+
+/// As on a desk run: the landing came after the bound, and the
+/// person's application ignored every request to come back the first way,
+/// in the call and in the late watch. With no person input, it is put back
+/// the second way, and the reply never claims the target was fronted.
+#[tokio::test]
+async fn a_late_landing_over_an_app_that_ignores_the_first_route_is_put_back() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let (reply, record) = chord_landing_after_its_bound(&rig, |state| {
+        state.restores_ignored = usize::MAX;
+        state.fallback_works = true;
+    })
+    .await;
+    assert_eq!(
+        rig.screen.frontmost(),
+        Some(PREVIOUS),
+        "the person's app is back: {reply} {record} {:?}",
+        rig.screen.log()
+    );
+    assert_eq!(reply["fronting"]["fronted"], false, "{reply}");
+    assert_eq!(record["restore"], "restored", "{record}");
+    assert_eq!(record["person_input_during_fronting"], false);
+    assert!(rig.screen.log().iter().any(|event| event == "fallback:100"));
+    assert!(!rig.screen.log().iter().any(|event| event == "post"));
+}
+
+/// The call itself puts back a landing it never confirmed; the same
+/// activation then lands again. The late watch puts it back again.
+#[tokio::test]
+async fn a_landing_restored_in_the_call_that_lands_again_is_put_back_again() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let (reply, record) = chord_landing_after_its_bound(&rig, |state| {
+        state.landings_at = vec![state.now + 1_500];
+    })
+    .await;
+    assert_eq!(reply["fronting"]["fronted"], false, "{reply}");
+    assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
+    assert_eq!(
+        rig.screen.frontmost(),
+        Some(PREVIOUS),
+        "the second landing was put back: {record} {:?}",
+        rig.screen.log()
+    );
+    assert_eq!(record["restore"], "restored", "{record}");
+    assert_eq!(
+        rig.screen
+            .log()
+            .iter()
+            .filter(|event| *event == "restore:100")
+            .count(),
+        2
+    );
+    assert!(!rig.screen.log().iter().any(|event| event == "post"));
 }
 
 #[tokio::test]

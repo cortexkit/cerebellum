@@ -151,6 +151,12 @@ pub trait RestoreHost: Send {
     /// Ask the application `pid` runs to become frontmost. `false` when the
     /// request itself was refused.
     fn request_front(&mut self, pid: u32) -> bool;
+    /// A second way to ask for `pid`, the application a restore puts back,
+    /// to come to the front, for when [`Self::request_front`] has not taken
+    /// effect. `false` when the host has none or the request was refused.
+    fn request_front_fallback(&mut self, _pid: u32) -> bool {
+        false
+    }
     /// The process-wide session observer's hardware input timestamps, on
     /// this host's clock. `None` when unavailable, which the decision reads
     /// as no input seen.
@@ -275,6 +281,10 @@ struct RestoreCellInner {
     decided: Option<RestoreDecided>,
     front_confirmed: bool,
     pending_since: Option<u64>,
+    /// The decision already put back the landing that `pending_since` is
+    /// watched for, so the late watch starts with the previous application
+    /// restored and only a further landing needs it.
+    pending_restored: bool,
 }
 
 impl RestoreCell {
@@ -297,6 +307,7 @@ impl RestoreCell {
                 decided: None,
                 front_confirmed: false,
                 pending_since: None,
+                pending_restored: false,
             }),
             changed: std::sync::Condvar::new(),
             pending_watch: late_fronting::register_pending(
@@ -421,15 +432,21 @@ impl RestoreCell {
                 if outcome.restore == crate::computer::dispatch::RestoreStatus::Restored {
                     self.probe_timing.restored();
                 }
+                // An activation the action never confirmed is always left to
+                // the late watch, even one restored here: the same activation
+                // can land again after this decision.
                 if !confirmed
                     && !matches!(
                         outcome.restore,
-                        crate::computer::dispatch::RestoreStatus::Restored
-                            | crate::computer::dispatch::RestoreStatus::NotNeeded
+                        crate::computer::dispatch::RestoreStatus::NotNeeded
                     )
                 {
                     let mut inner = self.inner();
                     inner.pending_since = Some(front_instant_ms);
+                    inner.pending_restored = matches!(
+                        outcome.restore,
+                        crate::computer::dispatch::RestoreStatus::Restored
+                    );
                     inner.host = Some(host);
                 }
                 RestoreDecided {
@@ -579,6 +596,9 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
     }
     fn request_front(&mut self, pid: u32) -> bool {
         self.host.request_front(pid)
+    }
+    fn request_front_fallback(&mut self, pid: u32) -> bool {
+        self.host.request_front_fallback(pid)
     }
     fn late_activation_observed(&mut self, _latency_ms: u64) {
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
@@ -2621,6 +2641,8 @@ mod restore_slot_tests {
             .register_restore(obligation(&shared, &releases))
             .unwrap();
         assert!(cell.begin_front_attempt(0));
+        // The target is in front when the attempt returns, as the worker saw.
+        cell.front_confirmed();
         cell.front_attempt_returned();
         let (worker, cleanup) = std::thread::scope(|scope| {
             let worker = scope.spawn(|| cell.decide());
@@ -3014,6 +3036,7 @@ mod restore_slot_tests {
                 });
                 let cell = terminal.register_restore(obligation).unwrap();
                 assert!(cell.begin_front_attempt(0));
+                cell.front_confirmed();
                 cell.front_attempt_returned();
                 let _ = ready.send(());
                 std::future::pending::<()>().await;

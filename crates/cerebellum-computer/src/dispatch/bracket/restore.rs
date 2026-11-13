@@ -18,6 +18,12 @@ use super::{FrontingBracketHost, RestoreStatus, FRONTING_POLL_MS};
 /// front, in milliseconds, counted from the restore request.
 pub const RESTORE_WAIT_MS: u64 = 300;
 
+/// How long a restore waits for its first request to take effect before it
+/// also asks the second way ([`FrontingBracketHost::request_front_fallback`]),
+/// in milliseconds from the request. Fronts made by the first route have been
+/// seen to land within about 140 ms on a desk, so a request still without
+/// effect after this long is unlikely to land at all.
+pub const RESTORE_FALLBACK_AFTER_MS: u64 = 150;
 /// The hardware input the session observer has seen, on the clock of the host
 /// that reports it.
 ///
@@ -266,7 +272,17 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
         RestoreDecision::Restore {
             person_input_during_fronting,
         } => {
-            let restore = request_restore(host, previous, requested_at, wait_ms);
+            let restore = request_restore(
+                host,
+                RestoreRequest {
+                    previous,
+                    target,
+                    front_instant_ms,
+                    require_quiet,
+                },
+                requested_at,
+                wait_ms,
+            );
             RestoreOutcome {
                 restore,
                 person_input_during_fronting,
@@ -276,44 +292,77 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
     }
 }
 
-/// Observation-only cleanup for one activation that remained pending at reply
-/// time. It never dispatches the action that timed out. An unavailable input
-/// observer or a gap in its coverage counts as input; focus is left alone.
+/// Observation-only cleanup for an activation the call did not see through:
+/// one that was still pending at reply time, or one that landed after the
+/// action gave up. It never dispatches the action that timed out.
+///
+/// It watches until `watch_ms` after `requested_at`, the front request.
+/// Whenever the target is in front and no person input has arrived since the
+/// front, it asks for the previous application back, both ways (as
+/// `request_restore` does), and asks again after any request that did not take
+/// effect. After a restore it keeps watching, so an activation that lands a
+/// second time is put back too. `already_restored` says the call itself
+/// already put back a landing it did not see through, so the watch starts
+/// with the previous application restored.
+///
+/// It stops at the first person input, and an unavailable input observer or
+/// a gap in its coverage counts as input: focus is then left alone, unless
+/// the previous application was already back, where the input is the
+/// person's own work in it. It also stops when a third application comes to
+/// the front or the front cannot be read, on `stop`, and at the window's end.
+///
+/// Returns the restore status as the watch ended, the latency of the first
+/// landing it saw, and whether person input arrived while the target could
+/// still be in front.
 pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
     host: &mut H,
     previous: u32,
     target: u32,
     requested_at: u64,
     watch_ms: u64,
+    already_restored: bool,
     stop: &dyn Fn() -> bool,
 ) -> (RestoreStatus, Option<u64>, bool) {
     let end = requested_at.saturating_add(watch_ms);
+    let mut first_landing = None;
+    let mut target_was_front = false;
+    let mut restored = already_restored;
     loop {
         let front = host.frontmost_pid();
         let input = hardware_input_since(host.hardware_input_snapshot(), requested_at);
         let now = host.now_ms();
-        let observed_latency = (front == Some(target)).then(|| now.saturating_sub(requested_at));
-        if let Some(latency) = observed_latency {
-            host.late_activation_observed(latency);
+        let target_front = front == Some(target);
+        if target_front {
+            restored = false;
+            // Reported once per landing, not once per poll while it stays.
+            if !target_was_front {
+                let latency = now.saturating_sub(requested_at);
+                host.late_activation_observed(latency);
+                first_landing.get_or_insert(latency);
+            }
         }
+        target_was_front = target_front;
         if input {
+            if restored {
+                return (RestoreStatus::Restored, first_landing, false);
+            }
             return (
                 RestoreStatus::SkippedPerson { now_front: front },
-                observed_latency,
+                first_landing,
                 true,
             );
         }
-        if front == Some(target) {
-            let latency = now.saturating_sub(requested_at);
-            if stop() || now >= end {
-                return (
-                    RestoreStatus::Failed {
-                        left_in_front: front,
-                    },
-                    Some(latency),
-                    false,
-                );
-            }
+        if stop() || now >= end {
+            let restore = if restored {
+                RestoreStatus::Restored
+            } else {
+                RestoreStatus::Failed {
+                    left_in_front: front,
+                }
+            };
+            return (restore, first_landing, false);
+        }
+        if target_front {
             let result = restore_attempt(
                 host,
                 previous,
@@ -323,30 +372,41 @@ pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
                 true,
                 true,
             );
-            return (
-                result.restore,
-                Some(latency),
-                result.person_input_during_fronting,
-            );
-        }
-        if stop() || now >= end {
-            return (
-                RestoreStatus::Failed {
-                    left_in_front: front,
-                },
-                None,
-                false,
-            );
+            match result.restore {
+                RestoreStatus::Restored => {
+                    restored = true;
+                    target_was_front = false;
+                }
+                RestoreStatus::SkippedPerson { .. } if result.person_input_during_fronting => {
+                    return (result.restore, first_landing, true);
+                }
+                // Not back yet, or a reading changed under the decision:
+                // look again, and ask again while the window lasts.
+                _ => host.pause_ms(FRONTING_POLL_MS),
+            }
+            continue;
         }
         if front != Some(previous) {
-            return (
-                RestoreStatus::SkippedPerson { now_front: front },
-                None,
-                false,
-            );
+            let restore = if restored {
+                RestoreStatus::Restored
+            } else {
+                RestoreStatus::SkippedPerson { now_front: front }
+            };
+            return (restore, first_landing, false);
         }
         host.pause_ms(10);
     }
+}
+
+/// What a restore request puts back, and the evidence that must still hold
+/// before it asks the second way.
+pub(super) struct RestoreRequest {
+    pub(super) previous: u32,
+    pub(super) target: u32,
+    /// When the front was requested: the floor for person input.
+    pub(super) front_instant_ms: u64,
+    /// Person input since the front forbids the second request.
+    pub(super) require_quiet: bool,
 }
 
 /// Request the previous application back and wait at most `wait_ms` from
@@ -354,14 +414,33 @@ pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
 ///
 /// A refused request is not given up on at once: the previous application
 /// left behind the target is the failure this exists to prevent, so the
-/// whole wait is spent before reporting it.
+/// whole wait is spent before reporting it. When the first request has not
+/// taken effect after [`RESTORE_FALLBACK_AFTER_MS`], the host's second route
+/// is asked too, but only while the target is still the application in
+/// front, the input observer has watched without a gap since the front, and,
+/// when `require_quiet`, no person input has arrived since it.
 pub(super) fn request_restore<H: FrontingBracketHost + ?Sized>(
     host: &mut H,
-    previous: u32,
+    request: RestoreRequest,
     requested_at_ms: u64,
     wait_ms: u64,
 ) -> RestoreStatus {
+    let previous = request.previous;
     let _ = host.request_front(previous);
+    let first_wait = RESTORE_FALLBACK_AFTER_MS.min(wait_ms);
+    if wait_for_front(host, previous, requested_at_ms, first_wait) {
+        return RestoreStatus::Restored;
+    }
+    if first_wait < wait_ms {
+        let target_in_front = host.frontmost_pid() == Some(request.target);
+        let snapshot = host.hardware_input_snapshot();
+        let covered =
+            snapshot.is_some_and(|snapshot| snapshot.coverage_start_ms <= request.front_instant_ms);
+        let input = hardware_input_since(snapshot, request.front_instant_ms);
+        if target_in_front && covered && !(request.require_quiet && input) {
+            let _ = host.request_front_fallback(previous);
+        }
+    }
     if wait_for_front(host, previous, requested_at_ms, wait_ms) {
         RestoreStatus::Restored
     } else {

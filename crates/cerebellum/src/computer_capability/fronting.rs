@@ -665,6 +665,9 @@ impl RestoreHost for PlatformRestoreHost {
     fn request_front(&mut self, pid: u32) -> bool {
         self.0.request_front(pid)
     }
+    fn request_front_fallback(&mut self, pid: u32) -> bool {
+        self.0.request_front_fallback(pid)
+    }
     fn hardware_input_snapshot(
         &mut self,
     ) -> Option<cerebellum_computer::dispatch::HardwareInputSnapshot> {
@@ -713,6 +716,10 @@ impl ObligationParts {
         host: Box<dyn FrontingRestoreHost>,
     ) -> Option<Arc<RestoreCell>> {
         let lock = self.lock.take()?;
+        let mut host = host;
+        // The restore host's second route to the front only ever activates
+        // this process, so a pid reused meanwhile is never brought forward.
+        host.remember_previous(previous);
         self.terminal
             .register_restore(RestoreObligation {
                 previous_pid: previous,
