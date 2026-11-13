@@ -857,6 +857,107 @@ async fn an_element_without_a_press_names_what_it_supports() {
     assert!(desk.state().hit_scopes.is_empty());
 }
 
+fn context_menu_desk(role: &str) -> Desk {
+    let desk = desk().with_element(
+        11,
+        DeskElement {
+            facts: facts(role, &["AXShowMenu"]),
+            ..DeskElement::default()
+        },
+    );
+    {
+        let mut state = desk.state();
+        state.roots[0].children[1] = RawElement::fixture(11, role).titled("Hello");
+        state.application_hit = Some((11, Some(grant().pid)));
+        state.element_windows.insert(11, 77);
+    }
+    desk
+}
+
+#[tokio::test]
+async fn pressing_a_context_menu_only_element_refuses_without_dispatch() {
+    for role in ["AXStaticText", "AXGroup"] {
+        let desk = context_menu_desk(role);
+        let plane = plane(&desk);
+        let management = granted_management().await;
+        let tree = read(&plane, &management).await;
+        let reply = serve(
+            &plane,
+            &management,
+            "computer.press_element",
+            json!({"element_id": id_of(&tree, "Hello")}),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "no_press_action", "{role}: {reply}");
+        assert_eq!(reply["reason"], "press_not_offered", "{reply}");
+        let remedy = reply["remedy"].as_str().unwrap();
+        assert!(
+            remedy.contains("nearby element that offers AXPress"),
+            "{reply}"
+        );
+        assert!(remedy.contains("read_state for a fresh read"), "{reply}");
+        assert!(desk.state().presses.is_empty());
+        assert!(desk.state().shown_menus.is_empty());
+        assert!(desk.state().hit_scopes.is_empty());
+        assert!(plane.result_schema_findings().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_point_on_a_context_menu_only_element_refuses_without_dispatch() {
+    for role in ["AXStaticText", "AXGroup"] {
+        let desk = context_menu_desk(role);
+        let plane = plane(&desk);
+        let management = granted_management().await;
+        let image_id = read_with_image(&plane, &management).await;
+        let reply = serve(
+            &plane,
+            &management,
+            "computer.press_point",
+            json!({"image_id": image_id, "x": 625, "y": 125}),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "no_press_action", "{role}: {reply}");
+        assert_eq!(reply["reason"], "press_not_offered", "{reply}");
+        assert!(desk.state().presses.is_empty());
+        assert!(desk.state().shown_menus.is_empty());
+        assert_eq!(
+            desk.state().hit_scopes,
+            vec![HitScope::Application { pid: grant().pid }]
+        );
+        assert!(plane.result_schema_findings().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_press_batch_stops_at_a_context_menu_only_element() {
+    for role in ["AXStaticText", "AXGroup"] {
+        let desk = context_menu_desk(role);
+        let plane = plane(&desk);
+        let management = granted_management().await;
+        let tree = read(&plane, &management).await;
+        let send = id_of(&tree, " button Send");
+        let label = id_of(&tree, "Hello");
+        let journaled = plane.journal_entry_count().await;
+        let reply = serve(
+            &plane,
+            &management,
+            "computer.press_element",
+            json!({"element_ids": [send, label, send]}),
+        )
+        .await;
+        assert_eq!(reply["outcome"], "no_press_action", "{role}: {reply}");
+        assert_eq!(reply["stopped_at"], 2, "{reply}");
+        assert_eq!(reply["steps"].as_array().unwrap().len(), 2, "{reply}");
+        assert_eq!(reply["steps"][0]["outcome"], "completed");
+        assert_eq!(reply["steps"][1]["outcome"], "no_press_action");
+        assert_eq!(desk.state().presses, [10]);
+        assert!(desk.state().shown_menus.is_empty());
+        assert_eq!(plane.journal_entry_count().await - journaled, 2);
+        assert!(plane.result_schema_findings().is_empty());
+    }
+}
+
 fn popup_desk() -> Desk {
     let desk = desk().with_element(
         14,
