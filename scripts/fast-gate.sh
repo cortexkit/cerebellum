@@ -103,7 +103,7 @@ source "$repo_root/scripts/lib/fast-gate-plan.sh"
 # exits 0 instead of 2, so a locked screen does not turn this gate red; the
 # gate reads the reason back from the output and names it in the summary, so a
 # skip is never silent.
-desk_suites=("cerebellum-macos:preview_hide")
+desk_suites=("cerebellum-macos:preview_hide" "cerebellum-macos:cursor_motion" "cerebellum-macos:cursor_hide")
 desk_skip_reason() {
   sed -n 's/^test [^ ]* \.\.\. SKIPPED[^:]*: //p' | head -n 1
 }
@@ -130,6 +130,14 @@ if [ "$self_test" -eq 1 ]; then
     exit 1
   fi
   echo "SELF-TEST PASSED: a planted tests/it source path selects suite it"
+
+  cursor_plan="$(plan_for_files 'crates/cerebellum-macos/src/cursor_geometry.rs' "$metadata")"
+  if ! printf '%s\n' "$cursor_plan" | grep -Fxq 'T|cerebellum-macos|cursor_motion' || \
+     ! printf '%s\n' "$cursor_plan" | grep -Fxq 'T|cerebellum-macos|cursor_hide'; then
+    echo "SELF-TEST FAILED: a planted cursor source path did not select the cursor desk tests" >&2
+    exit 1
+  fi
+  echo "SELF-TEST PASSED: a planted cursor source path selects the cursor desk tests"
 
   flat_plan="$(plan_for_files 'crates/cerebellum/src/flat_tools.rs' "$metadata")"
   if ! printf '%s\n' "$flat_plan" | grep -Fxq 'P|cerebellum' || \

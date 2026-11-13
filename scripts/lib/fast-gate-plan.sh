@@ -141,6 +141,22 @@ if "hardware_observer_health" in cerebellum_tests and any(
 ):
     selected_suites.add(("cerebellum", "hardware_observer_health"))
 
+# The agent cursor's drawing, timing and window following live in these
+# cerebellum-macos sources, and only the two harness-less desk tests watch the
+# helper's real loop draw them: a geometry or schedule change can pass every
+# unit test while the badge stops following a window or never hides. So a change
+# to any of them selects both desk tests, not only a change to the test files.
+cursor_sources = (
+    "crates/cerebellum-macos/src/cursor_geometry.rs",
+    "crates/cerebellum-macos/src/cursor_overlay.rs",
+    "crates/cerebellum-macos/src/cursor_schedule.rs",
+    "crates/cerebellum-macos/src/window_follow.rs",
+)
+if any(path in cursor_sources or path.startswith("crates/cerebellum-macos/src/cursor_overlay/")
+       for path in files):
+    selected_suites.add(("cerebellum-macos", "cursor_motion"))
+    selected_suites.add(("cerebellum-macos", "cursor_hide"))
+
 # Each crate's consolidated `it` target holds the source scans over that crate's
 # shipped code. cerebellum's covers the single launch-secret reader, zero
 # runtime prints, declared launch-path outcome words, the one lease clock,
