@@ -1327,8 +1327,9 @@ mod tests {
     fn socket_helper_with_unexpected_mapped_identity_is_killed_without_release_or_request() {
         use std::io::Read;
         let _serial = serialize_launch_fixtures();
-        let (child, mut socket) = spawn_barred_socket(&relocated_test_executable(), &[])
-            .expect("spawn barred test image");
+        let executable = relocated_test_executable();
+        let (child, mut socket) =
+            spawn_barred_socket(&executable, &[]).expect("spawn barred test image");
         let generation = child.generation();
         assert_ne!(
             crate::code_satisfies_requirement(

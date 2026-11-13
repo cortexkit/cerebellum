@@ -30,6 +30,26 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST: &[u8] = br#"{"op":"status","scope":{}}"#;
 const FIRST: &[u8] = br#"{"kind":"hello","probe":"peer-identity"}"#;
 
+/// Completed measurements, rendered only by the manually invoked example.
+pub enum ProbeCheck {
+    Legitimate,
+    Unsigned,
+    SwappedHelper,
+    ExecAttack,
+    VersionWriteAttack,
+}
+
+/// Protocol roles stay silent; the example renders measurement results and
+/// the legitimate launcher's separate coordination marker.
+pub enum ProbeVerdict {
+    RoleComplete,
+    LegitimateFirstFrame,
+    Rig {
+        passed: Vec<ProbeCheck>,
+        result: Result<()>,
+    },
+}
+
 fn fail(message: impl Into<String>) -> Box<dyn Error> {
     io::Error::other(message.into()).into()
 }
@@ -192,7 +212,7 @@ fn channel_has_byte(channel: &mut UnixStream) -> Result<bool> {
 
 /// Main entry for every role. The OS account and console owner are checked
 /// before signatures, descriptor adoption, child creation, or scratch writes.
-pub fn run() -> Result<()> {
+pub fn run() -> Result<ProbeVerdict> {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let account = Command::new("/usr/bin/id")
         .arg("-un")
@@ -210,15 +230,16 @@ pub fn run() -> Result<()> {
     )?;
     let mode = args.get(1).and_then(|a| a.to_str()).unwrap_or("");
     match mode {
-        "--helper" => helper(),
+        "--helper" => helper().map(|()| ProbeVerdict::RoleComplete),
         "--exec-attack" | "--write-attack" | "--unsigned-control" => {
-            unsigned_worker(mode, &args[2..])
+            unsigned_worker(mode, &args[2..]).map(|()| ProbeVerdict::RoleComplete)
         }
-        "--signed-wait" | "--version" => signed_wait(mode, &args[2..]),
+        "--signed-wait" | "--version" => {
+            signed_wait(mode, &args[2..]).map(|()| ProbeVerdict::RoleComplete)
+        }
         "--legitimate" => {
             legitimate(&own_team(SIGNED)?)?;
-            std::io::stdout().write_all(b"legitimate-first-frame\n")?;
-            Ok(())
+            Ok(ProbeVerdict::LegitimateFirstFrame)
         }
         "--run" => rig(),
         _ => Err(fail(
@@ -485,51 +506,58 @@ fn swapped_helper(team: &str) -> Result<()> {
     Ok(())
 }
 
-fn rig() -> Result<()> {
-    // No signed accomplice may hold a channel copy: otherwise an attack pass
-    // could be explained by that additional authorized holder.
-    require_unsigned()?;
-    let signed_path = sibling(SIGNED)?;
-    let identity = bundle_code_signing_identity(&signed_path, TIMEOUT)
-        .map_err(|e| fail(format!("signed stand-in unavailable: {e:?}")))?;
-    let team = identity
-        .team_id
-        .filter(|_| identity.signed && !identity.ad_hoc)
-        .ok_or_else(|| fail("the stand-in requires a team certificate signature"))?;
-    if bundle_code_satisfies_requirement(&signed_path, &requirement(SIGNED, &team)?, TIMEOUT)
-        .map_err(|e| fail(format!("{e:?}")))?
-        != RequirementCheck::Satisfied
-    {
-        return Err(fail(
-            "stand-in does not have the expected signing identifier",
-        ));
-    }
-    let control = command(&signed_path, "--legitimate").output()?;
-    if !control.status.success() || control.stdout != b"legitimate-first-frame\n" {
-        return Err(fail("FAIL control-legitimate first-frame=missing"));
-    }
-    println!("PASS control-legitimate first-frame=received");
-    if attack("--unsigned-control", &team)? {
-        return Err(fail("FAIL control-unsigned helper-byte=yes"));
-    }
-    println!("PASS control-unsigned helper-byte=no wait=10s");
-    swapped_helper(&team)?;
-    println!("PASS control-swapped-helper released=no request-sent=no");
-    for (mode, label) in [
-        ("--exec-attack", "attack-exec"),
-        ("--write-attack", "attack-version-write"),
-    ] {
-        if attack(mode, &team)? {
-            // A byte, including any part of hello, ends the experiment. There
-            // is no alternative identity check or fallback launch path.
-            return Err(fail(format!(
-                "FAIL {label} helper-byte=yes; candidate rejected; no fallback"
-            )));
+fn rig() -> Result<ProbeVerdict> {
+    let mut passed = Vec::new();
+    let result = (|| -> Result<()> {
+        // No signed accomplice may hold a channel copy: otherwise an attack pass
+        // could be explained by that additional authorized holder.
+        require_unsigned()?;
+        let signed_path = sibling(SIGNED)?;
+        let identity = bundle_code_signing_identity(&signed_path, TIMEOUT)
+            .map_err(|e| fail(format!("signed stand-in unavailable: {e:?}")))?;
+        let team = identity
+            .team_id
+            .filter(|_| identity.signed && !identity.ad_hoc)
+            .ok_or_else(|| fail("the stand-in requires a team certificate signature"))?;
+        if bundle_code_satisfies_requirement(&signed_path, &requirement(SIGNED, &team)?, TIMEOUT)
+            .map_err(|e| fail(format!("{e:?}")))?
+            != RequirementCheck::Satisfied
+        {
+            return Err(fail(
+                "stand-in does not have the expected signing identifier",
+            ));
         }
-        println!("PASS {label} helper-byte=no wait=10s signed-alive=yes");
-    }
-    println!("PASS peer-identity candidate: both attacks silent; both controls passed");
-    Ok(())
+        let control = command(&signed_path, "--legitimate").output()?;
+        if !control.status.success() || control.stdout != b"legitimate-first-frame\n" {
+            return Err(fail("FAIL control-legitimate first-frame=missing"));
+        }
+        passed.push(ProbeCheck::Legitimate);
+        if attack("--unsigned-control", &team)? {
+            return Err(fail("FAIL control-unsigned helper-byte=yes"));
+        }
+        passed.push(ProbeCheck::Unsigned);
+        swapped_helper(&team)?;
+        passed.push(ProbeCheck::SwappedHelper);
+        for (mode, label, check) in [
+            ("--exec-attack", "attack-exec", ProbeCheck::ExecAttack),
+            (
+                "--write-attack",
+                "attack-version-write",
+                ProbeCheck::VersionWriteAttack,
+            ),
+        ] {
+            if attack(mode, &team)? {
+                // A byte, including any part of hello, ends the experiment. There
+                // is no alternative identity check or fallback launch path.
+                return Err(fail(format!(
+                    "FAIL {label} helper-byte=yes; candidate rejected; no fallback"
+                )));
+            }
+            passed.push(check);
+        }
+        Ok(())
+    })();
+    Ok(ProbeVerdict::Rig { passed, result })
 }
 
 #[cfg(test)]
