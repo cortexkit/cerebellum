@@ -37,13 +37,13 @@ pub(super) struct SourceRecord {
 }
 
 pub(super) struct ReadRequest {
-    _reservation: ReservedRead,
-    token: Token,
-    operation: ReadOperation,
-    gate: Arc<TerminalArbiter>,
+    pub(super) _reservation: ReservedRead,
+    pub(super) token: Token,
+    pub(super) operation: ReadOperation,
+    pub(super) gate: Arc<TerminalArbiter>,
 }
 
-enum ReadOperation {
+pub(super) enum ReadOperation {
     Setup,
     Choices {
         key: String,
@@ -120,6 +120,9 @@ impl AbilityPlane {
         lease: &mut SourceLease,
         request: ReadRequest,
     ) -> Result<Option<Value>, Refusal> {
+        if let Some(helpers) = &self.helpers {
+            return super::helper::serve(helpers, lease, request).await;
+        }
         match lease.request(self.source.clone(), request).await {
             SourceOutcome::Completed(reply) => reply,
             SourceOutcome::Discarded(_) | SourceOutcome::Stopped => Ok(None),

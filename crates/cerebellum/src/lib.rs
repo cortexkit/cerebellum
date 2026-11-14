@@ -14,6 +14,7 @@
 #![recursion_limit = "256"]
 
 mod ability;
+pub mod ability_helper;
 pub mod ability_source;
 pub mod agent_grants;
 pub mod authorization;
