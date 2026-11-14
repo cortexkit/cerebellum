@@ -724,16 +724,38 @@ fn zoomed_element_summary<'a>(state_text: &'a str, element_id: &str) -> Option<&
     })
 }
 
+/// `element=no_state_text` when the reply carries no state at all: computer.keys
+/// reads the state only after a chord that posted, so a refused chord has none,
+/// and that is not the zoomed element being missing from a state that was read.
 fn zoomed_read_line(attempt: usize, reply: &Value, element_id: Option<&str>) -> String {
-    let summary = element_id.and_then(|id| {
-        zoomed_element_summary(reply["state_text"].as_str().unwrap_or_default(), id)
-    });
+    let element = match reply["state_text"].as_str() {
+        None => "no_state_text",
+        Some(state_text) => element_id
+            .and_then(|id| zoomed_element_summary(state_text, id))
+            .unwrap_or("absent"),
+    };
     format!(
-        "RECORD needs-front attempt {attempt}: zoomed read state_report={} focused_element_id={} element={}",
+        "RECORD needs-front attempt {attempt}: zoomed read state_report={} focused_element_id={} element={element}",
         reply["state_report"],
         reply["focused_element_id"],
-        summary.unwrap_or("absent")
     )
+}
+
+/// The ScreenCaptureKit window-list errors noted while one attempt ran, one
+/// line each. The fronting bracket reads the target's listing before it fronts
+/// and a failed read stops the chord with only `dispatch_failed` in the reply,
+/// so these lines are what tells an unreadable list from a target the list
+/// left out. No line at all means no list request failed.
+fn window_list_error_lines(attempt: usize, errors: &[String]) -> Vec<String> {
+    errors
+        .iter()
+        .map(|error| {
+            format!(
+                "RECORD needs-front attempt {attempt}: window-list error during the chord: {}",
+                error.replace(['\r', '\n'], " ")
+            )
+        })
+        .collect()
 }
 
 /// How long the target had been confirmed frontmost when the chord's first
@@ -2538,6 +2560,8 @@ mod desk {
             if let Some(id) = &text_area_id {
                 arguments["zoom"] = json!(id);
             }
+            // Errors noted before this chord belong to earlier calls.
+            let _ = cerebellum_macos::take_window_list_errors_for_probe();
             sampler.needs_front.store(true, Ordering::SeqCst);
             let chord = serve("computer.keys", arguments).await;
             sampler.needs_front.store(false, Ordering::SeqCst);
@@ -2566,6 +2590,12 @@ mod desk {
                     .map_err(|reason| redact_typed_text(&reason, &typed)),
             );
             tokio::time::sleep(FRONT_CLEANUP_SPACING).await;
+            for line in window_list_error_lines(
+                attempt,
+                &cerebellum_macos::take_window_list_errors_for_probe(),
+            ) {
+                println!("{line}");
+            }
             let selection_changes = sys::take_selection_changes();
             for (pid, latency) in cerebellum::desk_probe::take_fronting_landings() {
                 println!("RECORD needs-front attempt {attempt}: pid {pid} pending activation landed {latency} ms after request");
@@ -3307,6 +3337,20 @@ mod tests {
         // A longer id that merely ends with the zoomed one is not it.
         assert_eq!(zoomed_element_summary("xiq3 button", "iq3"), None);
         assert!(zoomed_read_line(5, &reply, None).ends_with("element=absent"));
+        // A refused chord's reply carries no state, which is not the same as
+        // the zoomed element missing from a state that was read.
+        assert_eq!(
+            zoomed_read_line(
+                7,
+                &json!({"outcome": "fronting_bound_exceeded", "effect_status": "not_dispatched"}),
+                Some("iq3")
+            ),
+            "RECORD needs-front attempt 7: zoomed read state_report=null focused_element_id=null element=no_state_text"
+        );
+        assert!(
+            zoomed_read_line(5, &json!({"state_text": "other: iq9 button"}), Some("iq3"))
+                .ends_with("element=absent")
+        );
         assert_eq!(
             redact_typed_text(&format!("reply: {reply}"), typed)
                 .matches("<typed text>")
@@ -3314,6 +3358,21 @@ mod tests {
             1
         );
         assert!(!redact_typed_text(&format!("reply: {reply}"), typed).contains(typed));
+    }
+
+    #[test]
+    fn window_list_errors_during_a_chord_are_printed_one_per_line() {
+        assert!(window_list_error_lines(7, &[]).is_empty());
+        assert_eq!(
+            window_list_error_lines(
+                7,
+                &["the window list did not arrive within 1s".into(), "two\nlines".into()]
+            ),
+            [
+                "RECORD needs-front attempt 7: window-list error during the chord: the window list did not arrive within 1s",
+                "RECORD needs-front attempt 7: window-list error during the chord: two lines",
+            ]
+        );
     }
 
     #[test]
