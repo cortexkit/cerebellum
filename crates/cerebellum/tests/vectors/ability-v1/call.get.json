@@ -1,0 +1,50 @@
+{
+  "method": "ability.call",
+  "reply": {
+    "item": {
+      "all_day": null,
+      "calendar": "bound",
+      "end_date": null,
+      "end_ms": 15,
+      "id": "event-a",
+      "location": null,
+      "notes": null,
+      "recurring": null,
+      "start_date": null,
+      "start_ms": 10,
+      "title": "Fixture event-a",
+      "truncated": []
+    }
+  },
+  "request": {
+    "method": "ability.call",
+    "params": {
+      "args": {
+        "id": "event-a"
+      },
+      "key": "family_calendar",
+      "op": "events.get",
+      "scope": {
+        "calendar": [
+          "bound"
+        ]
+      },
+      "token": "cap/calendar.read@1"
+    }
+  },
+  "route": {
+    "acts_as_agent": false,
+    "call_mode": "classic",
+    "codemode_head": null,
+    "flow_id": "flow-test",
+    "principal": "reserved:basal",
+    "stamp": {
+      "agent_id": null,
+      "flow_id": "flow-test",
+      "kind": "ephemeral",
+      "run_id": null
+    }
+  },
+  "tag": "ability-v1",
+  "time_zone": "America/New_York"
+}

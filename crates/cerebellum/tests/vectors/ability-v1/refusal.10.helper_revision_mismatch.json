@@ -1,0 +1,23 @@
+{
+  "error": {
+    "code": "helper_revision_mismatch",
+    "message": "the ability token is unavailable"
+  },
+  "method": "ability.scope_choices",
+  "request": {
+    "method": "ability.scope_choices",
+    "params": {
+      "key": "calendar",
+      "token": "cap/calendar.read@1"
+    }
+  },
+  "route": {
+    "acts_as_agent": false,
+    "call_mode": "classic",
+    "codemode_head": null,
+    "flow_id": null,
+    "principal": "reserved:prefrontal-core",
+    "stamp": null
+  },
+  "tag": "ability-v1"
+}

@@ -1,0 +1,33 @@
+{
+  "error": {
+    "code": "principal_denied",
+    "message": "this route may not call this ability operation"
+  },
+  "method": "ability.call",
+  "request": {
+    "method": "ability.call",
+    "params": {
+      "args": {
+        "from_ms": 0,
+        "to_ms": 100
+      },
+      "key": "family_calendar",
+      "op": "events.list",
+      "scope": {
+        "calendar": [
+          "bound"
+        ]
+      },
+      "token": "cap/calendar.read@1"
+    }
+  },
+  "route": {
+    "acts_as_agent": false,
+    "call_mode": "classic",
+    "codemode_head": null,
+    "flow_id": null,
+    "principal": "reserved:prefrontal-core",
+    "stamp": null
+  },
+  "tag": "ability-v1"
+}
