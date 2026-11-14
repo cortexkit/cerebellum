@@ -502,6 +502,9 @@ struct MacBracketHost {
     target: ProcessEventTarget,
     units: Vec<Option<Vec<SyntheticStep<cerebellum_macos::OwnedCgEvent>>>>,
     transport: MacOsPerProcessEventTransport,
+    /// The target's window-server listing, read before the front and reused
+    /// by the keystroke posts made while the target is in front.
+    visibility: VisibilityMemo,
     pointer: Option<MacPointerUnit>,
 }
 
@@ -539,6 +542,38 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
 
     fn our_pid(&self) -> i64 {
         self.heartbeat.our_pid
+    }
+
+    // Keystroke units share the process-wide post costs. A pointer gesture
+    // paces its own events, so its cost says nothing about a keystroke's and
+    // is neither reserved nor kept.
+    fn measured_unit_post_cost_ms(&mut self) -> Option<u64> {
+        if self.pointer.is_some() {
+            return None;
+        }
+        crate::dispatch::measured_unit_post_cost_ms(Instant::now())
+    }
+
+    fn record_unit_post_cost_ms(&mut self, milliseconds: u64) {
+        if self.pointer.is_none() {
+            crate::dispatch::record_unit_post_cost_ms(milliseconds, Instant::now());
+        }
+    }
+
+    fn before_front(&mut self) -> Result<(), SequencePostFailure> {
+        // Only keystroke units post through `post_unit` with this memo. A
+        // pointer gesture routes its own posts, and a fronted read posts
+        // nothing, so neither reads the listing here.
+        if self.pointer.is_some() || self.units.is_empty() {
+            return Ok(());
+        }
+        check_listed_before_front(self.target, &mut self.transport, &mut self.visibility).map_err(
+            |refusal| SequencePostFailure {
+                posts_returned: 0,
+                refusal,
+                held_state: HeldStateDisposition::NoneHeld,
+            },
+        )
     }
 
     fn create_tap(&mut self) -> Option<Self::Tap> {
@@ -585,7 +620,13 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
             .get_mut(index)
             .and_then(Option::take)
             .unwrap_or_default();
-        let report = post_event_sequence(self.target, steps, &mut self.transport, &|| false)?;
+        let report = post_event_sequence_with_visibility(
+            self.target,
+            steps,
+            &mut self.transport,
+            &mut self.visibility,
+            &|| false,
+        )?;
         Ok(crate::dispatch::UnitPosted {
             posts_returned: report.posts_returned,
             generation_verifications: report.generation_verifications,
@@ -1951,6 +1992,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
                     &request.synthetic.action,
                 )?)],
                 transport: MacOsPerProcessEventTransport::new(WINDOW_LIST_READ_TIMEOUT),
+                visibility: VisibilityMemo::new(VISIBLE_READING_MAX_AGE),
                 pointer: Some(MacPointerUnit {
                     guard,
                     interval_ms: request.minimum_inter_post_interval_ms,
@@ -2084,6 +2126,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
             },
             units,
             transport: MacOsPerProcessEventTransport::for_keyboard(WINDOW_LIST_READ_TIMEOUT),
+            visibility: VisibilityMemo::new(VISIBLE_READING_MAX_AGE),
             pointer: None,
         };
         let mut user_idle = self
@@ -2153,6 +2196,7 @@ impl PlatformDriver for MacOs26PlatformDriver {
             },
             units: Vec::new(),
             transport: MacOsPerProcessEventTransport::for_keyboard(WINDOW_LIST_READ_TIMEOUT),
+            visibility: VisibilityMemo::new(VISIBLE_READING_MAX_AGE),
             pointer: None,
         };
         let mut user_idle = self.user_idle.lock().unwrap_or_else(|p| p.into_inner());

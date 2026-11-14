@@ -331,13 +331,28 @@ pub(crate) fn bracket_fronting(
 }
 
 /// A dispatch refusal on the wire, with a remedy for the fronting ones.
-pub(crate) fn dispatch_refusal_reply(refusal: &DispatchError) -> Value {
+/// `bracket` is the fronting bracket's report when one ran: a bound refusal
+/// caused only by recent slow posts gets a remedy that says to retry later.
+pub(crate) fn dispatch_refusal_reply(
+    refusal: &DispatchError,
+    bracket: Option<&BracketReport>,
+) -> Value {
     let mut reply = super::synthetic_dispatch_refusal(refusal);
     let remedy = match refusal {
         DispatchError::FrontingFailed => Some(
             "the application did not come to the front in time, so nothing more was posted; \
              use write_text on a settable element, or retry",
         ),
+        DispatchError::FrontingBoundExceeded
+            if bracket.is_some_and(|bracket| bracket.waiting_out_slow_post) =>
+        {
+            Some(
+                "recent keystroke sends took too long to fit while the application is in front, \
+                 so this one was not started and nothing was posted. That wait clears within a \
+                 minute of the last slow send: retry shortly, or use write_text on a settable \
+                 element",
+            )
+        }
         DispatchError::FrontingBoundExceeded => Some(
             "the application would have stayed in front longer than allowed, so posting stopped; \
              posts_returned says how many keystrokes were already sent. Read the field before \
@@ -536,12 +551,45 @@ mod tests {
             slowest_restore_ms: 50,
             restore: RestoreStatus::Restored,
             stop: None,
+            waiting_out_slow_post: false,
         };
         assert_eq!(
             bracket_fronting(&report(104), 100),
             (false, Some("fronting_bound_exceeded"))
         );
         assert_eq!(bracket_fronting(&report(90), 100), (true, None));
+    }
+
+    /// A bound refusal that only the reserve for recent slow posts caused
+    /// tells the agent to retry shortly; any other bound refusal keeps the
+    /// remedy about shorter text.
+    #[test]
+    fn a_refusal_waiting_out_slow_posts_says_to_retry_shortly() {
+        let report = |waiting_out_slow_post| BracketReport {
+            previous_frontmost: Some(100),
+            chunks: 1,
+            units_posted: 0,
+            posts_returned: 0,
+            generation_verifications: 0,
+            longest_fronted_interval_ms: 40,
+            slowest_unit_ms: 0,
+            slowest_restore_ms: 20,
+            restore: RestoreStatus::Restored,
+            stop: Some(BracketStop::BoundExceeded),
+            waiting_out_slow_post,
+        };
+        let remedy = |bracket: Option<&BracketReport>| {
+            dispatch_refusal_reply(&DispatchError::FrontingBoundExceeded, bracket)["remedy"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let waiting = remedy(Some(&report(true)));
+        assert!(waiting.contains("retry shortly"), "{waiting}");
+        assert!(waiting.contains("nothing was posted"), "{waiting}");
+        for other in [remedy(Some(&report(false))), remedy(None)] {
+            assert!(other.contains("send shorter text"), "{other}");
+        }
     }
 
     #[test]

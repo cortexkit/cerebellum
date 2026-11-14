@@ -369,6 +369,7 @@ mod tests {
             slowest_restore_ms: 0,
             restore,
             stop: None,
+            waiting_out_slow_post: false,
         }
     }
 

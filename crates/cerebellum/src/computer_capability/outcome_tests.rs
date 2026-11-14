@@ -230,7 +230,7 @@ impl crate::management::TargetResolver for FixedResolution {
 fn replies(capability: ComputerCapability) -> Vec<Value> {
     let mut replies: Vec<_> = dispatch_refusals()
         .iter()
-        .map(keystrokes::dispatch_refusal_reply)
+        .map(|refusal| keystrokes::dispatch_refusal_reply(refusal, None))
         .collect();
     for refusal in [
         ConsentRefusal::Pending {

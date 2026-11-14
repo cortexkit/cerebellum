@@ -6,6 +6,9 @@ use super::*;
 use crate::dispatch::seize::{HeartbeatMarker, IdleGateRefusal, OBSERVED_DISPATCH_IDLE_MS};
 use crate::platform::{HeldStateDisposition, ProcessEventRefusal};
 
+mod listing;
+mod unit_cost;
+
 const TARGET: u32 = 200;
 const PREVIOUS: u32 = 100;
 const THIRD: u32 = 300;
@@ -68,6 +71,15 @@ struct FakeDesk {
     landings_at: Vec<u64>,
     /// Hardware input arrives at this instant.
     input_at: Option<u64>,
+    /// A window-server listing read through the production routing, when
+    /// set; units are then posted through it too.
+    listing: Option<listing::Listing>,
+    /// Unit post costs kept as a keystroke host keeps them, when set.
+    unit_costs: Option<latency::UnitPostCosts>,
+    /// The instant the desk clock's zero stands for, plus an offset, so a
+    /// sequence of desks can replay calls seconds apart on fixed instants.
+    clock_origin: std::time::Instant,
+    clock_offset_ms: u64,
 }
 
 impl FakeDesk {
@@ -108,6 +120,10 @@ impl FakeDesk {
             fallback_requests: Vec::new(),
             landings_at: Vec::new(),
             input_at: None,
+            listing: None,
+            unit_costs: None,
+            clock_origin: std::time::Instant::now(),
+            clock_offset_ms: 0,
         }
     }
 
@@ -127,6 +143,11 @@ impl FakeDesk {
         if self.input_at.is_some_and(|at| at <= now) {
             self.hardware_input_ms = self.input_at.take();
         }
+    }
+
+    /// The desk clock's present as an instant.
+    fn instant(&self) -> std::time::Instant {
+        self.clock_origin + std::time::Duration::from_millis(self.clock_offset_ms + self.now)
     }
 
     fn set_frontmost(&mut self, pid: u32) {
@@ -209,6 +230,19 @@ impl FrontingBracketHost for FakeDesk {
     fn our_pid(&self) -> i64 {
         OUR_PID
     }
+    fn before_front(&mut self) -> Result<(), SequencePostFailure> {
+        listing::before_front(self)
+    }
+    fn measured_unit_post_cost_ms(&mut self) -> Option<u64> {
+        let now = self.instant();
+        self.unit_costs.as_ref()?.maximum(now)
+    }
+    fn record_unit_post_cost_ms(&mut self, milliseconds: u64) {
+        let now = self.instant();
+        if let Some(costs) = &mut self.unit_costs {
+            costs.record(milliseconds, now);
+        }
+    }
     fn create_tap(&mut self) -> Option<()> {
         Some(())
     }
@@ -253,6 +287,7 @@ impl FrontingBracketHost for FakeDesk {
     fn post_unit(&mut self, index: usize) -> Result<UnitPosted, SequencePostFailure> {
         self.frontmost_at_post.push(self.frontmost);
         self.posted.push(index);
+        let posted = listing::post_chord(self)?;
         self.advance(self.unit_ms);
         if let Some(cancel) = &self.cancel_after_first_unit {
             cancel.set(true);
@@ -265,10 +300,7 @@ impl FrontingBracketHost for FakeDesk {
                 }
             }
         }
-        Ok(UnitPosted {
-            posts_returned: 2,
-            generation_verifications: 4,
-        })
+        Ok(posted)
     }
     fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
         self.snapshot_reads += 1;
