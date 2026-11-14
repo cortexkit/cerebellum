@@ -19,6 +19,7 @@ use crate::{
 };
 
 mod binding;
+mod helper;
 mod journal;
 mod serving;
 use binding::{BindingReader, UnavailableBindingReader};
@@ -161,13 +162,18 @@ pub(crate) struct AbilityPlane {
     binding: Arc<dyn BindingReader>,
     pending: Vec<(UnitKind, tokio::sync::Mutex<Option<u64>>)>,
     setup_pending: tokio::sync::Mutex<Option<u64>>,
+    helpers: Option<helper::Helpers>,
     #[cfg(test)]
     after_reserve: Option<Arc<dyn Fn(usize) + Send + Sync>>,
 }
 
 impl Default for AbilityPlane {
     fn default() -> Self {
-        Self::new(platform(), Arc::new(UnavailableSource(platform())), true)
+        let mut plane = Self::new(platform(), Arc::new(UnavailableSource(platform())), true);
+        if plane.platform == Platform::MacOs {
+            plane.helpers = Some(helper::Helpers::unverified());
+        }
+        plane
     }
 }
 
@@ -186,6 +192,7 @@ impl AbilityPlane {
                 .map(|&kind| (kind, tokio::sync::Mutex::new(None)))
                 .collect(),
             setup_pending: tokio::sync::Mutex::new(None),
+            helpers: None,
             #[cfg(test)]
             after_reserve: None,
         }
@@ -202,7 +209,17 @@ impl AbilityPlane {
             } else {
                 unit.kind().tokens()
             };
-            checks.spawn(async move { unit.status_for_tokens(source, gate, tokens).await });
+            let helper = self
+                .helpers
+                .as_ref()
+                .map(|helpers| helpers.for_unit(unit.kind()));
+            checks.spawn(async move {
+                if let Some(helper) = helper {
+                    helper::describe(&unit, &helper, gate, tokens).await
+                } else {
+                    unit.status_for_tokens(source, gate, tokens).await
+                }
+            });
         }
         let mut statuses = Vec::new();
         while let Some(result) = checks.join_next().await {
