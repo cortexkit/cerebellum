@@ -13,6 +13,7 @@
 // evaluate_obligation" until the cache was cleaned.
 #![recursion_limit = "256"]
 
+mod ability;
 pub mod ability_source;
 pub mod agent_grants;
 pub mod authorization;
@@ -998,6 +999,7 @@ pub fn dispatchable_management_operation(name: &str) -> bool {
     name == private_content::QUERY
         || name == image_handles::RESOLVE
         || permissions::is_operation(name)
+        || ability::is_operation(name)
         || matches!(
             name,
             management::OPEN_TARGET
@@ -4491,7 +4493,14 @@ async fn handle_management_request_observed(
     };
     if let Some(field) = object
         .keys()
-        .filter(|field| !matches!(field.as_str(), "method" | "params"))
+        .filter(|field| {
+            !matches!(field.as_str(), "method" | "params")
+                && !(field.as_str() == "origin"
+                    && matches!(
+                        object.get("method").and_then(Value::as_str),
+                        Some(ability::SCOPE_CHOICES | ability::SETUP)
+                    ))
+        })
         .min()
     {
         return send_invalid_request_response(
@@ -4532,6 +4541,9 @@ async fn handle_management_request_observed(
     }
     if permissions::is_operation(method) {
         return permissions::handle(&frame, writer, facts, planes, method, object).await;
+    }
+    if ability::is_operation(method) {
+        return ability::handle(&frame, writer, facts, planes, method, object).await;
     }
     if method == private_content::QUERY {
         return private_content::handle(&frame, writer, facts, planes, object).await;

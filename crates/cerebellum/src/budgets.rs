@@ -881,7 +881,51 @@ budget!(
     management::SESSION_TURN_ENDED,
     [("lookup", GRANT_LOOKUP_MS, 1)]
 );
-pub const MANAGEMENT_ACTIONS: [ActionBudget; 18] = [
+budget!(
+    MANAGEMENT_ABILITY_DESCRIBE,
+    crate::ability::DESCRIBE,
+    [
+        ("source", 10_000, 1),
+        ("teardown", EXIT_OBSERVATION_MS, 1),
+        ("slack", BOUNDARY_SLACK_MS, 1)
+    ]
+);
+budget!(
+    MANAGEMENT_ABILITY_SCOPE_CHOICES,
+    crate::ability::SCOPE_CHOICES,
+    [
+        ("source", 10_000, 1),
+        ("teardown", EXIT_OBSERVATION_MS, 1),
+        ("slack", BOUNDARY_SLACK_MS, 1),
+        ("journal", STORE_MS, 3)
+    ]
+);
+budget!(
+    MANAGEMENT_ABILITY_SETUP,
+    crate::ability::SETUP,
+    [
+        ("source", 10_000, 1),
+        ("teardown", EXIT_OBSERVATION_MS, 1),
+        ("slack", BOUNDARY_SLACK_MS, 1),
+        ("journal", STORE_MS, 3)
+    ]
+);
+budget!(
+    MANAGEMENT_ABILITY_CALL,
+    crate::ability::CALL,
+    [
+        ("source", 10_000, 1),
+        ("teardown", EXIT_OBSERVATION_MS, 1),
+        ("slack", BOUNDARY_SLACK_MS, 1),
+        ("journal", STORE_MS, 3),
+        ("binding", 10_000, 1)
+    ]
+);
+pub const MANAGEMENT_ACTIONS: [ActionBudget; 22] = [
+    MANAGEMENT_ABILITY_DESCRIBE,
+    MANAGEMENT_ABILITY_SCOPE_CHOICES,
+    MANAGEMENT_ABILITY_SETUP,
+    MANAGEMENT_ABILITY_CALL,
     MANAGEMENT_WOULD_ASK,
     MANAGEMENT_OPEN_TARGET,
     MANAGEMENT_LIST_APP_GRANTS,
@@ -1052,12 +1096,17 @@ const fn management_limits(
     }
 }
 
-// Only browser.* Management methods wait behind earlier browser calls in
-// the same conversation. Park allowances cover waiting for the person to
+// Browser methods wait behind earlier browser calls in the conversation;
+// abilities wait for their shared platform runner or helper instead.
+// Park allowances cover waiting for the person to
 // answer consent or complete sign-in. OPEN_GRANT, REBIND_PROFILE_ROOT and
 // CLEAR_LAUNCH_RECOVERY ask on spawned tasks after the Management reply,
 // so those replies need no park allowance.
-pub const MANAGEMENT_LIMITS: [ManagementLimits; 18] = [
+pub const MANAGEMENT_LIMITS: [ManagementLimits; 22] = [
+    management_limits(MANAGEMENT_ABILITY_DESCRIBE, 10_000, 0),
+    management_limits(MANAGEMENT_ABILITY_SCOPE_CHOICES, 10_000, 0),
+    management_limits(MANAGEMENT_ABILITY_SETUP, 10_000, CONSENT_PARK_LIMIT_MS),
+    management_limits(MANAGEMENT_ABILITY_CALL, 10_000, 0),
     management_limits(MANAGEMENT_WOULD_ASK, 0, 0),
     management_limits(MANAGEMENT_OPEN_TARGET, 0, CONSENT_PARK_LIMIT_MS),
     management_limits(MANAGEMENT_LIST_APP_GRANTS, 0, 0),
@@ -1436,6 +1485,22 @@ mod tests {
             (MANAGEMENT_PERMISSIONS_REVOKE, STORE_MS),
             (MANAGEMENT_PRIVATE_CONTENT_QUERY, GRANT_LOOKUP_MS),
             (MANAGEMENT_SESSION_TURN_ENDED, GRANT_LOOKUP_MS),
+            (
+                MANAGEMENT_ABILITY_DESCRIBE,
+                10_000 + EXIT_OBSERVATION_MS + BOUNDARY_SLACK_MS,
+            ),
+            (
+                MANAGEMENT_ABILITY_SCOPE_CHOICES,
+                10_000 + EXIT_OBSERVATION_MS + BOUNDARY_SLACK_MS + 3 * STORE_MS,
+            ),
+            (
+                MANAGEMENT_ABILITY_SETUP,
+                10_000 + EXIT_OBSERVATION_MS + BOUNDARY_SLACK_MS + 3 * STORE_MS,
+            ),
+            (
+                MANAGEMENT_ABILITY_CALL,
+                20_000 + EXIT_OBSERVATION_MS + BOUNDARY_SLACK_MS + 3 * STORE_MS,
+            ),
         ];
         assert_eq!(expected.len(), MANAGEMENT_ACTIONS.len());
         for (budget, total) in expected {
@@ -1612,6 +1677,10 @@ mod tests {
             (crate::permissions::REVOKE, 0, 0),
             (crate::private_content::QUERY, 0, 0),
             (management::SESSION_TURN_ENDED, 0, 0),
+            (crate::ability::DESCRIBE, 10_000, 0),
+            (crate::ability::SCOPE_CHOICES, 10_000, 0),
+            (crate::ability::SETUP, 10_000, CONSENT_PARK_LIMIT_MS),
+            (crate::ability::CALL, 10_000, 0),
         ];
         assert_eq!(expected.len(), management::OPERATIONS.len());
         assert_eq!(expected.len(), MANAGEMENT_LIMITS.len());
