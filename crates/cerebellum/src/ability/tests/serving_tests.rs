@@ -12,6 +12,8 @@ mod helper_tests;
 mod journal_tests;
 #[path = "outlook_guard_tests.rs"]
 mod outlook_guard_tests;
+#[path = "outlook_source_tests.rs"]
+mod outlook_source_tests;
 
 struct Bound;
 impl BindingReader for Bound {

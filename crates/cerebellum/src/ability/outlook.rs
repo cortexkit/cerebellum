@@ -1,5 +1,12 @@
 //! The guard runs before forwarding any operation to an Outlook member source.
 
+// The native factory is installed by the Windows COM adapter. Until then the
+// host-neutral seam is exercised by fakes, without opening an operator's profile.
+#![cfg_attr(not(test), allow(dead_code))]
+
+pub(super) mod source;
+pub(super) mod zones;
+
 use super::{serving, Availability, Refusal, StatusSource};
 use crate::outlook_guard::{GuardEnvironment, Guarded};
 use cerebellum_ability::{BoundScope, Token, ValidatedArgs};
