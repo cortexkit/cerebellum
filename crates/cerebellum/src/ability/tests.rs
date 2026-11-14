@@ -11,6 +11,7 @@ use subc_protocol::{
 };
 
 mod binding_tests;
+mod serving_tests;
 mod validation_tests;
 
 fn principal(name: &str) -> Option<Principal> {
@@ -623,7 +624,14 @@ async fn describe_invalid_params_use_fixed_error_and_principal_precedes_shape() 
 
 async fn assert_pending(method: &str, route: AcceptedBindFacts, code: &str) {
     let source = Arc::new(FakeStatus::default());
-    let planes = fixture(source.clone(), platform());
+    let planes = fixture(
+        source.clone(),
+        if method == SETUP {
+            Platform::MacOs
+        } else {
+            platform()
+        },
+    );
     let before = planes.browser.journal_export_for_test().await;
     let gate = Arc::new(TerminalArbiter::new(request(json!({"method": method}))));
     let holder = planes
@@ -664,7 +672,7 @@ async fn scope_choices_pending_adapter_refuses_without_touching_source_unit() {
     .await;
 }
 #[tokio::test(start_paused = true)]
-async fn setup_pending_adapter_refuses_without_touching_source_unit() {
+async fn mac_setup_pending_adapter_refuses_without_touching_source_unit() {
     assert_pending(SETUP, facts("prefrontal-core"), "ability_source_failed").await;
 }
 #[tokio::test(start_paused = true)]
