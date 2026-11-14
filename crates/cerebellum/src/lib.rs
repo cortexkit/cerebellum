@@ -13761,6 +13761,27 @@ mod tests {
             assert_eq!(release["scope"], "partial_runtime_advertisement");
             release["scope"] = json!("all_frozen_rows");
         }
+        // The personal-data abilities added five mapped capability tokens and
+        // four management operations. Remove exactly those, so the historical
+        // digests below still pin everything else.
+        let ability_provides: Vec<String> = ability::manifest_capabilities().collect();
+        let provides = legacy["capabilities"]["provides"].as_array_mut().unwrap();
+        let before = provides.len();
+        provides.retain(|name| !ability_provides.iter().any(|token| name == token.as_str()));
+        assert_eq!(before - provides.len(), ability_provides.len());
+        let mut removed_operations = 0;
+        for role in legacy["provides"].as_array_mut().unwrap() {
+            if let Some(operations) = role.get_mut("operations").and_then(Value::as_array_mut) {
+                let before = operations.len();
+                operations.retain(|operation| {
+                    !operation["name"]
+                        .as_str()
+                        .is_some_and(ability::is_operation)
+                });
+                removed_operations += before - operations.len();
+            }
+        }
+        assert_eq!(removed_operations, 4);
 
         // Keep the historical view and no-project subtraction guards. The
         // normalization above must not hide any unrelated manifest change.
@@ -13796,13 +13817,13 @@ mod tests {
         // Binding CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION withholds button-down gestures until recovery is
         // measured, while advertising the fronted move/scroll definition.
         #[cfg(target_os = "linux")]
-        let expected = "2b3184c68f59f3da166b6e2ec711781e09cca8d9aac9cd2182b5344256bb8752";
+        let expected = "8c7c3024e6b662373cdfc75cbd4af8bc36d60b39c96dd2b14b09267176cf2d4a";
         #[cfg(target_os = "macos")]
-        let expected = "3d3477f40476645c313c36790d4844019b6416340f1bbfee40b27751ab86be5b";
+        let expected = "be75638b3892bed37282a867be03a1daa283bd0a6ec2bc7a099deb591d2707fd";
         #[cfg(target_os = "linux")]
-        let expected_unbound = "07b08b84e41cccff515bb6765bd90831c1fae3b67d0fb90d1bccbb7a488da86d";
+        let expected_unbound = "5b43505f1804c63bdcdc220839f67f7a149ad7ce4832cd2c99d7776bc43e97d1";
         #[cfg(target_os = "macos")]
-        let expected_unbound = "bb026a1261e64db0449497393698649769dbb983261bd368e64465328f35ffd3";
+        let expected_unbound = "ec71302313702fd18b8cfcff461b523b7b5946265b0104261172081b0bfb991d";
         assert_eq!(digest(&value), expected);
         assert_eq!(digest(&unbound), expected_unbound);
     }

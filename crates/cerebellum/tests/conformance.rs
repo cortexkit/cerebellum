@@ -921,6 +921,10 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
             .map(|operation| operation.name.as_str())
             .collect::<Vec<_>>(),
         [
+            "ability.describe",
+            "ability.scope_choices",
+            "ability.setup",
+            "ability.call",
             "grants.would_ask",
             "computer.open_target",
             "computer.list_app_grants",
