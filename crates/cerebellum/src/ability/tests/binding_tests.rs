@@ -167,8 +167,8 @@ async fn bound_subset_with_unavailable_description_reaches_the_source_unit() {
     assert_eq!(reader.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         source.calls.load(Ordering::SeqCst),
-        0,
-        "source dispatched without a journaled handler"
+        1,
+        "authorized call must preflight after reserving"
     );
 }
 

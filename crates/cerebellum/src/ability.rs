@@ -12,12 +12,14 @@ use serde_json::{json, Map, Value};
 use subc_protocol::{call_mode::CallMode, scope::ScopeKind, Frame, Principal};
 
 use crate::{
-    ability_source::{QueueError, Source, SourceUnit, SourceUnits, UnitStatus},
+    ability_source::{QueueError, Source, SourceUnit, SourceUnits, UnitKind, UnitStatus},
+    browser::BrowserPlane,
     terminal_arbiter::TerminalArbiter,
     AcceptedBindFacts, ModuleError, Planes,
 };
 
 mod binding;
+mod journal;
 mod serving;
 use binding::{BindingReader, UnavailableBindingReader};
 
@@ -92,6 +94,10 @@ trait StatusSource: Send + Sync + 'static {
         Err(Refusal::SourceFailed)
     }
 
+    fn setup(&self, _token: Token) -> Result<Value, Refusal> {
+        Err(Refusal::SourceFailed)
+    }
+
     fn read(
         &self,
         _token: Token,
@@ -149,28 +155,39 @@ impl Source for StatusAdapter {
 
 pub(crate) struct AbilityPlane {
     platform: Platform,
+    macos_14_or_newer: bool,
     units: SourceUnits,
     source: Arc<StatusAdapter>,
     binding: Arc<dyn BindingReader>,
+    pending: Vec<(UnitKind, tokio::sync::Mutex<Option<u64>>)>,
+    setup_pending: tokio::sync::Mutex<Option<u64>>,
     #[cfg(test)]
-    reserved_reads_for_test: bool,
+    after_reserve: Option<Arc<dyn Fn(usize) + Send + Sync>>,
 }
 
 impl Default for AbilityPlane {
     fn default() -> Self {
-        Self::new(platform(), Arc::new(UnavailableSource(platform())))
+        Self::new(platform(), Arc::new(UnavailableSource(platform())), true)
     }
 }
 
 impl AbilityPlane {
-    fn new(platform: Platform, source: Arc<dyn StatusSource>) -> Self {
+    // The platform adapter supplies the OS-version decision once, without
+    // asking a helper or opening a source during request admission.
+    fn new(platform: Platform, source: Arc<dyn StatusSource>, macos_14_or_newer: bool) -> Self {
         Self {
             platform,
+            macos_14_or_newer,
             units: SourceUnits::new(platform),
             source: Arc::new(StatusAdapter(source)),
             binding: Arc::new(UnavailableBindingReader),
+            pending: UnitKind::for_platform(platform)
+                .iter()
+                .map(|&kind| (kind, tokio::sync::Mutex::new(None)))
+                .collect(),
+            setup_pending: tokio::sync::Mutex::new(None),
             #[cfg(test)]
-            reserved_reads_for_test: false,
+            after_reserve: None,
         }
     }
 
@@ -180,7 +197,12 @@ impl AbilityPlane {
             let unit: SourceUnit = unit.clone();
             let source = self.source.clone();
             let gate = gate.clone();
-            checks.spawn(async move { unit.status(source, gate).await });
+            let tokens = if unit.kind() == UnitKind::Pim && !self.macos_14_or_newer {
+                &[Token::Contacts][..]
+            } else {
+                unit.kind().tokens()
+            };
+            checks.spawn(async move { unit.status_for_tokens(source, gate, tokens).await });
         }
         let mut statuses = Vec::new();
         while let Some(result) = checks.join_next().await {
@@ -191,11 +213,15 @@ impl AbilityPlane {
         let tokens: Vec<_> = token_schemas(self.platform)
             .into_iter()
             .map(|schema| {
-                let availability = statuses
-                    .iter()
-                    .find(|(token, _)| *token == schema.token)
-                    .map(|(_, availability)| *availability)
-                    .unwrap_or(Availability::unavailable("source_unresponsive"));
+                let availability = if self.os_unsupported(schema.token) {
+                    Availability::unavailable("os_unsupported")
+                } else {
+                    statuses
+                        .iter()
+                        .find(|(token, _)| *token == schema.token)
+                        .map(|(_, availability)| *availability)
+                        .unwrap_or(Availability::unavailable("source_unresponsive"))
+                };
                 let mut entry =
                     serde_json::to_value(schema).expect("static token schema serializes");
                 entry["available"] = json!(availability.unavailable_reason.is_none());
@@ -208,13 +234,19 @@ impl AbilityPlane {
         json!({"tokens": tokens})
     }
 
+    fn os_unsupported(&self, token: Token) -> bool {
+        self.platform == Platform::MacOs
+            && !self.macos_14_or_newer
+            && matches!(token, Token::Calendar | Token::Reminders)
+    }
+
     async fn call(
         &self,
         facts: &AcceptedBindFacts,
         params: &Map<String, Value>,
         token: Token,
         gate: Arc<TerminalArbiter>,
-        reservation: Option<serving::ReservedRead>,
+        browser: &BrowserPlane,
     ) -> Result<Option<Value>, Refusal> {
         let op = params["op"].as_str().expect("validated op type");
         if token.operation(op).is_none() {
@@ -240,6 +272,87 @@ impl AbilityPlane {
         else {
             return Ok(None);
         };
+        self.journaled(
+            browser,
+            facts,
+            CALL,
+            params,
+            token,
+            gate,
+            Some((op.to_owned(), args, scope, install)),
+        )
+        .await
+    }
+
+    fn reserve(
+        &self,
+        store: Option<&mut crate::journal::store::JournalStore>,
+        pending: &mut Option<u64>,
+        facts: &AcceptedBindFacts,
+        detail: Value,
+    ) -> Result<journal::Reservation, crate::journal::JournalError> {
+        #[cfg(not(test))]
+        {
+            journal::reserve(store, pending, facts, detail)
+        }
+        #[cfg(test)]
+        {
+            let mut store = store;
+            let reservation = journal::reserve(store.as_deref_mut(), pending, facts, detail)?;
+            if let Some(hook) = &self.after_reserve {
+                hook(
+                    store
+                        .as_ref()
+                        .map_or(0, |s| s.status().active_reservation_count as usize),
+                );
+            }
+            Ok(reservation)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn journaled(
+        &self,
+        browser: &BrowserPlane,
+        facts: &AcceptedBindFacts,
+        method: &str,
+        params: &Map<String, Value>,
+        token: Token,
+        gate: Arc<TerminalArbiter>,
+        call: Option<(String, ValidatedArgs, BoundScope, binding::Install)>,
+    ) -> Result<Option<Value>, Refusal> {
+        if self.os_unsupported(token) {
+            return Err(Refusal::Unavailable("os_unsupported"));
+        }
+        let detail = journal::detail(
+            facts,
+            self.platform,
+            method,
+            token,
+            params,
+            call.as_ref().map(|(_, _, scope, install)| (scope, install)),
+        );
+        if method == SETUP && self.platform != Platform::MacOs {
+            let mut pending = self.setup_pending.lock().await;
+            return browser
+                .with_ability_journal(|store| {
+                    if gate.gate.stopped() {
+                        return Ok(None);
+                    }
+                    let mut store = store;
+                    let reservation =
+                        self.reserve(store.as_deref_mut(), &mut pending, facts, detail)?;
+                    let result = if gate.gate.stopped() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(json!({"state":"not_required"})))
+                    };
+                    reservation.commit(store, &mut pending, &result)?;
+                    Ok(result.expect("setup cannot refuse"))
+                })
+                .await
+                .map_err(|_| Refusal::JournalUnavailable);
+        }
         let unit = self.units.for_token(token).expect("declared token unit");
         let lease = match unit.arrive(gate.clone()).map(|ticket| ticket.wait()) {
             Ok(wait) => wait.await,
@@ -248,16 +361,42 @@ impl AbilityPlane {
         match lease {
             Err(QueueError::Stopped) => Ok(None),
             Err(QueueError::SourceTimeout) => Err(Refusal::SourceTimeout),
-            Ok(mut lease) => match reservation {
-                Some(proof) => {
-                    self.serve(
-                        &mut lease,
-                        serving::ReadRequest::call(proof, token, op, args, scope, gate),
-                    )
+            Ok(mut lease) => {
+                let mut pending = self
+                    .pending
+                    .iter()
+                    .find(|(kind, _)| *kind == unit.kind())
+                    .expect("unit recovery slot")
+                    .1
+                    .lock()
+                    .await;
+                let reservation = browser
+                    .with_ability_journal(|store| {
+                        if gate.gate.stopped() {
+                            return Ok(None);
+                        }
+                        self.reserve(store, &mut pending, facts, detail).map(Some)
+                    })
                     .await
-                }
-                None => Err(pending_call(install)),
-            },
+                    .map_err(|_| Refusal::JournalUnavailable)?;
+                let Some(reservation) = reservation else {
+                    return Ok(None);
+                };
+                let proof = reservation.proof();
+                let request = match call {
+                    Some((op, args, scope, _)) => {
+                        serving::ReadRequest::call(proof, token, &op, args, scope, gate)
+                    }
+                    None if method == SETUP => serving::ReadRequest::setup(proof, token, gate),
+                    None => serving::ReadRequest::choices(proof, token, params, gate),
+                };
+                let result = self.serve(&mut lease, request).await;
+                browser
+                    .with_ability_journal(|store| reservation.commit(store, &mut pending, &result))
+                    .await
+                    .map_err(|_| Refusal::JournalUnavailable)?;
+                result
+            }
         }
     }
 }
@@ -309,7 +448,7 @@ fn admitted(facts: &AcceptedBindFacts, method: &str, origin_present: bool) -> bo
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Refusal {
     PrincipalDenied,
     ArgsInvalid,
@@ -322,6 +461,7 @@ enum Refusal {
     BindingUnavailable,
     ScopeStale,
     ItemNotFound,
+    JournalUnavailable,
     Unavailable(&'static str),
 }
 impl Refusal {
@@ -362,6 +502,10 @@ impl Refusal {
                 "a bound ability container no longer exists",
             ),
             Self::ItemNotFound => ("ability_item_not_found", "the ability item was not found"),
+            Self::JournalUnavailable => (
+                "journal_unavailable",
+                "the ability request could not be audited",
+            ),
             Self::Unavailable(reason) => (reason, "the ability token is unavailable"),
         }
     }
@@ -403,24 +547,6 @@ fn params<'a>(
     Ok(Some(params))
 }
 
-/// The journal reservation will replace this refusal with a ReservedRead proof
-/// before source enumeration can read the person's calendars, lists or groups.
-fn pending_scope_choices() -> Refusal {
-    Refusal::SourceFailed
-}
-/// Fail closed until setup can durably record its access decision before replying.
-/// It must reserve a journal entry first and let a verified macOS helper prompt
-/// only after receiving permission to proceed.
-fn pending_setup() -> Refusal {
-    Refusal::SourceFailed
-}
-/// The journal reservation will replace this refusal with a ReservedRead proof.
-/// Keep the verified install id and version here for the journaled call handler
-/// to include in the read's durable record.
-fn pending_call(_install: binding::Install) -> Refusal {
-    Refusal::SourceFailed
-}
-
 fn validate_choices(token: Token, params: &Map<String, Value>) -> Result<(), Refusal> {
     let context = CursorContext::for_choices(token, params["key"].as_str().expect("validated key"))
         .map_err(|_| Refusal::ArgsInvalid)?;
@@ -439,28 +565,11 @@ fn validate_choices(token: Token, params: &Map<String, Value>) -> Result<(), Ref
 
 async fn dispatch(
     plane: &AbilityPlane,
+    browser: &BrowserPlane,
     facts: &AcceptedBindFacts,
     method: &str,
     request: &Map<String, Value>,
     gate: Arc<TerminalArbiter>,
-) -> Result<Option<Value>, Refusal> {
-    let reservation = None;
-    #[cfg(test)]
-    let reservation = if plane.reserved_reads_for_test {
-        Some(serving::ReservedRead::for_test())
-    } else {
-        reservation
-    };
-    dispatch_reserved(plane, facts, method, request, gate, reservation).await
-}
-
-async fn dispatch_reserved(
-    plane: &AbilityPlane,
-    facts: &AcceptedBindFacts,
-    method: &str,
-    request: &Map<String, Value>,
-    gate: Arc<TerminalArbiter>,
-    reservation: Option<serving::ReservedRead>,
 ) -> Result<Option<Value>, Refusal> {
     if !admitted(facts, method, request.contains_key("origin")) {
         return Err(Refusal::PrincipalDenied);
@@ -478,14 +587,16 @@ async fn dispatch_reserved(
     match method {
         SCOPE_CHOICES => {
             validate_choices(token, params)?;
-            match reservation {
-                Some(proof) => plane.choices(token, params, gate, proof).await,
-                None => Err(pending_scope_choices()),
-            }
+            plane
+                .journaled(browser, facts, method, params, token, gate, None)
+                .await
         }
-        SETUP if plane.platform != Platform::MacOs => Ok(Some(json!({"state":"not_required"}))),
-        SETUP => Err(pending_setup()),
-        CALL => plane.call(facts, params, token, gate, reservation).await,
+        SETUP => {
+            plane
+                .journaled(browser, facts, method, params, token, gate, None)
+                .await
+        }
+        CALL => plane.call(facts, params, token, gate, browser).await,
         _ => unreachable!(),
     }
 }
@@ -502,6 +613,7 @@ pub(crate) async fn handle(
         TerminalArbiter::current().unwrap_or_else(|| Arc::new(TerminalArbiter::new(frame.clone())));
     let result = dispatch(
         &planes.management.abilities,
+        &planes.browser,
         facts,
         method,
         request,

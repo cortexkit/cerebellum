@@ -1850,6 +1850,23 @@ impl BrowserPlane {
         .await
     }
 
+    /// Ability reads share the browser journal, including its disabled mode and
+    /// lazy-open failure. The closure keeps ability.setup's reservation and
+    /// commit under one hold of the journal lock.
+    pub(crate) async fn with_ability_journal<T>(
+        &self,
+        work: impl FnOnce(Option<&mut journal::store::JournalStore>) -> Result<T, JournalError>,
+    ) -> Result<T, JournalError> {
+        if !self.journal_mode.is_enabled() {
+            return work(None);
+        }
+        let mut journal = self.journal.lock().await;
+        if journal.store.is_none() {
+            journal.store = self.journal_mode.open_store()?;
+        }
+        work(journal.store.as_mut())
+    }
+
     /// Record only aggregate permission answers, never targets or screen text.
     pub(crate) async fn journal_would_ask(
         &self,

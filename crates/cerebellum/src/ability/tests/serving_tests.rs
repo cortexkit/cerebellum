@@ -1,10 +1,13 @@
 use super::*;
 use crate::ability::{
     binding::{BindingEntry, BindingRead, BindingRecord},
-    serving::{ReservedRead, ScopeChoice, SourceRead, SourceRecord},
+    serving::{ScopeChoice, SourceRead, SourceRecord},
 };
 use cerebellum_ability::{filter::TaggedItem, items::*, time::ReminderDue, Item};
 use std::collections::{BTreeMap, BTreeSet};
+
+#[path = "journal_tests.rs"]
+mod journal_tests;
 
 struct Bound;
 impl BindingReader for Bound {
@@ -132,13 +135,13 @@ async fn reserved(planes: &Planes, request_body: Value) -> Frame {
     } else {
         facts("prefrontal-core")
     };
-    let result = dispatch_reserved(
+    let result = dispatch(
         &planes.management.abilities,
+        &planes.browser,
         &route,
         method,
         request_body.as_object().unwrap(),
         gate.clone(),
-        Some(ReservedRead::for_test()),
     )
     .await;
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -437,7 +440,7 @@ async fn reply_byte_cut_keeps_whole_items_and_normalized_truncation_flags() {
 }
 
 #[tokio::test]
-async fn production_dispatch_cannot_read_without_a_journal_reservation() {
+async fn production_dispatch_serves_with_a_real_journal_reservation() {
     let (planes, source) = setup(
         Data {
             items: vec![item(Token::Calendar, "one", "bound")],
@@ -445,12 +448,24 @@ async fn production_dispatch_cannot_read_without_a_journal_reservation() {
         },
         Platform::MacOs,
     );
-    assert_refusal(
-        &exchange(&planes, &flow(), list(Token::Calendar, 100)).await,
-        "ability_source_failed",
+    assert_eq!(
+        body(&exchange(&planes, &flow(), list(Token::Calendar, 100)).await)["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
-    assert_refusal(&exchange(&planes, &facts("prefrontal-core"), json!({"method":SCOPE_CHOICES,"params":{"token":Token::Calendar.as_str(),"key":"calendar"}})).await, "ability_source_failed");
-    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(body(&exchange(&planes, &facts("prefrontal-core"), json!({"method":SCOPE_CHOICES,"params":{"token":Token::Calendar.as_str(),"key":"calendar"}})).await)["choices"], json!([]));
+    assert_eq!(source.calls.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        planes
+            .browser
+            .journal_export_for_test()
+            .await
+            .lines()
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -870,17 +885,13 @@ async fn largest_ability_reply_fits_one_management_frame_using_the_real_serializ
 async fn queued_call_taken_just_before_limit_reports_source_timeout_not_arbiter_deadline() {
     let block = Arc::new(Block::default());
     let release = Release(block.clone());
-    let (mut planes, _) = setup(
+    let (planes, _) = setup(
         Data {
             block: Some(block.clone()),
             ..Default::default()
         },
         Platform::MacOs,
     );
-    Arc::get_mut(&mut planes.management)
-        .unwrap()
-        .abilities
-        .reserved_reads_for_test = true;
     planes.routes.insert(19, 1, flow());
     let planes = Arc::new(planes);
     let unit = planes
@@ -988,13 +999,13 @@ async fn stopped_status_preflight_never_starts_read_or_choices() {
         } else {
             facts("prefrontal-core")
         };
-        let result = dispatch_reserved(
+        let result = dispatch(
             &planes.management.abilities,
+            &planes.browser,
             &route,
             method,
             request_body.as_object().unwrap(),
             gate,
-            Some(ReservedRead::for_test()),
         )
         .await;
         assert!(
@@ -1025,7 +1036,6 @@ async fn stale_scope_refuses_whole_read_even_with_matching_items() {
 #[tokio::test]
 async fn unavailable_reasons_refuse_choices_and_calls_but_unresponsive_is_not_a_code() {
     for reason in [
-        "os_unsupported",
         "helper_unverified",
         "helper_revision_mismatch",
         "permission_missing",
