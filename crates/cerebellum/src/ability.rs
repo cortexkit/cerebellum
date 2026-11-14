@@ -18,6 +18,7 @@ use crate::{
 };
 
 mod binding;
+mod serving;
 use binding::{BindingReader, UnavailableBindingReader};
 
 pub(crate) const DESCRIBE: &str = "ability.describe";
@@ -82,10 +83,24 @@ fn map_capability(value: &str) -> Option<String> {
     }
 }
 
-/// Status adapters return one availability value per requested token. No adapter
-/// is installed until its platform source and non-prompting preflight are ready.
+/// Adapters return owned records, tagged from their own containers, never from
+/// the requested scope. A read opens and drops its session on one pool thread.
 trait StatusSource: Send + Sync + 'static {
     fn status(&self, tokens: &'static [Token]) -> Result<Vec<(Token, Availability)>, ()>;
+
+    fn choices(&self, _token: Token) -> Result<Vec<serving::ScopeChoice>, Refusal> {
+        Err(Refusal::SourceFailed)
+    }
+
+    fn read(
+        &self,
+        _token: Token,
+        _op: &str,
+        _args: &ValidatedArgs,
+        _scope: &BoundScope,
+    ) -> Result<serving::SourceRead, Refusal> {
+        Err(Refusal::SourceFailed)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -118,17 +133,17 @@ impl StatusSource for UnavailableSource {
 
 struct StatusAdapter(Arc<dyn StatusSource>);
 impl Source for StatusAdapter {
-    type Request = ();
-    type Reply = ();
+    type Request = serving::ReadRequest;
+    type Reply = Option<Value>;
     type Status = Vec<(Token, Availability)>;
-    type Error = ();
+    type Error = Refusal;
 
-    fn request(&self, (): ()) -> Result<(), ()> {
-        Err(())
+    fn request(&self, request: Self::Request) -> Result<Self::Reply, Refusal> {
+        serving::read(self.0.as_ref(), request)
     }
 
-    fn status(&self, tokens: &'static [Token]) -> Result<Self::Status, ()> {
-        self.0.status(tokens)
+    fn status(&self, tokens: &'static [Token]) -> Result<Self::Status, Refusal> {
+        self.0.status(tokens).map_err(|_| Refusal::SourceFailed)
     }
 }
 
@@ -137,6 +152,8 @@ pub(crate) struct AbilityPlane {
     units: SourceUnits,
     source: Arc<StatusAdapter>,
     binding: Arc<dyn BindingReader>,
+    #[cfg(test)]
+    reserved_reads_for_test: bool,
 }
 
 impl Default for AbilityPlane {
@@ -152,6 +169,8 @@ impl AbilityPlane {
             units: SourceUnits::new(platform),
             source: Arc::new(StatusAdapter(source)),
             binding: Arc::new(UnavailableBindingReader),
+            #[cfg(test)]
+            reserved_reads_for_test: false,
         }
     }
 
@@ -195,6 +214,7 @@ impl AbilityPlane {
         params: &Map<String, Value>,
         token: Token,
         gate: Arc<TerminalArbiter>,
+        reservation: Option<serving::ReservedRead>,
     ) -> Result<Option<Value>, Refusal> {
         let op = params["op"].as_str().expect("validated op type");
         if token.operation(op).is_none() {
@@ -221,14 +241,23 @@ impl AbilityPlane {
             return Ok(None);
         };
         let unit = self.units.for_token(token).expect("declared token unit");
-        let lease = match unit.arrive(gate).map(|ticket| ticket.wait()) {
+        let lease = match unit.arrive(gate.clone()).map(|ticket| ticket.wait()) {
             Ok(wait) => wait.await,
             Err(error) => Err(error),
         };
         match lease {
             Err(QueueError::Stopped) => Ok(None),
             Err(QueueError::SourceTimeout) => Err(Refusal::SourceTimeout),
-            Ok(_lease) => Err(pending_call(install)),
+            Ok(mut lease) => match reservation {
+                Some(proof) => {
+                    self.serve(
+                        &mut lease,
+                        serving::ReadRequest::call(proof, token, op, args, scope, gate),
+                    )
+                    .await
+                }
+                None => Err(pending_call(install)),
+            },
         }
     }
 }
@@ -291,6 +320,9 @@ enum Refusal {
     SourceFailed,
     SourceTimeout,
     BindingUnavailable,
+    ScopeStale,
+    ItemNotFound,
+    Unavailable(&'static str),
 }
 impl Refusal {
     fn wire(self) -> (&'static str, &'static str) {
@@ -325,6 +357,12 @@ impl Refusal {
                 "ability_source_timeout",
                 "the ability source did not answer in time",
             ),
+            Self::ScopeStale => (
+                "ability_scope_stale",
+                "a bound ability container no longer exists",
+            ),
+            Self::ItemNotFound => ("ability_item_not_found", "the ability item was not found"),
+            Self::Unavailable(reason) => (reason, "the ability token is unavailable"),
         }
     }
 }
@@ -365,9 +403,8 @@ fn params<'a>(
     Ok(Some(params))
 }
 
-/// Fail closed until source enumeration can durably record the read's outcome
-/// before replying, without recording source labels or ids. It must reserve a
-/// journal entry before reading the person's bindable calendars, lists or groups.
+/// The journal reservation will replace this refusal with a ReservedRead proof
+/// before source enumeration can read the person's calendars, lists or groups.
 fn pending_scope_choices() -> Refusal {
     Refusal::SourceFailed
 }
@@ -377,8 +414,9 @@ fn pending_scope_choices() -> Refusal {
 fn pending_setup() -> Refusal {
     Refusal::SourceFailed
 }
-/// No source read may run until its outcome can be reserved and committed. Keep
-/// the verified install provenance at this boundary for the journaled handler.
+/// The journal reservation will replace this refusal with a ReservedRead proof.
+/// Keep the verified install id and version here for the journaled call handler
+/// to include in the read's durable record.
 fn pending_call(_install: binding::Install) -> Refusal {
     Refusal::SourceFailed
 }
@@ -406,6 +444,24 @@ async fn dispatch(
     request: &Map<String, Value>,
     gate: Arc<TerminalArbiter>,
 ) -> Result<Option<Value>, Refusal> {
+    let reservation = None;
+    #[cfg(test)]
+    let reservation = if plane.reserved_reads_for_test {
+        Some(serving::ReservedRead::for_test())
+    } else {
+        reservation
+    };
+    dispatch_reserved(plane, facts, method, request, gate, reservation).await
+}
+
+async fn dispatch_reserved(
+    plane: &AbilityPlane,
+    facts: &AcceptedBindFacts,
+    method: &str,
+    request: &Map<String, Value>,
+    gate: Arc<TerminalArbiter>,
+    reservation: Option<serving::ReservedRead>,
+) -> Result<Option<Value>, Refusal> {
     if !admitted(facts, method, request.contains_key("origin")) {
         return Err(Refusal::PrincipalDenied);
     }
@@ -422,10 +478,14 @@ async fn dispatch(
     match method {
         SCOPE_CHOICES => {
             validate_choices(token, params)?;
-            Err(pending_scope_choices())
+            match reservation {
+                Some(proof) => plane.choices(token, params, gate, proof).await,
+                None => Err(pending_scope_choices()),
+            }
         }
+        SETUP if plane.platform != Platform::MacOs => Ok(Some(json!({"state":"not_required"}))),
         SETUP => Err(pending_setup()),
-        CALL => plane.call(facts, params, token, gate).await,
+        CALL => plane.call(facts, params, token, gate, reservation).await,
         _ => unreachable!(),
     }
 }
@@ -448,6 +508,15 @@ pub(crate) async fn handle(
         gate.clone(),
     )
     .await;
+    respond(frame, writer, &gate, result).await
+}
+
+async fn respond(
+    frame: &Frame,
+    writer: &tokio::sync::mpsc::Sender<Frame>,
+    gate: &TerminalArbiter,
+    result: Result<Option<Value>, Refusal>,
+) -> Result<(), ModuleError> {
     // A stopped handler leaves the terminal reply to the arbiter, even if its
     // binding future became ready at the same instant as the stop.
     if gate.gate.stopped() {
