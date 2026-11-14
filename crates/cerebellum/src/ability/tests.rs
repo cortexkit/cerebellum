@@ -10,6 +10,9 @@ use subc_protocol::{
     BindIdentity, FrameType, RouteTarget,
 };
 
+mod binding_tests;
+mod validation_tests;
+
 fn principal(name: &str) -> Option<Principal> {
     Some(Principal::Reserved {
         module_id: name.into(),
@@ -667,6 +670,73 @@ async fn setup_pending_adapter_refuses_without_touching_source_unit() {
 #[tokio::test(start_paused = true)]
 async fn call_pending_binding_refuses_without_touching_source_unit() {
     assert_pending(CALL, flow(), "ability_binding_unavailable").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_rows_precede_binding_and_the_busy_source_unit() {
+    let source = Arc::new(FakeStatus::default());
+    let planes = fixture(source.clone(), platform());
+    let before = planes.browser.journal_export_for_test().await;
+    let gate = Arc::new(TerminalArbiter::new(request(json!({"method": CALL}))));
+    let holder = planes
+        .management
+        .abilities
+        .units
+        .for_token(Token::Calendar)
+        .unwrap()
+        .arrive(gate)
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    let call = valid_params(CALL);
+    let choices = valid_params(SCOPE_CHOICES);
+    let mut cases = Vec::new();
+    // A non-object scope is a params type error, before token or op lookup.
+    let mut p = call.clone();
+    p["token"] = json!("unknown");
+    p["scope"] = json!([]);
+    cases.push((CALL, p, "ability_args_invalid"));
+    let mut p = call.clone();
+    p["token"] = json!("unknown");
+    p["scope"] = json!({"calendar":[""]});
+    cases.push((CALL, p, "ability_token_unknown"));
+    let mut p = call.clone();
+    p["op"] = json!("unknown");
+    p["scope"] = json!({"calendar":[""]});
+    cases.push((CALL, p, "ability_op_unknown"));
+    let mut p = call.clone();
+    p["scope"] = json!({"calendar":[""]});
+    p["args"] = json!({"unknown":true});
+    cases.push((CALL, p, "ability_scope_invalid"));
+    let mut p = call.clone();
+    p["op"] = json!("events.get");
+    p["args"] = json!({"id":"é".repeat(1025)});
+    cases.push((CALL, p, "ability_args_invalid"));
+    let mut p = choices.clone();
+    p["token"] = json!("unknown");
+    p["limit"] = json!("wrong type");
+    cases.push((SCOPE_CHOICES, p, "ability_args_invalid"));
+    let mut p = choices;
+    p["token"] = json!("unknown");
+    p["limit"] = json!(201);
+    cases.push((SCOPE_CHOICES, p, "ability_token_unknown"));
+    let start = tokio::time::Instant::now();
+    for (method, params, code) in cases {
+        let route = if method == CALL {
+            flow()
+        } else {
+            facts("prefrontal-core")
+        };
+        assert_refusal(
+            &exchange(&planes, &route, json!({"method":method,"params":params})).await,
+            code,
+        );
+    }
+    assert_eq!(tokio::time::Instant::now(), start);
+    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(planes.browser.journal_export_for_test().await, before);
+    drop(holder);
 }
 
 #[tokio::test(start_paused = true)]

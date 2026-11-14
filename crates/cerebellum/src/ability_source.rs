@@ -149,6 +149,11 @@ impl SourceUnit {
         self.0.kind
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_users_for_test(&self, count: usize) -> bool {
+        self.0.queue.has_users(count)
+    }
+
     pub fn quarantined(&self) -> bool {
         self.0.work.lock().unwrap().as_ref().is_some_and(|work| {
             !work.done.load(Ordering::Acquire) && Instant::now() >= work.deadline
