@@ -479,6 +479,39 @@ mod tests {
     use super::*;
     use crate::call_queue::ConversationQueue;
 
+    #[tokio::test]
+    async fn ability_methods_never_reserve_or_wait_for_a_browser_ticket() {
+        let planes = crate::tests::management_bound_planes(1, 1);
+        let request = |method: &str| {
+            Frame::build(
+                subc_protocol::FrameType::Request,
+                subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+                1,
+                1,
+                1,
+                serde_json::to_vec(&serde_json::json!({"method": method, "params": {}})).unwrap(),
+            )
+            .unwrap()
+        };
+        // Hold the same conversation's browser lane throughout every ability
+        // request. The browser control proves the route can reserve tickets.
+        let browser = arrive(&request("browser.open_grant"), &planes).unwrap();
+        let (_holder, _) = browser.acquire().await;
+        for method in [
+            "ability.describe",
+            "ability.call",
+            "ability.scope_choices",
+            "ability.setup",
+            "ability.future",
+        ] {
+            let frame = request(method);
+            let arrival = arrive(&frame, &planes);
+            assert!(arrival.is_none(), "{method} reserved a browser ticket");
+            let entered = scope(arrival, enter(&frame, &planes)).await.unwrap();
+            assert!(entered.is_none(), "{method} acquired a browser lane");
+        }
+    }
+
     /// A queue refusal is certified against the refused capability's own
     /// result schema: the fill's, or the advertised browser vocabulary's.
     fn validate(

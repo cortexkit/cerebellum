@@ -13,6 +13,7 @@
 // evaluate_obligation" until the cache was cleaned.
 #![recursion_limit = "256"]
 
+pub mod ability_source;
 pub mod agent_grants;
 pub mod authorization;
 mod blocking_permits;
