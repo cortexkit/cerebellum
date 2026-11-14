@@ -125,6 +125,10 @@ fn management_surface() -> ProviderRole {
         // it by claiming no ordering matters, which is false for that lane.
         concurrency: Concurrency::ModuleManaged,
         operations: [
+            (crate::ability::DESCRIBE, "Describe declared personal-data abilities, their schemas and current source availability."),
+            (crate::ability::SCOPE_CHOICES, "List the personal-data sources a person may bind on an install card. Prefrontal core's own calls only."),
+            (crate::ability::SETUP, "Settle system access for one personal-data ability. Prefrontal core's own calls only; may ask the person."),
+            (crate::ability::CALL, "Read personal data within an installed flow's bound ability scope. Admitted flow routes only."),
             (
                 crate::management::WOULD_ASK,
                 "Check standing per-agent grants for flow installation without asking or touching targets. Prefrontal core only.",
@@ -478,7 +482,10 @@ fn build_with_browser_config_and_provenance(
                 SESSION_TURN_ENDED_CAPABILITY.to_string(),
                 cortexkit_role_tool_provider::PROVIDES.to_string(),
                 cortexkit_role_tool_provider::TOOL_VIEWS_CAPABILITY.to_string(),
-            ],
+            ]
+            .into_iter()
+            .chain(crate::ability::manifest_capabilities())
+            .collect(),
             requires: Vec::new(),
             must_never_reach: Vec::new(),
         }))
@@ -996,6 +1003,10 @@ mod tests {
         assert_eq!(
             advertised,
             vec![
+                crate::ability::DESCRIBE,
+                crate::ability::SCOPE_CHOICES,
+                crate::ability::SETUP,
+                crate::ability::CALL,
                 crate::management::WOULD_ASK,
                 crate::management::OPEN_TARGET,
                 crate::management::LIST_APP_GRANTS,

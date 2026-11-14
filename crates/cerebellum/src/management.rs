@@ -78,7 +78,11 @@ pub const LIST_GRANTS: &str = "grants.list";
 /// only. Interim: to be replaced by a subscription to the harness module's
 /// turn-ended event, after which core's direct call goes away.
 pub const SESSION_TURN_ENDED: &str = "session.turn_ended";
-pub const OPERATIONS: [&str; 18] = [
+pub const OPERATIONS: [&str; 22] = [
+    crate::ability::DESCRIBE,
+    crate::ability::SCOPE_CHOICES,
+    crate::ability::SETUP,
+    crate::ability::CALL,
     WOULD_ASK,
     OPEN_TARGET,
     LIST_APP_GRANTS,
@@ -359,6 +363,7 @@ impl TargetResolver for PlatformResolver {
 
 /// The state a management route needs.
 pub struct ManagementPlane {
+    pub(crate) abilities: crate::ability::AbilityPlane,
     unified_grants: Option<Arc<crate::agent_grants::AgentGrants>>,
     /// The computer plane's app and takeover grants, and the questions out
     /// for them.
@@ -687,6 +692,7 @@ impl ManagementPlane {
         let standing_browser_grants = Arc::new(StandingBrowserGrants::in_memory());
         let signed_in_domains = Arc::new(crate::browser_signed_in::SignedInDomains::default());
         Self {
+            abilities: crate::ability::AbilityPlane::default(),
             unified_grants: None,
             computer_grants,
             app_state_sessions: Arc::new(AppStateSessions::new()),

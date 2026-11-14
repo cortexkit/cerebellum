@@ -1,0 +1,60 @@
+{
+  "capability_tokens": {
+    "valid": [
+      "cap/code.read@1",
+      "cap/shell@1",
+      "cap/flow.template@2",
+      "cap/code.read@10"
+    ],
+    "invalid": [
+      "code.read@1",
+      "cap/code.read",
+      "cap/code.read@0",
+      "cap/code.read@01",
+      "cap/Code.read@1",
+      "cap/code.read.all@1",
+      "cap/code_read@1",
+      "flow-templates/v1",
+      "cap/.read@1",
+      "cap/code.@1",
+      "cap/memory-profile.read@1",
+      "cap/code-x.read@1",
+      "cap/code.re-ad@1",
+      "cap/1code.read@1",
+      "cap/code.1read@1"
+    ]
+  },
+  "capability_manifest_mapping": {
+    "pairs": [
+      {
+        "token": "cap/code.read@1",
+        "capability": "cap-code-read/v1"
+      },
+      {
+        "token": "cap/shell@1",
+        "capability": "cap-shell/v1"
+      },
+      {
+        "token": "cap/flow.template@2",
+        "capability": "cap-flow-template/v2"
+      },
+      {
+        "token": "cap/code.read@10",
+        "capability": "cap-code-read/v10"
+      },
+      {
+        "token": "cap/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@1",
+        "capability": "cap-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/v1"
+      }
+    ],
+    "token_too_long": "cap/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@1",
+    "capability_not_a_token": [
+      "cap-a-b-c/v1",
+      "cap-/v1",
+      "cap-code-/v1",
+      "flow-scopes/v1",
+      "cap-code-read/v0",
+      "cap-Code-read/v1"
+    ]
+  }
+}
