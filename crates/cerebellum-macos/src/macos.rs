@@ -435,6 +435,8 @@ pub struct CgEventPostCall;
 /// Rust binding. The caller owns all target checks and policy. A returned
 /// [`CgEventPostCall`] means only that the void framework call returned.
 pub fn post_event_to_pid(pid: i32, event: &CGEvent) -> CgEventPostCall {
+    #[cfg(feature = "desk-probe")]
+    note_post_for_probe(pid);
     CGEvent::post_to_pid(pid, Some(event));
     CgEventPostCall
 }
@@ -884,6 +886,39 @@ static WINDOW_LIST_ERRORS_FOR_PROBE: std::sync::Mutex<Vec<String>> =
 #[doc(hidden)]
 pub fn take_window_list_errors_for_probe() -> Vec<String> {
     std::mem::take(&mut *WINDOW_LIST_ERRORS_FOR_PROBE.lock().unwrap())
+}
+
+/// When each per-process post call was made, for the manual desk probe only:
+/// its fronting timing reads when a chord's first keystroke went out. Only the
+/// newest few are kept, because nothing drains them outside the probe.
+#[cfg(feature = "desk-probe")]
+static POSTS_FOR_PROBE: std::sync::Mutex<Vec<(i32, Instant)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "desk-probe")]
+const POSTS_KEPT_FOR_PROBE: usize = 64;
+
+/// Note a per-process post call to `pid`, immediately before it is made.
+#[cfg(feature = "desk-probe")]
+pub(crate) fn note_post_for_probe(pid: i32) {
+    let mut posts = POSTS_FOR_PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if posts.len() >= POSTS_KEPT_FOR_PROBE {
+        posts.remove(0);
+    }
+    posts.push((pid, Instant::now()));
+}
+
+/// Drain the per-process post calls noted since the last drain, oldest first,
+/// as `(pid, when)`. Only the manual probe's timing reads these.
+#[cfg(feature = "desk-probe")]
+#[doc(hidden)]
+pub fn take_posts_for_probe() -> Vec<(i32, Instant)> {
+    std::mem::take(
+        &mut *POSTS_FOR_PROBE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
 }
 
 /// One running application, as the window server lists it.
