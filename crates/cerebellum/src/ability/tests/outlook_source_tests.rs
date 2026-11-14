@@ -196,9 +196,12 @@ impl Session for FakeSession {
             .items
             .iter()
             .find(|(header, _)| {
-                let mut encoded = header.id.encode();
+                let Ok(mut encoded) = header.id.encode() else {
+                    return false;
+                };
                 if let Some(original) = header.original_start_ms {
-                    encoded.push_str(&format!(".{original}"));
+                    encoded =
+                        cerebellum_ability::events::occurrence_id(&encoded, original).unwrap();
                 }
                 encoded == requested
             })
@@ -239,6 +242,8 @@ async fn outlook_source_contact_folders_are_accounts_and_mailbox_uses_store_disp
             folder(Token::Contacts, "bound"),
             folder(Token::Contacts, "outside"),
             folder(Token::Mail, "bound"),
+            folder(Token::Contacts, &"x".repeat(1600)),
+            folder(Token::Contacts, ""),
         ],
         ..Default::default()
     });
@@ -256,7 +261,7 @@ async fn outlook_source_contact_folders_are_accounts_and_mailbox_uses_store_disp
     );
     assert_eq!(
         groups["items"],
-        json!([{"id":id("bound").encode(),"title":"bound","kind":"account","truncated":[]}])
+        json!([{"id":id("bound").encode().unwrap(),"title":"bound","kind":"account","truncated":[]}])
     );
     let mailboxes = body(
         &reserved(
@@ -267,14 +272,71 @@ async fn outlook_source_contact_folders_are_accounts_and_mailbox_uses_store_disp
     );
     assert_eq!(mailboxes["items"][0]["account"], "Store display name");
     // Independent fixed expectation, not an encode/decode self-comparison.
-    assert_eq!(id("bound").encode(), "c3RvcmU.Ym91bmQ");
+    assert_eq!(id("bound").encode().unwrap(), "c3RvcmU.Ym91bmQ");
     assert_eq!(
         Id {
             store: vec![0xff, 0xfe],
             entry: vec![0xfb, 0xff]
         }
-        .encode(),
+        .encode()
+        .unwrap(),
         "__4.-_8"
+    );
+}
+
+#[tokio::test]
+async fn outlook_source_moved_occurrences_keep_original_identity_across_page_cut_and_get() {
+    let mut items = vec![];
+    for original in [10, 20] {
+        let (mut header, mut fields) = raw(Token::Calendar, "series", "bound");
+        header.original_start_ms = Some(original);
+        let Fields::Appointment(event) = &mut fields else {
+            unreachable!()
+        };
+        event.title = Some(format!("original {original}"));
+        // Both occurrences now start at 10, but their original starts differ.
+        items.push((header, fields));
+    }
+    let (planes, _) = outlook_fixture(FakeFactory {
+        folders: vec![folder(Token::Calendar, "bound")],
+        items,
+        ..Default::default()
+    });
+    let mut args = list_args(Token::Calendar, 1);
+    let first = body(
+        &reserved(
+            &planes,
+            outlook_call(Token::Calendar, "events.list", args.clone()),
+        )
+        .await,
+    );
+    args["cursor"] = first["next_cursor"].clone();
+    let second = body(&reserved(&planes, outlook_call(Token::Calendar, "events.list", args)).await);
+    assert_ne!(first["items"][0]["id"], second["items"][0]["id"]);
+    assert!(second.get("next_cursor").is_none());
+    for (page, title) in [(first, "original 10"), (second, "original 20")] {
+        let item = &page["items"][0];
+        assert_eq!(item["title"], title);
+        assert_eq!(item["start_ms"], 10);
+        assert_eq!(item["recurring"], true);
+        let got = body(
+            &reserved(
+                &planes,
+                outlook_call(Token::Calendar, "events.get", json!({"id":item["id"]})),
+            )
+            .await,
+        );
+        assert_eq!(got["item"], *item);
+    }
+    let excluded =
+        cerebellum_ability::events::occurrence_id(&id("series").encode().unwrap(), 30).unwrap();
+    assert_refusal(
+        &reserved(
+            &planes,
+            outlook_call(Token::Calendar, "events.get", json!({"id":excluded})),
+        )
+        .await,
+        "ability_item_not_found",
     );
 }
 
@@ -304,7 +366,7 @@ async fn outlook_source_no_date_and_outlook_body_states_are_normalized() {
             outlook_call(
                 Token::Reminders,
                 "reminders.get",
-                json!({"id":id("task").encode()}),
+                json!({"id":id("task").encode().unwrap()}),
             ),
         ] {
             let reply = body(&reserved(&planes, request).await);
@@ -341,7 +403,7 @@ async fn outlook_source_no_date_and_outlook_body_states_are_normalized() {
                 outlook_call(
                     Token::Mail,
                     "messages.get",
-                    json!({"id":id("mail").encode()}),
+                    json!({"id":id("mail").encode().unwrap()}),
                 ),
             )
             .await,
@@ -649,7 +711,7 @@ impl BindingReader for OutlookBinding {
                     .map(|&token| BindingEntry {
                         key: token.as_str().into(),
                         token,
-                        ids: [id("bound").encode()].into(),
+                        ids: [id("bound").encode().unwrap()].into(),
                     })
                     .collect(),
             })
@@ -675,7 +737,7 @@ fn planes_for(data: Arc<FakeFactory>) -> Planes {
 }
 
 fn outlook_call(token: Token, op: &str, args: Value) -> Value {
-    json!({"method":CALL,"params":{"key":token.as_str(),"token":token.as_str(),"op":op,"args":args,"scope":{token.info().scope_key:[id("bound").encode()]}}})
+    json!({"method":CALL,"params":{"key":token.as_str(),"token":token.as_str(),"op":op,"args":args,"scope":{token.info().scope_key:[id("bound").encode().unwrap()]}}})
 }
 
 fn list_op(token: Token) -> &'static str {
@@ -691,7 +753,7 @@ fn list_op(token: Token) -> &'static str {
 fn list_args(token: Token, limit: usize) -> Value {
     match token {
         Token::Calendar => json!({"from_ms":0,"to_ms":100,"limit":limit}),
-        Token::Mail => json!({"mailbox":id("bound").encode(),"limit":limit}),
+        Token::Mail => json!({"mailbox":id("bound").encode().unwrap(),"limit":limit}),
         _ => json!({"limit":limit}),
     }
 }
@@ -733,7 +795,7 @@ async fn outlook_source_filters_parent_and_class_before_paging_for_all_four_toke
             for item in reply["items"].as_array().unwrap() {
                 let encoded = item["id"].as_str().unwrap();
                 assert!(seen.insert(encoded.to_owned()));
-                assert!((0..6).any(|n| encoded == id(&format!("item{n}")).encode()));
+                assert!((0..6).any(|n| encoded == id(&format!("item{n}")).encode().unwrap()));
                 let parent = match token {
                     Token::Calendar => &item["calendar"],
                     Token::Reminders => &item["list"],
@@ -741,7 +803,7 @@ async fn outlook_source_filters_parent_and_class_before_paging_for_all_four_toke
                     Token::Mail => &item["mailbox"],
                     _ => unreachable!(),
                 };
-                assert_eq!(parent, &json!(id("bound").encode()));
+                assert_eq!(parent, &json!(id("bound").encode().unwrap()));
             }
             let Some(cursor) = reply.get("next_cursor") else {
                 break;
@@ -754,13 +816,17 @@ async fn outlook_source_filters_parent_and_class_before_paging_for_all_four_toke
             outlook_call(
                 token,
                 get_op(token),
-                json!({"id":id("aaa-outside").encode()}),
+                json!({"id":id("aaa-outside").encode().unwrap()}),
             ),
         )
         .await;
         let unknown = reserved(
             &planes,
-            outlook_call(token, get_op(token), json!({"id":id("unknown").encode()})),
+            outlook_call(
+                token,
+                get_op(token),
+                json!({"id":id("unknown").encode().unwrap()}),
+            ),
         )
         .await;
         assert_refusal(&outside, "ability_item_not_found");

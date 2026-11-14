@@ -2,9 +2,10 @@
 
 use std::{cell::RefCell, collections::BTreeSet, sync::Arc};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use cerebellum_ability::{
+    events::occurrence_id,
     filter::TaggedItem,
+    ids::windows_id,
     items::{
         BodyState, Contact, Container, Event, Group, GroupKind, MailMessage, MailSummary, Mailbox,
         Reminder,
@@ -32,12 +33,8 @@ pub(in crate::ability) struct Id {
 }
 
 impl Id {
-    pub(in crate::ability) fn encode(&self) -> String {
-        format!(
-            "{}.{}",
-            URL_SAFE_NO_PAD.encode(&self.store),
-            URL_SAFE_NO_PAD.encode(&self.entry)
-        )
+    pub(in crate::ability) fn encode(&self) -> Result<String, Refusal> {
+        windows_id(&self.store, &self.entry).map_err(|_| Refusal::SourceFailed)
     }
 }
 
@@ -106,13 +103,13 @@ pub(in crate::ability) struct Header {
 }
 
 impl Header {
-    fn item_id(&self) -> String {
-        let mut id = self.id.encode();
+    fn item_id(&self) -> Result<String, Refusal> {
+        let id = self.id.encode()?;
         if let Some(original) = self.original_start_ms {
-            // Item ids may carry an occurrence discriminator; folder ids never do.
-            id.push_str(&format!(".{original}"));
+            occurrence_id(&id, original).map_err(|_| Refusal::SourceFailed)
+        } else {
+            Ok(id)
         }
-        id
     }
 }
 
@@ -259,16 +256,17 @@ impl ReadAccess for Access {
     }
 
     fn choices(&self, token: Token) -> Result<Vec<serving::ScopeChoice>, Refusal> {
-        self.folders(token)?
+        Ok(self
+            .folders(token)?
             .into_iter()
-            .map(|folder| {
-                Ok(serving::ScopeChoice {
-                    id: folder.id.encode(),
+            .filter_map(|folder| {
+                folder.id.encode().ok().map(|id| serving::ScopeChoice {
+                    id,
                     label: folder.title.unwrap_or_default(),
                     kind: (token == Token::Contacts).then_some(GroupKind::Account),
                 })
             })
-            .collect()
+            .collect())
     }
 
     fn read(
@@ -278,8 +276,14 @@ impl ReadAccess for Access {
         args: &ValidatedArgs,
         scope: &BoundScope,
     ) -> Result<SourceRead, Refusal> {
-        let folders = self.folders(token)?;
-        let containers: BTreeSet<_> = folders.iter().map(|f| f.id.encode()).collect();
+        // Unbindable folders are omitted from both scope choices and container
+        // listings. Item ids, in contrast, refuse the read rather than disappear.
+        let folders: Vec<_> = self
+            .folders(token)?
+            .into_iter()
+            .filter_map(|folder| folder.id.encode().ok().map(|id| (id, folder)))
+            .collect();
+        let containers: BTreeSet<_> = folders.iter().map(|(id, _)| id.clone()).collect();
         let mut read = SourceRead {
             containers,
             time_zone: self
@@ -301,8 +305,7 @@ impl ReadAccess for Access {
         ) {
             read.records = folders
                 .into_iter()
-                .map(|f| {
-                    let id = f.id.encode();
+                .map(|(id, f)| {
                     let item = match token {
                         Token::Mail => Item::Mailbox(Mailbox {
                             id,
@@ -340,10 +343,7 @@ impl ReadAccess for Access {
                 headers.push(header);
             }
         } else {
-            for folder in folders
-                .iter()
-                .filter(|f| scope.ids().contains(&f.id.encode()))
-            {
+            for (_, folder) in folders.iter().filter(|(id, _)| scope.ids().contains(id)) {
                 self.check()?;
                 headers.extend(self.session.borrow_mut().items(folder, args)?);
             }
@@ -354,7 +354,9 @@ impl ReadAccess for Access {
             if Some(header.class) != Class::for_token(token) {
                 continue;
             }
-            let parent = header.parent.encode();
+            let Ok(parent) = header.parent.encode() else {
+                continue;
+            };
             if !scope.ids().contains(&parent) {
                 continue;
             }
@@ -375,7 +377,7 @@ fn record(
     fields: Fields,
     op: &str,
 ) -> Result<SourceRecord, Refusal> {
-    let id = header.item_id();
+    let id = header.item_id()?;
     let mut reminder_due = None;
     let item = match (header.class, fields) {
         (Class::Appointment, Fields::Appointment(mut event)) => {
