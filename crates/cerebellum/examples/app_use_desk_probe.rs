@@ -631,6 +631,166 @@ fn selection_line(
     line
 }
 
+/// The text the probe types into the scratch document, kept out of the log.
+fn redact_typed_text(text: &str, typed: &str) -> String {
+    if typed.is_empty() {
+        return text.to_string();
+    }
+    text.replace(typed, "<typed text>")
+}
+
+/// Whether resetting the scratch selection to a caret worked before an
+/// attempt, and where the caret is.
+fn caret_reset_line(attempt: usize, caret: &Result<usize, String>) -> String {
+    match caret {
+        Ok(at) => format!(
+            "RECORD needs-front attempt {attempt}: selection reset to caret at={at} (UTF-16)"
+        ),
+        Err(reason) => format!(
+            "RECORD needs-front attempt {attempt}: selection reset failed: {}",
+            reason.replace(['\r', '\n'], " ")
+        ),
+    }
+}
+
+/// What Command-A did to the selection: `selected_all` when a caret became
+/// the whole text, `unchanged` when the range stayed the same, `other` for any
+/// other range, and `not_judged` when either side was unreadable or the
+/// attempt did not start from a caret in non-empty text.
+fn select_all_effect(
+    before: &Result<TextSelection, String>,
+    after: &Result<TextSelection, String>,
+) -> &'static str {
+    let (Ok(before), Ok(after)) = (before, after) else {
+        return "not_judged";
+    };
+    if before.length != 0 || before.text_length == 0 {
+        return "not_judged";
+    }
+    if after.start == 0 && after.length == after.text_length {
+        "selected_all"
+    } else if (after.start, after.length) == (before.start, before.length) {
+        "unchanged"
+    } else {
+        "other"
+    }
+}
+
+fn select_all_line(
+    attempt: usize,
+    before: &Result<TextSelection, String>,
+    after: &Result<TextSelection, String>,
+) -> String {
+    format!(
+        "RECORD needs-front attempt {attempt}: select_all effect={}",
+        select_all_effect(before, after)
+    )
+}
+
+/// Whether the Edit menu title was highlighted right after the chord
+/// returned. Recorded apart from the selection: the highlight shows AppKit
+/// matched the key equivalent, not that Select All took effect.
+fn edit_title_line(attempt: usize, highlighted: &Result<bool, String>) -> String {
+    match highlighted {
+        Ok(true) => format!("RECORD needs-front attempt {attempt}: edit_title_highlight=seen"),
+        Ok(false) => format!("RECORD needs-front attempt {attempt}: edit_title_highlight=not_seen"),
+        Err(reason) => format!(
+            "RECORD needs-front attempt {attempt}: edit_title_highlight=unreadable ({})",
+            reason.replace(['\r', '\n'], " ")
+        ),
+    }
+}
+
+/// The zoomed element's line from a reply's state text, without its value:
+/// its id, role and states. `None` when the element is not in the text.
+fn zoomed_element_summary<'a>(state_text: &'a str, element_id: &str) -> Option<&'a str> {
+    state_text.lines().find_map(|line| {
+        let start = line.find(&format!("{element_id} "))?;
+        let at_start = line[..start]
+            .chars()
+            .last()
+            .is_none_or(|before| before.is_whitespace());
+        if !at_start {
+            return None;
+        }
+        let element = &line[start..];
+        Some(
+            element
+                .split(", Value:")
+                .next()
+                .unwrap_or(element)
+                .trim_end(),
+        )
+    })
+}
+
+fn zoomed_read_line(attempt: usize, reply: &Value, element_id: Option<&str>) -> String {
+    let summary = element_id.and_then(|id| {
+        zoomed_element_summary(reply["state_text"].as_str().unwrap_or_default(), id)
+    });
+    format!(
+        "RECORD needs-front attempt {attempt}: zoomed read state_report={} focused_element_id={} element={}",
+        reply["state_report"],
+        reply["focused_element_id"],
+        summary.unwrap_or("absent")
+    )
+}
+
+/// How long the target had been confirmed frontmost when the chord's first
+/// keystroke was posted, both in ms from the front request.
+fn front_to_post_line(
+    attempt: usize,
+    confirmed_front: Option<f64>,
+    first_post: Option<f64>,
+) -> String {
+    match (confirmed_front, first_post) {
+        (Some(front), Some(post)) => format!(
+            "RECORD needs-front attempt {attempt}: frontmost confirmed→first post {:.3} ms (first post at_ms={post:.3})",
+            post - front
+        ),
+        (None, Some(post)) => format!(
+            "RECORD needs-front attempt {attempt}: first post at_ms={post:.3} with no in-call frontmost confirmation"
+        ),
+        (_, None) => format!("RECORD needs-front attempt {attempt}: no post observed"),
+    }
+}
+
+/// When the scratch text area reported selection changes, in ms from the
+/// front request, and how long after the first post the first one came.
+fn selection_change_line(attempt: usize, changes_ms: &[f64], first_post: Option<f64>) -> String {
+    let Some(first) = changes_ms.iter().copied().reduce(f64::min) else {
+        return format!("RECORD needs-front attempt {attempt}: no selection change observed");
+    };
+    let mut line = format!(
+        "RECORD needs-front attempt {attempt}: selection_changed count={} first_at_ms={first:.3}",
+        changes_ms.len()
+    );
+    if let Some(post) = first_post {
+        line.push_str(&format!(" (first post→change {:.3} ms)", first - post));
+    }
+    line
+}
+
+/// One ScreenCaptureKit window-list request: where in the probe's startup it
+/// ran, on which thread, what came back and how long it took. The baseline
+/// process's list requests have timed out while the main run's arrived, and
+/// these lines show which threads and stages get an answer.
+fn window_list_line(
+    stage: &str,
+    thread: &str,
+    result: &Result<usize, String>,
+    elapsed: Duration,
+) -> String {
+    let outcome = match result {
+        Ok(count) => format!("windows={count}"),
+        Err(reason) => format!("error={}", reason.replace(['\r', '\n'], " ")),
+    };
+    format!(
+        "RECORD window-list check stage={stage} thread={thread} {outcome} elapsed_ms={:.3}",
+        elapsed.as_secs_f64() * 1000.0
+    )
+}
+
 /// A background-mode action that is not a needs-front action completed
 /// without fronting anything.
 fn background_reply_verdict(action: &str, reply: &Value) -> Result<(), String> {
@@ -761,6 +921,26 @@ mod desk {
     const SAMPLE_EVERY: Duration = Duration::from_millis(100);
     const FRONT_CLEANUP_SPACING: Duration =
         Duration::from_millis(cerebellum::budgets::LATE_ACTIVATION_WATCH_MS + 100);
+    /// After the selection is reset to a caret, long enough for its own
+    /// selection-change notification to arrive before the chord's are counted.
+    const CARET_SETTLE: Duration = Duration::from_millis(300);
+    /// Each window-list check waits at most this long for ScreenCaptureKit.
+    const WINDOW_LIST_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// The calling thread's name and id, for the window-list checks.
+    fn thread_label() -> String {
+        let thread = std::thread::current();
+        format!("{}/{:?}", thread.name().unwrap_or("unnamed"), thread.id())
+    }
+
+    /// Ask ScreenCaptureKit for the window list once from this thread and
+    /// say what came back.
+    fn window_list_check(stage: &str) -> String {
+        let started = Instant::now();
+        let result = cerebellum_macos::enumerate_windows(WINDOW_LIST_CHECK_TIMEOUT)
+            .map(|windows| windows.len());
+        window_list_line(stage, &thread_label(), &result, started.elapsed())
+    }
 
     /// Private files are outside $TMPDIR, where signing can hang on this Mac.
     struct ScratchFiles {
@@ -843,6 +1023,21 @@ mod desk {
         fn selection(&self) -> Result<TextSelection, String> {
             scratch_ownership(&self.identity)?;
             sys::text_selection(self.pid(), &self.identity.files.document_url)
+        }
+
+        fn reset_to_caret(&self) -> Result<usize, String> {
+            scratch_ownership(&self.identity)?;
+            sys::reset_to_caret(self.pid(), &self.identity.files.document_url)
+        }
+
+        fn edit_title_highlighted(&self) -> Result<bool, String> {
+            scratch_ownership(&self.identity)?;
+            sys::edit_title_highlighted(self.pid())
+        }
+
+        fn observe_selection(&self) -> Result<sys::SelectionObserver, String> {
+            scratch_ownership(&self.identity)?;
+            sys::SelectionObserver::start(self.pid(), &self.identity.files.document_url)
         }
 
         fn finish(&mut self) -> bool {
@@ -1181,6 +1376,20 @@ mod desk {
             fn AXValueGetTypeID() -> usize;
             fn AXValueGetType(value: CfRef) -> u32;
             fn AXValueGetValue(value: CfRef, kind: u32, output: *mut c_void) -> u8;
+            fn AXValueCreate(kind: u32, value: *const c_void) -> CfRef;
+            fn AXUIElementSetAttributeValue(element: CfRef, attribute: CfRef, value: CfRef) -> i32;
+            fn AXObserverCreate(
+                pid: i32,
+                callback: extern "C" fn(CfRef, CfRef, CfRef, *mut c_void),
+                observer: *mut CfRef,
+            ) -> i32;
+            fn AXObserverAddNotification(
+                observer: CfRef,
+                element: CfRef,
+                notification: CfRef,
+                refcon: *mut c_void,
+            ) -> i32;
+            fn AXObserverGetRunLoopSource(observer: CfRef) -> CfRef;
         }
 
         #[link(name = "CoreFoundation", kind = "framework")]
@@ -1210,6 +1419,12 @@ mod desk {
             fn CFDictionaryGetTypeID() -> usize;
             fn CFRelease(value: CfRef);
             fn CFRetain(value: CfRef) -> CfRef;
+            fn CFBooleanGetTypeID() -> usize;
+            fn CFBooleanGetValue(value: CfRef) -> u8;
+            fn CFRunLoopGetMain() -> CfRef;
+            fn CFRunLoopAddSource(run_loop: CfRef, source: CfRef, mode: CfRef);
+            fn CFRunLoopRemoveSource(run_loop: CfRef, source: CfRef, mode: CfRef);
+            static kCFRunLoopDefaultMode: CfRef;
         }
 
         const UTF8: u32 = 0x0800_0100;
@@ -1396,7 +1611,7 @@ mod desk {
             pid: i32,
             depth: usize,
             remaining: &mut usize,
-            found: &mut Vec<TextSelection>,
+            found: &mut Vec<Owned>,
         ) -> Result<(), String> {
             if depth > 12 || *remaining == 0 {
                 return Err("scratch AX tree exceeds depth/node limit".into());
@@ -1404,7 +1619,8 @@ mod desk {
             *remaining -= 1;
             let role = ax_attribute(element, "AXRole")?;
             if string_text(role.0).as_deref() == Some("AXTextArea") {
-                found.push(selected_range(element)?);
+                // SAFETY: element is a live AX element; keep one more retain.
+                found.push(Owned(unsafe { CFRetain(element.0) }));
             } else {
                 for child in ax_elements(element, "AXChildren", pid)? {
                     find_text_areas(&child, pid, depth + 1, remaining, found)?;
@@ -1413,8 +1629,9 @@ mod desk {
             Ok(())
         }
 
-        /// Read the selection without focusing, fronting or changing any AX value.
-        pub fn text_selection(pid: u32, expected_document: &str) -> Result<TextSelection, String> {
+        /// The scratch document's one text area, found without focusing,
+        /// fronting or changing anything.
+        fn scratch_text_area(pid: u32, expected_document: &str) -> Result<Owned, String> {
             let pid = i32::try_from(pid).map_err(|_| "pid out of range")?;
             // SAFETY: creates an owned application reference for the scratch pid.
             let app = unsafe { AXUIElementCreateApplication(pid) };
@@ -1452,12 +1669,167 @@ mod desk {
             }
             let mut found = Vec::new();
             find_text_areas(window, pid, 0, &mut 128, &mut found)?;
-            match found.as_slice() {
-                [selection] => Ok(*selection),
-                _ => Err(format!(
-                    "expected one scratch AXTextArea, found {}",
-                    found.len()
-                )),
+            let count = found.len();
+            match <[Owned; 1]>::try_from(found) {
+                Ok([text_area]) => Ok(text_area),
+                Err(_) => Err(format!("expected one scratch AXTextArea, found {count}")),
+            }
+        }
+
+        /// Read the selection without focusing, fronting or changing any AX value.
+        pub fn text_selection(pid: u32, expected_document: &str) -> Result<TextSelection, String> {
+            selected_range(&scratch_text_area(pid, expected_document)?)
+        }
+
+        /// Put the scratch text area's selection back to a caret at the end
+        /// of its text, so the next Command-A has something to select.
+        /// Returns the caret position in UTF-16 units. Fronts nothing.
+        pub fn reset_to_caret(pid: u32, expected_document: &str) -> Result<usize, String> {
+            const CF_RANGE: u32 = 4;
+            let text_area = scratch_text_area(pid, expected_document)?;
+            let end = selected_range(&text_area)?.text_length;
+            let range = CfRange {
+                location: isize::try_from(end).map_err(|_| "text too long")?,
+                length: 0,
+            };
+            // SAFETY: range is a live CFRange; returns one owned AXValue or null.
+            let value = unsafe { AXValueCreate(CF_RANGE, (&range as *const CfRange).cast()) };
+            if value.is_null() {
+                return Err("caret AXValue could not be created".into());
+            }
+            let value = Owned(value);
+            let attribute = string("AXSelectedTextRange");
+            // SAFETY: element, attribute and value are live for the call.
+            let code = unsafe { AXUIElementSetAttributeValue(text_area.0, attribute.0, value.0) };
+            if code != 0 {
+                return Err(format!("AXSelectedTextRange set: AX error {code}"));
+            }
+            Ok(end)
+        }
+
+        /// Whether the scratch app's Edit menu title is highlighted
+        /// (`AXSelected` on its menu bar item), as AppKit shows it while it
+        /// handles a key equivalent from that menu.
+        pub fn edit_title_highlighted(pid: u32) -> Result<bool, String> {
+            let pid = i32::try_from(pid).map_err(|_| "pid out of range")?;
+            // SAFETY: creates an owned application reference for the scratch pid.
+            let app = unsafe { AXUIElementCreateApplication(pid) };
+            if app.is_null() {
+                return Err("AX application is null".into());
+            }
+            let app = Owned(app);
+            // SAFETY: app is a live AX element; bound its messages.
+            let code = unsafe { AXUIElementSetMessagingTimeout(app.0, 0.5) };
+            if code != 0 {
+                return Err(format!("app timeout setup: AX error {code}"));
+            }
+            let menu_bar = ax_attribute(&app, "AXMenuBar")?;
+            // SAFETY: menu_bar is a live CF value, checked before AX use.
+            if unsafe { CFGetTypeID(menu_bar.0) != AXUIElementGetTypeID() } {
+                return Err("AXMenuBar is not an AX element".into());
+            }
+            for item in ax_elements(&menu_bar, "AXChildren", pid)? {
+                let title = ax_attribute(&item, "AXTitle")?;
+                if string_text(title.0).as_deref() != Some("Edit") {
+                    continue;
+                }
+                let selected = ax_attribute(&item, "AXSelected")?;
+                // SAFETY: selected is live and checked before CFBoolean access.
+                if unsafe { CFGetTypeID(selected.0) != CFBooleanGetTypeID() } {
+                    return Err("Edit AXSelected is not a boolean".into());
+                }
+                // SAFETY: selected is a live CFBoolean.
+                return Ok(unsafe { CFBooleanGetValue(selected.0) } != 0);
+            }
+            Err("no Edit menu bar item".into())
+        }
+
+        /// When the scratch text area reported a selection change, noted on
+        /// the main run loop the probe keeps turning.
+        static SELECTION_CHANGES: std::sync::Mutex<Vec<std::time::Instant>> =
+            std::sync::Mutex::new(Vec::new());
+
+        extern "C" fn selection_changed(
+            _observer: CfRef,
+            _element: CfRef,
+            _notification: CfRef,
+            _refcon: *mut c_void,
+        ) {
+            SELECTION_CHANGES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(std::time::Instant::now());
+        }
+
+        /// Drain the selection changes noted since the last drain.
+        pub fn take_selection_changes() -> Vec<std::time::Instant> {
+            std::mem::take(
+                &mut *SELECTION_CHANGES
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        }
+
+        /// An accessibility observer for the scratch text area's
+        /// `AXSelectedTextChanged`, delivered on the main run loop. It reads
+        /// no text. Removed from the run loop when dropped.
+        pub struct SelectionObserver {
+            observer: Owned,
+            _text_area: Owned,
+        }
+
+        impl SelectionObserver {
+            pub fn start(pid: u32, expected_document: &str) -> Result<Self, String> {
+                let text_area = scratch_text_area(pid, expected_document)?;
+                let pid = i32::try_from(pid).map_err(|_| "pid out of range")?;
+                let mut observer = std::ptr::null();
+                // SAFETY: the callback has AXObserverCallback's signature;
+                // observer is an output slot that receives one retain.
+                let code = unsafe { AXObserverCreate(pid, selection_changed, &mut observer) };
+                if code != 0 || observer.is_null() {
+                    return Err(format!("AXObserverCreate: AX error {code}"));
+                }
+                let observer = Owned(observer);
+                let notification = string("AXSelectedTextChanged");
+                // SAFETY: observer, element and notification are live.
+                let code = unsafe {
+                    AXObserverAddNotification(
+                        observer.0,
+                        text_area.0,
+                        notification.0,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if code != 0 {
+                    return Err(format!("AXObserverAddNotification: AX error {code}"));
+                }
+                // SAFETY: the observer owns its source; the main run loop
+                // retains it while added.
+                unsafe {
+                    CFRunLoopAddSource(
+                        CFRunLoopGetMain(),
+                        AXObserverGetRunLoopSource(observer.0),
+                        kCFRunLoopDefaultMode,
+                    );
+                }
+                Ok(Self {
+                    observer,
+                    _text_area: text_area,
+                })
+            }
+        }
+
+        impl Drop for SelectionObserver {
+            fn drop(&mut self) {
+                // SAFETY: the observer is live and its source was added to the
+                // main run loop in this mode.
+                unsafe {
+                    CFRunLoopRemoveSource(
+                        CFRunLoopGetMain(),
+                        AXObserverGetRunLoopSource(self.observer.0),
+                        kCFRunLoopDefaultMode,
+                    );
+                }
             }
         }
 
@@ -1741,6 +2113,10 @@ mod desk {
                 return 2;
             }
         };
+        // Where ScreenCaptureKit's window list arrives: here on the main
+        // thread after AppKit starts, then from the measurement's worker
+        // thread while the main thread pumps, then from a Tokio worker.
+        println!("{}", window_list_check("main_thread_after_appkit_startup"));
         println!(
             "TIME BUDGET: allow about {} s (launch {} s, covering the window up to {} s, \
              {} needs-front attempts per run with {} ms cleanup spacing, \
@@ -1842,6 +2218,7 @@ mod desk {
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             cerebellum_macos::with_app_use_desk_probe_run_loop(|| {
+                println!("{}", window_list_check("std_thread_while_main_pumps"));
                 runtime.block_on(measure(&scratch, person, baseline))
             })
         }));
@@ -1951,6 +2328,12 @@ mod desk {
 
     /// Every phase against the scratch app. Returns the process exit code.
     async fn measure(scratch: &Scratch, person: i32, baseline: bool) -> i32 {
+        match tokio::spawn(async { window_list_check("tokio_worker_at_measure_start") }).await {
+            Ok(line) => println!("{line}"),
+            Err(error) => println!(
+                "RECORD window-list check stage=tokio_worker_at_measure_start did not run: {error}"
+            ),
+        }
         let target_pid = scratch.pid();
         let audit = match computer_audit(JournalPersistence::Isolated) {
             Ok(audit) => audit,
@@ -2088,20 +2471,24 @@ mod desk {
             .unwrap_or_default()
             .to_string();
         let text_area = settable_text_area_id(&tree);
+        // Written into the scratch document; redacted wherever a reply that
+        // may quote it is printed.
+        let typed = format!("app use desk probe {}", std::process::id());
         match text_area {
             Some(element_id) => {
                 let write = serve(
                     "computer.write_text",
                     json!({
                         "element_id": element_id,
-                        "text": format!("app use desk probe {}", std::process::id()),
+                        "text": typed,
                         "write_mode": "replace_value",
                     }),
                 )
                 .await;
                 report.check(
                     "background write_text fronts nothing",
-                    background_reply_verdict("write_text", &write),
+                    background_reply_verdict("write_text", &write)
+                        .map_err(|reason| redact_typed_text(&reason, &typed)),
                 );
             }
             None => report.check(
@@ -2126,20 +2513,48 @@ mod desk {
         // Discard any observations from the preceding background-only calls.
         let _ = cerebellum::desk_probe::take_fronting_timings();
         let _ = cerebellum::desk_probe::take_fronting_landings();
+        let text_area_id = text_area.map(str::to_owned);
+        // Kept for the whole attempt loop and removed from the run loop when
+        // dropped after it.
+        let selection_observer = match scratch.observe_selection() {
+            Ok(observer) => Some(observer),
+            Err(reason) => {
+                println!("RECORD selection observer unavailable: {reason}");
+                None
+            }
+        };
         let mut attempts = Vec::with_capacity(NEEDS_FRONT_ATTEMPTS);
         for attempt in 1..=NEEDS_FRONT_ATTEMPTS {
+            // Every attempt starts from a caret, so its selection afterwards
+            // shows whether this Command-A selected all.
+            println!("{}", caret_reset_line(attempt, &scratch.reset_to_caret()));
+            tokio::time::sleep(CARET_SETTLE).await;
+            let _ = sys::take_selection_changes();
             let selection_before = scratch.selection();
+            // The reply's state is read zoomed to the text area, so the
+            // chord is judged by the focused element rather than the whole
+            // tree, where the Edit menu's highlight appears.
+            let mut arguments = json!({"target": TEXTEDIT_BUNDLE, "keys": ["command", "a"]});
+            if let Some(id) = &text_area_id {
+                arguments["zoom"] = json!(id);
+            }
             sampler.needs_front.store(true, Ordering::SeqCst);
-            let chord = serve(
-                "computer.keys",
-                json!({"target": TEXTEDIT_BUNDLE, "keys": ["command", "a"]}),
-            )
-            .await;
+            let chord = serve("computer.keys", arguments).await;
             sampler.needs_front.store(false, Ordering::SeqCst);
+            let edit_title = scratch.edit_title_highlighted();
             let selection_after = scratch.selection();
             println!(
                 "{}",
                 selection_line(attempt, &selection_before, &selection_after)
+            );
+            println!(
+                "{}",
+                select_all_line(attempt, &selection_before, &selection_after)
+            );
+            println!("{}", edit_title_line(attempt, &edit_title));
+            println!(
+                "{}",
+                zoomed_read_line(attempt, &chord, text_area_id.as_deref())
             );
             println!(
                 "RECORD needs-front attempt {attempt}: outcome={} effect_status={} fronting={}",
@@ -2147,9 +2562,11 @@ mod desk {
             );
             report.check(
                 "needs-front chord fronts, sends and restores",
-                needs_front_reply_verdict(&chord),
+                needs_front_reply_verdict(&chord)
+                    .map_err(|reason| redact_typed_text(&reason, &typed)),
             );
             tokio::time::sleep(FRONT_CLEANUP_SPACING).await;
+            let selection_changes = sys::take_selection_changes();
             for (pid, latency) in cerebellum::desk_probe::take_fronting_landings() {
                 println!("RECORD needs-front attempt {attempt}: pid {pid} pending activation landed {latency} ms after request");
             }
@@ -2160,6 +2577,24 @@ mod desk {
                     for line in timing.record_lines(attempt) {
                         println!("{line}");
                     }
+                    println!(
+                        "{}",
+                        front_to_post_line(attempt, timing.confirmed_front_ms, timing.first_post_ms)
+                    );
+                    let changes_ms: Vec<f64> = timing
+                        .front_requested_at
+                        .map(|front| {
+                            selection_changes
+                                .iter()
+                                .filter_map(|at| at.checked_duration_since(front))
+                                .map(|since| since.as_secs_f64() * 1000.0)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "{}",
+                        selection_change_line(attempt, &changes_ms, timing.first_post_ms)
+                    );
                     measured.front_ms = timing.confirmed_front_ms.or(timing.late_landing_ms);
                     match timing.confirmed_front_ms {
                         Some(ms) => println!("RECORD needs-front attempt {attempt}: request→confirmed-frontmost {ms:.3} ms (in call)"),
@@ -2192,10 +2627,12 @@ mod desk {
             attempts.push(measured);
         }
         print_needs_front_summary(&attempts);
+        drop(selection_observer);
         let last = serve("computer.read_state", json!({"target": TEXTEDIT_BUNDLE})).await;
         report.check(
             "background read_state after the chord fronts nothing",
-            background_reply_verdict("read_state", &last),
+            background_reply_verdict("read_state", &last)
+                .map_err(|reason| redact_typed_text(&reason, &typed)),
         );
         tokio::time::sleep(Duration::from_secs(1)).await;
         let samples = sampler.finish();
@@ -2792,6 +3229,144 @@ mod tests {
     }
 
     #[test]
+    fn select_all_is_judged_only_from_a_caret_in_non_empty_text() {
+        let range = |start, length| {
+            Ok::<_, String>(TextSelection {
+                start,
+                length,
+                text_length: 24,
+            })
+        };
+        assert_eq!(
+            select_all_effect(&range(24, 0), &range(0, 24)),
+            "selected_all"
+        );
+        assert_eq!(select_all_effect(&range(24, 0), &range(24, 0)), "unchanged");
+        assert_eq!(select_all_effect(&range(24, 0), &range(3, 2)), "other");
+        // Already selected before the chord: no change could show.
+        assert_eq!(
+            select_all_effect(&range(0, 24), &range(0, 24)),
+            "not_judged"
+        );
+        assert_eq!(
+            select_all_effect(&range(24, 0), &Err("AX error".into())),
+            "not_judged"
+        );
+        let empty = Ok(TextSelection {
+            start: 0,
+            length: 0,
+            text_length: 0,
+        });
+        assert_eq!(select_all_effect(&empty, &empty), "not_judged");
+        assert_eq!(
+            select_all_line(4, &range(24, 0), &range(0, 24)),
+            "RECORD needs-front attempt 4: select_all effect=selected_all"
+        );
+    }
+
+    #[test]
+    fn caret_and_edit_title_lines_name_their_result_or_reason() {
+        assert_eq!(
+            caret_reset_line(2, &Ok(24)),
+            "RECORD needs-front attempt 2: selection reset to caret at=24 (UTF-16)"
+        );
+        assert_eq!(
+            caret_reset_line(2, &Err("AX error\n-25200".into())),
+            "RECORD needs-front attempt 2: selection reset failed: AX error -25200"
+        );
+        assert_eq!(
+            edit_title_line(3, &Ok(true)),
+            "RECORD needs-front attempt 3: edit_title_highlight=seen"
+        );
+        assert_eq!(
+            edit_title_line(3, &Ok(false)),
+            "RECORD needs-front attempt 3: edit_title_highlight=not_seen"
+        );
+        assert_eq!(
+            edit_title_line(3, &Err("no Edit menu bar item".into())),
+            "RECORD needs-front attempt 3: edit_title_highlight=unreadable (no Edit menu bar item)"
+        );
+    }
+
+    #[test]
+    fn the_zoomed_read_line_keeps_role_and_states_but_never_the_value() {
+        let typed = "app use desk probe 58798";
+        let reply = json!({
+            "state_report": "diff",
+            "focused_element_id": "iq3",
+            "state_text": format!(
+                "Removed element IDs: iq30\nfocused: iq3 text area (settable, focused), Value: {typed}\n"
+            ),
+        });
+        let line = zoomed_read_line(5, &reply, Some("iq3"));
+        assert_eq!(
+            line,
+            "RECORD needs-front attempt 5: zoomed read state_report=\"diff\" focused_element_id=\"iq3\" element=iq3 text area (settable, focused)"
+        );
+        assert!(!line.contains(typed));
+        // A longer id that merely ends with the zoomed one is not it.
+        assert_eq!(zoomed_element_summary("xiq3 button", "iq3"), None);
+        assert!(zoomed_read_line(5, &reply, None).ends_with("element=absent"));
+        assert_eq!(
+            redact_typed_text(&format!("reply: {reply}"), typed)
+                .matches("<typed text>")
+                .count(),
+            1
+        );
+        assert!(!redact_typed_text(&format!("reply: {reply}"), typed).contains(typed));
+    }
+
+    #[test]
+    fn post_and_selection_timing_lines_relate_to_the_front_request_and_first_post() {
+        assert_eq!(
+            front_to_post_line(6, Some(25.5), Some(28.0)),
+            "RECORD needs-front attempt 6: frontmost confirmed→first post 2.500 ms (first post at_ms=28.000)"
+        );
+        assert_eq!(
+            front_to_post_line(6, None, Some(28.0)),
+            "RECORD needs-front attempt 6: first post at_ms=28.000 with no in-call frontmost confirmation"
+        );
+        assert_eq!(
+            front_to_post_line(6, Some(25.5), None),
+            "RECORD needs-front attempt 6: no post observed"
+        );
+        assert_eq!(
+            selection_change_line(7, &[40.0, 31.0], Some(28.0)),
+            "RECORD needs-front attempt 7: selection_changed count=2 first_at_ms=31.000 (first post→change 3.000 ms)"
+        );
+        assert_eq!(
+            selection_change_line(7, &[31.0], None),
+            "RECORD needs-front attempt 7: selection_changed count=1 first_at_ms=31.000"
+        );
+        assert_eq!(
+            selection_change_line(7, &[], Some(28.0)),
+            "RECORD needs-front attempt 7: no selection change observed"
+        );
+    }
+
+    #[test]
+    fn window_list_lines_name_stage_thread_and_result() {
+        assert_eq!(
+            window_list_line(
+                "tokio_worker_at_measure_start",
+                "tokio-runtime-worker/ThreadId(4)",
+                &Ok(397),
+                Duration::from_micros(12_500)
+            ),
+            "RECORD window-list check stage=tokio_worker_at_measure_start thread=tokio-runtime-worker/ThreadId(4) windows=397 elapsed_ms=12.500"
+        );
+        assert_eq!(
+            window_list_line(
+                "std_thread_while_main_pumps",
+                "unnamed/ThreadId(2)",
+                &Err("the window list did not arrive\nwithin 2s".into()),
+                Duration::from_secs(2)
+            ),
+            "RECORD window-list check stage=std_thread_while_main_pumps thread=unnamed/ThreadId(2) error=the window list did not arrive within 2s elapsed_ms=2000.000"
+        );
+    }
+
+    #[test]
     fn selection_line_reports_both_ranges_and_utf16_text_lengths() {
         let before = Ok(TextSelection {
             start: 2,
@@ -2944,7 +3519,7 @@ fn timing_summary_p90_is_nearest_rank_for_twenty_unsorted_attempts() {
             max: 20.0,
         })
     );
-    assert!(NEEDS_FRONT_ATTEMPTS >= 20);
+    const { assert!(NEEDS_FRONT_ATTEMPTS >= 20) };
 }
 
 #[test]
