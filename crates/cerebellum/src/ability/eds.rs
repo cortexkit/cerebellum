@@ -1,8 +1,9 @@
 //! Host-neutral EDS reads. The native D-Bus adapter supplies a request-local bus.
 
-// No native bus factory is installed yet. Keep the seam available on every host
-// so its fake exercises the same filtering and parsers as the eventual adapter.
-#![cfg_attr(not(test), allow(dead_code))]
+#![cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+
+#[cfg(target_os = "linux")]
+mod native;
 
 use std::{cell::RefCell, sync::Arc};
 
@@ -67,6 +68,12 @@ pub(super) struct Source {
 /// NO_AUTO_START on every EDS call, even after its owner check succeeds.
 pub(super) trait BusFactory: Send + Sync + 'static {
     fn connect(&self) -> Result<Box<dyn Bus>, Refusal>;
+    fn connect_for_call(
+        &self,
+        _gate: Option<Arc<TerminalArbiter>>,
+    ) -> Result<Box<dyn Bus>, Refusal> {
+        self.connect()
+    }
 }
 
 pub(super) trait Bus {
@@ -81,8 +88,8 @@ pub(super) trait Bus {
 /// attachment, not from the request scope or from a scope-wide multi-source view.
 pub(super) trait Client {
     fn source_uid(&self) -> &str;
-    /// Each string is one vCard, or one calendar UID's complete object including
-    /// its master, every detached override and referenced VTIMEZONE definitions.
+    /// Each string is one vCard, or a calendar snapshot including complete UID
+    /// series: masters, detached overrides and referenced VTIMEZONE definitions.
     fn objects(&mut self) -> Result<Vec<String>, Refusal>;
     fn object(&mut self, uid: &str) -> Result<Option<String>, Refusal>;
 }
@@ -92,6 +99,14 @@ pub(super) struct EdsSource {
 }
 
 impl EdsSource {
+    pub(super) fn production() -> Self {
+        #[cfg(target_os = "linux")]
+        let factory = Some(Arc::new(native::Factory) as Arc<dyn BusFactory>);
+        #[cfg(not(target_os = "linux"))]
+        let factory = None;
+        Self::new(factory)
+    }
+
     pub(super) fn new(factory: Option<Arc<dyn BusFactory>>) -> Self {
         Self { factory }
     }
@@ -101,7 +116,7 @@ impl EdsSource {
             .factory
             .as_ref()
             .ok_or(Refusal::Unavailable("data_service_missing"))?
-            .connect()?;
+            .connect_for_call(gate.clone())?;
         Ok(Access {
             bus: RefCell::new(bus),
             gate,

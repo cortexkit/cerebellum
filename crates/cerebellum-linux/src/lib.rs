@@ -1,13 +1,16 @@
-//! A narrow seam over Linux process primitives, and nothing else.
+//! Narrow seams over Linux process primitives and the read-only EDS transport.
 //!
 //! This crate exists so the platform-neutral crates can keep their exact
 //! `#![forbid(unsafe_code)]` boundary. It returns raw process readings and
-//! performs the small ptrace barrier that requires syscalls. It decides nothing:
-//! callers decide what a path, digest, build ID, or missing reading means.
+//! performs the small ptrace barrier that requires syscalls. Its EDS transport
+//! exposes raw source objects without depending on cerebellum's ability policy.
+//! Callers decide what a path, digest, build ID, or missing reading means.
 //!
 //! Keep additions here small and mechanical. This crate is the auditable place
 //! for platform calls, not a place to move browser policy.
 
+#[cfg(target_os = "linux")]
+pub mod eds;
 // The exec-stop state machine has no syscalls, so its loop and bounds remain
 // testable where launching a Linux tracee is impossible.
 #[cfg(any(target_os = "linux", test))]

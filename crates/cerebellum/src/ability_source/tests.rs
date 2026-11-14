@@ -328,8 +328,17 @@ async fn stop_after_acquisition_starts_nothing_but_dispatched_work_finishes_with
 
 #[tokio::test(start_paused = true)]
 async fn source_gets_its_own_deadline_then_quarantines_without_a_second_worker() {
+    deadline_quarantine(UnitKind::Outlook).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn eds_source_deadline_quarantines_all_tokens_without_a_second_worker() {
+    deadline_quarantine(UnitKind::Eds).await;
+}
+
+async fn deadline_quarantine(kind: UnitKind) {
     assert_eq!(SOURCE_LIMIT, Duration::from_secs(10));
-    let unit = SourceUnit::new(UnitKind::Outlook);
+    let unit = SourceUnit::new(kind);
     let source = Arc::new(Fake::default());
     let holder = lease(&unit).await;
     let delayed = unit.arrive(gate()).unwrap();

@@ -41,13 +41,13 @@ impl std::fmt::Display for ParseError {
 }
 impl std::error::Error for ParseError {}
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Property {
     pub name: String,
     pub params: BTreeMap<String, String>,
     pub value: String,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Component {
     pub name: String,
     pub properties: Vec<Property>,
@@ -70,6 +70,140 @@ impl Component {
     }
     fn required(&self, name: &str) -> Result<&Property, ParseError> {
         self.one(name)?.ok_or(ParseError::Unsupported)
+    }
+}
+
+fn eds_components(texts: &[String]) -> Result<Vec<Component>, ParseError> {
+    let mut result = Vec::new();
+    for text in texts {
+        for root in components(text)? {
+            if root.name == "VCALENDAR" {
+                result.extend(root.children);
+            } else {
+                result.push(root);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// EDS can return bare components without their VTIMEZONE definitions. Fetch
+/// only referenced definitions not already carried by the source snapshot.
+pub fn eds_missing_time_zones(texts: &[String]) -> Result<Vec<String>, ParseError> {
+    fn collect(component: &Component, ids: &mut BTreeSet<String>) {
+        for p in &component.properties {
+            if let Some(id) = p.params.get("TZID") {
+                ids.insert(id.clone());
+            }
+        }
+        for child in &component.children {
+            collect(child, ids);
+        }
+    }
+    let components = eds_components(texts)?;
+    let mut referenced = BTreeSet::new();
+    let mut defined = BTreeSet::new();
+    for component in components {
+        if component.name == "VTIMEZONE" {
+            defined.insert(component.text("TZID")?.ok_or(ParseError::Unsupported)?);
+        } else {
+            collect(&component, &mut referenced);
+        }
+    }
+    Ok(referenced.difference(&defined).cloned().collect())
+}
+
+/// Join one EDS source's object list before projecting it. Detached overrides
+/// must be parsed with their masters, not as independent events. Repeated,
+/// identical zone definitions are harmless; conflicting ones fail closed.
+pub fn join_eds_objects(texts: &[String]) -> Result<String, ParseError> {
+    fn render(component: &Component, out: &mut String) -> Result<(), ParseError> {
+        out.push_str(&format!("BEGIN:{}\r\n", component.name));
+        for p in &component.properties {
+            out.push_str(&p.name);
+            for (key, value) in &p.params {
+                if value.contains('"') {
+                    return Err(ParseError::Unsupported);
+                }
+                out.push_str(&format!(";{key}=\"{value}\""));
+            }
+            out.push(':');
+            out.push_str(&p.value);
+            out.push_str("\r\n");
+        }
+        for child in &component.children {
+            render(child, out)?;
+        }
+        out.push_str(&format!("END:{}\r\n", component.name));
+        Ok(())
+    }
+    let mut zones = BTreeMap::new();
+    let mut output = String::new();
+    for component in eds_components(texts)? {
+        if component.name == "VTIMEZONE" {
+            let id = component.text("TZID")?.ok_or(ParseError::Unsupported)?;
+            if let Some(prior) = zones.insert(id, component.clone()) {
+                if prior != component {
+                    return Err(ParseError::Unsupported);
+                }
+                continue;
+            }
+        } else if !matches!(component.name.as_str(), "VEVENT" | "VTODO") {
+            return Err(ParseError::Unsupported);
+        }
+        render(&component, &mut output)?;
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+mod eds_tests {
+    use super::*;
+
+    #[test]
+    fn ical_eds_object_lists_keep_overrides_with_masters_and_deduplicate_equal_zones() {
+        let zone = "BEGIN:VTIMEZONE\nTZID:Private/Zone\nBEGIN:STANDARD\nDTSTART:19700101T000000\nTZOFFSETFROM:+0100\nTZOFFSETTO:+0100\nEND:STANDARD\nEND:VTIMEZONE";
+        let master = "BEGIN:VEVENT\nUID:series\nDTSTART;TZID=Private/Zone:20250101T090000\nDURATION:PT1H\nRRULE:FREQ=DAILY;COUNT=2\nEND:VEVENT";
+        let detached = "BEGIN:VEVENT\nUID:series\nRECURRENCE-ID;TZID=Private/Zone:20250102T090000\nDTSTART;TZID=Private/Zone:20250102T110000\nDURATION:PT1H\nEND:VEVENT";
+        assert_eq!(
+            eds_missing_time_zones(&[master.into(), detached.into()]).unwrap(),
+            ["Private/Zone"]
+        );
+        let texts = [
+            format!("BEGIN:VCALENDAR\n{master}\n{zone}\nEND:VCALENDAR"),
+            format!("BEGIN:VCALENDAR\n{zone}\n{detached}\nEND:VCALENDAR"),
+        ];
+        assert!(eds_missing_time_zones(&texts).unwrap().is_empty());
+        let joined = join_eds_objects(&texts).unwrap();
+        let calendar = Calendar::parse(&joined, Some("Europe/Berlin")).unwrap();
+        let events = calendar
+            .events("source", 1_735_689_600_000, 1_735_948_800_000)
+            .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].start_ms, Some(1_735_718_400_000));
+        assert_eq!(events[1].start_ms, Some(1_735_812_000_000));
+        for event in events {
+            assert_eq!(calendar.event("source", &event.id).unwrap(), Some(event));
+        }
+        assert_eq!(
+            join_eds_objects(&[texts[0].clone(), zone.replace("+0100", "+0200")]),
+            Err(ParseError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn ical_eds_unresolved_zones_and_malformed_snapshots_never_become_utc() {
+        let text = "BEGIN:VEVENT\nUID:zone\nDTSTART;TZID=Unknown/Zone:20250101T090000\nEND:VEVENT";
+        let joined = join_eds_objects(&[text.into()]).unwrap();
+        let calendar = Calendar::parse(&joined, Some("Europe/Berlin")).unwrap();
+        assert_eq!(
+            calendar.events("source", 1_735_689_600_000, 1_735_948_800_000),
+            Err(ParseError::Unsupported)
+        );
+        assert_eq!(
+            join_eds_objects(&["BEGIN:VEVENT\nEND:VTODO".into()]),
+            Err(ParseError::Syntax)
+        );
     }
 }
 

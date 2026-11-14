@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
-description = "Raw Linux process readings and ptrace launch barrier for ck-cerebellum. One of two seam crates in the workspace permitted to contain unsafe code."
+description = "Linux process readings, ptrace launch barrier and read-only EDS D-Bus transport for ck-cerebellum. One of two seam crates in the workspace permitted to contain unsafe code."
+
+[features]
+desk-probe = []
 
 [lib]
 name = "cerebellum_linux"
@@ -15,3 +18,15 @@ libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sha2 = { workspace = true }
+serde = { workspace = true }
+# Pure Rust/MIT: no libdbus, GLib or EDS link-time dependency.
+zbus = { version = "=6.3.0", default-features = false, features = ["proxy", "tokio"] }
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zbus = { version = "=6.3.0", default-features = false, features = ["service", "tokio"] }
+
+[[example]]
+name = "eds_desk_probe"
+required-features = ["desk-probe"]
+test = true
