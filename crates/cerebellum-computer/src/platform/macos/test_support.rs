@@ -32,6 +32,7 @@ pub fn post_observed_pointer(
                 .expect("test action constructs native pointer events"),
         )],
         transport: MacOsPerProcessEventTransport::new(Duration::from_millis(50)),
+        visibility: VisibilityMemo::new(VISIBLE_READING_MAX_AGE),
         pointer: Some(MacPointerUnit {
             guard,
             interval_ms: 50,

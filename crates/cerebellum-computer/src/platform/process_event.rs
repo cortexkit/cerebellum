@@ -214,6 +214,42 @@ impl VisibilityMemo {
     }
 }
 
+/// The generation check, then the window-server listing through `visibility`.
+/// The generation is read first so a departed process is not mistaken for an
+/// invisible one.
+fn require_listed_generation<T: PerProcessEventTransport>(
+    target: ProcessEventTarget,
+    transport: &mut T,
+    visibility: &mut VisibilityMemo,
+) -> Result<(), ProcessEventRefusal> {
+    require_exact_generation(target, transport.process_generation(target.pid))?;
+    match visibility.read(transport, target.pid) {
+        WindowServerVisibility::Visible => Ok(()),
+        WindowServerVisibility::NotVisible => Err(ProcessEventRefusal::NotVisibleToWindowServer),
+        WindowServerVisibility::Unreadable(reason) => {
+            Err(ProcessEventRefusal::WindowServerUnreadable { reason })
+        }
+    }
+}
+
+/// Read the window-server listing for `target` before the fronting bracket
+/// brings it forward, into the memo the bracket's posts then use.
+///
+/// It is the same generation check and listing read every post makes, run
+/// early: the listing is a full window-server query (about 150 ms on a busy
+/// desktop) and the bracket bounds how long the target stays in front, so
+/// reading it after the front spends most of that bound on the query. A
+/// `Visible` answer is remembered for the memo's age as usual, and a post
+/// after it expires reads the listing again. A refusal here means nothing may
+/// be fronted or posted.
+pub fn check_listed_before_front<T: PerProcessEventTransport>(
+    target: ProcessEventTarget,
+    transport: &mut T,
+    visibility: &mut VisibilityMemo,
+) -> Result<(), ProcessEventRefusal> {
+    require_listed_generation(target, transport, visibility)
+}
+
 fn route_event_with_visibility<T: PerProcessEventTransport>(
     target: ProcessEventTarget,
     event: T::Event,
@@ -221,18 +257,8 @@ fn route_event_with_visibility<T: PerProcessEventTransport>(
     visibility: &mut VisibilityMemo,
 ) -> Result<(PostCallMade, u64), ProcessEventRefusal> {
     let mut verifications = 0_u64;
-    require_exact_generation(target, transport.process_generation(target.pid))?;
+    require_listed_generation(target, transport, visibility)?;
     verifications += 1;
-
-    match visibility.read(transport, target.pid) {
-        WindowServerVisibility::Visible => {}
-        WindowServerVisibility::NotVisible => {
-            return Err(ProcessEventRefusal::NotVisibleToWindowServer)
-        }
-        WindowServerVisibility::Unreadable(reason) => {
-            return Err(ProcessEventRefusal::WindowServerUnreadable { reason })
-        }
-    }
 
     // This is the post-time identity check. Nothing that can block or inspect
     // another subsystem occurs between this reading and the selected post call.
@@ -274,6 +300,27 @@ pub fn post_event_sequence<T: PerProcessEventTransport>(
     post_event_sequence_paced(target, steps, Duration::ZERO, transport, cancelled)
 }
 
+/// [`post_event_sequence`] with the caller's listing memo instead of a fresh
+/// one, so a reading taken before the fronting bracket's front (see
+/// [`check_listed_before_front`]) serves the posts made while the target is
+/// in front. Every other check runs exactly as in [`post_event_sequence`].
+pub fn post_event_sequence_with_visibility<T: PerProcessEventTransport>(
+    target: ProcessEventTarget,
+    steps: Vec<SyntheticStep<T::Event>>,
+    transport: &mut T,
+    visibility: &mut VisibilityMemo,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SequencePostReport, SequencePostFailure> {
+    post_paced_with_visibility(
+        target,
+        steps,
+        Duration::ZERO,
+        transport,
+        visibility,
+        cancelled,
+    )
+}
+
 /// Post character pairs with a minimum gap after each completed pair. The
 /// caller supplies a nonzero interval only for text, not chords or pointers.
 /// Waiting happens before cancellation and identity checks, and recovery
@@ -285,15 +332,32 @@ pub fn post_event_sequence_paced<T: PerProcessEventTransport>(
     transport: &mut T,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<SequencePostReport, SequencePostFailure> {
+    post_paced_with_visibility(
+        target,
+        steps,
+        character_interval,
+        transport,
+        &mut VisibilityMemo::new(VISIBLE_READING_MAX_AGE),
+        cancelled,
+    )
+}
+
+fn post_paced_with_visibility<T: PerProcessEventTransport>(
+    target: ProcessEventTarget,
+    steps: Vec<SyntheticStep<T::Event>>,
+    character_interval: Duration,
+    transport: &mut T,
+    visibility: &mut VisibilityMemo,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SequencePostReport, SequencePostFailure> {
     let character_starts: Vec<bool> = steps
         .iter()
         .map(|step| step.role == SyntheticStepRole::Press)
         .collect();
-    let mut visibility = VisibilityMemo::new(VISIBLE_READING_MAX_AGE);
     post_guarded_event_sequence(steps, cancelled, |index, event, recovery| {
         transport.set_recovery(recovery);
         match event {
-            Some(event) => route_event_with_visibility(target, event, transport, &mut visibility)
+            Some(event) => route_event_with_visibility(target, event, transport, visibility)
                 .map(|(_, checks)| checks),
             None => {
                 if index > 0 && character_starts[index] && !character_interval.is_zero() {

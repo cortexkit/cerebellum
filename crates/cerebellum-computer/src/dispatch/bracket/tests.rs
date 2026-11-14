@@ -6,6 +6,8 @@ use super::*;
 use crate::dispatch::seize::{HeartbeatMarker, IdleGateRefusal, OBSERVED_DISPATCH_IDLE_MS};
 use crate::platform::{HeldStateDisposition, ProcessEventRefusal};
 
+mod listing;
+
 const TARGET: u32 = 200;
 const PREVIOUS: u32 = 100;
 const THIRD: u32 = 300;
@@ -68,6 +70,9 @@ struct FakeDesk {
     landings_at: Vec<u64>,
     /// Hardware input arrives at this instant.
     input_at: Option<u64>,
+    /// A window-server listing read through the production routing, when
+    /// set; units are then posted through it too.
+    listing: Option<listing::Listing>,
 }
 
 impl FakeDesk {
@@ -108,6 +113,7 @@ impl FakeDesk {
             fallback_requests: Vec::new(),
             landings_at: Vec::new(),
             input_at: None,
+            listing: None,
         }
     }
 
@@ -209,6 +215,9 @@ impl FrontingBracketHost for FakeDesk {
     fn our_pid(&self) -> i64 {
         OUR_PID
     }
+    fn before_front(&mut self) -> Result<(), SequencePostFailure> {
+        listing::before_front(self)
+    }
     fn create_tap(&mut self) -> Option<()> {
         Some(())
     }
@@ -253,6 +262,7 @@ impl FrontingBracketHost for FakeDesk {
     fn post_unit(&mut self, index: usize) -> Result<UnitPosted, SequencePostFailure> {
         self.frontmost_at_post.push(self.frontmost);
         self.posted.push(index);
+        let posted = listing::post_chord(self)?;
         self.advance(self.unit_ms);
         if let Some(cancel) = &self.cancel_after_first_unit {
             cancel.set(true);
@@ -265,10 +275,7 @@ impl FrontingBracketHost for FakeDesk {
                 }
             }
         }
-        Ok(UnitPosted {
-            posts_returned: 2,
-            generation_verifications: 4,
-        })
+        Ok(posted)
     }
     fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
         self.snapshot_reads += 1;

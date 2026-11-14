@@ -127,6 +127,13 @@ pub trait FrontingBracketHost {
     }
     /// Our own pid as input sources carry it.
     fn our_pid(&self) -> i64;
+    /// Checks on the target that need no front, run before each front is
+    /// requested so their cost is not spent inside the bounded interval. A
+    /// failure stops the bracket before that front: nothing is fronted and
+    /// nothing posted for the chunk. The default has no such checks.
+    fn before_front(&mut self) -> Result<(), SequencePostFailure> {
+        Ok(())
+    }
     /// Start watching session input. `None` when no observer can be started.
     fn create_tap(&mut self) -> Option<Self::Tap>;
     /// Time since the last hardware input.
@@ -453,6 +460,11 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
 
         // Front the target. The interval is counted from the request, so the
         // time the application takes to come forward is inside the bound.
+        // Checks that need no front run first, outside it.
+        if let Err(failure) = host.borrow_mut().before_front() {
+            report.stop = Some(BracketStop::PostFailed(failure));
+            break;
+        }
         let fronted_at = host.borrow_mut().now_ms();
         report.chunks += 1;
         let requested =

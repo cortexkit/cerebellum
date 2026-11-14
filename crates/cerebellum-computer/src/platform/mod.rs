@@ -1916,6 +1916,9 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
     fn front_attempt_finished(&mut self) {
         self.returned();
     }
+    fn before_front(&mut self) -> Result<(), SequencePostFailure> {
+        self.inner.before_front()
+    }
     fn measured_restore_latency_ms(&mut self) -> Option<u64> {
         self.inner.measured_restore_latency_ms()
     }

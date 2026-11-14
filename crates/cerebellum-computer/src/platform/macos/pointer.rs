@@ -306,6 +306,7 @@ mod tests {
                     .unwrap(),
                 )],
                 transport: MacOsPerProcessEventTransport::new(Duration::from_millis(50)),
+                visibility: VisibilityMemo::new(VISIBLE_READING_MAX_AGE),
                 pointer: Some(MacPointerUnit {
                     guard: super::super::super::GlobalPointerGuard(Arc::new(move |deadline| {
                         assert_eq!(deadline, started + Duration::from_millis(1000));
