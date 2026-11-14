@@ -12,6 +12,7 @@ Run only what your change needs, and keep each run to minutes:
 - **Lint:** `cargo clippy --locked -p <crate> --all-targets -- -D warnings` for the crates you changed, on Linux, plus `--target x86_64-pc-windows-msvc` if the change touches code that builds on Windows. Run these on the build server with your bash tool's `runon: "linux,8c"`. A 16-vCPU job waits for a whole free build server.
 - **macOS:** if your change touches code that builds or runs only on macOS, run macOS clippy for that crate and its macOS tests on this Mac. Linux never compiles that code, so the build server can't check it.
 - **Formatting:** `cargo fmt --check`.
+- **Pinned surfaces:** some tests pin what cerebellum announces, far from the code that changes it. If you change the HELLO manifest (`manifest.rs`: capabilities, roles, operations), `management::OPERATIONS`, or a tool definition, also run these on Linux and, when the change builds on macOS, on this Mac: `cargo test --locked -p cerebellum --lib hello_manifest` and `cargo test --locked -p cerebellum --test conformance`. If one fails only because of your intended addition, update the pin. In a historical comparison, remove exactly your addition rather than repinning the older digest. If you change a budget, also run `cargo test --locked -p cerebellum --lib budgets`.
 
 Run cargo on this Mac only for macOS-only checks. Each fresh test binary run on this Mac costs a system security scan while Ufuk works on it. Keep the normal build directory; a separate `CARGO_TARGET_DIR` forces a cold build.
 
