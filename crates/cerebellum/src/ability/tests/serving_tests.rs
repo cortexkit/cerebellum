@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 mod helper_tests;
 #[path = "journal_tests.rs"]
 mod journal_tests;
+#[path = "outlook_guard_tests.rs"]
+mod outlook_guard_tests;
 
 struct Bound;
 impl BindingReader for Bound {
