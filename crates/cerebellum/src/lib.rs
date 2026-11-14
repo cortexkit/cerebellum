@@ -80,6 +80,7 @@ pub mod manifest;
 mod model_view_tests;
 pub mod network;
 mod open_app_history;
+pub mod outlook_guard;
 mod permission_cards;
 mod permission_scope;
 mod permissions;

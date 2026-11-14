@@ -21,6 +21,7 @@ use crate::{
 mod binding;
 mod helper;
 mod journal;
+mod outlook;
 mod serving;
 use binding::{BindingReader, UnavailableBindingReader};
 
