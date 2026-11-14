@@ -13,6 +13,13 @@ pub struct FrontingTiming {
     pub confirmed_front_ms: Option<f64>,
     pub late_landing_ms: Option<f64>,
     pub restore_confirmed_ms: Option<f64>,
+    /// The first per-process post call to the target after the front
+    /// request. With `confirmed_front_ms` it gives how long the target had
+    /// been frontmost when the first keystroke went out.
+    pub first_post_ms: Option<f64>,
+    /// The instant every `_ms` value counts from, so the probe can place its
+    /// own observations on the same scale.
+    pub front_requested_at: Option<Instant>,
     events: Vec<Event>,
 }
 
@@ -44,6 +51,7 @@ enum EventKind {
         request: usize,
         pid: u32,
     },
+    FirstPost,
     WatchFinished(RestoreStatus),
 }
 
@@ -74,6 +82,7 @@ impl FrontingTiming {
                     EventKind::RestoreConfirmation { request, pid } => {
                         format!("restore_confirmation request={request} pid={pid}")
                     }
+                    EventKind::FirstPost => format!("first_post pid={}", self.target_pid),
                     EventKind::WatchFinished(restore) => format!(
                         "late_watch result={}",
                         match restore {
@@ -120,6 +129,8 @@ impl ProbeTiming {
                 confirmed_front_ms: None,
                 late_landing_ms: None,
                 restore_confirmed_ms: None,
+                first_post_ms: None,
+                front_requested_at: None,
                 events: Vec::new(),
             },
             last_front: None,
@@ -131,7 +142,9 @@ impl ProbeTiming {
     pub(super) fn begin(&self) {
         let mut state = self.0.lock().unwrap();
         if state.started.is_none() {
-            state.started = Some(Instant::now());
+            let now = Instant::now();
+            state.started = Some(now);
+            state.timing.front_requested_at = Some(now);
             state.timing.events.push(Event {
                 at_ms: 0.0,
                 kind: EventKind::FrontRequest,
@@ -160,6 +173,19 @@ impl ProbeTiming {
 
     pub(super) fn restore_requested(&self, pid: u32, route: RestoreRoute) {
         let mut state = self.0.lock().unwrap();
+        // Posts happen before the restore is asked for, so reading them here
+        // keeps the events in order.
+        if let (Some(started), None) = (state.started, state.timing.first_post_ms) {
+            let posts = cerebellum_macos::take_posts_for_probe();
+            if let Some(at) = first_post_after(&posts, state.timing.target_pid, started) {
+                let at_ms = at.duration_since(started).as_secs_f64() * 1000.0;
+                state.timing.first_post_ms = Some(at_ms);
+                state.timing.events.push(Event {
+                    at_ms,
+                    kind: EventKind::FirstPost,
+                });
+            }
+        }
         let id = state.requests + 1;
         let index = state.timing.events.len();
         if state
@@ -209,6 +235,16 @@ impl ProbeTiming {
     }
 }
 
+/// The earliest post call to `target` made at or after `started`, from the
+/// noted `(pid, when)` post calls.
+fn first_post_after(posts: &[(i32, Instant)], target: u32, started: Instant) -> Option<Instant> {
+    posts
+        .iter()
+        .filter(|(pid, at)| u32::try_from(*pid) == Ok(target) && *at >= started)
+        .map(|(_, at)| *at)
+        .min()
+}
+
 pub(crate) fn take_timings() -> Vec<FrontingTiming> {
     drain(&ATTEMPTS)
 }
@@ -234,6 +270,8 @@ mod tests {
             confirmed_front_ms: Some(12.5),
             late_landing_ms: None,
             restore_confirmed_ms: Some(180.0),
+            first_post_ms: Some(15.0),
+            front_requested_at: None,
             events: vec![
                 Event {
                     at_ms: 0.0,
@@ -242,6 +280,10 @@ mod tests {
                 Event {
                     at_ms: 12.5,
                     kind: EventKind::Landing { in_call: true },
+                },
+                Event {
+                    at_ms: 15.0,
+                    kind: EventKind::FirstPost,
                 },
                 Event {
                     at_ms: 20.0,
@@ -290,6 +332,7 @@ mod tests {
         assert_eq!(timing.record_lines(3), [
             "RECORD needs-front attempt 3: front_request pid=42 at_ms=0.000",
             "RECORD needs-front attempt 3: target_landing pid=42 source=in_call at_ms=12.500",
+            "RECORD needs-front attempt 3: first_post pid=42 at_ms=15.000",
             "RECORD needs-front attempt 3: restore_request id=1 pid=7 route=ax_frontmost confirmed=false confirmed_at_ms=unobserved at_ms=20.000",
             "RECORD needs-front attempt 3: restore_request id=2 pid=7 route=fallback confirmed=true confirmed_at_ms=180.000 at_ms=170.000",
             "RECORD needs-front attempt 3: restore_confirmation request=2 pid=7 at_ms=180.000",
@@ -298,6 +341,19 @@ mod tests {
             "RECORD needs-front attempt 3: late_watch result=failed left_in_front=Some(42) at_ms=1101.000",
             "RECORD needs-front attempt 3: late_watch result=skipped_person now_front=None at_ms=1102.000",
         ]);
+    }
+
+    /// Only posts to the target made after the front request count, and the
+    /// earliest of them is the first post.
+    #[test]
+    fn the_first_post_is_the_earliest_post_to_the_target_after_the_front_request() {
+        let started = Instant::now();
+        let at = |ms| started + std::time::Duration::from_millis(ms);
+        let earlier = started - std::time::Duration::from_millis(5);
+        let posts = [(42, earlier), (7, at(3)), (42, at(9)), (42, at(4))];
+        assert_eq!(first_post_after(&posts, 42, started), Some(at(4)));
+        assert_eq!(first_post_after(&posts, 8, started), None);
+        assert_eq!(first_post_after(&[(42, earlier)], 42, started), None);
     }
 
     struct ReturningTarget {

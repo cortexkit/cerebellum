@@ -349,6 +349,8 @@ mod imp {
                 set_auth(raw, message);
             }
             let post: unsafe extern "C" fn(i32, *mut c_void) = std::mem::transmute(post_address);
+            #[cfg(feature = "desk-probe")]
+            crate::macos::note_post_for_probe(pid);
             post(pid, raw);
             PostResult::Posted {
                 auth_attached: attach_auth,

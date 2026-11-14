@@ -129,7 +129,7 @@ pub use cursor_overlay::{
     PreviewHideProbe, ProbePass, AVATAR_PIXELS,
 };
 #[cfg(all(target_os = "macos", feature = "desk-probe"))]
-pub use macos::take_window_list_errors_for_probe;
+pub use macos::{take_posts_for_probe, take_window_list_errors_for_probe};
 #[cfg(target_os = "macos")]
 pub use preview_schedule::{OverlayFrame, OverlayPreview, OverlayPreviewMotion, PreviewFallback};
 #[cfg(target_os = "macos")]
