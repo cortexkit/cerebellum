@@ -1925,6 +1925,12 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
     fn record_restore_latency_ms(&mut self, milliseconds: u64) {
         self.inner.record_restore_latency_ms(milliseconds);
     }
+    fn measured_unit_post_cost_ms(&mut self) -> Option<u64> {
+        self.inner.measured_unit_post_cost_ms()
+    }
+    fn record_unit_post_cost_ms(&mut self, milliseconds: u64) {
+        self.inner.record_unit_post_cost_ms(milliseconds);
+    }
     fn restore_front_attempt(
         &mut self,
         _previous: u32,

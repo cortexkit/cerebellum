@@ -544,6 +544,22 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
         self.heartbeat.our_pid
     }
 
+    // Keystroke units share the process-wide post costs. A pointer gesture
+    // paces its own events, so its cost says nothing about a keystroke's and
+    // is neither reserved nor kept.
+    fn measured_unit_post_cost_ms(&mut self) -> Option<u64> {
+        if self.pointer.is_some() {
+            return None;
+        }
+        crate::dispatch::measured_unit_post_cost_ms(Instant::now())
+    }
+
+    fn record_unit_post_cost_ms(&mut self, milliseconds: u64) {
+        if self.pointer.is_none() {
+            crate::dispatch::record_unit_post_cost_ms(milliseconds, Instant::now());
+        }
+    }
+
     fn before_front(&mut self) -> Result<(), SequencePostFailure> {
         // Only keystroke units post through `post_unit` with this memo. A
         // pointer gesture routes its own posts, and a fronted read posts

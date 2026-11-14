@@ -33,6 +33,10 @@ mod press;
 mod reason;
 mod restore;
 
+pub use latency::UNIT_POST_COST_MAX_AGE;
+// Only the macOS keystroke host keeps unit post costs process-wide.
+#[cfg(target_os = "macos")]
+pub(crate) use latency::{measured_unit_post_cost_ms, record_unit_post_cost_ms};
 pub use press::*;
 pub use reason::*;
 pub use restore::*;
@@ -125,6 +129,16 @@ pub trait FrontingBracketHost {
     fn record_restore_latency_ms(&mut self, milliseconds: u64) {
         latency::record_restore_latency_ms(milliseconds);
     }
+    /// The largest recent unit post cost this host keeps, reserved for the
+    /// first unit of a bracket before the bracket has timed one of its own.
+    /// The default keeps none, which reserves nothing; a host that posts
+    /// keystrokes keeps them process-wide, each for
+    /// [`UNIT_POST_COST_MAX_AGE`].
+    fn measured_unit_post_cost_ms(&mut self) -> Option<u64> {
+        None
+    }
+    /// Retain a posted unit's cost. The default keeps nothing.
+    fn record_unit_post_cost_ms(&mut self, _milliseconds: u64) {}
     /// Our own pid as input sources carry it.
     fn our_pid(&self) -> i64;
     /// Checks on the target that need no front, run before each front is
@@ -240,6 +254,10 @@ pub struct BracketReport {
     pub slowest_restore_ms: u64,
     pub restore: RestoreStatus,
     pub stop: Option<BracketStop>,
+    /// The stop is `BoundExceeded` only because recent unit posts in this
+    /// process were slow: the front and the restore alone would have fit.
+    /// That reserve ages out, so a later retry can be admitted.
+    pub waiting_out_slow_post: bool,
 }
 
 impl BracketReport {
@@ -380,6 +398,7 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
         slowest_restore_ms: 0,
         restore: RestoreStatus::NotNeeded,
         stop: None,
+        waiting_out_slow_post: false,
     };
     let Some(previous) = host.frontmost_pid() else {
         report.stop = Some(BracketStop::PreviousUnknown);
@@ -528,16 +547,27 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
                     .measured_restore_latency_ms()
                     .unwrap_or(RESTORE_WAIT_MS)
             };
-            let expected = elapsed
-                .saturating_add(report.slowest_unit_ms)
-                .saturating_add(
-                    restore_latency
-                        .max(report.slowest_restore_ms)
-                        .max(front_latency),
-                );
+            // Until this bracket has timed a unit of its own, reserve the
+            // slowest unit post the host measured recently, so a post that
+            // has lately been slow is not started where it would overrun.
+            let unit_cost = if report.units_posted == 0 {
+                host.borrow_mut().measured_unit_post_cost_ms().unwrap_or(0)
+            } else {
+                report.slowest_unit_ms
+            };
+            let without_unit = elapsed.saturating_add(
+                restore_latency
+                    .max(report.slowest_restore_ms)
+                    .max(front_latency),
+            );
+            let expected = without_unit.saturating_add(unit_cost);
             if expected > bound {
                 if chunk_units == 0 {
                     stop = Some(BracketStop::BoundExceeded);
+                    // Only the reserve for recent slow posts kept it from
+                    // fitting, so a later retry can succeed once it ages out.
+                    report.waiting_out_slow_post =
+                        report.units_posted == 0 && without_unit <= bound;
                 }
                 break;
             }
@@ -570,7 +600,9 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
                     report.posts_returned += unit.posts_returned;
                     report.generation_verifications += unit.generation_verifications;
                     let after = host.borrow_mut().now_ms();
-                    report.slowest_unit_ms = report.slowest_unit_ms.max(after.saturating_sub(now));
+                    let unit_cost = after.saturating_sub(now);
+                    report.slowest_unit_ms = report.slowest_unit_ms.max(unit_cost);
+                    host.borrow_mut().record_unit_post_cost_ms(unit_cost);
                     chunk_units += 1;
                     next_unit += 1;
                 }

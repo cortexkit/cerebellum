@@ -10,9 +10,10 @@ use crate::platform::{
 };
 
 const GENERATION: u64 = 42;
-/// One listing read on the desk clock. A desk run measured 63 to 188 ms from
-/// the target landing in front to the restore request for a one-chord bracket,
-/// and the listing query is the slow step inside that.
+/// One listing read on the desk clock. On a live macOS desktop with about 400
+/// windows, 63 to 188 ms passed from the target landing in front to the
+/// restore request for a one-chord bracket, and the listing query is the slow
+/// step inside that.
 const LISTING_READ_MS: u64 = 150;
 
 /// What the listing answers, the memo the desk's posts share with its

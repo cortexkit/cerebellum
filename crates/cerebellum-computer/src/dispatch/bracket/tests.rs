@@ -7,6 +7,7 @@ use crate::dispatch::seize::{HeartbeatMarker, IdleGateRefusal, OBSERVED_DISPATCH
 use crate::platform::{HeldStateDisposition, ProcessEventRefusal};
 
 mod listing;
+mod unit_cost;
 
 const TARGET: u32 = 200;
 const PREVIOUS: u32 = 100;
@@ -73,6 +74,12 @@ struct FakeDesk {
     /// A window-server listing read through the production routing, when
     /// set; units are then posted through it too.
     listing: Option<listing::Listing>,
+    /// Unit post costs kept as a keystroke host keeps them, when set.
+    unit_costs: Option<latency::UnitPostCosts>,
+    /// The instant the desk clock's zero stands for, plus an offset, so a
+    /// sequence of desks can replay calls seconds apart on fixed instants.
+    clock_origin: std::time::Instant,
+    clock_offset_ms: u64,
 }
 
 impl FakeDesk {
@@ -114,6 +121,9 @@ impl FakeDesk {
             landings_at: Vec::new(),
             input_at: None,
             listing: None,
+            unit_costs: None,
+            clock_origin: std::time::Instant::now(),
+            clock_offset_ms: 0,
         }
     }
 
@@ -133,6 +143,11 @@ impl FakeDesk {
         if self.input_at.is_some_and(|at| at <= now) {
             self.hardware_input_ms = self.input_at.take();
         }
+    }
+
+    /// The desk clock's present as an instant.
+    fn instant(&self) -> std::time::Instant {
+        self.clock_origin + std::time::Duration::from_millis(self.clock_offset_ms + self.now)
     }
 
     fn set_frontmost(&mut self, pid: u32) {
@@ -217,6 +232,16 @@ impl FrontingBracketHost for FakeDesk {
     }
     fn before_front(&mut self) -> Result<(), SequencePostFailure> {
         listing::before_front(self)
+    }
+    fn measured_unit_post_cost_ms(&mut self) -> Option<u64> {
+        let now = self.instant();
+        self.unit_costs.as_ref()?.maximum(now)
+    }
+    fn record_unit_post_cost_ms(&mut self, milliseconds: u64) {
+        let now = self.instant();
+        if let Some(costs) = &mut self.unit_costs {
+            costs.record(milliseconds, now);
+        }
     }
     fn create_tap(&mut self) -> Option<()> {
         Some(())

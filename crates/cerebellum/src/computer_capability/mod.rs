@@ -2838,7 +2838,7 @@ where
                 // posts_returned: see `post_call_made` for why the two differ.
                 unposted_refusal =
                     keystrokes::post_call_made(&refusal, bracket.as_ref()) == Some(false);
-                let mut refused = keystrokes::dispatch_refusal_reply(&refusal);
+                let mut refused = keystrokes::dispatch_refusal_reply(&refusal, bracket.as_ref());
                 // A bracket that stopped part-way may already have posted
                 // earlier chunks. Saying how many keeps a caller from retrying
                 // text that partly landed as though none of it had.
