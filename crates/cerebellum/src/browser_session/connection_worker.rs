@@ -80,6 +80,11 @@ impl ConnectionWorker {
         };
         let readiness = {
             let _entered = runtime.enter();
+            // Tokio 1.53.3 deprecated its safe constructors in favour of unsafe
+            // register; cerebellum forbids unsafe code. This use remains sound:
+            // AsyncFd takes ownership of an OwnedFd that is never replaced or
+            // closed elsewhere. Retain the existing READABLE | WRITABLE interests.
+            #[allow(deprecated)]
             match AsyncFd::new(fd) {
                 Ok(readiness) => readiness,
                 Err(_) => return Err(StartFailure::Unavailable(process)),

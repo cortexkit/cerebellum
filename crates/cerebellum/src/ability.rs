@@ -179,7 +179,7 @@ impl Default for AbilityPlane {
     fn default() -> Self {
         let source: Arc<dyn StatusSource> = match platform() {
             Platform::Windows => Arc::new(outlook::source::OutlookSource::new(None)),
-            Platform::Linux => Arc::new(eds::EdsSource::new(None)),
+            Platform::Linux => Arc::new(eds::EdsSource::production()),
             Platform::MacOs => Arc::new(UnavailableSource(platform())),
         };
         let mut plane = Self::new(platform(), source, true);
