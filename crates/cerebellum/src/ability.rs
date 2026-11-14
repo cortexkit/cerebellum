@@ -92,6 +92,12 @@ fn map_capability(value: &str) -> Option<String> {
 trait StatusSource: Send + Sync + 'static {
     fn status(&self, tokens: &'static [Token]) -> Result<Vec<(Token, Availability)>, ()>;
 
+    /// Thread-affine adapters override this to keep preflight and the read in
+    /// one session, owned entirely by the request's blocking closure.
+    fn request(&self, request: serving::ReadRequest) -> Result<Option<Value>, Refusal> {
+        serving::read_inner(self, request)
+    }
+
     fn choices(&self, _token: Token) -> Result<Vec<serving::ScopeChoice>, Refusal> {
         Err(Refusal::SourceFailed)
     }
@@ -170,7 +176,12 @@ pub(crate) struct AbilityPlane {
 
 impl Default for AbilityPlane {
     fn default() -> Self {
-        let mut plane = Self::new(platform(), Arc::new(UnavailableSource(platform())), true);
+        let source: Arc<dyn StatusSource> = if platform() == Platform::Windows {
+            Arc::new(outlook::source::OutlookSource::new(None))
+        } else {
+            Arc::new(UnavailableSource(platform()))
+        };
+        let mut plane = Self::new(platform(), source, true);
         if plane.platform == Platform::MacOs {
             plane.helpers = Some(helper::Helpers::unverified());
         }

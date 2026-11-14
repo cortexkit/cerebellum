@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 use super::{
     journal::{ReservedRead, Summary},
-    AbilityPlane, Refusal, StatusSource,
+    AbilityPlane, Availability, Refusal, StatusSource,
 };
 use crate::{
     ability_source::{SourceLease, SourceOutcome},
@@ -34,6 +34,47 @@ pub(super) struct SourceRecord {
     /// A source's floating/date-only due value. Already-resolved reminder
     /// instants may instead be carried in the item's due_ms.
     pub reminder_due: Option<ReminderDue>,
+}
+
+/// Unlike the shared source factory, a request-local session need not be Send
+/// or Sync. Its interfaces never leave the blocking thread that opened it.
+pub(super) trait ReadAccess {
+    fn status(&self, tokens: &'static [Token]) -> Result<Vec<(Token, Availability)>, ()>;
+    fn setup(&self, _token: Token) -> Result<Value, Refusal> {
+        Err(Refusal::SourceFailed)
+    }
+    fn choices(&self, token: Token) -> Result<Vec<ScopeChoice>, Refusal>;
+    fn read(
+        &self,
+        token: Token,
+        op: &str,
+        args: &ValidatedArgs,
+        scope: &BoundScope,
+    ) -> Result<SourceRead, Refusal>;
+}
+
+impl<S: StatusSource + ?Sized> ReadAccess for S {
+    fn status(&self, tokens: &'static [Token]) -> Result<Vec<(Token, Availability)>, ()> {
+        StatusSource::status(self, tokens)
+    }
+
+    fn choices(&self, token: Token) -> Result<Vec<ScopeChoice>, Refusal> {
+        StatusSource::choices(self, token)
+    }
+
+    fn setup(&self, token: Token) -> Result<Value, Refusal> {
+        StatusSource::setup(self, token)
+    }
+
+    fn read(
+        &self,
+        token: Token,
+        op: &str,
+        args: &ValidatedArgs,
+        scope: &BoundScope,
+    ) -> Result<SourceRead, Refusal> {
+        StatusSource::read(self, token, op, args, scope)
+    }
 }
 
 pub(super) struct ReadRequest {
@@ -139,12 +180,15 @@ pub(super) fn read(
     request: ReadRequest,
 ) -> Result<Option<Value>, Refusal> {
     let completion = request._reservation.completion();
-    let result = read_inner(source, request);
+    let result = source.request(request);
     *completion.lock().unwrap() = Some(Summary::from_result(&result));
     result
 }
 
-fn read_inner(source: &dyn StatusSource, request: ReadRequest) -> Result<Option<Value>, Refusal> {
+pub(super) fn read_inner(
+    source: &(impl ReadAccess + ?Sized),
+    request: ReadRequest,
+) -> Result<Option<Value>, Refusal> {
     if request.gate.gate.stopped() {
         return Ok(None);
     }
@@ -182,7 +226,7 @@ fn read_inner(source: &dyn StatusSource, request: ReadRequest) -> Result<Option<
 }
 
 fn read_available(
-    source: &dyn StatusSource,
+    source: &(impl ReadAccess + ?Sized),
     token: Token,
     operation: ReadOperation,
 ) -> Result<Value, Refusal> {
