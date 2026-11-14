@@ -184,6 +184,18 @@ impl SourceUnit {
         source: Arc<S>,
         gate: Arc<TerminalArbiter>,
     ) -> UnitStatus<S::Status> {
+        self.status_for_tokens(source, gate, self.kind().tokens())
+            .await
+    }
+
+    /// Describe may omit tokens known to be unsupported from the OS version
+    /// alone, so those tokens never require a helper status request.
+    pub(crate) async fn status_for_tokens<S: Source>(
+        &self,
+        source: Arc<S>,
+        gate: Arc<TerminalArbiter>,
+        tokens: &'static [Token],
+    ) -> UnitStatus<S::Status> {
         let ticket = match self.arrive(gate) {
             Ok(ticket) => ticket,
             Err(_) => return UnitStatus::SourceUnresponsive,
@@ -192,7 +204,6 @@ impl SourceUnit {
             Ok(lease) => lease,
             Err(_) => return UnitStatus::SourceUnresponsive,
         };
-        let tokens = self.kind().tokens();
         match lease.blocking(move || source.status(tokens)).await {
             SourceOutcome::Completed(Ok(status)) => UnitStatus::Responsive(status),
             _ => UnitStatus::SourceUnresponsive,

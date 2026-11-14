@@ -481,6 +481,20 @@ impl JournalStore {
         self.reserve_core(identity, self.max_entry_bytes().to_le_bytes().to_vec())
     }
 
+    /// Settle exactly one failed policy commit. Recovery cancels a reservation
+    /// if no entry was stored, or publishes the entry saved before the failure.
+    pub(crate) fn recover_policy_event(&mut self, sequence: u64) -> bool {
+        #[cfg(test)]
+        if let Some(remaining) = self.faults.failures.get_mut("recover_policy_event") {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return false;
+            }
+        }
+        self.sync_faults();
+        self.core.recover_record(sequence).is_some()
+    }
+
     pub(crate) fn commit_reserved_policy(
         &mut self,
         handle: ReservationHandle,

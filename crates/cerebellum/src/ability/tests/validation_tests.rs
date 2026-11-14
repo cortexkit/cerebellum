@@ -241,13 +241,14 @@ async fn shared_cursors_are_checked_before_binding_with_the_same_default_and_sco
     let mut p = valid_params(CALL);
     p["scope"] = json!({"calendar":["bound","also-bound"]});
     p["args"] = json!({"cursor":cursor,"limit":200});
-    // Changing only limit or id order is allowed; the source boundary is still
-    // pending, but reaching it proves argument and binding admission passed.
+    // Changing only limit or id order is allowed. The default adapter's data
+    // refusal follows preflight, proving argument and binding admission passed.
     assert_refusal(
         &exchange(&planes, &flow(), json!({"method":CALL,"params":p})).await,
         "ability_source_failed",
     );
     assert_eq!(reader.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
     p["key"] = json!("another-key");
     assert_refusal(
         &exchange(&planes, &flow(), json!({"method":CALL,"params":p})).await,
@@ -299,5 +300,5 @@ async fn shared_cursors_are_checked_before_binding_with_the_same_default_and_sco
         .await,
         "ability_args_invalid",
     );
-    assert_eq!(source.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
 }

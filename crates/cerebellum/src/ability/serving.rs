@@ -11,24 +11,14 @@ use cerebellum_ability::{
 };
 use serde_json::{Map, Value};
 
-use super::{AbilityPlane, Refusal, StatusSource};
+use super::{
+    journal::{ReservedRead, Summary},
+    AbilityPlane, Refusal, StatusSource,
+};
 use crate::{
-    ability_source::{QueueError, SourceLease, SourceOutcome},
+    ability_source::{SourceLease, SourceOutcome},
     terminal_arbiter::TerminalArbiter,
 };
-
-/// Only a successful journal reservation may create this proof in production.
-/// There is deliberately no production constructor until journaling is wired.
-pub(super) struct ReservedRead {
-    _private: (),
-}
-
-#[cfg(test)]
-impl ReservedRead {
-    pub(super) fn for_test() -> Self {
-        Self { _private: () }
-    }
-}
 
 pub(super) struct SourceRead {
     /// All currently existing containers, including empty ones. Check every
@@ -54,6 +44,7 @@ pub(super) struct ReadRequest {
 }
 
 enum ReadOperation {
+    Setup,
     Choices {
         key: String,
         limit: Option<usize>,
@@ -67,6 +58,14 @@ enum ReadOperation {
 }
 
 impl ReadRequest {
+    pub(super) fn setup(proof: ReservedRead, token: Token, gate: Arc<TerminalArbiter>) -> Self {
+        Self {
+            _reservation: proof,
+            token,
+            gate,
+            operation: ReadOperation::Setup,
+        }
+    }
     pub(super) fn call(
         proof: ReservedRead,
         token: Token,
@@ -114,27 +113,6 @@ impl ReadRequest {
 }
 
 impl AbilityPlane {
-    pub(super) async fn choices(
-        &self,
-        token: Token,
-        params: &Map<String, Value>,
-        gate: Arc<TerminalArbiter>,
-        proof: ReservedRead,
-    ) -> Result<Option<Value>, Refusal> {
-        let unit = self.units.for_token(token).expect("declared token unit");
-        let mut lease = match unit.arrive(gate.clone()).map(|ticket| ticket.wait()) {
-            Ok(wait) => match wait.await {
-                Ok(lease) => lease,
-                Err(QueueError::Stopped) => return Ok(None),
-                Err(QueueError::SourceTimeout) => return Err(Refusal::SourceTimeout),
-            },
-            Err(QueueError::Stopped) => return Ok(None),
-            Err(QueueError::SourceTimeout) => return Err(Refusal::SourceTimeout),
-        };
-        self.serve(&mut lease, ReadRequest::choices(proof, token, params, gate))
-            .await
-    }
-
     /// The journaled handler keeps this lease through reservation, read and
     /// commit; serving does not acquire a second position in the same unit.
     pub(super) async fn serve(
@@ -157,10 +135,20 @@ pub(super) fn read(
     source: &dyn StatusSource,
     request: ReadRequest,
 ) -> Result<Option<Value>, Refusal> {
+    let completion = request._reservation.completion();
+    let result = read_inner(source, request);
+    *completion.lock().unwrap() = Some(Summary::from_result(&result));
+    result
+}
+
+fn read_inner(source: &dyn StatusSource, request: ReadRequest) -> Result<Option<Value>, Refusal> {
     if request.gate.gate.stopped() {
         return Ok(None);
     }
     let token = request.token;
+    if matches!(request.operation, ReadOperation::Setup) {
+        return source.setup(token).map(Some);
+    }
     let tokens: &'static [Token] = match token {
         Token::Calendar => &[Token::Calendar],
         Token::Reminders => &[Token::Reminders],
@@ -196,6 +184,7 @@ fn read_available(
     operation: ReadOperation,
 ) -> Result<Value, Refusal> {
     match operation {
+        ReadOperation::Setup => unreachable!("setup is served without read preflight"),
         ReadOperation::Choices { key, limit, cursor } => {
             let choices = source.choices(token)?;
             let page = build_choices_page(token, &key, limit, cursor.as_deref(), choices)

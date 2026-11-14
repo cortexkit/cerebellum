@@ -109,10 +109,19 @@ impl StatusSource for FakeStatus {
 
 fn fixture(source: Arc<dyn StatusSource>, platform: Platform) -> Planes {
     let mut planes = crate::isolated_test_planes(&Arc::new(HealthState::new()));
+    planes.browser = Arc::new(
+        crate::browser::BrowserPlane::default().with_journal_persistence(
+            false,
+            crate::journal::JournalConfig {
+                journal_retention_bytes: 4 * 1024 * 1024,
+                journal_max_entry_bytes: 64 * 1024,
+            },
+        ),
+    );
     let mut management = crate::management::ManagementPlane::new(Arc::new(
         crate::management::PlatformResolver::new(),
     ));
-    management.abilities = AbilityPlane::new(platform, source);
+    management.abilities = AbilityPlane::new(platform, source, true);
     planes.management = Arc::new(management);
     planes
 }
@@ -565,7 +574,7 @@ async fn describe_is_schema_complete_ordered_and_only_availability_changes() {
 async fn default_adapters_never_advertise_available_and_manifest_is_unchanged() {
     let before = serde_json::to_value(crate::manifest::build("cerebellum")).unwrap();
     for platform in [Platform::MacOs, Platform::Windows, Platform::Linux] {
-        let plane = AbilityPlane::new(platform, Arc::new(UnavailableSource(platform)));
+        let plane = AbilityPlane::new(platform, Arc::new(UnavailableSource(platform)), true);
         let reply = plane
             .describe(Arc::new(TerminalArbiter::new(request(
                 json!({"method":DESCRIBE}),
@@ -654,26 +663,30 @@ async fn assert_pending(method: &str, route: AcceptedBindFacts, code: &str) {
     .await;
     assert_refusal(&reply, code);
     assert_eq!(
-        tokio::time::Instant::now(),
-        start,
-        "placeholder waited for the held source unit"
+        start.elapsed(),
+        if method == CALL {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs(10)
+        },
+        "only bound and validated requests may wait for a source unit"
     );
     assert_eq!(source.calls.load(Ordering::SeqCst), 0);
     assert_eq!(planes.browser.journal_export_for_test().await, before);
     drop(holder);
 }
 #[tokio::test(start_paused = true)]
-async fn scope_choices_pending_adapter_refuses_without_touching_source_unit() {
+async fn scope_choices_queue_expiry_refuses_without_source_or_journal() {
     assert_pending(
         SCOPE_CHOICES,
         facts("prefrontal-core"),
-        "ability_source_failed",
+        "ability_source_timeout",
     )
     .await;
 }
 #[tokio::test(start_paused = true)]
-async fn mac_setup_pending_adapter_refuses_without_touching_source_unit() {
-    assert_pending(SETUP, facts("prefrontal-core"), "ability_source_failed").await;
+async fn mac_setup_queue_expiry_refuses_without_source_or_journal() {
+    assert_pending(SETUP, facts("prefrontal-core"), "ability_source_timeout").await;
 }
 #[tokio::test(start_paused = true)]
 async fn call_pending_binding_refuses_without_touching_source_unit() {
