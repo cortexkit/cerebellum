@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 const PRIVATE_NAME: &str = "private event payload not for durable storage";
@@ -25,6 +26,7 @@ struct SnapshotFault {
 struct FixturePipe {
     reads: VecDeque<Vec<u8>>,
     held: Option<Value>,
+    release_held: Option<Arc<AtomicBool>>,
     block_once: Option<&'static str>,
     large_fanout: bool,
     hit_backend: u64,
@@ -243,8 +245,14 @@ impl CdpPipeIo for FixturePipe {
                 }
             }
         }
-        if let Some(held) = self.held.take() {
-            self.queue(held);
+        if self
+            .release_held
+            .as_ref()
+            .is_none_or(|release| release.load(Ordering::SeqCst))
+        {
+            if let Some(held) = self.held.take() {
+                self.queue(held);
+            }
         }
         if method == "Input.dispatchMouseEvent" && command["params"]["type"] == "mouseReleased" {
             if let Some(attachment) = self.attachment.as_ref() {
@@ -268,6 +276,15 @@ impl CdpPipeIo for FixturePipe {
     }
 
     fn read(&mut self, destination: &mut [u8]) -> io::Result<PipeRead> {
+        if self
+            .release_held
+            .as_ref()
+            .is_some_and(|release| release.load(Ordering::SeqCst))
+        {
+            if let Some(held) = self.held.take() {
+                self.queue(held);
+            }
+        }
         let Some(bytes) = self.reads.pop_front() else {
             return Ok(PipeRead::WouldBlock);
         };
@@ -387,16 +404,40 @@ async fn fixture_with_fault(
     hidden_owner: bool,
     read_frames: bool,
 ) -> (BrowserPlane, RouteIdentity, Arc<Mutex<Vec<Value>>>) {
+    fixture_with_held_classification(
+        block_once,
+        hit_backend,
+        refusal,
+        fault,
+        hidden_owner,
+        read_frames,
+        None,
+    )
+    .await
+}
+
+async fn fixture_with_held_classification(
+    block_once: Option<&'static str>,
+    hit_backend: u64,
+    refusal: Option<ClickDriveError>,
+    fault: Option<SnapshotFault>,
+    hidden_owner: bool,
+    read_frames: bool,
+    release_held: Option<Arc<AtomicBool>>,
+) -> (BrowserPlane, RouteIdentity, Arc<Mutex<Vec<Value>>>) {
     let route = identity();
     let commands = Arc::new(Mutex::new(Vec::new()));
     let pipe = FixturePipe {
         reads: VecDeque::new(),
         held: None,
-        block_once: if block_once == Some("timeout_then_churn") {
+        block_once: if release_held.is_some() {
+            Some("DOM.enable")
+        } else if block_once == Some("timeout_then_churn") {
             Some("Accessibility.getRootAXNode")
         } else {
             block_once.filter(|method| *method != "large_fanout")
         },
+        release_held,
         large_fanout: block_once == Some("large_fanout"),
         hit_backend,
         commands: commands.clone(),
@@ -688,28 +729,63 @@ async fn busy_text_ancestor_cannot_lend_permission_to_a_nested_submit() {
 }
 
 #[tokio::test]
-async fn busy_snapshot_large_fanout_is_partial_without_requesting_the_huge_subtree() {
-    let (plane, route, commands) = fixture(Some("large_fanout"), 42, None).await;
+async fn busy_snapshot_exhausted_classification_refuses_input() {
+    let release = Arc::new(AtomicBool::new(false));
+    let (plane, route, commands) = fixture_with_held_classification(
+        Some("large_fanout"),
+        42,
+        None,
+        None,
+        false,
+        false,
+        Some(release.clone()),
+    )
+    .await;
     let partial = plane
         .dispatch(&route, BrowserCapability::Snapshot, &json!({"mode":"ax"}))
         .await;
+    // Hold the response until the snapshot has answered, not for a timed sleep.
+    // An exhausted classification budget is still a useful, explicitly partial
+    // observation, but its unclassified refs must never authorize input.
+    release.store(true, Ordering::SeqCst);
     assert_eq!(partial["outcome"], "ok", "{partial}");
     assert_eq!(partial["truncated"], true);
     assert_eq!(partial["refs_truncated"], true);
-    assert!(commands
+    assert!(
+        partial["state_text"]
+            .as_str()
+            .unwrap()
+            .contains("dom_read_failed"),
+        "{partial}"
+    );
+    assert!(!commands
         .lock()
         .unwrap()
         .iter()
         .any(|c| c["method"] == "DOM.getFlattenedDocument"));
-    assert_eq!(
-        commands
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|c| c["method"] == "Accessibility.getChildAXNodes")
-            .count(),
-        1
-    );
+    let commands_before_actions = commands.lock().unwrap().len();
+    for (capability, args) in [
+        (
+            BrowserCapability::Click,
+            json!({"ref":"e1","snapshot_id":partial["snapshot_id"],"intent":"inspect",
+                "severity":{"tier":2,"credential":false,"financial":false}}),
+        ),
+        (
+            BrowserCapability::Type,
+            json!({"ref":"e1","snapshot_id":partial["snapshot_id"],"text":"must not be sent"}),
+        ),
+    ] {
+        let refused = plane.dispatch(&route, capability, &args).await;
+        assert_eq!(
+            refused["outcome"], "classification_unavailable",
+            "{refused}"
+        );
+        assert_eq!(
+            refused["detail"]["classification_unavailable"], "dom_read_failed",
+            "{refused}"
+        );
+        assert_eq!(commands.lock().unwrap().len(), commands_before_actions);
+    }
 }
 
 #[tokio::test]
@@ -723,6 +799,7 @@ async fn an_attachment_click_is_blocked_without_writing_downloads_even_after_rel
         let pipe = FixturePipe {
             reads: VecDeque::new(),
             held: None,
+            release_held: None,
             block_once: None,
             large_fanout: false,
             hit_backend: 42,

@@ -5699,6 +5699,58 @@ mod tests {
     }
 
     #[test]
+    fn large_fanout_is_partial_without_requesting_the_huge_subtree() {
+        let ids = (100..20_100).map(|n| n.to_string()).collect::<Vec<_>>();
+        let children = ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut driver = attached_driver([
+            json!({"id":1,"sessionId":"session-own","result":{}}),
+            json!({"id":2,"sessionId":"session-own","result":{"node":ax_node("root","RootWebArea","Events", &["fanout"],1,Some("frame-own"))}}),
+            json!({"id":3,"sessionId":"session-own","result":{"nodes":[ax_node("fanout","generic","more replies", &children,42,None)]}}),
+            json!({"id":4,"sessionId":"session-own","result":{}}),
+            json!({"id":5,"sessionId":"session-own","result":{"nodes":[
+                {"nodeId":1,"backendNodeId":1,"nodeType":9,"localName":"#document"},
+                {"nodeId":2,"backendNodeId":42,"parentId":1,"nodeType":1,"localName":"div","attributes":["onclick","openDrawer()"]},
+            ]}}),
+        ]);
+        // Generating and parsing the large reply must not spend the test's
+        // classification allowance just because the host is under load.
+        let mut clock = FakeClock::new();
+        let observation = driver
+            .snapshot_with_clock(
+                "route-own",
+                SnapshotKind::Ax,
+                150,
+                Some((7, "https://example.com/")),
+                None,
+                &[],
+                &mut clock,
+            )
+            .unwrap();
+        assert!(observation.ax_truncated);
+        assert!(observation.refs_truncated);
+        assert_eq!(observation.refs.len(), 2);
+        assert!(
+            observation.refs[1].classification.is_ok(),
+            "{:?}",
+            observation.refs[1].classification
+        );
+        assert!(driver
+            .pipe
+            .writes
+            .iter()
+            .any(|c| c["method"] == "DOM.getFlattenedDocument"));
+        let child_reads = driver
+            .pipe
+            .writes
+            .iter()
+            .filter(|c| c["method"] == "Accessibility.getChildAXNodes")
+            .collect::<Vec<_>>();
+        assert_eq!(child_reads.len(), 1);
+        assert_eq!(child_reads[0]["params"]["id"], "root");
+        assert_eq!(driver.transport.pending_len(), 0);
+    }
+
+    #[test]
     fn partial_ax_snapshots_keep_type_and_login_field_classification() {
         let ids = (0..MAX_AX_NODES + 1)
             .map(|n| format!("child-{n}"))
