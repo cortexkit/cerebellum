@@ -13,6 +13,7 @@ use subc_protocol::{
 mod binding_tests;
 mod serving_tests;
 mod validation_tests;
+mod vector_tests;
 
 fn principal(name: &str) -> Option<Principal> {
     Some(Principal::Reserved {

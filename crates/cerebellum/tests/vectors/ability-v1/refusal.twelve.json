@@ -1,0 +1,37 @@
+{
+  "error": {
+    "code": "ability_item_not_found",
+    "message": "the ability item was not found"
+  },
+  "method": "ability.call",
+  "request": {
+    "method": "ability.call",
+    "params": {
+      "args": {
+        "id": "unknown"
+      },
+      "key": "family_calendar",
+      "op": "events.get",
+      "scope": {
+        "calendar": [
+          "bound"
+        ]
+      },
+      "token": "cap/calendar.read@1"
+    }
+  },
+  "route": {
+    "acts_as_agent": false,
+    "call_mode": "classic",
+    "codemode_head": null,
+    "flow_id": "flow-test",
+    "principal": "reserved:basal",
+    "stamp": {
+      "agent_id": null,
+      "flow_id": "flow-test",
+      "kind": "ephemeral",
+      "run_id": null
+    }
+  },
+  "tag": "ability-v1"
+}

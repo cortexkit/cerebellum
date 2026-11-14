@@ -1,0 +1,29 @@
+{
+  "method": "ability.scope_choices",
+  "reply": {
+    "choices": [
+      {
+        "id": "also-bound",
+        "label": "Work calendar"
+      }
+    ],
+    "next_cursor": "eyJ2ZXJzaW9uIjoxLCJkaWdlc3QiOiJMeHF3dnlxN3BZTUJtWWtjSFJOWkZ3dlJOU2tmUHFEMVk5Z3k0Vzdqa1ZjIiwibGFzdCI6eyJ0aW1lX21zIjpudWxsLCJpZCI6ImFsc28tYm91bmQifX0"
+  },
+  "request": {
+    "method": "ability.scope_choices",
+    "params": {
+      "key": "calendar",
+      "limit": 1,
+      "token": "cap/calendar.read@1"
+    }
+  },
+  "route": {
+    "acts_as_agent": false,
+    "call_mode": "classic",
+    "codemode_head": null,
+    "flow_id": null,
+    "principal": "reserved:prefrontal-core",
+    "stamp": null
+  },
+  "tag": "ability-v1"
+}

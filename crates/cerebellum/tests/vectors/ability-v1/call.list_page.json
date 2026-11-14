@@ -1,0 +1,55 @@
+{
+  "method": "ability.call",
+  "reply": {
+    "items": [
+      {
+        "all_day": null,
+        "calendar": "bound",
+        "end_date": null,
+        "end_ms": 15,
+        "id": "event-a",
+        "location": null,
+        "notes": null,
+        "recurring": null,
+        "start_date": null,
+        "start_ms": 10,
+        "title": "Fixture event-a",
+        "truncated": []
+      }
+    ],
+    "next_cursor": "eyJ2ZXJzaW9uIjoxLCJkaWdlc3QiOiJoN2k3NWV5SmtJeURVemRYdGREQkhTTHdHOGNYWlBLcUJQMl9BVmM2VkFJIiwibGFzdCI6eyJ0aW1lX21zIjoxMCwiaWQiOiJldmVudC1hIn19"
+  },
+  "request": {
+    "method": "ability.call",
+    "params": {
+      "args": {
+        "from_ms": 0,
+        "limit": 1,
+        "to_ms": 100
+      },
+      "key": "family_calendar",
+      "op": "events.list",
+      "scope": {
+        "calendar": [
+          "bound"
+        ]
+      },
+      "token": "cap/calendar.read@1"
+    }
+  },
+  "route": {
+    "acts_as_agent": false,
+    "call_mode": "classic",
+    "codemode_head": null,
+    "flow_id": "flow-test",
+    "principal": "reserved:basal",
+    "stamp": {
+      "agent_id": null,
+      "flow_id": "flow-test",
+      "kind": "ephemeral",
+      "run_id": null
+    }
+  },
+  "tag": "ability-v1",
+  "time_zone": "America/New_York"
+}

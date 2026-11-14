@@ -1,0 +1,21 @@
+{
+  "method": "ability.setup",
+  "reply": {
+    "state": "granted"
+  },
+  "request": {
+    "method": "ability.setup",
+    "params": {
+      "token": "cap/calendar.read@1"
+    }
+  },
+  "route": {
+    "acts_as_agent": false,
+    "call_mode": "classic",
+    "codemode_head": null,
+    "flow_id": null,
+    "principal": "reserved:prefrontal-core",
+    "stamp": null
+  },
+  "tag": "ability-v1"
+}

@@ -1,0 +1,38 @@
+{
+  "error": {
+    "code": "ability_source_failed",
+    "message": "the ability source could not serve the request"
+  },
+  "method": "ability.call",
+  "request": {
+    "method": "ability.call",
+    "params": {
+      "args": {
+        "from_ms": 0,
+        "to_ms": 100
+      },
+      "key": "family_calendar",
+      "op": "events.list",
+      "scope": {
+        "calendar": [
+          "bound"
+        ]
+      },
+      "token": "cap/calendar.read@1"
+    }
+  },
+  "route": {
+    "acts_as_agent": false,
+    "call_mode": "classic",
+    "codemode_head": null,
+    "flow_id": "flow-test",
+    "principal": "reserved:basal",
+    "stamp": {
+      "agent_id": null,
+      "flow_id": "flow-test",
+      "kind": "ephemeral",
+      "run_id": null
+    }
+  },
+  "tag": "ability-v1"
+}

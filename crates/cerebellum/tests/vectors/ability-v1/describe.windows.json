@@ -1,0 +1,1910 @@
+{
+  "method": "ability.describe",
+  "reply": {
+    "tokens": [
+      {
+        "available": true,
+        "ops": [
+          {
+            "args_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "cursor": {
+                  "type": "string"
+                },
+                "limit": {
+                  "default": 100,
+                  "maximum": 200,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [],
+              "type": "object"
+            },
+            "name": "calendars.list",
+            "result_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "items": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "id": {
+                        "maxLength": 2048,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-maxUtf8Bytes": 2048
+                      },
+                      "title": {
+                        "anyOf": [
+                          {
+                            "maxLength": 16384,
+                            "type": "string",
+                            "x-maxSerializedBytes": 16384
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "truncated": {
+                        "items": {
+                          "enum": [
+                            "title"
+                          ],
+                          "type": "string"
+                        },
+                        "maxItems": 1,
+                        "type": "array",
+                        "uniqueItems": true
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "title",
+                      "truncated"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "next_cursor": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "items"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "args_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "cursor": {
+                  "type": "string"
+                },
+                "from_ms": {
+                  "maximum": 9223372036854775807,
+                  "minimum": -9223372036854775808,
+                  "type": "integer"
+                },
+                "limit": {
+                  "default": 100,
+                  "maximum": 200,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "to_ms": {
+                  "maximum": 9223372036854775807,
+                  "minimum": -9223372036854775808,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "from_ms",
+                "to_ms"
+              ],
+              "type": "object",
+              "x-maxWindowMs": 7948800000
+            },
+            "name": "events.list",
+            "result_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "items": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "all_day": {
+                        "anyOf": [
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "calendar": {
+                        "maxLength": 2048,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-maxUtf8Bytes": 2048
+                      },
+                      "end_date": {
+                        "anyOf": [
+                          {
+                            "format": "date",
+                            "maxLength": 10,
+                            "minLength": 10,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "end_ms": {
+                        "anyOf": [
+                          {
+                            "maximum": 9223372036854775807,
+                            "minimum": -9223372036854775808,
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "id": {
+                        "maxLength": 2048,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-maxUtf8Bytes": 2048
+                      },
+                      "location": {
+                        "anyOf": [
+                          {
+                            "maxLength": 16384,
+                            "type": "string",
+                            "x-maxSerializedBytes": 16384
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "notes": {
+                        "anyOf": [
+                          {
+                            "maxLength": 16384,
+                            "type": "string",
+                            "x-maxSerializedBytes": 16384
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "recurring": {
+                        "anyOf": [
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "start_date": {
+                        "anyOf": [
+                          {
+                            "format": "date",
+                            "maxLength": 10,
+                            "minLength": 10,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "start_ms": {
+                        "anyOf": [
+                          {
+                            "maximum": 9223372036854775807,
+                            "minimum": -9223372036854775808,
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "title": {
+                        "anyOf": [
+                          {
+                            "maxLength": 16384,
+                            "type": "string",
+                            "x-maxSerializedBytes": 16384
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "truncated": {
+                        "items": {
+                          "enum": [
+                            "title",
+                            "location",
+                            "notes"
+                          ],
+                          "type": "string"
+                        },
+                        "maxItems": 3,
+                        "type": "array",
+                        "uniqueItems": true
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "calendar",
+                      "title",
+                      "start_ms",
+                      "end_ms",
+                      "all_day",
+                      "start_date",
+                      "end_date",
+                      "location",
+                      "notes",
+                      "recurring",
+                      "truncated"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "next_cursor": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "items"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "args_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string",
+                  "x-maxUtf8Bytes": 2048
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "events.get",
+            "result_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "item": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "all_day": {
+                      "anyOf": [
+                        {
+                          "type": "boolean"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "calendar": {
+                      "maxLength": 2048,
+                      "minLength": 1,
+                      "type": "string",
+                      "x-maxUtf8Bytes": 2048
+                    },
+                    "end_date": {
+                      "anyOf": [
+                        {
+                          "format": "date",
+                          "maxLength": 10,
+                          "minLength": 10,
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "end_ms": {
+                      "anyOf": [
+                        {
+                          "maximum": 9223372036854775807,
+                          "minimum": -9223372036854775808,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "id": {
+                      "maxLength": 2048,
+                      "minLength": 1,
+                      "type": "string",
+                      "x-maxUtf8Bytes": 2048
+                    },
+                    "location": {
+                      "anyOf": [
+                        {
+                          "maxLength": 16384,
+                          "type": "string",
+                          "x-maxSerializedBytes": 16384
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "notes": {
+                      "anyOf": [
+                        {
+                          "maxLength": 16384,
+                          "type": "string",
+                          "x-maxSerializedBytes": 16384
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "recurring": {
+                      "anyOf": [
+                        {
+                          "type": "boolean"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "start_date": {
+                      "anyOf": [
+                        {
+                          "format": "date",
+                          "maxLength": 10,
+                          "minLength": 10,
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "start_ms": {
+                      "anyOf": [
+                        {
+                          "maximum": 9223372036854775807,
+                          "minimum": -9223372036854775808,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "title": {
+                      "anyOf": [
+                        {
+                          "maxLength": 16384,
+                          "type": "string",
+                          "x-maxSerializedBytes": 16384
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "truncated": {
+                      "items": {
+                        "enum": [
+                          "title",
+                          "location",
+                          "notes"
+                        ],
+                        "type": "string"
+                      },
+                      "maxItems": 3,
+                      "type": "array",
+                      "uniqueItems": true
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "calendar",
+                    "title",
+                    "start_ms",
+                    "end_ms",
+                    "all_day",
+                    "start_date",
+                    "end_date",
+                    "location",
+                    "notes",
+                    "recurring",
+                    "truncated"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "item"
+              ],
+              "type": "object"
+            }
+          }
+        ],
+        "scope_key": "calendar",
+        "scope_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "calendar": {
+              "items": {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string",
+                "x-maxUtf8Bytes": 2048
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "calendar"
+          ],
+          "type": "object"
+        },
+        "token": "cap/calendar.read@1"
+      },
+      {
+        "available": true,
+        "ops": [
+          {
+            "args_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "cursor": {
+                  "type": "string"
+                },
+                "limit": {
+                  "default": 100,
+                  "maximum": 200,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [],
+              "type": "object"
+            },
+            "name": "lists.list",
+            "result_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "items": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "id": {
+                        "maxLength": 2048,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-maxUtf8Bytes": 2048
+                      },
+                      "title": {
+                        "anyOf": [
+                          {
+                            "maxLength": 16384,
+                            "type": "string",
+                            "x-maxSerializedBytes": 16384
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "truncated": {
+                        "items": {
+                          "enum": [
+                            "title"
+                          ],
+                          "type": "string"
+                        },
+                        "maxItems": 1,
+                        "type": "array",
+                        "uniqueItems": true
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "title",
+                      "truncated"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "next_cursor": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "items"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "args_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "cursor": {
+                  "type": "string"
+                },
+                "include_completed": {
+                  "default": false,
+                  "type": "boolean"
+                },
+                "limit": {
+                  "default": 100,
+                  "maximum": 200,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [],
+              "type": "object"
+            },
+            "name": "reminders.list",
+            "result_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "items": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "completed": {
+                        "anyOf": [
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "completed_ms": {
+                        "anyOf": [
+                          {
+                            "maximum": 9223372036854775807,
+                            "minimum": -9223372036854775808,
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "due_ms": {
+                        "anyOf": [
+                          {
+                            "maximum": 9223372036854775807,
+                            "minimum": -9223372036854775808,
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "id": {
+                        "maxLength": 2048,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-maxUtf8Bytes": 2048
+                      },
+                      "list": {
+                        "maxLength": 2048,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-maxUtf8Bytes": 2048
+                      },
+                      "notes": {
+                        "anyOf": [
+                          {
+                            "maxLength": 16384,
+                            "type": "string",
+                            "x-maxSerializedBytes": 16384
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "title": {
+                        "anyOf": [
+                          {
+                            "maxLength": 16384,
+                            "type": "string",
+                            "x-maxSerializedBytes": 16384
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "truncated": {
+                        "items": {
+                          "enum": [
+                            "title",
+                            "notes"
+                          ],
+                          "type": "string"
+                        },
+                        "maxItems": 2,
+                        "type": "array",
+                        "uniqueItems": true
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "list",
+                      "title",
+                      "notes",
+                      "due_ms",
+                      "completed",
+                      "completed_ms",
+                      "truncated"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "next_cursor": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "items"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "args_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string",
+                  "x-maxUtf8Bytes": 2048
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "reminders.get",
+            "result_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "item": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "completed": {
+                      "anyOf": [
+                        {
+                          "type": "boolean"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "completed_ms": {
+                      "anyOf": [
+                        {
+                          "maximum": 9223372036854775807,
+                          "minimum": -9223372036854775808,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "due_ms": {
+                      "anyOf": [
+                        {
+                          "maximum": 9223372036854775807,
+                          "minimum": -9223372036854775808,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "id": {
+                      "maxLength": 2048,
+                      "minLength": 1,
+                      "type": "string",
+                      "x-maxUtf8Bytes": 2048
+                    },
+                    "list": {
+                      "maxLength": 2048,
+                      "minLength": 1,
+                      "type": "string",
+                      "x-maxUtf8Bytes": 2048
+                    },
+                    "notes": {
+                      "anyOf": [
+                        {
+                          "maxLength": 16384,
+                          "type": "string",
+                          "x-maxSerializedBytes": 16384
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "title": {
+                      "anyOf": [
+                        {
+                          "maxLength": 16384,
+                          "type": "string",
+                          "x-maxSerializedBytes": 16384
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "truncated": {
+                      "items": {
+                        "enum": [
+                          "title",
+                          "notes"
+                        ],
+                        "type": "string"
+                      },
+                      "maxItems": 2,
+                      "type": "array",
+                      "uniqueItems": true
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "list",
+                    "title",
+                    "notes",
+                    "due_ms",
+                    "completed",
+                    "completed_ms",
+                    "truncated"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "item"
+              ],
+              "type": "object"
+            }
+          }
+        ],
+        "scope_key": "list",
+        "scope_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "list": {
+              "items": {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string",
+                "x-maxUtf8Bytes": 2048
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "list"
+          ],
+          "type": "object"
+        },
+        "token": "cap/reminders.read@1"
+      },
+      {
+        "available": true,
+        "ops": [
+          {
+            "args_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "cursor": {
+                  "type": "string"
+                },
+                "limit": {
+                  "default": 100,
+                  "maximum": 200,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [],
+              "type": "object"
+            },
+            "name": "groups.list",
+            "result_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "items": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "id": {
+                        "maxLength": 2048,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-maxUtf8Bytes": 2048
+                      },
+                      "kind": {
+                        "enum": [
+                          "group",
+                          "account"
+                        ],
+                        "type": "string"
+                      },
+                      "title": {
+                        "anyOf": [
+                          {
+                            "maxLength": 16384,
+                            "type": "string",
+                            "x-maxSerializedBytes": 16384
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "truncated": {
+                        "items": {
+                          "enum": [
+                            "title"
+                          ],
+                          "type": "string"
+                        },
+                        "maxItems": 1,
+                        "type": "array",
+                        "uniqueItems": true
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "title",
+                      "kind",
+                      "truncated"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "next_cursor": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "items"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "args_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "cursor": {
+                  "type": "string"
+                },
+                "limit": {
+                  "default": 100,
+                  "maximum": 200,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "query": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "type": "string",
+                  "x-maxUtf8Bytes": 128
+                }
+              },
+              "required": [],
+              "type": "object"
+            },
+            "name": "contacts.list",
+            "result_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "items": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "emails": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "label": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 256,
+                                  "type": "string",
+                                  "x-maxSerializedBytes": 256
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "value": {
+                              "maxLength": 256,
+                              "type": "string",
+                              "x-maxSerializedBytes": 256
+                            }
+                          },
+                          "required": [
+                            "label",
+                            "value"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 64,
+                        "type": "array"
+                      },
+                      "family_name": {
+                        "anyOf": [
+                          {
+                            "maxLength": 16384,
+                            "type": "string",
+                            "x-maxSerializedBytes": 16384
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "given_name": {
+                        "anyOf": [
+                          {
+                            "maxLength": 16384,
+                            "type": "string",
+                            "x-maxSerializedBytes": 16384
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "groups": {
+                        "items": {
+                          "maxLength": 2048,
+                          "minLength": 1,
+                          "type": "string",
+                          "x-maxUtf8Bytes": 2048
+                        },
+                        "maxItems": 64,
+                        "type": "array"
+                      },
+                      "id": {
+                        "maxLength": 2048,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-maxUtf8Bytes": 2048
+                      },
+                      "organization": {
+                        "anyOf": [
+                          {
+                            "maxLength": 16384,
+                            "type": "string",
+                            "x-maxSerializedBytes": 16384
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "phones": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "label": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 256,
+                                  "type": "string",
+                                  "x-maxSerializedBytes": 256
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "value": {
+                              "maxLength": 256,
+                              "type": "string",
+                              "x-maxSerializedBytes": 256
+                            }
+                          },
+                          "required": [
+                            "label",
+                            "value"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 64,
+                        "type": "array"
+                      },
+                      "truncated": {
+                        "items": {
+                          "enum": [
+                            "given_name",
+                            "family_name",
+                            "organization",
+                            "emails",
+                            "phones"
+                          ],
+                          "type": "string"
+                        },
+                        "maxItems": 5,
+                        "type": "array",
+                        "uniqueItems": true
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "groups",
+                      "given_name",
+                      "family_name",
+                      "organization",
+                      "emails",
+                      "phones",
+                      "truncated"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "next_cursor": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "items"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "args_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string",
+                  "x-maxUtf8Bytes": 2048
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "contacts.get",
+            "result_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "item": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "emails": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "label": {
+                            "anyOf": [
+                              {
+                                "maxLength": 256,
+                                "type": "string",
+                                "x-maxSerializedBytes": 256
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "value": {
+                            "maxLength": 256,
+                            "type": "string",
+                            "x-maxSerializedBytes": 256
+                          }
+                        },
+                        "required": [
+                          "label",
+                          "value"
+                        ],
+                        "type": "object"
+                      },
+                      "maxItems": 64,
+                      "type": "array"
+                    },
+                    "family_name": {
+                      "anyOf": [
+                        {
+                          "maxLength": 16384,
+                          "type": "string",
+                          "x-maxSerializedBytes": 16384
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "given_name": {
+                      "anyOf": [
+                        {
+                          "maxLength": 16384,
+                          "type": "string",
+                          "x-maxSerializedBytes": 16384
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "groups": {
+                      "items": {
+                        "maxLength": 2048,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-maxUtf8Bytes": 2048
+                      },
+                      "maxItems": 64,
+                      "type": "array"
+                    },
+                    "id": {
+                      "maxLength": 2048,
+                      "minLength": 1,
+                      "type": "string",
+                      "x-maxUtf8Bytes": 2048
+                    },
+                    "organization": {
+                      "anyOf": [
+                        {
+                          "maxLength": 16384,
+                          "type": "string",
+                          "x-maxSerializedBytes": 16384
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "phones": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "label": {
+                            "anyOf": [
+                              {
+                                "maxLength": 256,
+                                "type": "string",
+                                "x-maxSerializedBytes": 256
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "value": {
+                            "maxLength": 256,
+                            "type": "string",
+                            "x-maxSerializedBytes": 256
+                          }
+                        },
+                        "required": [
+                          "label",
+                          "value"
+                        ],
+                        "type": "object"
+                      },
+                      "maxItems": 64,
+                      "type": "array"
+                    },
+                    "truncated": {
+                      "items": {
+                        "enum": [
+                          "given_name",
+                          "family_name",
+                          "organization",
+                          "emails",
+                          "phones"
+                        ],
+                        "type": "string"
+                      },
+                      "maxItems": 5,
+                      "type": "array",
+                      "uniqueItems": true
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "groups",
+                    "given_name",
+                    "family_name",
+                    "organization",
+                    "emails",
+                    "phones",
+                    "truncated"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "item"
+              ],
+              "type": "object"
+            }
+          }
+        ],
+        "scope_key": "group",
+        "scope_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "group": {
+              "items": {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string",
+                "x-maxUtf8Bytes": 2048
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "group"
+          ],
+          "type": "object"
+        },
+        "token": "cap/contacts.read@1"
+      },
+      {
+        "available": true,
+        "ops": [
+          {
+            "args_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "cursor": {
+                  "type": "string"
+                },
+                "limit": {
+                  "default": 100,
+                  "maximum": 200,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [],
+              "type": "object"
+            },
+            "name": "mailboxes.list",
+            "result_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "items": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "account": {
+                        "anyOf": [
+                          {
+                            "maxLength": 16384,
+                            "type": "string",
+                            "x-maxSerializedBytes": 16384
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "id": {
+                        "maxLength": 2048,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-maxUtf8Bytes": 2048
+                      },
+                      "title": {
+                        "anyOf": [
+                          {
+                            "maxLength": 16384,
+                            "type": "string",
+                            "x-maxSerializedBytes": 16384
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "truncated": {
+                        "items": {
+                          "enum": [
+                            "title",
+                            "account"
+                          ],
+                          "type": "string"
+                        },
+                        "maxItems": 2,
+                        "type": "array",
+                        "uniqueItems": true
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "title",
+                      "account",
+                      "truncated"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "next_cursor": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "items"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "args_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "cursor": {
+                  "type": "string"
+                },
+                "limit": {
+                  "default": 100,
+                  "maximum": 200,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "mailbox": {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string",
+                  "x-maxUtf8Bytes": 2048
+                },
+                "since_ms": {
+                  "maximum": 9223372036854775807,
+                  "minimum": -9223372036854775808,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "mailbox"
+              ],
+              "type": "object"
+            },
+            "name": "messages.list",
+            "result_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "items": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "cc": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "address": {
+                              "maxLength": 256,
+                              "type": "string",
+                              "x-maxSerializedBytes": 256
+                            },
+                            "name": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 256,
+                                  "type": "string",
+                                  "x-maxSerializedBytes": 256
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "name",
+                            "address"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 256,
+                        "type": "array"
+                      },
+                      "date_ms": {
+                        "anyOf": [
+                          {
+                            "maximum": 9223372036854775807,
+                            "minimum": -9223372036854775808,
+                            "type": "integer"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "flagged": {
+                        "anyOf": [
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "from": {
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "address": {
+                                "maxLength": 256,
+                                "type": "string",
+                                "x-maxSerializedBytes": 256
+                              },
+                              "name": {
+                                "anyOf": [
+                                  {
+                                    "maxLength": 256,
+                                    "type": "string",
+                                    "x-maxSerializedBytes": 256
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "name",
+                              "address"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "id": {
+                        "maxLength": 2048,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-maxUtf8Bytes": 2048
+                      },
+                      "mailbox": {
+                        "maxLength": 2048,
+                        "minLength": 1,
+                        "type": "string",
+                        "x-maxUtf8Bytes": 2048
+                      },
+                      "read": {
+                        "anyOf": [
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "subject": {
+                        "anyOf": [
+                          {
+                            "maxLength": 16384,
+                            "type": "string",
+                            "x-maxSerializedBytes": 16384
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "to": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "address": {
+                              "maxLength": 256,
+                              "type": "string",
+                              "x-maxSerializedBytes": 256
+                            },
+                            "name": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 256,
+                                  "type": "string",
+                                  "x-maxSerializedBytes": 256
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "name",
+                            "address"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 256,
+                        "type": "array"
+                      },
+                      "truncated": {
+                        "items": {
+                          "enum": [
+                            "from",
+                            "to",
+                            "cc",
+                            "subject"
+                          ],
+                          "type": "string"
+                        },
+                        "maxItems": 4,
+                        "type": "array",
+                        "uniqueItems": true
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "mailbox",
+                      "date_ms",
+                      "from",
+                      "to",
+                      "cc",
+                      "subject",
+                      "read",
+                      "flagged",
+                      "truncated"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "next_cursor": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "items"
+              ],
+              "type": "object"
+            }
+          },
+          {
+            "args_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string",
+                  "x-maxUtf8Bytes": 2048
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "type": "object"
+            },
+            "name": "messages.get",
+            "result_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "item": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "body": {
+                      "anyOf": [
+                        {
+                          "maxLength": 262144,
+                          "type": "string",
+                          "x-maxSerializedBytes": 262144
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "body_state": {
+                      "enum": [
+                        "ok",
+                        "no_plain_text",
+                        "not_downloaded",
+                        "undecodable"
+                      ],
+                      "type": "string"
+                    },
+                    "cc": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "address": {
+                            "maxLength": 256,
+                            "type": "string",
+                            "x-maxSerializedBytes": 256
+                          },
+                          "name": {
+                            "anyOf": [
+                              {
+                                "maxLength": 256,
+                                "type": "string",
+                                "x-maxSerializedBytes": 256
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "address"
+                        ],
+                        "type": "object"
+                      },
+                      "maxItems": 256,
+                      "type": "array"
+                    },
+                    "date_ms": {
+                      "anyOf": [
+                        {
+                          "maximum": 9223372036854775807,
+                          "minimum": -9223372036854775808,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "flagged": {
+                      "anyOf": [
+                        {
+                          "type": "boolean"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "from": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "address": {
+                              "maxLength": 256,
+                              "type": "string",
+                              "x-maxSerializedBytes": 256
+                            },
+                            "name": {
+                              "anyOf": [
+                                {
+                                  "maxLength": 256,
+                                  "type": "string",
+                                  "x-maxSerializedBytes": 256
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "name",
+                            "address"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "id": {
+                      "maxLength": 2048,
+                      "minLength": 1,
+                      "type": "string",
+                      "x-maxUtf8Bytes": 2048
+                    },
+                    "mailbox": {
+                      "maxLength": 2048,
+                      "minLength": 1,
+                      "type": "string",
+                      "x-maxUtf8Bytes": 2048
+                    },
+                    "read": {
+                      "anyOf": [
+                        {
+                          "type": "boolean"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "subject": {
+                      "anyOf": [
+                        {
+                          "maxLength": 16384,
+                          "type": "string",
+                          "x-maxSerializedBytes": 16384
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "to": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "address": {
+                            "maxLength": 256,
+                            "type": "string",
+                            "x-maxSerializedBytes": 256
+                          },
+                          "name": {
+                            "anyOf": [
+                              {
+                                "maxLength": 256,
+                                "type": "string",
+                                "x-maxSerializedBytes": 256
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "address"
+                        ],
+                        "type": "object"
+                      },
+                      "maxItems": 256,
+                      "type": "array"
+                    },
+                    "truncated": {
+                      "items": {
+                        "enum": [
+                          "from",
+                          "to",
+                          "cc",
+                          "subject",
+                          "body"
+                        ],
+                        "type": "string"
+                      },
+                      "maxItems": 5,
+                      "type": "array",
+                      "uniqueItems": true
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "mailbox",
+                    "date_ms",
+                    "from",
+                    "to",
+                    "cc",
+                    "subject",
+                    "read",
+                    "flagged",
+                    "body",
+                    "body_state",
+                    "truncated"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "item"
+              ],
+              "type": "object"
+            }
+          }
+        ],
+        "scope_key": "mailbox",
+        "scope_schema": {
+          "additionalProperties": false,
+          "properties": {
+            "mailbox": {
+              "items": {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string",
+                "x-maxUtf8Bytes": 2048
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "mailbox"
+          ],
+          "type": "object"
+        },
+        "token": "cap/mail.read@1"
+      }
+    ]
+  },
+  "request": {
+    "method": "ability.describe"
+  },
+  "route": {
+    "acts_as_agent": false,
+    "call_mode": "classic",
+    "codemode_head": null,
+    "flow_id": null,
+    "principal": "reserved:prefrontal-core",
+    "stamp": null
+  },
+  "tag": "ability-v1"
+}
