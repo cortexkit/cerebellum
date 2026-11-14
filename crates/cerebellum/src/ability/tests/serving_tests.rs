@@ -6,6 +6,8 @@ use crate::ability::{
 use cerebellum_ability::{filter::TaggedItem, items::*, time::ReminderDue, Item};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "eds_source_tests.rs"]
+mod eds_source_tests;
 #[path = "helper_tests.rs"]
 mod helper_tests;
 #[path = "journal_tests.rs"]

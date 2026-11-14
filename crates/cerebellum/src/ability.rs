@@ -19,6 +19,7 @@ use crate::{
 };
 
 mod binding;
+mod eds;
 mod helper;
 mod journal;
 mod outlook;
@@ -176,10 +177,10 @@ pub(crate) struct AbilityPlane {
 
 impl Default for AbilityPlane {
     fn default() -> Self {
-        let source: Arc<dyn StatusSource> = if platform() == Platform::Windows {
-            Arc::new(outlook::source::OutlookSource::new(None))
-        } else {
-            Arc::new(UnavailableSource(platform()))
+        let source: Arc<dyn StatusSource> = match platform() {
+            Platform::Windows => Arc::new(outlook::source::OutlookSource::new(None)),
+            Platform::Linux => Arc::new(eds::EdsSource::new(None)),
+            Platform::MacOs => Arc::new(UnavailableSource(platform())),
         };
         let mut plane = Self::new(platform(), source, true);
         if plane.platform == Platform::MacOs {
@@ -490,6 +491,7 @@ enum Refusal {
     BindingUnavailable,
     ScopeStale,
     ItemNotFound,
+    RecurrenceUnsupported,
     JournalUnavailable,
     Unavailable(&'static str),
 }
@@ -531,6 +533,10 @@ impl Refusal {
                 "a bound ability container no longer exists",
             ),
             Self::ItemNotFound => ("ability_item_not_found", "the ability item was not found"),
+            Self::RecurrenceUnsupported => (
+                "ability_recurrence_unsupported",
+                "the ability event recurrence or time zone is unsupported",
+            ),
             Self::JournalUnavailable => (
                 "journal_unavailable",
                 "the ability request could not be audited",
