@@ -1,19 +1,24 @@
-//! Management-only personal-data ability admission and static descriptions.
+//! Management-only personal-data ability admission, bindings and descriptions.
 
 use std::sync::Arc;
 
 use cerebellum_ability::{
+    cursor::CursorContext,
     schema::token_schemas,
     tokens::{Platform, Token},
+    validate_args, validate_scope, BoundScope, ValidatedArgs,
 };
 use serde_json::{json, Map, Value};
 use subc_protocol::{call_mode::CallMode, scope::ScopeKind, Frame, Principal};
 
 use crate::{
-    ability_source::{Source, SourceUnit, SourceUnits, UnitStatus},
+    ability_source::{QueueError, Source, SourceUnit, SourceUnits, UnitStatus},
     terminal_arbiter::TerminalArbiter,
     AcceptedBindFacts, ModuleError, Planes,
 };
+
+mod binding;
+use binding::{BindingReader, UnavailableBindingReader};
 
 pub(crate) const DESCRIBE: &str = "ability.describe";
 pub(crate) const SCOPE_CHOICES: &str = "ability.scope_choices";
@@ -131,6 +136,7 @@ pub(crate) struct AbilityPlane {
     platform: Platform,
     units: SourceUnits,
     source: Arc<StatusAdapter>,
+    binding: Arc<dyn BindingReader>,
 }
 
 impl Default for AbilityPlane {
@@ -145,6 +151,7 @@ impl AbilityPlane {
             platform,
             units: SourceUnits::new(platform),
             source: Arc::new(StatusAdapter(source)),
+            binding: Arc::new(UnavailableBindingReader),
         }
     }
 
@@ -181,6 +188,66 @@ impl AbilityPlane {
             .collect();
         json!({"tokens": tokens})
     }
+
+    async fn call(
+        &self,
+        facts: &AcceptedBindFacts,
+        params: &Map<String, Value>,
+        token: Token,
+        gate: Arc<TerminalArbiter>,
+    ) -> Result<Option<Value>, Refusal> {
+        let op = params["op"].as_str().expect("validated op type");
+        if token.operation(op).is_none() {
+            return Err(Refusal::OpUnknown);
+        }
+        let scope = validate_scope(token, &params["scope"]).map_err(|_| Refusal::ScopeInvalid)?;
+        let args = validate_args(token, op, &params["args"]).map_err(|_| Refusal::ArgsInvalid)?;
+        if let Some(cursor) = args.cursor() {
+            CursorContext::for_call(token, op, &args, &scope)
+                .and_then(|context| context.validate(cursor))
+                .map_err(|_| Refusal::ArgsInvalid)?;
+        }
+        check_message_scope(token, op, &args, &scope)?;
+        let key = params["key"].as_str().expect("validated key type");
+        let Some(install) = binding::authorize(
+            self.binding.as_ref(),
+            facts.flow_id.as_deref().expect("admitted flow"),
+            key,
+            &scope,
+            &gate,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let unit = self.units.for_token(token).expect("declared token unit");
+        let lease = match unit.arrive(gate).map(|ticket| ticket.wait()) {
+            Ok(wait) => wait.await,
+            Err(error) => Err(error),
+        };
+        match lease {
+            Err(QueueError::Stopped) => Ok(None),
+            Err(QueueError::SourceTimeout) => Err(Refusal::SourceTimeout),
+            Ok(_lease) => Err(pending_call(install)),
+        }
+    }
+}
+
+fn check_message_scope(
+    token: Token,
+    op: &str,
+    args: &ValidatedArgs,
+    scope: &BoundScope,
+) -> Result<(), Refusal> {
+    if op == "messages.list" && matches!(token, Token::Messages | Token::Mail) {
+        let id = args.as_json()[token.info().scope_key]
+            .as_str()
+            .expect("validated message container");
+        if !scope.contains(id) {
+            return Err(Refusal::OutOfScope);
+        }
+    }
+    Ok(())
 }
 
 fn admitted(facts: &AcceptedBindFacts, method: &str, origin_present: bool) -> bool {
@@ -218,7 +285,11 @@ enum Refusal {
     PrincipalDenied,
     ArgsInvalid,
     TokenUnknown,
+    OpUnknown,
+    ScopeInvalid,
+    OutOfScope,
     SourceFailed,
+    SourceTimeout,
     BindingUnavailable,
 }
 impl Refusal {
@@ -233,6 +304,15 @@ impl Refusal {
                 "ability_token_unknown",
                 "the ability token is not declared by this build",
             ),
+            Self::OpUnknown => (
+                "ability_op_unknown",
+                "the ability operation is not declared for this token",
+            ),
+            Self::ScopeInvalid => ("ability_scope_invalid", "the ability scope is invalid"),
+            Self::OutOfScope => (
+                "ability_out_of_scope",
+                "the ability request is outside the bound scope",
+            ),
             Self::SourceFailed => (
                 "ability_source_failed",
                 "the ability source could not serve the request",
@@ -240,6 +320,10 @@ impl Refusal {
             Self::BindingUnavailable => (
                 "ability_binding_unavailable",
                 "the ability binding is unavailable",
+            ),
+            Self::SourceTimeout => (
+                "ability_source_timeout",
+                "the ability source did not answer in time",
             ),
         }
     }
@@ -267,7 +351,7 @@ fn params<'a>(
         || required.iter().any(|key| !params.contains_key(*key))
         || params.iter().any(|(key, value)| match key.as_str() {
             "scope" | "args" => !value.is_object(),
-            "limit" => !value.is_u64(),
+            "limit" => !value.is_i64() && !value.is_u64(),
             _ => !value.is_string(),
         })
         || (method == CALL
@@ -293,10 +377,57 @@ fn pending_scope_choices() -> Refusal {
 fn pending_setup() -> Refusal {
     Refusal::SourceFailed
 }
-/// Fail closed until core's install record supplies the person's bound source
-/// ids for the requested ability key, checked before any queued data read.
-fn pending_call() -> Refusal {
-    Refusal::BindingUnavailable
+/// No source read may run until its outcome can be reserved and committed. Keep
+/// the verified install provenance at this boundary for the journaled handler.
+fn pending_call(_install: binding::Install) -> Refusal {
+    Refusal::SourceFailed
+}
+
+fn validate_choices(token: Token, params: &Map<String, Value>) -> Result<(), Refusal> {
+    let context = CursorContext::for_choices(token, params["key"].as_str().expect("validated key"))
+        .map_err(|_| Refusal::ArgsInvalid)?;
+    if params.get("limit").is_some_and(|limit| {
+        limit
+            .as_u64()
+            .is_none_or(|limit| !(1..=200).contains(&limit))
+    }) {
+        return Err(Refusal::ArgsInvalid);
+    }
+    if let Some(cursor) = params.get("cursor").and_then(Value::as_str) {
+        context.validate(cursor).map_err(|_| Refusal::ArgsInvalid)?;
+    }
+    Ok(())
+}
+
+async fn dispatch(
+    plane: &AbilityPlane,
+    facts: &AcceptedBindFacts,
+    method: &str,
+    request: &Map<String, Value>,
+    gate: Arc<TerminalArbiter>,
+) -> Result<Option<Value>, Refusal> {
+    if !admitted(facts, method, request.contains_key("origin")) {
+        return Err(Refusal::PrincipalDenied);
+    }
+    let params = params(method, request)?;
+    if method == DESCRIBE {
+        return Ok(Some(plane.describe(gate).await));
+    }
+    let params = params.expect("non-describe params");
+    let token = params["token"]
+        .as_str()
+        .and_then(Token::parse)
+        .filter(|token| plane.platform.tokens().contains(token))
+        .ok_or(Refusal::TokenUnknown)?;
+    match method {
+        SCOPE_CHOICES => {
+            validate_choices(token, params)?;
+            Err(pending_scope_choices())
+        }
+        SETUP => Err(pending_setup()),
+        CALL => plane.call(facts, params, token, gate).await,
+        _ => unreachable!(),
+    }
 }
 
 pub(crate) async fn handle(
@@ -307,35 +438,21 @@ pub(crate) async fn handle(
     method: &str,
     request: &Map<String, Value>,
 ) -> Result<(), ModuleError> {
-    let result = if !admitted(facts, method, request.contains_key("origin")) {
-        Err(Refusal::PrincipalDenied)
-    } else {
-        match params(method, request) {
-            Err(refusal) => Err(refusal),
-            Ok(_) if method == DESCRIBE => {
-                let gate = TerminalArbiter::current()
-                    .unwrap_or_else(|| Arc::new(TerminalArbiter::new(frame.clone())));
-                Ok(planes.management.abilities.describe(gate).await)
-            }
-            Ok(Some(params)) => {
-                let token = params
-                    .get("token")
-                    .and_then(Value::as_str)
-                    .and_then(Token::parse);
-                if token.is_none_or(|token| !platform().tokens().contains(&token)) {
-                    Err(Refusal::TokenUnknown)
-                } else {
-                    Err(match method {
-                        SCOPE_CHOICES => pending_scope_choices(),
-                        SETUP => pending_setup(),
-                        CALL => pending_call(),
-                        _ => unreachable!(),
-                    })
-                }
-            }
-            Ok(None) => unreachable!(),
-        }
-    };
+    let gate =
+        TerminalArbiter::current().unwrap_or_else(|| Arc::new(TerminalArbiter::new(frame.clone())));
+    let result = dispatch(
+        &planes.management.abilities,
+        facts,
+        method,
+        request,
+        gate.clone(),
+    )
+    .await;
+    // A stopped handler leaves the terminal reply to the arbiter, even if its
+    // binding future became ready at the same instant as the stop.
+    if gate.gate.stopped() {
+        return Ok(());
+    }
     let (ver, channel, epoch, corr) = (
         frame.header.ver,
         frame.header.channel,
@@ -343,7 +460,10 @@ pub(crate) async fn handle(
         frame.header.corr,
     );
     match result {
-        Ok(reply) => crate::send_tool_response(writer, ver, channel, epoch, corr, reply).await,
+        Ok(Some(reply)) => {
+            crate::send_tool_response(writer, ver, channel, epoch, corr, reply).await
+        }
+        Ok(None) => Ok(()),
         Err(refusal) => {
             let (code, message) = refusal.wire();
             crate::send_route_error(writer, ver, channel, epoch, corr, code, message).await
