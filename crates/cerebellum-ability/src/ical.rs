@@ -17,12 +17,13 @@ use crate::{
 const DAY_MS: i64 = 86_400_000;
 
 /// Adapters map Unsupported to ability_recurrence_unsupported for event reads,
-/// and SourceTimeZone/Syntax to ability_source_failed. No input text is retained.
+/// and SourceTimeZone/Syntax/IdTooLong to ability_source_failed. No input text is retained.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParseError {
     Syntax,
     Unsupported,
     SourceTimeZone,
+    IdTooLong,
 }
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -33,6 +34,7 @@ impl std::fmt::Display for ParseError {
                 Self::Syntax => "malformed content",
                 Self::Unsupported => "unsupported calendar value",
                 Self::SourceTimeZone => "unresolved computer time zone",
+                Self::IdTooLong => "calendar occurrence id exceeds the id cap",
             }
         )
     }
@@ -783,7 +785,7 @@ impl Calendar {
             };
             items.push(Event {
                 id: if recurring {
-                    occurrence_id(uid, original).map_err(|_| ParseError::Unsupported)?
+                    occurrence_id(uid, original).map_err(|_| ParseError::IdTooLong)?
                 } else {
                     uid.to_owned()
                 },
@@ -1200,6 +1202,23 @@ mod tests {
             )
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn ical_oversized_recurring_uid_is_not_an_unsupported_rule() {
+        let uid = "u".repeat(1600);
+        let text = format!("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:{uid}\nDTSTART:20250101T090000Z\nRRULE:FREQ=DAILY;COUNT=1\nEND:VEVENT\nEND:VCALENDAR");
+        let c = Calendar::parse(&text, Some("UTC")).unwrap();
+        assert_eq!(
+            list(&c, "20250101T000000Z", "20250102T000000Z"),
+            Err(ParseError::IdTooLong)
+        );
+        assert_eq!(c.event("source", &uid), Err(ParseError::IdTooLong));
+        let unsupported = calendar("DTSTART:20250101T090000Z\nRRULE:FREQ=HOURLY", "");
+        assert_eq!(
+            list(&unsupported, "20250101T000000Z", "20250102T000000Z"),
+            Err(ParseError::Unsupported)
+        );
     }
 
     #[test]
