@@ -212,6 +212,7 @@ dependencies = [
  "async-trait",
  "avatar-svg",
  "base64",
+ "cerebellum-ability",
  "cerebellum-bridge-protocol",
  "cerebellum-computer",
  "cerebellum-core",
