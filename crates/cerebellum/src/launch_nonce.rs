@@ -123,7 +123,9 @@ mod tests {
     /// launch nonce, the way the daemon starts the module. This is the child
     /// side; run normally it finds no probe mode and does nothing.
     const PROBE_MODE: &str = "CEREBELLUM_LAUNCH_NONCE_PROBE";
+    #[cfg(unix)]
     const PROBE_TEST: &str = "launch_nonce::tests::launch_nonce_probe_child";
+    #[cfg(unix)]
     const PROBE_NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     /// What the grandchild reports: whether descriptor 3 is open in it, then

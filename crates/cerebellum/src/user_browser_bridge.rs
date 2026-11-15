@@ -406,7 +406,7 @@ impl UserBrowserBridge {
     /// A bridge that records its connection history into `gauges` instead of
     /// the process-wide health gauges, so a test can read exact values while
     /// other tests connect their own bridges.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_gauges_for_test(gauges: &'static ConnectionGauges) -> Self {
         Self::with_gauges(
             Arc::new(crate::browser_standing_grants::StandingBrowserGrants::in_memory()),

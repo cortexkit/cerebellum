@@ -88,7 +88,7 @@ fn main() {
             println!("decision: Ambiguous -- {}", parts.join("; "));
         }
         TargetResolution::NotRunning => println!("decision: NotRunning"),
-        TargetResolution::Unreadable => {
+        TargetResolution::Unreadable(_) => {
             println!("decision: Unreadable (the module could not look; from a service session this is the provenance refusal)")
         }
     }

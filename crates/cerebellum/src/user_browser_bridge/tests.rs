@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use crate::test_support::HANG_GUARD;
 use serde_json::json;
 

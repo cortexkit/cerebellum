@@ -49,7 +49,8 @@ pub mod computer_grants;
 pub mod connector_evidence;
 mod consent_card;
 pub mod consent_drain;
-#[cfg(test)]
+// Executable fixtures assert Unix modes and inode reuse.
+#[cfg(all(test, unix))]
 mod content_named_fixture;
 pub mod coordinate;
 #[cfg(test)]
@@ -11352,7 +11353,7 @@ mod tests {
             operator_confirm: Arc::default(),
             run_calls: codemode::RunCalls::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer_admitted: test_admitted_computer_capabilities(),
             health: Arc::new(HealthState::default()),
             routes: Arc::new(RouteBindings::new()),
@@ -11370,7 +11371,7 @@ mod tests {
             user_browser_cards: Arc::default(),
             #[cfg(test)]
             consent_test: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
@@ -13349,7 +13350,7 @@ mod tests {
             operator_confirm: Arc::default(),
             run_calls: codemode::RunCalls::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer_admitted: test_admitted_computer_capabilities(),
             health: Arc::new(HealthState::default()),
             routes: Arc::new(RouteBindings::new()),
@@ -13367,7 +13368,7 @@ mod tests {
             user_browser_cards: Arc::default(),
             #[cfg(test)]
             consent_test: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             #[cfg(test)]
             route_test_handler: None,
@@ -13445,7 +13446,7 @@ mod tests {
             operator_confirm: Arc::default(),
             run_calls: codemode::RunCalls::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer_admitted: test_admitted_computer_capabilities(),
             health: Arc::new(HealthState::default()),
             routes: Arc::new(RouteBindings::new()),
@@ -13463,7 +13464,7 @@ mod tests {
             user_browser_cards: Arc::default(),
             #[cfg(test)]
             consent_test: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
             #[cfg(test)]
             route_test_handler: None,
@@ -14521,11 +14522,15 @@ mod connection_liveness_tests {
 
         let socket = SockRef::from(&client);
         assert!(socket.keepalive().unwrap());
-        assert_eq!(socket.tcp_keepalive_time().unwrap(), TCP_KEEPALIVE_IDLE);
-        assert_eq!(
-            socket.tcp_keepalive_interval().unwrap(),
-            TCP_KEEPALIVE_INTERVAL
-        );
+        // socket2 exposes the idle and interval getters only on Unix.
+        #[cfg(unix)]
+        {
+            assert_eq!(socket.tcp_keepalive_time().unwrap(), TCP_KEEPALIVE_IDLE);
+            assert_eq!(
+                socket.tcp_keepalive_interval().unwrap(),
+                TCP_KEEPALIVE_INTERVAL
+            );
+        }
         assert_eq!(
             socket.tcp_keepalive_retries().unwrap(),
             TCP_KEEPALIVE_RETRIES
