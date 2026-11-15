@@ -733,7 +733,7 @@ mod tests {
         assert_eq!(wire["posts_returned"], 0, "{wire}");
 
         // After a chunk was fronted and posted, or without a bracket, the
-        // same refusal is a failed dispatch as before.
+        // same refusal is a failed dispatch.
         for (refusal, bracket) in [
             (refusal(0), Some(bracket_stopped_before_front(1, 2))),
             (refusal(2), Some(bracket_stopped_before_front(1, 2))),
