@@ -340,16 +340,28 @@ fn with_tcc_preflight<T>(answers: [bool; 3], operation: impl FnOnce() -> T) -> R
     Ok(operation())
 }
 
-/// Initialize AppKit for both processes. Only the cursor-on run displays colour
-/// patterns to check that captures exclude the preview and badge panels.
-/// Return whether that optional capture-exclusion check failed.
+/// Initialize AppKit, then run the capture-exclusion check, which displays
+/// colour patterns and checks that captures exclude the preview and badge
+/// panels. Both processes run both steps: the baseline's ScreenCaptureKit
+/// window lists have timed out while the main run's, which ran this check
+/// first, arrived, so the baseline runs it too to see whether that setup is
+/// what its later lists depend on. Only the main run's verdict counts.
+/// Return whether the check failed.
 fn desk_startup(
-    baseline: bool,
     bootstrap: impl FnOnce() -> Result<(), String>,
     exclusion_failed: impl FnOnce() -> bool,
 ) -> Result<bool, String> {
     bootstrap()?;
-    Ok(!baseline && exclusion_failed())
+    Ok(exclusion_failed())
+}
+
+/// How many times each window-list check after startup is repeated, so a
+/// failure rate is measured rather than one sample per stage.
+const WINDOW_LIST_CHECK_REPEATS: usize = 5;
+
+/// The stage name of one repeat of a repeated window-list check.
+fn repeated_stage(stage: &str, repeat: usize) -> String {
+    format!("{stage} repeat={repeat}/{WINDOW_LIST_CHECK_REPEATS}")
 }
 
 #[cfg(target_os = "macos")]
@@ -2202,7 +2214,6 @@ mod desk {
         // below still run: each desk session costs the person's time, so one
         // session should report every check rather than stop at the first.
         let exclusion_failed = match desk_startup(
-            baseline,
             cerebellum_macos::prepare_app_use_desk_probe,
             || match cerebellum_macos::probe_overlay_capture_exclusion() {
                 Ok(report) => {
@@ -2222,8 +2233,9 @@ mod desk {
             }
         };
         // Where ScreenCaptureKit's window list arrives: here on the main
-        // thread after AppKit starts, then from the measurement's worker
-        // thread while the main thread pumps, then from a Tokio worker.
+        // thread after AppKit starts, then five times each from the
+        // measurement's worker thread while the main thread pumps and from
+        // Tokio workers.
         println!("{}", window_list_check("main_thread_after_appkit_startup"));
         println!(
             "TIME BUDGET: allow about {} s (launch {} s, covering the window up to {} s, \
@@ -2326,7 +2338,12 @@ mod desk {
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             cerebellum_macos::with_app_use_desk_probe_run_loop(|| {
-                println!("{}", window_list_check("std_thread_while_main_pumps"));
+                for repeat in 1..=WINDOW_LIST_CHECK_REPEATS {
+                    println!(
+                        "{}",
+                        window_list_check(&repeated_stage("std_thread_while_main_pumps", repeat))
+                    );
+                }
                 runtime.block_on(measure(&scratch, person, baseline))
             })
         }));
@@ -2436,11 +2453,17 @@ mod desk {
 
     /// Every phase against the scratch app. Returns the process exit code.
     async fn measure(scratch: &Scratch, person: i32, baseline: bool) -> i32 {
-        match tokio::spawn(async { window_list_check("tokio_worker_at_measure_start") }).await {
-            Ok(line) => println!("{line}"),
-            Err(error) => println!(
-                "RECORD window-list check stage=tokio_worker_at_measure_start did not run: {error}"
-            ),
+        for repeat in 1..=WINDOW_LIST_CHECK_REPEATS {
+            let stage = repeated_stage("tokio_worker_at_measure_start", repeat);
+            // Each repeat is its own task, so repeats may land on different
+            // workers.
+            let task_stage = stage.clone();
+            match tokio::spawn(async move { window_list_check(&task_stage) }).await {
+                Ok(line) => println!("{line}"),
+                Err(error) => {
+                    println!("RECORD window-list check stage={stage} did not run: {error}")
+                }
+            }
         }
         let target_pid = scratch.pid();
         let audit = match computer_audit(JournalPersistence::Isolated) {
@@ -2931,40 +2954,40 @@ mod tests {
 
     #[test]
     fn both_probe_processes_bootstrap_before_any_optional_exclusion_check() {
-        for baseline in [false, true] {
+        for exclusion_fails in [false, true] {
             let events = std::cell::RefCell::new(Vec::new());
             let failed = desk_startup(
-                baseline,
                 || {
                     events.borrow_mut().push("bootstrap");
                     Ok(())
                 },
                 || {
                     events.borrow_mut().push("exclusion");
-                    true
+                    exclusion_fails
                 },
             )
             .unwrap();
-            assert_eq!(failed, !baseline);
-            let expected = if baseline {
-                vec!["bootstrap"]
-            } else {
-                vec!["bootstrap", "exclusion"]
-            };
-            assert_eq!(*events.borrow(), expected);
+            assert_eq!(failed, exclusion_fails);
+            assert_eq!(*events.borrow(), ["bootstrap", "exclusion"]);
         }
     }
 
     #[test]
+    fn repeated_window_list_checks_name_their_repeat() {
+        assert_eq!(WINDOW_LIST_CHECK_REPEATS, 5);
+        assert_eq!(
+            repeated_stage("tokio_worker_at_measure_start", 2),
+            "tokio_worker_at_measure_start repeat=2/5"
+        );
+    }
+
+    #[test]
     fn a_bootstrap_failure_prevents_the_exclusion_check_in_either_process() {
-        for baseline in [false, true] {
-            let result = desk_startup(
-                baseline,
-                || Err("no main thread".to_string()),
-                || panic!("exclusion must not run without AppKit"),
-            );
-            assert_eq!(result, Err("no main thread".to_string()));
-        }
+        let result = desk_startup(
+            || Err("no main thread".to_string()),
+            || panic!("exclusion must not run without AppKit"),
+        );
+        assert_eq!(result, Err("no main thread".to_string()));
     }
 
     #[test]
