@@ -442,11 +442,9 @@ pub(super) struct RestoreRequest {
 /// Request the previous application back and wait at most `wait_ms` from
 /// `requested_at_ms` for it: `Restored`, or `Failed` naming what is in front.
 ///
-/// A refused request is not given up on at once: the previous application
-/// left behind the target is the failure this exists to prevent, so the
-/// whole wait is spent before reporting it. When the first request has not
-/// taken effect after [`RESTORE_FALLBACK_AFTER_MS`], the host's second route
-/// is asked too, but only while the target is still the application in
+/// A refused first request asks the host's second route at once; an accepted
+/// request gets [`RESTORE_FALLBACK_AFTER_MS`] to take effect first. Either
+/// way, the second route is asked only while the target is still the application in
 /// front, the input observer has watched without a gap since the front, and,
 /// when `require_quiet`, no person input has arrived since it.
 pub(super) fn request_restore<H: FrontingBracketHost + ?Sized>(
@@ -456,8 +454,12 @@ pub(super) fn request_restore<H: FrontingBracketHost + ?Sized>(
     wait_ms: u64,
 ) -> RestoreStatus {
     let previous = request.previous;
-    let _ = host.request_front(previous);
-    let first_wait = RESTORE_FALLBACK_AFTER_MS.min(wait_ms);
+    let first_accepted = host.request_front(previous);
+    let first_wait = if first_accepted {
+        RESTORE_FALLBACK_AFTER_MS.min(wait_ms)
+    } else {
+        0
+    };
     if wait_for_front(host, previous, requested_at_ms, first_wait) {
         return RestoreStatus::Restored;
     }

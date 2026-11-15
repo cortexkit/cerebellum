@@ -95,7 +95,7 @@ pub trait FrontingBracketHost {
     /// request itself was refused.
     fn request_front(&mut self, pid: u32) -> bool;
     /// A second way to ask for `pid` to come to the front, used by a restore
-    /// only when [`Self::request_front`] has not taken effect within
+    /// when [`Self::request_front`] was refused or has not taken effect within
     /// [`RESTORE_FALLBACK_AFTER_MS`]. `false` when the host has none or the
     /// request was refused.
     fn request_front_fallback(&mut self, _pid: u32) -> bool {

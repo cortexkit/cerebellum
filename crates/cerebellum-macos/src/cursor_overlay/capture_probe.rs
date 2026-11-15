@@ -296,11 +296,25 @@ enum CaptureObservation {
     Pixels {
         patches: usize,
         visible_pixels: usize,
+        extent: Option<AlphaExtent>,
     },
+}
+
+/// Inclusive raster coordinates, measured from the top left, and the range
+/// of non-zero alpha values. Transparent pixels do not widen either range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AlphaExtent {
+    min_x: usize,
+    min_y: usize,
+    max_x: usize,
+    max_y: usize,
+    min_alpha: u8,
+    max_alpha: u8,
 }
 
 #[derive(Debug)]
 struct WindowObservation {
+    window_id: u32,
     shareable: Vec<ShareableWindow>,
     on_screen: bool,
     capture: CaptureObservation,
@@ -319,16 +333,19 @@ fn observe(
         // An invalid raster is a probe error, not evidence of capture refusal.
         Ok(image) => {
             let samples = patches(&image, pattern)?;
+            let (visible_pixels, extent) = visible_pixels(&image);
             (
                 CaptureObservation::Pixels {
                     patches: matched_count(&samples),
-                    visible_pixels: visible_pixels(&image),
+                    visible_pixels,
+                    extent,
                 },
                 samples.to_vec(),
             )
         }
     };
     Ok(WindowObservation {
+        window_id,
         shareable: Vec::new(),
         on_screen,
         capture,
@@ -336,14 +353,38 @@ fn observe(
     })
 }
 
-fn visible_pixels(image: &RawCapture) -> usize {
-    image
-        .bgra
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .filter(|pixel| pixel[3] != 0)
-        .count()
+fn visible_pixels(image: &RawCapture) -> (usize, Option<AlphaExtent>) {
+    let mut count = 0;
+    let mut extent: Option<AlphaExtent> = None;
+    for (index, pixel) in image.bgra.as_chunks::<4>().0.iter().enumerate() {
+        let alpha = pixel[3];
+        if alpha == 0 {
+            continue;
+        }
+        count += 1;
+        let (x, y) = (index % image.width, index / image.width);
+        match &mut extent {
+            Some(extent) => {
+                extent.min_x = extent.min_x.min(x);
+                extent.min_y = extent.min_y.min(y);
+                extent.max_x = extent.max_x.max(x);
+                extent.max_y = extent.max_y.max(y);
+                extent.min_alpha = extent.min_alpha.min(alpha);
+                extent.max_alpha = extent.max_alpha.max(alpha);
+            }
+            None => {
+                extent = Some(AlphaExtent {
+                    min_x: x,
+                    min_y: y,
+                    max_x: x,
+                    max_y: y,
+                    min_alpha: alpha,
+                    max_alpha: alpha,
+                });
+            }
+        }
+    }
+    (count, extent)
 }
 
 fn describe(observation: &WindowObservation) -> String {
@@ -352,8 +393,16 @@ fn describe(observation: &WindowObservation) -> String {
         CaptureObservation::Pixels {
             patches,
             visible_pixels,
+            extent,
         } => {
-            format!("captured {patches}/4 pattern patches, {visible_pixels} non-zero-alpha pixels")
+            let extent = match extent {
+                Some(e) => format!(
+                    "bbox=({},{})-({},{}) inclusive top-left raster pixels, alpha={}..={}",
+                    e.min_x, e.min_y, e.max_x, e.max_y, e.min_alpha, e.max_alpha
+                ),
+                None => "bbox=none, alpha=none".into(),
+            };
+            format!("captured {patches}/4 pattern patches, {visible_pixels} non-zero-alpha pixels, {extent}")
         }
     };
     if !observation.samples.is_empty() {
@@ -376,9 +425,10 @@ fn describe(observation: &WindowObservation) -> String {
         .map(|window| format!("title={:?}, owner={:?}", window.title, window.owner))
         .collect();
     format!(
-        "shareable={}, on_screen={}, metadata=[{}], {capture}",
+        "shareable={}, on_screen={}, window_id={}, metadata=[{}], {capture}",
         !observation.shareable.is_empty(),
         observation.on_screen,
+        observation.window_id,
         metadata.join("; ")
     )
 }
@@ -518,8 +568,9 @@ mod desk_worker_tests {
 /// after its --approve-desk-probe opt-in, permission preflight and
 /// [`prepare_app_use_desk_probe`].
 /// No raster is stored or returned; the report records shareable titles and
-/// owners, capture refusal or the count of non-zero-alpha pixels, and sampled
-/// colours next to those drawn. Listed panels must expose no title and belong
+/// owners, window IDs, capture refusal or the count, bounding box and alpha range
+/// of non-zero-alpha pixels, and sampled colours next to those drawn.
+/// Listed panels must expose no title and belong
 /// to this process; every panel must be on screen and yield no visible pixels.
 #[doc(hidden)]
 pub fn probe_overlay_capture_exclusion() -> Result<String, String> {
@@ -674,11 +725,13 @@ mod tests {
         CaptureObservation::Pixels {
             patches,
             visible_pixels,
+            extent: None,
         }
     }
 
     fn observation(listed: bool, capture: CaptureObservation) -> WindowObservation {
         WindowObservation {
+            window_id: 7,
             shareable: if listed {
                 vec![ShareableWindow {
                     id: 7,
@@ -763,19 +816,77 @@ mod tests {
                 image.bgra[at * 4 + 3] = alpha;
                 let samples = patches(&image, 0).unwrap();
                 assert_eq!(matched_count(&samples), 0);
-                assert_eq!(visible_pixels(&image), 1);
+                assert_eq!(visible_pixels(&image).0, 1);
                 for index in 0..2 {
                     let mut panels = [
                         observation(false, pixels(0, 0)),
                         observation(false, pixels(0, 0)),
                     ];
-                    panels[index].capture = pixels(0, visible_pixels(&image));
+                    panels[index].capture = pixels(0, visible_pixels(&image).0);
                     assert!(capture_verdict(&panels, &control, OWN_PID)
                         .unwrap_err()
                         .contains("visible pixels leaked"));
                 }
             }
         }
+    }
+
+    #[test]
+    fn alpha_extent_locates_a_single_row_and_column_in_raster_coordinates() {
+        for (row, expected) in [(true, (0, 127, 127, 127)), (false, (127, 0, 127, 127))] {
+            let mut image = quadrant_image(128, [[0; 3]; 4], 0);
+            for i in 0..128 {
+                let index = if row { 127 * 128 + i } else { i * 128 + 127 };
+                image.bgra[index * 4 + 3] = 1 + i as u8;
+            }
+            let (count, extent) = visible_pixels(&image);
+            assert_eq!(count, 128);
+            let (min_x, min_y, max_x, max_y) = expected;
+            assert_eq!(
+                extent,
+                Some(AlphaExtent {
+                    min_x,
+                    min_y,
+                    max_x,
+                    max_y,
+                    min_alpha: 1,
+                    max_alpha: 128,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn alpha_extent_counts_disconnected_pixels_without_counting_the_box_interior() {
+        let mut image = quadrant_image(128, [[0; 3]; 4], 0);
+        for (x, y, alpha) in [(5, 9, 255), (80, 70, 3), (12, 50, 127)] {
+            image.bgra[(y * 128 + x) * 4 + 3] = alpha;
+        }
+        assert_eq!(
+            visible_pixels(&image),
+            (
+                3,
+                Some(AlphaExtent {
+                    min_x: 5,
+                    min_y: 9,
+                    max_x: 80,
+                    max_y: 70,
+                    min_alpha: 3,
+                    max_alpha: 255,
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn transparent_capture_reports_no_alpha_extent() {
+        let image = quadrant_image(128, [[0; 3]; 4], 0);
+        assert_eq!(visible_pixels(&image), (0, None));
+        let text = describe(&observation(false, pixels(0, 0)));
+        assert!(
+            text.contains("0 non-zero-alpha pixels, bbox=none, alpha=none"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1114,7 +1225,7 @@ mod tests {
         let observation = |image: &RawCapture, pattern, listed| {
             let samples = patches(image, pattern).unwrap();
             WindowObservation {
-                capture: pixels(matched_count(&samples), visible_pixels(image)),
+                capture: pixels(matched_count(&samples), visible_pixels(image).0),
                 samples: samples.to_vec(),
                 ..observation(listed, pixels(0, 0))
             }
@@ -1168,15 +1279,20 @@ mod tests {
     fn the_report_shows_each_sampled_colour_next_to_the_drawn_one() {
         let image = quadrant_image(128, [[0, 0, 0]; 4], 255);
         let samples = patches(&image, 2).unwrap();
+        let (visible_pixels, extent) = visible_pixels(&image);
         let observation = WindowObservation {
-            capture: pixels(matched_count(&samples), visible_pixels(&image)),
+            capture: CaptureObservation::Pixels {
+                patches: matched_count(&samples),
+                visible_pixels,
+                extent,
+            },
             samples: samples.to_vec(),
             ..observation(true, pixels(0, 0))
         };
         let text = describe(&observation);
-        assert!(text.starts_with("shareable=true, on_screen=true, metadata=["));
+        assert!(text.starts_with("shareable=true, on_screen=true, window_id=7, metadata=["));
         assert!(text.contains(
-            "captured 0/4 pattern patches, 16384 non-zero-alpha pixels (sampled vs expected: "
+            "captured 0/4 pattern patches, 16384 non-zero-alpha pixels, bbox=(0,0)-(127,127) inclusive top-left raster pixels, alpha=255..=255 (sampled vs expected: "
         ));
         for [r, g, b] in pattern_colours(2) {
             assert!(
