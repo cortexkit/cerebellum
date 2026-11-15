@@ -444,9 +444,9 @@ pub(super) struct RestoreRequest {
 ///
 /// A refused first request asks the host's second route at once; an accepted
 /// request gets [`RESTORE_FALLBACK_AFTER_MS`] to take effect first. Either
-/// way, the second route is asked only while the target is still the application in
-/// front, the input observer has watched without a gap since the front, and,
-/// when `require_quiet`, no person input has arrived since it.
+/// way, the second route is asked only while the target is still the
+/// application in front, the input observer has watched without a gap since
+/// the front, and, when `require_quiet`, no person input has arrived since it.
 pub(super) fn request_restore<H: FrontingBracketHost + ?Sized>(
     host: &mut H,
     request: RestoreRequest,
