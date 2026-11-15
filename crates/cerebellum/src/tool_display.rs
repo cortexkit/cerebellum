@@ -44,6 +44,7 @@ type Key = (String, String);
 
 #[derive(Default)]
 pub(crate) struct Records {
+    pub(crate) events: Arc<crate::event_publish::Publisher>,
     backend: OnceLock<Arc<dyn Backend>>,
     state: Mutex<State>,
 }
@@ -209,6 +210,12 @@ pub(crate) fn site(origin: &str) {
 }
 
 impl Records {
+    pub(crate) fn with_events(events: Arc<crate::event_publish::Publisher>) -> Self {
+        Self {
+            events,
+            ..Default::default()
+        }
+    }
     pub(crate) fn connect(&self, backend: Arc<dyn Backend>) {
         let _ = self.backend.set(backend);
     }
@@ -506,6 +513,7 @@ impl Records {
         if valid.is_err() {
             return;
         }
+        self.events.tool_display(&write);
         let Some(backend) = self.backend.get().cloned() else {
             return;
         };
