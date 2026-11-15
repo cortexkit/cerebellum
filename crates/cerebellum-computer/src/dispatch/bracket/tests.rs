@@ -7,6 +7,7 @@ use crate::dispatch::seize::{HeartbeatMarker, IdleGateRefusal, OBSERVED_DISPATCH
 use crate::platform::{HeldStateDisposition, ProcessEventRefusal};
 
 mod listing;
+mod restore_fallback;
 mod restore_reserve;
 mod unit_cost;
 
@@ -63,10 +64,13 @@ struct FakeDesk {
     /// This many requests to bring `PREVIOUS` back are ignored, as an
     /// application that does not answer the first route does.
     ignored_restores: usize,
+    /// The first restore route returns an error rather than accepting a request.
+    refused_restores: bool,
     /// Whether the second route brings `PREVIOUS` back.
     fallback_restores: bool,
     /// Every request made the second way, in order.
     fallback_requests: Vec<u32>,
+    fallback_request_times: Vec<u64>,
     /// The target comes to the front again at each of these instants, as
     /// an activation the platform delivers more than once does.
     landings_at: Vec<u64>,
@@ -117,8 +121,10 @@ impl FakeDesk {
             switch_on_second_sample: false,
             input_on_second_sample: false,
             ignored_restores: 0,
+            refused_restores: false,
             fallback_restores: false,
             fallback_requests: Vec::new(),
+            fallback_request_times: Vec::new(),
             landings_at: Vec::new(),
             input_at: None,
             listing: None,
@@ -183,6 +189,9 @@ impl FrontingBracketHost for FakeDesk {
     }
     fn request_front(&mut self, pid: u32) -> bool {
         self.front_requests.push(pid);
+        if pid == PREVIOUS && self.refused_restores {
+            return false;
+        }
         if self.refuse_front_of == Some(pid) {
             return true;
         }
@@ -204,6 +213,7 @@ impl FrontingBracketHost for FakeDesk {
     }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
         self.fallback_requests.push(pid);
+        self.fallback_request_times.push(self.now);
         if !self.fallback_restores {
             return false;
         }
