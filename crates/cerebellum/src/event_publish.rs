@@ -5,7 +5,10 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering::Relaxed},
+        atomic::{
+            AtomicBool, AtomicU64, AtomicU8,
+            Ordering::{Acquire, Relaxed, Release},
+        },
         Arc, Mutex, OnceLock,
     },
     time::Duration,
@@ -98,6 +101,7 @@ impl Gauges {
 pub(crate) struct Publisher {
     sender: mpsc::Sender<Event>,
     receiver: Mutex<Option<mpsc::Receiver<Event>>>,
+    transport_installed: AtomicBool,
     gauges: Arc<Gauges>,
 }
 
@@ -130,6 +134,7 @@ impl Publisher {
         Self {
             sender,
             receiver: Mutex::new(Some(receiver)),
+            transport_installed: AtomicBool::new(false),
             gauges,
         }
     }
@@ -143,6 +148,7 @@ impl Publisher {
     pub(crate) fn connect(&self, transport: Arc<dyn Transport>) {
         if let Some(receiver) = self.receiver.lock().unwrap().take() {
             tokio::spawn(run(transport, receiver, self.gauges.clone()));
+            self.transport_installed.store(true, Release);
         }
     }
 
@@ -161,6 +167,11 @@ impl Publisher {
     }
 
     pub(crate) fn tool_display(&self, write: &DisplayWrite) {
+        // Direct display writes already carry these records. Retaining them
+        // while bus publication is disabled would only fill the recovery queue.
+        if !self.transport_installed.load(Acquire) {
+            return;
+        }
         let writer = subc_protocol::Principal::Reserved {
             module_id: "cerebellum".into(),
         };

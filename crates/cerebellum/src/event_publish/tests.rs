@@ -93,6 +93,78 @@ fn write(kind: DisplayKind) -> DisplayWrite {
 }
 
 #[test]
+fn bus_notice_disabled_display_does_not_queue_but_recovered_late_result_does() {
+    use crate::journal::call_records::{
+        Begin, CallRecords, InMemoryCallRecordStorage, ScopeIdentity,
+    };
+
+    let publisher = Publisher::new(Arc::new(Gauges::default()));
+    for _ in 0..200 {
+        publisher.tool_display(&write(DisplayKind::Record));
+    }
+    assert_eq!(publisher.gauges.failed.load(Relaxed), 0);
+    assert_eq!(publisher.sender.capacity(), CAPACITY);
+    assert!(matches!(
+        publisher
+            .receiver
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    let storage = InMemoryCallRecordStorage::new();
+    let calls = CallRecords::open(Box::new(storage.clone()), 100);
+    let owner = "reserved:prefrontal-core";
+    assert!(matches!(
+        calls.begin(owner, "opaque:recovered", "scope", 100),
+        Begin::Execute(_)
+    ));
+    calls
+        .hold_handoff(
+            owner,
+            "opaque:recovered",
+            "handoff",
+            ScopeIdentity {
+                owner: owner.into(),
+                reference: "scope".into(),
+                scope_epoch: 1,
+            },
+            "https://login.example",
+            100,
+        )
+        .unwrap();
+    drop(calls);
+    let recovered = CallRecords::open(Box::new(storage), 101);
+    for _ in 0..200 {
+        recovered.events.tool_display(&write(DisplayKind::Record));
+    }
+    assert_eq!(recovered.events.sender.capacity(), CAPACITY - 1);
+    let queued = recovered
+        .events
+        .receiver
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .try_recv()
+        .unwrap();
+    assert_eq!(
+        queued.kind,
+        Kind::LateResultReady {
+            custodian_module: Some("prefrontal-core".into())
+        }
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&queued.bytes).unwrap(),
+        json!({"call_key":"opaque:recovered", "outcome":"handoff_interrupted"})
+    );
+    assert_eq!(recovered.events.sender.capacity(), CAPACITY);
+}
+
+#[test]
 fn custodian_tail_requires_exact_reserved_module_label() {
     for module in ["thalamus-harness", "prefrontal-core", "broca"] {
         assert_eq!(
