@@ -118,6 +118,8 @@ mod macos;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod preview_schedule;
 #[cfg(all(target_os = "macos", feature = "desk-probe"))]
+pub use ax_actions::{take_frontmost_call_for_probe, FrontmostCallForProbe};
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
 pub use cursor_overlay::{
     prepare_app_use_desk_probe, probe_overlay_capture_exclusion, with_app_use_desk_probe_run_loop,
 };
@@ -129,9 +131,13 @@ pub use cursor_overlay::{
     PreviewHideProbe, ProbePass, AVATAR_PIXELS,
 };
 #[cfg(all(target_os = "macos", feature = "desk-probe"))]
-pub use macos::{take_posts_for_probe, take_window_list_errors_for_probe};
+pub use macos::{
+    application_is_active_for_probe, take_posts_for_probe, take_window_list_errors_for_probe,
+};
 #[cfg(target_os = "macos")]
 pub use preview_schedule::{OverlayFrame, OverlayPreview, OverlayPreviewMotion, PreviewFallback};
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
+pub use window_image::{normal_frontmost_window_for_probe, normal_window_order_for_probe};
 #[cfg(target_os = "macos")]
 mod peer_attestation;
 #[cfg(target_os = "macos")]

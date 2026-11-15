@@ -599,14 +599,28 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
     }
     fn request_front(&mut self, pid: u32) -> bool {
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
-        self.probe_timing
-            .restore_requested(pid, probe_timing::RestoreRoute::AxFrontmost);
+        {
+            probe_timing::request_restore(
+                &mut *self.host,
+                self.probe_timing,
+                pid,
+                probe_timing::RestoreRoute::AxFrontmost,
+            )
+        }
+        #[cfg(not(all(feature = "desk-probe", target_os = "macos")))]
         self.host.request_front(pid)
     }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
-        self.probe_timing
-            .restore_requested(pid, probe_timing::RestoreRoute::Fallback);
+        {
+            probe_timing::request_restore(
+                &mut *self.host,
+                self.probe_timing,
+                pid,
+                probe_timing::RestoreRoute::Fallback,
+            )
+        }
+        #[cfg(not(all(feature = "desk-probe", target_os = "macos")))]
         self.host.request_front_fallback(pid)
     }
     fn late_activation_observed(&mut self, _latency_ms: u64) {

@@ -1003,6 +1003,29 @@ pub fn activate_application(pid: u32, start_time_micros: u64) -> bool {
     })
 }
 
+/// Whether AppKit reports the application `pid` runs as the active one, for
+/// the manual desk probe only. Window order and activation can disagree: an
+/// application can become active without its windows coming above the one
+/// that was in front, and the probe samples both to tell those apart. A fresh
+/// `NSRunningApplication` is asked each time. `None` when no running
+/// application has the pid.
+#[cfg(feature = "desk-probe")]
+#[doc(hidden)]
+pub fn application_is_active_for_probe(pid: u32) -> Option<bool> {
+    use objc2::msg_send;
+    use objc2::runtime::AnyClass;
+    use objc2_app_kit::NSRunningApplication;
+    let raw_pid = i32::try_from(pid).ok()?;
+    let class = AnyClass::get(c"NSRunningApplication")?;
+    objc2::rc::autoreleasepool(|_| {
+        // SAFETY: a documented class method taking a pid_t; it returns nil or
+        // an NSRunningApplication, which `Retained` takes ownership of.
+        let application: Option<Retained<NSRunningApplication>> =
+            unsafe { msg_send![class, runningApplicationWithProcessIdentifier: raw_pid] };
+        application.map(|application| application.isActive())
+    })
+}
+
 /// One application as the window server lists it: pid, bundle identifier and
 /// name, copied out of the completion callback.
 type ListedApplication = (u32, String, String);
