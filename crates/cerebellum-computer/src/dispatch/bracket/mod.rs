@@ -258,6 +258,12 @@ pub struct BracketReport {
     /// process were slow: the front and the restore alone would have fit.
     /// That reserve ages out, so a later retry can be admitted.
     pub waiting_out_slow_post: bool,
+    /// The stop is `BoundExceeded` before anything was posted only because
+    /// recent restores of the previous application were measured slow: the
+    /// front, this bracket's own restores and the unit post alone would have
+    /// fit. A refusal while no restore has been measured yet (the full restore
+    /// allowance stands in) does not count: nothing was seen to be slow.
+    pub waiting_out_slow_restore: bool,
 }
 
 impl BracketReport {
@@ -399,6 +405,7 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
         restore: RestoreStatus::NotNeeded,
         stop: None,
         waiting_out_slow_post: false,
+        waiting_out_slow_restore: false,
     };
     let Some(previous) = host.frontmost_pid() else {
         report.stop = Some(BracketStop::PreviousUnknown);
@@ -540,12 +547,15 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
             // Without a restore measurement, reserve the full restore allowance.
             // The person's app may return more slowly than the target fronts.
             // A refused first call still restores and learns its cost.
+            let measured_restore = if previous == plan.target_pid {
+                None
+            } else {
+                host.borrow_mut().measured_restore_latency_ms()
+            };
             let restore_latency = if previous == plan.target_pid {
                 0
             } else {
-                host.borrow_mut()
-                    .measured_restore_latency_ms()
-                    .unwrap_or(RESTORE_WAIT_MS)
+                measured_restore.unwrap_or(RESTORE_WAIT_MS)
             };
             // Until this bracket has timed a unit of its own, reserve the
             // slowest unit post the host measured recently, so a post that
@@ -568,6 +578,14 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
                     // fitting, so a later retry can succeed once it ages out.
                     report.waiting_out_slow_post =
                         report.units_posted == 0 && without_unit <= bound;
+                    // Only the measured restores kept it from fitting: the
+                    // person's application has lately been slow to come back.
+                    let without_measured_restore = elapsed
+                        .saturating_add(report.slowest_restore_ms.max(front_latency))
+                        .saturating_add(unit_cost);
+                    report.waiting_out_slow_restore = report.units_posted == 0
+                        && measured_restore.is_some()
+                        && without_measured_restore <= bound;
                 }
                 break;
             }

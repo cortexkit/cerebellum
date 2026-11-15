@@ -438,6 +438,34 @@ pub(crate) fn normal_frontmost_process_id() -> Option<i32> {
     crate::window_visibility::frontmost_from_windows(&cursor_window_list()?)
 }
 
+/// The window `frontmost_process_id` reads its answer from, for the manual
+/// desk probe only: the first normal-layer window's owner pid and window id
+/// (`None` when the list gives none), chosen by the same rule. `None` when the
+/// list cannot be read or has no such window.
+#[cfg(feature = "desk-probe")]
+pub fn normal_frontmost_window_for_probe() -> Option<(i32, Option<u32>)> {
+    let windows = cursor_window_list()?;
+    let pid = crate::window_visibility::frontmost_from_windows(&windows)?;
+    let window = windows
+        .iter()
+        .find(|window| window.layer == Some(0) && window.pid == u32::try_from(pid).ok())?;
+    Some((pid, window.id))
+}
+
+/// The window ids of `pid`'s on-screen normal-layer windows, front to back,
+/// for the manual desk probe only, so it can tell whether a restore
+/// rearranged that application's windows. `None` when the list cannot be read.
+#[cfg(feature = "desk-probe")]
+pub fn normal_window_order_for_probe(pid: u32) -> Option<Vec<u32>> {
+    Some(
+        cursor_window_list()?
+            .iter()
+            .filter(|window| window.layer == Some(0) && window.pid == Some(pid))
+            .filter_map(|window| window.id)
+            .collect(),
+    )
+}
+
 /// Legacy rectangular window-list containment; it does not account for
 /// click-through overlays. The admitted pointer route uses pointer_window_at.
 pub fn topmost_window_at(x: f64, y: f64) -> Option<u32> {

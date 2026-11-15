@@ -266,7 +266,9 @@ impl PlatformResolver {
 /// running in the wrong session was told to check. The reasons are distinct
 /// because the remedies are, and the wire carries the reason itself so a
 /// caller need not parse the prose.
-fn unreadable_remedy(reason: &cerebellum_computer::platform::UnreadableReason) -> &'static str {
+pub(crate) fn unreadable_remedy(
+    reason: &cerebellum_computer::platform::UnreadableReason,
+) -> &'static str {
     use cerebellum_computer::platform::UnreadableReason;
     match reason {
         UnreadableReason::WindowListUnavailable => {

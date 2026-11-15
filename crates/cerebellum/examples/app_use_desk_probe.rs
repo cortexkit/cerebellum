@@ -91,7 +91,24 @@ const IDLE_COUNTERS: [&str; 2] = ["previewCaptureRequests", "previewFramesWritte
 /// The width of a background-mode preview window, in points.
 const PREVIEW_WIDTH: f64 = cerebellum_computer::preview_layout::PREVIEW_WIDTH;
 const NEEDS_FRONT_ATTEMPTS: usize = 20;
+/// From this attempt on, restores ask for the person's application by
+/// activation first. Earlier attempts keep production order (accessibility
+/// first), so one run measures both orders on the same desk.
+const ACTIVATE_FIRST_FROM_ATTEMPT: usize = 11;
 const CANDIDATE_BOUNDS_MS: [u64; 5] = [100, 150, 200, 250, 300];
+
+/// Whether `attempt`'s restores ask by activation first.
+fn activate_first_for(attempt: usize) -> bool {
+    attempt >= ACTIVATE_FIRST_FROM_ATTEMPT
+}
+
+fn restore_order_name(activate_first: bool) -> &'static str {
+    if activate_first {
+        "activate_first"
+    } else {
+        "ax_first"
+    }
+}
 
 #[derive(Debug, PartialEq)]
 struct TimingSummary {
@@ -133,6 +150,12 @@ struct AttemptTiming {
     /// Front confirmation through posting and confirmed restore, same attempt.
     post_and_restore_ms: Option<f64>,
     cleanup_only_ms: Option<f64>,
+    /// This attempt's restores asked by activation first.
+    activate_first: bool,
+    /// The restore's first request: the time from it to the restore being
+    /// confirmed (when it was), and whether it was confirmed before any
+    /// second request.
+    first_restore: Option<(Option<f64>, bool)>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -220,6 +243,69 @@ fn print_needs_front_summary(attempts: &[AttemptTiming]) {
             attempts.len()
         );
     }
+    for line in restore_order_summary_lines(attempts) {
+        println!("{line}");
+    }
+}
+
+/// Per restore order: how many restores the first request alone put back,
+/// and the time from the first request to the confirmed restore.
+fn restore_order_summary_lines(attempts: &[AttemptTiming]) -> Vec<String> {
+    [false, true]
+        .into_iter()
+        .map(|activate_first| {
+            let restores: Vec<_> = attempts
+                .iter()
+                .filter(|attempt| attempt.activate_first == activate_first)
+                .filter_map(|attempt| attempt.first_restore)
+                .collect();
+            let first_alone = restores.iter().filter(|(_, alone)| *alone).count();
+            let costs: Vec<f64> = restores.iter().filter_map(|(cost, _)| *cost).collect();
+            let timing = match timing_summary(&costs) {
+                Some(stats) => format!(
+                    "first request→confirmed count={} min={:.3} median={:.3} p90={:.3} max={:.3} ms",
+                    stats.count, stats.min, stats.median, stats.p90, stats.max
+                ),
+                None => "first request→confirmed count=0".into(),
+            };
+            format!(
+                "SUMMARY restore order {}: restores={} put back by the first request alone={} {timing}",
+                restore_order_name(activate_first),
+                restores.len(),
+                first_alone,
+            )
+        })
+        .collect()
+}
+
+/// The person's application's normal-layer windows, front to back, before the
+/// chord's front and after its restore, and whether the restore changed them.
+fn person_windows_line(attempt: usize, before: Option<&[u32]>, after: Option<&[u32]>) -> String {
+    let list = |windows: Option<&[u32]>| {
+        windows.map_or_else(
+            || "unreadable".to_string(),
+            |windows| {
+                format!(
+                    "[{}]",
+                    windows
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            },
+        )
+    };
+    let verdict = match (before, after) {
+        (Some(before), Some(after)) if before == after => "unchanged",
+        (Some(_), Some(_)) => "changed",
+        _ => "unknown",
+    };
+    format!(
+        "RECORD needs-front attempt {attempt}: person_windows before_front={} after_restore={} order={verdict}",
+        list(before),
+        list(after)
+    )
 }
 
 /// Whether the person approved this run on the command line.
@@ -254,16 +340,28 @@ fn with_tcc_preflight<T>(answers: [bool; 3], operation: impl FnOnce() -> T) -> R
     Ok(operation())
 }
 
-/// Initialize AppKit for both processes. Only the cursor-on run displays colour
-/// patterns to check that captures exclude the preview and badge panels.
-/// Return whether that optional capture-exclusion check failed.
+/// Initialize AppKit, then run the capture-exclusion check, which displays
+/// colour patterns and checks that captures exclude the preview and badge
+/// panels. Both processes run both steps: the baseline's ScreenCaptureKit
+/// window lists have timed out while the main run's, which ran this check
+/// first, arrived, so the baseline runs it too to see whether that setup is
+/// what its later lists depend on. Only the main run's verdict counts.
+/// Return whether the check failed.
 fn desk_startup(
-    baseline: bool,
     bootstrap: impl FnOnce() -> Result<(), String>,
     exclusion_failed: impl FnOnce() -> bool,
 ) -> Result<bool, String> {
     bootstrap()?;
-    Ok(!baseline && exclusion_failed())
+    Ok(exclusion_failed())
+}
+
+/// How many times each window-list check after startup is repeated, so a
+/// failure rate is measured rather than one sample per stage.
+const WINDOW_LIST_CHECK_REPEATS: usize = 5;
+
+/// The stage name of one repeat of a repeated window-list check.
+fn repeated_stage(stage: &str, repeat: usize) -> String {
+    format!("{stage} repeat={repeat}/{WINDOW_LIST_CHECK_REPEATS}")
 }
 
 #[cfg(target_os = "macos")]
@@ -724,16 +822,38 @@ fn zoomed_element_summary<'a>(state_text: &'a str, element_id: &str) -> Option<&
     })
 }
 
+/// `element=no_state_text` when the reply carries no state at all: computer.keys
+/// reads the state only after a chord that posted, so a refused chord has none,
+/// and that is not the zoomed element being missing from a state that was read.
 fn zoomed_read_line(attempt: usize, reply: &Value, element_id: Option<&str>) -> String {
-    let summary = element_id.and_then(|id| {
-        zoomed_element_summary(reply["state_text"].as_str().unwrap_or_default(), id)
-    });
+    let element = match reply["state_text"].as_str() {
+        None => "no_state_text",
+        Some(state_text) => element_id
+            .and_then(|id| zoomed_element_summary(state_text, id))
+            .unwrap_or("absent"),
+    };
     format!(
-        "RECORD needs-front attempt {attempt}: zoomed read state_report={} focused_element_id={} element={}",
+        "RECORD needs-front attempt {attempt}: zoomed read state_report={} focused_element_id={} element={element}",
         reply["state_report"],
         reply["focused_element_id"],
-        summary.unwrap_or("absent")
     )
+}
+
+/// The ScreenCaptureKit window-list errors noted while one attempt ran, one
+/// line each. The fronting bracket reads the target's listing before it fronts
+/// and a failed read stops the chord with only `dispatch_failed` in the reply,
+/// so these lines are what tells an unreadable list from a target the list
+/// left out. No line at all means no list request failed.
+fn window_list_error_lines(attempt: usize, errors: &[String]) -> Vec<String> {
+    errors
+        .iter()
+        .map(|error| {
+            format!(
+                "RECORD needs-front attempt {attempt}: window-list error during the chord: {}",
+                error.replace(['\r', '\n'], " ")
+            )
+        })
+        .collect()
 }
 
 /// How long the target had been confirmed frontmost when the chord's first
@@ -2094,7 +2214,6 @@ mod desk {
         // below still run: each desk session costs the person's time, so one
         // session should report every check rather than stop at the first.
         let exclusion_failed = match desk_startup(
-            baseline,
             cerebellum_macos::prepare_app_use_desk_probe,
             || match cerebellum_macos::probe_overlay_capture_exclusion() {
                 Ok(report) => {
@@ -2114,8 +2233,9 @@ mod desk {
             }
         };
         // Where ScreenCaptureKit's window list arrives: here on the main
-        // thread after AppKit starts, then from the measurement's worker
-        // thread while the main thread pumps, then from a Tokio worker.
+        // thread after AppKit starts, then five times each from the
+        // measurement's worker thread while the main thread pumps and from
+        // Tokio workers.
         println!("{}", window_list_check("main_thread_after_appkit_startup"));
         println!(
             "TIME BUDGET: allow about {} s (launch {} s, covering the window up to {} s, \
@@ -2218,7 +2338,12 @@ mod desk {
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             cerebellum_macos::with_app_use_desk_probe_run_loop(|| {
-                println!("{}", window_list_check("std_thread_while_main_pumps"));
+                for repeat in 1..=WINDOW_LIST_CHECK_REPEATS {
+                    println!(
+                        "{}",
+                        window_list_check(&repeated_stage("std_thread_while_main_pumps", repeat))
+                    );
+                }
                 runtime.block_on(measure(&scratch, person, baseline))
             })
         }));
@@ -2328,11 +2453,17 @@ mod desk {
 
     /// Every phase against the scratch app. Returns the process exit code.
     async fn measure(scratch: &Scratch, person: i32, baseline: bool) -> i32 {
-        match tokio::spawn(async { window_list_check("tokio_worker_at_measure_start") }).await {
-            Ok(line) => println!("{line}"),
-            Err(error) => println!(
-                "RECORD window-list check stage=tokio_worker_at_measure_start did not run: {error}"
-            ),
+        for repeat in 1..=WINDOW_LIST_CHECK_REPEATS {
+            let stage = repeated_stage("tokio_worker_at_measure_start", repeat);
+            // Each repeat is its own task, so repeats may land on different
+            // workers.
+            let task_stage = stage.clone();
+            match tokio::spawn(async move { window_list_check(&task_stage) }).await {
+                Ok(line) => println!("{line}"),
+                Err(error) => {
+                    println!("RECORD window-list check stage={stage} did not run: {error}")
+                }
+            }
         }
         let target_pid = scratch.pid();
         let audit = match computer_audit(JournalPersistence::Isolated) {
@@ -2538,9 +2669,31 @@ mod desk {
             if let Some(id) = &text_area_id {
                 arguments["zoom"] = json!(id);
             }
+            // Errors noted before this chord belong to earlier calls.
+            let _ = cerebellum_macos::take_window_list_errors_for_probe();
+            let activate_first = activate_first_for(attempt);
+            cerebellum::desk_probe::set_restore_activate_first(activate_first);
+            let person_windows_before =
+                cerebellum_macos::normal_window_order_for_probe(person as u32);
             sampler.needs_front.store(true, Ordering::SeqCst);
             let chord = serve("computer.keys", arguments).await;
             sampler.needs_front.store(false, Ordering::SeqCst);
+            // The call answers only after its restore decision, so this is
+            // the order the restore left.
+            let person_windows_after =
+                cerebellum_macos::normal_window_order_for_probe(person as u32);
+            println!(
+                "RECORD needs-front attempt {attempt}: restore_order={}",
+                restore_order_name(activate_first)
+            );
+            println!(
+                "{}",
+                person_windows_line(
+                    attempt,
+                    person_windows_before.as_deref(),
+                    person_windows_after.as_deref()
+                )
+            );
             let edit_title = scratch.edit_title_highlighted();
             let selection_after = scratch.selection();
             println!(
@@ -2566,14 +2719,34 @@ mod desk {
                     .map_err(|reason| redact_typed_text(&reason, &typed)),
             );
             tokio::time::sleep(FRONT_CLEANUP_SPACING).await;
+            for line in window_list_error_lines(
+                attempt,
+                &cerebellum_macos::take_window_list_errors_for_probe(),
+            ) {
+                println!("{line}");
+            }
             let selection_changes = sys::take_selection_changes();
             for (pid, latency) in cerebellum::desk_probe::take_fronting_landings() {
                 println!("RECORD needs-front attempt {attempt}: pid {pid} pending activation landed {latency} ms after request");
             }
             let timings = cerebellum::desk_probe::take_fronting_timings();
-            let mut measured = AttemptTiming::default();
+            let mut measured = AttemptTiming {
+                activate_first,
+                ..AttemptTiming::default()
+            };
             match timings.as_slice() {
                 [timing] if timing.target_pid == scratch.pid() => {
+                    measured.first_restore =
+                        timing
+                            .first_restore_request()
+                            .map(|(requested_ms, _, alone)| {
+                                (
+                                    timing
+                                        .restore_confirmed_ms
+                                        .map(|confirmed| confirmed - requested_ms),
+                                    alone,
+                                )
+                            });
                     for line in timing.record_lines(attempt) {
                         println!("{line}");
                     }
@@ -2627,6 +2800,7 @@ mod desk {
             attempts.push(measured);
         }
         print_needs_front_summary(&attempts);
+        cerebellum::desk_probe::set_restore_activate_first(false);
         drop(selection_observer);
         let last = serve("computer.read_state", json!({"target": TEXTEDIT_BUNDLE})).await;
         report.check(
@@ -2780,40 +2954,40 @@ mod tests {
 
     #[test]
     fn both_probe_processes_bootstrap_before_any_optional_exclusion_check() {
-        for baseline in [false, true] {
+        for exclusion_fails in [false, true] {
             let events = std::cell::RefCell::new(Vec::new());
             let failed = desk_startup(
-                baseline,
                 || {
                     events.borrow_mut().push("bootstrap");
                     Ok(())
                 },
                 || {
                     events.borrow_mut().push("exclusion");
-                    true
+                    exclusion_fails
                 },
             )
             .unwrap();
-            assert_eq!(failed, !baseline);
-            let expected = if baseline {
-                vec!["bootstrap"]
-            } else {
-                vec!["bootstrap", "exclusion"]
-            };
-            assert_eq!(*events.borrow(), expected);
+            assert_eq!(failed, exclusion_fails);
+            assert_eq!(*events.borrow(), ["bootstrap", "exclusion"]);
         }
     }
 
     #[test]
+    fn repeated_window_list_checks_name_their_repeat() {
+        assert_eq!(WINDOW_LIST_CHECK_REPEATS, 5);
+        assert_eq!(
+            repeated_stage("tokio_worker_at_measure_start", 2),
+            "tokio_worker_at_measure_start repeat=2/5"
+        );
+    }
+
+    #[test]
     fn a_bootstrap_failure_prevents_the_exclusion_check_in_either_process() {
-        for baseline in [false, true] {
-            let result = desk_startup(
-                baseline,
-                || Err("no main thread".to_string()),
-                || panic!("exclusion must not run without AppKit"),
-            );
-            assert_eq!(result, Err("no main thread".to_string()));
-        }
+        let result = desk_startup(
+            || Err("no main thread".to_string()),
+            || panic!("exclusion must not run without AppKit"),
+        );
+        assert_eq!(result, Err("no main thread".to_string()));
     }
 
     #[test]
@@ -3307,6 +3481,20 @@ mod tests {
         // A longer id that merely ends with the zoomed one is not it.
         assert_eq!(zoomed_element_summary("xiq3 button", "iq3"), None);
         assert!(zoomed_read_line(5, &reply, None).ends_with("element=absent"));
+        // A refused chord's reply carries no state, which is not the same as
+        // the zoomed element missing from a state that was read.
+        assert_eq!(
+            zoomed_read_line(
+                7,
+                &json!({"outcome": "fronting_bound_exceeded", "effect_status": "not_dispatched"}),
+                Some("iq3")
+            ),
+            "RECORD needs-front attempt 7: zoomed read state_report=null focused_element_id=null element=no_state_text"
+        );
+        assert!(
+            zoomed_read_line(5, &json!({"state_text": "other: iq9 button"}), Some("iq3"))
+                .ends_with("element=absent")
+        );
         assert_eq!(
             redact_typed_text(&format!("reply: {reply}"), typed)
                 .matches("<typed text>")
@@ -3314,6 +3502,72 @@ mod tests {
             1
         );
         assert!(!redact_typed_text(&format!("reply: {reply}"), typed).contains(typed));
+    }
+
+    #[test]
+    fn window_list_errors_during_a_chord_are_printed_one_per_line() {
+        assert!(window_list_error_lines(7, &[]).is_empty());
+        assert_eq!(
+            window_list_error_lines(
+                7,
+                &["the window list did not arrive within 1s".into(), "two\nlines".into()]
+            ),
+            [
+                "RECORD needs-front attempt 7: window-list error during the chord: the window list did not arrive within 1s",
+                "RECORD needs-front attempt 7: window-list error during the chord: two lines",
+            ]
+        );
+    }
+
+    #[test]
+    fn attempts_from_eleven_ask_by_activation_first_and_say_so() {
+        assert!((1..=10).all(|attempt| !activate_first_for(attempt)));
+        assert!((11..=NEEDS_FRONT_ATTEMPTS).all(activate_first_for));
+        assert_eq!(restore_order_name(false), "ax_first");
+        assert_eq!(restore_order_name(true), "activate_first");
+    }
+
+    #[test]
+    fn person_window_order_is_compared_before_the_front_and_after_the_restore() {
+        assert_eq!(
+            person_windows_line(4, Some(&[7, 9]), Some(&[7, 9])),
+            "RECORD needs-front attempt 4: person_windows before_front=[7,9] after_restore=[7,9] order=unchanged"
+        );
+        assert_eq!(
+            person_windows_line(12, Some(&[7, 9]), Some(&[9, 7])),
+            "RECORD needs-front attempt 12: person_windows before_front=[7,9] after_restore=[9,7] order=changed"
+        );
+        assert_eq!(
+            person_windows_line(12, None, Some(&[])),
+            "RECORD needs-front attempt 12: person_windows before_front=unreadable after_restore=[] order=unknown"
+        );
+    }
+
+    #[test]
+    fn restore_orders_are_summarised_separately() {
+        let attempt = |activate_first, first_restore| AttemptTiming {
+            activate_first,
+            first_restore,
+            ..AttemptTiming::default()
+        };
+        let attempts = [
+            attempt(false, Some((Some(175.0), false))),
+            attempt(false, Some((Some(185.0), false))),
+            attempt(false, None),
+            attempt(true, Some((Some(20.0), true))),
+            attempt(true, Some((None, false))),
+        ];
+        assert_eq!(
+            restore_order_summary_lines(&attempts),
+            [
+                "SUMMARY restore order ax_first: restores=2 put back by the first request alone=0 first request→confirmed count=2 min=175.000 median=180.000 p90=185.000 max=185.000 ms",
+                "SUMMARY restore order activate_first: restores=2 put back by the first request alone=1 first request→confirmed count=1 min=20.000 median=20.000 p90=20.000 max=20.000 ms",
+            ]
+        );
+        assert_eq!(
+            restore_order_summary_lines(&[])[0],
+            "SUMMARY restore order ax_first: restores=0 put back by the first request alone=0 first request→confirmed count=0"
+        );
     }
 
     #[test]
@@ -3530,12 +3784,14 @@ fn bound_counts_keep_measured_completions_separate_from_estimated_late_cleanups(
             bracket_ms: Some(100.0),
             post_and_restore_ms: Some(30.0),
             cleanup_only_ms: None,
+            ..AttemptTiming::default()
         },
         AttemptTiming {
             front_ms: Some(80.0),
             bracket_ms: Some(130.0),
             post_and_restore_ms: Some(50.0),
             cleanup_only_ms: None,
+            ..AttemptTiming::default()
         },
         // Late fronting and cleanup provide no measured chord completion.
         AttemptTiming {

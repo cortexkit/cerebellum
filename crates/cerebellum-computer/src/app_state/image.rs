@@ -370,6 +370,7 @@ mod tests {
             restore,
             stop: None,
             waiting_out_slow_post: false,
+            waiting_out_slow_restore: false,
         }
     }
 

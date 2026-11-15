@@ -847,6 +847,8 @@ pub fn focused_window(
 /// A request, answered asynchronously: the caller watches which process is
 /// frontmost to learn whether and when it took effect.
 pub fn request_frontmost(pid: u32) -> Result<(), AxElementActionError> {
+    #[cfg(feature = "desk-probe")]
+    note_frontmost_call_for_probe(pid, None);
     require_trust()?;
     let application = application(pid)?;
     let name = CFString::from_static_str("AXFrontmost");
@@ -860,9 +862,43 @@ pub fn request_frontmost(pid: u32) -> Result<(), AxElementActionError> {
             (value as *const CFBoolean).cast(),
         )
     };
+    #[cfg(feature = "desk-probe")]
+    note_frontmost_call_for_probe(pid, Some(code));
     if code == AX_ERROR_SUCCESS {
         Ok(())
     } else {
         Err(classify(code))
     }
+}
+
+/// What the calling thread's latest [`request_frontmost`] did, for the manual
+/// desk probe only: the pid it asked for and the raw accessibility error code
+/// the write returned, `None` when it stopped before the write (no trust, or
+/// no such process). The public result folds several codes into one error
+/// kind, and the probe needs the exact code to tell a refused write from one
+/// the application accepted without coming forward.
+#[cfg(feature = "desk-probe")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrontmostCallForProbe {
+    pub pid: u32,
+    pub ax_error: Option<i32>,
+}
+
+#[cfg(feature = "desk-probe")]
+thread_local! {
+    static FRONTMOST_CALL_FOR_PROBE: std::cell::Cell<Option<FrontmostCallForProbe>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "desk-probe")]
+fn note_frontmost_call_for_probe(pid: u32, ax_error: Option<i32>) {
+    FRONTMOST_CALL_FOR_PROBE.set(Some(FrontmostCallForProbe { pid, ax_error }));
+}
+
+/// Take the calling thread's latest [`request_frontmost`] record. Per thread,
+/// so a request made on another thread can never be read as this one's.
+#[cfg(feature = "desk-probe")]
+#[doc(hidden)]
+pub fn take_frontmost_call_for_probe() -> Option<FrontmostCallForProbe> {
+    FRONTMOST_CALL_FOR_PROBE.take()
 }
