@@ -60,6 +60,7 @@ pub mod custody;
 pub mod desk_probe;
 pub mod durable_formats;
 mod egress;
+mod event_publish;
 pub mod flat_tools;
 mod grant_enforcement;
 mod image_handles;
@@ -3609,7 +3610,12 @@ impl Planes {
             }
             JournalPersistence::Isolated => journal::call_records::CallRecords::in_memory(),
         });
-        let routes = Arc::new(RouteBindings::new());
+        let routes = Arc::new(RouteBindings {
+            display: Arc::new(tool_display::Records::with_events(Arc::clone(
+                &calls.events,
+            ))),
+            ..Default::default()
+        });
         let _ = calls.display.set(Arc::downgrade(&routes.display));
         let egress_deadlines = Arc::new(ConnectionDeadlines {
             display: Arc::clone(&routes.display),
@@ -9474,6 +9480,7 @@ fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlRespon
         };
         metrics.insert("turnEndedLastAtMs".into(), last_at_ms);
         USER_BROWSER_CONNECTION_GAUGES.insert_into(metrics);
+        event_publish::gauges().insert_into(metrics);
         #[cfg(any(target_os = "macos", test))]
         crate::turn_hints::HINT_GAUGES.insert_into(metrics);
         metrics.insert(
@@ -15805,6 +15812,23 @@ mod sigterm_listener_tests {
     #[tokio::test]
     async fn the_backup_catalog_write_failure_count_is_on_the_health_reply() {
         assert_eq!(health_metrics().await["engramCatalogWriteFailures"], 0);
+    }
+
+    #[tokio::test]
+    async fn bus_notice_counters_are_on_the_health_reply() {
+        let metrics = health_metrics().await;
+        assert!(metrics["busEventsPublished"].is_u64());
+        assert!(metrics["busEventsFailed"].is_u64());
+        let reason = metrics
+            .get("busEventsLastFailureReason")
+            .expect("last failure health key");
+        assert!(
+            reason.is_null()
+                || matches!(
+                    reason.as_str(),
+                    Some("unavailable" | "timeout" | "overflow" | "expired")
+                )
+        );
     }
 
     #[tokio::test]

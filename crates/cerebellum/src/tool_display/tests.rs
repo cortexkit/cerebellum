@@ -144,6 +144,115 @@ async fn relayed_record_uses_origin_and_is_written_once_after_flush() {
     cortexkit_role_tool_display::schema::validate_record(&writes[0].body, &schema()).unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn bus_notice_waits_for_flush_and_failure_leaves_reply_and_direct_display_untouched() {
+    use std::{
+        pin::Pin,
+        sync::atomic::{AtomicBool, Ordering::Relaxed},
+        task::{Context, Poll, Waker},
+    };
+    use tokio::io::AsyncWrite;
+
+    #[derive(Default)]
+    struct Gate {
+        bytes: Mutex<Vec<u8>>,
+        entered: AtomicBool,
+        released: AtomicBool,
+        waker: Mutex<Option<Waker>>,
+    }
+    struct Writer(Arc<Gate>);
+    impl AsyncWrite for Writer {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.0.bytes.lock().unwrap().extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.0.entered.store(true, Relaxed);
+            if self.0.released.load(Relaxed) {
+                return Poll::Ready(Ok(()));
+            }
+            *self.0.waker.lock().unwrap() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    for tool in ["browser_use", "computer_use"] {
+        for stall in [false, true] {
+            let planes = planes();
+            let display = DisplayDouble::new(&["display"]);
+            planes.routes.display.connect(display.clone());
+            let fake = Arc::new(crate::event_publish::tests::Fake::default());
+            fake.fail_publish.store(true, Relaxed);
+            fake.hang_publish.store(stall, Relaxed);
+            planes.routes.display.events.connect(Arc::new(fake.clone()));
+            let facts = install(&planes);
+            let mut request = request();
+            request["name"] = json!(tool);
+            if tool == "computer_use" {
+                request["arguments"] = json!({"action":"read_state", "target":"com.example.app"});
+            }
+            planes.routes.display.arm(&frame(request), &facts).unwrap();
+            let body = json!({"outcome":"ok", "screen_text":"planted-screen-text"});
+            let mut reply = frame(body.clone());
+            reply.header.ty = FrameType::Response;
+            let (tx, rx) = mpsc::channel(8);
+            tx.send(reply).await.unwrap();
+            drop(tx);
+            let gate = Arc::new(Gate::default());
+            let writer = tokio::spawn(crate::egress::drain_writer(
+                Writer(gate.clone()),
+                rx,
+                planes.egress_deadlines.clone(),
+            ));
+            crate::event_publish::tests::settle().await;
+            assert!(gate.entered.load(Relaxed));
+            assert!(
+                fake.writes.lock().unwrap().is_empty(),
+                "bus publish before reply flush"
+            );
+            assert!(display.writes.lock().unwrap().is_empty());
+            gate.released.store(true, Relaxed);
+            gate.waker.lock().unwrap().take().unwrap().wake();
+            let at_flush = tokio::time::Instant::now();
+            writer.await.unwrap().unwrap();
+            assert_eq!(
+                at_flush.elapsed(),
+                Duration::ZERO,
+                "bus must not hold egress"
+            );
+            display.count(1).await;
+            crate::event_publish::tests::settle().await;
+            let bytes = gate.bytes.lock().unwrap().clone();
+            let emitted = subc_transport::read_frame(&mut bytes.as_slice())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&emitted.body).unwrap(),
+                body
+            );
+            {
+                let direct = display.writes.lock().unwrap();
+                let bus = fake.writes.lock().unwrap();
+                assert_eq!(direct.len(), 1);
+                assert_eq!(bus.len(), 1);
+                assert_eq!(bus[0].bytes, serde_json::to_vec(&direct[0]).unwrap());
+                assert!(!String::from_utf8_lossy(&bus[0].bytes).contains("planted-screen-text"));
+            }
+            tokio::time::advance(Duration::from_secs(4)).await;
+            crate::event_publish::tests::settle().await;
+            assert_eq!(display.writes.lock().unwrap().len(), 1);
+        }
+    }
+}
+
 #[tokio::test]
 async fn no_identity_and_codemode_without_origin_or_pin_do_not_write() {
     let planes = planes();

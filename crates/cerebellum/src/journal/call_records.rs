@@ -746,6 +746,7 @@ struct Inner {
 /// The call records of one module process.
 pub struct CallRecords {
     pub(crate) display: std::sync::OnceLock<crate::tool_display::WeakRecords>,
+    pub(crate) events: Arc<crate::event_publish::Publisher>,
     storage: Box<dyn CallRecordStorage>,
     inner: Mutex<Inner>,
 }
@@ -839,6 +840,7 @@ impl CallRecords {
     fn broken(error: CallRecordError) -> Self {
         Self {
             display: std::sync::OnceLock::new(),
+            events: Arc::default(),
             storage: Box::new(InMemoryCallRecordStorage::new()),
             inner: Mutex::new(Inner {
                 broken: Some(error),
@@ -925,6 +927,7 @@ impl CallRecords {
         }
         let records = Self {
             display: std::sync::OnceLock::new(),
+            events: Arc::default(),
             storage,
             inner: Mutex::new(inner),
         };
@@ -933,7 +936,8 @@ impl CallRecords {
             // Resolve pending handoffs only after selecting the last journal
             // row for each call key. An older pending row may be followed by
             // a saved result or acknowledgement that must not be overwritten.
-            reconciled |= late::reconcile(&mut inner, now_ms);
+            let ready = late::reconcile(&mut inner, now_ms);
+            reconciled |= !ready.is_empty();
             if let Err(error) = records.bound_late(&mut inner, now_ms) {
                 inner.broken = Some(error);
             }
@@ -944,6 +948,11 @@ impl CallRecords {
             {
                 if let Err(error) = records.compact(&mut inner, file_version) {
                     inner.broken = Some(error);
+                }
+                if inner.broken.is_none() {
+                    for (key, outcome) in ready {
+                        records.events.late_result(&key.0, &key.1, outcome);
+                    }
                 }
             }
         }

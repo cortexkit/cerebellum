@@ -210,37 +210,31 @@ fn next_seq(inner: &mut Inner, key: &Key) {
         .late_seq = Some(*head);
 }
 
-pub(super) fn reconcile(inner: &mut Inner, now_ms: u64) -> bool {
-    let mut changed = false;
+pub(super) fn reconcile(inner: &mut Inner, now_ms: u64) -> Vec<(Key, &'static str)> {
+    let mut ready = Vec::new();
     let mut keys = Vec::new();
     for (key, entry) in &mut inner.entries {
         let Some(handoff) = entry.record.handoff.as_mut() else {
             continue;
         };
         if matches!(handoff.phase, Phase::Pending) {
+            let outcome = if handoff.is_consent() {
+                LateOutcome::Consent(ConsentEnding::Withdrawn)
+            } else {
+                LateOutcome::Handoff(HandoffEnding::HandoffInterrupted)
+            };
             handoff.phase = Phase::Result {
-                outcome: if handoff.is_consent() {
-                    LateOutcome::Consent(ConsentEnding::Withdrawn)
-                } else {
-                    LateOutcome::Handoff(HandoffEnding::HandoffInterrupted)
-                },
+                outcome,
                 settled_at: now_ms,
             };
-            entry.record.outcome = Some(
-                if handoff.is_consent() {
-                    "withdrawn"
-                } else {
-                    "handoff_interrupted"
-                }
-                .into(),
-            );
+            entry.record.outcome = Some(outcome.as_str().into());
             entry.record.state = if handoff.is_consent() {
                 CallState::Asked
             } else {
                 CallState::Replied
             };
             entry.record.settled_at_ms = Some(now_ms);
-            changed = true;
+            ready.push((key.clone(), outcome.as_str()));
         }
         if let Phase::Result { settled_at, .. } | Phase::Expired { settled_at, .. } = handoff.phase
         {
@@ -251,7 +245,7 @@ pub(super) fn reconcile(inner: &mut Inner, now_ms: u64) -> bool {
     for (_, key) in keys {
         next_seq(inner, &key);
     }
-    changed
+    ready
 }
 
 fn wire_entry(record: &CallRecord) -> Option<LateEntry> {
@@ -678,6 +672,7 @@ impl CallRecords {
         inner.handoffs.retain(|_, held_key| held_key != key);
         next_seq(inner, key);
         self.bound_late(inner, now_ms)?;
+        self.events.late_result(&key.0, &key.1, outcome.as_str());
         if let Some(display) = self.display.get().and_then(std::sync::Weak::upgrade) {
             display.completed(&key.0, &key.1, &result);
         }
@@ -896,6 +891,163 @@ mod tests {
         calls
             .finish_handoff(OWNER, key, HandoffEnding::LoginObserved, now)
             .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bus_notice_startup_recovery_queues_only_new_commits_with_live_identity() {
+        use crate::event_publish::tests::{settle, Fake};
+
+        let storage = InMemoryCallRecordStorage::new();
+        let calls = CallRecords::open(Box::new(storage.clone()), 100);
+        hold(&calls, "opaque:recovered", "scope", 100);
+        drop(calls);
+        let recovered = CallRecords::open(Box::new(storage.clone()), 101);
+        let committed = recovered
+            .late_results(OWNER, &LateResultsRequest::new(), 101)
+            .unwrap();
+        assert_eq!(committed.entries.len(), 1);
+        assert_eq!(
+            committed.entries[0].result.as_ref().unwrap()["outcome"],
+            "handoff_interrupted"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        let fake = Arc::new(Fake::default());
+        recovered.events.connect(Arc::new(fake.clone()));
+        settle().await;
+        let recovery = fake.writes.lock().unwrap().clone();
+        assert_eq!(
+            recovery.len(),
+            1,
+            "recovery queued one notice before transport installation"
+        );
+
+        let live = CallRecords::in_memory();
+        let live_fake = Arc::new(Fake::default());
+        live.events.connect(Arc::new(live_fake.clone()));
+        hold(&live, "opaque:recovered", "scope", 100);
+        live.finish_handoff(
+            OWNER,
+            "opaque:recovered",
+            HandoffEnding::HandoffInterrupted,
+            101,
+        )
+        .unwrap();
+        settle().await;
+        let live_writes = live_fake.writes.lock().unwrap().clone();
+        assert_eq!(live_writes.len(), 1);
+        assert_eq!(live_writes[0].id, recovery[0].id);
+        assert_eq!(live_writes[0].bytes, recovery[0].bytes);
+        assert_eq!(live_writes[0].kind, recovery[0].kind);
+
+        let reopened = CallRecords::open(Box::new(storage), 102);
+        let second_fake = Arc::new(Fake::default());
+        reopened.events.connect(Arc::new(second_fake.clone()));
+        settle().await;
+        assert!(
+            second_fake.writes.lock().unwrap().is_empty(),
+            "opening an already committed result is not another commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn bus_notice_requires_committed_late_result_and_excludes_screen_text() {
+        use crate::event_publish::{
+            tests::{publisher, settle},
+            Kind,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+        struct FallibleStorage {
+            memory: InMemoryCallRecordStorage,
+            refuse: Arc<AtomicBool>,
+        }
+        impl CallRecordStorage for FallibleStorage {
+            fn load(&self) -> Result<Option<Vec<u8>>, CallRecordError> {
+                self.memory.load()
+            }
+            fn append(&self, bytes: &[u8], version: u64) -> Result<(), CallRecordError> {
+                if self.refuse.load(Relaxed) {
+                    return Err(CallRecordError::WriteFailed("fixture".into()));
+                }
+                self.memory.append(bytes, version)
+            }
+            fn replace(&self, bytes: &[u8], version: u64) -> Result<(), CallRecordError> {
+                self.memory.replace(bytes, version)
+            }
+        }
+
+        for fail_commit in [true, false] {
+            let memory = InMemoryCallRecordStorage::new();
+            let refuse = Arc::new(AtomicBool::new(false));
+            let mut calls = CallRecords::open(
+                Box::new(FallibleStorage {
+                    memory: memory.clone(),
+                    refuse: refuse.clone(),
+                }),
+                100,
+            );
+            let (events, fake) = publisher();
+            calls.events = events;
+            assert!(matches!(
+                calls.begin(OWNER, "opaque:key", "conversation", 100),
+                Begin::Execute(_)
+            ));
+            calls
+                .hold_handoff(
+                    OWNER,
+                    "opaque:key",
+                    "handoff",
+                    scope("scope"),
+                    "https://planted-screen-text.example",
+                    100,
+                )
+                .unwrap();
+            settle().await;
+            assert!(
+                fake.writes.lock().unwrap().is_empty(),
+                "pending holds have no ready result"
+            );
+            refuse.store(fail_commit, Relaxed);
+            let result =
+                calls.finish_handoff(OWNER, "opaque:key", HandoffEnding::LoginObserved, 101);
+            settle().await;
+            let writes = fake.writes.lock().unwrap();
+            if fail_commit {
+                assert!(result.is_err());
+                assert!(
+                    writes.is_empty(),
+                    "failed custody write must not enqueue a notice"
+                );
+                continue;
+            }
+            result.unwrap();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(
+                writes[0].kind,
+                Kind::LateResultReady {
+                    custodian_module: Some("prefrontal-core".into())
+                }
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&writes[0].bytes).unwrap(),
+                json!({"call_key":"opaque:key", "outcome":"login_observed"})
+            );
+            assert!(!String::from_utf8_lossy(&writes[0].bytes).contains("planted-screen-text"));
+            // Reopening from committed bytes, not the live in-memory entries,
+            // must already expose the result the notice describes.
+            let reopened = CallRecords::open(Box::new(memory), 101);
+            let late = reopened
+                .late_results(OWNER, &LateResultsRequest::new(), 101)
+                .unwrap();
+            assert_eq!(late.entries.len(), 1);
+            let body = serde_json::to_value(&late.entries[0]).unwrap();
+            assert_eq!(body["call_key"], "opaque:key");
+            assert_eq!(body["result"]["outcome"], "login_observed");
+            assert!(
+                body.to_string().contains("planted-screen-text"),
+                "the fixture must plant content in the stored result"
+            );
+        }
     }
 
     #[test]
