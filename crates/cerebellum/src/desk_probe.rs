@@ -114,6 +114,15 @@ pub fn take_fronting_landings() -> Vec<(u32, u64)> {
 
 pub use crate::terminal_arbiter::probe_timing::FrontingTiming;
 
+/// Make the restores of calls that begin from now on ask for the person's
+/// application by activation (all windows) first and by accessibility second,
+/// the reverse of production order; `false` returns to production order. Only
+/// desk-probe builds have this, so the probe can compare both orders in one
+/// run.
+pub fn set_restore_activate_first(activate_first: bool) {
+    crate::terminal_arbiter::probe_timing::set_restore_activate_first(activate_first);
+}
+
 /// Drain passive front/restore confirmations after the probe's cleanup spacing.
 /// These records do not sample the desktop or change the production bound.
 pub fn take_fronting_timings() -> Vec<FrontingTiming> {

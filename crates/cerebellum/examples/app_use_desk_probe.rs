@@ -91,7 +91,24 @@ const IDLE_COUNTERS: [&str; 2] = ["previewCaptureRequests", "previewFramesWritte
 /// The width of a background-mode preview window, in points.
 const PREVIEW_WIDTH: f64 = cerebellum_computer::preview_layout::PREVIEW_WIDTH;
 const NEEDS_FRONT_ATTEMPTS: usize = 20;
+/// From this attempt on, restores ask for the person's application by
+/// activation first. Earlier attempts keep production order (accessibility
+/// first), so one run measures both orders on the same desk.
+const ACTIVATE_FIRST_FROM_ATTEMPT: usize = 11;
 const CANDIDATE_BOUNDS_MS: [u64; 5] = [100, 150, 200, 250, 300];
+
+/// Whether `attempt`'s restores ask by activation first.
+fn activate_first_for(attempt: usize) -> bool {
+    attempt >= ACTIVATE_FIRST_FROM_ATTEMPT
+}
+
+fn restore_order_name(activate_first: bool) -> &'static str {
+    if activate_first {
+        "activate_first"
+    } else {
+        "ax_first"
+    }
+}
 
 #[derive(Debug, PartialEq)]
 struct TimingSummary {
@@ -133,6 +150,12 @@ struct AttemptTiming {
     /// Front confirmation through posting and confirmed restore, same attempt.
     post_and_restore_ms: Option<f64>,
     cleanup_only_ms: Option<f64>,
+    /// This attempt's restores asked by activation first.
+    activate_first: bool,
+    /// The restore's first request: the time from it to the restore being
+    /// confirmed (when it was), and whether it was confirmed before any
+    /// second request.
+    first_restore: Option<(Option<f64>, bool)>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -220,6 +243,69 @@ fn print_needs_front_summary(attempts: &[AttemptTiming]) {
             attempts.len()
         );
     }
+    for line in restore_order_summary_lines(attempts) {
+        println!("{line}");
+    }
+}
+
+/// Per restore order: how many restores the first request alone put back,
+/// and the time from the first request to the confirmed restore.
+fn restore_order_summary_lines(attempts: &[AttemptTiming]) -> Vec<String> {
+    [false, true]
+        .into_iter()
+        .map(|activate_first| {
+            let restores: Vec<_> = attempts
+                .iter()
+                .filter(|attempt| attempt.activate_first == activate_first)
+                .filter_map(|attempt| attempt.first_restore)
+                .collect();
+            let first_alone = restores.iter().filter(|(_, alone)| *alone).count();
+            let costs: Vec<f64> = restores.iter().filter_map(|(cost, _)| *cost).collect();
+            let timing = match timing_summary(&costs) {
+                Some(stats) => format!(
+                    "first request→confirmed count={} min={:.3} median={:.3} p90={:.3} max={:.3} ms",
+                    stats.count, stats.min, stats.median, stats.p90, stats.max
+                ),
+                None => "first request→confirmed count=0".into(),
+            };
+            format!(
+                "SUMMARY restore order {}: restores={} put back by the first request alone={} {timing}",
+                restore_order_name(activate_first),
+                restores.len(),
+                first_alone,
+            )
+        })
+        .collect()
+}
+
+/// The person's application's normal-layer windows, front to back, before the
+/// chord's front and after its restore, and whether the restore changed them.
+fn person_windows_line(attempt: usize, before: Option<&[u32]>, after: Option<&[u32]>) -> String {
+    let list = |windows: Option<&[u32]>| {
+        windows.map_or_else(
+            || "unreadable".to_string(),
+            |windows| {
+                format!(
+                    "[{}]",
+                    windows
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            },
+        )
+    };
+    let verdict = match (before, after) {
+        (Some(before), Some(after)) if before == after => "unchanged",
+        (Some(_), Some(_)) => "changed",
+        _ => "unknown",
+    };
+    format!(
+        "RECORD needs-front attempt {attempt}: person_windows before_front={} after_restore={} order={verdict}",
+        list(before),
+        list(after)
+    )
 }
 
 /// Whether the person approved this run on the command line.
@@ -2562,9 +2648,29 @@ mod desk {
             }
             // Errors noted before this chord belong to earlier calls.
             let _ = cerebellum_macos::take_window_list_errors_for_probe();
+            let activate_first = activate_first_for(attempt);
+            cerebellum::desk_probe::set_restore_activate_first(activate_first);
+            let person_windows_before =
+                cerebellum_macos::normal_window_order_for_probe(person as u32);
             sampler.needs_front.store(true, Ordering::SeqCst);
             let chord = serve("computer.keys", arguments).await;
             sampler.needs_front.store(false, Ordering::SeqCst);
+            // The call answers only after its restore decision, so this is
+            // the order the restore left.
+            let person_windows_after =
+                cerebellum_macos::normal_window_order_for_probe(person as u32);
+            println!(
+                "RECORD needs-front attempt {attempt}: restore_order={}",
+                restore_order_name(activate_first)
+            );
+            println!(
+                "{}",
+                person_windows_line(
+                    attempt,
+                    person_windows_before.as_deref(),
+                    person_windows_after.as_deref()
+                )
+            );
             let edit_title = scratch.edit_title_highlighted();
             let selection_after = scratch.selection();
             println!(
@@ -2601,9 +2707,23 @@ mod desk {
                 println!("RECORD needs-front attempt {attempt}: pid {pid} pending activation landed {latency} ms after request");
             }
             let timings = cerebellum::desk_probe::take_fronting_timings();
-            let mut measured = AttemptTiming::default();
+            let mut measured = AttemptTiming {
+                activate_first,
+                ..AttemptTiming::default()
+            };
             match timings.as_slice() {
                 [timing] if timing.target_pid == scratch.pid() => {
+                    measured.first_restore =
+                        timing
+                            .first_restore_request()
+                            .map(|(requested_ms, _, alone)| {
+                                (
+                                    timing
+                                        .restore_confirmed_ms
+                                        .map(|confirmed| confirmed - requested_ms),
+                                    alone,
+                                )
+                            });
                     for line in timing.record_lines(attempt) {
                         println!("{line}");
                     }
@@ -2657,6 +2777,7 @@ mod desk {
             attempts.push(measured);
         }
         print_needs_front_summary(&attempts);
+        cerebellum::desk_probe::set_restore_activate_first(false);
         drop(selection_observer);
         let last = serve("computer.read_state", json!({"target": TEXTEDIT_BUNDLE})).await;
         report.check(
@@ -3376,6 +3497,57 @@ mod tests {
     }
 
     #[test]
+    fn attempts_from_eleven_ask_by_activation_first_and_say_so() {
+        assert!((1..=10).all(|attempt| !activate_first_for(attempt)));
+        assert!((11..=NEEDS_FRONT_ATTEMPTS).all(activate_first_for));
+        assert_eq!(restore_order_name(false), "ax_first");
+        assert_eq!(restore_order_name(true), "activate_first");
+    }
+
+    #[test]
+    fn person_window_order_is_compared_before_the_front_and_after_the_restore() {
+        assert_eq!(
+            person_windows_line(4, Some(&[7, 9]), Some(&[7, 9])),
+            "RECORD needs-front attempt 4: person_windows before_front=[7,9] after_restore=[7,9] order=unchanged"
+        );
+        assert_eq!(
+            person_windows_line(12, Some(&[7, 9]), Some(&[9, 7])),
+            "RECORD needs-front attempt 12: person_windows before_front=[7,9] after_restore=[9,7] order=changed"
+        );
+        assert_eq!(
+            person_windows_line(12, None, Some(&[])),
+            "RECORD needs-front attempt 12: person_windows before_front=unreadable after_restore=[] order=unknown"
+        );
+    }
+
+    #[test]
+    fn restore_orders_are_summarised_separately() {
+        let attempt = |activate_first, first_restore| AttemptTiming {
+            activate_first,
+            first_restore,
+            ..AttemptTiming::default()
+        };
+        let attempts = [
+            attempt(false, Some((Some(175.0), false))),
+            attempt(false, Some((Some(185.0), false))),
+            attempt(false, None),
+            attempt(true, Some((Some(20.0), true))),
+            attempt(true, Some((None, false))),
+        ];
+        assert_eq!(
+            restore_order_summary_lines(&attempts),
+            [
+                "SUMMARY restore order ax_first: restores=2 put back by the first request alone=0 first request→confirmed count=2 min=175.000 median=180.000 p90=185.000 max=185.000 ms",
+                "SUMMARY restore order activate_first: restores=2 put back by the first request alone=1 first request→confirmed count=1 min=20.000 median=20.000 p90=20.000 max=20.000 ms",
+            ]
+        );
+        assert_eq!(
+            restore_order_summary_lines(&[])[0],
+            "SUMMARY restore order ax_first: restores=0 put back by the first request alone=0 first request→confirmed count=0"
+        );
+    }
+
+    #[test]
     fn post_and_selection_timing_lines_relate_to_the_front_request_and_first_post() {
         assert_eq!(
             front_to_post_line(6, Some(25.5), Some(28.0)),
@@ -3589,12 +3761,14 @@ fn bound_counts_keep_measured_completions_separate_from_estimated_late_cleanups(
             bracket_ms: Some(100.0),
             post_and_restore_ms: Some(30.0),
             cleanup_only_ms: None,
+            ..AttemptTiming::default()
         },
         AttemptTiming {
             front_ms: Some(80.0),
             bracket_ms: Some(130.0),
             post_and_restore_ms: Some(50.0),
             cleanup_only_ms: None,
+            ..AttemptTiming::default()
         },
         // Late fronting and cleanup provide no measured chord completion.
         AttemptTiming {

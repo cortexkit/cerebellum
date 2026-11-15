@@ -604,7 +604,7 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
                 &mut *self.host,
                 self.probe_timing,
                 pid,
-                probe_timing::RestoreRoute::AxFrontmost,
+                probe_timing::RestoreSlot::First,
             )
         }
         #[cfg(not(all(feature = "desk-probe", target_os = "macos")))]
@@ -617,7 +617,7 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
                 &mut *self.host,
                 self.probe_timing,
                 pid,
-                probe_timing::RestoreRoute::Fallback,
+                probe_timing::RestoreSlot::Second,
             )
         }
         #[cfg(not(all(feature = "desk-probe", target_os = "macos")))]

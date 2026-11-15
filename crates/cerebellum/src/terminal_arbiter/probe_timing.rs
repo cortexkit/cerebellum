@@ -1,5 +1,6 @@
 //! Passive timing records for the manual desk probe, never reply fields.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,13 +21,55 @@ pub struct FrontingTiming {
     /// The instant every `_ms` value counts from, so the probe can place its
     /// own observations on the same scale.
     pub front_requested_at: Option<Instant>,
+    /// This attempt's restores asked by activation first, the reverse of
+    /// production order (see [`set_restore_activate_first`]).
+    pub activate_first: bool,
     events: Vec<Event>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum RestoreRoute {
+    /// The accessibility write (`request_front`).
     AxFrontmost,
-    Fallback,
+    /// AppKit activation with all windows (`request_front_fallback`).
+    ActivateAllWindows,
+}
+
+/// Which of a restore's requests the decision is making: the one it always
+/// makes, or the one it adds when the first has not taken effect.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RestoreSlot {
+    First,
+    Second,
+}
+
+/// Whether restores of attempts that begin from now on ask by activation
+/// first. Production asks by accessibility first and this probe-only switch
+/// never changes that outside a desk-probe build; the probe turns it on for
+/// part of a run so both orders are measured on the same desk.
+static ACTIVATE_FIRST: AtomicBool = AtomicBool::new(false);
+
+/// Set the restore order for attempts that begin after this call.
+pub(crate) fn set_restore_activate_first(activate_first: bool) {
+    ACTIVATE_FIRST.store(activate_first, Ordering::SeqCst);
+}
+
+/// The route a restore request in `slot` takes under this attempt's order.
+fn route_for(slot: RestoreSlot, activate_first: bool) -> RestoreRoute {
+    match (slot, activate_first) {
+        (RestoreSlot::First, false) | (RestoreSlot::Second, true) => RestoreRoute::AxFrontmost,
+        (RestoreSlot::First, true) | (RestoreSlot::Second, false) => {
+            RestoreRoute::ActivateAllWindows
+        }
+    }
+}
+
+fn order_name(activate_first: bool) -> &'static str {
+    if activate_first {
+        "activate_first"
+    } else {
+        "ax_first"
+    }
 }
 
 /// What the accessibility write behind the `ax_frontmost` route reported.
@@ -124,7 +167,7 @@ enum EventKind {
 fn route_name(route: RestoreRoute) -> &'static str {
     match route {
         RestoreRoute::AxFrontmost => "ax_frontmost",
-        RestoreRoute::Fallback => "fallback",
+        RestoreRoute::ActivateAllWindows => "activate_all_windows",
     }
 }
 
@@ -157,6 +200,26 @@ fn sample_text(sample: RestoreSample) -> String {
 }
 
 impl FrontingTiming {
+    /// This attempt's restore order, as its log lines name it.
+    pub fn restore_order(&self) -> &'static str {
+        order_name(self.activate_first)
+    }
+
+    /// The first restore request of this attempt: when it was made, its
+    /// route, and whether the restored application was seen in front before
+    /// any later request was made.
+    pub fn first_restore_request(&self) -> Option<(f64, &'static str, bool)> {
+        self.events.iter().find_map(|event| match event.kind {
+            EventKind::RestoreRequest {
+                id: 1,
+                route,
+                confirmed_ms,
+                ..
+            } => Some((event.at_ms, route_name(route), confirmed_ms.is_some())),
+            _ => None,
+        })
+    }
+
     /// One line per passive observation, in collection order. A confirmation
     /// belongs to the latest request; it does not prove which asynchronous
     /// activation route caused the application to come forward. Consecutive
@@ -168,7 +231,11 @@ impl FrontingTiming {
         while let Some(event) = self.events.get(index) {
             index += 1;
             let detail = match event.kind {
-                EventKind::FrontRequest => format!("front_request pid={}", self.target_pid),
+                EventKind::FrontRequest => format!(
+                    "front_request pid={} restore_order={}",
+                    self.target_pid,
+                    order_name(self.activate_first)
+                ),
                 EventKind::Landing { in_call } => format!(
                     "target_landing pid={} source={}",
                     self.target_pid,
@@ -276,10 +343,10 @@ impl ProbeTiming {
         } else {
             DESK_SAMPLING
         };
-        Self::with_sampling(target_pid, sampling)
+        Self::with_sampling(target_pid, sampling, ACTIVATE_FIRST.load(Ordering::SeqCst))
     }
 
-    fn with_sampling(target_pid: u32, sampling: Sampling) -> Self {
+    fn with_sampling(target_pid: u32, sampling: Sampling, activate_first: bool) -> Self {
         Self(Arc::new(Mutex::new(State {
             started: None,
             timing: FrontingTiming {
@@ -289,6 +356,7 @@ impl ProbeTiming {
                 restore_confirmed_ms: None,
                 first_post_ms: None,
                 front_requested_at: None,
+                activate_first,
                 events: Vec::new(),
             },
             last_front: None,
@@ -424,15 +492,17 @@ impl ProbeTiming {
     }
 }
 
-/// Make one restore request through `host` by `route`, recording the request,
-/// how its call returned, and for the accessibility route the write's error
-/// code.
+/// Make the restore request in `slot` through `host`, by the route this
+/// attempt's order gives that slot, recording the request, how its call
+/// returned, and for the accessibility route the write's error code.
 pub(super) fn request_restore(
     host: &mut dyn super::RestoreHost,
     timing: &ProbeTiming,
     pid: u32,
-    route: RestoreRoute,
+    slot: RestoreSlot,
 ) -> bool {
+    let activate_first = timing.0.lock().unwrap().timing.activate_first;
+    let route = route_for(slot, activate_first);
     timing.restore_requested(pid, route);
     let (accepted, ax) = match route {
         RestoreRoute::AxFrontmost => {
@@ -447,7 +517,7 @@ pub(super) fn request_restore(
             };
             (accepted, Some(ax))
         }
-        RestoreRoute::Fallback => (host.request_front_fallback(pid), None),
+        RestoreRoute::ActivateAllWindows => (host.request_front_fallback(pid), None),
     };
     timing.restore_request_returned(accepted, ax);
     accepted
@@ -511,6 +581,7 @@ mod tests {
             restore_confirmed_ms: Some(180.0),
             first_post_ms: Some(15.0),
             front_requested_at: None,
+            activate_first: false,
             events: vec![
                 Event {
                     at_ms: 0.0,
@@ -573,7 +644,7 @@ mod tests {
                     kind: EventKind::RestoreRequest {
                         id: 2,
                         pid: 7,
-                        route: RestoreRoute::Fallback,
+                        route: RestoreRoute::ActivateAllWindows,
                         confirmed_ms: Some(180.0),
                         returned: Some(RequestReturn {
                             accepted: true,
@@ -643,13 +714,13 @@ mod tests {
             ],
         };
         assert_eq!(timing.record_lines(3), [
-            "RECORD needs-front attempt 3: front_request pid=42 at_ms=0.000",
+            "RECORD needs-front attempt 3: front_request pid=42 restore_order=ax_first at_ms=0.000",
             "RECORD needs-front attempt 3: target_landing pid=42 source=in_call at_ms=12.500",
             "RECORD needs-front attempt 3: first_post pid=42 at_ms=15.000",
             "RECORD needs-front attempt 3: restore_request id=1 pid=7 route=ax_frontmost confirmed=false confirmed_at_ms=unobserved accepted=false ax_error=-25204 returned_at_ms=21.250 at_ms=20.000",
             "RECORD needs-front attempt 3: restore_sample pid=7 active=true top=42/501 count=2 until_ms=40.000 at_ms=30.000",
             "RECORD needs-front attempt 3: restore_sample pid=7 active=unknown top=unreadable count=1 until_ms=50.000 at_ms=50.000",
-            "RECORD needs-front attempt 3: restore_request id=2 pid=7 route=fallback confirmed=true confirmed_at_ms=180.000 accepted=true returned_at_ms=170.500 at_ms=170.000",
+            "RECORD needs-front attempt 3: restore_request id=2 pid=7 route=activate_all_windows confirmed=true confirmed_at_ms=180.000 accepted=true returned_at_ms=170.500 at_ms=170.000",
             "RECORD needs-front attempt 3: restore_sample pid=7 active=true top=7/none count=1 until_ms=175.000 at_ms=175.000",
             "RECORD needs-front attempt 3: restore_confirmation request=2 pid=7 at_ms=180.000",
             "RECORD needs-front attempt 3: restore_request id=3 pid=7 route=ax_frontmost confirmed=false confirmed_at_ms=unobserved returned=unobserved at_ms=190.000",
@@ -754,7 +825,7 @@ mod tests {
                 "confirmed_at_ms=unobserved accepted=false ax_error=unnoted returned_at_ms=",
                 2,
             ),
-            ("route=fallback confirmed=true", 2),
+            ("route=activate_all_windows confirmed=true", 2),
             ("accepted=true returned_at_ms=", 2),
             ("restore_confirmation", 2),
             ("late_watch result=restored", 1),
@@ -821,6 +892,7 @@ mod tests {
                 after_confirmation: Duration::from_millis(5),
                 limit: Duration::from_secs(10),
             },
+            false,
         );
         probe.begin();
         probe.restore_requested(7, RestoreRoute::AxFrontmost);
@@ -840,7 +912,7 @@ mod tests {
             assert!(Instant::now() < deadline, "sampling never started");
             std::thread::sleep(Duration::from_millis(1));
         }
-        probe.restore_requested(7, RestoreRoute::Fallback);
+        probe.restore_requested(7, RestoreRoute::ActivateAllWindows);
         probe.frontmost_observed(Some(7));
         while probe.0.lock().unwrap().sampling_running {
             assert!(Instant::now() < deadline, "sampling never stopped");
@@ -865,5 +937,81 @@ mod tests {
             .sampling
             .sampler
             .is_none());
+    }
+
+    /// Records which host route each request reached. The accessibility
+    /// route is refused and the activation route accepted, so the recorded
+    /// results also show each request reached the route its label names.
+    struct RouteCalls(Vec<&'static str>);
+
+    impl RestoreHost for RouteCalls {
+        fn now_ms(&mut self) -> u64 {
+            0
+        }
+        fn pause_ms(&mut self, _ms: u64) {}
+        fn frontmost_pid(&mut self) -> Option<u32> {
+            None
+        }
+        fn request_front(&mut self, _pid: u32) -> bool {
+            self.0.push("ax");
+            false
+        }
+        fn request_front_fallback(&mut self, _pid: u32) -> bool {
+            self.0.push("activate");
+            true
+        }
+        fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
+            None
+        }
+    }
+
+    #[test]
+    fn the_activate_first_order_swaps_the_route_each_restore_request_takes() {
+        for (activate_first, calls, order, first, second) in [
+            (
+                false,
+                ["ax", "activate"],
+                "restore_order=ax_first",
+                "route=ax_frontmost confirmed=false confirmed_at_ms=unobserved accepted=false",
+                "route=activate_all_windows confirmed=false confirmed_at_ms=unobserved accepted=true",
+            ),
+            (
+                true,
+                ["activate", "ax"],
+                "restore_order=activate_first",
+                "route=activate_all_windows confirmed=false confirmed_at_ms=unobserved accepted=true",
+                "route=ax_frontmost confirmed=false confirmed_at_ms=unobserved accepted=false",
+            ),
+        ] {
+            let probe = ProbeTiming::with_sampling(
+                42,
+                Sampling {
+                    sampler: None,
+                    ..DESK_SAMPLING
+                },
+                activate_first,
+            );
+            probe.begin();
+            let mut host = RouteCalls(Vec::new());
+            request_restore(&mut host, &probe, 7, RestoreSlot::First);
+            request_restore(&mut host, &probe, 7, RestoreSlot::Second);
+            assert_eq!(host.0, calls);
+            let timing = probe.0.lock().unwrap().timing.clone();
+            let lines = timing.record_lines(1);
+            assert!(lines[0].contains(order), "{lines:?}");
+            assert!(lines[1].contains(first), "{lines:?}");
+            assert!(lines[2].contains(second), "{lines:?}");
+            assert_eq!(
+                timing.first_restore_request().map(|(_, route, confirmed)| (route, confirmed)),
+                Some((
+                    if activate_first {
+                        "activate_all_windows"
+                    } else {
+                        "ax_frontmost"
+                    },
+                    false
+                ))
+            );
+        }
     }
 }
