@@ -332,11 +332,26 @@ pub(crate) fn bracket_fronting(
 
 /// A dispatch refusal on the wire, with a remedy for the fronting ones.
 /// `bracket` is the fronting bracket's report when one ran: a bound refusal
-/// caused only by recent slow posts gets a remedy that says to retry later.
+/// caused only by recent slow posts, or only by recent slow restores of the
+/// person's application, gets a remedy that says to retry later.
+///
+/// A bracket stopped before its first front because the window list could
+/// not be read answers `targets_unreadable`, as the same unreadable list does
+/// when the target is resolved: nothing was fronted or posted, and the cause
+/// is the list, not the dispatch.
 pub(crate) fn dispatch_refusal_reply(
     refusal: &DispatchError,
     bracket: Option<&BracketReport>,
 ) -> Value {
+    if unreadable_list_before_any_front(refusal, bracket) {
+        let reason = cerebellum_computer::platform::UnreadableReason::WindowListUnavailable;
+        return json!({
+            "outcome": "targets_unreadable",
+            "unreadable": reason,
+            "remedy": crate::management::unreadable_remedy(&reason),
+            "posts_returned": 0,
+        });
+    }
     let mut reply = super::synthetic_dispatch_refusal(refusal);
     let remedy = match refusal {
         DispatchError::FrontingFailed => Some(
@@ -353,6 +368,15 @@ pub(crate) fn dispatch_refusal_reply(
                  element",
             )
         }
+        DispatchError::FrontingBoundExceeded
+            if bracket.is_some_and(|bracket| bracket.waiting_out_slow_restore) =>
+        {
+            Some(
+                "the application the person was using has lately been slow to come back to the \
+                 front after this module fronted another one, so this one was not started and \
+                 nothing was posted: retry shortly, or use write_text on a settable element",
+            )
+        }
         DispatchError::FrontingBoundExceeded => Some(
             "the application would have stayed in front longer than allowed, so posting stopped; \
              posts_returned says how many keystrokes were already sent. Read the field before \
@@ -361,12 +385,36 @@ pub(crate) fn dispatch_refusal_reply(
         DispatchError::FrontingRestoreFailed => {
             Some("the previous application could not be brought back, so nothing more was posted")
         }
+        DispatchError::SyntheticSequenceFailed {
+            refusal: ProcessEventRefusal::NotVisibleToWindowServer,
+            ..
+        } => Some(
+            "the window server does not list this application's window, so posting stopped; \
+             posts_returned says how many keystrokes were already sent. Read the state, then \
+             retry",
+        ),
         _ => None,
     };
     if let Some(remedy) = remedy {
         reply["remedy"] = json!(remedy);
     }
     reply
+}
+
+/// The fronting bracket stopped before its first front, with nothing posted,
+/// because the window list could not be read.
+fn unreadable_list_before_any_front(
+    refusal: &DispatchError,
+    bracket: Option<&BracketReport>,
+) -> bool {
+    matches!(
+        refusal,
+        DispatchError::SyntheticSequenceFailed {
+            posts_returned: 0,
+            refusal: ProcessEventRefusal::WindowServerUnreadable { .. },
+            held_state: HeldStateDisposition::NoneHeld,
+        }
+    ) && bracket.is_some_and(|bracket| bracket.chunks == 0 && bracket.posts_returned == 0)
 }
 
 /// Replace the reply with `restore_failed` when a bracket could not put the
@@ -552,6 +600,7 @@ mod tests {
             restore: RestoreStatus::Restored,
             stop: None,
             waiting_out_slow_post: false,
+            waiting_out_slow_restore: false,
         };
         assert_eq!(
             bracket_fronting(&report(104), 100),
@@ -577,6 +626,7 @@ mod tests {
             restore: RestoreStatus::Restored,
             stop: Some(BracketStop::BoundExceeded),
             waiting_out_slow_post,
+            waiting_out_slow_restore: false,
         };
         let remedy = |bracket: Option<&BracketReport>| {
             dispatch_refusal_reply(&DispatchError::FrontingBoundExceeded, bracket)["remedy"]
@@ -590,6 +640,127 @@ mod tests {
         for other in [remedy(Some(&report(false))), remedy(None)] {
             assert!(other.contains("send shorter text"), "{other}");
         }
+    }
+
+    /// A bound refusal that only the measured slow restores of the person's
+    /// application caused says so and tells the agent to retry shortly,
+    /// rather than to send shorter text.
+    #[test]
+    fn a_refusal_waiting_out_slow_restores_says_the_persons_app_was_slow_to_come_back() {
+        let report = |waiting_out_slow_restore| BracketReport {
+            previous_frontmost: Some(100),
+            chunks: 1,
+            units_posted: 0,
+            posts_returned: 0,
+            generation_verifications: 0,
+            longest_fronted_interval_ms: 210,
+            slowest_unit_ms: 0,
+            slowest_restore_ms: 180,
+            restore: RestoreStatus::Restored,
+            stop: Some(BracketStop::BoundExceeded),
+            waiting_out_slow_post: false,
+            waiting_out_slow_restore,
+        };
+        let remedy = |bracket: &BracketReport| {
+            dispatch_refusal_reply(&DispatchError::FrontingBoundExceeded, Some(bracket))["remedy"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let waiting = remedy(&report(true));
+        assert!(waiting.contains("slow to come back"), "{waiting}");
+        assert!(waiting.contains("retry shortly"), "{waiting}");
+        assert!(waiting.contains("nothing was posted"), "{waiting}");
+        assert!(!waiting.contains("shorter text"), "{waiting}");
+        assert!(remedy(&report(false)).contains("send shorter text"));
+    }
+
+    fn bracket_stopped_before_front(chunks: u32, posts_returned: u64) -> BracketReport {
+        BracketReport {
+            previous_frontmost: Some(100),
+            chunks,
+            units_posted: 0,
+            posts_returned,
+            generation_verifications: 0,
+            longest_fronted_interval_ms: 0,
+            slowest_unit_ms: 0,
+            slowest_restore_ms: 0,
+            restore: RestoreStatus::NotNeeded,
+            stop: None,
+            waiting_out_slow_post: false,
+            waiting_out_slow_restore: false,
+        }
+    }
+
+    /// A window list that could not be read before the first front answers
+    /// the same `targets_unreadable` reply, reason and remedy as an unreadable
+    /// list does when the target is resolved, and the wire envelope keeps it
+    /// marked as having posted nothing.
+    #[test]
+    fn an_unreadable_window_list_before_the_front_answers_targets_unreadable() {
+        let refusal = |posts_returned| DispatchError::SyntheticSequenceFailed {
+            posts_returned,
+            refusal: ProcessEventRefusal::WindowServerUnreadable {
+                reason: "the window list did not arrive within 1s".into(),
+            },
+            held_state: HeldStateDisposition::NoneHeld,
+        };
+        let before_front = bracket_stopped_before_front(0, 0);
+        let reply = dispatch_refusal_reply(&refusal(0), Some(&before_front));
+        assert_eq!(reply["outcome"], "targets_unreadable", "{reply}");
+        assert_eq!(
+            reply["unreadable"]["reason"], "window_list_unavailable",
+            "{reply}"
+        );
+        assert_eq!(
+            reply["remedy"],
+            crate::management::unreadable_remedy(
+                &cerebellum_computer::platform::UnreadableReason::WindowListUnavailable
+            ),
+            "{reply}"
+        );
+        assert_eq!(
+            post_call_made(&refusal(0), Some(&before_front)),
+            Some(false)
+        );
+        let wire = super::super::synthetic_wire_envelope(refused_before_posting(reply));
+        assert_eq!(wire["outcome"], "targets_unreadable", "{wire}");
+        assert_eq!(
+            wire["unreadable"]["reason"], "window_list_unavailable",
+            "{wire}"
+        );
+        assert_eq!(wire["effect_status"], "not_dispatched", "{wire}");
+        assert_eq!(wire["posts_returned"], 0, "{wire}");
+
+        // After a chunk was fronted and posted, or without a bracket, the
+        // same refusal is a failed dispatch as before.
+        for (refusal, bracket) in [
+            (refusal(0), Some(bracket_stopped_before_front(1, 2))),
+            (refusal(2), Some(bracket_stopped_before_front(1, 2))),
+            (refusal(0), None),
+        ] {
+            let reply = dispatch_refusal_reply(&refusal, bracket.as_ref());
+            assert_eq!(reply["outcome"], "dispatch_failed", "{reply}");
+        }
+    }
+
+    /// A target the window server does not list gets a remedy that names that
+    /// cause and says to read the state before retrying.
+    #[test]
+    fn a_target_the_window_server_does_not_list_gets_a_remedy_to_read_and_retry() {
+        let refusal = DispatchError::SyntheticSequenceFailed {
+            posts_returned: 0,
+            refusal: ProcessEventRefusal::NotVisibleToWindowServer,
+            held_state: HeldStateDisposition::NoneHeld,
+        };
+        let reply = dispatch_refusal_reply(&refusal, Some(&bracket_stopped_before_front(0, 0)));
+        assert_eq!(reply["outcome"], "dispatch_failed", "{reply}");
+        let remedy = reply["remedy"].as_str().expect("a remedy");
+        assert!(
+            remedy.contains("does not list this application's window"),
+            "{remedy}"
+        );
+        assert!(remedy.contains("Read the state, then retry"), "{remedy}");
     }
 
     #[test]

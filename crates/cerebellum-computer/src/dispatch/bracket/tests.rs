@@ -7,6 +7,7 @@ use crate::dispatch::seize::{HeartbeatMarker, IdleGateRefusal, OBSERVED_DISPATCH
 use crate::platform::{HeldStateDisposition, ProcessEventRefusal};
 
 mod listing;
+mod restore_reserve;
 mod unit_cost;
 
 const TARGET: u32 = 200;
