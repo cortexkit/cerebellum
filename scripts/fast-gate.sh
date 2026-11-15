@@ -287,12 +287,12 @@ else
     cargo clippy --locked --workspace --all-targets --quiet -- -D warnings
 fi
 
-# Match the full gate's default-target Windows checks; cross-host test targets
-# require a Windows C toolchain and are exercised in the Windows VM instead.
-for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
-  run_serial_phase "cargo clippy --locked --workspace --target $target -- -D warnings" \
-    cargo clippy --locked --workspace --target "$target" --quiet -- -D warnings
-done
+# Cross-check x86_64 Windows tests and examples too: the Linux build server can
+# compile these targets without a Windows C toolchain. ARM64 stays default-only.
+run_serial_phase "cargo clippy --locked --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings" \
+  cargo clippy --locked --workspace --all-targets --target x86_64-pc-windows-msvc --quiet -- -D warnings
+run_serial_phase "cargo clippy --locked --workspace --target aarch64-pc-windows-msvc -- -D warnings" \
+  cargo clippy --locked --workspace --target aarch64-pc-windows-msvc --quiet -- -D warnings
 fi
 
 if [ "$part" = mac ] && ! run_mac_clippy; then

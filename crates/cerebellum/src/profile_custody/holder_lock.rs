@@ -51,7 +51,7 @@ impl HolderId {
     /// so a later recovery can still prove that the claim is the one it owns.
     /// Only the production launch service recovers launches, and it exists
     /// only where the module can launch a browser.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub(crate) fn from_recorded(holder_id: impl Into<String>) -> Self {
         Self(holder_id.into())
     }

@@ -23,6 +23,8 @@ pub enum ProcessStartTime {
 ///
 /// The full enum is intentional: collapsing `NotPermitted` and `NoSuchProcess`
 /// would erase the distinction between an unreadable generation and a mismatch.
+// The live reader needs sysconf; injected parser tests below remain portable.
+#[cfg(unix)]
 pub fn process_start_time(pid: u32) -> ProcessStartTime {
     process_start_time_from_readings(
         fs::read_to_string(format!("/proc/{pid}/stat")),

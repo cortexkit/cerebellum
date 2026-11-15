@@ -35,16 +35,20 @@
 
 use std::process::ExitCode;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use cerebellum::browser_launch::{
     recover_browser_launches, AuthorizedLaunchIntent, BrowserProcessGeneration,
     DurableLaunchJournal, OrphanBrowserProcessControl, OrphanProcessControlFailure,
     OrphanProfileCustody, OrphanProfileCustodyFailure,
 };
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use cerebellum::browser_launch_service::{launch_journal_config, production_profile_lifecycle};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use cerebellum::profile::{
     untrustworthy_registry_reason_code, untrustworthy_registry_remedy, DurableResolution,
     RebindProvenance, RegistryError, UntrustworthyRegistryReason, PROFILE_ROOT_REBINDS_FILE,
 };
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use serde_json::Value;
 
 /// Reports what production would do to a process and does none of it. The
@@ -52,10 +56,12 @@ use serde_json::Value;
 /// naming a pid that some unrelated process now holds is exactly the input a
 /// wrong reaper would kill on, so this control turns "would terminate" into a
 /// printed line and a failure the drill can read.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct ObserveOnly {
     would_terminate: Vec<BrowserProcessGeneration>,
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl OrphanBrowserProcessControl for ObserveOnly {
     fn observed_start_time_micros(
         &mut self,
@@ -102,11 +108,13 @@ impl OrphanBrowserProcessControl for ObserveOnly {
 
 /// Releasing or retaining custody edits files under the restored root, so the
 /// drill records those actions without modifying the restored tree.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct ReportOnlyCustody {
     releases: Vec<String>,
     retains: Vec<String>,
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl OrphanProfileCustody for ReportOnlyCustody {
     fn release(
         &mut self,
@@ -125,11 +133,19 @@ impl OrphanProfileCustody for ReportOnlyCustody {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn fail(arm: &str, reason: impl std::fmt::Display) -> ExitCode {
     eprintln!("ARM {arm} FAILED: {reason}");
     ExitCode::from(1)
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn main() -> ExitCode {
+    eprintln!("This restore drill requires the production browser launcher (macOS or Linux).");
+    ExitCode::FAILURE
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn main() -> ExitCode {
     if std::env::var_os("XDG_DATA_HOME").is_none() {
         eprintln!(

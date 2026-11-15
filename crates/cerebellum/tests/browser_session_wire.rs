@@ -452,6 +452,8 @@ enum PageMove {
 struct RecordingLauncher {
     launches: Arc<Mutex<usize>>,
     accepted_launches: Mutex<Vec<cerebellum_core::identity::AcceptedBindFacts>>,
+    // Production profile custody is available only where the browser can launch.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     profile_service: Option<cerebellum::browser_launch_service::ProductionLaunchService>,
     profile_directories: Mutex<Vec<std::path::PathBuf>>,
     page: CommittedPage,
@@ -516,10 +518,11 @@ impl BrowserSessionLauncher for RecordingLauncher {
     fn launch(
         &self,
         accepted: &cerebellum_core::identity::AcceptedBindFacts,
-        session_id: &str,
+        _session_id: &str,
     ) -> Result<LaunchedBrowser, Value> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(service) = &self.profile_service {
-            let directory = service.take_and_return_profile_custody(accepted, session_id)?;
+            let directory = service.take_and_return_profile_custody(accepted, _session_id)?;
             self.profile_directories.lock().unwrap().push(directory);
         }
         self.accepted_launches
@@ -2233,6 +2236,7 @@ async fn unattested_project_cannot_reach_profile_launch() {
 #[tokio::test]
 async fn an_empty_attested_project_refuses_launch_with_a_typed_reason() {
     let launcher = Arc::new(RecordingLauncher {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         profile_service: Some(
             cerebellum::browser_launch_service::ProductionLaunchService::open(
                 config(),
@@ -8768,6 +8772,7 @@ async fn scope_admission_head_launches_for_agent_and_reads_standing_grants() {
     let (mut planes, _) = scope_admission_planes();
     // Exercise production profile selection and custody without starting Chrome.
     let launcher = Arc::new(RecordingLauncher {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         profile_service: Some(
             cerebellum::browser_launch_service::ProductionLaunchService::open(
                 config(),
@@ -8791,25 +8796,29 @@ async fn scope_admission_head_launches_for_agent_and_reads_standing_grants() {
     let launched = launcher.accepted_launches.lock().unwrap()[0].clone();
     assert_eq!(launched.identity.agent_project_id, "pj-scope-agent");
     assert!(launched.acts_as_agent);
-    assert_eq!(launcher.profile_directories.lock().unwrap().len(), 1);
-    let service = launcher.profile_service.as_ref().unwrap();
-    let reused = service
-        .take_and_return_profile_custody(&launched, "second-session")
-        .unwrap();
-    assert_eq!(
-        reused,
-        launcher.profile_directories.lock().unwrap()[0],
-        "durable agent profile is reused across sessions"
-    );
-    let mut another_agent = launched.clone();
-    another_agent.identity.agent_project_id = "pj-other-agent".into();
-    let other = service
-        .take_and_return_profile_custody(&another_agent, "other-session")
-        .unwrap();
-    assert_ne!(
-        other, reused,
-        "profile ownership is keyed on the stamp's agent"
-    );
+    // Windows has no production launcher; keep its route and grant checks below.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        assert_eq!(launcher.profile_directories.lock().unwrap().len(), 1);
+        let service = launcher.profile_service.as_ref().unwrap();
+        let reused = service
+            .take_and_return_profile_custody(&launched, "second-session")
+            .unwrap();
+        assert_eq!(
+            reused,
+            launcher.profile_directories.lock().unwrap()[0],
+            "durable agent profile is reused across sessions"
+        );
+        let mut another_agent = launched.clone();
+        another_agent.identity.agent_project_id = "pj-other-agent".into();
+        let other = service
+            .take_and_return_profile_custody(&another_agent, "other-session")
+            .unwrap();
+        assert_ne!(
+            other, reused,
+            "profile ownership is keyed on the stamp's agent"
+        );
+    }
     assert_eq!(
         launched.identity.logical_profile_key(),
         Some(("pj-scope-agent".into(), "default".into()))
@@ -8853,14 +8862,18 @@ async fn scope_admission_nondelegating_head_has_no_durable_profile_or_standing_a
         accepted.identity.resolve_profile().logical_profile_key,
         None
     );
-    let service = cerebellum::browser_launch_service::ProductionLaunchService::open(
-        config(),
-        cerebellum::JournalPersistence::Isolated,
-    );
-    let refusal = service
-        .take_and_return_profile_custody(&accepted, "no-profile-session")
-        .unwrap_err();
-    assert_eq!(refusal["outcome"], "no_profile");
+    // The direct custody check needs the macOS/Linux production launcher.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let service = cerebellum::browser_launch_service::ProductionLaunchService::open(
+            config(),
+            cerebellum::JournalPersistence::Isolated,
+        );
+        let refusal = service
+            .take_and_return_profile_custody(&accepted, "no-profile-session")
+            .unwrap_err();
+        assert_eq!(refusal["outcome"], "no_profile");
+    }
     let navigated = invoke_existing(
         &planes,
         2,

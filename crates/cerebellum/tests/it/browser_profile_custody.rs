@@ -16,12 +16,11 @@ use cerebellum::profile::{
     ProfileOutcome, ProfileState, RegistryConfig, UntrustworthyRegistryReason,
 };
 use cerebellum::profile_custody::{
-    classify_process_generation, classify_supervisor_start_time, current_supervisor_generation,
-    read_record_if_present, BootId, GenerationObservation, KernelSupervisorLiveness,
-    ProfileCustodyAcquisition, ProfileCustodyEvent, ProfileCustodyEventKind, ProfileCustodyJournal,
-    ProfileCustodyKey, ProfileCustodyLockError, ProfileCustodyLockRecord, ProfileCustodyLocks,
-    ProfileCustodyRelease, StartTimeStability, SupervisorGeneration, SupervisorLiveness,
-    SupervisorLivenessProbe,
+    classify_process_generation, classify_supervisor_start_time, read_record_if_present, BootId,
+    GenerationObservation, ProfileCustodyAcquisition, ProfileCustodyEvent, ProfileCustodyEventKind,
+    ProfileCustodyJournal, ProfileCustodyKey, ProfileCustodyLockError, ProfileCustodyLockRecord,
+    ProfileCustodyLocks, ProfileCustodyRelease, StartTimeStability, SupervisorGeneration,
+    SupervisorLiveness, SupervisorLivenessProbe,
 };
 use serde_json::{json, Value};
 
@@ -1253,6 +1252,7 @@ fn a_start_time_mismatch_refuses_where_the_reading_moves_with_the_clock() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_production_probe_reads_back_the_generation_this_supervisor_records() {
+    use cerebellum::profile_custody::{current_supervisor_generation, KernelSupervisorLiveness};
     let own = current_supervisor_generation().expect("this platform records a supervisor");
     assert_eq!(
         KernelSupervisorLiveness.observe(own),
@@ -1495,6 +1495,7 @@ fn a_v1_custody_lock_that_claims_a_boot_id_is_invalid() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_supervisor_generation_carries_a_boot_id_exactly_on_linux() {
+    use cerebellum::profile_custody::current_supervisor_generation;
     let own = current_supervisor_generation().expect("this platform records a supervisor");
     assert_eq!(own.boot_id.is_some(), cfg!(target_os = "linux"));
 }

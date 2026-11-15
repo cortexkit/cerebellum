@@ -31,7 +31,7 @@ pub use launch::{
     BarredChild, ExecutedImageIdentity, GenerationMatch, ImageIdentityError, ProcessControlError,
     ProcessGeneration, ReleasedChild, SpawnError, TerminationOutcome,
 };
+#[cfg(any(target_os = "linux", all(test, unix)))]
+pub use linux::process_start_time;
 #[cfg(any(target_os = "linux", test))]
-pub use linux::{
-    process_generation, process_start_time, ProcessGenerationReading, ProcessStartTime,
-};
+pub use linux::{process_generation, ProcessGenerationReading, ProcessStartTime};

@@ -290,6 +290,33 @@ linux_mode() {
     grep -Fxq fixture "$scratch/argv"
 }
 
+windows_clippy_targets() {
+  # Execute fast-gate.sh's Linux block with Cargo recorded, not run, so the
+  # assertion checks dispatched arguments rather than printed phase labels.
+  python3 - "$repo_root/scripts/fast-gate.sh" "$scratch/windows-clippy-calls" <<'PY'
+from pathlib import Path
+import subprocess
+import sys
+
+source = Path(sys.argv[1]).read_text()
+start = source.index('if [ "$part" = linux ]; then\n')
+end = source.index('\nif [ "$part" = mac ]', start)
+fixture = r'''
+set -eu
+part=linux
+packages=(cerebellum)
+start_static_phase() { :; }
+run_serial_phase() { shift; if [ "$1" = cargo ]; then "$@"; fi; }
+cargo() { printf '%s\n' "$*" >>"$CALL_LOG"; }
+'''
+subprocess.run(['bash', '-c', 'CALL_LOG="$1"\n' + fixture + source[start:end],
+                'windows-clippy-fixture', sys.argv[2]], check=True)
+calls = Path(sys.argv[2]).read_text().splitlines()
+assert 'clippy --locked --workspace --all-targets --target x86_64-pc-windows-msvc --quiet -- -D warnings' in calls, calls
+assert 'clippy --locked --workspace --target aarch64-pc-windows-msvc --quiet -- -D warnings' in calls, calls
+PY
+}
+
 mac_mode() {
   uname() { echo Darwin; }
   require_part_host mac && ! require_part_host linux || return 1
@@ -563,6 +590,7 @@ check 'source checks overlap serial work with whole, ordered logs' concurrent_or
 check 'the sandbox skip prints NOT VERIFIED before the verdict' unreadable_process_table
 check 'a readable process table leaves library tests unchanged' readable_process_table
 check '--part linux selects the remote Linux lane' linux_mode
+check 'Linux cross-checks every x86_64 Windows target and keeps ARM64 default checks' windows_clippy_targets
 check '--part mac keeps platform binaries and excludes Linux-only checks' mac_mode
 check '--part mac --vm defers desk phases with NOT VERIFIED; --remote/--vm reject anything but --part mac' remote_vm_arg_validation
 check '--part mac --remote dispatches to the macOS VM with a 60 min timeout, without vcpus or net' mac_remote_dispatch

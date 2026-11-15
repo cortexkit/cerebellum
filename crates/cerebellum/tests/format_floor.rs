@@ -13,14 +13,13 @@
 
 use cortexkit_test_support::ScratchDir;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use cerebellum::computer_grants::{
     FilesystemGrantStorage, GrantStorage, GrantStoreError, GrantStoreState, InMemoryGrantStorage,
     GRANT_STORE_FORMAT,
 };
-use cerebellum_core::format_floor::{read_floors, FormatFloor, NewerWriter, FORMAT_FLOOR_FILE};
+use cerebellum_core::format_floor::{read_floors, FormatFloor, FORMAT_FLOOR_FILE};
 use cerebellum_core::journal::{
     FilesystemJournalStorage, InMemoryJournalStorage, JournalStorage, RefusalRing,
     RefusalRingConfig, StorageError,
@@ -200,6 +199,8 @@ mod custody {
         ProfileCustodyJournal, ProfileCustodyKey, ProfileCustodyLockError, ProfileCustodyLocks,
         SupervisorGeneration, SupervisorLiveness, SupervisorLivenessProbe, CUSTODY_LOCK_FORMAT,
     };
+    use cerebellum_core::format_floor::NewerWriter;
+    use std::io;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
