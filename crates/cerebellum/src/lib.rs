@@ -14614,13 +14614,10 @@ mod tests {
         };
 
         let both = admitted(&bindings(Some("fixture-global"), Some("fixture-takeover")));
+        // With both reviews bound and mouse-up recovery measured, every
+        // takeover row is admitted, the button-down rows included.
         for row in takeover_rows {
-            let available = matches!(row, "computer.takeover_move" | "computer.takeover_scroll");
-            assert_eq!(
-                both.iter().any(|id| id == row),
-                available,
-                "{row}: {both:?}"
-            );
+            assert!(both.iter().any(|id| id == row), "{row}: {both:?}");
         }
         for (gate, context) in [
             (
