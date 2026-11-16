@@ -89,6 +89,18 @@ fn published() -> BTreeMap<String, ViewManifest> {
         .collect()
 }
 
+/// Keep the bucket payload on the same builder and JSON encoding as tool.views.
+pub(super) fn published_replies() -> Vec<(String, Vec<u8>)> {
+    published()
+        .into_keys()
+        .map(|pin| {
+            let reply = answer(json!({"pins": [&pin]}).as_object().expect("request object"))
+                .expect("published pin request");
+            (pin, serde_json::to_vec(&reply).expect("views serialize"))
+        })
+        .collect()
+}
+
 pub(super) fn answer(arguments: &Map<String, Value>) -> Result<Value, ErrorBody> {
     if let Some(field) = arguments.keys().find(|field| field.as_str() != "pins") {
         return Err(errors::invalid_request(field, "unknown views member"));
