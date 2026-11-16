@@ -882,6 +882,11 @@ budget!(
     [("lookup", GRANT_LOOKUP_MS, 1)]
 );
 budget!(
+    MANAGEMENT_DISPLAY_READ,
+    cortexkit_role_tool_display::DISPLAY_READ,
+    [("catalog", 3_000, 1), ("lookup", GRANT_LOOKUP_MS, 1)]
+);
+budget!(
     MANAGEMENT_ABILITY_DESCRIBE,
     crate::ability::DESCRIBE,
     [
@@ -921,7 +926,8 @@ budget!(
         ("binding", 10_000, 1)
     ]
 );
-pub const MANAGEMENT_ACTIONS: [ActionBudget; 22] = [
+pub const MANAGEMENT_ACTIONS: [ActionBudget; 23] = [
+    MANAGEMENT_DISPLAY_READ,
     MANAGEMENT_ABILITY_DESCRIBE,
     MANAGEMENT_ABILITY_SCOPE_CHOICES,
     MANAGEMENT_ABILITY_SETUP,
@@ -1102,7 +1108,8 @@ const fn management_limits(
 // answer consent or complete sign-in. OPEN_GRANT, REBIND_PROFILE_ROOT and
 // CLEAR_LAUNCH_RECOVERY ask on spawned tasks after the Management reply,
 // so those replies need no park allowance.
-pub const MANAGEMENT_LIMITS: [ManagementLimits; 22] = [
+pub const MANAGEMENT_LIMITS: [ManagementLimits; 23] = [
+    management_limits(MANAGEMENT_DISPLAY_READ, 0, 0),
     management_limits(MANAGEMENT_ABILITY_DESCRIBE, 10_000, 0),
     management_limits(MANAGEMENT_ABILITY_SCOPE_CHOICES, 10_000, 0),
     management_limits(MANAGEMENT_ABILITY_SETUP, 10_000, CONSENT_PARK_LIMIT_MS),
@@ -1484,6 +1491,7 @@ mod tests {
             (MANAGEMENT_PERMISSIONS_LIST, STORE_MS + RESOLUTION_LIMIT_MS),
             (MANAGEMENT_PERMISSIONS_REVOKE, STORE_MS),
             (MANAGEMENT_PRIVATE_CONTENT_QUERY, GRANT_LOOKUP_MS),
+            (MANAGEMENT_DISPLAY_READ, 3_000 + GRANT_LOOKUP_MS),
             (MANAGEMENT_SESSION_TURN_ENDED, GRANT_LOOKUP_MS),
             (
                 MANAGEMENT_ABILITY_DESCRIBE,
@@ -1676,6 +1684,7 @@ mod tests {
             (crate::permissions::LIST, 0, 0),
             (crate::permissions::REVOKE, 0, 0),
             (crate::private_content::QUERY, 0, 0),
+            (cortexkit_role_tool_display::DISPLAY_READ, 0, 0),
             (management::SESSION_TURN_ENDED, 0, 0),
             (crate::ability::DESCRIBE, 10_000, 0),
             (crate::ability::SCOPE_CHOICES, 10_000, 0),

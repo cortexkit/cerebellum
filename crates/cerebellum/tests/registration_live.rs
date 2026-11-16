@@ -144,6 +144,13 @@ impl Registered {
                 .expect("the manifest lists provided capabilities")
                 .push(json!(capability));
         }
+        if module_id == "ckbus" {
+            for role in manifest["provides"].as_array_mut().unwrap() {
+                if let Some(operations) = role.get_mut("operations").and_then(Value::as_array_mut) {
+                    operations.push(json!({"name":"ckbus.credential","kind":"query"}));
+                }
+            }
+        }
         let hello = json!({
             "manifest": manifest,
             "protocol_ver": PROTOCOL_VERSION,
@@ -185,7 +192,7 @@ impl Registered {
                     (FrameType::Request, 0) => {
                         let body: Value = serde_json::from_slice(&frame.body).unwrap_or_default();
                         let reply = if body["op"] == "health.check" {
-                            json!({"op":"health.check", "status":"healthy"})
+                            json!({"op":"health.check", "status":"ok"})
                         } else {
                             let _ = bound.send(body);
                             json!({"op":"route.bind"})
@@ -203,6 +210,12 @@ impl Registered {
                     }
                     (FrameType::Response | FrameType::Error, 0) => {
                         let _ = answered.send(frame).await;
+                    }
+                    (FrameType::Request, _) => {
+                        let reply = Frame::build(FrameType::Error, cerebellum::control_flags(),
+                            frame.header.channel, frame.header.epoch, frame.header.corr,
+                            serde_json::to_vec(&json!({"code":"test_bus_unavailable","message":"no NATS server in the registration fixture"})).unwrap()).unwrap();
+                        let _ = replies.send(reply).await;
                     }
                     _ => {}
                 }
@@ -262,6 +275,7 @@ struct Fixture {
     owner_nonce: String,
     _owner: Registered,
     display: Registered,
+    ckbus: Registered,
 }
 
 impl Drop for Fixture {
@@ -310,13 +324,26 @@ impl Fixture {
         let connection_path = directory.join("subc-connection.json");
         let daemon_path = directory.join("subc.jsonc");
         let mut modules = serde_json::Map::new();
-        for id in [OWNER, DISPLAY] {
+        for id in [OWNER, DISPLAY, "ckbus"] {
             let mut helper_env = module_env.clone();
             helper_env.insert("NONCE_OUT".into(), directory.join(format!("{id}-nonce")));
             modules.insert(
                 id.into(),
                 json!({"program":support::nonce_holder(), "env":helper_env, "reserved":true}),
             );
+        }
+        if registration_channel {
+            let mut probe_env = module_env.clone();
+            probe_env.insert("CEREBELLUM_CLAIM_PROBE".into(), connection_path.clone());
+            probe_env.insert(
+                "CEREBELLUM_CLAIM_PROBE_DONE".into(),
+                directory.join("probe-done"),
+            );
+            modules.insert("claim-probe".into(), json!({
+                "program": support::daemon_binary("ckdev-cerebellum-claim-probe", std::env::current_exe().unwrap()),
+                "args":["--exact","claim_consumer_probe","--nocapture","--"],
+                "env":probe_env,"reserved":true,"registration_channel":true
+            }));
         }
         // This daemon hands every module it starts a registration channel. The
         // channel launch runs cerebellum directly, so it adopts that channel.
@@ -367,6 +394,7 @@ impl Fixture {
         .expect("the daemon publishes its connection file");
         let owner_nonce = read_nonce(directory.path(), OWNER).await;
         let display_nonce = read_nonce(directory.path(), DISPLAY).await;
+        let ckbus_nonce = read_nonce(directory.path(), "ckbus").await;
         let mut owner = Registered::register(&connection, &owner_nonce, OWNER, None).await;
         let display = Registered::register(
             &connection,
@@ -375,6 +403,40 @@ impl Fixture {
             Some(cortexkit_role_tool_display::TOOL_DISPLAY_CAPABILITY),
         )
         .await;
+        let ckbus = Registered::register(
+            &connection,
+            &ckbus_nonce,
+            "ckbus",
+            Some("caller-attestation/v1"),
+        )
+        .await;
+        if registration_channel {
+            let bind = timeout(HANG_GUARD, ckbus.binds.lock().await.recv())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "probe did not open its claimed route: {error}; {}",
+                        fs::read_to_string(run.join("logs/claim-probe.stderr.log"))
+                            .unwrap_or_default()
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                bind["principal"],
+                serde_json::to_value(reserved("claim-probe")).unwrap()
+            );
+            assert_eq!(
+                bind["caller"]["claim"], "own",
+                "SDK probe must present a self claim: {bind}"
+            );
+            timeout(HANG_GUARD, async {
+                while !directory.join("probe-done").exists() {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("probe passed its pre-install refusal and post-install connection checks");
+        }
         owner.sync_head_scope().await;
         let fixture = Self {
             _directory: directory,
@@ -383,6 +445,7 @@ impl Fixture {
             owner_nonce,
             _owner: owner,
             display,
+            ckbus,
         };
         fixture.await_registration(registration_channel).await;
         fixture
@@ -620,6 +683,20 @@ async fn serves_binds_health_and_outbound_routes(registration_channel: bool) {
         serde_json::to_value(reserved("cerebellum")).unwrap(),
         "the daemon stamped cerebellum's own outbound route as cerebellum: {bind}"
     );
+    let bus_bind = timeout(HANG_GUARD, fixture.ckbus.binds.lock().await.recv())
+        .await
+        .expect("publisher opens the SDK credential route")
+        .expect("fake ckbus remains registered");
+    assert_eq!(
+        bus_bind["principal"],
+        serde_json::to_value(reserved("cerebellum")).unwrap()
+    );
+    if registration_channel {
+        assert_eq!(
+            bus_bind["caller"]["claim"], "own",
+            "production bus consumer must present a self claim: {bus_bind}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -630,4 +707,57 @@ async fn channel_launch_answers_binds_health_and_opens_claimed_routes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nonce_launch_answers_binds_health_and_opens_attested_routes() {
     serves_binds_health_and_outbound_routes(false).await;
+}
+
+/// This exact test is also the daemon-launched, process-isolated SDK probe.
+#[test]
+fn claim_consumer_probe() {
+    let Some(connection_path) = std::env::var_os("CEREBELLUM_CLAIM_PROBE") else {
+        return;
+    };
+    let done =
+        std::env::var_os("CEREBELLUM_CLAIM_PROBE_DONE").expect("parent supplies completion path");
+    let failure = PathBuf::from(&done).with_extension("failed");
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = fs::write(&failure, info.to_string());
+    }));
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        use std::sync::Arc;
+        use subc_client_rs::registration::{self, ClaimError, ClaimMinter};
+        use subc_protocol::claim::{ClaimMintReply, ClaimMintRequest};
+        struct Minter(tokio::sync::Mutex<Box<dyn subc_client_rs::ModuleStream>>);
+        #[subc_client_rs::async_trait]
+        impl ClaimMinter for Minter {
+            async fn mint(&self, request: ClaimMintRequest) -> Result<ClaimMintReply, ClaimError> {
+                let mut stream = self.0.lock().await;
+                let frame = Frame::build(FrameType::Request, cerebellum::control_flags(), 0, 0, 900,
+                    serde_json::to_vec(&request).unwrap()).unwrap();
+                write_frame(&mut *stream, &frame).await.map_err(|_| ClaimError::Unavailable)?;
+                let reply = read_frame(&mut *stream).await.map_err(|_| ClaimError::Unavailable)?.ok_or(ClaimError::Unavailable)?;
+                assert_eq!((reply.header.channel, reply.header.corr), (0, 900), "unexpected frame while minting");
+                assert_eq!(reply.header.ty, FrameType::Response, "claim refused: {}", String::from_utf8_lossy(&reply.body));
+                serde_json::from_slice(&reply.body).map_err(|_| ClaimError::Protocol)
+            }
+        }
+        let mut stream = registration::adopt_channel().unwrap().expect("probe must be channel launched");
+        let connection_path = PathBuf::from(connection_path);
+        let connection = connection_file::read(&connection_path).unwrap();
+        authenticate_client(&mut stream, &connection, HANG_GUARD).await.unwrap();
+        assert!(registration::adopt_channel().is_err(), "second take must refuse");
+        let before = subc_client_rs::SubcConsumer::connect(&connection_path, Default::default()).await;
+        assert!(matches!(before, Err(subc_client_rs::consumer::ConsumerError::Connect { ref endpoint, ref source, .. })
+            if endpoint == "claim binding" && matches!(source.get_ref().and_then(|error| error.downcast_ref::<ClaimError>()), Some(ClaimError::Unavailable))),
+            "a pre-minter consumer must refuse specifically for the missing claim owner");
+        let hello = Frame::build(FrameType::Hello, cerebellum::control_flags(), 0, 0, 1,
+            serde_json::to_vec(&json!({"manifest":cerebellum::manifest::build("claim-probe"),"protocol_ver":PROTOCOL_VERSION,"control_ops":["health.check"]})).unwrap()).unwrap();
+        write_frame(&mut stream, &hello).await.unwrap();
+        let ack = read_frame(&mut stream).await.unwrap().unwrap();
+        assert_eq!(ack.header.ty, FrameType::HelloAck);
+        registration::install_claim_minter(Arc::new(Minter(tokio::sync::Mutex::new(stream)))).unwrap();
+        let consumer = subc_client_rs::SubcConsumer::connect(&connection_path, Default::default()).await.expect("post-install SDK consumer presents claim");
+        let result = consumer.call(RouteTarget::ManagementSurface { module_id:"ckbus".into() }, BindIdentity::new("probe", "claim-probe"),
+            serde_json::to_vec(&json!({"method":"ckbus.credential","params":{}})).unwrap(), Default::default()).await;
+        assert!(matches!(result, Err(subc_client_rs::consumer::CallError::Module(ref body)) if body.code == "test_bus_unavailable"), "fixture must receive the claimed SDK call: {result:?}");
+        fs::write(done, b"passed").unwrap();
+    });
 }

@@ -1005,6 +1005,7 @@ pub fn dispatchable_tool(name: &str) -> Option<&str> {
 /// Whether the management dispatcher has an explicit arm for this operation.
 pub fn dispatchable_management_operation(name: &str) -> bool {
     name == private_content::QUERY
+        || name == cortexkit_role_tool_display::DISPLAY_READ
         || name == image_handles::RESOLVE
         || permissions::is_operation(name)
         || ability::is_operation(name)
@@ -2216,6 +2217,8 @@ pub async fn run_entry_prepared_for_test(
     browser: BrowserConfig,
     prepare: impl FnOnce(&mut Planes),
 ) -> Result<(), ModuleError> {
+    let registration = registration::take_before_any_spawn()?;
+    launch_nonce::read_before_any_spawn();
     let config = ModuleConfig {
         connection_file_path,
         module_id: DEFAULT_MODULE_ID.into(),
@@ -2223,7 +2226,7 @@ pub async fn run_entry_prepared_for_test(
         agent_cursor: false,
         browser: BrowserSurface::Available(browser),
     };
-    conclude(run(config, prepare, false, None).await)
+    conclude(run(config, prepare, false, registration).await)
 }
 
 /// How a module run ended, which decides how the process exits.
@@ -2931,7 +2934,14 @@ where
     expect_hello_ack(read_half).await?;
 
     planes.scopes.control.connect(&writer);
-    registration::connect(&writer);
+    let _registration = registration::connect(&writer)?;
+    #[cfg(not(test))]
+    planes
+        .calls
+        .events
+        .connect(Arc::new(event_publish::BusTransport {
+            connection_file: config.connection_file_path.clone(),
+        }));
     #[cfg(target_os = "macos")]
     if let Some(cursor) = planes_cursor(&planes) {
         cursor.listen_for_turn_hints(Arc::new(turn_hints::LiveTransport::new(
@@ -4337,6 +4347,13 @@ async fn handle_route_request(
         )
         .await;
     }
+    if facts.surface == RouteSurface::Management
+        && serde_json::from_slice::<Value>(&frame.body)
+            .ok()
+            .is_some_and(|body| body["method"] == cortexkit_role_tool_display::DISPLAY_READ)
+    {
+        return handle_management_request_observed(frame, writer, &facts, planes, None).await;
+    }
     if planes
         .routes
         .display
@@ -4692,6 +4709,32 @@ async fn handle_management_request_observed(
     }
     if method == image_handles::RESOLVE {
         return handle_image_resolve(&frame, writer, planes, object).await;
+    }
+    if method == cortexkit_role_tool_display::DISPLAY_READ {
+        return match planes
+            .routes
+            .display
+            .read(
+                facts.principal.as_ref(),
+                object.get("params").cloned().unwrap_or(Value::Null),
+            )
+            .await
+        {
+            Ok(bytes) => {
+                send_tool_response(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    serde_json::from_slice(&bytes).expect("stored display arguments are JSON"),
+                )
+                .await
+            }
+            Err(error) => {
+                tool_provider::send_error(error, (ver, channel, epoch, corr), writer).await
+            }
+        };
     }
     if method == management::SESSION_TURN_ENDED {
         return handle_session_turn_ended(
@@ -13880,6 +13923,39 @@ mod tests {
             digest(&value),
             digest(&unbound)
         );
+        // Subtract only display.read for comparisons with older manifests.
+        // Every pre-existing operation and tool definition remains pinned.
+        let without_display_read = |current: &Value| {
+            let mut previous = current.clone();
+            let mut removed = 0;
+            for role in previous["provides"].as_array_mut().unwrap() {
+                if let Some(operations) = role.get_mut("operations").and_then(Value::as_array_mut) {
+                    let before = operations.len();
+                    operations.retain(|operation| {
+                        operation["name"] != cortexkit_role_tool_display::DISPLAY_READ
+                    });
+                    removed += before - operations.len();
+                }
+            }
+            assert_eq!(removed, 1);
+            previous
+        };
+        let before_read = without_display_read(&value);
+        let before_read_unbound = without_display_read(&unbound);
+        #[cfg(target_os = "linux")]
+        let before_read_pins = [
+            "7e31cf93aff05066e6057747b36fb780f6972b37c6eea61c67f5acd17a64289e",
+            "5ccb6b3f6e8eb53cec1b5a5e6e572c43e376d0227b731c8271fb07ede73fa77a",
+        ];
+        #[cfg(target_os = "macos")]
+        let before_read_pins = [
+            "36b634587d38fe35aeab157ab028be55ba6f5e57d238e2a38d0b04dca7ef7892",
+            "30c989be33e0848f18b00cba45d88940b5fec6353a456331572382732228567b",
+        ];
+        assert_eq!(
+            [digest(&before_read), digest(&before_read_unbound)],
+            before_read_pins
+        );
         // Only the channel-support declaration may change the fixed HELLO.
         // Remove that exact addition and retain the complete previous pins.
         #[cfg(target_os = "linux")]
@@ -13892,7 +13968,7 @@ mod tests {
             "be75638b3892bed37282a867be03a1daa283bd0a6ec2bc7a099deb591d2707fd",
             "ec71302313702fd18b8cfcff461b523b7b5946265b0104261172081b0bfb991d",
         ];
-        for (current, prior) in [&value, &unbound].into_iter().zip(prior) {
+        for (current, prior) in [&before_read, &before_read_unbound].into_iter().zip(prior) {
             let mut previous = current.clone();
             assert_eq!(
                 previous
@@ -13908,7 +13984,7 @@ mod tests {
         // additive release evidence (and vocabulary/views differ elsewhere).
         // Normalize those HELLO additions only for historical comparison;
         // this is not a claim of raw HELLO byte equality.
-        let mut legacy = unbound.clone();
+        let mut legacy = before_read_unbound;
         assert_eq!(
             legacy
                 .as_object_mut()
@@ -13990,13 +14066,13 @@ mod tests {
         // Binding CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION withholds button-down gestures until recovery is
         // measured, while advertising the fronted move/scroll definition.
         #[cfg(target_os = "linux")]
-        let expected = "7e31cf93aff05066e6057747b36fb780f6972b37c6eea61c67f5acd17a64289e";
+        let expected = "b9c8213a01901103879372dddf9c66b24e1f863e7498fe4214089a031cbacb37";
         #[cfg(target_os = "macos")]
-        let expected = "36b634587d38fe35aeab157ab028be55ba6f5e57d238e2a38d0b04dca7ef7892";
+        let expected = "f3044a4a847579d999d1e615e37afea785eab78501db7dca735aa84b95637075";
         #[cfg(target_os = "linux")]
-        let expected_unbound = "5ccb6b3f6e8eb53cec1b5a5e6e572c43e376d0227b731c8271fb07ede73fa77a";
+        let expected_unbound = "0cbf726cba749725308de4a6daefc75d2911e22501732f9a5adf47cbeb88b074";
         #[cfg(target_os = "macos")]
-        let expected_unbound = "30c989be33e0848f18b00cba45d88940b5fec6353a456331572382732228567b";
+        let expected_unbound = "5a61bd4809b2145ca1f1d9b76dd74f7ac0f3a367f9746177147d6f587ecb5bb1";
         assert_eq!(digest(&value), expected);
         assert_eq!(digest(&unbound), expected_unbound);
     }

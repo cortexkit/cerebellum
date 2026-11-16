@@ -19,6 +19,8 @@
 
 #[path = "it/support/hang_guard.rs"]
 mod hang_guard;
+#[allow(dead_code)]
+mod support;
 use hang_guard::HANG_GUARD;
 
 use std::io::Write;
@@ -37,7 +39,7 @@ use cerebellum_core::identity::{AcceptedBindFacts, ProfileDisposition};
 use serde_json::{json, Value};
 use subc_protocol::{Flags, Frame, FrameType, Priority, PROTOCOL_VERSION};
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 /// Set only in the child: the connection file it should connect with.
 const CHILD_CONNECTION_ENV: &str = "CEREBELLUM_ENDING_CHILD_CONNECTION";
@@ -205,6 +207,8 @@ struct Harness {
     key: Vec<u8>,
     daemon_id: [u8; connection_file::DAEMON_ID_LEN],
     child: tokio::process::Child,
+    channel: std::sync::Mutex<Option<tokio::net::UnixStream>>,
+    channel_path: bool,
 }
 
 impl Drop for Harness {
@@ -216,6 +220,10 @@ impl Drop for Harness {
 
 impl Harness {
     async fn start(close_ms: u64) -> Self {
+        Self::start_with_channel(close_ms, false).await
+    }
+
+    async fn start_with_channel(close_ms: u64, channel_path: bool) -> Self {
         // Tests run in parallel and start within the same microsecond often
         // enough that a timestamp alone collides: two harnesses then share one
         // directory, the second connection file overwrites the first, and both
@@ -259,7 +267,11 @@ impl Harness {
         )
         .expect("write connection file");
         let stderr = std::fs::File::create(directory.join("child.stderr")).expect("stderr file");
-        let child = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+        let executable = std::env::current_exe()
+            .map(|binary| support::daemon_binary("ckdev-cerebellum-shutdown", binary))
+            .expect("test binary");
+        let mut command = tokio::process::Command::new(executable);
+        command
             .args([
                 "--exact",
                 "module_child_entry",
@@ -277,9 +289,25 @@ impl Harness {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr)
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn the module child");
+            .kill_on_drop(true);
+        let channel = if channel_path {
+            use subc_os::registration_channel::{
+                registration_socketpair, ChildDescriptorSlots, DAEMON_PID_ENV, REGISTRATION_FD_ENV,
+            };
+            let (parent, child, metadata) = registration_socketpair().unwrap();
+            command
+                .env(REGISTRATION_FD_ENV, metadata)
+                .env(DAEMON_PID_ENV, std::process::id().to_string());
+            let mut slots = ChildDescriptorSlots::default();
+            slots.channel(child).unwrap();
+            slots.install(command.as_std_mut());
+            parent.set_nonblocking(true).unwrap();
+            Some(tokio::net::UnixStream::from_std(parent).unwrap())
+        } else {
+            None
+        };
+        let child = command.spawn().expect("spawn the module child");
+        drop(command);
         Self {
             directory,
             markers,
@@ -287,16 +315,24 @@ impl Harness {
             key,
             daemon_id,
             child,
+            channel: std::sync::Mutex::new(channel),
+            channel_path,
         }
     }
 
     /// Accept the module, authenticate it, and answer its HELLO, leaving the
     /// connection open and the module serving.
-    async fn accept_and_register(&self) -> TcpStream {
-        let (mut stream, _) = tokio::time::timeout(CHILD_DEADLINE, self.listener.accept())
-            .await
-            .expect("the module connects")
-            .expect("accept");
+    async fn accept_and_register(&self) -> Box<dyn subc_client_rs::ModuleStream> {
+        let channel = self.channel.lock().unwrap().take();
+        let mut stream: Box<dyn subc_client_rs::ModuleStream> = if let Some(channel) = channel {
+            Box::new(channel)
+        } else {
+            let (stream, _) = tokio::time::timeout(CHILD_DEADLINE, self.listener.accept())
+                .await
+                .expect("the module connects")
+                .expect("accept");
+            Box::new(stream)
+        };
         subc_transport::authenticate_server(
             &mut stream,
             &self.key,
@@ -311,6 +347,13 @@ impl Harness {
             .expect("HELLO is readable")
             .expect("the module sends HELLO");
         assert_eq!(hello.header.ty, FrameType::Hello);
+        if self.channel_path {
+            let body: Value = serde_json::from_slice(&hello.body).unwrap();
+            assert!(
+                body["launch_nonce"].is_null(),
+                "channel HELLO must not use nonce authentication"
+            );
+        }
         let ack = Frame::build_with_version(
             PROTOCOL_VERSION,
             FrameType::HelloAck,
@@ -480,6 +523,34 @@ async fn sigterm_during_the_connection_teardown_joins_it_and_dies_by_signal_15()
         "SIGTERM during the teardown must still end the module by signal 15, not {}; stderr: {}",
         describe(status),
         harness.stderr()
+    );
+    harness.assert_torn_down_once();
+}
+
+/// SDK channel adoption must leave process lifetime and teardown to cerebellum.
+#[tokio::test]
+async fn channel_eof_runs_bounded_teardown_before_process_exit() {
+    let mut harness = Harness::start_with_channel(500, true).await;
+    let connection = harness.accept_and_register().await;
+    let started = Instant::now();
+    drop(connection);
+    for route in ROUTES {
+        harness.wait_for_marker(&format!("closing {route}")).await;
+    }
+    assert!(
+        harness.child.try_wait().unwrap().is_none(),
+        "the child must stay alive while browsers are closing"
+    );
+    let status = harness.wait_for_exit().await;
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "channel EOF must exit normally after teardown: {}",
+        harness.stderr()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "channel teardown exceeded its production budget"
     );
     harness.assert_torn_down_once();
 }
