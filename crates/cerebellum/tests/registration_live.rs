@@ -508,6 +508,11 @@ impl Fixture {
 /// Binds, health and an outbound route, all answered promptly.
 async fn serves_binds_health_and_outbound_routes(registration_channel: bool) {
     let fixture = std::sync::Arc::new(Fixture::start(registration_channel).await);
+    let path = if registration_channel {
+        "channel"
+    } else {
+        "nonce"
+    };
 
     // Head routes open together while the daemon probes health.
     let mut opens = tokio::task::JoinSet::new();
@@ -528,7 +533,7 @@ async fn serves_binds_health_and_outbound_routes(registration_channel: bool) {
         let (elapsed, result) = opened.unwrap();
         let route = result
             .unwrap_or_else(|error| panic!("a head route.open failed after {elapsed:?}: {error}"));
-        eprintln!("head route.bind acknowledged in {elapsed:?}");
+        eprintln!("{path} launch: head route.bind acknowledged in {elapsed:?}");
         assert!(
             elapsed < ANSWER_BUDGET,
             "cerebellum acknowledged a head route.bind only after {elapsed:?}"
@@ -536,7 +541,7 @@ async fn serves_binds_health_and_outbound_routes(registration_channel: bool) {
         routes.push(route);
     }
     let (elapsed, health) = probe.await.unwrap();
-    eprintln!("health.check during the binds answered in {elapsed:?}");
+    eprintln!("{path} launch: health.check during the binds answered in {elapsed:?}");
     assert_eq!(health["frame"], "Response", "{health}");
     assert!(
         elapsed < ANSWER_BUDGET,

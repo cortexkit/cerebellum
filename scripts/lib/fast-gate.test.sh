@@ -86,15 +86,15 @@ standalone_source_plans() {
   expect_source_suites crates/cerebellum/src/management.rs \
     conformance flow_live it scope_revocation_live || return 1
   expect_source_suites crates/cerebellum/src/scope_watch.rs \
-    conformance flow_live it scope_revocation_live shutdown_endings || return 1
+    conformance flow_live it registration_live scope_revocation_live shutdown_endings || return 1
   expect_source_suites crates/cerebellum/src/login_capture/vault_wire.rs \
     browser_own_golden browser_session_wire conformance flow_live it vault_deposit_live || return 1
   expect_source_suites crates/cerebellum/src/manifest.rs \
-    browser_own_golden browser_session_wire conformance flow_live it manifest_flag vault_deposit_live || return 1
+    browser_own_golden browser_session_wire conformance flow_live it manifest_flag registration_live vault_deposit_live || return 1
   expect_source_suites crates/cerebellum/src/profile/mod.rs \
     browser_own_golden browser_session_wire conformance flow_live format_floor it || return 1
   expect_source_suites crates/cerebellum/src/content_named_fixture.rs \
-    conformance flow_live it manifest_flag scope_revocation_live vault_deposit_live || return 1
+    conformance flow_live it manifest_flag registration_live scope_revocation_live vault_deposit_live || return 1
   expect_source_suites crates/cerebellum/src/new_module.rs conformance it || return 1
   expect_source_suites crates/cerebellum-macos/src/event_tap.rs hardware_observer_health || return 1
   expect_source_suites crates/cerebellum-core/src/private_fs.rs || return 1
