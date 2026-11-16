@@ -67,7 +67,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use subc_protocol::{Frame, FrameType, Principal};
 
+mod browser_resume;
 mod late;
+pub(crate) use browser_resume::BrowserResume;
 pub use late::{ConsentEnding, HandoffEnding, HeldHandoff};
 
 /// The file name under the journal data home.
@@ -698,6 +700,8 @@ type Key = (String, String);
 
 #[derive(Debug)]
 struct Entry {
+    browser_resume: Option<BrowserResume>,
+    resumed_result: bool,
     consent_ended: bool,
     // Capture can start depositing after its held reply. Process-local only:
     // pending captures restart as handoff_interrupted, without a dispatch mark.
@@ -913,6 +917,8 @@ impl CallRecords {
             inner.entries.insert(
                 key,
                 Entry {
+                    browser_resume: None,
+                    resumed_result: false,
                     consent_ended: false,
                     held_dispatched: false,
                     record,
@@ -1151,6 +1157,8 @@ impl CallRecords {
             return Begin::Unavailable(error);
         }
         let entry = Entry {
+            browser_resume: None,
+            resumed_result: false,
             consent_ended: false,
             held_dispatched: false,
             record,
@@ -1178,6 +1186,9 @@ impl CallRecords {
         let Some(entry) = inner.entries.get_mut(&ticket.key) else {
             return;
         };
+        if entry.resumed_result {
+            return;
+        }
         if let Some(result) = late::settled_result(&entry.record) {
             // A fast resume may settle before the initial held reply is cached.
             // Preserve that ending instead of caching an already-obsolete hold.
@@ -1194,6 +1205,14 @@ impl CallRecords {
         entry.record.posts_returned = settlement.posts_returned;
         entry.record.settled_at_ms = Some(now_ms);
         entry.ask_id = settlement.ask_id;
+        if !entry
+            .record
+            .handoff
+            .as_ref()
+            .is_some_and(|held| held.is_consent() && matches!(held.phase, late::Phase::Pending))
+        {
+            entry.browser_resume = None;
+        }
         let record = entry.record.clone();
         let _ = self.write(inner, &record, now_ms);
         let size = settlement.reply.frame.body.len();
@@ -1226,6 +1245,7 @@ impl CallRecords {
         let Some(entry) = inner.entries.get_mut(&ticket.key) else {
             return;
         };
+        entry.browser_resume = None;
         if entry.record.outcome.as_deref()
             == Some(cortexkit_role_tool_provider::late_results::reasons::SCOPE_ENDED)
         {
@@ -1290,6 +1310,9 @@ impl CallRecords {
         let inner = &mut *guard;
         let mut freed = 0;
         for entry in inner.entries.values_mut() {
+            if entry.conversation_key == conversation_key {
+                entry.browser_resume = None;
+            }
             if entry.conversation_key == conversation_key && entry.reply.is_some() {
                 entry.reply = None;
                 entry.cached_at = None;

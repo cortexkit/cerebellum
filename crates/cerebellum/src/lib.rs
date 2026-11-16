@@ -24,6 +24,7 @@ pub mod browser_config;
 mod browser_consent;
 pub mod browser_crash_reports;
 pub mod browser_executable_identity;
+mod browser_held;
 pub mod browser_launch;
 pub mod browser_launch_readiness;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1787,6 +1788,9 @@ fn held_scope_end(
 /// its cancellation predicate; the persistent browser keeps its normal handoff
 /// and teardown policy.
 fn settle_scope_holds(planes: &Planes, key: &scope_watch::ScopeKey) {
+    planes
+        .browser_resumes
+        .cancel_scope(&held_scope_identity(key));
     let _ = planes
         .calls
         .end_held_scope(&held_scope_identity(key), wall_clock_ms());
@@ -1945,6 +1949,7 @@ async fn scope_epoch_admits_bind(
 /// forgotten card is then ignored by the next drain instead of granting
 /// anything; Cingulate expires the card on the person's phone by itself.
 fn forget_conversation_cards(planes: &Planes, conversation_key: &str) {
+    planes.browser_resumes.cancel_conversation(conversation_key);
     planes
         .management
         .computer_grants()
@@ -2293,13 +2298,14 @@ fn die_by_sigterm() -> Result<(), ModuleError> {
 
 /// The module's one shutdown teardown, reachable from every way it can end.
 ///
-/// The first caller starts it on a blocking thread, and every caller, the first
-/// included, then waits for that same run to finish. It is never started twice,
-/// and a caller that stops waiting (its future dropped) does not stop it.
+/// The first caller starts it, and every caller, the first included, waits for
+/// that same run to finish. Browser process waits use a blocking thread. It is
+/// never started twice, and a caller that stops waiting does not stop it.
 #[derive(Clone)]
 struct ShutdownTeardown(Arc<ShutdownTeardownState>);
 
 struct ShutdownTeardownState {
+    browser_resumes: Arc<browser_held::Tasks>,
     cursor: Option<computer_capability::cursor::Coordinator>,
     user_browser: user_browser_bridge::UserBrowserBridge,
     sessions: browser_session::BrowserSessions,
@@ -2329,9 +2335,11 @@ impl ShutdownTeardown {
         cursor: Option<computer_capability::cursor::Coordinator>,
         user_browser: user_browser_bridge::UserBrowserBridge,
         private_content: Arc<private_content::PrivateContent>,
+        browser_resumes: Arc<browser_held::Tasks>,
     ) -> Self {
         let (finished, _) = tokio::sync::watch::channel(false);
         Self(Arc::new(ShutdownTeardownState {
+            browser_resumes,
             cursor,
             user_browser,
             sessions,
@@ -2344,12 +2352,15 @@ impl ShutdownTeardown {
     }
 
     async fn run_or_join(&self) {
+        let resume_deadline =
+            tokio::time::Instant::now() + browser_session::SHUTDOWN_TEARDOWN_BUDGET;
         let mut finished = self.0.finished.subscribe();
         if !self
             .0
             .started
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
+            self.0.browser_resumes.stop();
             self.0.user_browser.shutdown();
             if let Some(cursor) = &self.0.cursor {
                 cursor.shutdown();
@@ -2364,14 +2375,19 @@ impl ShutdownTeardown {
                 enforcer.abort();
             }
             let state = Arc::clone(&self.0);
-            // On a blocking thread because the teardown waits on browser
-            // processes, and the runtime must stay free to notice SIGTERM
-            // while it does.
-            tokio::task::spawn_blocking(move || {
+            // Wait for browser processes on a blocking thread while joining
+            // asynchronous resumptions in parallel. The runtime stays free
+            // to notice SIGTERM during those waits.
+            tokio::spawn(async move {
                 let finished = MarkTeardownFinished(state);
-                if let Some(browser) = &finished.0.browser {
-                    finished.0.sessions.teardown_all(browser);
-                }
+                let browser_state = Arc::clone(&finished.0);
+                let browser = tokio::task::spawn_blocking(move || {
+                    if let Some(browser) = &browser_state.browser {
+                        browser_state.sessions.teardown_all(browser);
+                    }
+                });
+                let resumes = finished.0.browser_resumes.stop_and_join(resume_deadline);
+                let _ = tokio::join!(browser, resumes);
                 // Serving has stopped, so no further reply can be delivered:
                 // a clean ending may now tell the next start that every mark
                 // reached disk. A crash never gets here and leaves the marker.
@@ -2563,6 +2579,7 @@ async fn run(
         planes_cursor(&planes),
         planes.user_browser.clone(),
         Arc::clone(&planes.private_content),
+        Arc::clone(&planes.browser_resumes),
     );
     let serving = serve_then_tear_down(&mut read_half, write_half, &config, planes, &teardown);
     #[cfg(unix)]
@@ -2693,6 +2710,7 @@ where
         planes_cursor(&planes),
         planes.user_browser.clone(),
         Arc::clone(&planes.private_content),
+        Arc::clone(&planes.browser_resumes),
     );
     serve_then_tear_down(read_half, write_half, config, planes, &teardown).await
 }
@@ -3378,6 +3396,7 @@ pub struct Planes {
     cancellations: RequestCancellations,
     operator_confirm: Arc<computer_capability::operator_confirm::Wire>,
     run_calls: codemode::RunCalls,
+    browser_resumes: Arc<browser_held::Tasks>,
     browser_queue: Arc<call_queue::ConversationQueue>,
     draining: Arc<std::sync::atomic::AtomicBool>,
     /// The same drain, as a signal a waiting task can await: a call parked on
@@ -3888,6 +3907,7 @@ impl Planes {
             cancellations: RequestCancellations::default(),
             operator_confirm: Arc::default(),
             run_calls: codemode::RunCalls::default(),
+            browser_resumes: Arc::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             capture,
             calls,
@@ -3932,6 +3952,7 @@ impl Clone for Planes {
             run_calls: self.run_calls.clone(),
             browser_queue: self.browser_queue.clone(),
             draining: self.draining.clone(),
+            browser_resumes: Arc::clone(&self.browser_resumes),
             drain_signal: Arc::clone(&self.drain_signal),
             drain_notice: self.drain_notice.clone(),
             routes: Arc::clone(&self.routes),
@@ -4049,6 +4070,7 @@ async fn handle_frame(
                         .store(true, std::sync::atomic::Ordering::Release);
                     planes.drain_signal.send_replace(true);
                     planes.cancellations.stop_all(TerminalCause::Draining);
+                    planes.browser_resumes.stop();
                     // Spend the drain window flushing profiles, not waiting for the
                     // deadline. It is only an upper bound, never a scheduled start.
                     if let Some(config) = planes.browser_config.clone() {
@@ -4084,6 +4106,14 @@ async fn handle_frame(
                 .remove(frame.header.channel, frame.header.epoch);
             planes
                 .cancellations
+                .cancel_route(frame.header.channel, frame.header.epoch);
+            planes.calls.abandon_browser_route(
+                frame.header.channel,
+                frame.header.epoch,
+                wall_clock_ms(),
+            );
+            planes
+                .browser_resumes
                 .cancel_route(frame.header.channel, frame.header.epoch);
             if let Some(facts) = removed {
                 let conversation_key = &facts.identity.conversation_key;
@@ -4144,6 +4174,17 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Cancel => {
+            planes.browser_resumes.cancel_correlation((
+                frame.header.channel,
+                frame.header.epoch,
+                frame.header.corr,
+            ));
+            planes.calls.abandon_browser_correlation(
+                frame.header.channel,
+                frame.header.epoch,
+                frame.header.corr,
+                wall_clock_ms(),
+            );
             terminal_arbiter::cancel_late_fronting_request(
                 planes.cancellations.namespace(),
                 (frame.header.channel, frame.header.epoch, frame.header.corr),
@@ -4249,6 +4290,7 @@ async fn handle_frame(
             let browser_park_limit = BROWSER_CONSENT_PARK_LIMIT
                 .try_with(|limit| *limit)
                 .unwrap_or(Duration::from_secs(120));
+            let resumed_browser = browser_held::context();
             let worker = async move {
                 let planes = worker_planes;
                 #[cfg(test)]
@@ -4289,6 +4331,9 @@ async fn handle_frame(
                     browser_arrival,
                     Box::pin(handle_route_request(frame, &proxy, &planes)),
                 ));
+                // Task locals do not cross spawn: carry only the already-claimed
+                // browser continuation's key and consent id to its new guard.
+                let dispatch = browser_held::with_context(resumed_browser, dispatch);
                 let dispatch = BROWSER_CONSENT_PARK_LIMIT.scope(browser_park_limit, dispatch);
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 let result = computer_capability::serialized_call(computer_arrival, dispatch).await;
@@ -4584,13 +4629,16 @@ async fn dispatch_resolved_route(
         frame.header.epoch,
         frame.header.corr,
     );
-    if let Ok(live) = consent_drain::live_call(&frame, facts, planes) {
-        // A failed drain is retried on a later call; it must not replace this
-        // call's ordinary reply with a consent refusal.
-        let _ = planes
-            .consent_drain
-            .run_recording(&planes.consent, &live, Some(&planes.calls))
-            .await;
+    if !browser_held::resuming() {
+        if let Ok(live) = consent_drain::live_call(&frame, facts, planes) {
+            // A failed drain is retried on a later call; it must not replace this
+            // call's ordinary reply with a consent refusal.
+            let _ = planes
+                .consent_drain
+                .run_recording(&planes.consent, &live, Some(&planes.calls))
+                .await;
+        }
+        Box::pin(browser_held::run_ready(planes)).await;
     }
 
     let dispatch = dispatch_bound_route(frame, writer, planes, facts);
@@ -7107,13 +7155,24 @@ async fn handle_keyed_tool_request_inner(
     let origin =
         cerebellum_core::journal::CallOriginRecord::from_request_member(object.get("origin"));
     let Some(call_key) = call_key else {
-        return handle_tool_request(
-            frame,
-            writer,
-            planes,
-            &CallObservation::new().with_origin(origin),
-        )
-        .await;
+        let _resumed_run = browser_held::resuming()
+            .then(|| {
+                let facts = planes.routes.get(channel, epoch)?;
+                let key = call_context::current_call_key()?;
+                planes.run_calls.register(
+                    &facts,
+                    &key,
+                    planes.cancellations.get((channel, epoch, corr)),
+                )
+            })
+            .flatten();
+        let mut observation = CallObservation::new().with_origin(origin);
+        if browser_held::resuming() {
+            if let Some(key) = call_context::current_call_key() {
+                observation = observation.with_key(key);
+            }
+        }
+        return handle_tool_request(frame, writer, planes, &observation).await;
     };
     let flat_tool = matches!(
         object.get("name").and_then(Value::as_str),
@@ -7289,6 +7348,7 @@ async fn handle_keyed_tool_request_inner(
         }
     };
 
+    browser_held::retain(planes, &facts, &call_key, &call);
     if let Some(terminal) = TerminalArbiter::current() {
         let observation = CallObservation::new()
             .with_origin(origin)
@@ -7750,6 +7810,11 @@ async fn handle_tool_withdraw(
     }
     match lookup {
         Lookup::Own(snapshot) => {
+            if snapshot.state == call_records::CallState::Asked {
+                let _ = planes
+                    .calls
+                    .abandon_browser_request(&carrier, &call_key, wall_clock_ms());
+            }
             if let Some(cancel) =
                 planes
                     .run_calls
@@ -7886,6 +7951,7 @@ async fn handle_tool_request_inner(
     planes: &Planes,
     call: &CallObservation,
 ) -> Result<(), ModuleError> {
+    browser_held::track_consent(planes);
     if let Some(terminal) = TerminalArbiter::current() {
         terminal.set_step(CallStep::Queue);
     }
@@ -8723,6 +8789,9 @@ async fn serve_browser_with_consent(
     let Some(scope) = reply.pointer("/detail/grant_request") else {
         return Ok(reply);
     };
+    if browser_held::resuming() {
+        return Ok(reply);
+    }
     if codemode::legacy_run(facts) {
         reply["outcome"] = json!("consent_unavailable");
         reply["detail"]["reason"] = json!("agent_run");
@@ -8854,6 +8923,11 @@ async fn serve_browser_with_consent(
     drop(parked);
     match ending {
         InCall::Settled(_) if matches!(settled, management::BrowserGrantSettlement::Granted(_)) => {
+            if !browser_held::can_resume(arguments) || capability.name() == "browser.click_point" {
+                return Ok(
+                    json!({"outcome":"not_started", "detail":{"consent":"approved","ask_id":id}, "remedy":"Approved; call again to run it."}),
+                );
+            }
             if let Some(terminal) = TerminalArbiter::current() {
                 terminal.track_consent(Arc::clone(&planes.consent), &id);
             }
@@ -11589,6 +11663,7 @@ mod tests {
             cancellations: RequestCancellations::default(),
             operator_confirm: Arc::default(),
             run_calls: codemode::RunCalls::default(),
+            browser_resumes: Arc::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer_admitted: test_admitted_computer_capabilities(),
@@ -13583,6 +13658,7 @@ mod tests {
             cancellations: RequestCancellations::default(),
             operator_confirm: Arc::default(),
             run_calls: codemode::RunCalls::default(),
+            browser_resumes: Arc::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer_admitted: test_admitted_computer_capabilities(),
@@ -13679,6 +13755,7 @@ mod tests {
             cancellations: RequestCancellations::default(),
             operator_confirm: Arc::default(),
             run_calls: codemode::RunCalls::default(),
+            browser_resumes: Arc::default(),
             browser_queue: Arc::new(call_queue::ConversationQueue::default()),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer_admitted: test_admitted_computer_capabilities(),

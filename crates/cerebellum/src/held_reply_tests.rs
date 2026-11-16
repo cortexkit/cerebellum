@@ -5,6 +5,9 @@ use crate::test_support::HANG_GUARD;
 use cortexkit_role_tool_provider::{result, HELD_REPLY_V1, TOOL_RESULT_V1_CAPABILITY};
 use std::sync::atomic::Ordering;
 
+#[path = "held_browser_tests.rs"]
+mod held_browser_tests;
+
 fn vectors() -> Value {
     serde_json::from_str(cortexkit_role_tool_provider::vectors::HELD_REPLY_V1_JSON).unwrap()
 }
@@ -77,6 +80,38 @@ async fn late(planes: &Planes, channel: u16) -> Value {
         )
         .await,
     )
+}
+
+async fn late_key(planes: &Planes, channel: u16, key: &str) -> Value {
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let reply = late(planes, channel).await;
+            if reply["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["call_key"] == key)
+            {
+                return reply;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the original held call settles")
+}
+
+async fn capture_waiting(planes: &Planes) {
+    let scope = journal::call_records::ScopeIdentity::from_stamp(
+        planes.routes.get(9, 3).unwrap().scope.as_ref().unwrap(),
+    );
+    tokio::time::timeout(HANG_GUARD, async {
+        while !planes.calls.has_pending_scope(&scope) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the resumed capture reaches its login hold");
 }
 
 fn answered(id: &str, choice: &str) -> Value {
@@ -369,7 +404,7 @@ async fn declared_terminal_refusals_never_hold() {
 }
 
 #[tokio::test]
-async fn approved_consent_settles_basal_not_started_then_new_key_uses_grant() {
+async fn approved_consent_resumes_basal_call_and_delivers_cached_result_once() {
     let consent = tests::ScriptedConsent::new();
     detach(&consent, "approved-site");
     let planes = attach_consent(
@@ -382,19 +417,21 @@ async fn approved_consent_settles_basal_not_started_then_new_key_uses_grant() {
         "consent",
     );
     consent.feed(json!([answered("approved-site", "allow_30m")]));
-    let entries = late(&planes, 9).await;
+    let entries = late_key(&planes, 9, "site-approval").await;
     let entry = &entries["entries"][0];
-    assert_eq!(entry["kind"], "not_started", "{entries}");
+    assert_eq!(entry["kind"], "result", "{entries}");
     assert_eq!(entry["custodian"], "reserved:basal");
     assert_eq!(entry["call_key"], "site-approval");
-    assert_eq!(entry["detail"]["consent"], "approved");
     assert_eq!(
-        entry["result"]["structuredContent"]["detail"]["consent"],
-        "approved"
+        entry["result"]["structuredContent"]["outcome"], "granted",
+        "{entries}"
     );
-    assert!(entry["result"]["content"]
-        .to_string()
-        .contains("Approved; call again to run it."));
+    assert_eq!(planes.calls.browser_request_count(), 0);
+    let after_delivery = late(&planes, 9).await;
+    assert_eq!(
+        after_delivery["entries"][0]["result"]["structuredContent"]["outcome"],
+        "outcome_unknown"
+    );
     assert!(
         late(&planes, 8).await["entries"]
             .as_array()
@@ -439,6 +476,7 @@ async fn denied_withdrawn_and_expired_consent_settle_terminally() {
         assert_eq!(entry["result"]["errorCode"], expected);
         assert!(entry["result"].get("held").is_none());
         assert!(!planes.calls.has_pending_consents());
+        assert_eq!(planes.calls.browser_request_count(), 0);
     }
 }
 
@@ -449,7 +487,7 @@ fn capture_request(key: &str) -> Value {
 }
 
 #[tokio::test]
-async fn consent_approval_never_executes_original_capture_and_retry_holds_login_capture() {
+async fn consent_approval_resumes_original_capture_into_login_capture() {
     let fixture = login_capture::test_support::fixture_with(|env| {
         env.poll_interval = Duration::from_millis(20);
         env.handoff_duration = Duration::from_secs(60);
@@ -465,23 +503,19 @@ async fn consent_approval_never_executes_original_capture_and_retry_holds_login_
     assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 0);
     consent.feed(json!([answered("capture-approval", "allow")]));
     let entries = late(&planes, 9).await;
-    assert_eq!(
-        entries["entries"][0]["detail"]["consent"], "approved",
-        "{entries}"
-    );
+    tokio::time::timeout(HANG_GUARD, async {
+        while fixture.launcher.launches.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("approval starts the original capture");
     assert_eq!(
         fixture.launcher.launches.load(Ordering::SeqCst),
-        0,
-        "approval cannot launch the original capture; only an explicit retry may do that"
+        1,
+        "the still-held original capture consumes approval: {entries}"
     );
-    assert_eq!(fixture.vault.calls(), 0);
-    let reply = tokio::time::timeout(
-        HANG_GUARD,
-        exchange(&planes, 9, 4, capture_request("capture-retry")),
-    )
-    .await
-    .unwrap();
-    assert_held(&decode(reply), "login_capture");
+    assert_eq!(planes.calls.browser_request_count(), 0);
     assert_eq!(consent.cards().len(), 1);
     assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 1);
     let result = tokio::time::timeout(HANG_GUARD, async {
@@ -491,7 +525,7 @@ async fn consent_approval_never_executes_original_capture_and_retry_holds_login_
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|entry| entry["call_key"] == "capture-retry")
+                .find(|entry| entry["call_key"] == "capture-original")
             {
                 break entry.clone();
             }
@@ -972,25 +1006,18 @@ async fn capture_scope_ended_settles_once_and_disposes_without_deposit() {
     let planes = attach_consent(tests::capture_planes(&fixture), &consent);
     bind_held(&planes).await;
     assert_held(
-        &decode(exchange(&planes, 9, 3, capture_request("scope-consent")).await),
+        &decode(exchange(&planes, 9, 3, capture_request("scope-held")).await),
         "consent",
     );
-    consent.feed(json!([answered("scope-capture-card", "allow")]));
-    let granted = late(&planes, 9).await;
-    decode(
-        exchange(
-            &planes,
-            9,
-            4,
-            json!({"name":"late_results.ack","arguments":{"through":granted["cursor"]}}),
-        )
-        .await,
-    );
     let finalized = planes.capture.expect_journal_finalization();
-    assert_held(
-        &decode(exchange(&planes, 9, 5, capture_request("scope-held")).await),
-        "login_capture",
+    consent.feed(json!([answered("scope-capture-card", "allow")]));
+    let waiting = late(&planes, 9).await;
+    capture_waiting(&planes).await;
+    assert!(
+        waiting["entries"].as_array().unwrap().is_empty(),
+        "{waiting}"
     );
+    assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 1);
     let (tx, _rx) = mpsc::channel(16);
     handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
         .await
@@ -1058,25 +1085,18 @@ async fn capture_scope_ended_during_deposit_preserves_the_observed_result_or_unk
         let planes = attach_consent(tests::capture_planes(&fixture), &consent);
         bind_held(&planes).await;
         assert_held(
-            &decode(exchange(&planes, 9, 3, capture_request("deposit-consent")).await),
+            &decode(exchange(&planes, 9, 3, capture_request("scope-held")).await),
             "consent",
         );
-        consent.feed(json!([answered("deposit-card", "allow")]));
-        let granted = late(&planes, 9).await;
-        decode(
-            exchange(
-                &planes,
-                9,
-                4,
-                json!({"name":"late_results.ack","arguments":{"through":granted["cursor"]}}),
-            )
-            .await,
-        );
         let finalized = planes.capture.expect_journal_finalization();
-        assert_held(
-            &decode(exchange(&planes, 9, 5, capture_request("scope-held")).await),
-            "login_capture",
+        consent.feed(json!([answered("deposit-card", "allow")]));
+        let waiting = late(&planes, 9).await;
+        capture_waiting(&planes).await;
+        assert!(
+            waiting["entries"].as_array().unwrap().is_empty(),
+            "{waiting}"
         );
+        assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 1);
         tokio::time::timeout(HANG_GUARD, async {
             while fixture.vault.calls() == 0 {
                 tokio::task::yield_now().await;
@@ -1520,8 +1540,13 @@ async fn consent_drain_cannot_overtake_the_held_custody_write() {
     );
     drop(release);
     assert_held(&decode(raising.await.unwrap()), "consent");
-    let result = tokio::time::timeout(HANG_GUARD, poll).await.unwrap();
-    assert_eq!(result["entries"][0]["detail"]["consent"], "approved");
+    let _ = tokio::time::timeout(HANG_GUARD, poll).await.unwrap();
+    let result = late_key(&planes, 9, "racing-key").await;
+    assert_eq!(result["entries"][0]["kind"], "result");
+    assert_eq!(
+        result["entries"][0]["result"]["structuredContent"]["outcome"],
+        "granted"
+    );
 }
 
 struct FailingStorage {

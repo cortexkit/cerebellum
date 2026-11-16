@@ -1561,6 +1561,7 @@ async fn a_clean_shutdown_removes_the_marker_and_answers_normally() {
         None,
         planes.user_browser.clone(),
         Arc::clone(&planes.private_content),
+        Arc::clone(&planes.browser_resumes),
     );
     teardown.run_or_join().await;
     assert!(!marker(&scratch).exists());
