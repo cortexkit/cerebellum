@@ -4,6 +4,7 @@ mod classification_golden;
 mod classification_index;
 mod fill;
 mod frames;
+pub(crate) mod native_select;
 mod peers;
 mod scroll;
 mod service;
@@ -1198,6 +1199,25 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             if Some(&actual) != expected {
                 return Err(ClickDriveError::ClassificationChanged);
             }
+            match native_select::target(&nodes, identity, &actual) {
+                Ok(true) => {
+                    return self.choose_native_option(
+                        context_key,
+                        identity,
+                        &attachment,
+                        (epoch, origin, &actual),
+                        deadline,
+                        deadline_ms,
+                        clock,
+                    );
+                }
+                Err(reason) => {
+                    return Err(ClickDriveError::Intercepted(
+                        serde_json::json!({"reason_code":"target_not_interactive","problem":reason}),
+                    ))
+                }
+                Ok(false) => {}
+            }
             let activated = nodes
                 .iter()
                 .find(|node| {
@@ -1603,6 +1623,7 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         // The public point is in the addressed screenshot's coordinate system,
         // even when input used a child renderer's local coordinate system.
         Ok(match outcome {
+            selected @ BrowserClickOutcome::OptionSelected { .. } => selected,
             BrowserClickOutcome::Clicked { navigation, .. } => BrowserClickOutcome::Clicked {
                 position,
                 navigation,
@@ -4488,6 +4509,9 @@ const KEY_EVENT: &str = "Input.dispatchKeyEvent";
 /// Runtime helpers that change selection or the viewport must pass the
 /// dispatch gate even though their command is not in CDP's Input domain.
 fn runtime_function_mutating(function: &str) -> bool {
+    if function == crate::user_browser::functions::CHOOSE_OPTION {
+        return true;
+    }
     [
         ".select()",
         "setSelectionRange",
@@ -5387,6 +5411,8 @@ fn collect_dom_facts(
 
 #[cfg(test)]
 mod large_page_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod native_select_tests;
 #[cfg(test)]
 mod read_loop_tests;
 

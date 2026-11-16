@@ -5,12 +5,14 @@
 pub(super) const SELECT: &str = "function() { if (typeof this.select === 'function') { this.select(); } else { const range = this.ownerDocument.createRange(); range.selectNodeContents(this); const selection = this.ownerDocument.getSelection(); selection.removeAllRanges(); selection.addRange(range); } }";
 pub(super) const APPEND_CARET: &str = "function() { if (typeof this.setSelectionRange === 'function') { const end = this.value.length; this.setSelectionRange(end, end); } else { const range = this.ownerDocument.createRange(); range.selectNodeContents(this); range.collapse(false); const selection = this.ownerDocument.getSelection(); selection.removeAllRanges(); selection.addRange(range); } return true; }";
 pub(super) const HAS_FOCUS: &str = "function() { return this.ownerDocument.hasFocus() && this.getRootNode().activeElement === this; }";
+pub(crate) const CHOOSE_OPTION: &str = "function() { if (!(this instanceof HTMLOptionElement)) { throw new Error('target is not an option'); } const select = this.closest('select'); if (!select) { throw new Error('option has no select'); } const group = this.closest('optgroup'); if (this.disabled || select.disabled || (group && group.disabled)) { throw new Error('option, optgroup or select is disabled'); } this.selected = select.multiple ? !this.selected : true; select.dispatchEvent(new Event('input', {bubbles:true})); select.dispatchEvent(new Event('change', {bubbles:true})); return {value:select.value, selectedIndex:select.selectedIndex}; }";
 
 #[cfg(test)]
-pub(super) const ALL: [(&str, &str); 3] = [
+pub(super) const ALL: [(&str, &str); 4] = [
     ("SELECT", SELECT),
     ("APPEND_CARET", APPEND_CARET),
     ("HAS_FOCUS", HAS_FOCUS),
+    ("CHOOSE_OPTION", CHOOSE_OPTION),
 ];
 
 #[cfg(test)]
@@ -35,6 +37,9 @@ mod tests {
                     "ac62bcd9e6db95e84a42a90a37f286117b8ce6d3b0760ae1d1083c084d96bba7"
                 }
                 "HAS_FOCUS" => "2cd006d8e531e4e1c03b2e4bfebec513fe642134af0ddc6d7fb602ca9c835ffe",
+                "CHOOSE_OPTION" => {
+                    "b324ab559e352cc33aaeed89829c47aff9d34d6a8ef74a9e38c2a44d3a6cf0ff"
+                }
                 _ => unreachable!("fixed function list"),
             };
             assert_eq!(

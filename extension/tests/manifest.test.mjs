@@ -66,10 +66,10 @@ test("the exact admitted CDP subset excludes broader driver commands", () => {
 });
 
 
-test("browser-adapter declarations match all three pins and a one-byte change refuses", async () => {
+test("browser-adapter declarations match all four pins and a one-byte change refuses", async () => {
   const { DECLARATIONS } = await import("./functions-fixture.mjs");
   const protocol = await readFile(new URL("../PROTOCOL.md", import.meta.url), "utf8");
-  const names = ["SELECT", "APPEND_CARET", "HAS_FOCUS"];
+  const names = ["SELECT", "APPEND_CARET", "HAS_FOCUS", "CHOOSE_OPTION"];
   assert.equal(RUNTIME_FUNCTION_SHA256.length, names.length);
   for (const [index, name] of names.entries()) {
     const declaration = DECLARATIONS[name];

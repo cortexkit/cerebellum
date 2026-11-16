@@ -16,6 +16,8 @@ const READ_METHODS = new Set([
 // quad and hit-test queries only observe the page, so they are listed there.
 // Unlisted methods count as mutations. Runtime.callFunctionOn is exempt only
 // for the exact native focus-check function documented as HAS_FOCUS in PROTOCOL.md.
+// CHOOSE_OPTION remains input: like a mouse click, changing selected and firing
+// events requires the interaction epoch recorded by the last page read.
 const INPUT_METHODS = new Set(["Input.dispatchMouseEvent", "Input.dispatchKeyEvent", "Input.insertText", "DOM.focus", "DOM.scrollIntoViewIfNeeded"]);
 
 export function classifyCommand(command) {

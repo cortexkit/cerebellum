@@ -868,6 +868,13 @@ fn execute(
         "https://ungranted.example/secret".into()
     };
     let commands = command["commands"].as_array().unwrap();
+    if state.extension_revision == Some(Some(4))
+        && commands
+            .iter()
+            .any(|command| command["params"]["functionDeclaration"] == functions::CHOOSE_OPTION)
+    {
+        return Err("unsupported_cdp_method".into());
+    }
     if state.moving_child
         && commands
             .iter()
@@ -1143,23 +1150,28 @@ fn execute(
             }
             "Runtime.callFunctionOn" => {
                 let declaration = command["params"]["functionDeclaration"].as_str().unwrap();
-                if declaration == functions::SELECT {
-                    state.typed_selected = true;
-                } else if declaration == functions::APPEND_CARET {
-                    state.typed_selected = false;
-                    state.typed_caret = state.typed_value.len();
-                }
-                let focused = state
-                    .type_focused_backend
-                    .is_none_or(|backend| backend == state.type_resolved_backend);
-                if declaration == functions::HAS_FOCUS {
-                    if state.type_focus_checks_before_mutation > 0 {
-                        state.type_focus_checks_before_mutation -= 1;
-                    } else if let Some(dom) = state.type_dom_after_focus_check.take() {
-                        state.dom_override = Some(dom);
+                if declaration == functions::CHOOSE_OPTION {
+                    state.inputs.push(method.into());
+                    json!({"result":{"value":{"value":"mac","selectedIndex":1}}})
+                } else {
+                    if declaration == functions::SELECT {
+                        state.typed_selected = true;
+                    } else if declaration == functions::APPEND_CARET {
+                        state.typed_selected = false;
+                        state.typed_caret = state.typed_value.len();
                     }
+                    let focused = state
+                        .type_focused_backend
+                        .is_none_or(|backend| backend == state.type_resolved_backend);
+                    if declaration == functions::HAS_FOCUS {
+                        if state.type_focus_checks_before_mutation > 0 {
+                            state.type_focus_checks_before_mutation -= 1;
+                        } else if let Some(dom) = state.type_dom_after_focus_check.take() {
+                            state.dom_override = Some(dom);
+                        }
+                    }
+                    json!({"result":{"value":declaration != functions::HAS_FOCUS || focused}})
                 }
-                json!({"result":{"value":declaration != functions::HAS_FOCUS || focused}})
             }
             "Input.insertText" => {
                 state.inputs.push(method.into());
@@ -3769,6 +3781,7 @@ mod worker;
 mod agent_enforcement;
 mod codemode;
 mod dom_full;
+mod native_select;
 mod observer_wait;
 mod person_check;
 mod type_combobox;
@@ -4838,9 +4851,9 @@ async fn an_old_revision_reply_is_extension_outdated_not_protocol_error() {
     let tab = fixture.claim(1).await;
     // Every field the reply types require is present, so only the revision
     // check can refuse this read.
-    fixture.state.lock().unwrap().extension_revision = Some(Some(EXTENSION_REVISION - 1));
+    fixture.state.lock().unwrap().extension_revision = Some(Some(MINIMUM_EXTENSION_REVISION - 1));
     let (reply, cards) = fixture.snapshot(1, &tab, "allow_30m").await;
-    assert_outdated(&reply, json!(EXTENSION_REVISION - 1));
+    assert_outdated(&reply, json!(MINIMUM_EXTENSION_REVISION - 1));
     assert!(cards.is_empty(), "no site card before a usable read");
     assert!(reply.get("state_text").is_none());
 }

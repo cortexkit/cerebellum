@@ -1701,11 +1701,28 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
         if scope_watch::classify(answer.as_ref(), key.scope_epoch)
             == scope_watch::ScopeVerdict::Ended
         {
-            // A head may end before every route's GOODBYE arrives. Reuse the
-            // existing route release on both sides of the browser bridge;
-            // uncertain scope answers must leave these claims untouched.
-            for route in planes.routes.user_browser_head_routes_under_scope(&key) {
-                planes.user_browser.goodbye(route);
+            // A head may end after its last route closed. Release its retained
+            // bridge alias too, but never let an old epoch's watcher release
+            // claims after the session's scope epoch advances. Uncertain
+            // answers release nothing.
+            let stamp = subc_protocol::scope::ScopeStamp::new(
+                key.owner.clone(),
+                key.scope_ref.clone(),
+                key.scope_epoch,
+                subc_protocol::scope::ScopeKind::Head,
+            );
+            let newer_live_epoch = answer
+                .as_ref()
+                .is_some_and(|answer| answer.status == subc_protocol::scope::ScopeStatus::Live);
+            // A live higher epoch is the same agent session even when its
+            // replacement tools route has not reached this module yet.
+            if !newer_live_epoch && !planes.scopes.is_superseded(&stamp) {
+                if let Some(route) = planes.user_browser.target().end_session(&key) {
+                    planes.user_browser.goodbye(route);
+                }
+                for route in planes.routes.user_browser_head_routes_under_scope(&key) {
+                    planes.user_browser.goodbye(route);
+                }
             }
             let mut conversations = planes.scopes.finish(&key);
             // A route under the scope whose close has not reached this module
@@ -1725,7 +1742,11 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
             .awaiting_execution_sessions()
             .contains(&session);
         let held_waiting = planes.calls.has_pending_scope(&held_scope_identity(&key));
-        if (!browser_open && !consent_waiting && !held_waiting) || planes.routes.carries_scope(&key)
+        if (!browser_open
+            && !consent_waiting
+            && !held_waiting
+            && !planes.user_browser.target().has_session(&key))
+            || planes.routes.carries_scope(&key)
         {
             planes.scopes.finish(&key);
             return;
@@ -4040,14 +4061,16 @@ async fn handle_frame(
         }
         FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
         FrameType::Goodbye => {
-            // Keyed by the closing route itself, not its canonical browser
-            // route. A run or noncanonical head route closing must not release
-            // the head's claims or snapshots; its in-flight calls end through
-            // `cancel_route` below.
-            planes.user_browser.goodbye(user_browser_bridge::Route {
+            // A retained head alias is custody for the session, not for this
+            // transport. Its claims survive; only this route's in-flight calls
+            // end through `cancel_route` below. Isolated routes still release.
+            let closing_route = user_browser_bridge::Route {
                 channel: frame.header.channel,
                 epoch: frame.header.epoch,
-            });
+            };
+            if !planes.user_browser.target().retains_route(closing_route) {
+                planes.user_browser.goodbye(closing_route);
+            }
             // The route's agent is done with the computer: its badge goes now
             // rather than resting on screen until it idles out.
             if let Some(cursor) = planes_cursor(planes) {
