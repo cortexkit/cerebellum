@@ -5,7 +5,7 @@ fn site_card_uses_plain_capability_and_hazard_words() {
     let hazards = BTreeSet::from(HazardClass::ALL);
     for (tier, expected) in [
         (authorization::COMPOSE, "It can open and read pages there and click ordinary buttons and links"),
-        (authorization::MUTATE_REVERSIBLE, "It can open and read pages there and click ordinary buttons and links. It can also make changes on those sites that can be undone afterwards"),
+        (authorization::MUTATE_REVERSIBLE, "It can open and read pages there and click ordinary buttons and links. It can also make changes there that can be undone afterwards"),
         (authorization::MUTATE_DURABLE, "It can open and read pages there and click ordinary buttons and links. It can also submit forms that make lasting changes, such as posting, saving or sending something"),
     ] {
         let card = site_question("https://example.com", tier, &hazards, true);
@@ -15,7 +15,10 @@ fn site_card_uses_plain_capability_and_hazard_words() {
         assert_eq!(facts[2], json!({"label":"Can", "value":expected}));
         assert_eq!(facts[3], json!({"label":"Includes", "value":"submitting sign-in forms; submitting payment forms; submitting forms it can't fully check"}));
         assert_eq!(facts.len(), 4);
-        assert!(facts.iter().all(|fact| !fact["value"].as_str().unwrap().contains("other sites")));
+        assert!(facts.iter().all(|fact| {
+            let value = fact["value"].as_str().unwrap();
+            !value.contains("other sites") && !value.contains("those sites")
+        }));
     }
     let card = site_question(
         "https://example.com",

@@ -2094,8 +2094,11 @@ pub(crate) fn browser_grant_capabilities(tier: u8, beyond_site: bool) -> String 
         MUTATE_DURABLE => text.push_str(
             " It can also submit forms that make lasting changes, such as posting, saving or sending something.",
         ),
-        MUTATE_REVERSIBLE => {
+        MUTATE_REVERSIBLE if beyond_site => {
             text.push_str(" It can also make changes on those sites that can be undone afterwards.")
+        }
+        MUTATE_REVERSIBLE => {
+            text.push_str(" It can also make changes there that can be undone afterwards.")
         }
         _ => {}
     }
