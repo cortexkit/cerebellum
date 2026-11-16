@@ -101,6 +101,9 @@ fn every_published_pin_recomputes_from_its_stored_tool() {
     kept.extend(
         serde_json::from_str::<BTreeMap<String, Value>>(POINTER_MOVE_SCROLL_PUBLISHED).unwrap(),
     );
+    kept.extend(
+        serde_json::from_str::<BTreeMap<String, Value>>(BROWSER_FILTERED_WAIT_PUBLISHED).unwrap(),
+    );
     for (pin, entry) in &kept {
         let tool: ViewTool = serde_json::from_value(entry["tool"].clone()).unwrap();
         assert_eq!(tool.name, SchemaPin::parse(pin).unwrap().tool, "{pin}");
@@ -123,6 +126,25 @@ fn every_published_pin_recomputes_from_its_stored_tool() {
     // Every current catalog definition is still one of the published pins.
     for tool in current_definitions() {
         assert!(kept.contains_key(&pin(&tool)));
+    }
+}
+
+#[test]
+fn filtered_browser_wait_publication_keeps_historical_pins() {
+    assert_eq!(
+        manifest::sha256_hex(BROWSER_FILTERED_WAIT_PUBLISHED.as_bytes()),
+        "c0c11d94cb48675a9a41976f96900880f0bdaafb2f797f88bdab9f8a37203468"
+    );
+    let addition: BTreeMap<String, Value> =
+        serde_json::from_str(BROWSER_FILTERED_WAIT_PUBLISHED).unwrap();
+    assert_eq!(addition.len(), 1);
+    let served = published();
+    for (pin, entry) in addition {
+        assert_eq!(entry["tool"]["name"], "browser_use");
+        assert!(served[&pin].check_pin(&pin).unwrap());
+        assert!(entry["tool"]["input_schema"]["properties"]
+            .get("wait_for_ms")
+            .is_some());
     }
 }
 
@@ -297,7 +319,7 @@ fn row_badges_fit_short_slots_at_phone_width() {
 #[test]
 fn views_validate_requests_and_answer_only_requested_pins() {
     let pins = published().into_keys().collect::<Vec<_>>();
-    assert_eq!(pins.len(), 4);
+    assert_eq!(pins.len(), 5);
     let request = cortexkit_role_tool_provider::views::ViewsRequest::new(vec![
         pins[0].clone(),
         pins[0].clone(),

@@ -17,6 +17,8 @@ const POINTER_FRONTING_PUBLISHED: &str =
     include_str!("../../resources/tool-views/published-v2.json");
 const POINTER_MOVE_SCROLL_PUBLISHED: &str =
     include_str!("../../resources/tool-views/published-v3.json");
+const BROWSER_FILTERED_WAIT_PUBLISHED: &str =
+    include_str!("../../resources/tool-views/published-v4.json");
 const BROWSER_ROW: &str = include_str!("../../resources/tool-views/browser-row.ui");
 const BROWSER_PAGE: &str = include_str!("../../resources/tool-views/browser-page.ui");
 const COMPUTER_ROW: &str = include_str!("../../resources/tool-views/computer-row.ui");
@@ -70,7 +72,11 @@ fn view(pin: &str, entry: &Value) -> ViewManifest {
 fn published() -> BTreeMap<String, ViewManifest> {
     let mut entries: BTreeMap<String, Value> =
         serde_json::from_str(PUBLISHED).expect("published views");
-    for table in [POINTER_FRONTING_PUBLISHED, POINTER_MOVE_SCROLL_PUBLISHED] {
+    for table in [
+        POINTER_FRONTING_PUBLISHED,
+        POINTER_MOVE_SCROLL_PUBLISHED,
+        BROWSER_FILTERED_WAIT_PUBLISHED,
+    ] {
         let addition: BTreeMap<String, Value> =
             serde_json::from_str(table).expect("pointer-fronting published views");
         for (pin, entry) in addition {

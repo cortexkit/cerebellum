@@ -88,11 +88,11 @@
         "uniqueItems": true
       },
       "image_height_px": {
-        "description": "Echoed screenshot dimension; coordinates are meaningful only in the exact frame the model saw. Required for: click_point.",
+        "description": "Echoed screenshot dimension; coordinates use that exact frame. Required for: click_point.",
         "type": "integer"
       },
       "image_width_px": {
-        "description": "Echoed screenshot dimension; coordinates are meaningful only in the exact frame the model saw. Required for: click_point.",
+        "description": "Echoed screenshot dimension; coordinates use that exact frame. Required for: click_point.",
         "type": "integer"
       },
       "intent": {
@@ -105,7 +105,7 @@
       },
       "max_bytes": {
         "default": 5000,
-        "description": "Snapshot: cap on state_text bytes, cutting navigation before main content.",
+        "description": "Page-text byte cap; preserves main content first.",
         "maximum": 262144,
         "minimum": 1,
         "type": "integer"
@@ -143,7 +143,7 @@
       },
       "point": {
         "additionalProperties": false,
-        "description": "Pixel in the echoed screenshot; it is meaningful only with that image's required width and height. Required for: click_point.",
+        "description": "Pixel in that screenshot's exact frame, with its required dimensions. Required for: click_point.",
         "properties": {
           "x": {
             "description": "Horizontal window pixel from the left edge.",
@@ -220,7 +220,7 @@
         "type": "string"
       },
       "tab": {
-        "description": "User tab handle. With browser:user, required on every page action. Own calls never accept tab. Required for: claim_tab.",
+        "description": "User tab handle; required on user page actions, refused on own. Required for: claim_tab.",
         "minLength": 1,
         "type": "string"
       },
@@ -250,8 +250,14 @@
         ],
         "type": "string"
       },
+      "wait_for_ms": {
+        "description": "Snapshot with text_filter or role_filter: wait up to this many ms for a match.",
+        "maximum": 10000,
+        "minimum": 1,
+        "type": "integer"
+      },
       "zoom": {
-        "description": "Snapshot: a printed ref; expands its subtree while it exists on the same page.",
+        "description": "Snapshot: expand a printed ref's subtree on the same page.",
         "type": "string"
       }
     },
@@ -769,6 +775,11 @@
               "none"
             ],
             "type": "string"
+          },
+          "wait_for_ms": {
+            "maximum": 10000,
+            "minimum": 1,
+            "type": "integer"
           },
           "zoom": {
             "type": "string"

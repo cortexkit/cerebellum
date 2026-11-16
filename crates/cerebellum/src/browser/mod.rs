@@ -10,6 +10,7 @@ pub(crate) mod dom_layout;
 mod dom_values;
 pub mod extraction;
 pub mod fill;
+pub(crate) mod filtered_wait;
 pub mod geometry;
 pub mod navigation;
 mod refs;
@@ -739,8 +740,11 @@ fn navigate_reply(tracker: &Tracker, should_settle: bool) -> Value {
     });
     if tracker.download_blocked {
         response["outcome"] = json!("unsupported_download");
+        if let Some(filename) = &tracker.download_suggested_filename {
+            response["suggested_filename"] = json!(filename);
+        }
         response["remedy"] = json!(
-            "the download was blocked; choose an in-page action that does not start a download"
+            "the download was blocked because the agent's own browser does not save files; choose an in-page action that does not start a download"
         );
     } else if should_settle && !loaded {
         response["outcome"] = json!("not_settled");
@@ -858,6 +862,7 @@ pub struct MainFrameResponse {
 pub struct Tracker {
     pub main_frame_network: document_network::DocumentNetwork,
     pub download_blocked: bool,
+    pub download_suggested_filename: Option<String>,
     pub url_final: Option<String>,
     pub main_frame_response: Option<MainFrameResponse>,
     pub lifecycle: Vec<String>,
@@ -2263,6 +2268,34 @@ impl BrowserPlane {
         capability: BrowserCapability,
         args: &Value,
     ) -> Value {
+        let action = if capability == BrowserCapability::Snapshot {
+            "snapshot"
+        } else {
+            "other"
+        };
+        let wait = match filtered_wait::validate(args, action) {
+            Ok(wait) => wait,
+            Err(error) => return self.result(identity, Err(error)).await,
+        };
+        filtered_wait::read(
+            wait,
+            args["max_bytes"].as_u64().map(|n| n as usize),
+            || async {
+                Ok::<_, std::convert::Infallible>(
+                    self.dispatch_once(identity, capability, args).await,
+                )
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn dispatch_once(
+        &self,
+        identity: &RouteIdentity,
+        capability: BrowserCapability,
+        args: &Value,
+    ) -> Value {
         // Route admission is performed by lib.rs. This lane is still required
         // for direct first-party callers because it serializes all CDP operations
         // for a conversation and prevents concurrent invocations from interleaving them.
@@ -2742,8 +2775,13 @@ impl BrowserPlane {
                 })
             }
         };
-        let read_max_bytes = optional_integer(object, "max_bytes", 1, 262_144)?
-            .unwrap_or(DEFAULT_READ_PAGE_MAX_BYTES) as usize;
+        let read_max_bytes = optional_integer(object, "max_bytes", 1, 262_144)?.unwrap_or(
+            if crate::codemode::program() {
+                262_144
+            } else {
+                DEFAULT_READ_PAGE_MAX_BYTES
+            },
+        ) as usize;
         let wait = match object.get("wait") {
             None => crate::browser_session::NavigationWait::Settle,
             Some(Value::String(value)) if value == "settle" => {
@@ -3012,7 +3050,14 @@ impl BrowserPlane {
         let object = self
             .validate_request(
                 args,
-                &["mode", "max_bytes", "zoom", "text_filter", "role_filter"],
+                &[
+                    "mode",
+                    "max_bytes",
+                    "zoom",
+                    "text_filter",
+                    "role_filter",
+                    "wait_for_ms",
+                ],
             )
             .await?;
         let kind = match object.get("mode") {
@@ -3033,8 +3078,13 @@ impl BrowserPlane {
                 })
             }
         };
-        let max_bytes =
-            optional_integer(object, "max_bytes", 1, 262_144)?.unwrap_or(65_536) as usize;
+        let max_bytes = optional_integer(object, "max_bytes", 1, 262_144)?.unwrap_or(
+            if crate::codemode::program() {
+                262_144
+            } else {
+                65_536
+            },
+        ) as usize;
         let zoom = match object.get("zoom") {
             None => None,
             // Zoom selects one element: the default view prints its subtree
@@ -3060,6 +3110,7 @@ impl BrowserPlane {
             }
         };
         let filters = state_text::Filters::parse(object, kind)?;
+        let max_bytes = filtered_wait::text_budget(args, max_bytes);
         self.capture_snapshot(identity, kind, max_bytes, true, zoom.as_deref(), &filters)
             .await
     }
@@ -3614,6 +3665,7 @@ impl BrowserPlane {
             return Ok((json!({"outcome":"ref_not_found", "state_text":text}), 0));
         }
         let mut ax_refs_withheld = false;
+        let mut filter_matched = false;
         let (content, encoded_truncated, schema, prior_cut) = match mode {
             SnapshotKind::Actionable => {
                 let rendered = state_text::render_with_capture_status(
@@ -3632,6 +3684,7 @@ impl BrowserPlane {
                     content_incomplete || refs_truncated,
                 );
                 // A ref stays usable only if the caller was shown it.
+                filter_matched = rendered.filter_matched;
                 refs.retain(|record| rendered.printed_refs.contains(&record.captured.reference));
                 (
                     rendered.text,
@@ -3714,6 +3767,9 @@ impl BrowserPlane {
             prior_cut,
             BrowserContextResult::from_identity(identity).json(),
         );
+        if filters.text.is_some() || !filters.roles.is_empty() {
+            reply[filtered_wait::MATCH_FIELD] = json!(filter_matched);
+        }
         if content_incomplete || refs_truncated {
             reply["remedy"] = json!(state_text::capture_cut_notice(filters));
         } else if encoded_truncated {
@@ -4990,7 +5046,7 @@ fn browser_tool_definitions() -> Vec<BrowserToolDefinition> {
         BrowserToolDefinition {
             name: SNAPSHOT,
             description: "Read the page as plain text in state_text: an outline of its landmarks by default, main content first; zoom names one ref to print that element's whole subtree. Use ax or dom_full only when something is missing.",
-            request_schema: json!({"type":"object","properties":{"mode":{"type":"string","enum":["actionable","ax","dom_full"],"default":"actionable"},"text_filter":{"type":"string","maxLength":4096,"description":"Literal, case-insensitive label/value substring; keeps labelled ancestors. Default mode only."},"role_filter":{"type":"array","items":{"type":"string","minLength":1,"maxLength":128},"minItems":1,"maxItems":16,"description":"Keep matching roles, case-insensitively (button; AXButton also works). Default mode only."},"zoom":{"type":"string","description":"A previously printed ref; prints that element's whole subtree instead of the outline while it exists on the same page. Default mode only."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":65536,"description":"Cap on state_text bytes. When cut, main content is kept before navigation and the last line says what was cut."}},"additionalProperties":false}),
+            request_schema: json!({"type":"object","properties":{"mode":{"type":"string","enum":["actionable","ax","dom_full"],"default":"actionable"},"text_filter":{"type":"string","maxLength":4096,"description":"Literal, case-insensitive label/value substring; keeps labelled ancestors. Default mode only."},"role_filter":{"type":"array","items":{"type":"string","minLength":1,"maxLength":128},"minItems":1,"maxItems":16,"description":"Keep matching roles, case-insensitively (button; AXButton also works). Default mode only."},"wait_for_ms":{"type":"integer","minimum":1,"maximum":10000},"zoom":{"type":"string","description":"A previously printed ref; prints that element's whole subtree instead of the outline while it exists on the same page. Default mode only."},"max_bytes":{"type":"integer","minimum":1,"maximum":262144,"default":65536,"description":"Cap on state_text bytes. When cut, main content is kept before navigation and the last line says what was cut."}},"additionalProperties":false}),
             result_schema: snapshot_result_schema(),
         },
         BrowserToolDefinition {
@@ -5285,6 +5341,7 @@ fn text_snapshot_properties() -> Value {
         "content_schema":string_schema(),
         "truncated":boolean_schema(),
         "refs_truncated":boolean_schema(),
+        "wait":enum_schema(&["matched", "timed_out"]),
         (state_text::STATE_TEXT_FIELD):string_schema(),
     })
 }
@@ -5409,6 +5466,7 @@ fn navigate_result_schema() -> Value {
             "url_final":nullable_string_schema(),
             "lifecycle":navigation_lifecycle_schema(),
             "http_status":integer_schema(),
+            "suggested_filename":string_schema(),
             "challenge":closed_object(json!({"vendor":string_schema(),"evidence":string_schema()}), &["vendor", "evidence"]),
             (state_text::STATE_TEXT_FIELD):string_schema(),
             "read_page":embedded_read_page_schema(),
@@ -5428,6 +5486,7 @@ fn click_result_schema() -> Value {
             "selectedIndex":integer_schema(),
             "navigation":enum_schema(&["none_observed", "same_document", "not_committed", "main_frame"]),
             "navigation_window_ms":integer_schema(),
+            "suggested_filename":string_schema(),
             "activated_element":closed_object(json!({"identity":string_schema(),"kind":string_schema()}), &["identity","kind"]),
             "url_final":nullable_string_schema(),
             "lifecycle":navigation_lifecycle_schema(),
@@ -6127,6 +6186,7 @@ pub(crate) fn user_browser_result_schema(action: &str) -> Value {
                 "connection_epoch":integer_schema(), "interaction_epoch":integer_schema(),
                 "tabs":{"type":"array","items":closed_object(json!({"tab":string_schema(),"claim":enum_schema(&["claimed_by_this_route","unclaimed_handed"]),"interaction_epoch":integer_schema()}), &["tab","claim","interaction_epoch"])},
                 "snapshot_id":string_schema(), "state_text":string_schema(),
+                "wait":enum_schema(&["matched", "timed_out"]),
                 "truncated":boolean_schema(), "refs_truncated":boolean_schema(),
                 "omitted_frames":integer_schema(), "frame_note":string_schema(),
                 "image":closed_object(json!({"mime":string_schema(),"data_b64":string_schema(),"width_px":integer_schema(),"height_px":integer_schema()}), &["mime","data_b64","width_px","height_px"]),
@@ -8876,7 +8936,7 @@ mod tests {
         // branches must never change the bytes agents are shown.
         assert_eq!(
             crate::manifest::sha256_hex(&bytes),
-            "26d4941ed9f8f95aa0d823e45ad8ffc5f9fae85286410d53bf717508a0b2c130"
+            "7492560906aaf5f1c1b03b6af2849ddfd28b449f6bf7a33ad84a43c69a03d647"
         );
     }
 

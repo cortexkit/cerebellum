@@ -1700,9 +1700,13 @@ async fn serve_scoped(
 ) -> Value {
     let mut reply = match validate(action, args) {
         Err(reply) => reply,
-        Ok(()) => serve_inner(planes, facts, writer, request, route, action, args)
-            .await
-            .unwrap_or_else(|reply| reply),
+        Ok(()) => crate::browser::filtered_wait::read(
+            args["wait_for_ms"].as_u64(),
+            args["max_bytes"].as_u64().map(|n| n as usize),
+            || serve_inner(planes, facts, writer, request, route, action, args),
+        )
+        .await
+        .unwrap_or_else(|reply| reply),
     };
     // One browser_use call can contain several detached plans. Preserve popup
     // reports from metadata and refused plans, not only from the last input.
@@ -1767,6 +1771,8 @@ fn note_settlement_once(target: &UserBrowser, reply: &Value) {
 }
 
 fn validate(action: &str, args: &Value) -> Result<(), Value> {
+    crate::browser::filtered_wait::validate(args, action)
+        .map_err(|_| invalid("wait_for_ms", "unsupported_value"))?;
     let object = args
         .as_object()
         .ok_or_else(|| invalid("arguments", "wrong_type"))?;
@@ -3555,7 +3561,15 @@ async fn capture_attempt(
         html.retain(|(frame, _)| !changed.contains(frame));
         omitted_frames = omitted_frames.max(markers.len());
     }
-    let max_bytes = args["max_bytes"].as_u64().unwrap_or(5000).min(262144) as usize;
+    let max_bytes = args["max_bytes"]
+        .as_u64()
+        .unwrap_or(if crate::codemode::program() {
+            262_144
+        } else {
+            5000
+        })
+        .min(262144) as usize;
+    let max_bytes = crate::browser::filtered_wait::text_budget(args, max_bytes);
     let mut filters = Filters {
         text: args["text_filter"].as_str().map(str::to_owned),
         roles: args["role_filter"]
@@ -3593,6 +3607,7 @@ async fn capture_attempt(
         },
         ax_truncated || refs_truncated,
     );
+    let filter_matched = rendered.filter_matched;
     let (text, text_truncated) = if args["mode"] == "dom_full" {
         let mut seen = BTreeSet::new();
         let mut documents = Vec::new();
@@ -3659,6 +3674,9 @@ async fn capture_attempt(
     let truncated = ax_truncated || refs_truncated || text_truncated;
     context.target().retain(id.clone(), snapshot);
     let mut reply = json!({"browser":"user","outcome":"ok","tab":tab,"snapshot_id":id,"connection_epoch":context.connection,"interaction_epoch":document.interaction,"state_text":text,"input_dispatched":false,"truncated":truncated,"refs_truncated":refs_truncated});
+    if filters.text.is_some() || !filters.roles.is_empty() {
+        reply[crate::browser::filtered_wait::MATCH_FIELD] = json!(filter_matched);
+    }
     // A committed document and an unchanged interaction epoch do not establish
     // that Chrome has finished loading its page or accessibility tree.
     reply["settled"] = json!(false);

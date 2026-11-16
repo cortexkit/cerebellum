@@ -825,12 +825,6 @@ pub fn render_ax_text(
         in_field: bool,
     }
     let mut lines: Vec<(String, Option<&str>)> = Vec::new();
-    let notices = crate::browser::state_text::ClassificationNotices::new(records, facts);
-    let mut summary = String::new();
-    notices.append_summary(&mut summary);
-    if !summary.is_empty() {
-        lines.push((format!("{}\n", summary.trim_start()), None));
-    }
     let mut ancestors: Vec<Seen<'_>> = Vec::new();
     // Depths of the ancestors that printed, which set a line's indent.
     let mut printed: Vec<i64> = Vec::new();
@@ -876,9 +870,6 @@ pub fn render_ax_text(
         if let Some(value) = ax_shown_value(record, facts).filter(|value| !value.is_empty()) {
             line.push_str(", Value: ");
             line.push_str(&value);
-        }
-        if let Some(reference) = &record.reference {
-            notices.append_inline(&mut line, reference, facts);
         }
         line.push('\n');
         lines.push((line, record.reference.as_deref()));

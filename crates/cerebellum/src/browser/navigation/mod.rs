@@ -3576,6 +3576,12 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
                         .any(|document| document.frame_id == frame)
             }) {
                 tracker.download_blocked = true;
+                tracker.download_suggested_filename = event
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("suggestedFilename"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 tracker.token("download_blocked");
             }
             return;

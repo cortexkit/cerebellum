@@ -112,9 +112,8 @@ pub struct NodeFacts {
     /// just as `Some(true)` does: a value is printed only when the page's own
     /// markup shows the field is neither.
     pub credential: Option<bool>,
-    /// Why the ref has no captured input classification. Shared failures print
-    /// once; a different failure prints beside its ref so a filtered match does
-    /// not imply that input classification was captured.
+    /// Why the ref has no captured input classification. Click and typing
+    /// refusals name this reason; page reads omit classification notices.
     pub classification_unavailable: Option<&'static str>,
     /// The field's placeholder text, which is a hint and never the value.
     pub placeholder: Option<String>,
@@ -138,72 +137,6 @@ pub struct NodeFacts {
 /// element. A row is a few texts in a few wrappers, so the innermost sixteen
 /// hold any row a filter can print; a longer chain is cut at this many.
 pub const MAX_IGNORED_ANCESTORS: usize = 16;
-
-pub(crate) fn append_classification_notice(
-    text: &mut String,
-    reference: &str,
-    facts: &HashMap<String, NodeFacts>,
-) {
-    if let Some(reason) = facts
-        .get(reference)
-        .and_then(|facts| facts.classification_unavailable)
-    {
-        text.push_str(&format!(
-            " [{reference} classification unavailable: {reason}]"
-        ));
-    }
-}
-
-/// A repeated failure is capture metadata, not part of every element's label.
-/// Count captured identities, not occurrences in joined rows or zoom headers.
-#[derive(Default)]
-pub(crate) struct ClassificationNotices {
-    shared: Option<(&'static str, usize)>,
-}
-
-impl ClassificationNotices {
-    pub(crate) fn new(records: &[AxRecord], facts: &HashMap<String, NodeFacts>) -> Self {
-        let mut counts = std::collections::BTreeMap::new();
-        let references = records
-            .iter()
-            .filter_map(|r| r.reference.as_deref())
-            .collect::<BTreeSet<_>>();
-        for reference in references {
-            if let Some(reason) = facts
-                .get(reference)
-                .and_then(|f| f.classification_unavailable)
-            {
-                *counts.entry(reason).or_insert(0) += 1;
-            }
-        }
-        Self {
-            shared: counts
-                .into_iter()
-                .filter(|(_, count)| *count > 1)
-                .max_by_key(|(_, count)| *count),
-        }
-    }
-
-    pub(crate) fn append_summary(&self, text: &mut String) {
-        if let Some((reason, count)) = self.shared {
-            text.push_str(&format!("\nClassification unavailable for {count} captured refs: {reason}; clicks and typing on them will refuse until a snapshot captures their classification."));
-        }
-    }
-
-    pub(crate) fn append_inline(
-        &self,
-        text: &mut String,
-        reference: &str,
-        facts: &HashMap<String, NodeFacts>,
-    ) {
-        let reason = facts
-            .get(reference)
-            .and_then(|f| f.classification_unavailable);
-        if reason.is_some() && reason != self.shared.map(|(reason, _)| reason) {
-            append_classification_notice(text, reference, facts);
-        }
-    }
-}
 
 pub(crate) const BYTE_CUT_NOTICE: &str = "This snapshot is partial: max_bytes cut the rendered text. Zoom into a container ref or raise max_bytes before assuming absent controls are unavailable.";
 
@@ -320,6 +253,8 @@ impl Filters {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedState {
     pub text: String,
+    /// A captured element matched the filters, before the output byte cap.
+    pub filter_matched: bool,
     /// Every ref the text names. These, and only these, stay usable for a
     /// click or a zoom on this snapshot.
     pub printed_refs: BTreeSet<String>,
@@ -339,6 +274,14 @@ pub fn render(input: &RenderInput<'_>) -> RenderedState {
 pub fn render_with_capture_status(
     input: &RenderInput<'_>,
     capture_incomplete: bool,
+) -> RenderedState {
+    render_with_presentation(input, capture_incomplete, crate::codemode::program())
+}
+
+fn render_with_presentation(
+    input: &RenderInput<'_>,
+    capture_incomplete: bool,
+    unfolded: bool,
 ) -> RenderedState {
     let tree = Tree::build(input.records, input.facts);
     let mut header = String::new();
@@ -363,8 +306,6 @@ pub fn render_with_capture_status(
                 match tree.reference(target) {
                     Some(reference) => {
                         header.push_str(reference);
-                        tree.notices
-                            .append_inline(&mut header, reference, input.facts);
                         header_refs.push(reference.to_string());
                     }
                     None => header.push_str(zoom.requested),
@@ -396,9 +337,17 @@ pub fn render_with_capture_status(
             tree.filtered_lines(0, 0, input.filters, &mut lines);
             lines
         }
+        None if unfolded => {
+            let mut lines = Vec::new();
+            let mut entries = tree.entries(&tree.kids[0]);
+            entries.sort_by_key(|entry| tree.class[*entry]);
+            for entry in entries {
+                tree.full_lines(entry, 0, &mut lines);
+            }
+            lines
+        }
         None => tree.outline_lines(),
     };
-    tree.notices.append_summary(&mut header);
     if capture_incomplete {
         header.push('\n');
         header.push_str(&capture_cut_notice(input.filters));
@@ -421,11 +370,14 @@ pub fn render_with_capture_status(
         header.push('\n');
         header.push_str(&one_line(&notice.name));
     }
-    if input.zoom.is_none() && !input.filters.narrows() {
+    let filter_matched = input.filters.narrows() && !lines.is_empty();
+    let mut rendered = if !unfolded && input.zoom.is_none() && !input.filters.narrows() {
         fit_outline(header, lines, &tree, input.max_bytes)
     } else {
         fit(header, header_refs, lines, &tree, input.max_bytes)
-    }
+    };
+    rendered.filter_matched = filter_matched;
+    rendered
 }
 
 /// Neighbours are numeric ref neighbours, not DOM siblings. Callers pass only
@@ -715,7 +667,6 @@ struct Tree<'a> {
     kids: Vec<Vec<usize>>,
     by_ref: HashMap<&'a str, usize>,
     facts: &'a HashMap<String, NodeFacts>,
-    notices: ClassificationNotices,
     class: Vec<u8>,
     has_landmark_below: Vec<bool>,
     section: Vec<Option<usize>>,
@@ -778,7 +729,6 @@ impl<'a> Tree<'a> {
             kids: Vec::new(),
             by_ref,
             facts,
-            notices: ClassificationNotices::new(records, facts),
             class: Vec::new(),
             has_landmark_below: Vec::new(),
             section: Vec::new(),
@@ -1060,10 +1010,7 @@ impl<'a> Tree<'a> {
         }
     }
 
-    fn line(&self, node: usize, depth: usize, mut text: String) -> Line {
-        if let Some(reference) = self.reference(node) {
-            self.notices.append_inline(&mut text, reference, self.facts);
-        }
+    fn line(&self, node: usize, depth: usize, text: String) -> Line {
         Line {
             depth,
             text,
@@ -1622,7 +1569,6 @@ impl<'a> Tree<'a> {
         if let Some(reference) = self.reference(owner) {
             text.push_str("; zoom ");
             text.push_str(reference);
-            self.notices.append_inline(&mut text, reference, self.facts);
             refs.push(reference.to_string());
         }
         let sizes: Vec<_> = members
@@ -1751,7 +1697,6 @@ impl<'a> Tree<'a> {
             if let Some(reference) = self.reference(owner) {
                 text.push_str("; zoom ");
                 text.push_str(reference);
-                self.notices.append_inline(&mut text, reference, self.facts);
                 refs.push(reference.to_string());
             }
             out.push(Line {
@@ -1922,6 +1867,7 @@ fn fit_outline(
                 printed_refs.clear();
             }
             return RenderedState {
+                filter_matched: false,
                 text,
                 printed_refs,
                 cut_bytes: lines
@@ -2006,6 +1952,7 @@ fn fit(
         cut_bytes = header_bytes + lines.iter().map(Line::bytes).sum::<usize>();
     }
     RenderedState {
+        filter_matched: false,
         text,
         printed_refs,
         cut_bytes,
@@ -2112,6 +2059,48 @@ fn cut_report(lines: &[Line], keep: &[bool], tree: &Tree<'_>, max_bytes: usize) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn program_reads_unfold_but_keep_masking_and_byte_cut_disclosure() {
+        let mut records = vec![record(0, "RootWebArea", "Page", Some("e1"))];
+        for i in 2..80 {
+            records.push(record(
+                1,
+                "button",
+                &format!("Item {i}"),
+                Some(&format!("e{i}")),
+            ));
+        }
+        let mut field = record(1, "textbox", "Secret", Some("e80"));
+        field.value = Some("must never print".into());
+        records.push(field);
+        let facts = HashMap::new();
+        let filters = Filters::default();
+        let mut input = RenderInput {
+            records: &records,
+            facts: &facts,
+            filters: &filters,
+            page_url: "https://example.com",
+            snapshot_id: "s1",
+            zoom: None,
+            max_bytes: 262_144,
+        };
+        let direct = render_with_presentation(&input, false, false);
+        assert!(direct.text.contains("more"), "{}", direct.text);
+        let program = render_with_presentation(&input, false, true);
+        assert!(!program.text.contains("more lines"), "{}", program.text);
+        assert!(
+            program.text.contains("e79 button Item 79"),
+            "{}",
+            program.text
+        );
+        assert!(!program.text.contains("must never print"));
+        input.max_bytes = 240;
+        let cut = render_with_presentation(&input, false, true);
+        assert!(cut.text.len() <= 240);
+        assert!(cut.cut_lines > 0);
+        assert!(cut.text.contains("max_bytes"), "{}", cut.text);
+    }
+
     use super::*;
 
     #[test]
@@ -2179,7 +2168,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_classification_failures_print_once_and_keep_exceptions() {
+    fn classification_failures_do_not_add_read_noise() {
         let records = vec![
             record(0, "RootWebArea", "Thread", Some("e1")),
             record(1, "region", "Comments", Some("e2")),
@@ -2217,26 +2206,18 @@ mod tests {
             filters: &Filters::default(),
             max_bytes: 30_000,
         });
-        assert_eq!(
-            rendered.text.matches("dom_read_failed").count(),
-            1,
+        assert!(
+            !rendered.text.contains("classification unavailable"),
             "{}",
             rendered.text
         );
         assert!(
-            rendered.text.contains("Classification unavailable for"),
+            !rendered.text.contains("Classification unavailable"),
             "{}",
             rendered.text
         );
         assert!(
-            rendered.text.contains("clicks and typing"),
-            "{}",
-            rendered.text
-        );
-        assert!(
-            rendered
-                .text
-                .contains("[e5 classification unavailable: target_not_in_document]"),
+            !rendered.text.contains("dom_read_failed"),
             "{}",
             rendered.text
         );
@@ -2325,7 +2306,7 @@ mod tests {
     }
 
     #[test]
-    fn classification_notices_survive_filtered_rows_and_byte_cuts() {
+    fn filtered_and_ax_reads_omit_classification_noise() {
         let records = vec![
             record(0, "RootWebArea", "Page", Some("e1")),
             record(1, "generic", "", Some("e2")),
@@ -2370,31 +2351,16 @@ mod tests {
                 if max_bytes == 1024 {
                     assert!(!rendered.printed_refs.is_empty());
                 }
-                for reference in rendered.printed_refs {
-                    assert!(
-                        rendered.text.contains(&format!(
-                            "[{reference} classification unavailable: dom_read_failed]"
-                        )) || rendered.text.contains(
-                            "Classification unavailable for 6 captured refs: dom_read_failed"
-                        ),
-                        "{}",
-                        rendered.text
-                    );
-                }
+                assert!(
+                    !rendered.text.contains("dom_read_failed"),
+                    "{}",
+                    rendered.text
+                );
             }
         }
         let ax = crate::snapshot_store::render_ax_text(&records, &facts, 1024).unwrap();
-        for reference in ax.printed_refs {
-            assert!(
-                ax.text.contains(&format!(
-                    "[{reference} classification unavailable: dom_read_failed]"
-                )) || ax
-                    .text
-                    .contains("Classification unavailable for 6 captured refs: dom_read_failed"),
-                "{}",
-                ax.text
-            );
-        }
+        assert!(!ax.printed_refs.is_empty());
+        assert!(!ax.text.contains("dom_read_failed"), "{}", ax.text);
     }
 
     #[test]
