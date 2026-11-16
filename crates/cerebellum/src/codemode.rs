@@ -79,8 +79,15 @@ impl Drop for RunCall {
 }
 
 tokio::task_local! {
+    pub(crate) static CALL_MODE: subc_protocol::call_mode::CallMode;
     pub(crate) static CALL_DETAIL: RefCell<Option<Value>>;
     pub(crate) static CALL_RECORDS: Arc<crate::journal::call_records::CallRecords>;
+}
+
+pub(crate) fn program() -> bool {
+    CALL_MODE
+        .try_with(|mode| *mode == subc_protocol::call_mode::CallMode::Codemode)
+        .unwrap_or(false)
 }
 
 pub(crate) fn active() -> bool {

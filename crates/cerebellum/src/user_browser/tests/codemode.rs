@@ -16,6 +16,58 @@ const HEAD: Route = Route {
     epoch: 1,
 };
 
+#[tokio::test]
+async fn program_page_reads_unfold_with_large_default_and_explicit_lower_cap() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.top_level_only = true;
+        let ids: Vec<_> = (0..800).map(|i| format!("item-{i}")).collect();
+        let mut nodes = vec![
+            json!({"nodeId":"root","ignored":false,"role":{"value":"RootWebArea"},"name":{"value":"Many items"},"backendDOMNodeId":1,"frameId":"main","childIds":ids}),
+        ];
+        nodes.extend((0..800).map(|i| json!({"nodeId":format!("item-{i}"),"ignored":false,"role":{"value":"button"},"name":{"value":format!("Item {i} {}", "label ".repeat(20))},"backendDOMNodeId":100+i})));
+        state.ax_override = Some(json!({"nodes":nodes}));
+    }
+    let (direct, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert!(
+        direct["state_text"].as_str().unwrap().contains("more"),
+        "{direct}"
+    );
+    bind_run(&fixture, false).await;
+    for action in ["snapshot", "navigate"] {
+        let mut args = snapshot_args(&tab);
+        if action == "navigate" {
+            args = json!({"browser":"user","action":"navigate","tab":tab,"url":"https://example.com/go","intent":"read page","severity":{"tier":1,"credential":false,"financial":false},"read_page":true});
+        }
+        for max_bytes in [None, Some(7000)] {
+            let mut args = args.clone();
+            if let Some(max_bytes) = max_bytes {
+                args["max_bytes"] = json!(max_bytes);
+            }
+            let wire = fixture.finish(start_run(&fixture, args, None)).await;
+            let reply = structured(&wire);
+            assert_eq!(reply["outcome"], "ok", "{wire}");
+            let page = if action == "navigate" {
+                &reply["read_page"]
+            } else {
+                reply
+            };
+            let text = page["state_text"].as_str().unwrap();
+            assert!(!text.contains("more lines"), "{page}");
+            if let Some(max_bytes) = max_bytes {
+                assert!(text.len() <= max_bytes);
+                assert!(text.contains("max_bytes"), "{page}");
+            } else {
+                assert!(text.len() > 65_536, "only {} bytes", text.len());
+                assert!(text.contains("Item 799"));
+                assert!(text.len() <= 262_144);
+            }
+        }
+    }
+}
+
 fn core() -> subc_protocol::Principal {
     subc_protocol::Principal::Reserved {
         module_id: "prefrontal-core".into(),

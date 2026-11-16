@@ -176,6 +176,7 @@ struct DoubleState {
     untyped_button: bool,
     submit_button: bool,
     ax_override: Option<Value>,
+    ax_script: std::collections::VecDeque<Value>,
     dom_override: Option<Value>,
     outer_html: BTreeMap<(String, u64), String>,
     top_level_only: bool,
@@ -1022,7 +1023,11 @@ fn execute(
                         {"nodeId":"pair-button","ignored":false,"role":{"value":"button"},"name":{"value":format!("{} button", command["frame_id"].as_str().unwrap())},"backendDOMNodeId":3}
                     ]})
                 } else {
-                    let mut ax = state.ax_override.clone().unwrap_or_else(ax);
+                    let mut ax = state
+                        .ax_script
+                        .pop_front()
+                        .or_else(|| state.ax_override.clone())
+                        .unwrap_or_else(ax);
                     // A page with no child documents normally has no iframe
                     // element. Retain that element to simulate a child missing
                     // from discovery but still visible in the parent's AX tree.
@@ -2049,7 +2054,7 @@ async fn filtered_partial_capture_discloses_unsearched_content_in_user_browser()
 }
 
 #[tokio::test]
-async fn shared_classification_failure_prints_once_in_user_browser() {
+async fn classification_failure_is_quiet_until_input_uses_the_ref() {
     let fixture = Fixture::new();
     let tab = fixture.claim(1).await;
     {
@@ -2060,15 +2065,62 @@ async fn shared_classification_failure_prints_once_in_user_browser() {
     let (snapshot, _) = fixture.snapshot(1, &tab, "allow_30m").await;
     assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
     let text = snapshot["state_text"].as_str().unwrap();
-    assert_eq!(
-        text.matches("target_not_in_document").count(),
-        1,
-        "{snapshot}"
+    assert!(!text.contains("classification unavailable"), "{snapshot}");
+    assert!(!text.contains("Classification unavailable"), "{snapshot}");
+    let (reply, _) = fixture
+        .call(
+            1,
+            click(&tab, &snapshot, &reference(&snapshot, "Go")),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(reply["reason"], "classification_unavailable", "{reply}");
+    assert!(
+        reply["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("target_not_in_document"),
+        "{reply}"
     );
     assert!(
-        text.contains("Classification unavailable for") && text.contains("clicks and typing"),
-        "{snapshot}"
+        reply["remedy"].as_str().unwrap().contains("snapshot"),
+        "{reply}"
     );
+    assert!(fixture.state.lock().unwrap().inputs.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn filtered_user_read_waits_for_scripted_page_and_reports_timeout() {
+    let fixture = Fixture::new();
+    let tab = fixture.claim(1).await;
+    fixture.state.lock().unwrap().top_level_only = true;
+    let (initial, _) = fixture.snapshot(1, &tab, "allow_30m").await;
+    assert_eq!(initial["outcome"], "ok", "{initial}");
+    let mut ready = ax();
+    ready["nodes"][1]["name"]["value"] = json!("Ready");
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.ax_script = [ax(), ready].into();
+        state.captures.clear();
+    }
+    let (matched, _) = fixture.call(1, json!({"browser":"user","action":"snapshot","tab":tab,"text_filter":"Ready","wait_for_ms":1000,"max_bytes":400}), "allow_30m").await;
+    assert_eq!(matched["wait"], "matched", "{matched}");
+    assert!(matched["state_text"].as_str().unwrap().contains("Ready"));
+    assert!(matched["state_text"]
+        .as_str()
+        .unwrap()
+        .starts_with("wait: matched\n"));
+    assert!(matched["state_text"].as_str().unwrap().len() <= 400);
+    assert_eq!(fixture.state.lock().unwrap().captures.len(), 2);
+    let (timed_out, _) = fixture.call(1, json!({"browser":"user","action":"snapshot","tab":tab,"role_filter":["missing-role"],"wait_for_ms":300}), "allow_30m").await;
+    assert_eq!(timed_out["wait"], "timed_out", "{timed_out}");
+    assert!(timed_out["state_text"]
+        .as_str()
+        .unwrap()
+        .starts_with("wait: timed_out\n"));
+    assert!(timed_out
+        .get(crate::browser::filtered_wait::MATCH_FIELD)
+        .is_none());
 }
 
 #[tokio::test]

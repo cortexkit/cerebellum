@@ -562,14 +562,15 @@ pub fn browser_tool(admitted: &[String]) -> Option<Tool> {
             let description = match output_name {
                 "url" => Some("URL to navigate to."),
                 "wait" => Some("settle waits for stability; none returns now. browser:user refuses settle: settlement isn't observed."),
+                "wait_for_ms" => Some("Snapshot with text_filter or role_filter: wait up to this many ms for a match."),
                 "ref" => Some("Element reference returned by the named snapshot."),
                 "snapshot_id" => Some("Snapshot identifier that prevents acting on stale page data."),
-                "image_width_px" | "image_height_px" => Some("Echoed screenshot dimension; coordinates are meaningful only in the exact frame the model saw."),
+                "image_width_px" | "image_height_px" => Some("Echoed screenshot dimension; coordinates use that exact frame."),
                 "intent" => Some("Short reason for the action, for policy and audit."),
                 "severity" => Some("Declared interaction severity for authorization checks."),
-                "max_bytes" => Some("Snapshot: cap on state_text bytes, cutting navigation before main content."),
+                "max_bytes" => Some("Page-text byte cap; preserves main content first."),
                 "mode" => Some("Snapshot: actionable (default; outline or zoom), ax or dom_full."),
-                "zoom" => Some("Snapshot: a printed ref; expands its subtree while it exists on the same page."),
+                "zoom" => Some("Snapshot: expand a printed ref's subtree on the same page."),
                 "browser_session_id" => Some("Own-only session id from launch; user close takes none."),
                 _ => None,
             };
@@ -620,11 +621,11 @@ pub fn browser_tool(admitted: &[String]) -> Option<Tool> {
     );
     properties.insert(
         "tab".into(),
-        json!({"type":"string","minLength":1,"description":"User tab handle. With browser:user, required on every page action. Own calls never accept tab."}),
+        json!({"type":"string","minLength":1,"description":"User tab handle; required on user page actions, refused on own."}),
     );
     properties.insert(
         "point".into(),
-        point_schema("Pixel in the echoed screenshot; it is meaningful only with that image's required width and height."),
+        point_schema("Pixel in that screenshot's exact frame, with its required dimensions."),
     );
     annotate_required_actions(&mut properties, &requirements);
     properties.insert(

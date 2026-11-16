@@ -4538,7 +4538,10 @@ async fn handle_route_request(
                     cursor_session,
                     codemode::CALL_DETAIL.scope(
                         std::cell::RefCell::new(detail),
-                        dispatch_resolved_route(frame, writer, planes, &facts),
+                        codemode::CALL_MODE.scope(
+                            facts.call_mode.clone(),
+                            dispatch_resolved_route(frame, writer, planes, &facts),
+                        ),
                     ),
                 ),
             ),
