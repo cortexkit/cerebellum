@@ -3929,7 +3929,6 @@ impl Clone for Planes {
     }
 }
 
-/// Returns `Ok(false)` to stop the loop (graceful goodbye / EOF).
 /// Hand a channel-0 response or error to the control request of this module's
 /// that is waiting for it: operator confirmation, a claim mint or a scope query.
 /// Returns whether one was waiting; an answer nobody waits for is dropped.
@@ -3949,6 +3948,7 @@ fn deliver_control_reply(frame: &Frame, planes: &Planes) -> bool {
     planes.scopes.control.deliver(frame.header.corr, answer)
 }
 
+/// Returns `Ok(false)` to stop the loop (graceful goodbye / EOF).
 async fn handle_frame(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
