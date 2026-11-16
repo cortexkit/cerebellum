@@ -12,7 +12,7 @@
     },
     {
       "label": "Storage",
-      "value": "Your login is stored in the vault for insula; the sign-in window is deleted afterwards"
+      "value": "Your CortexKit login store."
     },
     {
       "label": "Other browsers",
@@ -35,7 +35,7 @@
       "label": "Don't allow"
     }
   ],
-  "prompt": "insula will hold a copy of your ollama.com login.",
+  "prompt": "Save your ollama.com login for the agent?",
   "requester_ref": "pf:card-golden",
   "scope": {
     "account": "work",
@@ -45,6 +45,6 @@
     "kind": "site",
     "label": "ollama.com"
   },
-  "title": "Save your ollama.com login?",
+  "title": "Save a login",
   "urgency": "high"
 }

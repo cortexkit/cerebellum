@@ -1743,10 +1743,10 @@ async fn per_site_ask_is_required_and_thirty_minute_approval_is_reused() {
             "the site row should authorize the second read"
         );
         if let Some(card) = cards.first() {
-            assert!(card["prompt"]
-                .as_str()
-                .unwrap()
-                .contains("your own Chrome, signed in as you"));
+            assert!(card["facts"].as_array().unwrap().contains(&json!({
+                "label": "Browser",
+                "value": "Your own Chrome, signed in as you"
+            })));
             assert!(card["options"]
                 .as_array()
                 .unwrap()

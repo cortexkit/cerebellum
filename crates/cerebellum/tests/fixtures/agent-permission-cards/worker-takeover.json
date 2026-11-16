@@ -1,7 +1,16 @@
 {
   "default": "deny",
   "expires_in_ms": 300000,
-  "facts": [],
+  "facts": [
+    {
+      "label": "Covers",
+      "value": "Bringing apps to the front, typing into them and moving your real pointer, in any app on the screen."
+    },
+    {
+      "label": "To stop",
+      "value": "Touch your mouse or keyboard."
+    }
+  ],
   "kind": "consent",
   "late_execution": "execute",
   "material_damage": true,
@@ -25,7 +34,7 @@
       "label": "Don't allow"
     }
   ],
-  "prompt": "Takeover lets the agent bring apps to the front, type into them, and move your real mouse pointer. It can reach every application on the screen. Touch your mouse or keyboard to stop it.",
+  "prompt": "Let the agent control your mouse and keyboard?",
   "requester_ref": "pf:card-golden",
   "scope": {
     "takeover": "machine"
@@ -34,6 +43,6 @@
     "kind": "machine",
     "label": "your mouse and keyboard"
   },
-  "title": "Allow control of your mouse and keyboard?",
+  "title": "Allow mouse and keyboard control",
   "urgency": "high"
 }

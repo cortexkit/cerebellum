@@ -539,11 +539,10 @@ pub(crate) fn import_question(origin: &str, host: &str, presence: &[BrowserPrese
         })
         .collect();
     facts.push(Fact::new("Privacy", "No cookie value is read by the agent"));
+    facts.push(Fact::new("From", "A browser on this computer."));
     ConsentCard {
-        title: format!("Copy your {host} login?"),
-        prompt: format!(
-            "Copy your {host} login from a browser on this computer into the agent's browser."
-        ),
+        title: "Copy a login".into(),
+        prompt: format!("Copy your {host} login into the agent's browser?"),
         target: Target {
             kind: TargetKind::Site,
             label: host.to_string(),

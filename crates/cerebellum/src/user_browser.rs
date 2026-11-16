@@ -1050,8 +1050,8 @@ pub(crate) fn site_question_with_choices(
         })
         .collect();
     ConsentCard {
-        title: format!("Allow access to {origin}?"),
-        prompt: "Let the agent use your own Chrome, signed in as you, on this site?".into(),
+        title: "Allow access in your Chrome".into(),
+        prompt: format!("Let the agent use {origin} in your Chrome?"),
         target: Target {
             kind: TargetKind::Site,
             label: origin.into(),

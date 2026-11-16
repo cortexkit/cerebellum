@@ -2245,26 +2245,39 @@ pub(crate) fn question_body(
     use crate::consent_card::*;
     let (title, prompt, target, deadline) = match need {
         GrantNeed::App { display_name, .. } => (
+            "Allow app control".to_string(),
             format!("Allow access to {display_name}?"),
-            if signature_changed {
-                "This application's code signature has changed since it was approved. Covers reading and acting inside this application.".to_string()
-            } else {
-                "Covers reading and acting inside this application.".to_string()
+            Target {
+                kind: TargetKind::App,
+                label: display_name.clone(),
             },
-            Target { kind: TargetKind::App, label: display_name.clone() }, APP_QUESTION_DEADLINE,
+            APP_QUESTION_DEADLINE,
         ),
         GrantNeed::Takeover => (
-            "Allow control of your mouse and keyboard?".to_string(),
-            "Takeover lets the agent bring apps to the front, type into them, and move your real mouse pointer. It can reach every application on the screen. Touch your mouse or keyboard to stop it.".to_string(),
-            Target { kind: TargetKind::Machine, label: "your mouse and keyboard".into() }, TAKEOVER_QUESTION_DEADLINE,
+            "Allow mouse and keyboard control".to_string(),
+            "Let the agent control your mouse and keyboard?".to_string(),
+            Target {
+                kind: TargetKind::Machine,
+                label: "your mouse and keyboard".into(),
+            },
+            TAKEOVER_QUESTION_DEADLINE,
         ),
     };
     let grants = cards::render_options(need, offered);
-    let facts = if signature_changed {
+    let mut facts = if signature_changed {
         vec![Fact::new("Application changed", "This application's code signature has changed since it was approved, so it may not be the application you approved")]
     } else {
         vec![]
     };
+    match need {
+        GrantNeed::App { .. } => {
+            facts.push(Fact::new("Covers", "Reading and acting inside this app."));
+        }
+        GrantNeed::Takeover => {
+            facts.push(Fact::new("Covers", "Bringing apps to the front, typing into them and moving your real pointer, in any app on the screen."));
+            facts.push(Fact::new("To stop", "Touch your mouse or keyboard."));
+        }
+    }
     ConsentCard {
         title,
         prompt,

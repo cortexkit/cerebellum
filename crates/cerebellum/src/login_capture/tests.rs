@@ -703,7 +703,7 @@ async fn only_an_affirmative_answer_proceeds() {
 }
 
 #[test]
-fn the_question_names_the_holder_site_account_and_the_vault() {
+fn the_question_names_the_site_account_and_login_store() {
     let question = consent_question(&ollama());
     crate::consent_card::assert_contract(&question, &["allow", "deny"], "deny");
     // Only the params are rendered: the id the deposit later names as its
@@ -711,7 +711,7 @@ fn the_question_names_the_holder_site_account_and_the_vault() {
     assert!(question.get("id").is_none(), "{question}");
     assert_eq!(
         question["params"]["prompt"],
-        "insula will hold a copy of your ollama.com login."
+        "Save your ollama.com login for the agent?"
     );
     assert_eq!(question["params"]["urgency"], "high");
     assert_eq!(
@@ -721,12 +721,16 @@ fn the_question_names_the_holder_site_account_and_the_vault() {
     let facts = &question["params"]["facts"];
     assert_eq!(facts[0], json!({"label": "Account", "value": "work"}));
     let text = facts.to_string();
-    assert!(text.contains("stored in the vault for insula"), "{text}");
+    assert_eq!(
+        facts[2],
+        json!({"label": "Storage", "value": "Your CortexKit login store."})
+    );
     assert!(
         text.contains("Some sites allow one sign-in at a time; signing in here may sign you out of this site in your other browsers."),
         "{text}"
     );
     assert!(!text.contains("ck auth"), "{text}");
+    assert!(!question.to_string().contains("insula"), "{question}");
 }
 
 /// The deposit names the card the person approved by the id Cingulate raised

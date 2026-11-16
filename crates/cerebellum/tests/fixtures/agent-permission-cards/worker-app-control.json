@@ -1,7 +1,12 @@
 {
   "default": "deny",
   "expires_in_ms": 1800000,
-  "facts": [],
+  "facts": [
+    {
+      "label": "Covers",
+      "value": "Reading and acting inside this app."
+    }
+  ],
   "kind": "consent",
   "late_execution": "execute",
   "material_damage": true,
@@ -25,7 +30,7 @@
       "label": "Don't allow"
     }
   ],
-  "prompt": "Covers reading and acting inside this application.",
+  "prompt": "Allow access to Editor?",
   "requester_ref": "pf:card-golden",
   "scope": {
     "app": "com.example.Editor",
@@ -35,6 +40,6 @@
     "kind": "app",
     "label": "Editor"
   },
-  "title": "Allow access to Editor?",
+  "title": "Allow app control",
   "urgency": "high"
 }

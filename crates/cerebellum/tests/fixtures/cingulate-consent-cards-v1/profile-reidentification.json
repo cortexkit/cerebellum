@@ -31,7 +31,7 @@
       "label": "Don't allow"
     }
   ],
-  "prompt": "Re-identify the agent's browser profiles at their current location.",
+  "prompt": "Let the agent use its browser profiles at their new location?",
   "requester_ref": "pf:card-golden",
   "scope": {
     "generation": 7,
@@ -51,6 +51,6 @@
     "kind": "machine",
     "label": "the agent's browser profiles"
   },
-  "title": "Re-identify browser profiles?",
+  "title": "Browser profiles moved",
   "urgency": "normal"
 }

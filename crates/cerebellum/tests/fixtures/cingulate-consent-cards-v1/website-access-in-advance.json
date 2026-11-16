@@ -46,7 +46,7 @@
       "label": "Don't allow"
     }
   ],
-  "prompt": "Let the agent use its own browser on example.com to read pages and click, including actions that make lasting changes.",
+  "prompt": "Let the agent use example.com in its own browser?",
   "requester_ref": "pf:card-golden",
   "scope": {
     "hazards": [
@@ -61,6 +61,6 @@
     "kind": "site",
     "label": "example.com"
   },
-  "title": "Allow access to example.com?",
+  "title": "Allow browser access",
   "urgency": "normal"
 }

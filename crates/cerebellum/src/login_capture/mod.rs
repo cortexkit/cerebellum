@@ -51,17 +51,13 @@ pub mod secret_use;
 pub mod vault;
 pub mod vault_wire;
 
-/// The principal a captured login is for, as the consent card names it and
-/// the journal records it.
+/// The principal the journal records a captured login for.
 ///
 /// The vault decides who may read a deposited cookie (its `browser-session`
-/// category), and this module sends no holder with the deposit. The constant
-/// is what the person is told, so it is fixed rather than a request
-/// parameter: a caller-chosen holder would be the caller choosing whom the
-/// person is told receives their login.
+/// category), and this module sends no holder with the deposit. The journal's
+/// holder is fixed rather than a request parameter, so callers cannot choose
+/// whom the recorded capture is for.
 pub const HOLDER: &str = "reserved:insula";
-/// How the holder is named to the person in the consent question.
-const HOLDER_DISPLAY_NAME: &str = "insula";
 /// The directory under the per-user temporary directory that holds the
 /// throwaway profile.
 pub const CAPTURE_ROOT_NAME: &str = "ck-cerebellum-capture";
@@ -1987,8 +1983,8 @@ pub fn consent_question(request: &CaptureRequest) -> Value {
     use crate::consent_card::*;
     let site = &request.credential_domain;
     ConsentCard {
-        title: format!("Save your {site} login?"),
-        prompt: format!("{HOLDER_DISPLAY_NAME} will hold a copy of your {site} login."),
+        title: "Save a login".into(),
+        prompt: format!("Save your {site} login for the agent?"),
         target: Target {
             kind: TargetKind::Site,
             label: site.clone(),
@@ -1999,12 +1995,7 @@ pub fn consent_question(request: &CaptureRequest) -> Value {
                 "Browser",
                 "Sign in in a new, empty browser window; your own browser is not touched",
             ),
-            Fact::new(
-                "Storage",
-                format!(
-                    "Your login is stored in the vault for {HOLDER_DISPLAY_NAME}; the sign-in window is deleted afterwards"
-                ),
-            ),
+            Fact::new("Storage", "Your CortexKit login store."),
             Fact::new(
                 "Other browsers",
                 "Some sites allow one sign-in at a time; signing in here may sign you out of this site in your other browsers.",

@@ -35,7 +35,7 @@
       "label": "Keep it locked"
     }
   ],
-  "prompt": "Clear the stuck record so the agent can open its browser on this profile again.",
+  "prompt": "Clear the stuck record so the agent can open its browser again?",
   "requester_ref": "pf:card-golden",
   "scope": {
     "profile_uuid": "7f0c2a8e-0000-4000-8000-000000000001",
@@ -45,6 +45,6 @@
     "kind": "machine",
     "label": "the agent's browser profile"
   },
-  "title": "Clear the stuck browser record?",
+  "title": "Fix the agent's browser",
   "urgency": "normal"
 }

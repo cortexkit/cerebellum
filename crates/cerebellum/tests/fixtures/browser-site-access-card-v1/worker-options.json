@@ -35,7 +35,7 @@
       "label": "Don't allow"
     }
   ],
-  "prompt": "Let the agent use its own browser on example.com to read pages and click.",
+  "prompt": "Let the agent use example.com in its own browser?",
   "scope": {
     "origins": [
       "https://example.com"
@@ -46,6 +46,6 @@
     "kind": "site",
     "label": "example.com"
   },
-  "title": "Allow access to example.com?",
+  "title": "Allow browser access",
   "urgency": "high"
 }

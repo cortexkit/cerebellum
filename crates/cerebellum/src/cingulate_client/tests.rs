@@ -254,6 +254,32 @@ fn request_for(kind: CardKind, body: &Value, deadline: Duration) -> CardRequest 
         .unwrap_or_else(|error| panic!("{kind:?}: {error:?}"))
 }
 
+#[test]
+fn every_generic_card_has_a_question_prompt_and_short_label() {
+    let mut kinds = Vec::new();
+    for (kind, name, body, deadline) in todays_cards()
+        .into_iter()
+        .filter(|(kind, ..)| *kind != CardKind::SecretUse)
+    {
+        let request = request_for(kind, &body, deadline);
+        let prompt = request.params["prompt"].as_str().unwrap();
+        let title = request.params["title"].as_str().unwrap();
+        assert!(prompt.ends_with('?'), "{name}: prompt is not a question");
+        assert!(!title.contains('?'), "{name}: title contains a question");
+        assert!(title.chars().count() <= 40, "{name}: title is too long");
+        assert_eq!(request.params["facts"], body["params"]["facts"], "{name}");
+        kinds.push(kind);
+    }
+    assert_eq!(
+        kinds,
+        CardKind::ALL
+            .into_iter()
+            .filter(|kind| *kind != CardKind::SecretUse)
+            .collect::<Vec<_>>(),
+        "a generic card kind was not checked"
+    );
+}
+
 /// The params as the reverse elicitation lane (see `mod.rs`) sent them: the
 /// builder's params with the enforced deadline stamped as `expires_in_ms`.
 /// Written out here rather than taken from the mapping, so the comparison
