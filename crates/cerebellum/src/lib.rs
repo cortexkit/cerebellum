@@ -4347,12 +4347,31 @@ async fn handle_route_request(
         )
         .await;
     }
-    if facts.surface == RouteSurface::Management
-        && serde_json::from_slice::<Value>(&frame.body)
-            .ok()
+    if facts.surface == RouteSurface::Management {
+        let body = serde_json::from_slice::<Value>(&frame.body).ok();
+        if body
+            .as_ref()
             .is_some_and(|body| body["method"] == cortexkit_role_tool_display::DISPLAY_READ)
-    {
-        return handle_management_request_observed(frame, writer, &facts, planes, None).await;
+        {
+            return handle_management_request_observed(frame, writer, &facts, planes, None).await;
+        }
+        // The tool-display contract names this op as `{name, arguments}`, the
+        // shape the display server sends; cerebellum's own management ops use
+        // `{method, params}`. Both reach the same read and the same caller check.
+        if let Some(body) = body.filter(|body| {
+            body["name"] == cortexkit_role_tool_display::DISPLAY_READ
+                && body.get("method").is_none()
+        }) {
+            let arguments = body.get("arguments").cloned().unwrap_or(Value::Null);
+            return send_display_read(
+                writer,
+                (ver, channel, epoch, corr),
+                &facts,
+                planes,
+                arguments,
+            )
+            .await;
+        }
     }
     if planes
         .routes
@@ -4622,6 +4641,36 @@ async fn handle_management_request(
     handle_management_request_observed(frame, writer, &facts, planes, None).await
 }
 
+/// Serve one tool-display pull: the caller check and the record lookup live in
+/// `Records::read`; this only frames its answer or refusal.
+async fn send_display_read(
+    writer: &mpsc::Sender<Frame>,
+    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+    facts: &AcceptedBindFacts,
+    planes: &Planes,
+    params: Value,
+) -> Result<(), ModuleError> {
+    match planes
+        .routes
+        .display
+        .read(facts.principal.as_ref(), params)
+        .await
+    {
+        Ok(bytes) => {
+            send_tool_response(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                serde_json::from_slice(&bytes).expect("stored display arguments are JSON"),
+            )
+            .await
+        }
+        Err(error) => tool_provider::send_error(error, (ver, channel, epoch, corr), writer).await,
+    }
+}
+
 async fn handle_management_request_observed(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
@@ -4711,30 +4760,8 @@ async fn handle_management_request_observed(
         return handle_image_resolve(&frame, writer, planes, object).await;
     }
     if method == cortexkit_role_tool_display::DISPLAY_READ {
-        return match planes
-            .routes
-            .display
-            .read(
-                facts.principal.as_ref(),
-                object.get("params").cloned().unwrap_or(Value::Null),
-            )
-            .await
-        {
-            Ok(bytes) => {
-                send_tool_response(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    serde_json::from_slice(&bytes).expect("stored display arguments are JSON"),
-                )
-                .await
-            }
-            Err(error) => {
-                tool_provider::send_error(error, (ver, channel, epoch, corr), writer).await
-            }
-        };
+        let params = object.get("params").cloned().unwrap_or(Value::Null);
+        return send_display_read(writer, (ver, channel, epoch, corr), facts, planes, params).await;
     }
     if method == management::SESSION_TURN_ENDED {
         return handle_session_turn_ended(

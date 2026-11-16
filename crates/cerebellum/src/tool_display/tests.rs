@@ -1674,7 +1674,18 @@ fn read_vector() -> Value {
     serde_json::from_str(bytes).unwrap()
 }
 
+/// A pull exactly as the display server sends it: the contract's named request
+/// `{name: "display.read", arguments}`, not cerebellum's `{method, params}`.
 async fn read_request(planes: &Planes, principal: Principal, params: Value) -> Frame {
+    read_request_body(
+        planes,
+        principal,
+        json!({"name":cortexkit_role_tool_display::DISPLAY_READ,"arguments":params}),
+    )
+    .await
+}
+
+async fn read_request_body(planes: &Planes, principal: Principal, body: Value) -> Frame {
     let facts = AcceptedBindFacts::from_bind(
         &subc_protocol::BindIdentity::new("test", "reader"),
         Some(principal),
@@ -1686,13 +1697,9 @@ async fn read_request(planes: &Planes, principal: Principal, params: Value) -> F
     );
     planes.routes.insert(7, 1, facts);
     let (writer, mut replies) = mpsc::channel(8);
-    handle_route_request(
-        frame(json!({"method":cortexkit_role_tool_display::DISPLAY_READ,"params":params})),
-        &writer,
-        planes,
-    )
-    .await
-    .unwrap();
+    handle_route_request(frame(body), &writer, planes)
+        .await
+        .unwrap();
     replies.recv().await.unwrap()
 }
 
@@ -1717,12 +1724,10 @@ async fn display_read_wire_vector_round_trips_through_management_and_fails_close
                 .display
                 .events
                 .seed_display("record:1", &write);
-            let reply = read_request(
-                &planes,
-                principal.clone(),
-                vector["request"]["arguments"].clone(),
-            )
-            .await;
+            // The vector's own request bytes, so the envelope can't drift from
+            // the contract the display server follows.
+            let reply =
+                read_request_body(&planes, principal.clone(), vector["request"].clone()).await;
             let body: Value = serde_json::from_slice(&reply.body).unwrap();
             if modules == ["reader"] && principal == reserved("reader") {
                 assert_eq!(reply.header.ty, FrameType::Response);
@@ -1758,6 +1763,36 @@ async fn display_read_wire_vector_round_trips_through_management_and_fails_close
     assert_eq!(
         serde_json::from_slice::<Value>(&reply.body).unwrap(),
         vector["refusals"][3]
+    );
+}
+
+#[tokio::test]
+async fn display_read_also_answers_cerebellum_management_envelope() {
+    let vector = read_vector();
+    let planes = planes();
+    planes
+        .routes
+        .display
+        .connect(DisplayDouble::new(&["reader"]));
+    let write: DisplayWrite = serde_json::from_value(vector["reply"].clone()).unwrap();
+    planes
+        .routes
+        .display
+        .events
+        .seed_display("record:1", &write);
+    let reader = || Principal::Reserved {
+        module_id: "reader".into(),
+    };
+    let reply = read_request_body(
+        &planes,
+        reader(),
+        json!({"method":cortexkit_role_tool_display::DISPLAY_READ,"params":vector["request"]["arguments"]}),
+    )
+    .await;
+    assert_eq!(reply.header.ty, FrameType::Response);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reply.body).unwrap(),
+        vector["reply"]
     );
 }
 
