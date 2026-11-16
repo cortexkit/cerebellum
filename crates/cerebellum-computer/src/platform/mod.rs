@@ -612,13 +612,11 @@ fn capability_declaration(
     }
 }
 
-/// Keep fronted button-down gestures unavailable until `mouse_up_routing_probe`
-/// measures secure-focus, moved/closed windows and termination. The receipts
-/// must establish how a held button can be released without acting on an
-/// unrelated target after containment or sensitivity changes. Record that
-/// justification in `.cortexkit/internal-docs/designs/takeover-pointer-fronting-review-packet.md`,
-/// section "Live evidence still to collect", before changing this constant.
-pub const DOWN_GESTURE_RECOVERY_MEASURED: bool = false;
+/// On macOS 27.0.1, `.cortexkit/internal-docs/investigations/mouse-up-routing-vm-20261116.log`
+/// records baseline, moved-window, closed-window and same-window secure-focus releases reaching the down owner,
+/// and app termination producing no receipt; the window behind received none in all five cases.
+/// Recovery guards still refuse the moved, closed, terminated and secure-focus cases.
+pub const DOWN_GESTURE_RECOVERY_MEASURED: bool = true;
 
 /// Platform-neutral semantic action intents a semantic dispatch may carry.
 pub const SEMANTIC_PRESS_ACTION: &str = "press";
