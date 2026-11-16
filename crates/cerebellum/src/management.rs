@@ -2294,14 +2294,14 @@ pub(crate) fn profile_root_rebind_question(root_path: &str, preview: &RebindRepo
             label: "the agent's browser profiles".into(),
         },
         facts: vec![
-            Fact::new("Path", root_path),
+            Fact::new("Location", root_path),
             Fact::new("Profiles affected", preview.record_count.to_string()),
             Fact::new(
-                "Protection",
-                "Only profiles created by the registry can be re-identified",
+                "Limit",
+                "Only the agent's own browser profiles are affected.",
             ),
         ],
-        grants: vec![ConsentOption::grant("allow", "Re-identify")],
+        grants: vec![ConsentOption::grant("allow", "Use them here")],
         decline: ConsentOption::decline("deny", "Don't allow"),
         expires_in: PHONE_CONSENT_DEADLINE,
         material_damage: true,
@@ -2354,22 +2354,12 @@ pub(crate) fn launch_recovery_clear_question(preview: &ClearPreview) -> Value {
                     .as_deref()
                     .unwrap_or("Time not recorded"),
             ),
+            Fact::new("Checked", clearance_evidence_text(&preview.evidence)),
             Fact::new(
-                "Verified evidence",
-                preview
-                    .evidence
-                    .describe()
-                    .replace("Chrome's SingletonLock", "The browser lock")
-                    .replace("pid ", "process "),
+                "Why",
+                "After a restart, CortexKit couldn't confirm the agent's last browser had closed.",
             ),
-            Fact::new(
-                "Recovery",
-                "After restarting, the module could not prove the previous browser had exited",
-            ),
-            Fact::new(
-                "Safety check",
-                "The evidence is read again before anything is cleared",
-            ),
+            Fact::new("Before clearing", "These checks run again."),
         ],
         grants: vec![ConsentOption::grant("clear", "Clear it")],
         decline: ConsentOption::decline("keep", "Keep it locked"),
@@ -2387,6 +2377,39 @@ pub(crate) fn launch_recovery_clear_question(preview: &ClearPreview) -> Value {
             .with("sequence", preview.sequence),
     }
     .render()
+}
+
+fn clearance_evidence_text(evidence: &crate::launch_recovery::ProfileEvidence) -> String {
+    let readings = evidence.as_json();
+    let processes = readings["processes"]["reading"].as_str().unwrap_or("");
+    let lock = readings["singleton_lock"]["reading"].as_str().unwrap_or("");
+    format!(
+        "{}; {}",
+        clearance_process_text(processes),
+        clearance_lock_text(lock)
+    )
+}
+
+fn clearance_process_text(reading: &str) -> &'static str {
+    match reading {
+        "none_names_profile" => "No running program is using the agent's browser profile",
+        "named_by" => "A running program is using the agent's browser profile",
+        "unreadable" => "The running programs could not all be checked",
+        _ => "The running programs could not be checked",
+    }
+}
+
+fn clearance_lock_text(reading: &str) -> &'static str {
+    match reading {
+        "absent" => "The browser's lock file is gone",
+        "pid_not_alive" | "pid_not_a_browser" => {
+            "The browser's lock points to a program that has closed"
+        }
+        "live_browser" => "The browser's lock points to a running browser",
+        "other_host" => "The browser's lock was created on another computer",
+        "unreadable" => "The browser's lock could not be read",
+        _ => "The browser's lock could not be checked",
+    }
 }
 
 fn rebind_refusal_reply(refusal: RebindRefusal) -> Value {
@@ -2844,6 +2867,74 @@ pub(crate) fn browser_missing_grant(origin: &str, level: u64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearance_evidence_uses_plain_sentences_for_every_reading() {
+        use crate::launch_recovery::{
+            ProcessReading as P, ProfileEvidence, SingletonLockReading as L,
+        };
+
+        for (reading, expected) in [
+            (
+                P::NoneNamesDirectory { examined: 137 },
+                "No running program is using the agent's browser profile",
+            ),
+            (
+                P::NamedBy { pid: 12345 },
+                "A running program is using the agent's browser profile",
+            ),
+            (
+                P::Unreadable,
+                "The running programs could not all be checked",
+            ),
+        ] {
+            let evidence = ProfileEvidence {
+                processes: reading,
+                singleton_lock: L::Absent,
+            };
+            assert_eq!(
+                clearance_evidence_text(&evidence),
+                format!("{expected}; The browser's lock file is gone")
+            );
+        }
+        for (reading, expected) in [
+            (L::Absent, "The browser's lock file is gone"),
+            (
+                L::PidNotAlive { pid: 12345 },
+                "The browser's lock points to a program that has closed",
+            ),
+            (
+                L::PidNotABrowser { pid: 12345 },
+                "The browser's lock points to a program that has closed",
+            ),
+            (
+                L::LiveBrowser { pid: 12345 },
+                "The browser's lock points to a running browser",
+            ),
+            (
+                L::OtherHost,
+                "The browser's lock was created on another computer",
+            ),
+            (L::Unreadable, "The browser's lock could not be read"),
+        ] {
+            let evidence = ProfileEvidence {
+                processes: P::NoneNamesDirectory { examined: 137 },
+                singleton_lock: reading,
+            };
+            assert_eq!(
+                clearance_evidence_text(&evidence),
+                format!("No running program is using the agent's browser profile; {expected}")
+            );
+        }
+        assert_eq!(
+            clearance_process_text("future diagnostic 12345"),
+            "The running programs could not be checked"
+        );
+        assert_eq!(
+            clearance_lock_text("future diagnostic 12345"),
+            "The browser's lock could not be checked"
+        );
+    }
 
     struct Fixed(TargetResolution);
 

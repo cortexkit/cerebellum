@@ -3,7 +3,7 @@
   "expires_in_ms": 1800000,
   "facts": [
     {
-      "label": "Path",
+      "label": "Location",
       "value": "/Users/someone/Library/Application Support/cerebellum/profiles"
     },
     {
@@ -11,8 +11,8 @@
       "value": "3"
     },
     {
-      "label": "Protection",
-      "value": "Only profiles created by the registry can be re-identified"
+      "label": "Limit",
+      "value": "Only the agent's own browser profiles are affected."
     }
   ],
   "kind": "consent",
@@ -23,7 +23,7 @@
     {
       "effect": "grant",
       "id": "allow",
-      "label": "Re-identify"
+      "label": "Use them here"
     },
     {
       "effect": "decline",
