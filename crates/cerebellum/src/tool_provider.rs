@@ -17,6 +17,10 @@ use subc_protocol::call_mode::CallMode;
 
 mod views;
 
+pub(crate) fn view_replies() -> Vec<(String, Vec<u8>)> {
+    views::published_replies()
+}
+
 pub(crate) fn is_operation(name: &str) -> bool {
     matches!(
         name,

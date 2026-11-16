@@ -2939,7 +2939,7 @@ where
     planes
         .calls
         .events
-        .connect(Arc::new(event_publish::BusTransport {
+        .connect_and_reconcile(Arc::new(event_publish::BusTransport {
             connection_file: config.connection_file_path.clone(),
         }));
     #[cfg(target_os = "macos")]

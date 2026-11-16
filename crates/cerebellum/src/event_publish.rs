@@ -1,5 +1,5 @@
-//! Best-effort, post-commit notices. Call records and direct display writes remain
-//! authoritative; losing a notice must never change either path.
+//! Best-effort bus notices and startup view publication. Call records, direct
+//! display writes and tool.views remain authoritative when the bus is unavailable.
 
 use std::{
     future::Future,
@@ -25,6 +25,7 @@ mod records;
 pub(crate) mod tests;
 #[cfg(not(test))]
 mod transport;
+mod views;
 
 #[cfg(not(test))]
 pub(crate) use transport::BusTransport;
@@ -89,6 +90,10 @@ pub(crate) trait Transport: Send + Sync {
 /// Dropping a connection must release all client owners and background work.
 /// Success means the JetStream acknowledgement arrived, not just a socket write.
 pub(crate) trait Connection: Send {
+    fn views_bucket(&self) -> Result<Box<dyn views::Bucket>, Failure> {
+        Err(Failure::Unavailable)
+    }
+
     fn publish<'a>(
         &'a mut self,
         kind: &'a Kind,
@@ -178,9 +183,23 @@ impl Publisher {
     }
 
     // Recovery can queue notices before installation, without a task or timer.
+    #[cfg(test)]
     pub(crate) fn connect(&self, transport: Arc<dyn Transport>) {
+        self.install(transport, false);
+    }
+
+    pub(crate) fn connect_and_reconcile(&self, transport: Arc<dyn Transport>) {
+        self.install(transport, true);
+    }
+
+    fn install(&self, transport: Arc<dyn Transport>, reconcile_views: bool) {
         if let Some(receiver) = self.receiver.lock().unwrap().take() {
-            tokio::spawn(run(transport, receiver, self.gauges.clone()));
+            tokio::spawn(run(
+                transport,
+                receiver,
+                self.gauges.clone(),
+                reconcile_views,
+            ));
             self.transport_installed.store(true, Release);
         }
     }
@@ -286,9 +305,40 @@ async fn run(
     transport: Arc<dyn Transport>,
     mut events: mpsc::Receiver<Event>,
     gauges: Arc<Gauges>,
+    reconcile_views: bool,
 ) {
     let mut connection: Option<Box<dyn Connection>> = None;
     let mut idle_close = None;
+    if reconcile_views {
+        match tokio::time::timeout(OPEN_WINDOW, transport.open()).await {
+            Ok(Ok(opened)) => {
+                let bucket = opened.views_bucket();
+                connection = Some(opened);
+                let reconcile = async {
+                    let bucket = bucket?;
+                    views::reconcile(
+                        bucket.as_ref(),
+                        crate::tool_provider::view_replies(),
+                        &gauges,
+                    )
+                    .await;
+                    Ok(())
+                };
+                match tokio::time::timeout(views::RECONCILE_WINDOW, reconcile).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(reason)) => gauges.failed(reason),
+                    Err(_) => gauges.failed(Failure::Timeout),
+                }
+                // With no notices queued, close now so the bus client's credential
+                // renewal task and the publisher's idle timer need not stay alive.
+                if events.is_empty() {
+                    connection = None;
+                }
+            }
+            Ok(Err(reason)) => gauges.failed(reason),
+            Err(_) => gauges.failed(Failure::Timeout),
+        }
+    }
     // Startup recovery may predate transport installation. Its queue budget
     // starts when delivery becomes possible, not while no client exists.
     let installed_at = Instant::now();
