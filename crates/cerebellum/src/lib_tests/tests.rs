@@ -1,4 +1,4 @@
-#[path = "../tests/capture_audit_tests.rs"]
+#[path = "tests/capture_audit_tests.rs"]
 mod capture_audit_tests;
 use crate::test_support::HANG_GUARD;
 #[tokio::test]
@@ -108,16 +108,24 @@ fn scope_admission_nondelegating_routes_do_not_read_or_offer_standing_grants() {
 /// changed here and not there.
 #[test]
 fn the_release_script_names_every_attestation_the_compiler_reads() {
-    let source = include_str!("../lib.rs");
+    let source = concat!(
+        include_str!("../lib.rs"),
+        include_str!("../control.rs"),
+        include_str!("../management_dispatch.rs"),
+        include_str!("../tool_dispatch.rs"),
+        include_str!("../planes.rs"),
+    );
     let script = include_str!("../../../../scripts/release-build.sh");
 
     let read_here: std::collections::BTreeSet<&str> = source
-        .split("option_env!(\"")
+        .split("option_env!(")
         .skip(1)
+        .filter_map(|rest| rest.trim_start().strip_prefix('"'))
         .filter_map(|rest| rest.split('"').next())
         .filter(|name| name.starts_with("CEREBELLUM_"))
         .collect();
 
+    assert!(read_here.contains("CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION"));
     assert_eq!(
         read_here.len(),
         13,

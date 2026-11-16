@@ -27,7 +27,7 @@ use crate::support::source_scan::{self, copy_tree, scratch_directory};
 /// the real-tree scan can insist on finding it: a site that is renamed or moved
 /// fails the scan instead of leaving it to pass over nothing.
 const ALLOWED: &[(&str, &str, &str)] = &[(
-    "src/lib.rs",
+    "src/planes.rs",
     "let lease_clock = Arc::new(cerebellum_core::clock::SystemClock::new());",
     "the module's own lease clock, built once in Planes::new and shared by Arc",
 )];
@@ -267,7 +267,7 @@ fn rust_sources(directory: &Path) -> Vec<PathBuf> {
 fn the_clock_detector_flags_every_planted_construction() {
     assert_flags(
         "a second SystemClock::new() beside the allowed one",
-        "src/lib.rs",
+        "src/planes.rs",
         &[
             "fn planes_new() {",
             "    let lease_clock = Arc::new(cerebellum_core::clock::SystemClock::new());",
@@ -282,7 +282,7 @@ fn the_clock_detector_flags_every_planted_construction() {
     // second clock all the same.
     assert_flags(
         "the allowed line repeated in the allowed file",
-        "src/lib.rs",
+        "src/planes.rs",
         &[
             "let lease_clock = Arc::new(cerebellum_core::clock::SystemClock::new());",
             "let lease_clock = Arc::new(cerebellum_core::clock::SystemClock::new());",
@@ -587,7 +587,7 @@ fn the_clock_detector_flags_every_planted_construction() {
 fn the_clock_detector_passes_every_planted_non_construction() {
     assert_flags(
         "the allowed site in the allowed file",
-        "src/lib.rs",
+        "src/planes.rs",
         &[
             "fn planes_new() {",
             "    let lease_clock = Arc::new(cerebellum_core::clock::SystemClock::new());",
@@ -645,7 +645,7 @@ fn the_clock_detector_passes_every_planted_non_construction() {
 /// crate's `src` with one violating file planted two directories down.
 ///
 /// The snippet controls exercise the detector on text handed to it, and the
-/// premise check only proves the walk reaches `src/lib.rs`. Neither notices a
+/// premise check only proves the walk reaches `src/planes.rs`. Neither notices a
 /// walk that stops descending into module directories or reads the wrong file
 /// extension; this does.
 #[test]

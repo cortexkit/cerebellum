@@ -28,8 +28,8 @@ const LAUNCH_PATH_FILES: &[&str] = &[
     "src/browser_session.rs",
 ];
 
-/// `lib.rs` serves every plane, so only the browser control handler is read.
-const LIB_FUNCTION: (&str, &str) = ("src/lib.rs", "async fn handle_browser_control(");
+/// Tool dispatch serves every plane, so only the browser control handler is read.
+const LIB_FUNCTION: (&str, &str) = ("src/tool_dispatch.rs", "async fn handle_browser_control(");
 
 /// Fewer distinct words than this means the scan stopped reading the sources
 /// it names, and an empty scan proves nothing.
@@ -48,7 +48,8 @@ fn every_launch_path_outcome_literal_is_declared_by_a_browser_session_schema() {
         sources.push((relative.to_string(), source_scan::shipped_lines(&text)));
     }
     let (lib_path, lib_function) = LIB_FUNCTION;
-    let lib = std::fs::read_to_string(crate_root.join(lib_path)).expect("read src/lib.rs");
+    let lib =
+        std::fs::read_to_string(crate_root.join(lib_path)).expect("read tool dispatch source");
     let handler = function_lines(&lib, lib_function);
     assert!(
         !handler.is_empty(),
