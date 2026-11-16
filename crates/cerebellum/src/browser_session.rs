@@ -523,6 +523,11 @@ pub enum ClickNavigation {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BrowserClickOutcome {
+    OptionSelected {
+        value: String,
+        selected_index: i64,
+        navigation: ClickNavigation,
+    },
     Clicked {
         position: BrowserClickPosition,
         navigation: ClickNavigation,

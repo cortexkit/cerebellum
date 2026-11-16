@@ -1,5 +1,5 @@
 //! A codemode run acts in the person's Chrome exactly as its head route does:
-//! its claims, snapshots, refs and quarantine are keyed by the head's route,
+//! its claims, snapshots, refs and quarantine use the head session's bridge alias,
 //! its site cards go to the head's session and are held rather than parked,
 //! and withdrawing it cancels its extension work.
 
@@ -151,6 +151,246 @@ async fn goodbye(fixture: &Fixture, channel: u16) {
     assert!(fixture.planes.routes.get(channel, 1).is_none());
 }
 
+async fn bind_direct_head(fixture: &Fixture, channel: u16) {
+    bind_direct_head_scope(fixture, channel, "direct-head", 1).await;
+}
+
+async fn bind_direct_head_scope(
+    fixture: &Fixture,
+    channel: u16,
+    scope_ref: &str,
+    scope_epoch: u64,
+) {
+    let stamp = ScopeStamp::new(core(), scope_ref, scope_epoch, ScopeKind::Head)
+        .with_attributes(
+            ScopeAttributes::new()
+                .with_agent_id(Some("test-project".into()))
+                .with_delegates(true),
+        )
+        .with_owner_authorized(true);
+    let bind = subc_protocol::session::ModuleControlRequest::RouteBind {
+        route_channel: channel,
+        epoch: 1,
+        principal: Some(core()),
+        identity: subc_protocol::BindIdentity::new("direct", format!("call-{channel}")),
+        admission_facts: Some(
+            json!({"agentProjectId":"test-project","sessionKind":"primary",
+            "effectiveCapabilityScope":["*"],"browserControlOperations":["browser.launch","browser.status","browser.close"]}),
+        ),
+        consumer_capabilities: None,
+        target: subc_protocol::RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+        scope: Some(stamp),
+        role_versions: None,
+        call_mode: Some(CallMode::Classic),
+    };
+    let frame = Frame::build(
+        FrameType::Request,
+        crate::control_flags(),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&bind).unwrap(),
+    )
+    .unwrap();
+    let (writer, mut replies) = mpsc::channel(4);
+    crate::handle_frame_for_test(frame, &writer, &fixture.planes)
+        .await
+        .unwrap();
+    let reply = replies.recv().await.unwrap();
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    let facts = fixture.planes.routes.get(channel, 1).unwrap();
+    assert!(facts.agent_project_id_attested && facts.session_kind_attested);
+}
+
+#[tokio::test]
+async fn real_route_bind_direct_head_calls_share_claims_while_the_oldest_route_lives() {
+    let fixture = Fixture::new();
+    bind_direct_head(&fixture, 20).await;
+    let tab = fixture.claim(20).await;
+    bind_direct_head(&fixture, 21).await;
+    let (snapshot, _) = fixture.snapshot(21, &tab, "allow_30m").await;
+    assert_eq!(snapshot["outcome"], "ok", "{snapshot}");
+    assert_eq!(
+        fixture
+            .planes
+            .user_browser
+            .target()
+            .state()
+            .claims
+            .get(&tab),
+        Some(&Route {
+            channel: 20,
+            epoch: 1
+        })
+    );
+    goodbye(&fixture, 21).await;
+    let (reply, _) = fixture.snapshot(20, &tab, "allow_30m").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+}
+
+#[tokio::test]
+async fn real_route_bind_direct_head_claim_survives_between_per_call_routes() {
+    let fixture = Fixture::new();
+    bind_direct_head(&fixture, 20).await;
+    let tab = fixture.claim(20).await;
+    goodbye(&fixture, 20).await;
+    assert!(fixture
+        .planes
+        .user_browser
+        .target()
+        .state()
+        .claims
+        .contains_key(&tab));
+    bind_direct_head(&fixture, 21).await;
+    let (reply, _) = fixture.snapshot(21, &tab, "allow_30m").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert!(fixture.state.lock().unwrap().inputs.is_empty());
+    assert_eq!(fixture.claim(21).await, tab);
+    let (reply, _) = fixture.snapshot(21, &tab, "allow_30m").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+}
+
+#[tokio::test]
+async fn real_route_bind_direct_head_claim_survives_a_move_to_a_new_scope_epoch() {
+    let fixture = Fixture::new();
+    bind_direct_head_scope(&fixture, 20, "moving-head", 1).await;
+    let tab = fixture.claim(20).await;
+    bind_direct_head_scope(&fixture, 21, "moving-head", 2).await;
+    let (reply, _) = fixture.snapshot(21, &tab, "allow_30m").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    goodbye(&fixture, 20).await;
+    let (reply, _) = fixture.snapshot(21, &tab, "allow_30m").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    bind_direct_head_scope(&fixture, 22, "different-head", 2).await;
+    let (reply, _) = fixture.snapshot(22, &tab, "allow_30m").await;
+    assert_eq!(reply["reason"], "tab_not_claimed_by_route", "{reply}");
+}
+
+#[tokio::test]
+async fn real_route_bind_another_head_can_claim_only_after_lazy_staleness() {
+    let fixture = Fixture::new();
+    let start = std::time::Instant::now();
+    fixture.planes.user_browser.target().set_claim_clock(start);
+    bind_direct_head(&fixture, 20).await;
+    let tab = fixture.claim(20).await;
+    bind_direct_head_scope(&fixture, 21, "other-head", 1).await;
+    let claim = json!({"browser":"user","action":"claim_tab","tab":tab});
+    fixture
+        .planes
+        .user_browser
+        .target()
+        .set_claim_clock(start + Duration::from_secs(1801));
+    let (reply, _) = fixture.call(21, claim.clone(), "allow_30m").await;
+    assert_eq!(
+        reply["reason"], "tab_already_claimed",
+        "live route: {reply}"
+    );
+    // The last call above belongs to the other head, not the claim owner.
+    goodbye(&fixture, 20).await;
+    fixture
+        .planes
+        .user_browser
+        .target()
+        .set_claim_clock(start + Duration::from_secs(1799));
+    let (reply, _) = fixture.call(21, claim.clone(), "allow_30m").await;
+    assert_eq!(
+        reply["reason"], "tab_already_claimed",
+        "not idle long enough: {reply}"
+    );
+    fixture
+        .planes
+        .user_browser
+        .target()
+        .set_claim_clock(start + Duration::from_secs(1800));
+    let (reply, _) = fixture.call(21, claim, "allow_30m").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    let (reply, _) = fixture.snapshot(21, &tab, "allow_30m").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+}
+
+async fn answer_last_head_close(fixture: &Fixture, tab: &str, status: &str, scope_epoch: u64) {
+    let (writer, mut replies) = mpsc::channel(8);
+    let close = Frame::build(FrameType::Goodbye, crate::control_flags(), 20, 1, 0, vec![]).unwrap();
+    crate::handle_frame_for_test(close, &writer, &fixture.planes)
+        .await
+        .unwrap();
+    let question = tokio::time::timeout(HANG_GUARD, replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let body: Value = serde_json::from_slice(&question.body).unwrap();
+    assert_eq!(body["op"], "scope.describe");
+    assert_eq!(body["ref"], "direct-head");
+    assert!(fixture
+        .planes
+        .user_browser
+        .target()
+        .state()
+        .claims
+        .contains_key(tab));
+    let response = Frame::build(FrameType::Response, crate::control_flags(), 0, 0, question.header.corr,
+         serde_json::to_vec(&json!({"op":"scope.describe","status":status,"scope_epoch":scope_epoch,"daemon_incarnation":"test","owner_synced":true,"owner_configured":true})).unwrap()).unwrap();
+    crate::handle_frame_for_test(response, &writer, &fixture.planes)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn real_route_bind_session_end_releases_claims_after_the_last_route_closed() {
+    let fixture = Fixture::new();
+    bind_direct_head(&fixture, 20).await;
+    let tab = fixture.claim(20).await;
+    answer_last_head_close(&fixture, &tab, "ended", 1).await;
+    until_frozen(|| {
+        !fixture
+            .planes
+            .user_browser
+            .target()
+            .state()
+            .claims
+            .contains_key(&tab)
+    })
+    .await;
+    bind_direct_head_scope(&fixture, 21, "other-head", 1).await;
+    assert_eq!(fixture.claim(21).await, tab);
+}
+
+#[tokio::test]
+async fn real_route_bind_newer_live_scope_answer_preserves_claim_before_rebind() {
+    let fixture = Fixture::new();
+    bind_direct_head(&fixture, 20).await;
+    let tab = fixture.claim(20).await;
+    let key = crate::scope_watch::ScopeKey::from_stamp(
+        fixture
+            .planes
+            .routes
+            .get(20, 1)
+            .unwrap()
+            .scope
+            .as_ref()
+            .unwrap(),
+    );
+    answer_last_head_close(&fixture, &tab, "live", 2).await;
+    until_frozen(|| fixture.planes.scopes.conversations(&key).is_empty()).await;
+    assert!(fixture
+        .planes
+        .user_browser
+        .target()
+        .state()
+        .claims
+        .contains_key(&tab));
+    bind_direct_head_scope(&fixture, 21, "direct-head", 2).await;
+    let (reply, _) = fixture.snapshot(21, &tab, "allow_30m").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+}
+
 #[tokio::test]
 async fn a_run_acts_on_the_tab_its_head_claimed() {
     let fixture = Fixture::new();
@@ -217,7 +457,6 @@ async fn other_scopes_and_unattested_routes_cannot_borrow_a_heads_tab() {
     for change in [
         "owner",
         "ref",
-        "epoch",
         "worker",
         "flow",
         "unscoped",
@@ -309,7 +548,7 @@ async fn a_noncanonical_head_route_goodbye_keeps_claims_and_refs_for_the_run() {
 }
 
 #[tokio::test]
-async fn closing_the_canonical_head_route_requires_a_new_claim_on_the_remaining_route() {
+async fn closing_the_original_head_route_keeps_the_sessions_claim_and_refs() {
     let fixture = Fixture::new();
     let tab = fixture.claim(2).await;
     let (snapshot, _) = fixture.snapshot(2, &tab, "allow_30m").await;
@@ -317,8 +556,8 @@ async fn closing_the_canonical_head_route_requires_a_new_claim_on_the_remaining_
     goodbye(&fixture, HEAD.channel).await;
     {
         let state = fixture.planes.user_browser.target().state();
-        assert!(!state.claims.contains_key(&tab));
-        assert!(!state
+        assert!(state.claims.contains_key(&tab));
+        assert!(state
             .snapshots
             .contains_key(snapshot["snapshot_id"].as_str().unwrap()));
     }
@@ -331,7 +570,7 @@ async fn closing_the_canonical_head_route_requires_a_new_claim_on_the_remaining_
         )
         .clone(),
     ] {
-        assert_eq!(reply["reason"], "tab_not_claimed_by_route", "{reply}");
+        assert_eq!(reply["outcome"], "ok", "{reply}");
     }
     let reclaimed = fixture.claim(2).await;
     assert_eq!(reclaimed, tab);
@@ -344,7 +583,7 @@ async fn closing_the_canonical_head_route_requires_a_new_claim_on_the_remaining_
             .claims
             .get(&tab),
         Some(&Route {
-            channel: 2,
+            channel: 1,
             epoch: 1
         })
     );

@@ -83,12 +83,13 @@ are omitted, not null.
 Every `completed` result (including a chunked one) carries
 `extension_revision:<positive integer>` beside the fields below, and every
 `refused` reason JSON carries it beside `reason` and `remedy`. The value is
-`EXTENSION_REVISION` in `revision.mjs`; cerebellum requires exactly its own
-`EXTENSION_REVISION` (in `crates/cerebellum/src/user_browser.rs`) and checks it
-before decoding anything else. A missing or lower revision refuses as
+`EXTENSION_REVISION` in `revision.mjs`; cerebellum checks it before decoding
+anything else. Revision 5 adds the pinned `CHOOSE_OPTION` function; revision 4
+remains compatible for every existing operation. Native option selection alone
+requires revision 5. A missing or unsupported lower revision refuses as
 `extension_outdated` and a higher one as `extension_newer`, both with a remedy
-asking the person to reload the extension in `chrome://extensions`, for every
-action including `status`. Raise both constants together whenever a plan, reply
+asking the person to reload the extension in `chrome://extensions`. Raise both
+constants together whenever a plan, reply
 or refusal shape in this document changes; a test compares them. The manifest
 `version` is not this revision: Chrome keeps running whichever unpacked copy it
 loaded, and that copy's `version` says nothing about the reply shapes it sends.
@@ -292,7 +293,7 @@ resolving to one), a string `functionDeclaration`, and `returnByValue:true`, wit
 no other parameters. SHA-256 is computed over the exact UTF-8 declaration, without
 whitespace normalization. The digest must occur in `RUNTIME_FUNCTION_SHA256` in
 `runtime-functions.mjs` and in the list below. A test compares the executable and
-documented lists, independently hashes all three declarations, and refuses a
+documented lists, independently hashes all four declarations, and refuses a
 one-byte change. The browser adapter uses the matching declarations in
 `crates/cerebellum/src/user_browser/functions.rs`. All admitted function calls are
 conservatively modifying steps and require a fresh input baseline.
@@ -302,13 +303,15 @@ conservatively modifying steps and require a fresh input baseline.
 | SELECT | `5642611a1b2f6289d347bf6b0182feca100bb1cd024a91730bf48236a9924689` |
 | APPEND_CARET | `ac62bcd9e6db95e84a42a90a37f286117b8ce6d3b0760ae1d1083c084d96bba7` |
 | HAS_FOCUS | `2cd006d8e531e4e1c03b2e4bfebec513fe642134af0ddc6d7fb602ca9c835ffe` |
+| CHOOSE_OPTION | `b324ab559e352cc33aaeed89829c47aff9d34d6a8ef74a9e38c2a44d3a6cf0ff` |
 
 <!-- runtime-function-sha256 -->
 ```json
 [
   "5642611a1b2f6289d347bf6b0182feca100bb1cd024a91730bf48236a9924689",
   "ac62bcd9e6db95e84a42a90a37f286117b8ce6d3b0760ae1d1083c084d96bba7",
-  "2cd006d8e531e4e1c03b2e4bfebec513fe642134af0ddc6d7fb602ca9c835ffe"
+  "2cd006d8e531e4e1c03b2e4bfebec513fe642134af0ddc6d7fb602ca9c835ffe",
+  "b324ab559e352cc33aaeed89829c47aff9d34d6a8ef74a9e38c2a44d3a6cf0ff"
 ]
 ```
 <!-- /runtime-function-sha256 -->
@@ -320,6 +323,7 @@ Exact function declarations (also independently hash-tested in
 const SELECT = "function() { if (typeof this.select === 'function') { this.select(); } else { const range = this.ownerDocument.createRange(); range.selectNodeContents(this); const selection = this.ownerDocument.getSelection(); selection.removeAllRanges(); selection.addRange(range); } }";
 const APPEND_CARET = "function() { if (typeof this.setSelectionRange === 'function') { const end = this.value.length; this.setSelectionRange(end, end); } else { const range = this.ownerDocument.createRange(); range.selectNodeContents(this); range.collapse(false); const selection = this.ownerDocument.getSelection(); selection.removeAllRanges(); selection.addRange(range); } return true; }";
 const HAS_FOCUS = "function() { return this.ownerDocument.hasFocus() && this.getRootNode().activeElement === this; }";
+const CHOOSE_OPTION = "function() { if (!(this instanceof HTMLOptionElement)) { throw new Error('target is not an option'); } const select = this.closest('select'); if (!select) { throw new Error('option has no select'); } const group = this.closest('optgroup'); if (this.disabled || select.disabled || (group && group.disabled)) { throw new Error('option, optgroup or select is disabled'); } this.selected = select.multiple ? !this.selected : true; select.dispatchEvent(new Event('input', {bubbles:true})); select.dispatchEvent(new Event('change', {bubbles:true})); return {value:select.value, selectedIndex:select.selectedIndex}; }";
 ```
 
 `Emulation.setFocusEmulationEnabled` emulates document focus for clicking and

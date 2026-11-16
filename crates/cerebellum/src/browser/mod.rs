@@ -3819,7 +3819,16 @@ impl BrowserPlane {
         outcome: crate::browser_session::BrowserClickOutcome,
     ) -> Value {
         use crate::browser_session::{BrowserClickOutcome, ClickNavigation};
+        let selected = match &outcome {
+            BrowserClickOutcome::OptionSelected {
+                value,
+                selected_index,
+                ..
+            } => Some((value.clone(), *selected_index)),
+            _ => None,
+        };
         let (dialogs, navigation) = match outcome {
+            BrowserClickOutcome::OptionSelected { navigation, .. } => (Vec::new(), navigation),
             BrowserClickOutcome::Clicked { navigation, .. } => (Vec::new(), navigation),
             BrowserClickOutcome::JavaScriptDialogDismissed {
                 dialogs,
@@ -3911,6 +3920,10 @@ impl BrowserPlane {
                 response
             }
         };
+        if let Some((value, selected_index)) = selected {
+            response["value"] = json!(value);
+            response["selectedIndex"] = json!(selected_index);
+        }
         if !dialogs.is_empty() {
             let object = response
                 .as_object_mut()
@@ -5411,6 +5424,8 @@ fn snapshot_result_schema() -> Value {
 fn click_result_schema() -> Value {
     reply_schema(
         json!({
+            "value":string_schema(),
+            "selectedIndex":integer_schema(),
             "navigation":enum_schema(&["none_observed", "same_document", "not_committed", "main_frame"]),
             "navigation_window_ms":integer_schema(),
             "activated_element":closed_object(json!({"identity":string_schema(),"kind":string_schema()}), &["identity","kind"]),
@@ -6121,6 +6136,7 @@ pub(crate) fn user_browser_result_schema(action: &str) -> Value {
                 "image_handle":string_schema(),
                 "image_width_px":integer_schema(), "image_height_px":integer_schema(),
                 "popup_activated_briefly":boolean_schema(),
+                "value":string_schema(), "selectedIndex":integer_schema(),
                 // A committed navigation whose landing page has no
                 // interaction observer yet says so instead of refusing.
                 "observer_available":boolean_schema(),

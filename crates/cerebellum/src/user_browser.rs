@@ -387,6 +387,7 @@ struct State {
 
 pub(crate) struct UserBrowser {
     state: Mutex<State>,
+    sessions: Mutex<SessionClaims>,
     next_ref: std::sync::atomic::AtomicU64,
     grants: Arc<StandingBrowserGrants>,
     workers: crate::blocking_permits::PermitPool,
@@ -396,6 +397,7 @@ impl UserBrowser {
     pub(crate) fn new(grants: Arc<StandingBrowserGrants>) -> Self {
         Self {
             state: Mutex::new(State::default()),
+            sessions: Mutex::new(SessionClaims::default()),
             next_ref: std::sync::atomic::AtomicU64::new(1),
             grants,
             workers: crate::blocking_permits::PermitPool::new(
@@ -821,13 +823,15 @@ fn classification_changed(
 /// can keep running an old unpacked copy that reports the same `version`, and
 /// replies from such a copy must refuse with a reload remedy instead of
 /// failing to decode.
-pub(crate) const EXTENSION_REVISION: u64 = 4;
+pub(crate) const EXTENSION_REVISION: u64 = 5;
+
+const MINIMUM_EXTENSION_REVISION: u64 = 4;
 
 const EXTENSION_OUTDATED_REMEDY: &str = "The CortexKit Chrome extension is out of date. Ask the person to reload it in chrome://extensions, then retry.";
 const EXTENSION_NEWER_REMEDY: &str = "The CortexKit Chrome extension is newer than this cerebellum. Ask the person to load the extension copy installed with this cerebellum and reload it in chrome://extensions, or update cerebellum, then retry.";
 
-/// The refusal for a reply whose extension revision differs from
-/// [`EXTENSION_REVISION`]. A missing revision means an extension older than
+/// The refusal for a reply whose extension revision cannot serve the operation.
+/// A missing revision means an extension older than
 /// the handshake itself, so it counts as outdated. Every reply from such an
 /// extension is untrusted for decoding, so nothing of it is relayed except
 /// whether input was dispatched.
@@ -1255,6 +1259,18 @@ async fn invoke(
 ) -> Result<Value, Value> {
     command["version"] = json!(2);
     command["action"] = json!(action);
+    let minimum_revision = if command["commands"].as_array().is_some_and(|commands| {
+        commands
+            .iter()
+            .any(|command| command["params"]["functionDeclaration"] == functions::CHOOSE_OPTION)
+    }) {
+        EXTENSION_REVISION
+    } else {
+        MINIMUM_EXTENSION_REVISION
+    };
+    let compatible = |revision: Option<u64>| {
+        revision.is_some_and(|revision| (minimum_revision..=EXTENSION_REVISION).contains(&revision))
+    };
     let outcome = bridge.invoke(route, command, cancel.clone()).await;
     if outcome.terminal == Terminal::Completed {
         let mut result = outcome
@@ -1268,7 +1284,7 @@ async fn invoke(
             .as_object_mut()
             .and_then(|fields| fields.remove("extension_revision"))
             .and_then(|revision| revision.as_u64());
-        if revision != Some(EXTENSION_REVISION) {
+        if !compatible(revision) {
             return Err(extension_revision_mismatch(
                 revision,
                 outcome.input_dispatched,
@@ -1283,7 +1299,7 @@ async fn invoke(
         let revision = serde_json::from_str::<Value>(reason)
             .ok()
             .and_then(|detail| detail.get("extension_revision").and_then(Value::as_u64));
-        if revision != Some(EXTENSION_REVISION) {
+        if !compatible(revision) {
             let mut reply = extension_revision_mismatch(revision, outcome.input_dispatched);
             reply["outcome"] = serde_json::to_value(outcome.terminal).expect("terminal serializes");
             return Err(reply);
@@ -2480,6 +2496,9 @@ async fn serve_inner(
     if matches!(action, "open_tab" | "claim_tab") {
         if action == "claim_tab" {
             let tab = args["tab"].as_str().expect("validated tab");
+            if let Some(stale) = target.stale_claim(tab, route, &planes.routes) {
+                bridge.goodbye(stale);
+            }
             if target
                 .state()
                 .claims
@@ -3913,6 +3932,17 @@ async fn input_inner(
         snapshot.interaction,
         "input.classify_flattened_document",
     )?;
+    let native_option = action == "click"
+        && crate::browser::navigation::native_select::target_from_capture(
+            dom_object,
+            &identity,
+            &classification,
+        )
+        .map_err(|problem| {
+            let mut reply = refusal("target_not_interactive");
+            reply["detail"] = json!({"step":"input.native_option","problem":problem});
+            reply
+        })?;
     if let Some(expected) = args["ref"]
         .as_str()
         .and_then(|reference| snapshot.refs.get(reference))
@@ -4032,7 +4062,7 @@ async fn input_inner(
             );
         }
     }
-    let position = if action == "type" {
+    let position = if action == "type" || native_option {
         None
     } else if position.is_some() {
         position
@@ -4065,7 +4095,12 @@ async fn input_inner(
         )?)
     };
     let mut steps = Vec::new();
-    if action == "type" {
+    if native_option {
+        steps.push(command(
+            "Runtime.callFunctionOn",
+            json!({"functionDeclaration":functions::CHOOSE_OPTION,"returnByValue":true}),
+        ));
+    } else if action == "type" {
         steps.push(command(
             "DOM.focus",
             json!({"backendNodeId":identity.backend_node_id}),
@@ -4092,6 +4127,7 @@ async fn input_inner(
     let mut dispatched = false;
     let mut popup = false;
     let mut after_focus = false;
+    let mut selected = None;
     let mut steps = steps.into_iter();
     while let Some(step) = steps.next() {
         let just_focused = std::mem::take(&mut after_focus);
@@ -4162,7 +4198,9 @@ async fn input_inner(
             .await
             .map_err(|reply| prior_input(reply, dispatched))?;
         }
-        let commands = if action == "type" && step["method"] == "Runtime.callFunctionOn" {
+        let commands = if (action == "type" || native_option)
+            && step["method"] == "Runtime.callFunctionOn"
+        {
             if args["clear_first"] != true
                 && matches!(
                     classification.effective_input_type.as_deref(),
@@ -4255,7 +4293,24 @@ async fn input_inner(
                     .iter()
                     .any(|result| result.get("exceptionDetails").is_some())
                 {
-                    return Err(prior_input(refusal("runtime_exception"), true));
+                    let mut reply = refusal(if native_option {
+                        "target_not_interactive"
+                    } else {
+                        "runtime_exception"
+                    });
+                    if native_option {
+                        reply["detail"] = json!({"step":"input.native_option","problem":"option or select is disabled or unavailable"});
+                    }
+                    return Err(prior_input(reply, true));
+                }
+                if native_option {
+                    selected = result
+                        .results
+                        .last()
+                        .and_then(crate::browser::navigation::native_select::selected_value);
+                    if selected.is_none() {
+                        return Err(prior_input(refusal("runtime_exception"), true));
+                    }
                 }
                 dispatched = true;
                 after_focus = is_focus;
@@ -4308,6 +4363,10 @@ async fn input_inner(
         return Err(reply);
     }
     let mut reply = json!({"browser":"user","outcome":"ok","tab":tab,"input_dispatched":dispatched,"connection_epoch":context.connection,"interaction_epoch":landed.interaction});
+    if let Some((value, selected_index)) = selected {
+        reply["value"] = json!(value);
+        reply["selectedIndex"] = json!(selected_index);
+    }
     if popup {
         reply["popup_activated_briefly"] = json!(true);
     }
@@ -4682,6 +4741,14 @@ async fn verify_input(
         snapshot.interaction,
         "verify_input.classify_flattened_document",
     )?;
+    if context.action == "click" {
+        crate::browser::navigation::native_select::target_from_capture(dom, identity, &record)
+            .map_err(|problem| {
+                let mut reply = refusal("target_not_interactive");
+                reply["detail"] = json!({"step":"verify_input.native_option","problem":problem});
+                prior_input(reply, dispatched)
+            })?;
+    }
     if record != *expected
         && !(context.action == "type"
             && matches!(check, InputCheck::PostFocus)
@@ -4820,7 +4887,9 @@ fn declared_severity(args: &Value) -> Result<Severity, Value> {
 }
 
 mod agent_enforcement;
-mod functions;
+pub(crate) mod functions;
+mod session_claims;
+use session_claims::SessionClaims;
 mod typing;
 
 #[cfg(test)]

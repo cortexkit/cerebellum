@@ -311,7 +311,7 @@ pub(crate) fn live_head(
 
 /// The route whose claims, snapshots, element refs and quarantine a request on
 /// (`channel`, `epoch`) uses in the person's own Chrome. Direct admitted head
-/// calls and that head's runs share its oldest tools route. Other scopes keep
+/// calls and that head's runs share a retained session alias. Other scopes keep
 /// their inbound route key; neither conversation identity nor relay origin
 /// confers access to a head's tabs.
 pub(crate) fn user_browser_route(
@@ -323,7 +323,8 @@ pub(crate) fn user_browser_route(
     let Some(facts) = planes.routes.get(channel, epoch) else {
         return Ok(own);
     };
-    let run = live_head(planes, &facts)?.is_some();
+    let head = live_head(planes, &facts)?;
+    let run = head.is_some();
     let heads = if run {
         planes
             .routes
@@ -342,7 +343,11 @@ pub(crate) fn user_browser_route(
         ))
     };
     match head_tools_route(&heads) {
-        Some(route) => Ok(route),
+        Some(route) => {
+            let scope =
+                admitted_head_scope(head.as_ref().unwrap_or(&facts)).expect("admitted head scope");
+            Ok(planes.user_browser.target().session_route(scope, route))
+        }
         None if run => Err(ParentRefusal::NoHeadToolsRoute),
         None => Ok(own),
     }
@@ -375,13 +380,13 @@ struct HeadRoute {
     facts: AcceptedBindFacts,
 }
 
-/// Which of a head's routes keeps its user-browser work, regardless of which
-/// route carried the direct call or linked run.
+/// Choose the initial bridge alias for a head that has not used this browser yet.
 ///
 /// Only a tools-surface route can be that route, since management routes never
 /// serve `browser_use`. Among tools routes the oldest-bound one is chosen.
-/// Closing that route releases its claims. A later call resolves the remaining
-/// oldest route and must claim again; ownership is never transferred on close.
+/// Once retained by the session, that alias survives route closure and a newer
+/// scope epoch for the same session. Its channel and epoch identify bridge
+/// custody, not a live transport.
 /// Channel numbers say nothing about which route was bound first.
 fn head_tools_route(heads: &[HeadRoute]) -> Option<crate::user_browser_bridge::Route> {
     heads
@@ -392,6 +397,18 @@ fn head_tools_route(heads: &[HeadRoute]) -> Option<crate::user_browser_bridge::R
 }
 
 impl RouteBindings {
+    pub(crate) fn has_user_browser_session(&self, owner: &str, scope_ref: &str) -> bool {
+        self.inner
+            .read()
+            .expect("route bindings lock poisoned")
+            .values()
+            .any(|facts| {
+                admitted_head_scope(facts.head_context()).is_some_and(|scope| {
+                    serde_json::to_string(&scope.owner).ok().as_deref() == Some(owner)
+                        && scope.scope_ref == scope_ref
+                })
+            })
+    }
     pub(crate) fn run_head(&self, run: &ScopeStamp) -> Result<AcceptedBindFacts, ParentRefusal> {
         let heads = self.head_routes(run)?;
         let head = &heads.first().ok_or(ParentRefusal::NoLiveHead)?.facts;

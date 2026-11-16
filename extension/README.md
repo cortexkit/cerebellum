@@ -77,8 +77,8 @@ exposed as an unadmitted public tool.
 
 The allowlist supports an explicit subset of the current driver's AX/DOM traversal,
 geometry, navigation, screenshots and classified input. Runtime function calls are
-fail-closed behind three SHA-256 pins for the browser adapter's exact selection,
-append-caret and focus-check declarations. Tests independently hash each declaration
+fail-closed behind four SHA-256 pins for the browser adapter's exact text selection,
+append-caret, focus-check and native-option declarations. Tests independently hash each declaration
 and reject a one-byte change. It intentionally refuses browser-wide
 Target bootstrap/activation, downloads, Runtime.evaluate and arbitrary JavaScript.
 OOPIF child sessions are discovered only beneath the claimed tab's per-action

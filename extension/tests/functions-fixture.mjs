@@ -1,7 +1,8 @@
-// Exact declarations used by the existing typing driver. Hashes are checked
+// Exact declarations used by the browser adapter. Hashes are checked
 // independently against the browser adapter's pinned wire contract.
 export const DECLARATIONS = Object.freeze({
   SELECT: "function() { if (typeof this.select === 'function') { this.select(); } else { const range = this.ownerDocument.createRange(); range.selectNodeContents(this); const selection = this.ownerDocument.getSelection(); selection.removeAllRanges(); selection.addRange(range); } }",
   APPEND_CARET: "function() { if (typeof this.setSelectionRange === 'function') { const end = this.value.length; this.setSelectionRange(end, end); } else { const range = this.ownerDocument.createRange(); range.selectNodeContents(this); range.collapse(false); const selection = this.ownerDocument.getSelection(); selection.removeAllRanges(); selection.addRange(range); } return true; }",
   HAS_FOCUS: "function() { return this.ownerDocument.hasFocus() && this.getRootNode().activeElement === this; }",
+  CHOOSE_OPTION: "function() { if (!(this instanceof HTMLOptionElement)) { throw new Error('target is not an option'); } const select = this.closest('select'); if (!select) { throw new Error('option has no select'); } const group = this.closest('optgroup'); if (this.disabled || select.disabled || (group && group.disabled)) { throw new Error('option, optgroup or select is disabled'); } this.selected = select.multiple ? !this.selected : true; select.dispatchEvent(new Event('input', {bubbles:true})); select.dispatchEvent(new Event('change', {bubbles:true})); return {value:select.value, selectedIndex:select.selectedIndex}; }",
 });
