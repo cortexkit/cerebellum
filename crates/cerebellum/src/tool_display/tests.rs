@@ -165,6 +165,8 @@ fn arm_counts(counter: &str) -> Value {
         "invalidOrigin":0,
         "invalidKeyOrPin":0,
         "duplicate":0,
+        "unparsed":0,
+        "noPrincipal":0,
     });
     counts[counter] = json!(1);
     counts
@@ -256,6 +258,81 @@ async fn arm_health_reports_duplicates_without_another_armed_count() {
     let mut expected = arm_counts("armed");
     expected["duplicate"] = json!(1);
     assert_eq!(arm_health_metrics(&planes).await, expected);
+}
+
+async fn route_reply(planes: &Planes, call: Frame) -> Value {
+    let (writer, mut replies) = mpsc::channel(32);
+    handle_frame(call, &writer, planes).await.unwrap();
+    let reply = tokio::time::timeout(crate::test_support::HANG_GUARD, replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    serde_json::from_slice(&reply.body).unwrap()
+}
+
+#[tokio::test]
+async fn relayed_prefrontal_status_sample_reports_no_schema_pin() {
+    let planes = planes();
+    let mut facts = install(&planes);
+    facts.principal = Some(Principal::Reserved {
+        module_id: "prefrontal-core".into(),
+    });
+    planes.routes.insert(7, 1, facts.clone());
+    // Reconstructed relay body, including the original caller's slash-separated key.
+    let body = br#"{"arguments":{"action":"status"},"call_key":"pf:39b7e70681f026216a4ca1efa6c4b6f9","name":"browser_use","origin":{"call_key":"msg_1e4085e85001iUy7R1Hq0nwm3A/toolu_01XiwEYbWXjj2i6uSjes7ViH","carrier":{"kind":"reserved","module_id":"thalamus-harness"}}}"#;
+    let decoded: subc_protocol::tool_call::ToolCallRequest = serde_json::from_slice(body).unwrap();
+    subc_protocol::tool_call::validate_call_key(decoded.call_key.as_ref().unwrap()).unwrap();
+    subc_protocol::tool_call::validate_call_origin(decoded.origin.as_ref().unwrap()).unwrap();
+    let mut call = frame(json!(null));
+    call.body = body.to_vec();
+    assert!(planes.routes.display.arm(&call, &facts).is_none());
+    assert_eq!(planes.routes.display.metrics()["noSchemaPin"], 1);
+
+    let planes = self::planes();
+    planes.routes.insert(7, 1, facts);
+    let reply = route_reply(&planes, call).await;
+    assert_eq!(reply["outcome"], "no_session", "{reply}");
+    assert_eq!(planes.routes.display.metrics()["noSchemaPin"], 1);
+}
+
+#[tokio::test]
+async fn arm_health_reports_unparsed_json() {
+    for (surface, body, unparsed) in [
+        (RouteSurface::Tools, b"{".to_vec(), 1),
+        (
+            RouteSurface::Tools,
+            serde_json::to_vec(&json!({"name":1,"arguments":{}})).unwrap(),
+            1,
+        ),
+        (
+            RouteSurface::Management,
+            serde_json::to_vec(&json!({"method":"unknown","params":{}})).unwrap(),
+            0,
+        ),
+    ] {
+        let planes = planes();
+        let mut facts = install(&planes);
+        facts.surface = surface;
+        planes.routes.insert(7, 1, facts);
+        let mut call = frame(request());
+        call.body = body;
+        route_reply(&planes, call).await;
+        let mut expected = arm_counts("unparsed");
+        expected["unparsed"] = json!(unparsed);
+        assert_eq!(arm_health_metrics(&planes).await, expected);
+    }
+}
+
+#[tokio::test]
+async fn arm_health_reports_no_principal_for_direct_call() {
+    let planes = planes();
+    let mut facts = install(&planes);
+    facts.principal = None;
+    planes.routes.insert(7, 1, facts);
+    let mut call = request();
+    call.as_object_mut().unwrap().remove("origin");
+    route_reply(&planes, frame(call)).await;
+    assert_eq!(arm_health_metrics(&planes).await, arm_counts("noPrincipal"));
 }
 
 async fn deliver(planes: &Planes, body: Value) {
