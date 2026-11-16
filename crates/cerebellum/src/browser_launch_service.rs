@@ -5338,7 +5338,7 @@ mod orphan_recovery_tests {
             assert!(reply["params"]["facts"][1]["value"]
                 .as_str()
                 .unwrap()
-                .contains("none of the"));
+                .starts_with("No running program is using the agent's browser profile"));
         }
 
         #[tokio::test]
@@ -5499,10 +5499,12 @@ mod orphan_recovery_tests {
             assert!(!message.contains(PROJECT), "{message}");
             assert!(!message.contains("attestation_untrusted"), "{message}");
             assert!(message.contains("1970-01-01T00:00:00.000Z"), "{message}");
+            // The card says so in plain words; the process number stays out of it.
             assert!(
-                message.contains("names process 4000000, which is not running"),
+                message.contains("The browser's lock points to a program that has closed"),
                 "{message}"
             );
+            assert!(!message.contains("4000000"), "{message}");
 
             assert_eq!(
                 fixture
