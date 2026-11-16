@@ -43,10 +43,10 @@ async fn authenticated(connection_file: &std::path::Path) -> Option<TcpStream> {
 
 /// Read the daemon's catalog on a connection of its own that presents no claim.
 ///
-/// `route.bind` reads the catalog to recognise display modules, so this runs
-/// for nearly every bind. The daemon serves `catalog.list` to any authenticated
+/// `route.bind` reads the catalog to recognise display modules when the declarer
+/// cache expires. The daemon serves `catalog.list` to any authenticated
 /// client, and a claim would cost a mint on the module connection for each
-/// bind. The connection never leaves this function and carries nothing but
+/// refresh. The connection never leaves this function and carries nothing but
 /// `catalog.list`: a route opened on it would be stamped as an unattested
 /// direct client, so anything that acts as this module needs
 /// [`DaemonDisplay::connection`] or its own claimed connection instead.

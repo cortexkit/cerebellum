@@ -37,6 +37,7 @@ pub(crate) trait Backend: Send + Sync {
 }
 
 const WRITE_WINDOW: Duration = Duration::from_secs(3);
+const DECLARER_TTL: Duration = Duration::from_secs(30);
 const MAX_WAITING: usize = 16_384;
 const MAX_RECENT_CONSENTS: usize = 16_384;
 const MAX_RECENT_CALLS: usize = 65_536;
@@ -46,7 +47,14 @@ type Key = (String, String);
 pub(crate) struct Records {
     pub(crate) events: Arc<crate::event_publish::Publisher>,
     backend: OnceLock<Arc<dyn Backend>>,
+    declarers: Mutex<DeclarerCache>,
     state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct DeclarerCache {
+    cached: Option<(tokio::time::Instant, Vec<String>)>,
+    in_flight: Option<tokio::sync::watch::Receiver<Option<Vec<String>>>>,
 }
 
 #[derive(Default)]
@@ -225,17 +233,51 @@ impl Records {
         let Some(backend) = self.backend.get() else {
             return vec![];
         };
-        let modules = tokio::time::timeout(WRITE_WINDOW, backend.declarers())
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        self.state
-            .lock()
-            .unwrap()
-            .display_principals
-            .extend(modules.iter().cloned());
-        modules
+        loop {
+            let (sender, mut receiver) = {
+                let mut cache = self.declarers.lock().unwrap();
+                if let Some((refreshed, modules)) = &cache.cached {
+                    if refreshed.elapsed() < DECLARER_TTL {
+                        return modules.clone();
+                    }
+                }
+                if let Some(receiver) = cache
+                    .in_flight
+                    .as_ref()
+                    .filter(|receiver| receiver.has_changed().is_ok())
+                {
+                    (None, receiver.clone())
+                } else {
+                    let (sender, receiver) = tokio::sync::watch::channel(None);
+                    cache.in_flight = Some(receiver.clone());
+                    (Some(sender), receiver)
+                }
+            };
+            if let Some(sender) = sender {
+                let answer = tokio::time::timeout(WRITE_WINDOW, backend.declarers())
+                    .await
+                    .ok()
+                    .flatten();
+                let mut cache = self.declarers.lock().unwrap();
+                cache.cached = answer
+                    .as_ref()
+                    .map(|modules| (tokio::time::Instant::now(), modules.clone()));
+                let modules = answer.unwrap_or_default();
+                self.state
+                    .lock()
+                    .unwrap()
+                    .display_principals
+                    .extend(modules.iter().cloned());
+                // Current waiters share even failures; later calls retry them.
+                cache.in_flight = None;
+                let _ = sender.send(Some(modules.clone()));
+                return modules;
+            }
+            if let Ok(answer) = receiver.wait_for(Option::is_some).await {
+                return answer.as_ref().unwrap().clone();
+            };
+            // A cancelled reader drops its sender. A waiter takes over on retry.
+        }
     }
 
     // Retain declarations across teardown and failed catalog refreshes. A display
