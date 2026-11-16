@@ -86,6 +86,14 @@ fn fixture_binding(path: &str, before: &[Token], name: &str) -> bool {
         // Offline CLI inspection launches the module fixture, never a browser.
         || (path == "cerebellum/tests/manifest_flag.rs"
             && expression.starts_with(&["support", "::", "daemon_binary", "(", "ckdev-cerebellum-manifest"]))
+        // The live registration suite's launcher runs the module the test
+        // names in NONCE_LAUNCH_PROGRAM (the test-built ck-cerebellum), never
+        // a browser; any other source for its program is refused.
+        || (path == "cerebellum/tests/support/nonce_launcher.rs"
+            && name == "program"
+            && expression.starts_with(&[
+                "std", "::", "env", "::", "var_os", "(", "NONCE_LAUNCH_PROGRAM", ")",
+            ]))
         // The operator-script provider requires a ckdev- copy of this test
         // executable; neither an arbitrary binary nor a browser is admitted.
         || (path == "cerebellum/src/computer_capability/operator_confirm_tests.rs"
@@ -360,6 +368,17 @@ fn manifest_cli_fixture_is_narrowly_recognized() {
         1
     );
     assert_eq!(violations("cerebellum/tests/other.rs", module).len(), 1);
+}
+
+#[test]
+fn nonce_launcher_accepts_only_the_program_its_test_names() {
+    let own = r#"let program = std::env::var_os("NONCE_LAUNCH_PROGRAM").expect("x"); std::process::Command::new(program);"#;
+    let other = r#"let program = std::env::var_os("CHROME").expect("x"); std::process::Command::new(program);"#;
+    let path = "cerebellum/tests/support/nonce_launcher.rs";
+    assert!(violations(path, own).is_empty());
+    assert_eq!(violations(path, other).len(), 1);
+    assert_eq!(violations("cerebellum/tests/other.rs", own).len(), 1);
+    assert!(violations(path, include_str!("../support/nonce_launcher.rs")).is_empty());
 }
 
 #[test]

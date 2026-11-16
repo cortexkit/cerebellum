@@ -203,7 +203,7 @@ fn cursor_avatar_work_never_runs_on_the_frame_reader() {
     let start = source.find("async fn module_loop<").unwrap();
     let end = source[start..].find("async fn send_hello(").unwrap() + start;
     let reader = &source[start..end];
-    assert!(reader.contains("read_frame(read_half)"));
+    assert!(reader.contains("read_one(read_half)"));
     for token in ["avatar", "render_tree", "fetch_and_render", "rasterize"] {
         assert!(
             !reader.contains(token),
