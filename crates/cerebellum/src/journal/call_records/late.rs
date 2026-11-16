@@ -50,8 +50,8 @@ impl HandoffEnding {
     }
 }
 
-/// A consent answer never dispatches the original action: its context may have
-/// changed while the person decided. Only the grant survives for a fresh call.
+/// The answer to a consent question. A live, re-verifiable browser request may
+/// consume approval; otherwise only the grant survives for a fresh call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsentEnding {
@@ -74,7 +74,7 @@ impl ConsentEnding {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
-enum LateOutcome {
+pub(super) enum LateOutcome {
     Handoff(HandoffEnding),
     Consent(ConsentEnding),
     Scope(ScopeEnding),
@@ -82,7 +82,7 @@ enum LateOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum ScopeEnding {
+pub(super) enum ScopeEnding {
     ScopeEnded,
 }
 
@@ -98,7 +98,7 @@ impl LateOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
-enum Phase {
+pub(super) enum Phase {
     Pending,
     Result {
         outcome: LateOutcome,
@@ -118,13 +118,13 @@ enum Phase {
 pub struct HeldHandoff {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     origin: String,
-    scope: ScopeIdentity,
-    phase: Phase,
+    pub(super) scope: ScopeIdentity,
+    pub(super) phase: Phase,
     // Omitted for present so its existing version-3 representation is unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     capture: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    consent: Option<String>,
+    pub(super) consent: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -200,7 +200,7 @@ fn event_id(
     format!("{:x}", hash.finalize())
 }
 
-fn next_seq(inner: &mut Inner, key: &Key) {
+pub(super) fn next_seq(inner: &mut Inner, key: &Key) {
     let head = inner.late_heads.entry(key.0.clone()).or_default();
     *head += 1;
     inner
@@ -255,7 +255,9 @@ fn wire_entry(record: &CallRecord) -> Option<LateEntry> {
             outcome,
             settled_at,
         } => (
-            if handoff.is_consent() || handoff.scope_ended() {
+            if (handoff.is_consent() && matches!(outcome, LateOutcome::Consent(_)))
+                || handoff.scope_ended()
+            {
                 late_results::kinds::NOT_STARTED
             } else {
                 late_results::kinds::RESULT
@@ -290,7 +292,13 @@ fn wire_entry(record: &CallRecord) -> Option<LateEntry> {
     }
     if handoff.scope_ended() {
         entry.reason = Some(late_results::reasons::SCOPE_ENDED.into());
-    } else if let (Some(ask_id), Phase::Result { outcome, .. }) = (&handoff.consent, &handoff.phase)
+    } else if let (
+        Some(ask_id),
+        Phase::Result {
+            outcome: LateOutcome::Consent(outcome),
+            ..
+        },
+    ) = (&handoff.consent, &handoff.phase)
     {
         entry.reason = Some("consent".into());
         entry.outcome = Some(outcome.as_str().into());
@@ -314,6 +322,8 @@ pub(super) fn settled_result(record: &CallRecord) -> Option<Value> {
 fn result_body(held: &HeldHandoff, outcome: &str) -> Value {
     if outcome == late_results::reasons::SCOPE_ENDED {
         json!({"outcome":"not_started","reason":late_results::reasons::SCOPE_ENDED})
+    } else if held.is_consent() && outcome == "unknown" {
+        json!({"outcome":"outcome_unknown"})
     } else if let Some(ask_id) = &held.consent {
         json!({"outcome": if outcome == "approved" { "not_started" } else { outcome },
             "detail":{"consent":outcome,"ask_id":ask_id},
@@ -324,8 +334,8 @@ fn result_body(held: &HeldHandoff, outcome: &str) -> Value {
 }
 
 impl CallRecords {
-    /// Save the obligation before forwarding the held first reply. Consent is
-    /// not an execution queue: an answer only settles this call as not started.
+    /// Persist the call record before forwarding the held first reply. The
+    /// original browser request, if resumable, stays only in bounded memory.
     pub fn hold_consent(
         &self,
         principal: &str,
@@ -499,11 +509,28 @@ impl CallRecords {
             })
             .map(|(key, _)| key.clone())
             .collect();
+        let mut consumed = false;
         for key in keys {
+            if ending == ConsentEnding::Approved && inner.entries[&key].browser_resume.is_some() {
+                let record = inner.entries[&key].record.clone();
+                self.write(&mut inner, &record, now_ms)?;
+                let resume = inner
+                    .entries
+                    .get_mut(&key)
+                    .unwrap()
+                    .browser_resume
+                    .as_mut()
+                    .unwrap();
+                resume.approved = true;
+                consumed = true;
+                continue;
+            }
             self.finish_held_locked(&mut inner, &key, LateOutcome::Consent(ending), now_ms)?;
         }
-        if let Some(display) = self.display.get().and_then(std::sync::Weak::upgrade) {
-            display.consent_completed(ask_id, ending.as_str());
+        if !consumed {
+            if let Some(display) = self.display.get().and_then(std::sync::Weak::upgrade) {
+                display.consent_completed(ask_id, ending.as_str());
+            }
         }
         Ok(())
     }
@@ -576,11 +603,12 @@ impl CallRecords {
             consent: None,
         });
         self.write(&mut inner, &record, now_ms)?;
-        inner
-            .entries
-            .get_mut(&key)
-            .expect("held record exists")
-            .record = record;
+        let entry = inner.entries.get_mut(&key).expect("held record exists");
+        entry.record = record;
+        // A new login/capture hold must still stop on scope end until its own
+        // deposit starts. Claiming the earlier consent is not evidence that
+        // the deposit has been sent.
+        entry.held_dispatched = false;
         if let Some(conversation) = conversation {
             inner.handoffs.insert(conversation.to_owned(), key);
         }
@@ -619,7 +647,7 @@ impl CallRecords {
         self.finish_held_locked(inner, key, LateOutcome::Handoff(outcome), now_ms)
     }
 
-    fn finish_held_locked(
+    pub(super) fn finish_held_locked(
         &self,
         inner: &mut Inner,
         key: &Key,
@@ -660,6 +688,7 @@ impl CallRecords {
         self.write(inner, &record, now_ms)?;
         let result = settled_result(&record).expect("settled handoff has a result");
         let entry = inner.entries.get_mut(key).expect("settled record exists");
+        entry.browser_resume = None;
         entry.record = record;
         // A resend must not receive login_pending after its entry was acked:
         // that would create another hold with no remaining settlement to pull.
@@ -812,6 +841,10 @@ impl CallRecords {
         let limit = request.limit.unwrap_or(100) as usize;
         let more = entries.len() > limit;
         entries.truncate(limit);
+        for (_, entry) in &mut entries {
+            let key = (entry.custodian.clone(), entry.call_key.clone());
+            Self::overlay_browser_result(&inner, &key, entry);
+        }
         let seq = entries
             .last()
             .map_or(if more { since } else { head }, |(seq, _)| *seq);

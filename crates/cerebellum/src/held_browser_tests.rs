@@ -1,0 +1,674 @@
+//! Browser actions exercise held consent through the real frame dispatcher.
+
+use super::*;
+use crate::browser::navigation::BrowserSnapshotObservation;
+use crate::browser_session::*;
+use crate::classification::{
+    classify_click, ElementClassificationInput, NodeIdentityInput, NonTypeClassificationInput,
+    TargetKind,
+};
+use crate::snapshot_store::{
+    AxRecord, BackendNodeIdentity, CommittedDocument, DocumentTransition, RefRecord, SnapshotKind,
+    SnapshotRef,
+};
+use std::sync::{atomic::AtomicUsize, Mutex};
+
+const PAGE_TEXT: &str = "held-page-text-must-never-reach-call-records-8d741";
+const PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+#[derive(Default)]
+struct Page {
+    navigations: AtomicUsize,
+    inputs: AtomicUsize,
+    private_redirect: std::sync::atomic::AtomicBool,
+    url: Mutex<String>,
+}
+
+struct Browser(Arc<Page>);
+
+fn classification(epoch: u64) -> crate::classification::NonTypeClassificationRecord {
+    classify_click(&NonTypeClassificationInput::new(
+        epoch,
+        ElementClassificationInput::new(
+            NodeIdentityInput::new("target", "frame", 42),
+            TargetKind::Button,
+        ),
+        "https://example.com",
+    ))
+    .unwrap()
+}
+
+impl OwnedBrowserProcess for Browser {
+    fn navigate(
+        &mut self,
+        _: &str,
+        url: &str,
+        _: NavigationWait,
+        _: u64,
+        tracker: &mut browser::Tracker,
+    ) -> Result<(), NavigationDriveError> {
+        self.0.navigations.fetch_add(1, Ordering::SeqCst);
+        *self.0.url.lock().unwrap() = url.into();
+        tracker.url_final = Some(url.into());
+        if self.0.private_redirect.load(Ordering::SeqCst) {
+            tracker.url_final = Some("https://127.0.0.1/private".into());
+            tracker.main_frame_network.private_origin_seen = true;
+        }
+        tracker.load_observed = true;
+        Ok(())
+    }
+    fn committed_document(
+        &mut self,
+        _: &str,
+        _: u64,
+    ) -> Result<CommittedDocument, NavigationDriveError> {
+        Ok(CommittedDocument::new(
+            self.0.url.lock().unwrap().clone(),
+            1,
+            "loader",
+        ))
+    }
+    fn snapshot(
+        &mut self,
+        _: &str,
+        _: SnapshotKind,
+        _: u64,
+    ) -> Result<BrowserSnapshotObservation, NavigationDriveError> {
+        Ok(BrowserSnapshotObservation {
+            records: vec![AxRecord {
+                depth: 0,
+                role: "document".into(),
+                name: PAGE_TEXT.into(),
+                value: None,
+                reference: None,
+            }],
+            dom_text: Some(PAGE_TEXT.into()),
+            refs: vec![],
+            ax_truncated: false,
+            refs_truncated: false,
+            facts: Default::default(),
+        })
+    }
+    fn classify_point(
+        &mut self,
+        _: &str,
+        _: BrowserClickPosition,
+        epoch: u64,
+        _: &str,
+        _: u64,
+    ) -> Result<
+        Result<
+            crate::classification::NonTypeClassificationRecord,
+            crate::classification::ClassificationUnavailable,
+        >,
+        NavigationDriveError,
+    > {
+        Ok(Ok(classification(epoch)))
+    }
+    fn click_point_classified(
+        &mut self,
+        _: &str,
+        _: BrowserClickPosition,
+        _: u64,
+        _: &str,
+        _: &crate::classification::NonTypeClassificationRecord,
+        _: u64,
+        _: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        self.0.inputs.fetch_add(1, Ordering::SeqCst);
+        panic!("a held coordinate click must not dispatch")
+    }
+    fn click_classified(
+        &mut self,
+        _: &str,
+        _: &BackendNodeIdentity,
+        _: u64,
+        _: &str,
+        _: Option<&crate::classification::NonTypeClassificationRecord>,
+        _: u64,
+        _: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        self.0.inputs.fetch_add(1, Ordering::SeqCst);
+        panic!("a stale held ref must not dispatch")
+    }
+    fn generation_matches(&self) -> bool {
+        true
+    }
+    fn request_graceful_termination(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+    fn wait_for_exit(&mut self, _: Duration) -> Result<bool, ProcessControlFailure> {
+        Ok(true)
+    }
+    fn force_terminate(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+    fn wait_until_reaped(&mut self) -> Result<(), ProcessControlFailure> {
+        Ok(())
+    }
+}
+
+async fn fixture() -> (
+    Planes,
+    tests::ScriptedConsent,
+    Arc<Page>,
+    journal::call_records::InMemoryCallRecordStorage,
+) {
+    fixture_with_consent(true).await
+}
+
+async fn fixture_with_consent(
+    detached: bool,
+) -> (
+    Planes,
+    tests::ScriptedConsent,
+    Arc<Page>,
+    journal::call_records::InMemoryCallRecordStorage,
+) {
+    let consent = tests::ScriptedConsent::new();
+    if detached {
+        detach(&consent, "browser-card");
+    } else {
+        consent.raises("browser-card");
+    }
+    let mut planes = attach_consent(
+        isolated_test_planes(&Arc::new(HealthState::new())),
+        &consent,
+    );
+    let storage = journal::call_records::InMemoryCallRecordStorage::new();
+    planes.calls = Arc::new(journal::call_records::CallRecords::open(
+        Box::new(storage.clone()),
+        wall_clock_ms(),
+    ));
+    planes.browser = Arc::new(
+        Arc::try_unwrap(planes.browser)
+            .ok()
+            .unwrap()
+            .with_shared_grants(planes.management.browser_grants()),
+    );
+    bind_held(&planes).await;
+    let page = Arc::new(Page::default());
+    *page.url.lock().unwrap() = "https://example.com".into();
+    assert!(matches!(
+        planes.sessions.acquire_launch_slot("head-conversation"),
+        LaunchSlot::Acquired { .. }
+    ));
+    planes
+        .sessions
+        .establish_ready(
+            "head-conversation",
+            ProfileDisposition::Disposable,
+            planes.browser_config.as_ref().unwrap(),
+            planes.lease_clock.as_ref(),
+            Box::new(Browser(page.clone())),
+            Box::new(Cleanup),
+        )
+        .unwrap();
+    let identity = &planes.routes.get(8, 3).unwrap().identity;
+    planes.browser.open_context(identity.clone()).await.unwrap();
+    (planes, consent, page, storage)
+}
+
+fn navigate_request() -> Value {
+    json!({"name":"browser_use","call_key":"held-navigation","arguments":{
+        "action":"navigate","url":"https://example.com/destination","wait":"none","read_page":true,
+        "severity":{"tier":3,"credential":false,"financial":false},"intent":"read the approved destination"}})
+}
+
+async fn start_navigation(planes: &Planes) {
+    assert_held(
+        &decode(exchange(planes, 9, 3, navigate_request()).await),
+        "consent",
+    );
+    assert_eq!(planes.calls.browser_request_count(), 1);
+}
+
+#[tokio::test]
+async fn approval_while_held_runs_navigate_and_returns_its_page_without_persisting_text() {
+    let (planes, consent, page, storage) = fixture().await;
+    start_navigation(&planes).await;
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
+    consent.feed(json!([answered("browser-card", "allow_30m")]));
+    let reply = late(&planes, 9).await;
+    let entry = &reply["entries"][0];
+    assert_eq!(entry["kind"], "result", "{reply}");
+    let body = &entry["result"]["structuredContent"];
+    assert_eq!(body["outcome"], "ok", "{reply}");
+    assert_eq!(body["url_final"], "https://example.com/destination");
+    assert!(
+        body["state_text"].as_str().unwrap().contains(PAGE_TEXT),
+        "{reply}"
+    );
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 1);
+    assert_eq!(planes.calls.browser_request_count(), 0);
+    let disk = String::from_utf8(storage.contents().unwrap()).unwrap();
+    assert!(!disk.contains(PAGE_TEXT));
+    let restarted = journal::call_records::CallRecords::open(Box::new(storage), wall_clock_ms());
+    let after_restart = restarted
+        .late_results(
+            "reserved:basal",
+            &cortexkit_role_tool_provider::late_results::LateResultsRequest::new(),
+            wall_clock_ms(),
+        )
+        .unwrap();
+    assert_eq!(
+        after_restart.entries[0].result.as_ref().unwrap()["outcome"],
+        "outcome_unknown"
+    );
+}
+
+#[tokio::test]
+async fn stale_ref_after_held_approval_names_stale_snapshot_without_input() {
+    let (planes, consent, page, _) = fixture().await;
+    let identity = &planes.routes.get(8, 3).unwrap().identity;
+    let snapshot = planes
+        .browser
+        .retain_text_snapshot(
+            identity,
+            SnapshotKind::Ax,
+            &[AxRecord {
+                depth: 0,
+                role: "button".into(),
+                name: "Access".into(),
+                value: None,
+                reference: Some("e1".into()),
+            }],
+            None,
+            vec![RefRecord {
+                frame_document: None,
+                captured: SnapshotRef::new("e1", "button", "Access", 0).unwrap(),
+                frame_path: vec!["frame".into()],
+                backend_identity: Some(BackendNodeIdentity::new("target", "frame", 42).unwrap()),
+                raw_role: None,
+                raw_name: None,
+                classification: Ok(Box::new(classification(0))),
+            }],
+            4096,
+            Some(CommittedDocument::new("https://example.com", 1, "loader")),
+        )
+        .await
+        .unwrap();
+    let request = json!({"name":"browser_use","call_key":"held-ref","arguments":{"action":"click","ref":"e1","snapshot_id":snapshot["snapshot_id"],"severity":{"tier":3,"credential":false,"financial":false},"intent":"press the shown button"}});
+    assert_held(&decode(exchange(&planes, 9, 3, request).await), "consent");
+    planes
+        .browser
+        .replace_document(identity, DocumentTransition::TopLevelDocumentReplaced)
+        .await
+        .unwrap();
+    consent.feed(json!([answered("browser-card", "allow_30m")]));
+    let reply = late(&planes, 9).await;
+    let entry = &reply["entries"][0];
+    assert_eq!(entry["kind"], "not_started", "{reply}");
+    assert_eq!(entry["reason"], "stale_snapshot", "{reply}");
+    assert_eq!(
+        entry["result"]["structuredContent"]["reason"],
+        "stale_snapshot"
+    );
+    assert_eq!(page.inputs.load(Ordering::SeqCst), 0);
+    assert_eq!(planes.calls.browser_request_count(), 0);
+}
+
+#[tokio::test]
+async fn refused_private_landing_after_navigation_is_not_misreported_as_not_started() {
+    let (planes, consent, page, _) = fixture().await;
+    page.private_redirect.store(true, Ordering::SeqCst);
+    start_navigation(&planes).await;
+    consent.feed(json!([answered("browser-card", "allow_30m")]));
+    let reply = late(&planes, 9).await;
+    assert_eq!(reply["entries"][0]["kind"], "result", "{reply}");
+    assert_eq!(
+        reply["entries"][0]["result"]["structuredContent"]["outcome"], "authorization_denied",
+        "{reply}"
+    );
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        consent.cards().len(),
+        1,
+        "resumption must not raise a replacement consent question"
+    );
+}
+
+#[tokio::test]
+async fn held_click_point_never_runs_after_approval() {
+    let (planes, consent, page, _) = fixture().await;
+    let identity = &planes.routes.get(8, 3).unwrap().identity;
+    let view = coordinate::ViewportObservation::new(
+        0,
+        coordinate::TransformInputs::from_values(0.0, 0.0, 1.0, 1.0, 1.0, 1.0),
+    );
+    let snapshot = planes
+        .browser
+        .retain_screenshot(
+            identity,
+            coordinate::ScreenshotPayload::new(PNG, 1, 1),
+            view,
+            view,
+            false,
+            Some(CommittedDocument::new("https://example.com", 1, "loader")),
+        )
+        .await
+        .unwrap();
+    let request = json!({"name":"browser_use","call_key":"held-point","arguments":{"action":"click_point","snapshot_id":snapshot["snapshot_id"],"point":{"x":0,"y":0},"image_width_px":1,"image_height_px":1,"severity":{"tier":3,"credential":false,"financial":false},"intent":"press at the old image position"}});
+    assert_held(&decode(exchange(&planes, 9, 3, request).await), "consent");
+    assert_eq!(planes.calls.browser_request_count(), 0);
+    consent.feed(json!([answered("browser-card", "allow_30m")]));
+    let reply = late(&planes, 9).await;
+    assert_eq!(reply["entries"][0]["kind"], "not_started", "{reply}");
+    assert_eq!(reply["entries"][0]["detail"]["consent"], "approved");
+    assert_eq!(page.inputs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn late_approval_after_explicit_withdrawal_cannot_run_the_navigation() {
+    let (planes, consent, page, _) = fixture().await;
+    start_navigation(&planes).await;
+    consent.feed(json!([]));
+    let withdraw = decode(
+        exchange(
+            &planes,
+            9,
+            4,
+            json!({"name":"tool.withdraw","arguments":{"call_key":"held-navigation"}}),
+        )
+        .await,
+    );
+    assert_eq!(withdraw["answer"], "withdrawn", "{withdraw}");
+    assert_eq!(planes.calls.browser_request_count(), 0);
+    consent.feed(json!([answered("browser-card", "allow_30m")]));
+    let reply = late(&planes, 9).await;
+    assert_eq!(reply["entries"][0]["kind"], "not_started", "{reply}");
+    assert_eq!(reply["entries"][0]["detail"]["consent"], "withdrawn");
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cancel_after_first_held_reply_removes_the_original_request() {
+    let (planes, consent, page, _) = fixture().await;
+    start_navigation(&planes).await;
+    let mut cancel = request(9, 3, json!({}));
+    cancel.header.ty = FrameType::Cancel;
+    let (writer, _) = mpsc::channel(16);
+    handle_frame_for_test(cancel, &writer, &planes)
+        .await
+        .unwrap();
+    assert_eq!(planes.calls.browser_request_count(), 0);
+    consent.feed(json!([answered("browser-card", "allow_30m")]));
+    assert_eq!(late(&planes, 9).await["entries"][0]["kind"], "not_started");
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn deny_and_card_expiry_remove_the_original_request() {
+    for record in [
+        answered("browser-card", "deny"),
+        json!({"elicitation_id":"browser-card","state":"expired"}),
+    ] {
+        let (planes, consent, page, _) = fixture().await;
+        start_navigation(&planes).await;
+        consent.feed(json!([record]));
+        assert_eq!(late(&planes, 9).await["entries"][0]["kind"], "not_started");
+        assert_eq!(planes.calls.browser_request_count(), 0);
+        assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn route_end_removes_the_original_request() {
+    let (planes, _, page, _) = fixture().await;
+    start_navigation(&planes).await;
+    let mut goodbye = request(9, 4, json!({}));
+    goodbye.header.ty = FrameType::Goodbye;
+    let (writer, _) = mpsc::channel(16);
+    handle_frame_for_test(goodbye, &writer, &planes)
+        .await
+        .unwrap();
+    assert_eq!(planes.calls.browser_request_count(), 0);
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn scope_end_removes_the_original_request() {
+    let (planes, _, page, _) = fixture().await;
+    start_navigation(&planes).await;
+    let scope = journal::call_records::ScopeIdentity::from_stamp(
+        planes.routes.get(9, 3).unwrap().scope.as_ref().unwrap(),
+    );
+    planes
+        .calls
+        .end_held_scope(&scope, wall_clock_ms())
+        .unwrap();
+    assert_eq!(planes.calls.browser_request_count(), 0);
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn session_end_removes_the_original_request() {
+    let (planes, _, page, _) = fixture().await;
+    start_navigation(&planes).await;
+    planes
+        .calls
+        .end_consent_conversation("head-conversation", wall_clock_ms())
+        .unwrap();
+    assert_eq!(planes.calls.browser_request_count(), 0);
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn resume_and_withdrawal_race_produce_exactly_one_result() {
+    let (planes, _, _, _) = fixture().await;
+    start_navigation(&planes).await;
+    let calls = &planes.calls;
+    calls
+        .finish_consent(
+            "browser-card",
+            journal::call_records::ConsentEnding::Approved,
+            wall_clock_ms(),
+        )
+        .unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let claiming = scope.spawn(|| {
+            barrier.wait();
+            calls
+                .claim_browser_request("reserved:basal", "held-navigation", wall_clock_ms(), |_| {
+                    true
+                })
+                .unwrap()
+        });
+        barrier.wait();
+        calls
+            .abandon_browser_request("reserved:basal", "held-navigation", wall_clock_ms())
+            .unwrap();
+        if let Some(resume) = claiming.join().unwrap() {
+            let mut result = resume.frame;
+            result.header.ty = FrameType::Response;
+            result.body = serde_json::to_vec(&json!({"outcome":"ok"})).unwrap();
+            calls
+                .finish_browser_request(
+                    "reserved:basal",
+                    "held-navigation",
+                    result,
+                    false,
+                    wall_clock_ms(),
+                )
+                .unwrap();
+        }
+    });
+    let reply = calls
+        .late_results(
+            "reserved:basal",
+            &cortexkit_role_tool_provider::late_results::LateResultsRequest::new(),
+            wall_clock_ms(),
+        )
+        .unwrap();
+    assert_eq!(reply.entries.len(), 1, "{reply:?}");
+    assert_eq!(calls.browser_request_count(), 0);
+}
+
+#[tokio::test]
+async fn replaced_head_bind_cannot_resume_even_when_its_facts_are_identical() {
+    let (planes, consent, page, _) = fixture().await;
+    start_navigation(&planes).await;
+    let original = planes.routes.remove(8, 3).unwrap();
+    planes.routes.insert(8, 3, original);
+    consent.feed(json!([answered("browser-card", "allow_30m")]));
+    let reply = late(&planes, 9).await;
+    assert_eq!(reply["entries"][0]["kind"], "not_started", "{reply}");
+    assert_eq!(reply["entries"][0]["detail"]["consent"], "approved");
+    assert_eq!(planes.calls.browser_request_count(), 0);
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn expired_memory_hold_keeps_approval_for_a_fresh_call_without_running() {
+    let (planes, consent, page, _) = fixture().await;
+    start_navigation(&planes).await;
+    let mut body = navigate_request();
+    body.as_object_mut().unwrap().remove("call_key");
+    planes.calls.retain_browser_request(
+        "reserved:basal",
+        "held-navigation",
+        journal::call_records::BrowserResume {
+            frame: request(9, 3, body),
+            facts: planes.routes.get(9, 3).unwrap(),
+            bind_sequence: planes.routes.bind_sequence(9, 3).unwrap(),
+            head: Some(((8, 3), planes.routes.bind_sequence(8, 3).unwrap())),
+            approved: false,
+            ask_id: String::new(),
+            created: std::time::Instant::now()
+                - journal::call_records::CACHE_MAX_AGE
+                - Duration::from_secs(1),
+        },
+    );
+    consent.feed(json!([answered("browser-card", "allow_30m")]));
+    let reply = late(&planes, 9).await;
+    assert_eq!(reply["entries"][0]["kind"], "not_started", "{reply}");
+    assert_eq!(reply["entries"][0]["detail"]["consent"], "approved");
+    assert_eq!(planes.calls.browser_request_count(), 0);
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn held_request_registry_is_bounded_by_count_and_argument_bytes() {
+    let (planes, _, _, _) = fixture().await;
+    let facts = planes.routes.get(9, 3).unwrap();
+    for index in 0..=journal::call_records::CACHE_MAX_REPLIES {
+        let key = format!("bounded-{index}");
+        assert!(matches!(
+            planes
+                .calls
+                .begin("reserved:basal", &key, "head-conversation", wall_clock_ms()),
+            journal::call_records::Begin::Execute(_)
+        ));
+        browser_held::retain(
+            &planes,
+            &facts,
+            &key,
+            &request(9, 100 + index as u64, navigate_request()),
+        );
+    }
+    assert_eq!(
+        planes.calls.browser_request_count(),
+        journal::call_records::CACHE_MAX_REPLIES
+    );
+    planes.calls.end_conversation("head-conversation");
+    assert_eq!(planes.calls.browser_request_count(), 0);
+    let mut oversized = navigate_request();
+    oversized["arguments"]["text"] =
+        json!("x".repeat(journal::call_records::CACHE_MAX_REPLY_BYTES));
+    browser_held::retain(&planes, &facts, "bounded-0", &request(9, 100, oversized));
+    assert_eq!(planes.calls.browser_request_count(), 0);
+    for index in 0..9 {
+        let mut body = navigate_request();
+        body["arguments"]["text"] =
+            json!("x".repeat(journal::call_records::CACHE_MAX_REPLY_BYTES - 1024));
+        browser_held::retain(
+            &planes,
+            &facts,
+            &format!("bounded-{index}"),
+            &request(9, 100, body),
+        );
+    }
+    assert_eq!(planes.calls.browser_request_count(), 8);
+}
+
+#[test]
+fn browser_late_approval_classification_keeps_refs_but_never_image_coordinates() {
+    for action in [
+        "navigate",
+        "snapshot",
+        "screenshot",
+        "scroll",
+        "status",
+        "launch",
+        "open_tab",
+        "claim_tab",
+        "close",
+        "open_grant",
+        "present",
+        "resume",
+        "import_login",
+        "capture_login",
+        "fill_login",
+        "revoke_access",
+        "click",
+        "type",
+    ] {
+        assert!(
+            browser_held::can_resume(&json!({"action":action})),
+            "{action}"
+        );
+    }
+    assert!(!browser_held::can_resume(&json!({"action":"click_point"})));
+    assert!(!browser_held::can_resume(
+        &json!({"action":"click","point":{"x":1,"y":2}})
+    ));
+}
+
+#[tokio::test]
+async fn direct_navigation_already_runs_when_approval_arrives_in_call() {
+    let (planes, consent, page, _) = fixture_with_consent(false).await;
+    consent.script.then(
+        cingulate_client::wire::CONSENT_AWAIT,
+        cingulate_client::Reply::Result(answered("browser-card", "allow_30m")),
+    );
+    let mut request = navigate_request();
+    request.as_object_mut().unwrap().remove("call_key");
+    let reply = decode(exchange(&planes, 8, 3, request).await);
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 1);
+    assert_eq!(planes.calls.browser_request_count(), 0);
+}
+
+#[tokio::test]
+async fn direct_coordinate_click_does_not_run_after_waiting_for_approval() {
+    let (planes, consent, page, _) = fixture_with_consent(false).await;
+    consent.script.then(
+        cingulate_client::wire::CONSENT_AWAIT,
+        cingulate_client::Reply::Result(answered("browser-card", "allow_30m")),
+    );
+    let identity = &planes.routes.get(8, 3).unwrap().identity;
+    let view = coordinate::ViewportObservation::new(
+        0,
+        coordinate::TransformInputs::from_values(0.0, 0.0, 1.0, 1.0, 1.0, 1.0),
+    );
+    let snapshot = planes
+        .browser
+        .retain_screenshot(
+            identity,
+            coordinate::ScreenshotPayload::new(PNG, 1, 1),
+            view,
+            view,
+            false,
+            Some(CommittedDocument::new("https://example.com", 1, "loader")),
+        )
+        .await
+        .unwrap();
+    let request = json!({"name":"browser_use","arguments":{"action":"click_point","snapshot_id":snapshot["snapshot_id"],"point":{"x":0,"y":0},"image_width_px":1,"image_height_px":1,"severity":{"tier":3,"credential":false,"financial":false},"intent":"press at the old image position"}});
+    let reply = decode(exchange(&planes, 8, 3, request).await);
+    assert_eq!(reply["outcome"], "not_started", "{reply}");
+    assert_eq!(reply["detail"]["consent"], "approved");
+    assert_eq!(page.inputs.load(Ordering::SeqCst), 0);
+    assert_eq!(planes.calls.browser_request_count(), 0);
+}

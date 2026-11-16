@@ -24,6 +24,7 @@ pub mod browser_config;
 mod browser_consent;
 pub mod browser_crash_reports;
 pub mod browser_executable_identity;
+mod browser_held;
 pub mod browser_launch;
 pub mod browser_launch_readiness;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -4062,6 +4063,11 @@ async fn handle_frame(
             planes
                 .cancellations
                 .cancel_route(frame.header.channel, frame.header.epoch);
+            planes.calls.abandon_browser_route(
+                frame.header.channel,
+                frame.header.epoch,
+                wall_clock_ms(),
+            );
             if let Some(facts) = removed {
                 let conversation_key = &facts.identity.conversation_key;
                 let last_route = !planes.routes.carries_conversation(conversation_key);
@@ -4121,6 +4127,12 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Cancel => {
+            planes.calls.abandon_browser_correlation(
+                frame.header.channel,
+                frame.header.epoch,
+                frame.header.corr,
+                wall_clock_ms(),
+            );
             terminal_arbiter::cancel_late_fronting_request(
                 planes.cancellations.namespace(),
                 (frame.header.channel, frame.header.epoch, frame.header.corr),
@@ -4226,6 +4238,7 @@ async fn handle_frame(
             let browser_park_limit = BROWSER_CONSENT_PARK_LIMIT
                 .try_with(|limit| *limit)
                 .unwrap_or(Duration::from_secs(120));
+            let resumed_browser = browser_held::context();
             let worker = async move {
                 let planes = worker_planes;
                 #[cfg(test)]
@@ -4266,6 +4279,9 @@ async fn handle_frame(
                     browser_arrival,
                     Box::pin(handle_route_request(frame, &proxy, &planes)),
                 ));
+                // Task locals do not cross spawn: carry only the already-claimed
+                // browser continuation's key and consent id to its new guard.
+                let dispatch = browser_held::with_context(resumed_browser, dispatch);
                 let dispatch = BROWSER_CONSENT_PARK_LIMIT.scope(browser_park_limit, dispatch);
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 let result = computer_capability::serialized_call(computer_arrival, dispatch).await;
@@ -4558,13 +4574,16 @@ async fn dispatch_resolved_route(
         frame.header.epoch,
         frame.header.corr,
     );
-    if let Ok(live) = consent_drain::live_call(&frame, facts, planes) {
-        // A failed drain is retried on a later call; it must not replace this
-        // call's ordinary reply with a consent refusal.
-        let _ = planes
-            .consent_drain
-            .run_recording(&planes.consent, &live, Some(&planes.calls))
-            .await;
+    if !browser_held::resuming() {
+        if let Ok(live) = consent_drain::live_call(&frame, facts, planes) {
+            // A failed drain is retried on a later call; it must not replace this
+            // call's ordinary reply with a consent refusal.
+            let _ = planes
+                .consent_drain
+                .run_recording(&planes.consent, &live, Some(&planes.calls))
+                .await;
+        }
+        Box::pin(browser_held::run_ready(planes)).await;
     }
 
     let dispatch = dispatch_bound_route(frame, writer, planes, facts);
@@ -7081,13 +7100,24 @@ async fn handle_keyed_tool_request_inner(
     let origin =
         cerebellum_core::journal::CallOriginRecord::from_request_member(object.get("origin"));
     let Some(call_key) = call_key else {
-        return handle_tool_request(
-            frame,
-            writer,
-            planes,
-            &CallObservation::new().with_origin(origin),
-        )
-        .await;
+        let _resumed_run = browser_held::resuming()
+            .then(|| {
+                let facts = planes.routes.get(channel, epoch)?;
+                let key = call_context::current_call_key()?;
+                planes.run_calls.register(
+                    &facts,
+                    &key,
+                    planes.cancellations.get((channel, epoch, corr)),
+                )
+            })
+            .flatten();
+        let mut observation = CallObservation::new().with_origin(origin);
+        if browser_held::resuming() {
+            if let Some(key) = call_context::current_call_key() {
+                observation = observation.with_key(key);
+            }
+        }
+        return handle_tool_request(frame, writer, planes, &observation).await;
     };
     let flat_tool = matches!(
         object.get("name").and_then(Value::as_str),
@@ -7263,6 +7293,7 @@ async fn handle_keyed_tool_request_inner(
         }
     };
 
+    browser_held::retain(planes, &facts, &call_key, &call);
     if let Some(terminal) = TerminalArbiter::current() {
         let observation = CallObservation::new()
             .with_origin(origin)
@@ -7724,6 +7755,11 @@ async fn handle_tool_withdraw(
     }
     match lookup {
         Lookup::Own(snapshot) => {
+            if snapshot.state == call_records::CallState::Asked {
+                let _ = planes
+                    .calls
+                    .abandon_browser_request(&carrier, &call_key, wall_clock_ms());
+            }
             if let Some(cancel) =
                 planes
                     .run_calls
@@ -7860,6 +7896,7 @@ async fn handle_tool_request_inner(
     planes: &Planes,
     call: &CallObservation,
 ) -> Result<(), ModuleError> {
+    browser_held::track_consent(planes);
     if let Some(terminal) = TerminalArbiter::current() {
         terminal.set_step(CallStep::Queue);
     }
@@ -8697,6 +8734,9 @@ async fn serve_browser_with_consent(
     let Some(scope) = reply.pointer("/detail/grant_request") else {
         return Ok(reply);
     };
+    if browser_held::resuming() {
+        return Ok(reply);
+    }
     if codemode::legacy_run(facts) {
         reply["outcome"] = json!("consent_unavailable");
         reply["detail"]["reason"] = json!("agent_run");
@@ -8828,6 +8868,11 @@ async fn serve_browser_with_consent(
     drop(parked);
     match ending {
         InCall::Settled(_) if matches!(settled, management::BrowserGrantSettlement::Granted(_)) => {
+            if !browser_held::can_resume(arguments) || capability.name() == "browser.click_point" {
+                return Ok(
+                    json!({"outcome":"not_started", "detail":{"consent":"approved","ask_id":id}, "remedy":"Approved; call again to run it."}),
+                );
+            }
             if let Some(terminal) = TerminalArbiter::current() {
                 terminal.track_consent(Arc::clone(&planes.consent), &id);
             }

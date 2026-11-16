@@ -2059,7 +2059,7 @@ impl Context<'_> {
         {
             return Ok(grant);
         }
-        if self.facts.flow_id.is_some() {
+        if self.facts.flow_id.is_some() || crate::browser_held::resuming() {
             return Err(refusal("consent_unavailable"));
         }
         let can_record = self.planes.management.unified_agent_grants().map_or_else(
@@ -2239,7 +2239,13 @@ impl Context<'_> {
                     .iter()
                     .find(|choice| choice.option_id() == choice_id)
                     .unwrap();
-                return self.record_agent_answer(grant, &ask_id, *choice);
+                let grant = self.record_agent_answer(grant, &ask_id, *choice)?;
+                if self.action == "click_point" {
+                    return Err(
+                        json!({"browser":"user","outcome":"not_started","detail":{"consent":"approved","ask_id":ask_id},"input_dispatched":false,"remedy":"Approved; call again to run it."}),
+                    );
+                }
+                return Ok(grant);
             }
             Ending::Declined { choice_id } if choice_id == SITE_DENY => {
                 let mut reply = refusal("consent_declined");
