@@ -4,6 +4,8 @@ Read this before you change code here. Each rule comes from a defect a worker sh
 
 ## Gates
 
+The file-size check keeps tracked hand-written Rust source under 5,000 lines and prevents already larger files from growing. Before adding to a baselined file, split something out first or ask the agent that assigned the work.
+
 Don't run the fast gate (`scripts/fast-gate.sh`) or the full gate (`scripts/rust-test-gate.sh`). The head runs the fast gate when it merges your delivery, so running it yourself only doubles the wait: on 31 Oct and 1 Nov, workers spent most of each hour watching gate halves the head then ran again.
 
 Run only what your change needs, and keep each run to minutes:

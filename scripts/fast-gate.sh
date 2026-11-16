@@ -260,6 +260,11 @@ if printf '%s\n' "$plan" | grep -Fxq 'A|shell-exit-traps'; then
   start_static_phase "nounset scripts fail closed on EXIT" check_shell_exit_traps
 fi
 
+if [ "$part" = mac ]; then
+  start_static_phase "source file size limit" \
+    bash -c 'scripts/file-size-check.test.sh && scripts/file-size-check.sh'
+fi
+
 if [ "$part" = linux ]; then
 start_static_phase "module wiring: scripts/module-wiring-gate.sh" ./scripts/module-wiring-gate.sh
 # The full gate's test-code source scans take seconds and catch defects no
