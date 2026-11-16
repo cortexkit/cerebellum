@@ -82,13 +82,10 @@ pub(super) async fn reconcile(
     };
     let desired: BTreeSet<_> = replies.iter().map(|(pin, _)| key(pin)).collect();
     for (pin, bytes) in replies {
+        // Cerebellum never writes to stderr; the overflow gauge is the only
+        // trace. Views are static templates, so a skipped pin reproduces in tests.
         if bytes.len() > value_cap() {
             gauges.failed(Failure::Overflow);
-            eprintln!(
-                "bus views skipped pin {pin}: {} bytes exceeds {} byte cap",
-                bytes.len(),
-                value_cap()
-            );
             continue;
         }
         let key = key(&pin);
