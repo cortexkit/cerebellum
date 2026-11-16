@@ -223,24 +223,7 @@ mod tests {
     /// descriptor 3. Returns the probe's report lines.
     #[cfg(unix)]
     fn probe(mode: &str, pipe: bool) -> Vec<String> {
-        static EXECUTABLE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-        // Copy once before any probe forks: an overlapping copy can leave a
-        // writable executable descriptor in another child until its exec.
-        let executable = EXECUTABLE.get_or_init(|| {
-            let directory = std::path::Path::new("/tmp").join(format!(
-                "cerebellum-launch-probe-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir(&directory).unwrap();
-            let executable = directory.join("probe");
-            std::fs::copy(std::env::current_exe().expect("test binary"), &executable).unwrap();
-            executable
-        });
-        let mut command = Command::new(executable);
+        let mut command = Command::new(std::env::current_exe().expect("test binary"));
         command
             .args([PROBE_TEST, "--exact", "--nocapture", "--test-threads=1"])
             .env(PROBE_MODE, mode)
