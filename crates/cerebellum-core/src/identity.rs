@@ -452,7 +452,7 @@ impl AcceptedBindFacts {
                             .map(String::from)
                             .to_vec()
                     }
-                    subc_protocol::scope::ScopeKind::Ephemeral => Vec::new(),
+                    _ => Vec::new(),
                 };
             }
         }
@@ -690,7 +690,7 @@ fn session_kind_from_scope(kind: subc_protocol::scope::ScopeKind) -> SessionKind
     match kind {
         subc_protocol::scope::ScopeKind::Head => SessionKind::Primary,
         subc_protocol::scope::ScopeKind::Worker => SessionKind::Subagent,
-        subc_protocol::scope::ScopeKind::Ephemeral => SessionKind::Ephemeral,
+        _ => SessionKind::Ephemeral,
     }
 }
 

@@ -1523,6 +1523,7 @@ async fn open_live_route(stream: &mut TcpStream, corr: u64) -> (u16, u32) {
         stream,
         corr,
         ClientControlRequest::RouteOpen {
+            busy_refusals: None,
             role_versions: None,
             target: RouteTarget::ToolProvider {
                 module_id: MODULE_ID.to_string(),
@@ -1545,6 +1546,7 @@ async fn open_live_route(stream: &mut TcpStream, corr: u64) -> (u16, u32) {
         ClientControlResponse::RouteOpen {
             route_channel,
             route_epoch,
+            ..
         } => (route_channel, route_epoch),
         other => panic!("expected route.open response, got {other:?}"),
     }

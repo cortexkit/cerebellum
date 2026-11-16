@@ -3,7 +3,7 @@
 //!
 //! Cingulate takes the requester's identity from the daemon's stamp on this
 //! route and nothing else: the principal (`reserved:cerebellum`, from the
-//! launch nonce presented as `consumer_identity`) and the session scope the
+//! self claim, or legacy launch nonce) and the session scope the
 //! route was admitted under (whose agent becomes the card's subject). The
 //! daemon admits cerebellum under an agent's scope only because core lists
 //! `reserved:cerebellum` as a carrier of that scope with `cingulate` as its one
@@ -34,6 +34,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Why a call to Cingulate produced no result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallError {
+    /// The channel owner could not attest this outbound connection.
+    Claim(crate::registration::ClaimError),
     /// Cingulate answered with an Error frame.
     Refused(Refusal),
     /// The daemon or the route failed: no connection, a refused route.open,
@@ -145,6 +147,15 @@ impl DaemonCingulate {
 
     fn open_body(&self, scope: &ScopeSelector) -> Vec<u8> {
         let identity = BindIdentity::new(BIND_HARNESS, BIND_SESSION);
+        if subc_os::registration_channel::supervised() {
+            return crate::channel_route::open(
+                RouteTarget::ManagementSurface {
+                    module_id: wire::CINGULATE_MODULE_ID.into(),
+                },
+                &identity,
+                Some(scope),
+            );
+        }
         let request = RouteOpenRequest {
             op: "route.open",
             target: RouteTarget::ManagementSurface {
@@ -174,6 +185,9 @@ impl DaemonCingulate {
         authenticate_client(&mut stream, &connection, AUTH_DEADLINE)
             .await
             .map_err(|_| unreachable())?;
+        crate::registration::bind_consumer(&mut stream, AUTH_DEADLINE)
+            .await
+            .map_err(CallError::Claim)?;
         let open = Frame::build(
             FrameType::Request,
             crate::control_flags(),

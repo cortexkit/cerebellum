@@ -279,6 +279,7 @@ mod daemon {
             assert!(ack.subc_ops.contains(&"operator.confirm".into()));
             let (client, mut client_rx, _client_egress) = ctx(2);
             let open = ClientControlRequest::RouteOpen {
+                busy_refusals: None,
                 target: RouteTarget::ToolProvider {
                     module_id: "cerebellum".into(),
                 },

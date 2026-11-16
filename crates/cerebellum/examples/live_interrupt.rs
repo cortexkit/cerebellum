@@ -246,6 +246,7 @@ mod probe {
         async fn open_route(&mut self, target: RouteTarget) -> Result<(u16, u32), String> {
             // Keep both routes on this probe run's conversation.
             let request = ClientControlRequest::RouteOpen {
+                busy_refusals: None,
                 role_versions: None,
                 target: target.clone(),
                 identity: BindIdentity::new("live_interrupt", self.conversation.clone()),
@@ -272,6 +273,7 @@ mod probe {
                 Ok(ClientControlResponse::RouteOpen {
                     route_channel,
                     route_epoch,
+                    ..
                 }) => Ok((route_channel, route_epoch)),
                 Ok(other) => Err(format!("route.open for {target:?} answered {other:?}")),
                 Err(error) => Err(format!(

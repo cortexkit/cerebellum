@@ -2,6 +2,10 @@
 //! it spawns it, which HELLO presents to prove the connection comes from the
 //! process the daemon started.
 //!
+//! Channel launches have no nonce: subc-os validates and adopts their private
+//! socket before any spawn, setting close-on-exec. The accessors below then
+//! omit nonce identity even if a stale nonce variable was inherited.
+//!
 //! On Unix the daemon hands it over through a pipe on descriptor 3. On Windows
 //! it serves it once on a named pipe it creates before starting the module,
 //! named in `SUBC_LAUNCH_NONCE_PIPE`. During the transition it also passes the
@@ -36,18 +40,23 @@ use subc_protocol::manifest::LaunchNonceSource as ProvenanceSource;
 /// after: every descriptor the accessor leaves open is one holding no nonce
 /// (an empty pipe, or one that is not the daemon's).
 pub(crate) fn read_before_any_spawn() {
-    let _ = subc_os::launch_nonce();
+    if !subc_os::registration_channel::supervised() {
+        let _ = subc_os::launch_nonce();
+    }
 }
 
 /// The nonce to present in HELLO, or `None` when the daemon gave none (the
 /// module was started by hand). A descriptor that is named but unusable is an
 /// error, never a silent fallback to the environment copy.
 pub(crate) fn for_hello() -> Result<Option<String>, subc_os::LaunchNonceError> {
+    if subc_os::registration_channel::supervised() {
+        return Ok(None);
+    }
     Ok(subc_os::launch_nonce()?.map(|nonce| nonce.value().to_string()))
 }
 
 /// The nonce to present as `consumer_identity` when this module opens a route
-/// of its own (today only the vault deposit after a granted capture card).
+/// of its own on a legacy nonce launch. A channel launch uses self claims instead.
 ///
 /// The same cached answer HELLO used: the accessor read the pipe once at
 /// startup and this never reads it again. Without it the daemon stamps the
@@ -55,6 +64,9 @@ pub(crate) fn for_hello() -> Result<Option<String>, subc_os::LaunchNonceError> {
 /// daemon gave no nonce (the module was started by hand) or the read failed;
 /// a failed read already stopped HELLO, so a registered module never sees it.
 pub(crate) fn for_consumer_identity() -> Option<String> {
+    if subc_os::registration_channel::supervised() {
+        return None;
+    }
     subc_os::launch_nonce()
         .ok()
         .flatten()
@@ -65,6 +77,9 @@ pub(crate) fn for_consumer_identity() -> Option<String> {
 /// (`fd`, `pipe` or `env`). `None` when there is no nonce or it could not be
 /// read: then there is no source to claim.
 pub(crate) fn provenance_source() -> Option<ProvenanceSource> {
+    if subc_os::registration_channel::supervised() {
+        return None;
+    }
     provenance_source_from(
         subc_os::launch_nonce()
             .ok()
@@ -81,7 +96,7 @@ fn provenance_source_from(source: Option<subc_os::LaunchNonceSource>) -> Option<
     source.map(|source| ProvenanceSource::from_wire_name(source.as_str()))
 }
 
-/// Keep every launch-nonce variable out of a child's environment.
+/// Keep launch-nonce and registration-channel metadata out of children.
 ///
 /// A child that inherited `SUBC_LAUNCH_NONCE` could present it and be admitted
 /// as this module. The other three carry no secret. `SUBC_LAUNCH_NONCE_FD` and
@@ -89,13 +104,17 @@ fn provenance_source_from(source: Option<subc_os::LaunchNonceSource>) -> Option<
 /// that inherits them would try to read a descriptor or pipe it was never given.
 /// `SUBC_LAUNCH_NONCE_PIPE_FALLBACK` only permits the environment copy, and
 /// subc-os requires it to be removed together with that copy. Dropping all four
-/// means a child sees no sign of a nonce at all.
+/// means a child sees no sign of a nonce at all. Registration metadata is also
+/// removed so a helper never tries to adopt the module's channel descriptor.
 pub(crate) fn without_launch_nonce(command: &mut Command) -> &mut Command {
     command
         .env_remove(subc_os::LAUNCH_NONCE_ENV)
         .env_remove(subc_os::LAUNCH_NONCE_FD_ENV)
         .env_remove(subc_os::LAUNCH_NONCE_PIPE_ENV)
         .env_remove(subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV)
+        .env_remove(subc_os::registration_channel::REGISTRATION_FD_ENV)
+        .env_remove(subc_os::registration_channel::REGISTRATION_PIPE_ENV)
+        .env_remove(subc_os::registration_channel::DAEMON_PID_ENV)
 }
 
 #[cfg(test)]
@@ -136,7 +155,7 @@ mod tests {
         let output = without_launch_nonce(&mut Command::new("/bin/sh"))
             .args([
                 "-c",
-                "if [ -e /dev/fd/3 ]; then echo fd3=open; else echo fd3=closed; fi; exec /usr/bin/env",
+                "for fd in 3 4; do if [ -e /dev/fd/$fd ]; then echo fd$fd=open; else echo fd$fd=closed; fi; done; exec /usr/bin/env",
             ])
             .current_dir("/tmp")
             .output()
@@ -145,18 +164,40 @@ mod tests {
         String::from_utf8(output.stdout).expect("grandchild output is UTF-8")
     }
 
-    #[test]
-    fn launch_nonce_probe_child() {
+    #[tokio::test]
+    async fn launch_nonce_probe_child() {
         let Some(mode) = std::env::var_os(PROBE_MODE) else {
             return;
         };
         #[cfg(unix)]
         {
-            let spawn_first = mode == "spawn-first";
+            let spawn_first = mode == "spawn-first" || mode == "channel-spawn-first";
             let early = spawn_first.then(run_grandchild);
             read_before_any_spawn();
+            let channel =
+                subc_os::registration_channel::take_registration_channel().expect("take handoff");
             let late = run_grandchild();
             let grandchild = early.unwrap_or(late);
+            if mode == "channel" || mode == "channel-spawn-first" {
+                assert!(channel.is_some());
+                assert!(for_hello().unwrap().is_none());
+                assert!(for_consumer_identity().is_none());
+                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                crate::send_hello_for_test(
+                    &tx,
+                    &crate::ModuleConfigForTest {
+                        module_id: "cerebellum".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                let hello: serde_json::Value =
+                    serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+                assert!(hello.get("launch_nonce").is_none());
+                assert_eq!(hello["manifest"]["registration_channel"], true);
+            } else {
+                assert_eq!(for_consumer_identity().as_deref(), Some(PROBE_NONCE));
+            }
             let provenance = crate::manifest::build("cerebellum")
                 .provenance
                 .and_then(|provenance| provenance.launch_nonce_source)
@@ -182,7 +223,24 @@ mod tests {
     /// descriptor 3. Returns the probe's report lines.
     #[cfg(unix)]
     fn probe(mode: &str, pipe: bool) -> Vec<String> {
-        let mut command = Command::new(std::env::current_exe().expect("test binary"));
+        static EXECUTABLE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        // Copy once before any probe forks: an overlapping copy can leave a
+        // writable executable descriptor in another child until its exec.
+        let executable = EXECUTABLE.get_or_init(|| {
+            let directory = std::path::Path::new("/tmp").join(format!(
+                "cerebellum-launch-probe-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let executable = directory.join("probe");
+            std::fs::copy(std::env::current_exe().expect("test binary"), &executable).unwrap();
+            executable
+        });
+        let mut command = Command::new(executable);
         command
             .args([PROBE_TEST, "--exact", "--nocapture", "--test-threads=1"])
             .env(PROBE_MODE, mode)
@@ -195,6 +253,33 @@ mod tests {
                 r"\\.\pipe\cerebellum-probe-unused",
             )
             .env(subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV, "env");
+        for name in [
+            subc_os::registration_channel::REGISTRATION_FD_ENV,
+            subc_os::registration_channel::REGISTRATION_PIPE_ENV,
+            subc_os::registration_channel::DAEMON_PID_ENV,
+        ] {
+            command.env_remove(name);
+        }
+        let _registration_parent = if mode.starts_with("channel") {
+            let (parent, child, metadata) =
+                subc_os::registration_channel::registration_socketpair().unwrap();
+            command
+                .env(subc_os::registration_channel::REGISTRATION_FD_ENV, metadata)
+                .env(
+                    subc_os::registration_channel::REGISTRATION_PIPE_ENV,
+                    "unused-test-pipe",
+                )
+                .env(
+                    subc_os::registration_channel::DAEMON_PID_ENV,
+                    std::process::id().to_string(),
+                );
+            let mut slots = subc_os::registration_channel::ChildDescriptorSlots::default();
+            slots.channel(child).unwrap();
+            slots.install(&mut command);
+            Some(parent)
+        } else {
+            None
+        };
         if pipe {
             let handoff = subc_os::LaunchNonceHandoff::new(PROBE_NONCE).expect("nonce pipe");
             command.env(subc_os::LAUNCH_NONCE_FD_ENV, handoff.fd_env_value());
@@ -281,5 +366,31 @@ mod tests {
         );
         let report = probe("read-first", true);
         assert!(has(&report, "grandchild:fd3=closed"), "{report:#?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn channel_hello_omits_nonce_and_children_inherit_neither_channel_nor_metadata() {
+        let control = probe("channel-spawn-first", false);
+        assert!(has(&control, "grandchild:fd4=open"), "{control:#?}");
+        let report = probe("channel", false);
+        assert!(has(&report, "source=none"), "{report:#?}");
+        assert!(has(&report, "grandchild:fd4=closed"), "{report:#?}");
+        for name in [
+            subc_os::registration_channel::REGISTRATION_FD_ENV,
+            subc_os::registration_channel::REGISTRATION_PIPE_ENV,
+            subc_os::registration_channel::DAEMON_PID_ENV,
+            subc_os::LAUNCH_NONCE_ENV,
+            subc_os::LAUNCH_NONCE_FD_ENV,
+            subc_os::LAUNCH_NONCE_PIPE_ENV,
+            subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV,
+        ] {
+            assert!(
+                !report
+                    .iter()
+                    .any(|line| line.starts_with(&format!("grandchild:{name}="))),
+                "{name} inherited"
+            );
+        }
     }
 }

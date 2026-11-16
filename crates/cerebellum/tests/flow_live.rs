@@ -380,6 +380,7 @@ impl Fixture {
             &mut client,
             7,
             ClientControlRequest::RouteOpen {
+                busy_refusals: None,
                 role_versions: None,
                 target: RouteTarget::ToolProvider {
                     module_id: "cerebellum".into(),
@@ -435,6 +436,7 @@ async fn route(fixture: &Fixture, carrier: &str) -> (TcpStream, u16, u32) {
         ClientControlResponse::RouteOpen {
             route_channel,
             route_epoch,
+            ..
         } => (client, route_channel, route_epoch),
         other => panic!("unexpected {other:?}"),
     }

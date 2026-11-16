@@ -50,6 +50,7 @@ pub mod connector_evidence;
 mod consent_card;
 pub mod consent_drain;
 // Executable fixtures assert Unix modes and inode reuse.
+mod channel_route;
 #[cfg(all(test, unix))]
 mod content_named_fixture;
 pub mod coordinate;
@@ -93,6 +94,7 @@ mod private_content_marks_tests;
 pub mod profile;
 pub mod profile_custody;
 pub mod public_suffix;
+mod registration;
 #[cfg(test)]
 mod result_negotiation_tests;
 #[cfg(test)]
@@ -2141,14 +2143,21 @@ fn consent_context(
 pub async fn run_entry() -> Result<(), ModuleError> {
     // First, before anything can spawn a process: loading the browser
     // configuration can already run a browser probe, and a child started
-    // before this read would inherit the launch-nonce pipe.
+    // before adoption would inherit the registration socket or launch-nonce pipe.
+    let registration = registration::take_before_any_spawn()?;
     launch_nonce::read_before_any_spawn();
     #[cfg(target_os = "macos")]
     let cursor_executable = computer_capability::cursor::pin_helper_at_startup();
     let config = ModuleConfig::from_env()?;
     record_private_state_tightening();
     record_engram_catalog_write();
-    let ending = run(config, read_live_settings_from_config_file, true).await;
+    let ending = run(
+        config,
+        read_live_settings_from_config_file,
+        true,
+        registration,
+    )
+    .await;
     #[cfg(target_os = "macos")]
     drop(cursor_executable);
     conclude(ending)
@@ -2212,7 +2221,7 @@ pub async fn run_entry_prepared_for_test(
         agent_cursor: false,
         browser: BrowserSurface::Available(browser),
     };
-    conclude(run(config, prepare, false).await)
+    conclude(run(config, prepare, false, None).await)
 }
 
 /// How a module run ended, which decides how the process exits.
@@ -2392,6 +2401,7 @@ async fn run(
     config: ModuleConfig,
     prepare: impl FnOnce(&mut Planes),
     enable_user_bridge: bool,
+    registration: Option<registration::Stream>,
 ) -> ModuleEnding {
     #[cfg(not(target_os = "macos"))]
     let _ = enable_user_bridge;
@@ -2400,7 +2410,7 @@ async fn run(
     // than ending the process with no teardown.
     #[cfg(unix)]
     let mut sigterm = listen_for_sigterm();
-    let stream = match connect_to_subc(&config.connection_file_path).await {
+    let stream = match connect_to_subc(&config.connection_file_path, registration).await {
         Ok(stream) => stream,
         Err(error) => return ModuleEnding::Disconnected(Err(error)),
     };
@@ -2710,18 +2720,26 @@ impl Drop for ConsentShutdown {
     }
 }
 
-async fn connect_to_subc(connection_file_path: &PathBuf) -> Result<TcpStream, ModuleError> {
+async fn connect_to_subc(
+    connection_file_path: &PathBuf,
+    registration: Option<registration::Stream>,
+) -> Result<registration::Stream, ModuleError> {
     let conn = connection_file::read(connection_file_path)
         .map_err(|e| ModuleError::Message(format!("reading connection file: {e}")))?;
-    let endpoint = conn
-        .endpoints
-        .first()
-        .ok_or_else(|| ModuleError::Message("connection file has no endpoints".into()))?;
-    let addr = format!("{}:{}", endpoint.host, endpoint.port);
-    let mut stream = TcpStream::connect(&addr)
-        .await
-        .map_err(|e| ModuleError::Message(format!("connect {addr}: {e}")))?;
-    configure_tcp_keepalive(&stream)?;
+    let mut stream = if let Some(stream) = registration {
+        stream
+    } else {
+        let endpoint = conn
+            .endpoints
+            .first()
+            .ok_or_else(|| ModuleError::Message("connection file has no endpoints".into()))?;
+        let addr = format!("{}:{}", endpoint.host, endpoint.port);
+        let stream = TcpStream::connect(&addr)
+            .await
+            .map_err(|e| ModuleError::Message(format!("connect {addr}: {e}")))?;
+        configure_tcp_keepalive(&stream)?;
+        Box::new(stream) as registration::Stream
+    };
     authenticate_client(&mut stream, &conn, std::time::Duration::from_secs(5))
         .await
         .map_err(|e| ModuleError::Message(format!("authenticate: {e}")))?;
@@ -2911,6 +2929,7 @@ where
     expect_hello_ack(read_half).await?;
 
     planes.scopes.control.connect(&writer);
+    registration::connect(&writer);
     #[cfg(target_os = "macos")]
     if let Some(cursor) = planes_cursor(&planes) {
         cursor.listen_for_turn_hints(Arc::new(turn_hints::LiveTransport::new(
@@ -3828,7 +3847,7 @@ async fn handle_frame(
             Ok(true)
         }
         // The daemon's answer to a control request this module sent on its own
-        // connection (`scope.describe` or `operator.confirm`). The daemon's requests to the module
+        // connection (claim minting, scope queries or operator confirmation). The daemon's requests to the module
         // arrive as requests, so a response or error on channel 0 can only be
         // one of these; it is handed to whoever asked, or dropped if nobody
         // still waits. Without this arm such an answer would fall to the
@@ -3846,6 +3865,9 @@ async fn handle_frame(
             } else {
                 scope_watch::ControlAnswer::Error(body)
             };
+            if registration::deliver(frame.header.corr, &answer) {
+                return Ok(true);
+            }
             planes.scopes.control.deliver(frame.header.corr, answer);
             Ok(true)
         }
@@ -13747,12 +13769,42 @@ mod tests {
             digest(&value),
             digest(&unbound)
         );
+        // Only the channel-support declaration may change the fixed HELLO.
+        // Remove that exact addition and retain the complete previous pins.
+        #[cfg(target_os = "linux")]
+        let prior = [
+            "8c7c3024e6b662373cdfc75cbd4af8bc36d60b39c96dd2b14b09267176cf2d4a",
+            "5b43505f1804c63bdcdc220839f67f7a149ad7ce4832cd2c99d7776bc43e97d1",
+        ];
+        #[cfg(target_os = "macos")]
+        let prior = [
+            "be75638b3892bed37282a867be03a1daa283bd0a6ec2bc7a099deb591d2707fd",
+            "ec71302313702fd18b8cfcff461b523b7b5946265b0104261172081b0bfb991d",
+        ];
+        for (current, prior) in [&value, &unbound].into_iter().zip(prior) {
+            let mut previous = current.clone();
+            assert_eq!(
+                previous
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("registration_channel"),
+                Some(json!(true))
+            );
+            assert_eq!(digest(&previous), prior);
+        }
 
         // The unbound computer_use flat tool definition is byte-identical, but HELLO has
         // additive release evidence (and vocabulary/views differ elsewhere).
         // Normalize those HELLO additions only for historical comparison;
         // this is not a claim of raw HELLO byte equality.
         let mut legacy = unbound.clone();
+        assert_eq!(
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("registration_channel"),
+            Some(json!(true))
+        );
         let release = &mut legacy["computer_plane_release"];
         assert_eq!(release["frozen_row_count"], 13);
         assert_eq!(release["canonical_row_count"], 13);
@@ -13827,13 +13879,13 @@ mod tests {
         // Binding CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION withholds button-down gestures until recovery is
         // measured, while advertising the fronted move/scroll definition.
         #[cfg(target_os = "linux")]
-        let expected = "8c7c3024e6b662373cdfc75cbd4af8bc36d60b39c96dd2b14b09267176cf2d4a";
+        let expected = "7e31cf93aff05066e6057747b36fb780f6972b37c6eea61c67f5acd17a64289e";
         #[cfg(target_os = "macos")]
-        let expected = "be75638b3892bed37282a867be03a1daa283bd0a6ec2bc7a099deb591d2707fd";
+        let expected = "36b634587d38fe35aeab157ab028be55ba6f5e57d238e2a38d0b04dca7ef7892";
         #[cfg(target_os = "linux")]
-        let expected_unbound = "5b43505f1804c63bdcdc220839f67f7a149ad7ce4832cd2c99d7776bc43e97d1";
+        let expected_unbound = "5ccb6b3f6e8eb53cec1b5a5e6e572c43e376d0227b731c8271fb07ede73fa77a";
         #[cfg(target_os = "macos")]
-        let expected_unbound = "ec71302313702fd18b8cfcff461b523b7b5946265b0104261172081b0bfb991d";
+        let expected_unbound = "30c989be33e0848f18b00cba45d88940b5fec6353a456331572382732228567b";
         assert_eq!(digest(&value), expected);
         assert_eq!(digest(&unbound), expected_unbound);
     }

@@ -76,7 +76,7 @@ impl LoginMaterialSource for VaultLoginSource {
 
 fn unavailable(error: &VaultReachError) -> bool {
     match error {
-        VaultReachError::Unreachable => true,
+        VaultReachError::Unreachable | VaultReachError::Claim(_) => true,
         VaultReachError::RouteRefused { code } | VaultReachError::CallFailed { code } => {
             code.as_deref().is_none_or(|code| {
                 matches!(

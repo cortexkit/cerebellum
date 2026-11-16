@@ -176,6 +176,7 @@ async fn open_scoped_route(
         &mut client,
         7,
         ClientControlRequest::RouteOpen {
+            busy_refusals: None,
             role_versions: None,
             target: RouteTarget::ToolProvider {
                 module_id: "cerebellum".into(),
@@ -207,6 +208,7 @@ async fn open_scoped_route(
         ClientControlResponse::RouteOpen {
             route_channel,
             route_epoch,
+            ..
         } => (client, route_channel, route_epoch),
         other => panic!("expected route.open, got {other:?}"),
     }

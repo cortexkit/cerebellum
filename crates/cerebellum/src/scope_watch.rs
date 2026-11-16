@@ -82,21 +82,41 @@ pub enum ControlAnswer {
 /// This module's outstanding channel-0 requests to the daemon.
 pub struct ControlRequests {
     next_corr: AtomicU64,
-    pending: Mutex<HashMap<u64, oneshot::Sender<ControlAnswer>>>,
+    pending: Mutex<HashMap<u64, PendingControl>>,
     connection: std::sync::OnceLock<mpsc::WeakSender<Frame>>,
+}
+
+struct PendingControl {
+    operation: String,
+    answer: oneshot::Sender<ControlAnswer>,
+}
+
+struct ForgetControl<'a>(&'a ControlRequests, u64);
+impl Drop for ForgetControl<'_> {
+    fn drop(&mut self) {
+        self.0
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.1);
+    }
 }
 
 impl Default for ControlRequests {
     fn default() -> Self {
-        Self {
-            next_corr: AtomicU64::new(FIRST_CONTROL_CORR),
-            pending: Mutex::new(HashMap::new()),
-            connection: std::sync::OnceLock::new(),
-        }
+        Self::starting_at(FIRST_CONTROL_CORR)
     }
 }
 
 impl ControlRequests {
+    pub(crate) fn starting_at(first: u64) -> Self {
+        Self {
+            next_corr: AtomicU64::new(first),
+            pending: Mutex::new(HashMap::new()),
+            connection: std::sync::OnceLock::new(),
+        }
+    }
+
     /// Attach the module connection only after its daemon handshake succeeds.
     /// Isolated planes have no connection and cannot invent scope authority.
     pub fn connect(&self, writer: &mpsc::Sender<Frame>) -> bool {
@@ -107,7 +127,7 @@ impl ControlRequests {
 
     pub(crate) async fn request_connected(
         &self,
-        request: &ModuleControlRequestFromModule,
+        request: &impl serde::Serialize,
         deadline: Duration,
     ) -> Option<ControlAnswer> {
         let writer = self.connection.get()?.upgrade()?;
@@ -120,10 +140,12 @@ impl ControlRequests {
     pub async fn request(
         &self,
         writer: &mpsc::Sender<Frame>,
-        request: &ModuleControlRequestFromModule,
+        request: &impl serde::Serialize,
         deadline: Duration,
     ) -> Option<ControlAnswer> {
         let body = serde_json::to_vec(request).ok()?;
+        let value: Value = serde_json::from_slice(&body).ok()?;
+        let operation = value.get("op")?.as_str()?.to_owned();
         let corr = self.next_corr.fetch_add(1, Ordering::Relaxed);
         let (answered, answer) = oneshot::channel();
         {
@@ -131,8 +153,15 @@ impl ControlRequests {
             if pending.len() >= MAX_CONTROL_REQUESTS_IN_FLIGHT {
                 return None;
             }
-            pending.insert(corr, answered);
+            pending.insert(
+                corr,
+                PendingControl {
+                    operation,
+                    answer: answered,
+                },
+            );
         }
+        let _forget = ForgetControl(self, corr);
         let frame = Frame::build(FrameType::Request, crate::control_flags(), 0, 0, corr, body).ok();
         let answer = match frame {
             Some(frame) => tokio::time::timeout(deadline, async {
@@ -156,12 +185,18 @@ impl ControlRequests {
     /// Hand an answer that arrived on channel 0 to whoever asked. Returns
     /// whether anyone was waiting for it.
     pub fn deliver(&self, corr: u64, answer: ControlAnswer) -> bool {
-        let waiting = self
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&corr);
-        waiting.is_some_and(|waiting| waiting.send(answer).is_ok())
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if let ControlAnswer::Response(body) = &answer {
+            if pending
+                .get(&corr)
+                .is_none_or(|waiting| body["op"] != waiting.operation)
+            {
+                return false;
+            }
+        }
+        pending
+            .remove(&corr)
+            .is_some_and(|waiting| waiting.answer.send(answer).is_ok())
     }
 
     /// How many requests are waiting for an answer.
@@ -612,12 +647,12 @@ mod tests {
         ));
         assert!(requests.deliver(
             question.header.corr,
-            ControlAnswer::Response(serde_json::json!({"answered": true}))
+            ControlAnswer::Response(serde_json::json!({"op":"scope.describe", "answered": true}))
         ));
         assert_eq!(
             asking.await.unwrap(),
             Some(ControlAnswer::Response(
-                serde_json::json!({"answered": true})
+                serde_json::json!({"op":"scope.describe", "answered": true})
             ))
         );
         assert!(!requests.deliver(question.header.corr, ControlAnswer::Response(Value::Null)));
