@@ -66,3 +66,16 @@ pub fn nonce_holder() -> std::path::PathBuf {
     );
     daemon_binary("test-nonce-holder", path)
 }
+
+/// Runs the module named in `NONCE_LAUNCH_PROGRAM` without the daemon's
+/// registration channel; see `tests/support/nonce_launcher.rs`.
+#[allow(dead_code)]
+pub fn nonce_launcher() -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(env!("CARGO_BIN_EXE_cerebellum-test-nonce-launcher"));
+    assert!(
+        path.is_file(),
+        "missing test nonce launcher at {}",
+        path.display()
+    );
+    daemon_binary("test-nonce-launcher", path)
+}

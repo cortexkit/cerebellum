@@ -108,6 +108,13 @@ standalone_sources = {
         "lib.rs", "main.rs", "manifest.rs", "browser_config.rs", "flat_tools.rs",
         "content_named_fixture.rs",
     ),
+    # Both registration paths of the supervised binary under the real daemon:
+    # HELLO, binds and health on the module connection, and the self claims a
+    # channel launch presents on its outbound connections.
+    "registration_live": (
+        "lib.rs", "main.rs", "registration*", "channel_route.rs", "launch_nonce.rs",
+        "scope_watch.rs", "tool_display*", "manifest.rs", "content_named_fixture.rs",
+    ),
     "scope_revocation_live": lifecycle_sources + (
         "management*", "agent_grants*", "authorization.rs", "browser_standing_grants.rs",
         "cingulate_client/*", "content_named_fixture.rs",
