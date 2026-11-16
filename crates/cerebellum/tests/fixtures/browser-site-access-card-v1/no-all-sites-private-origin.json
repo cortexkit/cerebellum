@@ -38,7 +38,7 @@
       "label": "Don't allow"
     }
   ],
-  "prompt": "Let the agent use its own browser on 10.0.0.5 to read pages and click.",
+  "prompt": "Let the agent use 10.0.0.5 in its own browser?",
   "scope": {
     "origins": [
       "http://10.0.0.5"
@@ -49,6 +49,6 @@
     "kind": "site",
     "label": "10.0.0.5"
   },
-  "title": "Allow access to 10.0.0.5?",
+  "title": "Allow browser access",
   "urgency": "high"
 }

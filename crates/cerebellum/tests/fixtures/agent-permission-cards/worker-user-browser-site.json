@@ -36,7 +36,7 @@
       "label": "Don't allow"
     }
   ],
-  "prompt": "Let the agent use your own Chrome, signed in as you, on this site?",
+  "prompt": "Let the agent use https://example.net in your Chrome?",
   "requester_ref": "pf:card-golden",
   "scope": {
     "browser": "user",
@@ -52,6 +52,6 @@
     "kind": "site",
     "label": "https://example.net"
   },
-  "title": "Allow access to https://example.net?",
+  "title": "Allow access in your Chrome",
   "urgency": "high"
 }

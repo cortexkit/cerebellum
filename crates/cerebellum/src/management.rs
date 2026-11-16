@@ -2221,18 +2221,8 @@ pub(crate) fn browser_grant_question(
         facts.push(Fact::new("Exact sites", origins.join(", ")));
     }
     ConsentCard {
-        title: format!("Allow access to {}?", hosts.join(", ")),
-        prompt: format!(
-            "Let the agent use its own browser on {} to read pages and click{}.",
-            hosts.join(", "),
-            if severity.tier >= MUTATE_DURABLE {
-                ", including actions that make lasting changes"
-            } else if severity.tier == MUTATE_REVERSIBLE {
-                " and make changes that can be undone"
-            } else {
-                ""
-            }
-        ),
+        title: "Allow browser access".into(),
+        prompt: format!("Let the agent use {} in its own browser?", hosts.join(", ")),
         target: Target {
             kind: TargetKind::Site,
             label: hosts.join(", "),
@@ -2284,8 +2274,8 @@ fn browser_grant_scope(
 pub(crate) fn profile_root_rebind_question(root_path: &str, preview: &RebindReport) -> Value {
     use crate::consent_card::*;
     ConsentCard {
-        title: "Re-identify browser profiles?".into(),
-        prompt: "Re-identify the agent's browser profiles at their current location.".into(),
+        title: "Browser profiles moved".into(),
+        prompt: "Let the agent use its browser profiles at their new location?".into(),
         target: Target {
             kind: TargetKind::Machine,
             label: "the agent's browser profiles".into(),
@@ -2337,9 +2327,8 @@ fn profile_root_rebind_scope(preview: &RebindReport) -> crate::consent_card::Sco
 pub(crate) fn launch_recovery_clear_question(preview: &ClearPreview) -> Value {
     use crate::consent_card::*;
     ConsentCard {
-        title: "Clear the stuck browser record?".into(),
-        prompt: "Clear the stuck record so the agent can open its browser on this profile again."
-            .into(),
+        title: "Fix the agent's browser".into(),
+        prompt: "Clear the stuck record so the agent can open its browser again?".into(),
         target: Target {
             kind: TargetKind::Machine,
             label: "the agent's browser profile".into(),

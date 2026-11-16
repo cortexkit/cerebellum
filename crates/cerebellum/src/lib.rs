@@ -12673,10 +12673,7 @@ mod tests {
             ]
         );
         let asked = cingulate.cards().remove(0);
-        assert_eq!(
-            asked["prompt"],
-            "insula will hold a copy of your ollama.com login."
-        );
+        assert_eq!(asked["prompt"], "Save your ollama.com login for the agent?");
         // The Cingulate card id becomes the deposit's consent reference.
         assert_eq!(
             fixture.vault.request_params()[0]["consent_ref"],
