@@ -39,6 +39,11 @@ pub(crate) trait Backend: Send + Sync {
 
 const WRITE_WINDOW: Duration = Duration::from_secs(3);
 const DECLARER_TTL: Duration = Duration::from_secs(30);
+/// How long a catalog answer that leaves a module out keeps refusing that
+/// module. A display module that restarts can bind before the catalog lists its
+/// capabilities again; holding that answer for the full TTL would refuse it for
+/// 30 s after every restart.
+const ABSENT_DECLARER_TTL: Duration = Duration::from_secs(2);
 const MAX_WAITING: usize = 16_384;
 const MAX_RECENT_CONSENTS: usize = 16_384;
 const MAX_RECENT_CALLS: usize = 65_536;
@@ -327,7 +332,27 @@ impl Records {
         {
             return false;
         }
-        self.declarers().await.as_slice() == [module_id.as_str()]
+        if self.declarers().await.as_slice() == [module_id.as_str()] {
+            return true;
+        }
+        self.expire_if_absent(module_id)
+            && self.declarers().await.as_slice() == [module_id.as_str()]
+    }
+
+    /// Drops a cached answer that leaves `module_id` out once it is older than
+    /// [`ABSENT_DECLARER_TTL`], so the caller reads the catalog again. Returns
+    /// whether it did. Failed reads are never cached, so only a successful
+    /// answer can be dropped here.
+    fn expire_if_absent(&self, module_id: &str) -> bool {
+        let mut cache = self.declarers.lock().unwrap();
+        let stale = cache.cached.as_ref().is_some_and(|(refreshed, modules)| {
+            !modules.iter().any(|module| module == module_id)
+                && refreshed.elapsed() >= ABSENT_DECLARER_TTL
+        });
+        if stale {
+            cache.cached = None;
+        }
+        stale
     }
 
     pub(crate) async fn read(

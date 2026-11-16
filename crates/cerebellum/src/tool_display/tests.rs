@@ -865,6 +865,28 @@ async fn declarer_cache_caches_empty_and_ambiguous_answers() {
     }
 }
 
+/// A display module that restarts binds before the catalog lists it again. The
+/// answer that leaves it out refuses it for two seconds, not the full 30.
+#[tokio::test(start_paused = true)]
+async fn declarer_cache_rereads_an_answer_missing_the_binder_after_two_seconds() {
+    let planes = planes();
+    let catalog = CatalogDouble::new(&[]);
+    planes.routes.display.connect(catalog.clone());
+    assert_eq!(bind_display(&planes).await.header.ty, FrameType::Error);
+    *catalog.answer.lock().unwrap() = Some(vec!["display-vendor".into()]);
+    tokio::time::advance(Duration::from_millis(1_999)).await;
+    assert_eq!(bind_display(&planes).await.header.ty, FrameType::Error);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(bind_display(&planes).await.header.ty, FrameType::Response);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 2);
+    // The fresh answer names the binder, so it is held for the full TTL again.
+    *catalog.answer.lock().unwrap() = Some(vec![]);
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert_eq!(bind_display(&planes).await.header.ty, FrameType::Response);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test(start_paused = true)]
 async fn declarer_cache_failed_read_is_not_cached() {
     let planes = planes();
