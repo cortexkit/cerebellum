@@ -807,12 +807,28 @@ async fn takeover_is_asked_separately_and_no_app_grant_satisfies_it() {
         ["allow_once", "computer_30m", "computer_always", "deny"]
     );
     assert!(takeover["params"].get("app").is_none());
-    // Pinned byte for byte: the host shows this line unchanged, and it has to
-    // cover both uses of the grant, fronting an application for keystrokes
-    // and driving the real pointer.
+    // Pinned byte for byte: the apps show these unchanged. The headline asks the
+    // question; the Covers row has to name both uses of the grant, fronting an
+    // application for keystrokes and driving the real pointer.
     assert_eq!(
         takeover["params"]["prompt"],
-        "Takeover lets the agent bring apps to the front, type into them, and move your real mouse pointer. It can reach every application on the screen. Touch your mouse or keyboard to stop it."
+        "Let the agent control your mouse and keyboard?"
+    );
+    let fact = |label: &str| {
+        takeover["params"]["facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|fact| fact["label"] == label)
+            .map(|fact| fact["value"].clone())
+    };
+    assert_eq!(
+        fact("Covers"),
+        Some(json!("Bringing apps to the front, typing into them and moving your real pointer, in any app on the screen."))
+    );
+    assert_eq!(
+        fact("To stop"),
+        Some(json!("Touch your mouse or keyboard."))
     );
     assert!(grants.holds(&attested, &GrantNeed::Takeover));
     assert!(grants.holds(&caller("conversation-2", true), &GrantNeed::Takeover));
