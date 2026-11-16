@@ -1,0 +1,10 @@
+9147 crates/cerebellum/src/browser/mod.rs
+10658 crates/cerebellum/src/browser/navigation/mod.rs
+5807 crates/cerebellum/src/browser_launch.rs
+5984 crates/cerebellum/src/browser_launch_service.rs
+8479 crates/cerebellum/src/browser_session.rs
+5281 crates/cerebellum/src/computer_capability/cursor.rs
+5828 crates/cerebellum/src/computer_capability/mod.rs
+17062 crates/cerebellum/src/lib.rs
+5015 crates/cerebellum/src/profile/mod.rs
+5037 crates/cerebellum/src/user_browser.rs

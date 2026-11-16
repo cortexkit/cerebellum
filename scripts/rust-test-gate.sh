@@ -254,6 +254,8 @@ check_test_binaries_use_ckdev_names() {
 not_verified=
 start_parallel_phase "extension tests (nonzero test count required)" node extension/test-gate.mjs
 start_parallel_phase "repository-contained path dependencies" check_path_dependencies
+start_parallel_phase "source file size limit" \
+  bash -c 'scripts/file-size-check.test.sh && scripts/file-size-check.sh'
 start_parallel_phase "no test journals to the operator's disk" check_tests_do_not_journal_durably
 start_parallel_phase "no test requests macOS permissions" check_tests_do_not_request_macOS_permissions
 start_parallel_phase "test and script ck-* executions use ckdev names" check_test_binaries_use_ckdev_names
