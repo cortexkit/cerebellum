@@ -6602,6 +6602,7 @@ async fn handle_control_request(
                 ..
             } = &mut report
             {
+                metrics.insert("toolDisplay".into(), route_bindings.display.metrics());
                 metrics.insert(
                     "privateContentStore".into(),
                     json!(private_content.map_or("not_opened", |store| store.health())),

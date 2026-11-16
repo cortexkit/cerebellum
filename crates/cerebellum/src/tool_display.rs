@@ -1,6 +1,7 @@
 //! Call-time transcript metadata. No argument or reply object is retained here.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -37,6 +38,7 @@ pub(crate) trait Backend: Send + Sync {
 }
 
 const WRITE_WINDOW: Duration = Duration::from_secs(3);
+const DECLARER_TTL: Duration = Duration::from_secs(30);
 const MAX_WAITING: usize = 16_384;
 const MAX_RECENT_CONSENTS: usize = 16_384;
 const MAX_RECENT_CALLS: usize = 65_536;
@@ -46,7 +48,25 @@ type Key = (String, String);
 pub(crate) struct Records {
     pub(crate) events: Arc<crate::event_publish::Publisher>,
     backend: OnceLock<Arc<dyn Backend>>,
+    declarers: Mutex<DeclarerCache>,
+    metrics: ArmMetrics,
     state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct ArmMetrics {
+    armed: AtomicU64,
+    no_schema_pin: AtomicU64,
+    no_call_key: AtomicU64,
+    invalid_origin: AtomicU64,
+    invalid_key_or_pin: AtomicU64,
+    duplicate: AtomicU64,
+}
+
+#[derive(Default)]
+struct DeclarerCache {
+    cached: Option<(tokio::time::Instant, Vec<String>)>,
+    in_flight: Option<tokio::sync::watch::Receiver<Option<Vec<String>>>>,
 }
 
 #[derive(Default)]
@@ -210,6 +230,17 @@ pub(crate) fn site(origin: &str) {
 }
 
 impl Records {
+    pub(crate) fn metrics(&self) -> Value {
+        json!({
+            "armed": self.metrics.armed.load(Ordering::Relaxed),
+            "noSchemaPin": self.metrics.no_schema_pin.load(Ordering::Relaxed),
+            "noCallKey": self.metrics.no_call_key.load(Ordering::Relaxed),
+            "invalidOrigin": self.metrics.invalid_origin.load(Ordering::Relaxed),
+            "invalidKeyOrPin": self.metrics.invalid_key_or_pin.load(Ordering::Relaxed),
+            "duplicate": self.metrics.duplicate.load(Ordering::Relaxed),
+        })
+    }
+
     pub(crate) fn with_events(events: Arc<crate::event_publish::Publisher>) -> Self {
         Self {
             events,
@@ -225,17 +256,51 @@ impl Records {
         let Some(backend) = self.backend.get() else {
             return vec![];
         };
-        let modules = tokio::time::timeout(WRITE_WINDOW, backend.declarers())
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        self.state
-            .lock()
-            .unwrap()
-            .display_principals
-            .extend(modules.iter().cloned());
-        modules
+        loop {
+            let (sender, mut receiver) = {
+                let mut cache = self.declarers.lock().unwrap();
+                if let Some((refreshed, modules)) = &cache.cached {
+                    if refreshed.elapsed() < DECLARER_TTL {
+                        return modules.clone();
+                    }
+                }
+                if let Some(receiver) = cache
+                    .in_flight
+                    .as_ref()
+                    .filter(|receiver| receiver.has_changed().is_ok())
+                {
+                    (None, receiver.clone())
+                } else {
+                    let (sender, receiver) = tokio::sync::watch::channel(None);
+                    cache.in_flight = Some(receiver.clone());
+                    (Some(sender), receiver)
+                }
+            };
+            if let Some(sender) = sender {
+                let answer = tokio::time::timeout(WRITE_WINDOW, backend.declarers())
+                    .await
+                    .ok()
+                    .flatten();
+                let mut cache = self.declarers.lock().unwrap();
+                cache.cached = answer
+                    .as_ref()
+                    .map(|modules| (tokio::time::Instant::now(), modules.clone()));
+                let modules = answer.unwrap_or_default();
+                self.state
+                    .lock()
+                    .unwrap()
+                    .display_principals
+                    .extend(modules.iter().cloned());
+                // Current waiters share even failures; later calls retry them.
+                cache.in_flight = None;
+                let _ = sender.send(Some(modules.clone()));
+                return modules;
+            }
+            if let Ok(answer) = receiver.wait_for(Option::is_some).await {
+                return answer.as_ref().unwrap().clone();
+            };
+            // A cancelled reader drops its sender. A waiter takes over on retry.
+        }
     }
 
     // Retain declarations across teardown and failed catalog refreshes. A display
@@ -302,17 +367,35 @@ impl Records {
             _ => return None,
         };
         let (runner, key, pin) = if let Some(origin) = request.origin {
-            subc_protocol::tool_call::validate_call_origin(&origin).ok()?;
-            (origin.carrier, origin.call_key, origin.schema_pin?)
+            if subc_protocol::tool_call::validate_call_origin(&origin).is_err() {
+                self.metrics.invalid_origin.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            let Some(pin) = origin.schema_pin else {
+                self.metrics.no_schema_pin.fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
+            (origin.carrier, origin.call_key, pin)
         } else {
-            (
-                facts.principal.clone()?,
-                request.call_key.clone()?,
-                request.schema_pin?,
-            )
+            let principal = facts.principal.clone()?;
+            let Some(key) = request.call_key.clone() else {
+                self.metrics.no_call_key.fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
+            let Some(pin) = request.schema_pin else {
+                self.metrics.no_schema_pin.fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
+            (principal, key, pin)
         };
-        subc_protocol::tool_call::validate_call_key(&key).ok()?;
-        subc_protocol::tool_call::validate_schema_pin(&pin).ok()?;
+        if subc_protocol::tool_call::validate_call_key(&key).is_err()
+            || subc_protocol::tool_call::validate_schema_pin(&pin).is_err()
+        {
+            self.metrics
+                .invalid_key_or_pin
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         let local = (
             crate::journal::call_records::principal_label(facts.principal.as_ref()),
             request.call_key.unwrap_or_else(|| key.clone()),
@@ -323,6 +406,7 @@ impl Records {
             || state.seen_local_keys.contains(&local)
             || state.identities.contains(&identity)
         {
+            self.metrics.duplicate.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         // Bound ID-only duplicate suppression with a recent FIFO window. For a
@@ -374,6 +458,7 @@ impl Records {
                 ask: None,
             },
         );
+        self.metrics.armed.fetch_add(1, Ordering::Relaxed);
         Some(timing)
     }
 

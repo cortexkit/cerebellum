@@ -1,5 +1,6 @@
 use super::*;
 use crate::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::{mpsc, Notify};
 
 #[allow(dead_code)]
@@ -59,6 +60,42 @@ impl Backend for DisplayDouble {
     }
 }
 
+struct CatalogDouble {
+    answer: Mutex<Option<Vec<String>>>,
+    reads: AtomicUsize,
+    blocked: AtomicBool,
+    release: tokio::sync::Semaphore,
+}
+
+impl CatalogDouble {
+    fn new(modules: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            answer: Mutex::new(Some(
+                modules.iter().map(|module| (*module).into()).collect(),
+            )),
+            reads: AtomicUsize::new(0),
+            blocked: AtomicBool::new(false),
+            release: tokio::sync::Semaphore::new(0),
+        })
+    }
+}
+
+impl Backend for CatalogDouble {
+    fn declarers(&self) -> Future<'_, Option<Vec<String>>> {
+        Box::pin(async {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.blocked.load(Ordering::SeqCst) {
+                self.release.acquire().await.unwrap().forget();
+            }
+            self.answer.lock().unwrap().clone()
+        })
+    }
+
+    fn write<'a>(&'a self, _module: &'a str, _write: DisplayWrite) -> Future<'a, bool> {
+        Box::pin(async { false })
+    }
+}
+
 fn planes() -> Planes {
     Planes::with_browser_config_journaling(
         Arc::new(cerebellum_core::health::HealthState::new()),
@@ -100,6 +137,125 @@ fn request() -> Value {
 fn install(planes: &Planes) -> crate::AcceptedBindFacts {
     install_browser_test_bind(&planes.routes, 7, 1, &["browser.status"]);
     planes.routes.get(7, 1).unwrap()
+}
+
+async fn arm_health_metrics(planes: &Planes) -> Value {
+    let mut request = frame(serde_json::to_value(ModuleControlRequest::HealthCheck {}).unwrap());
+    request.header.channel = 0;
+    let (writer, mut replies) = mpsc::channel(8);
+    handle_control_request(request, &writer, &planes.health, &planes.routes, None, None)
+        .await
+        .unwrap();
+    let reply = replies.recv().await.unwrap();
+    let ModuleControlResponse::HealthCheck {
+        metrics: Some(metrics),
+        ..
+    } = serde_json::from_slice(&reply.body).unwrap()
+    else {
+        panic!("health reply");
+    };
+    metrics["toolDisplay"].clone()
+}
+
+fn arm_counts(counter: &str) -> Value {
+    let mut counts = json!({
+        "armed":0,
+        "noSchemaPin":0,
+        "noCallKey":0,
+        "invalidOrigin":0,
+        "invalidKeyOrPin":0,
+        "duplicate":0,
+    });
+    counts[counter] = json!(1);
+    counts
+}
+
+#[tokio::test]
+async fn arm_health_reports_armed_for_browser_and_computer_only() {
+    for name in [flat_tools::BROWSER_USE, flat_tools::COMPUTER_USE] {
+        let planes = planes();
+        let facts = install(&planes);
+        let mut call = request();
+        call["name"] = json!(name);
+        assert!(planes.routes.display.arm(&frame(call), &facts).is_some());
+        let mut unrelated = request();
+        unrelated["name"] = json!("tool.catalog");
+        assert!(planes
+            .routes
+            .display
+            .arm(&frame(unrelated), &facts)
+            .is_none());
+        assert_eq!(arm_health_metrics(&planes).await, arm_counts("armed"));
+    }
+}
+
+#[tokio::test]
+async fn arm_health_reports_missing_schema_pin_for_relayed_and_direct_calls() {
+    for relayed in [true, false] {
+        let planes = planes();
+        let facts = install(&planes);
+        let mut call = request();
+        if relayed {
+            call["origin"].as_object_mut().unwrap().remove("schema_pin");
+        } else {
+            call.as_object_mut().unwrap().remove("origin");
+            call.as_object_mut().unwrap().remove("schema_pin");
+        }
+        assert!(planes.routes.display.arm(&frame(call), &facts).is_none());
+        assert_eq!(arm_health_metrics(&planes).await, arm_counts("noSchemaPin"));
+    }
+}
+
+#[tokio::test]
+async fn arm_health_reports_missing_call_key() {
+    let planes = planes();
+    let facts = install(&planes);
+    let mut call = request();
+    call.as_object_mut().unwrap().remove("origin");
+    call.as_object_mut().unwrap().remove("call_key");
+    assert!(planes.routes.display.arm(&frame(call), &facts).is_none());
+    assert_eq!(arm_health_metrics(&planes).await, arm_counts("noCallKey"));
+}
+
+#[tokio::test]
+async fn arm_health_reports_invalid_origin() {
+    let planes = planes();
+    let facts = install(&planes);
+    let mut call = request();
+    call["origin"]["call_key"] = json!("");
+    assert!(planes.routes.display.arm(&frame(call), &facts).is_none());
+    assert_eq!(
+        arm_health_metrics(&planes).await,
+        arm_counts("invalidOrigin")
+    );
+}
+
+#[tokio::test]
+async fn arm_health_reports_invalid_key_or_pin() {
+    for field in ["call_key", "schema_pin"] {
+        let planes = planes();
+        let facts = install(&planes);
+        let mut call = request();
+        call.as_object_mut().unwrap().remove("origin");
+        call[field] = json!("");
+        assert!(planes.routes.display.arm(&frame(call), &facts).is_none());
+        assert_eq!(
+            arm_health_metrics(&planes).await,
+            arm_counts("invalidKeyOrPin")
+        );
+    }
+}
+
+#[tokio::test]
+async fn arm_health_reports_duplicates_without_another_armed_count() {
+    let planes = planes();
+    let facts = install(&planes);
+    let call = frame(request());
+    assert!(planes.routes.display.arm(&call, &facts).is_some());
+    assert!(planes.routes.display.arm(&call, &facts).is_none());
+    let mut expected = arm_counts("armed");
+    expected["duplicate"] = json!(1);
+    assert_eq!(arm_health_metrics(&planes).await, expected);
 }
 
 async fn deliver(planes: &Planes, body: Value) {
@@ -537,6 +693,178 @@ async fn bind_scope_carrier(
         .await
         .unwrap();
     replies.recv().await.unwrap()
+}
+
+async fn bind_display(planes: &Planes) -> Frame {
+    bind_scope_carrier(
+        planes,
+        Principal::Reserved {
+            module_id: "display-vendor".into(),
+        },
+        subc_protocol::RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+        None,
+    )
+    .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn declarer_cache_one_catalog_read_for_100_binds_within_ttl() {
+    let planes = planes();
+    let catalog = CatalogDouble::new(&["prefrontal-core"]);
+    planes.routes.display.connect(catalog.clone());
+    let stamp = subc_protocol::scope::ScopeStamp::new(
+        Principal::Reserved {
+            module_id: "scope-owner".into(),
+        },
+        "display-scope",
+        1,
+        subc_protocol::scope::ScopeKind::Head,
+    );
+    for _ in 0..100 {
+        let reply = bind_scope_carrier(
+            &planes,
+            Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            subc_protocol::RouteTarget::ToolProvider {
+                module_id: "cerebellum".into(),
+            },
+            Some(serde_json::to_value(&stamp).unwrap()),
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+    }
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn declarer_cache_refreshes_at_30_seconds_and_expires_read_access() {
+    let planes = planes();
+    let catalog = CatalogDouble::new(&["display-vendor"]);
+    planes.routes.display.connect(catalog.clone());
+    assert_eq!(bind_display(&planes).await.header.ty, FrameType::Response);
+    *catalog.answer.lock().unwrap() = Some(vec![]);
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert_eq!(bind_display(&planes).await.header.ty, FrameType::Response);
+    let principal = Principal::Reserved {
+        module_id: "display-vendor".into(),
+    };
+    let params = json!({"record_id":"missing"});
+    let before = planes
+        .routes
+        .display
+        .read(Some(&principal), params.clone())
+        .await
+        .unwrap_err();
+    assert_ne!(
+        before.code,
+        cortexkit_role_tool_display::DISPLAY_READ_DENIED
+    );
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(bind_display(&planes).await.header.ty, FrameType::Error);
+    let after = planes
+        .routes
+        .display
+        .read(Some(&principal), params)
+        .await
+        .unwrap_err();
+    assert_eq!(after.code, cortexkit_role_tool_display::DISPLAY_READ_DENIED);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn declarer_cache_caches_empty_and_ambiguous_answers() {
+    for modules in [vec![], vec!["display-vendor", "another-display"]] {
+        let planes = planes();
+        let catalog = CatalogDouble::new(&modules);
+        planes.routes.display.connect(catalog.clone());
+        for _ in 0..100 {
+            assert_eq!(bind_display(&planes).await.header.ty, FrameType::Error);
+        }
+        assert_eq!(catalog.reads.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn declarer_cache_failed_read_is_not_cached() {
+    let planes = planes();
+    let catalog = CatalogDouble::new(&[]);
+    *catalog.answer.lock().unwrap() = None;
+    planes.routes.display.connect(catalog.clone());
+    assert_eq!(bind_display(&planes).await.header.ty, FrameType::Error);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 1);
+    *catalog.answer.lock().unwrap() = Some(vec!["display-vendor".into()]);
+    assert_eq!(bind_display(&planes).await.header.ty, FrameType::Response);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn declarer_cache_concurrent_refresh_shares_success_failure_and_timeout() {
+    for outcome in ["success", "failure", "timeout"] {
+        let planes = planes();
+        let catalog = CatalogDouble::new(&["display-vendor"]);
+        planes.routes.display.connect(catalog.clone());
+        assert_eq!(bind_display(&planes).await.header.ty, FrameType::Response);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        catalog.blocked.store(true, Ordering::SeqCst);
+        if outcome == "failure" {
+            *catalog.answer.lock().unwrap() = None;
+        }
+        let mut binds: Vec<_> = (0..100).map(|_| Box::pin(bind_display(&planes))).collect();
+        std::future::poll_fn(|cx| {
+            for bind in &mut binds {
+                assert!(std::future::Future::poll(bind.as_mut(), cx).is_pending());
+            }
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(catalog.reads.load(Ordering::SeqCst), 2, "{outcome}");
+        if outcome == "timeout" {
+            tokio::time::advance(WRITE_WINDOW).await;
+        } else {
+            catalog.release.add_permits(100);
+        }
+        let expected = if outcome == "success" {
+            FrameType::Response
+        } else {
+            FrameType::Error
+        };
+        for bind in binds {
+            assert_eq!(bind.await.header.ty, expected, "{outcome}");
+        }
+        assert_eq!(catalog.reads.load(Ordering::SeqCst), 2, "{outcome}");
+        catalog.blocked.store(false, Ordering::SeqCst);
+        *catalog.answer.lock().unwrap() = Some(vec!["display-vendor".into()]);
+        assert_eq!(bind_display(&planes).await.header.ty, FrameType::Response);
+        let expected_reads = if outcome == "success" { 2 } else { 3 };
+        assert_eq!(catalog.reads.load(Ordering::SeqCst), expected_reads);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn declarer_cache_waiter_retries_when_refresh_owner_is_cancelled() {
+    let records = Records::default();
+    let catalog = CatalogDouble::new(&["display-vendor"]);
+    catalog.blocked.store(true, Ordering::SeqCst);
+    records.connect(catalog.clone());
+    let mut owner = Box::pin(records.declarers());
+    let mut waiter = Box::pin(records.declarers());
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(owner.as_mut(), cx).is_pending());
+        assert!(std::future::Future::poll(waiter.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 1);
+    drop(owner);
+    catalog.blocked.store(false, Ordering::SeqCst);
+    assert_eq!(waiter.await, vec!["display-vendor"]);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(records.declarers().await, vec!["display-vendor"]);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
