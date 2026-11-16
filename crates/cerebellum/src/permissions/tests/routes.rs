@@ -121,6 +121,17 @@ async fn cingulate_management_route_refuses_grants_list_and_every_other_method_b
             "{method}: {}",
             body(&refused)
         );
+        // The tool-display contract names its own final refusal for every caller
+        // that is not the one display server, Cingulate included.
+        if method == cortexkit_role_tool_display::DISPLAY_READ {
+            assert_eq!(
+                body(&refused)["code"],
+                cortexkit_role_tool_display::DISPLAY_READ_DENIED,
+                "{method}"
+            );
+            assert_eq!(backend.load().unwrap(), before, "{method} changed grants");
+            continue;
+        }
         assert_eq!(body(&refused)["code"], "principal_denied", "{method}");
         assert!(body(&refused)["message"]
             .as_str()

@@ -1005,6 +1005,7 @@ mod tests {
         assert_eq!(
             advertised,
             vec![
+                cortexkit_role_tool_display::DISPLAY_READ,
                 crate::ability::DESCRIBE,
                 crate::ability::SCOPE_CHOICES,
                 crate::ability::SETUP,
