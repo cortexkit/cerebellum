@@ -11,12 +11,8 @@
       "value": "https://example.com"
     },
     {
-      "label": "Level",
-      "value": "3"
-    },
-    {
-      "label": "Hazards",
-      "value": ""
+      "label": "Can",
+      "value": "It can open and read pages there and click ordinary buttons and links. It can also make changes there that can be undone afterwards"
     }
   ],
   "kind": "consent",

@@ -2058,28 +2058,19 @@ fn browser_grant_message(origins: &[String], hazards: &[String], ceiling_tier: u
         }
     }
 
-    let mut message = format!(
-        "Let this agent use its own browser on {}? It can open and read pages there \
-         and click ordinary buttons and links.",
-        join_words(
-            &origins.iter().map(String::as_str).collect::<Vec<_>>(),
-            "and"
-        )
-    );
     // The sentence follows the ceiling the grant is minted at, whatever raised
     // it. A disclosed hazard also lifts the ceiling to the durable tier, and
     // that tier admits every lasting-change click, not only the one form kind
     // the hazard names; describing only the form kind would ask the person to
     // approve less than the grant allows.
-    match ceiling_tier {
-        MUTATE_DURABLE => message.push_str(
-            " It can also follow links that lead to other sites and submit other forms, \
-             which can make lasting changes such as posting, saving or sending something.",
+    let mut message = format!(
+        "Let this agent use its own browser on {}? {}",
+        join_words(
+            &origins.iter().map(String::as_str).collect::<Vec<_>>(),
+            "and"
         ),
-        MUTATE_REVERSIBLE => message
-            .push_str(" It can also make changes on those sites that can be undone afterwards."),
-        _ => {}
-    }
+        browser_grant_capabilities(ceiling_tier, true)
+    );
     if !allowed.is_empty() {
         message.push_str(&format!(
             " It can also submit {}.",
@@ -2090,6 +2081,28 @@ fn browser_grant_message(origins: &[String], hazards: &[String], ceiling_tier: u
         message.push_str(&format!(" It can't submit {}.", join_words(&refused, "or")));
     }
     message
+}
+
+pub(crate) fn browser_grant_capabilities(tier: u8, beyond_site: bool) -> String {
+    let mut text =
+        "It can open and read pages there and click ordinary buttons and links.".to_string();
+    match tier {
+        MUTATE_DURABLE if beyond_site => text.push_str(
+            " It can also follow links that lead to other sites and submit other forms, \
+             which can make lasting changes such as posting, saving or sending something.",
+        ),
+        MUTATE_DURABLE => text.push_str(
+            " It can also submit forms that make lasting changes, such as posting, saving or sending something.",
+        ),
+        MUTATE_REVERSIBLE if beyond_site => {
+            text.push_str(" It can also make changes on those sites that can be undone afterwards.")
+        }
+        MUTATE_REVERSIBLE => {
+            text.push_str(" It can also make changes there that can be undone afterwards.")
+        }
+        _ => {}
+    }
+    text
 }
 
 /// `a`, `a and b`, `a, b and c`, with the given final conjunction.

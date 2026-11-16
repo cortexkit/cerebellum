@@ -1,6 +1,43 @@
 use super::*;
 
 #[test]
+fn site_card_uses_plain_capability_and_hazard_words() {
+    let hazards = BTreeSet::from(HazardClass::ALL);
+    for (tier, expected) in [
+        (authorization::COMPOSE, "It can open and read pages there and click ordinary buttons and links"),
+        (authorization::MUTATE_REVERSIBLE, "It can open and read pages there and click ordinary buttons and links. It can also make changes there that can be undone afterwards"),
+        (authorization::MUTATE_DURABLE, "It can open and read pages there and click ordinary buttons and links. It can also submit forms that make lasting changes, such as posting, saving or sending something"),
+    ] {
+        let card = site_question("https://example.com", tier, &hazards, true);
+        let facts = card["params"]["facts"].as_array().unwrap();
+        assert_eq!(facts[0], json!({"label":"Browser", "value":"Your own Chrome, signed in as you"}));
+        assert_eq!(facts[1], json!({"label":"Site", "value":"https://example.com"}));
+        assert_eq!(facts[2], json!({"label":"Can", "value":expected}));
+        assert_eq!(facts[3], json!({"label":"Includes", "value":"submitting sign-in forms; submitting payment forms; submitting forms it can't fully check"}));
+        assert_eq!(facts.len(), 4);
+        assert!(facts.iter().all(|fact| {
+            let value = fact["value"].as_str().unwrap();
+            !value.contains("other sites") && !value.contains("those sites")
+        }));
+    }
+    let card = site_question(
+        "https://example.com",
+        authorization::COMPOSE,
+        &BTreeSet::new(),
+        true,
+    );
+    assert_eq!(card["params"]["facts"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn unknown_site_hazard_never_displays_the_token() {
+    assert_eq!(
+        site_hazard_words("unknown_hazard"),
+        "other sensitive actions"
+    );
+}
+
+#[test]
 fn user_actions_require_explicit_tabs_and_closed_arguments() {
     for action in [
         "snapshot",

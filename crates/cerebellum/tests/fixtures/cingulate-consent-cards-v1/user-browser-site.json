@@ -11,12 +11,12 @@
       "value": "https://example.net"
     },
     {
-      "label": "Level",
-      "value": "3"
+      "label": "Can",
+      "value": "It can open and read pages there and click ordinary buttons and links. It can also make changes there that can be undone afterwards"
     },
     {
-      "label": "Hazards",
-      "value": "credential_form_submit"
+      "label": "Includes",
+      "value": "submitting sign-in forms"
     }
   ],
   "kind": "consent",

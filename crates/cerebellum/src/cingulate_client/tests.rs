@@ -38,6 +38,54 @@ fn todays_cards() -> Vec<(CardKind, &'static str, Value, Duration)> {
     cards_with_standing(true)
 }
 
+#[test]
+fn every_generic_card_fact_uses_plain_words() {
+    for (kind, name, body, _) in todays_cards() {
+        if kind == CardKind::SecretUse {
+            continue;
+        }
+        for fact in body["params"]["facts"].as_array().unwrap() {
+            let label = fact["label"].as_str().unwrap();
+            let value = fact["value"].as_str().unwrap();
+            for word in value.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                assert!(
+                    !word.contains('_'),
+                    "{name}: {label} contains an underscore-joined token: {value}"
+                );
+            }
+            if label.eq_ignore_ascii_case("level") || label.eq_ignore_ascii_case("tier") {
+                assert!(
+                    value.parse::<u8>().is_err(),
+                    "{name}: {label} contains a bare tier number: {value}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn website_card_can_rows_keep_their_wording() {
+    let (_, _, body, _) = todays_cards()
+        .into_iter()
+        .find(|(kind, ..)| *kind == CardKind::WebsiteAccessInCall)
+        .unwrap();
+    let rows: Vec<_> = body["params"]["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|fact| fact["label"] == "Can")
+        .cloned()
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            json!({"label":"Can", "value":"It can open and read pages there and click ordinary buttons and links"}),
+            json!({"label":"Can", "value":"It can also follow links that lead to other sites and submit other forms, which can make lasting changes such as posting, saving or sending something"}),
+            json!({"label":"Can", "value":"It can also submit sign-in forms"}),
+        ]
+    );
+}
+
 fn cards_with_standing(standing: bool) -> Vec<(CardKind, &'static str, Value, Duration)> {
     use crate::authorization::{HazardClass, Severity};
     use crate::computer_grants::{AppIdentity, GrantNeed, NoIdentityReader};
