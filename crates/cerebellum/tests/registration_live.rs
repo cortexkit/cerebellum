@@ -411,16 +411,27 @@ impl Fixture {
         )
         .await;
         if registration_channel {
-            let bind = timeout(HANG_GUARD, ckbus.binds.lock().await.recv())
-                .await
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "probe did not open its claimed route: {error}; {}",
-                        fs::read_to_string(run.join("logs/claim-probe.stderr.log"))
-                            .unwrap_or_default()
-                    )
-                })
-                .unwrap();
+            // Cerebellum's startup views reconcile may reach the fake ckbus
+            // before the probe does. Its route must be claimed too; skip past it.
+            let bind = timeout(HANG_GUARD, async {
+                loop {
+                    let bind = ckbus.binds.lock().await.recv().await.unwrap();
+                    if bind["principal"] != serde_json::to_value(reserved("cerebellum")).unwrap() {
+                        return bind;
+                    }
+                    assert_eq!(
+                        bind["caller"]["claim"], "own",
+                        "cerebellum's startup bus route must present a self claim: {bind}"
+                    );
+                }
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "probe did not open its claimed route: {error}; {}",
+                    fs::read_to_string(run.join("logs/claim-probe.stderr.log")).unwrap_or_default()
+                )
+            });
             assert_eq!(
                 bind["principal"],
                 serde_json::to_value(reserved("claim-probe")).unwrap()
