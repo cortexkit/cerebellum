@@ -47,11 +47,14 @@ file="$fixture/crates/example/src/file0.rs"
 expect 'test files excluded from denominator' 0 'scanned 100 files'
 lines "$file" 5001
 expect 'new oversized source fails' 1 'file0.rs: 5001 lines exceeds 5000'
-printf '5001 crates/example/src/file0.rs\n' > "$fixture/scripts/file-size-baseline.txt"
+printf '5001 crates/example/src/file0.rs # fixture reason\n' > "$fixture/scripts/file-size-baseline.txt"
 expect 'baseline permits its recorded size' 0 'scanned 100 files'
 lines "$file" 5002
-expect 'baseline growth fails' 1 'file0.rs: 5002 lines exceeds baseline 5001'
 printf '5002 crates/example/src/file0.rs\n' > "$fixture/scripts/file-size-baseline.txt"
+expect 'exception without a reason fails' 1 'invalid baseline entry'
+printf '5001 crates/example/src/file0.rs # fixture reason\n' > "$fixture/scripts/file-size-baseline.txt"
+expect 'baseline growth fails' 1 'file0.rs: 5002 lines exceeds baseline 5001'
+printf '5002 crates/example/src/file0.rs # fixture reason\n' > "$fixture/scripts/file-size-baseline.txt"
 lines "$file" 5001
 expect 'shrink above limit suggests lowering baseline' 0 '5001 lines; lower its baseline from 5002'
 lines "$file" 5000

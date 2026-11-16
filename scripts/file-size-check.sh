@@ -19,8 +19,10 @@ baseline_path = Path("scripts/file-size-baseline.txt")
 baseline = {}
 try:
     for line in baseline_path.read_text().splitlines():
-        count, path = line.split(" ", 1)
-        if not count.isascii() or not count.isdigit() or int(count) <= limit or not path.startswith("crates/") or path in baseline:
+        # Each exception states why the file is still over the limit.
+        entry, sep, reason = line.partition(" # ")
+        count, _, path = entry.partition(" ")
+        if not sep or not reason.strip() or not count.isascii() or not count.isdigit() or int(count) <= limit or not path.startswith("crates/") or path in baseline:
             raise ValueError(f"invalid baseline entry: {line!r}")
         baseline[path] = int(count)
     tracked = subprocess.run(
