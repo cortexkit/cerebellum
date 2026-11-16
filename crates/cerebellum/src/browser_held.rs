@@ -1,6 +1,8 @@
 //! Resume only live held browser calls, through the ordinary request boundary.
 
 use crate::*;
+mod tasks;
+pub(crate) use tasks::Tasks;
 
 tokio::task_local! {
     static RESUMING: ResumeContext;
@@ -101,7 +103,24 @@ pub(crate) fn retain(planes: &Planes, facts: &AcceptedBindFacts, call_key: &str,
             ask_id: String::new(),
             created: std::time::Instant::now(),
         },
+        &planes.browser_resumes,
     );
+}
+
+fn still_live(planes: &Planes, resume: &journal::call_records::BrowserResume) -> bool {
+    let header = &resume.frame.header;
+    resume.created.elapsed() <= journal::call_records::CACHE_MAX_AGE
+        && planes.routes.get(header.channel, header.epoch).as_ref() == Some(&resume.facts)
+        && planes.routes.bind_sequence(header.channel, header.epoch) == Some(resume.bind_sequence)
+        && resume
+            .facts
+            .scope
+            .as_ref()
+            .is_some_and(|scope| !planes.scopes.is_superseded(scope))
+        && resume.head.is_some_and(|((channel, epoch), sequence)| {
+            planes.routes.bind_sequence(channel, epoch) == Some(sequence)
+        })
+        && codemode::user_browser_route(planes, header.channel, header.epoch).is_ok()
 }
 
 pub(crate) fn run_ready(
@@ -109,71 +128,26 @@ pub(crate) fn run_ready(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
     Box::pin(async move {
         for (principal, call_key) in planes.calls.approved_browser_requests() {
+            let Some(bytes) = planes.calls.browser_request_bytes(&principal, &call_key) else {
+                continue;
+            };
+            let Some(reservation) = planes
+                .browser_resumes
+                .reserve((principal.clone(), call_key.clone()), bytes)
+            else {
+                continue;
+            };
             let request = planes.calls.claim_browser_request(
                 &principal,
                 &call_key,
                 wall_clock_ms(),
-                |resume| {
-                    let header = &resume.frame.header;
-                    planes.routes.get(header.channel, header.epoch).as_ref() == Some(&resume.facts)
-                        && planes.routes.bind_sequence(header.channel, header.epoch)
-                            == Some(resume.bind_sequence)
-                        && resume
-                            .facts
-                            .scope
-                            .as_ref()
-                            .is_some_and(|scope| !planes.scopes.is_superseded(scope))
-                        && resume.head.is_some_and(|((channel, epoch), sequence)| {
-                            planes.routes.bind_sequence(channel, epoch) == Some(sequence)
-                        })
-                        && codemode::user_browser_route(planes, header.channel, header.epoch)
-                            .is_ok()
-                },
+                |resume| still_live(planes, resume),
             );
-            let Ok(Some(resume)) = request else { continue };
-            let (writer, mut replies) = mpsc::channel(16);
-            // A new request guard and the exact original bind make this the same
-            // admission, claim, grant and target checks as a freshly issued call.
-            let context = ResumeContext {
-                ask_id: resume.ask_id.clone(),
-                call_key: call_key.clone(),
-                dispatch: Arc::new(std::sync::Mutex::new(None)),
-            };
-            let result = with_context(
-                Some(context.clone()),
-                Box::pin(handle_frame(resume.frame.clone(), &writer, planes)),
-            )
-            .await;
-            drop(writer);
-            let mut terminal = None;
-            while let Some(reply) = replies.recv().await {
-                if matches!(reply.header.ty, FrameType::Response | FrameType::Error) {
-                    terminal = Some(reply);
-                }
+            if let Ok(Some(resume)) = request {
+                planes
+                    .browser_resumes
+                    .spawn(reservation, resume, planes.clone());
             }
-            let reply = terminal.unwrap_or_else(|| {
-                let mut reply = resume.frame;
-                reply.header.ty = FrameType::Response;
-                reply.body = serde_json::to_vec(&json!({"outcome":"outcome_unknown"})).unwrap();
-                reply
-            });
-            let _ = result;
-            let dispatched =
-                context
-                    .dispatch
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .is_some_and(|(witness, gate)| {
-                        witness.committed() || gate.load(std::sync::atomic::Ordering::Acquire)
-                    });
-            let _ = planes.calls.finish_browser_request(
-                &principal,
-                &call_key,
-                reply,
-                dispatched,
-                wall_clock_ms(),
-            );
         }
     })
 }

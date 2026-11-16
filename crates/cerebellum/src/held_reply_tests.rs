@@ -82,6 +82,38 @@ async fn late(planes: &Planes, channel: u16) -> Value {
     )
 }
 
+async fn late_key(planes: &Planes, channel: u16, key: &str) -> Value {
+    tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let reply = late(planes, channel).await;
+            if reply["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["call_key"] == key)
+            {
+                return reply;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the original held call settles")
+}
+
+async fn capture_waiting(planes: &Planes) {
+    let scope = journal::call_records::ScopeIdentity::from_stamp(
+        planes.routes.get(9, 3).unwrap().scope.as_ref().unwrap(),
+    );
+    tokio::time::timeout(HANG_GUARD, async {
+        while !planes.calls.has_pending_scope(&scope) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the resumed capture reaches its login hold");
+}
+
 fn answered(id: &str, choice: &str) -> Value {
     json!({"elicitation_id":id,"state":"answered","answered_choice_id":choice})
 }
@@ -385,7 +417,7 @@ async fn approved_consent_resumes_basal_call_and_delivers_cached_result_once() {
         "consent",
     );
     consent.feed(json!([answered("approved-site", "allow_30m")]));
-    let entries = late(&planes, 9).await;
+    let entries = late_key(&planes, 9, "site-approval").await;
     let entry = &entries["entries"][0];
     assert_eq!(entry["kind"], "result", "{entries}");
     assert_eq!(entry["custodian"], "reserved:basal");
@@ -471,6 +503,13 @@ async fn consent_approval_resumes_original_capture_into_login_capture() {
     assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 0);
     consent.feed(json!([answered("capture-approval", "allow")]));
     let entries = late(&planes, 9).await;
+    tokio::time::timeout(HANG_GUARD, async {
+        while fixture.launcher.launches.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("approval starts the original capture");
     assert_eq!(
         fixture.launcher.launches.load(Ordering::SeqCst),
         1,
@@ -973,6 +1012,7 @@ async fn capture_scope_ended_settles_once_and_disposes_without_deposit() {
     let finalized = planes.capture.expect_journal_finalization();
     consent.feed(json!([answered("scope-capture-card", "allow")]));
     let waiting = late(&planes, 9).await;
+    capture_waiting(&planes).await;
     assert!(
         waiting["entries"].as_array().unwrap().is_empty(),
         "{waiting}"
@@ -1051,6 +1091,7 @@ async fn capture_scope_ended_during_deposit_preserves_the_observed_result_or_unk
         let finalized = planes.capture.expect_journal_finalization();
         consent.feed(json!([answered("deposit-card", "allow")]));
         let waiting = late(&planes, 9).await;
+        capture_waiting(&planes).await;
         assert!(
             waiting["entries"].as_array().unwrap().is_empty(),
             "{waiting}"
@@ -1499,7 +1540,8 @@ async fn consent_drain_cannot_overtake_the_held_custody_write() {
     );
     drop(release);
     assert_held(&decode(raising.await.unwrap()), "consent");
-    let result = tokio::time::timeout(HANG_GUARD, poll).await.unwrap();
+    let _ = tokio::time::timeout(HANG_GUARD, poll).await.unwrap();
+    let result = late_key(&planes, 9, "racing-key").await;
     assert_eq!(result["entries"][0]["kind"], "result");
     assert_eq!(
         result["entries"][0]["result"]["structuredContent"]["outcome"],

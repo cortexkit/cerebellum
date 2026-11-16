@@ -22,6 +22,7 @@ struct Page {
     navigations: AtomicUsize,
     inputs: AtomicUsize,
     private_redirect: std::sync::atomic::AtomicBool,
+    gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     url: Mutex<String>,
 }
 
@@ -48,6 +49,13 @@ impl OwnedBrowserProcess for Browser {
         _: u64,
         tracker: &mut browser::Tracker,
     ) -> Result<(), NavigationDriveError> {
+        let gate = self.0.gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            tokio::runtime::Handle::current()
+                .block_on(gate.acquire())
+                .unwrap()
+                .forget();
+        }
         self.0.navigations.fetch_add(1, Ordering::SeqCst);
         *self.0.url.lock().unwrap() = url.into();
         tracker.url_final = Some(url.into());
@@ -230,7 +238,7 @@ async fn approval_while_held_runs_navigate_and_returns_its_page_without_persisti
     start_navigation(&planes).await;
     assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
     consent.feed(json!([answered("browser-card", "allow_30m")]));
-    let reply = late(&planes, 9).await;
+    let reply = late_key(&planes, 9, "held-navigation").await;
     let entry = &reply["entries"][0];
     assert_eq!(entry["kind"], "result", "{reply}");
     let body = &entry["result"]["structuredContent"];
@@ -297,7 +305,7 @@ async fn stale_ref_after_held_approval_names_stale_snapshot_without_input() {
         .await
         .unwrap();
     consent.feed(json!([answered("browser-card", "allow_30m")]));
-    let reply = late(&planes, 9).await;
+    let reply = late_key(&planes, 9, "held-ref").await;
     let entry = &reply["entries"][0];
     assert_eq!(entry["kind"], "not_started", "{reply}");
     assert_eq!(entry["reason"], "stale_snapshot", "{reply}");
@@ -315,7 +323,7 @@ async fn refused_private_landing_after_navigation_is_not_misreported_as_not_star
     page.private_redirect.store(true, Ordering::SeqCst);
     start_navigation(&planes).await;
     consent.feed(json!([answered("browser-card", "allow_30m")]));
-    let reply = late(&planes, 9).await;
+    let reply = late_key(&planes, 9, "held-navigation").await;
     assert_eq!(reply["entries"][0]["kind"], "result", "{reply}");
     assert_eq!(
         reply["entries"][0]["result"]["structuredContent"]["outcome"], "authorization_denied",
@@ -540,6 +548,7 @@ async fn expired_memory_hold_keeps_approval_for_a_fresh_call_without_running() {
                 - journal::call_records::CACHE_MAX_AGE
                 - Duration::from_secs(1),
         },
+        &planes.browser_resumes,
     );
     consent.feed(json!([answered("browser-card", "allow_30m")]));
     let reply = late(&planes, 9).await;
@@ -671,4 +680,188 @@ async fn direct_coordinate_click_does_not_run_after_waiting_for_approval() {
     assert_eq!(reply["detail"]["consent"], "approved");
     assert_eq!(page.inputs.load(Ordering::SeqCst), 0);
     assert_eq!(planes.calls.browser_request_count(), 0);
+}
+
+async fn queued_fixture(
+    per_head: usize,
+    global: usize,
+) -> (
+    Planes,
+    tests::ScriptedConsent,
+    Arc<Page>,
+    Arc<tokio::sync::Semaphore>,
+) {
+    let (mut planes, consent, page, _) = fixture().await;
+    planes.browser_resumes = Arc::new(browser_held::Tasks::new(per_head, global));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *page.gate.lock().unwrap() = Some(gate.clone());
+    for index in 0..3 {
+        if index > 0 {
+            consent.feed(json!([]));
+        }
+        let mut request = navigate_request();
+        request["call_key"] = json!(format!("queued-{index}"));
+        assert_held(
+            &decode(exchange(&planes, 9, 3 + index, request).await),
+            "consent",
+        );
+    }
+    consent.feed(json!([answered("browser-card", "allow_30m")]));
+    let _ = late(&planes, 9).await;
+    tokio::time::timeout(HANG_GUARD, async {
+        while planes.browser_resumes.counts() != (3, 1) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("one continuation runs while the rest wait in the bounded task queue");
+    (planes, consent, page, gate)
+}
+
+#[tokio::test]
+async fn queued_resumptions_obey_both_global_and_per_head_caps_without_blocking_the_poll() {
+    for (per_head, global) in [(1, 2), (2, 1)] {
+        let (planes, _consent, page, gate) = queued_fixture(per_head, global).await;
+        let ModuleControlResponse::HealthCheck {
+            metrics: Some(metrics),
+            ..
+        } = planes.health.report()
+        else {
+            panic!("health metrics")
+        };
+        assert!(metrics["inFlightActions"].as_u64().unwrap() > 0);
+        gate.add_permits(3);
+        tokio::time::timeout(HANG_GUARD, async {
+            while planes.browser_resumes.counts().0 != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all queued resumptions eventually finish");
+        assert_eq!(page.navigations.load(Ordering::SeqCst), 3);
+    }
+}
+
+#[tokio::test]
+async fn original_key_withdraw_and_cancel_stop_queued_resumptions_before_dispatch() {
+    let (planes, _consent, page, gate) = queued_fixture(1, 1).await;
+    // The key whose request reached the driver is deliberately not selected:
+    // hash-map iteration does not promise which approved call runs first.
+    let active = planes.browser_resumes.active_keys();
+    let queued: Vec<_> = (0..3)
+        .filter(|index| !active.contains(&format!("queued-{index}")))
+        .collect();
+    let key = format!("queued-{}", queued[0]);
+    let _ = decode(
+        exchange(
+            &planes,
+            9,
+            20,
+            json!({"name":"tool.withdraw","arguments":{"call_key":key}}),
+        )
+        .await,
+    );
+    let mut cancel = request(9, 3 + queued[1], json!({}));
+    cancel.header.ty = FrameType::Cancel;
+    let (writer, _) = mpsc::channel(16);
+    handle_frame_for_test(cancel, &writer, &planes)
+        .await
+        .unwrap();
+    gate.add_permits(3);
+    tokio::time::timeout(HANG_GUARD, async {
+        while planes.browser_resumes.counts().0 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled queued calls leave the registry");
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn module_teardown_aborts_and_joins_owned_resumptions_within_its_existing_budget() {
+    let (planes, _consent, _page, gate) = queued_fixture(1, 1).await;
+    let teardown = ShutdownTeardown::new(
+        planes.sessions.clone(),
+        None,
+        None,
+        None,
+        planes.user_browser.clone(),
+        Arc::clone(&planes.private_content),
+        Arc::clone(&planes.browser_resumes),
+    );
+    tokio::time::timeout(
+        browser_session::SHUTDOWN_TEARDOWN_BUDGET,
+        teardown.run_or_join(),
+    )
+    .await
+    .expect("owned resumptions do not extend teardown");
+    assert_eq!(planes.browser_resumes.counts(), (0, 0));
+    gate.add_permits(3);
+}
+
+#[tokio::test]
+async fn route_scope_and_session_end_cancel_queued_owned_resumptions() {
+    for ending in ["route", "scope", "session", "rebind"] {
+        let (planes, _consent, page, gate) = queued_fixture(1, 1).await;
+        match ending {
+            "route" => {
+                let mut goodbye = request(9, 30, json!({}));
+                goodbye.header.ty = FrameType::Goodbye;
+                let (writer, _) = mpsc::channel(16);
+                handle_frame_for_test(goodbye, &writer, &planes)
+                    .await
+                    .unwrap();
+            }
+            "scope" => {
+                let scope = scope_watch::ScopeKey::from_stamp(
+                    planes.routes.get(9, 3).unwrap().scope.as_ref().unwrap(),
+                );
+                settle_scope_holds(&planes, &scope);
+            }
+            "session" => forget_conversation_cards(&planes, "head-conversation"),
+            _ => {
+                let head = planes.routes.remove(8, 3).unwrap();
+                planes.routes.insert(8, 3, head);
+            }
+        }
+        gate.add_permits(3);
+        tokio::time::timeout(HANG_GUARD, async {
+            while planes.browser_resumes.counts().0 != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ended calls leave the owned task registry");
+        assert!(
+            page.navigations.load(Ordering::SeqCst) <= 1,
+            "queued calls must not start after {ending} end"
+        );
+    }
+}
+
+#[tokio::test]
+async fn module_draining_cancels_the_owned_resume_task_queue() {
+    let (mut planes, _consent, _page, gate) = queued_fixture(1, 1).await;
+    planes.browser_config = None;
+    let frame = Frame::build(
+        FrameType::Push,
+        control_flags(),
+        0,
+        0,
+        0,
+        serde_json::to_vec(&json!({"op":"module.draining","reason":"restart","deadline_ms":123}))
+            .unwrap(),
+    )
+    .unwrap();
+    let (writer, _) = mpsc::channel(16);
+    handle_frame_for_test(frame, &writer, &planes)
+        .await
+        .unwrap();
+    planes
+        .browser_resumes
+        .stop_and_join(tokio::time::Instant::now() + browser_session::SHUTDOWN_TEARDOWN_BUDGET)
+        .await;
+    assert_eq!(planes.browser_resumes.counts(), (0, 0));
+    gate.add_permits(3);
 }

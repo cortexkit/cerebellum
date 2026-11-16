@@ -24,8 +24,23 @@ impl std::fmt::Debug for BrowserResume {
 }
 
 impl CallRecords {
-    pub(crate) fn retain_browser_request(&self, principal: &str, key: &str, resume: BrowserResume) {
+    pub(crate) fn browser_request_bytes(&self, principal: &str, key: &str) -> Option<usize> {
+        self.lock()
+            .entries
+            .get(&(principal.into(), key.into()))?
+            .browser_resume
+            .as_ref()
+            .map(|resume| resume.frame.body.len())
+    }
+    pub(crate) fn retain_browser_request(
+        &self,
+        principal: &str,
+        key: &str,
+        resume: BrowserResume,
+        tasks: &crate::browser_held::Tasks,
+    ) {
         let mut inner = self.lock();
+        let (running, running_bytes) = tasks.usage();
         let (count, bytes) = inner
             .entries
             .values()
@@ -33,8 +48,11 @@ impl CallRecords {
             .fold((0, 0), |(count, bytes), resume| {
                 (count + 1, bytes + resume.frame.body.len())
             });
-        if count >= CACHE_MAX_REPLIES
-            || bytes.saturating_add(resume.frame.body.len()) > CACHE_MAX_BYTES
+        if count + running >= CACHE_MAX_REPLIES
+            || bytes
+                .saturating_add(running_bytes)
+                .saturating_add(resume.frame.body.len())
+                > CACHE_MAX_BYTES
             || resume.frame.body.len() > CACHE_MAX_REPLY_BYTES
         {
             return;

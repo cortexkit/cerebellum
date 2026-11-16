@@ -105,9 +105,16 @@ fn run_frame(corr: u64, args: Value, key: Option<&str>) -> Frame {
 
 /// [`Fixture::start`] on the run route, with an optional `call_key`.
 fn start_run(fixture: &Fixture, args: Value, key: Option<&str>) -> Started {
+    start_run_named(fixture, "browser_use", args, key)
+}
+
+fn start_run_named(fixture: &Fixture, name: &str, args: Value, key: Option<&str>) -> Started {
     *fixture.site.decision.lock().unwrap() = "allow_30m".into();
     let corr = fixture.corr.fetch_add(1, Ordering::Relaxed);
-    let frame = run_frame(corr, args, key);
+    let mut frame = run_frame(corr, args, key);
+    let mut body: Value = serde_json::from_slice(&frame.body).unwrap();
+    body["name"] = json!(name);
+    frame.body = serde_json::to_vec(&body).unwrap();
     let registration = fixture.planes.cancellations.register((RUN, 1, corr));
     let (writer, replies) = mpsc::channel(16);
     let planes = fixture.planes.clone();
@@ -543,7 +550,7 @@ async fn a_run_route_goodbye_leaves_the_heads_claims_and_snapshots_untouched() {
 }
 
 #[tokio::test]
-async fn a_held_site_card_is_approved_and_the_runs_retry_acts_without_a_second_card() {
+async fn held_approval_and_an_ordinary_next_browser_call_do_not_deadlock() {
     let script = ScriptedCingulate::new().accept_execution_reports();
     let fixture = Fixture::scripted(&script);
     bind_run(&fixture, true).await;
@@ -582,8 +589,9 @@ async fn a_held_site_card_is_approved_and_the_runs_retry_acts_without_a_second_c
         "a held card opens no tab"
     );
 
-    // The person approves. The run's next call reads that answer, which
-    // stores the site grant, and then opens and loads the page under it.
+    // The next browser request already has a queue position when it drains
+    // approval. The original held action must not block that request while
+    // waiting behind its queue position.
     script
         .then(
             wire::CONSENT_ANSWERS,
@@ -608,6 +616,40 @@ async fn a_held_site_card_is_approved_and_the_runs_retry_acts_without_a_second_c
             .count(),
         1,
         "the approved retry raised a second card"
+    );
+    let original = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let reply = fixture
+                .finish(start_run_named(
+                    &fixture,
+                    "late_results",
+                    json!({"since":null}),
+                    None,
+                ))
+                .await;
+            if let Some(entry) = reply["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["call_key"] == "run-open")
+            {
+                return entry.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the original held browser call settles");
+    assert_eq!(original["kind"], "result", "{original}");
+    assert_eq!(
+        structured(&original["result"])["outcome"],
+        "ok",
+        "{original}"
+    );
+    assert_eq!(
+        fixture.state.lock().unwrap().tabs.len(),
+        tabs + 2,
+        "both explicit requests open exactly one tab"
     );
     assert!(!fixture.planes.calls.has_pending_consents());
 }
