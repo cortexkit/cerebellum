@@ -139,6 +139,125 @@ fn install(planes: &Planes) -> crate::AcceptedBindFacts {
     planes.routes.get(7, 1).unwrap()
 }
 
+async fn arm_health_metrics(planes: &Planes) -> Value {
+    let mut request = frame(serde_json::to_value(ModuleControlRequest::HealthCheck {}).unwrap());
+    request.header.channel = 0;
+    let (writer, mut replies) = mpsc::channel(8);
+    handle_control_request(request, &writer, &planes.health, &planes.routes, None, None)
+        .await
+        .unwrap();
+    let reply = replies.recv().await.unwrap();
+    let ModuleControlResponse::HealthCheck {
+        metrics: Some(metrics),
+        ..
+    } = serde_json::from_slice(&reply.body).unwrap()
+    else {
+        panic!("health reply");
+    };
+    metrics["toolDisplay"].clone()
+}
+
+fn arm_counts(counter: &str) -> Value {
+    let mut counts = json!({
+        "armed":0,
+        "noSchemaPin":0,
+        "noCallKey":0,
+        "invalidOrigin":0,
+        "invalidKeyOrPin":0,
+        "duplicate":0,
+    });
+    counts[counter] = json!(1);
+    counts
+}
+
+#[tokio::test]
+async fn arm_health_reports_armed_for_browser_and_computer_only() {
+    for name in [flat_tools::BROWSER_USE, flat_tools::COMPUTER_USE] {
+        let planes = planes();
+        let facts = install(&planes);
+        let mut call = request();
+        call["name"] = json!(name);
+        assert!(planes.routes.display.arm(&frame(call), &facts).is_some());
+        let mut unrelated = request();
+        unrelated["name"] = json!("tool.catalog");
+        assert!(planes
+            .routes
+            .display
+            .arm(&frame(unrelated), &facts)
+            .is_none());
+        assert_eq!(arm_health_metrics(&planes).await, arm_counts("armed"));
+    }
+}
+
+#[tokio::test]
+async fn arm_health_reports_missing_schema_pin_for_relayed_and_direct_calls() {
+    for relayed in [true, false] {
+        let planes = planes();
+        let facts = install(&planes);
+        let mut call = request();
+        if relayed {
+            call["origin"].as_object_mut().unwrap().remove("schema_pin");
+        } else {
+            call.as_object_mut().unwrap().remove("origin");
+            call.as_object_mut().unwrap().remove("schema_pin");
+        }
+        assert!(planes.routes.display.arm(&frame(call), &facts).is_none());
+        assert_eq!(arm_health_metrics(&planes).await, arm_counts("noSchemaPin"));
+    }
+}
+
+#[tokio::test]
+async fn arm_health_reports_missing_call_key() {
+    let planes = planes();
+    let facts = install(&planes);
+    let mut call = request();
+    call.as_object_mut().unwrap().remove("origin");
+    call.as_object_mut().unwrap().remove("call_key");
+    assert!(planes.routes.display.arm(&frame(call), &facts).is_none());
+    assert_eq!(arm_health_metrics(&planes).await, arm_counts("noCallKey"));
+}
+
+#[tokio::test]
+async fn arm_health_reports_invalid_origin() {
+    let planes = planes();
+    let facts = install(&planes);
+    let mut call = request();
+    call["origin"]["call_key"] = json!("");
+    assert!(planes.routes.display.arm(&frame(call), &facts).is_none());
+    assert_eq!(
+        arm_health_metrics(&planes).await,
+        arm_counts("invalidOrigin")
+    );
+}
+
+#[tokio::test]
+async fn arm_health_reports_invalid_key_or_pin() {
+    for field in ["call_key", "schema_pin"] {
+        let planes = planes();
+        let facts = install(&planes);
+        let mut call = request();
+        call.as_object_mut().unwrap().remove("origin");
+        call[field] = json!("");
+        assert!(planes.routes.display.arm(&frame(call), &facts).is_none());
+        assert_eq!(
+            arm_health_metrics(&planes).await,
+            arm_counts("invalidKeyOrPin")
+        );
+    }
+}
+
+#[tokio::test]
+async fn arm_health_reports_duplicates_without_another_armed_count() {
+    let planes = planes();
+    let facts = install(&planes);
+    let call = frame(request());
+    assert!(planes.routes.display.arm(&call, &facts).is_some());
+    assert!(planes.routes.display.arm(&call, &facts).is_none());
+    let mut expected = arm_counts("armed");
+    expected["duplicate"] = json!(1);
+    assert_eq!(arm_health_metrics(&planes).await, expected);
+}
+
 async fn deliver(planes: &Planes, body: Value) {
     let mut reply = frame(body);
     reply.header.ty = FrameType::Response;
