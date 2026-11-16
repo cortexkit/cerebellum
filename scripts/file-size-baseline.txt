@@ -5,6 +5,5 @@
 8479 crates/cerebellum/src/browser_session.rs # session lifecycle and connection worker; split when next worked on
 5281 crates/cerebellum/src/computer_capability/cursor.rs # agent cursor badge; split drawing from coordination when next worked on
 5828 crates/cerebellum/src/computer_capability/mod.rs # computer plane dispatch; split by action area when next worked on
-17059 crates/cerebellum/src/lib.rs # wire loop and per-operation handlers in one file; split by area next
 5015 crates/cerebellum/src/profile/mod.rs # self-digesting profile registry (pin in resources); split needs the pin moved too
 5037 crates/cerebellum/src/user_browser.rs # person's-Chrome bridge; split when next worked on

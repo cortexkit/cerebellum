@@ -75,8 +75,9 @@ pub fn test_source(source: &str) -> String {
 
 /// The source files among `files` that are out-of-line test modules: each file
 /// a `#[cfg(test)] mod name;` declaration loads (`name.rs` or `name/mod.rs`
-/// beside the declaring module), and every file beneath that module's
-/// directory. None of them ships, but nothing inside them says so.
+/// beside the declaring module, or an explicit `#[path]`), and every file
+/// beneath that module's directory. None of them ships, but nothing inside
+/// them says so.
 pub fn test_only_module_files(files: &[PathBuf]) -> Vec<PathBuf> {
     let mut modules = Vec::new();
     for file in files {
@@ -84,8 +85,16 @@ pub fn test_only_module_files(files: &[PathBuf]) -> Vec<PathBuf> {
             continue;
         };
         let directory = module_directory(file);
-        for name in test_only_module_names(&source) {
-            modules.push((directory.join(format!("{name}.rs")), directory.join(&name)));
+        for (name, path) in test_only_module_names(&source) {
+            let module = path.map_or_else(
+                || (directory.join(format!("{name}.rs")), directory.join(&name)),
+                |path| {
+                    let module_file = file.parent().unwrap_or(Path::new("")).join(path);
+                    let module_directory = module_directory(&module_file);
+                    (module_file, module_directory)
+                },
+            );
+            modules.push(module);
         }
     }
     files
@@ -109,8 +118,8 @@ fn module_directory(file: &Path) -> PathBuf {
     }
 }
 
-/// The names of modules a source file declares out of line and test-only.
-fn test_only_module_names(source: &str) -> Vec<String> {
+/// The names and explicit paths of out-of-line test-only module declarations.
+fn test_only_module_names(source: &str) -> Vec<(String, Option<String>)> {
     let original: Vec<char> = source.chars().collect();
     let code = code_only(&original);
     let mut names = Vec::new();
@@ -125,7 +134,20 @@ fn test_only_module_names(source: &str) -> Vec<String> {
             index += 1;
         }
         if let [_, name, ";"] = words.get(index..).unwrap_or(&[]) {
-            names.push((*name).to_string());
+            let path = (start..end).filter(|&i| code[i] == '#').find_map(|i| {
+                let close = i + code[i..end].iter().position(|&c| c == ']')?;
+                let attribute: String = code[i..=close].iter().collect();
+                let attribute_tokens = tokens(&[(1, attribute.as_str())]);
+                let words: Vec<&str> = attribute_tokens.iter().map(|(_, word)| *word).collect();
+                if words != ["#", "[", "path", "=", "]"] {
+                    return None;
+                }
+                let original_attribute: String = original[i..=close].iter().collect();
+                let (_, value) = original_attribute.split_once('=')?;
+                let value = value.trim().strip_prefix('"')?;
+                Some(value.split_once('"')?.0.to_string())
+            });
+            names.push(((*name).to_string(), path));
         }
     }
     names
@@ -753,7 +775,8 @@ fn the_skipper_drops_every_test_only_item() {
 /// The files an out-of-line test module loads are found by path: `name.rs`
 /// beside the declaring file, `name/mod.rs`, files nested under either, and a
 /// module declared from a non-`mod.rs` file, whose children live in a
-/// directory named for it. Shipped modules declared beside them are not.
+/// directory named for it. Explicit `#[path]` test modules and their children
+/// are included without excluding shipped files beside them.
 #[test]
 fn out_of_line_test_modules_are_found_by_path() {
     let scratch = scratch_directory("test-module-files");
@@ -767,7 +790,7 @@ fn out_of_line_test_modules_are_found_by_path() {
     };
     let lib = write(
         "lib.rs",
-        "mod shipped;\n#[cfg(test)]\nmod flat_tests;\n#[cfg(all(test, unix))]\npub(crate) mod tree_tests;\n",
+        "mod shipped;\n#[cfg(test)]\nmod flat_tests;\n#[cfg(all(test, unix))]\npub(crate) mod tree_tests;\n#[cfg(test)]\n#[path = \"lib_tests/relocated.rs\"]\nmod relocated_tests;\n#[path = \"lib_tests/shipped.rs\"]\nmod relocated_shipped;\n",
     );
     let shipped = write("shipped.rs", "#[cfg(test)]\nmod inner;\nmod public;\n");
     let flat = write("flat_tests.rs", "");
@@ -775,6 +798,9 @@ fn out_of_line_test_modules_are_found_by_path() {
     let nested = write("tree_tests/nested.rs", "");
     let inner = write("shipped/inner.rs", "");
     let public = write("shipped/public.rs", "");
+    let relocated = write("lib_tests/relocated.rs", "mod nested;\n");
+    let relocated_nested = write("lib_tests/relocated/nested.rs", "");
+    let relocated_shipped = write("lib_tests/shipped.rs", "");
     let files = vec![
         lib,
         shipped,
@@ -783,12 +809,15 @@ fn out_of_line_test_modules_are_found_by_path() {
         nested.clone(),
         inner.clone(),
         public,
+        relocated.clone(),
+        relocated_nested.clone(),
+        relocated_shipped,
     ];
 
     let mut found = test_only_module_files(&files);
     let _ = std::fs::remove_dir_all(&scratch);
     found.sort();
-    let mut expected = vec![flat, tree, nested, inner];
+    let mut expected = vec![flat, tree, nested, inner, relocated, relocated_nested];
     expected.sort();
     assert_eq!(found, expected);
 }
