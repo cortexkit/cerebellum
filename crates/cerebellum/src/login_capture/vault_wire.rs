@@ -82,6 +82,9 @@ pub(super) fn wipe(bytes: &mut [u8]) {
 pub struct SecretBytes(Vec<u8>);
 
 impl SecretBytes {
+    pub(crate) fn from_channel_route(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
     /// Serialize `value` into a buffer reserved up front, so the buffer never
     /// grows. A growing `Vec` copies itself and frees the old allocation
     /// unwiped, which would leave a copy of the secret nobody can reach to

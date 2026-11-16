@@ -3,8 +3,8 @@
 //! The vault opens a route of its own, because the vault is not the caller: a second,
 //! consumer connection to the daemon, authenticated with the same connection
 //! file and HMAC handshake as the module connection, opens a route to
-//! claustrum presenting this module's launch nonce as `consumer_identity`. The
-//! daemon checks the nonce against the process it spawned and stamps the route
+//! claustrum. Channel launches first present a self claim; legacy launches name
+//! the launch nonce on the route. The daemon verifies the spawn and stamps it
 //! `Reserved { module_id }`; claustrum's deposit grant is keyed on that stamp.
 //!
 //! One connection per deposit: opened when a capture has a cookie to store and
@@ -78,6 +78,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// never anything from a request or reply body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultReachError {
+    /// The channel owner could not attest this outbound connection.
+    Claim(crate::registration::ClaimError),
     /// No connection to the daemon: the connection file, the connect or the
     /// handshake failed, or the daemon closed the connection before the route
     /// opened.
@@ -147,7 +149,9 @@ pub async fn deposit(
     let attempt = async {
         let mut route = match vault.open().await {
             Ok(route) => route,
-            Err(VaultReachError::Unreachable) => return DepositEnd::Unreachable,
+            Err(VaultReachError::Unreachable | VaultReachError::Claim(_)) => {
+                return DepositEnd::Unreachable
+            }
             Err(VaultReachError::RouteRefused { code }) => {
                 return DepositEnd::RouteRefused { code }
             }
@@ -167,7 +171,9 @@ pub async fn deposit(
                 | Err(VaultReachError::RouteRefused { code }) => {
                     return DepositEnd::CallFailed { code }
                 }
-                Err(VaultReachError::Unreachable) => return DepositEnd::CallFailed { code: None },
+                Err(VaultReachError::Unreachable | VaultReachError::Claim(_)) => {
+                    return DepositEnd::CallFailed { code: None }
+                }
             };
             match vault_wire::parse_deposit_reply(&reply) {
                 Ok(DepositReply::Deposited(deposited)) if deposited.id == credential_id => {
@@ -267,18 +273,30 @@ impl ClaustrumVault {
         authenticate_client(&mut stream, &connection, AUTH_DEADLINE)
             .await
             .map_err(|_| VaultReachError::Unreachable)?;
+        crate::registration::bind_consumer(&mut stream, AUTH_DEADLINE)
+            .await
+            .map_err(VaultReachError::Claim)?;
 
         let identity = BindIdentity::new(BIND_HARNESS, self.bind_session);
-        let consumer = self
-            .launch_nonce
-            .as_deref()
-            .map(|launch_nonce| ConsumerIdentity {
-                module_id: &self.module_id,
-                launch_nonce,
-            });
-        let open =
+        let open = if subc_os::registration_channel::supervised() {
+            vault_wire::SecretBytes::from_channel_route(crate::channel_route::open(
+                subc_protocol::RouteTarget::ManagementSurface {
+                    module_id: self.target_module.clone(),
+                },
+                &identity,
+                None,
+            ))
+        } else {
+            let consumer = self
+                .launch_nonce
+                .as_deref()
+                .map(|launch_nonce| ConsumerIdentity {
+                    module_id: &self.module_id,
+                    launch_nonce,
+                });
             vault_wire::management_route_open_request(&identity, consumer, &self.target_module)
-                .map_err(|_| VaultReachError::Unreachable)?;
+                .map_err(|_| VaultReachError::Unreachable)?
+        };
         send_request(
             &mut stream,
             crate::control_flags(),

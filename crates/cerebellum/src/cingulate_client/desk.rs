@@ -173,7 +173,7 @@ impl Ending {
             CallError::Transport { code: Some(code) } if code == OPEN_REFUSED_SCOPE_ENDED => {
                 Self::NoCard(NoCard::ScopeEnded)
             }
-            CallError::Transport { .. } => Self::DeliveryFailed,
+            CallError::Transport { .. } | CallError::Claim(_) => Self::DeliveryFailed,
             CallError::Refused(refusal) => match refusal.code {
                 RefusalCode::RequesterRefused
                 | RefusalCode::FailClosedRequired

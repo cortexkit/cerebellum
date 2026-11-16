@@ -438,6 +438,7 @@ fn build_with_browser_config_and_provenance(
     // it does not open. Absence is the honest form; an old daemon that still
     // decodes them treats absence as it treated the fabricated values.
     ModuleManifest::builder(module_id.to_string(), env!("CARGO_PKG_VERSION").to_string())
+        .registration_channel(true)
         .provenance(provenance)
         .self_signals(Some(self_signals()))
         .provides(vec![

@@ -3112,6 +3112,15 @@ mod executable_identity_launch_tests {
             ),
             (OsString::from("HOME"), OsString::from("/home/operator")),
             (
+                OsString::from("SUBC_REGISTRATION_FD"),
+                OsString::from("4:12345"),
+            ),
+            (
+                OsString::from("SUBC_REGISTRATION_PIPE"),
+                OsString::from("unused-pipe"),
+            ),
+            (OsString::from("SUBC_DAEMON_PID"), OsString::from("12345")),
+            (
                 OsString::from("XDG_CONFIG_HOME"),
                 OsString::from("/home/operator/.config"),
             ),
@@ -3176,6 +3185,11 @@ mod executable_identity_launch_tests {
         let crash_reports = excluded_directory();
         let environment =
             browser_launch_environment(Path::new("/tmp/browser-profile"), &crash_reports);
+        assert_eq!(
+            environment.len(),
+            1,
+            "Chrome receives only the crash-report location, never launch metadata"
+        );
 
         let location = environment
             .iter()

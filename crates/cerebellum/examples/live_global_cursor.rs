@@ -1132,6 +1132,7 @@ mod probe {
             // a route that did not declare elicitation here can never be asked
             // a consent question, and every pointer action needs one.
             let request = ClientControlRequest::RouteOpen {
+                busy_refusals: None,
                 role_versions: None,
                 target: target.clone(),
                 identity: BindIdentity::new("live_global_cursor", "live-global-cursor-probe"),
@@ -1159,6 +1160,7 @@ mod probe {
                 Ok(ClientControlResponse::RouteOpen {
                     route_channel,
                     route_epoch,
+                    ..
                 }) => Ok((route_channel, route_epoch)),
                 Ok(other) => Err(format!("route.open for {target:?} answered {other:?}")),
                 Err(error) => Err(format!(

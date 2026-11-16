@@ -27,6 +27,9 @@ impl DaemonDisplay {
         authenticate_client(&mut stream, &info, super::WRITE_WINDOW)
             .await
             .ok()?;
+        crate::registration::bind_consumer(&mut stream, super::WRITE_WINDOW)
+            .await
+            .ok()?;
         Some(stream)
     }
 }
@@ -90,15 +93,27 @@ impl Backend for DaemonDisplay {
         Box::pin(async move {
             let attempt = async {
                 let mut stream = self.connection().await?;
-                let mut open = json!({
-                    "op":"route.open", "target":subc_protocol::RouteTarget::ToolProvider { module_id: module.into() },
-                    "identity":subc_protocol::BindIdentity::new("cerebellum", "tool-display"),
-                });
-                // The daemon verifies the launch nonce to attest a module writer,
-                // rather than a direct or unverified client claiming a module id.
-                let nonce = crate::launch_nonce::for_consumer_identity()?;
-                open["consumer_identity"] =
-                    json!({"module_id":self.module_id,"launch_nonce":nonce});
+                let open = if subc_os::registration_channel::supervised() {
+                    serde_json::from_slice(&crate::channel_route::open(
+                        subc_protocol::RouteTarget::ToolProvider {
+                            module_id: module.into(),
+                        },
+                        &subc_protocol::BindIdentity::new("cerebellum", "tool-display"),
+                        None,
+                    ))
+                    .ok()?
+                } else {
+                    let mut open = json!({
+                        "op":"route.open", "target":subc_protocol::RouteTarget::ToolProvider { module_id: module.into() },
+                        "identity":subc_protocol::BindIdentity::new("cerebellum", "tool-display"),
+                    });
+                    // The daemon verifies the launch nonce to attest a module writer,
+                    // rather than a direct or unverified client claiming a module id.
+                    let nonce = crate::launch_nonce::for_consumer_identity()?;
+                    open["consumer_identity"] =
+                        json!({"module_id":self.module_id,"launch_nonce":nonce});
+                    open
+                };
                 // Bounded post-reply exception to live-call-only outbound routes:
                 // the outer three-second budget drops this socket on every ending.
                 let opened = call(&mut stream, 0, 0, 1, open).await?;
