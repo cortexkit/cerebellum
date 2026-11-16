@@ -616,6 +616,8 @@ fn capability_declaration(
 /// records baseline, moved-window, closed-window and same-window secure-focus releases reaching the down owner,
 /// and app termination producing no receipt; the window behind received none in all five cases.
 /// Recovery guards still refuse the moved, closed, terminated and secure-focus cases.
+/// The probe posted through the fronted global dispatch only, so this admits
+/// that path alone; per-process dispatch refuses button gestures regardless.
 pub const DOWN_GESTURE_RECOVERY_MEASURED: bool = true;
 
 /// Platform-neutral semantic action intents a semantic dispatch may carry.

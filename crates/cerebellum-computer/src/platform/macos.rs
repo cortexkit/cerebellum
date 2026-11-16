@@ -1873,14 +1873,16 @@ impl PlatformDriver for MacOs26PlatformDriver {
         character_interval: Duration,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
-        if !super::DOWN_GESTURE_RECOVERY_MEASURED
-            && matches!(
-                request.action,
-                SyntheticAction::ClickPointer { .. } | SyntheticAction::DragPointer { .. }
-            )
-        {
+        // A pointer button gesture is posted only through the observed global
+        // dispatch and its fronting bracket. The mouse-up routing measurement
+        // behind DOWN_GESTURE_RECOVERY_MEASURED covered that path alone, so a
+        // press or drag aimed at one process here is refused whatever it says.
+        if matches!(
+            request.action,
+            SyntheticAction::ClickPointer { .. } | SyntheticAction::DragPointer { .. }
+        ) {
             return Err(DriverError::StartupRefused(
-                "mouse-up routing measurement is not recorded",
+                "pointer button gestures are posted only through observed global dispatch",
             ));
         }
         request.target.validate()?;
@@ -3677,23 +3679,24 @@ mod cached_element_tests {
         }
 
         #[test]
-        fn per_pid_down_gestures_pass_measurement_and_honor_cancellation() {
+        fn per_pid_down_gestures_are_refused_whatever_the_measurement() {
+            // DOWN_GESTURE_RECOVERY_MEASURED is true: the routing measurement
+            // covered fronted global posting only, so the per-process path
+            // still refuses button gestures before anything else.
+            // Cancellation stays reported as live, so a refusal here cannot
+            // come from the cancellation check.
             let point = SyntheticPoint { x: 10.0, y: 20.0 };
             for action in [
                 SyntheticAction::ClickPointer { point },
                 SyntheticAction::drag_pointer(point, point),
             ] {
                 let mut driver = MacOs26PlatformDriver::default();
-                // Admission must reach cancellation without posting any event
-                // to a real process.
-                let result = driver.dispatch_per_pid(request(action), &|| true);
+                let result = driver.dispatch_per_pid(request(action), &|| false);
                 assert_eq!(
                     result.unwrap_err(),
-                    DriverError::SyntheticDispatchFailed(SequencePostFailure {
-                        posts_returned: 0,
-                        refusal: super::super::process_event::ProcessEventRefusal::Cancelled,
-                        held_state: HeldStateDisposition::NoneHeld,
-                    })
+                    DriverError::StartupRefused(
+                        "pointer button gestures are posted only through observed global dispatch"
+                    )
                 );
             }
         }
