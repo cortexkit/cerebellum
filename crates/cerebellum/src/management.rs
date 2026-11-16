@@ -2402,9 +2402,9 @@ fn clearance_process_text(reading: &str) -> &'static str {
 fn clearance_lock_text(reading: &str) -> &'static str {
     match reading {
         "absent" => "The browser's lock file is gone",
-        "pid_not_alive" | "pid_not_a_browser" => {
-            "The browser's lock points to a program that has closed"
-        }
+        "pid_not_alive" => "The browser's lock points to a program that has closed",
+        // The program is still running; it just isn't a browser, so the lock is stale.
+        "pid_not_a_browser" => "The browser's lock points to a program that isn't a browser",
         "live_browser" => "The browser's lock points to a running browser",
         "other_host" => "The browser's lock was created on another computer",
         "unreadable" => "The browser's lock could not be read",
@@ -2905,7 +2905,7 @@ mod tests {
             ),
             (
                 L::PidNotABrowser { pid: 12345 },
-                "The browser's lock points to a program that has closed",
+                "The browser's lock points to a program that isn't a browser",
             ),
             (
                 L::LiveBrowser { pid: 12345 },
