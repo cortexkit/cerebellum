@@ -56,6 +56,8 @@ pub(crate) struct Records {
 #[derive(Default)]
 struct ArmMetrics {
     armed: AtomicU64,
+    unparsed: AtomicU64,
+    no_principal: AtomicU64,
     no_schema_pin: AtomicU64,
     no_call_key: AtomicU64,
     invalid_origin: AtomicU64,
@@ -233,6 +235,8 @@ impl Records {
     pub(crate) fn metrics(&self) -> Value {
         json!({
             "armed": self.metrics.armed.load(Ordering::Relaxed),
+            "unparsed": self.metrics.unparsed.load(Ordering::Relaxed),
+            "noPrincipal": self.metrics.no_principal.load(Ordering::Relaxed),
             "noSchemaPin": self.metrics.no_schema_pin.load(Ordering::Relaxed),
             "noCallKey": self.metrics.no_call_key.load(Ordering::Relaxed),
             "invalidOrigin": self.metrics.invalid_origin.load(Ordering::Relaxed),
@@ -360,7 +364,17 @@ impl Records {
         facts: &crate::AcceptedBindFacts,
     ) -> Option<Arc<Timing>> {
         let request: subc_protocol::tool_call::ToolCallRequest =
-            serde_json::from_slice(&frame.body).ok()?;
+            match serde_json::from_slice(&frame.body) {
+                Ok(request) => request,
+                Err(_) => {
+                    // Management routes carry a different envelope, so failing
+                    // to decode one as a tool call is not a malformed caller.
+                    if facts.surface == crate::RouteSurface::Tools {
+                        self.metrics.unparsed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return None;
+                }
+            };
         let plane = match request.name.as_str() {
             crate::flat_tools::BROWSER_USE => "browser",
             crate::flat_tools::COMPUTER_USE => "computer",
@@ -377,7 +391,10 @@ impl Records {
             };
             (origin.carrier, origin.call_key, pin)
         } else {
-            let principal = facts.principal.clone()?;
+            let Some(principal) = facts.principal.clone() else {
+                self.metrics.no_principal.fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
             let Some(key) = request.call_key.clone() else {
                 self.metrics.no_call_key.fetch_add(1, Ordering::Relaxed);
                 return None;
