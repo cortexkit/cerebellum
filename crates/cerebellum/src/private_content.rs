@@ -607,26 +607,89 @@ fn prune(document: &mut Document, now: u64) {
     });
 }
 
+/// Browser reply fields that never carry page or screen content. Paths name
+/// fixed diagnostics, opaque handles, counts, or the caller's requested origin.
+/// The result-schema privacy test and `carries_content` share this table so
+/// metadata classification cannot drift between testing and reply delivery.
+pub(crate) const BROWSER_METADATA_FIELDS: &[&str] = &[
+    "browser",
+    "outcome",
+    "ask_id",
+    "reason",
+    "remedy",
+    "settled",
+    "settlement_reason",
+    "input_dispatched",
+    "tab",
+    "connected",
+    "origin",
+    "connection_epoch",
+    "interaction_epoch",
+    "tabs.[].tab",
+    "tabs.[].claim",
+    "tabs.[].interaction_epoch",
+    "snapshot_id",
+    "wait",
+    "truncated",
+    "refs_truncated",
+    "omitted_frames",
+    "frame_note",
+    "image.mime",
+    "image.width_px",
+    "image.height_px",
+    "image_width_px",
+    "image_height_px",
+    "popup_activated_briefly",
+    "observer_available",
+    "revoked",
+    "detail.field",
+    "detail.reason_code",
+    "detail.decision",
+    "detail.consent",
+    "detail.ask_id",
+    "detail.reason",
+    "detail.method",
+    "detail.code",
+    "detail.message",
+    "detail.extension_revision",
+    "detail.required_revision",
+    "detail.step",
+    "detail.problem",
+    "detail.check",
+    // Names from a closed enum of classification record fields, never values.
+    "detail.changed_fields.[]",
+    "detail.cause",
+    "detail.history_entry_changed",
+    "detail.history_index_changed",
+    "detail.history_length_changed",
+    "detail.url_changed",
+    "detail.loader_changed",
+];
+
 /// Inspect the returned payload, not the requested action or its outcome: an
 /// input refusal can still return the application's changed state.
 fn carries_content(reply: &Value) -> bool {
-    let text = reply.get("state_text").and_then(Value::as_str);
-    text.is_some_and(|text| !text.is_empty())
-        || reply
-            .pointer("/image/data_b64")
-            .and_then(Value::as_str)
-            .is_some_and(|image| !image.is_empty())
-        // A handle delivers the same pixels through image.resolve even when
-        // inline bytes are withheld. Mark before sending the handle.
-        || reply
-            .get("image_handle")
-            .and_then(Value::as_str)
-            .is_some_and(|handle| !handle.is_empty())
-        || reply
-            .pointer("/detail/hit_name")
-            .and_then(Value::as_str)
-            .is_some_and(|name| !name.is_empty())
-        || reply.get("read_page").is_some_and(carries_content)
+    let nonempty_text = |value: &Value| value.as_str().is_some_and(|text| !text.is_empty());
+    reply.as_object().is_some_and(|fields| {
+        fields.iter().any(|(field, value)| {
+            if BROWSER_METADATA_FIELDS.contains(&field.as_str()) {
+                return false;
+            }
+            match field.as_str() {
+                "state_text" => nonempty_text(value),
+                // A handle delivers pixels through image.resolve even when
+                // inline bytes are withheld. Mark before sending the handle.
+                "image_handle" => nonempty_text(value),
+                // Even an empty value or an unselected index reveals page state.
+                "value" => value.is_string(),
+                "selectedIndex" => value.is_i64(),
+                "image" => value.get("data_b64").is_some_and(nonempty_text),
+                "detail" => value.get("hit_name").is_some_and(nonempty_text),
+                "read_page" => carries_content(value),
+                _ => false,
+            }
+        })
+    })
 }
 
 /// The computer_use refusals that stay unmarked, each with the only top-level

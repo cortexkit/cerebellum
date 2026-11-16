@@ -102,11 +102,10 @@ async fn late_key(planes: &Planes, channel: u16, key: &str) -> Value {
 }
 
 async fn capture_waiting(planes: &Planes) {
-    let scope = journal::call_records::ScopeIdentity::from_stamp(
-        planes.routes.get(9, 3).unwrap().scope.as_ref().unwrap(),
-    );
     tokio::time::timeout(HANG_GUARD, async {
-        while !planes.calls.has_pending_scope(&scope) {
+        // A login-capture consent can already be pending for this scope. Wait
+        // until the capture has actually transferred to its detached task.
+        while !planes.capture.is_detached() {
             tokio::task::yield_now().await;
         }
     })
@@ -1049,6 +1048,40 @@ async fn capture_scope_ended_settles_once_and_disposes_without_deposit() {
         ),
         json!({"answer":"refused","reason":"scope_ended"})
     );
+}
+
+#[tokio::test]
+async fn capture_scope_ended_before_consent_approval_never_launches_or_deposits() {
+    let fixture = login_capture::test_support::fixture();
+    let consent = tests::ScriptedConsent::new();
+    detach(&consent, "scope-capture-card");
+    let planes = attach_consent(tests::capture_planes(&fixture), &consent);
+    bind_held(&planes).await;
+    assert_held(
+        &decode(exchange(&planes, 9, 3, capture_request("scope-held")).await),
+        "consent",
+    );
+    assert_eq!(consent.cards().len(), 1);
+    assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 0);
+    let (tx, _rx) = mpsc::channel(16);
+    handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
+        .await
+        .unwrap();
+    let first = held_scope_entries(&planes);
+    assert_scope_ended(&first);
+    consent.feed(json!([answered("scope-capture-card", "allow")]));
+    let _ = late(&planes, 9).await;
+    handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
+        .await
+        .unwrap();
+    let _ = late(&planes, 9).await;
+    assert_eq!(held_scope_entries(&planes), first);
+    assert_eq!(planes.calls.browser_request_count(), 0);
+    assert_eq!(consent.cards().len(), 1);
+    assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.vault.calls(), 0);
+    assert!(fixture.fs.files().is_empty());
+    assert!(fixture.launcher.placements.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

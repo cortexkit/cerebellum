@@ -225,64 +225,76 @@ person_content_test!(
     json!({"browser":"user","outcome":"ok","image":{"mime":"image/png","data_b64":"cGl4ZWxz","width_px":1,"height_px":1}})
 );
 
-// These paths contain fixed diagnostics, opaque handles, counts, or the
-// caller's requested origin, not text read from a page. Any new leaf must be
-// marked at the real reply boundary or explicitly reviewed as metadata here.
-const PERSON_METADATA: &[&str] = &[
-    "browser",
-    "outcome",
-    "ask_id",
-    "reason",
-    "remedy",
-    "settled",
-    "settlement_reason",
-    "input_dispatched",
-    "tab",
-    "connected",
-    "origin",
-    "connection_epoch",
-    "interaction_epoch",
-    "tabs.[].tab",
-    "tabs.[].claim",
-    "tabs.[].interaction_epoch",
-    "snapshot_id",
-    // An opaque handle for the screenshot this reply already carries, not page
-    // text: the bytes it names came in the same reply, which marks on its own.
-    "image_handle",
-    "read_page.image_handle",
-    "truncated",
-    "refs_truncated",
-    "omitted_frames",
-    "frame_note",
-    "image.mime",
-    "image.width_px",
-    "image.height_px",
-    "image_width_px",
-    "image_height_px",
-    "popup_activated_briefly",
-    "observer_available",
-    "revoked",
-    "detail.field",
-    "detail.reason_code",
-    "detail.decision",
-    "detail.reason",
-    "detail.method",
-    "detail.code",
-    "detail.message",
-    "detail.extension_revision",
-    "detail.required_revision",
-    "detail.step",
-    "detail.problem",
-    "detail.check",
-    // Names from a closed enum of classification record fields, never values.
-    "detail.changed_fields.[]",
-    "detail.cause",
-    "detail.history_entry_changed",
-    "detail.history_index_changed",
-    "detail.history_length_changed",
-    "detail.url_changed",
-    "detail.loader_changed",
-];
+#[tokio::test]
+async fn select_reply_fields_mark_person_heads_and_signed_in_own_profiles() {
+    for (index, payload) in [
+        json!({"value":"private option"}),
+        json!({"value":""}),
+        json!({"selectedIndex":-1}),
+        json!({"selectedIndex":0}),
+        json!({"read_page":{"value":""}}),
+        json!({"read_page":{"selectedIndex":0}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let planes = isolated_test_planes(&Arc::new(HealthState::new()));
+        let facts = run(&planes, &format!("select-run-{index}"), 2);
+        reply(&planes, &facts, ReplyPlane::PersonBrowser, payload.clone()).await;
+        assert_eq!(
+            query(&planes, "head").await["sources"],
+            json!(["person_browser"])
+        );
+
+        let planes = isolated_test_planes(&Arc::new(HealthState::new()));
+        planes
+            .signed_in
+            .initialize_profile("fixture-agent", "default", "uuid", true)
+            .unwrap();
+        planes
+            .signed_in
+            .record("fixture-agent", "default", "https://accounts.example.com")
+            .unwrap();
+        reply(
+            &planes,
+            &scoped("own-select", ScopeKind::Head),
+            ReplyPlane::OwnBrowser,
+            payload,
+        )
+        .await;
+        assert_eq!(
+            query(&planes, "own-select").await["sources"],
+            json!(["signed_in_site"])
+        );
+    }
+}
+
+#[tokio::test]
+async fn wait_status_without_page_content_never_marks() {
+    let planes = isolated_test_planes(&Arc::new(HealthState::new()));
+    planes
+        .signed_in
+        .initialize_profile("fixture-agent", "default", "uuid", true)
+        .unwrap();
+    planes
+        .signed_in
+        .record("fixture-agent", "default", "https://accounts.example.com")
+        .unwrap();
+    for status in ["matched", "timed_out"] {
+        for payload in [json!({"wait":status}), json!({"read_page":{"wait":status}})] {
+            for plane in [ReplyPlane::PersonBrowser, ReplyPlane::OwnBrowser] {
+                reply(
+                    &planes,
+                    &scoped("wait-only", ScopeKind::Head),
+                    plane,
+                    payload.clone(),
+                )
+                .await;
+                assert_eq!(query(&planes, "wait-only").await["private_content"], false);
+            }
+        }
+    }
+}
 
 fn schema_content_probes(
     schema: &Value,
@@ -310,7 +322,7 @@ fn schema_content_probes(
             .cloned()
             .collect::<Vec<_>>()
             .join(".");
-        if !PERSON_METADATA.contains(&normalized.as_str()) {
+        if !private_content::BROWSER_METADATA_FIELDS.contains(&normalized.as_str()) {
             let sample = if ty == "boolean" {
                 json!(true)
             } else if ty == "integer" || ty == "number" {
@@ -380,8 +392,12 @@ async fn person_result_schema_has_no_unmarked_content_fields() {
     // The walk must reach the known content fields, or it proves nothing.
     for known in [
         "state_text",
+        "value",
+        "selectedIndex",
         "image.data_b64",
         "read_page.state_text",
+        "read_page.value",
+        "read_page.selectedIndex",
         "read_page.image.data_b64",
     ] {
         assert!(probed.contains(known), "{known} was not probed: {probed:?}");

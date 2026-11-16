@@ -6306,6 +6306,8 @@ async fn capture_browser_login(
             let _ = finalized.send(());
         }
     });
+    #[cfg(test)]
+    planes.capture.note_detached();
     json!({
         "outcome":"capture_pending", "origin":handoff.origin,
         "expires_in_ms":handoff.expires_in_ms,

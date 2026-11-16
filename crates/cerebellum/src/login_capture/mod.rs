@@ -921,6 +921,8 @@ pub struct CaptureModule {
     failed_deletions: Arc<Mutex<BTreeMap<PathBuf, String>>>,
     #[cfg(test)]
     journal_finalization: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
+    detached: std::sync::atomic::AtomicBool,
 }
 
 /// Everything a capture call needs from the route that made it.
@@ -997,6 +999,8 @@ impl CaptureModule {
             failed_deletions: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(test)]
             journal_finalization: Mutex::new(None),
+            #[cfg(test)]
+            detached: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1016,6 +1020,17 @@ impl CaptureModule {
     #[cfg(test)]
     pub(crate) fn take_journal_finalization(&self) -> Option<tokio::sync::oneshot::Sender<()>> {
         self.journal_finalization.lock().unwrap().take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_detached(&self) {
+        self.detached
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_detached(&self) -> bool {
+        self.detached.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Publish the launcher. Set after startup recovery, so a capture never
