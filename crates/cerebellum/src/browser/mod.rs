@@ -6230,6 +6230,19 @@ pub(crate) fn user_browser_result_schema(action: &str) -> Value {
     };
     let embedded = schema.clone();
     schema["properties"]["read_page"] = embedded;
+    if action == "click_point" {
+        // A screenshot can become stale during approval. Report the saved
+        // approval without dispatching, so the caller can read fresh pixels.
+        return json!({"anyOf":[schema, closed_object(json!({
+            "browser":enum_schema(&["user"]),
+            "outcome":enum_schema(&["not_started"]),
+            "input_dispatched":{"type":"boolean","enum":[false]},
+            "detail":closed_object(json!({
+                "consent":enum_schema(&["approved"]), "ask_id":string_schema(),
+            }), &["consent", "ask_id"]),
+            "remedy":string_schema(),
+        }), &["browser", "outcome", "input_dispatched", "detail"])]});
+    }
     schema
 }
 

@@ -2844,13 +2844,69 @@ async fn screenshot_points_use_echoed_pixels_and_refuse_changed_viewports_and_fr
     fixture.state.lock().unwrap().foreign_hit = true;
     let (foreign, cards) = fixture.call(1, point.clone(), "allow_30m").await;
     assert_eq!(cards.len(), 1);
-    assert_eq!(foreign["outcome"], "ok", "{foreign}");
-    assert_eq!(foreign["input_dispatched"], true);
+    assert_eq!(foreign["outcome"], "not_started", "{foreign}");
+    assert_eq!(foreign["detail"]["consent"], "approved");
+    assert!(foreign["detail"]["ask_id"].is_string());
+    assert_eq!(foreign["input_dispatched"], false);
+    assert!(fixture.state.lock().unwrap().inputs.is_empty());
+    let (fresh_image, _) = fixture
+        .call(
+            1,
+            json!({"browser":"user","action":"screenshot","tab":tab}),
+            "allow_30m",
+        )
+        .await;
+    assert_eq!(fresh_image["outcome"], "ok", "{fresh_image}");
+    let mut point = point;
+    point["snapshot_id"] = fresh_image["snapshot_id"].clone();
+    let (retried, cards) = fixture.call(1, point.clone(), "allow_30m").await;
+    assert!(cards.is_empty());
+    assert_eq!(retried["outcome"], "ok", "{retried}");
+    assert_eq!(retried["input_dispatched"], true);
     fixture.state.lock().unwrap().inputs.clear();
     fixture.state.lock().unwrap().viewport_changed = true;
     let (changed, _) = fixture.call(1, point, "allow_30m").await;
     assert_eq!(changed["reason"], "viewport_changed");
     assert!(fixture.state.lock().unwrap().inputs.is_empty());
+}
+
+#[test]
+fn screenshot_point_approval_result_schema_is_closed_and_never_dispatches() {
+    let approved = json!({"browser":"user","outcome":"not_started",
+        "detail":{"consent":"approved","ask_id":"opaque-approval"},
+        "input_dispatched":false,"remedy":"Approved; call again to run it."});
+    assert!(crate::browser::validate_user_browser_result("click_point", &approved).is_ok());
+    for (pointer, value) in [
+        ("/input_dispatched", json!(true)),
+        ("/input_dispatched", Value::Null),
+        ("/detail/consent", json!("denied")),
+        ("/detail/unreviewed", json!("page text")),
+        ("/unreviewed", json!("page text")),
+    ] {
+        let mut invalid = approved.clone();
+        if let Some(slot) = invalid.pointer_mut(pointer) {
+            *slot = value;
+        } else if pointer == "/detail/unreviewed" {
+            invalid["detail"]["unreviewed"] = value;
+        } else {
+            invalid["unreviewed"] = value;
+        }
+        assert!(
+            crate::browser::validate_user_browser_result("click_point", &invalid).is_err(),
+            "{invalid}"
+        );
+    }
+    for required in ["detail", "input_dispatched"] {
+        let mut invalid = approved.clone();
+        invalid.as_object_mut().unwrap().remove(required);
+        assert!(
+            crate::browser::validate_user_browser_result("click_point", &invalid).is_err(),
+            "{invalid}"
+        );
+    }
+    let mut invalid = approved;
+    invalid["detail"].as_object_mut().unwrap().remove("ask_id");
+    assert!(crate::browser::validate_user_browser_result("click_point", &invalid).is_err());
 }
 
 #[tokio::test]
