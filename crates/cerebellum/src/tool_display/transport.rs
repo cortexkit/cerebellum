@@ -18,20 +18,49 @@ impl DaemonDisplay {
         }
     }
 
+    /// A connection for opening a display route. On a channel launch it first
+    /// presents a self claim, so the daemon stamps the route as this module.
     async fn connection(&self) -> Option<TcpStream> {
-        let info = connection_file::read(&self.connection_file).ok()?;
-        let endpoint = info.endpoints.first()?;
-        let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
-            .await
-            .ok()?;
-        authenticate_client(&mut stream, &info, super::WRITE_WINDOW)
-            .await
-            .ok()?;
+        let mut stream = authenticated(&self.connection_file).await?;
         crate::registration::bind_consumer(&mut stream, super::WRITE_WINDOW)
             .await
             .ok()?;
         Some(stream)
     }
+}
+
+async fn authenticated(connection_file: &std::path::Path) -> Option<TcpStream> {
+    let info = connection_file::read(connection_file).ok()?;
+    let endpoint = info.endpoints.first()?;
+    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+        .await
+        .ok()?;
+    authenticate_client(&mut stream, &info, super::WRITE_WINDOW)
+        .await
+        .ok()?;
+    Some(stream)
+}
+
+/// Read the daemon's catalog on a connection of its own that presents no claim.
+///
+/// `route.bind` reads the catalog to recognise display modules, so this runs
+/// for nearly every bind. The daemon serves `catalog.list` to any authenticated
+/// client, and a claim would cost a mint on the module connection for each
+/// bind. The connection never leaves this function and carries nothing but
+/// `catalog.list`: a route opened on it would be stamped as an unattested
+/// direct client, so anything that acts as this module needs
+/// [`DaemonDisplay::connection`] or its own claimed connection instead.
+async fn read_catalog_unclaimed(
+    connection_file: &std::path::Path,
+) -> Option<Vec<subc_control::CatalogEntry>> {
+    let mut stream = authenticated(connection_file).await?;
+    let response = call(&mut stream, 0, 0, 1, json!({"op":"catalog.list"})).await?;
+    let subc_control::ClientControlResponse::CatalogList { modules, .. } =
+        serde_json::from_value(response).ok()?
+    else {
+        return None;
+    };
+    Some(modules)
 }
 
 async fn call(
@@ -78,13 +107,7 @@ pub(crate) fn declarers(modules: &[subc_control::CatalogEntry]) -> Vec<String> {
 impl Backend for DaemonDisplay {
     fn declarers(&self) -> Future<'_, Option<Vec<String>>> {
         Box::pin(async move {
-            let mut stream = self.connection().await?;
-            let response = call(&mut stream, 0, 0, 1, json!({"op":"catalog.list"})).await?;
-            let subc_control::ClientControlResponse::CatalogList { modules, .. } =
-                serde_json::from_value(response).ok()?
-            else {
-                return None;
-            };
+            let modules = read_catalog_unclaimed(&self.connection_file).await?;
             Some(declarers(&modules))
         })
     }

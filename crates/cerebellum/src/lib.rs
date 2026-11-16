@@ -60,6 +60,8 @@ pub mod custody;
 #[cfg(all(target_os = "macos", feature = "desk-probe"))]
 #[doc(hidden)]
 pub mod desk_probe;
+#[cfg(test)]
+mod dispatch_reply_tests;
 pub mod durable_formats;
 mod egress;
 mod event_publish;
@@ -2952,8 +2954,67 @@ where
         let planes = handler_planes.clone();
         async move { handle_frame(frame, &writer, &planes).await }
     };
+    // A handler may itself wait for the daemon's answer to a control request
+    // this module sent, such as a claim mint for an outbound connection. That
+    // answer arrives on this connection, so the loop hands it over while the
+    // handler is still running instead of after it.
+    let reply_planes = planes.clone();
+    let take_reply = move |frame: Frame| {
+        if frame.header.channel == 0
+            && matches!(frame.header.ty, FrameType::Response | FrameType::Error)
+            && deliver_control_reply(&frame, &reply_planes)
+        {
+            Ok(())
+        } else {
+            Err(frame)
+        }
+    };
 
-    run_dispatch_loop(read_half, &planes.health, &clock, &mut idle_wake, handler).await
+    run_dispatch_loop_taking_replies(
+        read_half,
+        &planes.health,
+        &clock,
+        &mut idle_wake,
+        take_reply,
+        handler,
+    )
+    .await
+}
+
+/// How many frames the dispatch loop reads ahead while a handler runs, so that
+/// the answer to a control request the handler awaits can still reach it. When
+/// this many frames are waiting, the loop stops reading until the handler
+/// ends; an answer stuck behind them then times out like any unanswered request.
+const DISPATCH_LOOKAHEAD_FRAMES: usize = 32;
+
+/// Read one frame and hand the reader back with it, so the loop can start the
+/// next read on the same reader without holding two borrows of it.
+async fn read_one<R>(reader: &mut R) -> (Result<Option<Frame>, String>, &mut R)
+where
+    R: AsyncRead + Unpin,
+{
+    let result = read_frame(reader).await.map_err(|e| e.to_string());
+    (result, reader)
+}
+
+/// [`run_dispatch_loop_taking_replies`] for a loop with no control requests of
+/// its own: every frame goes to `handler`, in arrival order.
+#[cfg(test)]
+async fn run_dispatch_loop<R, C, W, H, Fut>(
+    read_half: &mut R,
+    health_state: &Arc<HealthState>,
+    clock: &C,
+    idle_wake: &mut W,
+    handler: H,
+) -> Result<(), ModuleError>
+where
+    R: AsyncRead + Unpin,
+    C: cerebellum_core::clock::MonotonicClock,
+    W: IdleWake,
+    H: FnMut(Frame) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, ModuleError>>,
+{
+    run_dispatch_loop_taking_replies(read_half, health_state, clock, idle_wake, Err, handler).await
 }
 
 /// The bounded-idle-wake dispatch loop.
@@ -2979,55 +3040,98 @@ where
 ///    performs `read_exact`-style reads and is not cancellation-safe: dropping it
 ///    partway through a frame loses the already-consumed bytes and the next read
 ///    mis-frames the stream. Re-polling the same pinned future preserves
-///    partial-read state across idle wakes; a fresh read future is created only
-///    when a frame actually completes.
-async fn run_dispatch_loop<R, C, W, H, Fut>(
+///    partial-read state across idle wakes and across handlers; a fresh read
+///    future is created only when a frame actually completes.
+///
+/// Handlers run one at a time, in arrival order. While one runs, the loop keeps
+/// reading: `take_reply` is offered each frame read meanwhile and takes only an
+/// answer to a control request this module is waiting for, which it delivers
+/// at once. Every other frame waits, in order, for the handlers before it, up to
+/// [`DISPATCH_LOOKAHEAD_FRAMES`]. Without this, a handler awaiting such an
+/// answer would wait for a read that only its own completion can start, and
+/// the request would always run out its deadline.
+///
+/// The end of the stream, or a read error, is reported only after the frames
+/// read before it have been handled.
+async fn run_dispatch_loop_taking_replies<R, C, W, T, H, Fut>(
     read_half: &mut R,
     health_state: &Arc<HealthState>,
     clock: &C,
     idle_wake: &mut W,
+    mut take_reply: T,
     mut handler: H,
 ) -> Result<(), ModuleError>
 where
     R: AsyncRead + Unpin,
     C: cerebellum_core::clock::MonotonicClock,
     W: IdleWake,
+    T: FnMut(Frame) -> Result<(), Frame>,
     H: FnMut(Frame) -> Fut,
     Fut: std::future::Future<Output = Result<bool, ModuleError>>,
 {
     // Stamp the initial heartbeat so a freshly-started module reports healthy.
     health_state.stamp_heartbeat_with_clock(clock);
 
+    // One read future at a time, re-polled until it completes (see above).
+    let mut read = std::pin::pin!(read_one(read_half));
+    let mut waiting = std::collections::VecDeque::<Frame>::new();
+    // How the stream ended, once a read has seen it end. No read is polled
+    // after that.
+    let mut ended: Option<Result<(), ModuleError>> = None;
+
     loop {
         health_state.stamp_heartbeat_with_clock(clock);
-        // Pin the read future once; it is re-polled across idle wakes below and
-        // dropped only when a frame completes (see the function-level comment).
-        let mut read = std::pin::pin!(read_frame(read_half));
-        let frame = loop {
-            let wake = idle_wake.next_wake();
-            tokio::select! {
-                // `biased` polls the read first so an available frame is always
-                // processed before an idle re-stamp (a wake never pre-empts a
-                // ready frame), and so the wake/frame ordering is deterministic.
-                biased;
-                result = &mut read => {
-                    let Some(frame) =
-                        result.map_err(|e| ModuleError::Message(e.to_string()))?
-                    else {
-                        return Ok(()); // clean EOF: subc closed the connection.
-                    };
-                    break frame;
-                }
-                _ = wake => {
-                    // Bounded idle wake: still waiting for input (healthy), so
-                    // re-stamp and keep awaiting the SAME pinned read.
-                    health_state.stamp_heartbeat_with_clock(clock);
+        let frame = if let Some(frame) = waiting.pop_front() {
+            frame
+        } else if let Some(ending) = ended.take() {
+            return ending;
+        } else {
+            loop {
+                let wake = idle_wake.next_wake();
+                tokio::select! {
+                    // `biased` polls the read first so an available frame is always
+                    // processed before an idle re-stamp (a wake never pre-empts a
+                    // ready frame), and so the wake/frame ordering is deterministic.
+                    biased;
+                    (result, reader) = &mut read => {
+                        let Some(frame) = result.map_err(ModuleError::Message)? else {
+                            return Ok(()); // clean EOF: subc closed the connection.
+                        };
+                        read.set(read_one(reader));
+                        break frame;
+                    }
+                    _ = wake => {
+                        // Bounded idle wake: still waiting for input (healthy), so
+                        // re-stamp and keep awaiting the SAME pinned read.
+                        health_state.stamp_heartbeat_with_clock(clock);
+                    }
                 }
             }
         };
         // The handler runs OUTSIDE the idle-wake select on purpose: a wedged
         // handler gets no re-stamp here, so it honestly goes stale (Degraded).
-        if !handler(frame).await? {
+        let mut handling = std::pin::pin!(handler(frame));
+        let keep_going = loop {
+            tokio::select! {
+                biased;
+                result = &mut handling => break result?,
+                (result, reader) = &mut read,
+                    if ended.is_none() && waiting.len() < DISPATCH_LOOKAHEAD_FRAMES =>
+                {
+                    match result {
+                        Ok(Some(frame)) => {
+                            read.set(read_one(reader));
+                            if let Err(frame) = take_reply(frame) {
+                                waiting.push_back(frame);
+                            }
+                        }
+                        Ok(None) => ended = Some(Ok(())),
+                        Err(error) => ended = Some(Err(ModuleError::Message(error))),
+                    }
+                }
+            }
+        };
+        if !keep_going {
             return Ok(());
         }
     }
@@ -3826,6 +3930,25 @@ impl Clone for Planes {
 }
 
 /// Returns `Ok(false)` to stop the loop (graceful goodbye / EOF).
+/// Hand a channel-0 response or error to the control request of this module's
+/// that is waiting for it: operator confirmation, a claim mint or a scope query.
+/// Returns whether one was waiting; an answer nobody waits for is dropped.
+fn deliver_control_reply(frame: &Frame, planes: &Planes) -> bool {
+    if planes.operator_confirm.deliver(frame) {
+        return true;
+    }
+    let body = serde_json::from_slice(&frame.body).unwrap_or(serde_json::Value::Null);
+    let answer = if frame.header.ty == FrameType::Response {
+        scope_watch::ControlAnswer::Response(body)
+    } else {
+        scope_watch::ControlAnswer::Error(body)
+    };
+    if registration::deliver(frame.header.corr, &answer) {
+        return true;
+    }
+    planes.scopes.control.deliver(frame.header.corr, answer)
+}
+
 async fn handle_frame(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
@@ -3856,19 +3979,7 @@ async fn handle_frame(
         // answers nothing this module sent (it never sends requests on a
         // route), so the catch-all drops those.
         FrameType::Response | FrameType::Error if frame.header.channel == 0 => {
-            if planes.operator_confirm.deliver(&frame) {
-                return Ok(true);
-            }
-            let body = serde_json::from_slice(&frame.body).unwrap_or(serde_json::Value::Null);
-            let answer = if frame.header.ty == FrameType::Response {
-                scope_watch::ControlAnswer::Response(body)
-            } else {
-                scope_watch::ControlAnswer::Error(body)
-            };
-            if registration::deliver(frame.header.corr, &answer) {
-                return Ok(true);
-            }
-            planes.scopes.control.deliver(frame.header.corr, answer);
+            deliver_control_reply(&frame, planes);
             Ok(true)
         }
         FrameType::Push if frame.header.channel == 0 => {

@@ -38,6 +38,12 @@ path = "tests/support/nonce_holder.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "cerebellum-test-nonce-launcher"
+path = "tests/support/nonce_launcher.rs"
+test = false
+bench = false
+
 [lib]
 name = "cerebellum"
 path = "src/lib.rs"
