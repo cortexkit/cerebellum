@@ -398,10 +398,11 @@ async fn a_covered_granted_image_click_fronts_posts_down_up_and_restores() {
 }
 
 #[tokio::test]
-async fn bound_down_gestures_refuse_without_the_routing_measurement() {
+async fn bound_down_gestures_use_the_recorded_routing_measurement() {
     for action in ["takeover_click", "takeover_drag"] {
         let (mut rig, image_id) = fixture().await;
         let mut plane = Arc::try_unwrap(rig.plane).ok().unwrap();
+        // Exercise production readiness, not the dormant test-only override.
         plane.down_gesture_recovery_measured = false;
         rig.plane = Arc::new(plane);
         let args = if action == "takeover_click" {
@@ -412,8 +413,14 @@ async fn bound_down_gestures_refuse_without_the_routing_measurement() {
         let reply = rig
             .call_under(&under_terminal(), &format!("computer.{action}"), args)
             .await;
-        assert_eq!(reply["outcome"], "invalid_request", "{reply}");
-        assert!(rig.screen.log().is_empty());
+        assert_eq!(reply["outcome"], "completed", "{reply}");
+        let expected = if action == "takeover_click" {
+            vec!["front:4242", "down", "up", "restore:100"]
+        } else {
+            vec!["front:4242", "down", "move", "up", "restore:100"]
+        };
+        assert_eq!(rig.screen.log(), expected);
+        assert!(!rig.lock.held());
     }
 }
 

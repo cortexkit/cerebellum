@@ -249,8 +249,7 @@ fn release_held_to_pid(
     let mut released = 0_u64;
     let mut failed = None;
     for step in super::macos_synthetic::synthetic_event_steps(action)? {
-        // The original action may contain a withheld button-down. Cleanup
-        // must still release an already-held button, but can never replay
+        // Cleanup releases an already-held button; it must never replay
         // the press or the dragged move, even for trusted library callers.
         if step.role != super::process_event::SyntheticStepRole::Release {
             continue;
@@ -2484,47 +2483,42 @@ mod tests {
     }
 
     #[test]
-    fn native_fronted_down_gestures_refuse_even_with_all_reviews_bound() {
+    fn native_fronted_down_gestures_pass_measurement_and_require_restore_hooks() {
         let point = SyntheticPoint { x: 10.0, y: 20.0 };
         for action in [
             SyntheticAction::ClickPointer { point },
             SyntheticAction::drag_pointer(point, point),
         ] {
-            for install_guard in [false, true] {
-                let mut driver = MacOs26PlatformDriver::default()
-                    .with_global_dispatch_review_revision(Some("fixture-global".into()))
-                    .with_takeover_dispatch_review_revision(Some("fixture-takeover".into()))
-                    .with_takeover_pointer_fronting_review_revision(Some("fixture-pointer".into()));
-                if install_guard {
-                    assert!(
-                        driver.accept_pointer_fronting(super::super::GlobalPointerGuard(Arc::new(
-                            |_| panic!("interlock must precede containment and OS calls")
-                        )))
-                    );
-                }
-                let result = driver.dispatch_global(
-                    GlobalDispatchRequest {
-                        synthetic: SyntheticDispatchRequest {
-                            target: ProcessGrant {
-                                pid: 42,
-                                bundle_identity: "com.example.target".into(),
-                                process_generation_evidence: "123".into(),
-                            },
-                            action: action.clone(),
+            let mut driver = MacOs26PlatformDriver::default()
+                .with_global_dispatch_review_revision(Some("fixture-global".into()))
+                .with_takeover_dispatch_review_revision(Some("fixture-takeover".into()))
+                .with_takeover_pointer_fronting_review_revision(Some("fixture-pointer".into()));
+            assert!(
+                driver.accept_pointer_fronting(super::super::GlobalPointerGuard(Arc::new(
+                    |_| panic!("restore hooks must precede containment and OS calls")
+                )))
+            );
+            let result = driver.dispatch_global(
+                GlobalDispatchRequest {
+                    synthetic: SyntheticDispatchRequest {
+                        target: ProcessGrant {
+                            pid: 42,
+                            bundle_identity: "com.example.target".into(),
+                            process_generation_evidence: "123".into(),
                         },
-                        once_dispatch_token:
-                            cerebellum_core::consent::OnceDispatchToken::admitted_by_takeover_grant(
-                            ),
-                        maximum_seize_detection_latency_ms: 50,
-                        minimum_inter_post_interval_ms: 50,
+                        action: action.clone(),
                     },
-                    &|| false,
-                );
-                assert_eq!(
-                    result.unwrap_err(),
-                    DriverError::StartupRefused("mouse-up routing measurement is not recorded")
-                );
-            }
+                    once_dispatch_token:
+                        cerebellum_core::consent::OnceDispatchToken::admitted_by_takeover_grant(),
+                    maximum_seize_detection_latency_ms: 50,
+                    minimum_inter_post_interval_ms: 50,
+                },
+                &|| false,
+            );
+            assert_eq!(
+                result.unwrap_err(),
+                DriverError::StartupRefused("pointer restore obligation unavailable")
+            );
         }
     }
 
@@ -2656,8 +2650,8 @@ mod tests {
     /// The takeover rows are advertised only when both of their reviews are
     /// bound, and each review is proved by isolation: with every other input
     /// bound and every permission live, leaving that one review unbound
-    /// withholds all four rows and names that review. Click/drag also remain
-    /// withheld by the independent recovery-measurement interlock.
+    /// withholds all four rows and names that review. Measured recovery allows
+    /// click/drag alongside move/scroll when all reviews are bound.
     #[test]
     fn the_takeover_rows_need_both_reviews_each_proved_by_isolation() {
         let driver = MacOs26PlatformDriver::default();
@@ -2681,19 +2675,11 @@ mod tests {
             "computer.takeover_drag",
             "computer.takeover_scroll",
         ];
-        // Move/scroll must pass when all reviews are bound; click/drag must
-        // name the independent recovery barrier, not a missing review.
+        // Every pointer row passes with all reviews bound and recovery measured.
         for id in rows {
             let declaration = driver.declaration(id, &context(fully_bound_inputs()));
-            let expected_reason =
-                matches!(id, "computer.takeover_click" | "computer.takeover_drag")
-                    .then_some("mouse-up routing measurement is not recorded");
-            assert_eq!(declaration.advertised, expected_reason.is_none(), "{id}");
-            assert_eq!(
-                declaration.suppression_reason.as_deref(),
-                expected_reason,
-                "{id}"
-            );
+            assert!(declaration.advertised, "{id}");
+            assert_eq!(declaration.suppression_reason.as_deref(), None, "{id}");
         }
         let mut without_global = fully_bound_inputs();
         without_global.global_dispatch_review_revision = None;
@@ -3691,25 +3677,29 @@ mod cached_element_tests {
         }
 
         #[test]
-        fn per_pid_down_gestures_refuse_without_the_routing_measurement() {
+        fn per_pid_down_gestures_pass_measurement_and_honor_cancellation() {
             let point = SyntheticPoint { x: 10.0, y: 20.0 };
             for action in [
                 SyntheticAction::ClickPointer { point },
                 SyntheticAction::drag_pointer(point, point),
             ] {
                 let mut driver = MacOs26PlatformDriver::default();
-                // Cancellation makes the negative control safe even without
-                // the interlock: it cannot post any event to a real process.
+                // Admission must reach cancellation without posting any event
+                // to a real process.
                 let result = driver.dispatch_per_pid(request(action), &|| true);
                 assert_eq!(
                     result.unwrap_err(),
-                    DriverError::StartupRefused("mouse-up routing measurement is not recorded")
+                    DriverError::SyntheticDispatchFailed(SequencePostFailure {
+                        posts_returned: 0,
+                        refusal: super::super::process_event::ProcessEventRefusal::Cancelled,
+                        held_state: HeldStateDisposition::NoneHeld,
+                    })
                 );
             }
         }
 
         #[test]
-        fn held_pointer_cleanup_posts_only_up_even_while_down_is_withheld() {
+        fn held_pointer_cleanup_still_posts_only_up_after_down_is_admitted() {
             let point = SyntheticPoint { x: 10.0, y: 20.0 };
             for action in [
                 SyntheticAction::ClickPointer { point },

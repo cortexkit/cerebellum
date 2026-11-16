@@ -14053,6 +14053,55 @@ mod tests {
             digest(&value),
             digest(&unbound)
         );
+        // Historical bound manifests withheld click/drag before recovery was
+        // measured. Subtract exactly their admission, including the selected
+        // flat definition and release-evidence counts, without repinning history.
+        let before_measurement = if cfg!(target_os = "macos") {
+            let mut previous = value.clone();
+            let release = &mut previous["computer_plane_release"];
+            let down = ["computer.takeover_click", "computer.takeover_drag"];
+            for field in ["gate_admitted_capabilities", "advertised_capabilities"] {
+                let rows = release[field].as_array_mut().unwrap();
+                assert_eq!(rows.len(), 13);
+                rows.retain(|row| !down.iter().any(|name| row == name));
+                assert_eq!(rows.len(), 11);
+            }
+            assert_eq!(release["advertised_row_count"], 13);
+            assert_eq!(release["scope"], "all_frozen_rows");
+            release["advertised_row_count"] = json!(11);
+            release["scope"] = json!("partial_runtime_advertisement");
+            let names = release["advertised_capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|name| name.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            let mut removed = 0;
+            let mut replaced = 0;
+            for role in previous["provides"].as_array_mut().unwrap() {
+                if let Some(tools) = role.get_mut("tools").and_then(Value::as_array_mut) {
+                    let before = tools.len();
+                    tools.retain(|tool| !down.iter().any(|name| tool["name"] == *name));
+                    removed += before - tools.len();
+                    for tool in tools {
+                        if tool["name"] == "computer_use" {
+                            *tool =
+                                serde_json::to_value(flat_tools::computer_tool(&names).unwrap())
+                                    .unwrap();
+                            replaced += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!((removed, replaced), (2, 1));
+            assert_eq!(
+                digest(&previous),
+                "f3044a4a847579d999d1e615e37afea785eab78501db7dca735aa84b95637075"
+            );
+            previous
+        } else {
+            value.clone()
+        };
         // Subtract only display.read for comparisons with older manifests.
         // Every pre-existing operation and tool definition remains pinned.
         let without_display_read = |current: &Value| {
@@ -14070,7 +14119,7 @@ mod tests {
             assert_eq!(removed, 1);
             previous
         };
-        let before_read = without_display_read(&value);
+        let before_read = without_display_read(&before_measurement);
         let before_read_unbound = without_display_read(&unbound);
         #[cfg(target_os = "linux")]
         let before_read_pins = [
@@ -14193,12 +14242,12 @@ mod tests {
         assert_eq!(digest(&legacy), before_pointer_fronting);
 
         // Full HELLO pins are separate from the computer_use prompt pin:
-        // Binding CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION withholds button-down gestures until recovery is
-        // measured, while advertising the fronted move/scroll definition.
+        // Binding CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION now admits
+        // measured click/drag alongside the fronted move/scroll definition.
         #[cfg(target_os = "linux")]
         let expected = "b9c8213a01901103879372dddf9c66b24e1f863e7498fe4214089a031cbacb37";
         #[cfg(target_os = "macos")]
-        let expected = "f3044a4a847579d999d1e615e37afea785eab78501db7dca735aa84b95637075";
+        let expected = "e58eb1b873306e0eea2790edacddabb2db934813ca44e5881d5f3671602bf70a";
         #[cfg(target_os = "linux")]
         let expected_unbound = "0cbf726cba749725308de4a6daefc75d2911e22501732f9a5adf47cbeb88b074";
         #[cfg(target_os = "macos")]
@@ -14243,7 +14292,7 @@ mod tests {
     /// Every external attestation bound, as a release build supplying all of
     /// them would compile it.
     #[test]
-    fn pointer_fronting_review_withholds_unmeasured_down_gestures_and_keeps_legacy_drag() {
+    fn pointer_fronting_review_admits_measured_down_gestures_and_keeps_legacy_drag() {
         use std::collections::BTreeSet;
         let bound = release_inputs_from_build_bindings(fully_bound_release_bindings());
         let names = |inputs: ComputerReleaseInputs| {
@@ -14263,10 +14312,10 @@ mod tests {
         };
         assert!(takeover_pointer_fronting_admitted(&bound));
         let bound_names = names(bound.clone());
-        assert!(!bound_names
+        assert!(bound_names
             .iter()
             .any(|name| name == "computer.takeover_click"));
-        assert!(!bound_names
+        assert!(bound_names
             .iter()
             .any(|name| name == "computer.takeover_drag"));
         assert!(bound_names
@@ -14282,10 +14331,10 @@ mod tests {
             "bound definition is {} bytes",
             bytes.len()
         );
-        assert!(!bytes.contains("takeover_click"));
-        assert!(!bytes.contains("takeover_drag"));
+        assert!(bytes.contains("takeover_click"));
+        assert!(bytes.contains("takeover_drag"));
         let mut legacy_names = bound_names.into_iter().collect::<BTreeSet<_>>();
-        legacy_names.insert("computer.takeover_drag".into());
+        legacy_names.remove("computer.takeover_click");
         for absent in [
             None,
             Some(""),

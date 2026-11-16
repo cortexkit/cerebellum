@@ -121,7 +121,7 @@ fn available_capabilities(context: &ComputerCapabilityAdvertisementContext) -> V
         .collect()
 }
 
-/// Rows the fully bound build can run before mouse-up recovery is measured.
+/// Rows the fully bound build can run with mouse-up recovery measured.
 fn bound_advertised_rows() -> Vec<&'static str> {
     vec![
         "computer.read_state",
@@ -131,6 +131,8 @@ fn bound_advertised_rows() -> Vec<&'static str> {
         "computer.type",
         "computer.keys",
         "computer.takeover_move",
+        "computer.takeover_click",
+        "computer.takeover_drag",
         "computer.takeover_scroll",
         "computer.wait",
         "computer.list_apps",
@@ -189,9 +191,8 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     let context = valid_context();
     let evidence = computer_release_evidence(&context);
 
-    // Complete release identifiers still withhold click/drag until recovery is
-    // measured. The remaining reviewed rows have wire handlers. This was
-    // originally asserted against the manifest, on the assumption that
+    // Complete release identifiers admit all reviewed rows now that recovery
+    // is measured. This was originally asserted against the manifest, on the assumption that
     // advertisement is a function of the identifiers alone -- the assumption
     // that allowed a capability to be advertised which dispatch cannot serve.
     // Advertisement also requires production grant support and dispatchability,
@@ -224,8 +225,8 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert_eq!(evidence.advertised_capabilities, computer_tools);
 
     // The scope describes what is advertised rather than what the identifiers
-    // admit. A macOS build carrying every review advertises the runnable subset
-    // of frozen rows; elsewhere no production app identity
+    // admit. A macOS build carrying every review advertises all frozen rows;
+    // elsewhere no production app identity
     // reader exists, so no app grant can authorize even wait.
     //
     // This is a release-visible claim: it says what a caller can do on the
@@ -235,7 +236,7 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert_eq!(
         evidence.scope,
         if cfg!(target_os = "macos") {
-            ComputerAdvertisementScope::PartialRuntimeAdvertisement
+            ComputerAdvertisementScope::AllFrozenRows
         } else {
             ComputerAdvertisementScope::EmptyRuntimeAdvertisement
         }
@@ -307,6 +308,8 @@ fn caller_manifest_requires_the_input_review_to_advertise_keystrokes() {
         "computer.press_point",
         "computer.write_text",
         "computer.takeover_move",
+        "computer.takeover_click",
+        "computer.takeover_drag",
         "computer.takeover_scroll",
     ] {
         assert!(
@@ -315,8 +318,6 @@ fn caller_manifest_requires_the_input_review_to_advertise_keystrokes() {
         );
     }
     for never in [
-        "computer.takeover_click",
-        "computer.takeover_drag",
         "computer.click",
         "computer.screenshot",
         "computer.move",
@@ -547,11 +548,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
                     &context.inputs
                 ));
                 let mut legacy = bound_advertised_rows();
-                let scroll = legacy
-                    .iter()
-                    .position(|row| *row == "computer.takeover_scroll")
-                    .unwrap();
-                legacy.insert(scroll, "computer.takeover_drag");
+                legacy.retain(|row| *row != "computer.takeover_click");
                 assert_eq!(
                     admitted, legacy,
                     "unbound drag retains its legacy frontmost-only route; click remains withheld"
@@ -666,22 +663,13 @@ fn supplied_placeholder_external_pin_is_an_implementation_failure_not_an_unresol
 /// manifest, and each withheld row names that review as the reason.
 #[test]
 fn the_takeover_rows_need_both_reviews_each_proved_by_isolation() {
-    // The available positive rows prove the missing-review negatives below;
-    // click/drag additionally remain withheld by the independent recovery barrier.
+    // Positive admission of every pointer row proves the missing-review negatives below.
     let bound = valid_context();
     let admitted = computer_release_evidence(&bound).gate_admitted_capabilities;
     for row in TAKEOVER_ROWS {
-        let available = matches!(row, "computer.takeover_move" | "computer.takeover_scroll");
-        assert_eq!(
-            available_capabilities(&bound).contains(&row.to_string()),
-            available
-        );
+        assert!(available_capabilities(&bound).contains(&row.to_string()));
         if cfg!(target_os = "macos") {
-            assert_eq!(
-                admitted.contains(&row.to_string()),
-                available,
-                "{row}: {admitted:?}"
-            );
+            assert!(admitted.contains(&row.to_string()), "{row}: {admitted:?}");
         }
     }
 
