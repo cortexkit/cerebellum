@@ -1016,6 +1016,24 @@ pub(crate) fn site_question_with_choices(
     use crate::consent_card::*;
     let tier = site_grant_tier(tier);
     let hazard_names: Vec<&str> = hazards.iter().map(|hazard| hazard.as_str()).collect();
+    let mut facts = vec![
+        Fact::new("Browser", "Your own Chrome, signed in as you"),
+        Fact::new("Site", origin),
+        Fact::new(
+            "Can",
+            crate::management::browser_grant_capabilities(tier, false).trim_end_matches('.'),
+        ),
+    ];
+    if !hazard_names.is_empty() {
+        facts.push(Fact::new(
+            "Includes",
+            hazard_names
+                .iter()
+                .map(|name| site_hazard_words(name))
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
     let host = crate::login_import::origin_host(origin).unwrap_or_else(|| origin.into());
     let scope = crate::browser_standing_grants::domain_scope(origin).map_or_else(
         || host.clone(),
@@ -1056,12 +1074,7 @@ pub(crate) fn site_question_with_choices(
             kind: TargetKind::Site,
             label: origin.into(),
         },
-        facts: vec![
-            Fact::new("Browser", "Your own Chrome, signed in as you"),
-            Fact::new("Site", origin),
-            Fact::new("Level", tier.to_string()),
-            Fact::new("Hazards", hazard_names.join(", ")),
-        ],
+        facts,
         grants: options,
         decline: ConsentOption::decline(SITE_DENY, "Don't allow"),
         expires_in: CONSENT_DEADLINE,
@@ -1075,6 +1088,15 @@ pub(crate) fn site_question_with_choices(
             .with("hazards", json!(hazard_names)),
     }
     .render()
+}
+
+fn site_hazard_words(hazard: &str) -> &'static str {
+    match hazard {
+        "credential_form_submit" => "submitting sign-in forms",
+        "financial_form_submit" => "submitting payment forms",
+        "unverified_form_contents" => "submitting forms it can't fully check",
+        _ => "other sensitive actions",
+    }
 }
 
 /// A durable site answer covers reading, clicking and typing even when a read
