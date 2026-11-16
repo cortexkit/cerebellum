@@ -77,7 +77,8 @@ fn config() -> BrowserConfig {
         termination_grace_period_ms: 100,
         browser_idle_timeout_ms: 30_000,
         browser_exit_observation_deadline_ms: 100,
-        navigation_settle_deadline_ms: 1_000,
+        // CDP captures share this bound; these tests check privacy, not latency.
+        navigation_settle_deadline_ms: HANG_GUARD.as_millis() as u64,
     }
 }
 
@@ -108,6 +109,7 @@ struct Page {
     fail_after_password: bool,
     resolve_fails: bool,
     snapshot_delay: Duration,
+    cdp_pause_once: Option<(&'static str, Duration)>,
     real_dom_capture: bool,
     real_ax_capture: bool,
     frame_generation: u64,
@@ -146,6 +148,7 @@ impl Default for Page {
             fail_after_password: false,
             resolve_fails: false,
             snapshot_delay: Duration::ZERO,
+            cdp_pause_once: None,
             real_dom_capture: false,
             real_ax_capture: false,
             frame_generation: 1,
@@ -414,6 +417,17 @@ impl CdpPipeIo for Pipe {
     fn write_frame(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         let command: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
         let method = command["method"].as_str().unwrap().to_string();
+        let pause = {
+            let mut page = self.page.lock();
+            if page.cdp_pause_once.is_some_and(|(held, _)| held == method) {
+                page.cdp_pause_once.take().map(|(_, pause)| pause)
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            std::thread::sleep(pause);
+        }
         let answered = self.page.lock().answer(&method, &command["params"]);
         let mut reply = json!({"id": command["id"]});
         if let Some(session) = command.get("sessionId") {
@@ -2369,9 +2383,24 @@ async fn opaque_main_document_refuses_before_vault_access() {
 
 #[tokio::test]
 async fn dom_full_capture_masks_type_mutated_nodes_by_identity() {
+    assert_dom_full_capture_masks_type_mutated_nodes(None).await;
+}
+
+#[tokio::test]
+async fn dom_full_capture_masks_type_mutated_nodes_after_a_cdp_pause() {
+    // A descheduled fake browser must not turn this masking check into a
+    // one-second performance test. Pause inside capture, after its clock starts.
+    assert_dom_full_capture_masks_type_mutated_nodes(Some(Duration::from_millis(1_100))).await;
+}
+
+async fn assert_dom_full_capture_masks_type_mutated_nodes(pause: Option<Duration>) {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     assert_eq!(fixture.fill(false).await["outcome"], "ok");
-    fixture.page.lock().real_dom_capture = true;
+    {
+        let mut page = fixture.page.lock();
+        page.real_dom_capture = true;
+        page.cdp_pause_once = pause.map(|pause| ("DOM.getDocument", pause));
+    }
     let reply = fixture.snapshot("dom_full").await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
     assert!(
@@ -2385,6 +2414,7 @@ async fn dom_full_capture_masks_type_mutated_nodes_by_identity() {
             .contains("type=button"),
         "{reply}"
     );
+    assert!(fixture.page.lock().cdp_pause_once.is_none());
 }
 
 /// `approval_required` files one card carrying the vault's request id and
