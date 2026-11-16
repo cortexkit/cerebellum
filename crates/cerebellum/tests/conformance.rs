@@ -921,6 +921,7 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
             .map(|operation| operation.name.as_str())
             .collect::<Vec<_>>(),
         [
+            cortexkit_role_tool_display::DISPLAY_READ,
             "ability.describe",
             "ability.scope_choices",
             "ability.setup",

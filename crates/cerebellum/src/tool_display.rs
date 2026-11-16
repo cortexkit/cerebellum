@@ -253,11 +253,40 @@ impl Records {
         let Some(Principal::Reserved { module_id }) = principal else {
             return false;
         };
-        if !matches!(target, subc_protocol::RouteTarget::ToolProvider { module_id } if module_id == "cerebellum")
+        if !matches!(target, subc_protocol::RouteTarget::ToolProvider { module_id }
+            | subc_protocol::RouteTarget::ManagementSurface { module_id } if module_id == "cerebellum")
         {
             return false;
         }
         self.declarers().await.as_slice() == [module_id.as_str()]
+    }
+
+    pub(crate) async fn read(
+        &self,
+        principal: Option<&Principal>,
+        params: Value,
+    ) -> Result<Vec<u8>, subc_protocol::ErrorBody> {
+        use cortexkit_role_tool_display::{
+            DisplayRead, DISPLAY_READ_DENIED, DISPLAY_RECORD_UNKNOWN, NOT_READY,
+        };
+        let target = subc_protocol::RouteTarget::ManagementSurface {
+            module_id: "cerebellum".into(),
+        };
+        if !self.admits_view_reader(principal, &target).await {
+            return Err(subc_protocol::ErrorBody::new(
+                DISPLAY_READ_DENIED,
+                "display reads are restricted to the discovered display server",
+            ));
+        }
+        let read: DisplayRead = serde_json::from_value(params)
+            .map_err(|_| cortexkit_role_tool_display::InvalidParams::new("record_id").refusal())?;
+        read.validate().map_err(|error| error.refusal())?;
+        self.events
+            .display_read(&read.record_id)
+            .map_err(|_| subc_protocol::ErrorBody::new(NOT_READY, "provider is not ready"))?
+            .ok_or_else(|| {
+                subc_protocol::ErrorBody::new(DISPLAY_RECORD_UNKNOWN, "display record is unknown")
+            })
     }
 
     pub(crate) fn arm(

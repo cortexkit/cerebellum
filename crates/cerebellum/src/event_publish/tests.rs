@@ -20,6 +20,7 @@ pub(crate) struct Fake {
     pub(crate) fail_publish: AtomicBool,
     hang_open: AtomicBool,
     pub(crate) hang_publish: AtomicBool,
+    pub(crate) readable: Mutex<Option<std::sync::Weak<Publisher>>>,
 }
 
 struct FakeConnection(Arc<Fake>);
@@ -50,6 +51,21 @@ impl Connection for FakeConnection {
         bytes: &'a [u8],
     ) -> BoxFuture<'a, Result<(), Failure>> {
         Box::pin(async move {
+            if *kind == Kind::DisplayRecordReady {
+                if let Some(publisher) = self
+                    .0
+                    .readable
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                {
+                    assert!(
+                        publisher.display_read(message_id).unwrap().is_some(),
+                        "pointer must be readable before publish starts"
+                    );
+                }
+            }
             self.0.writes.lock().unwrap().push(Captured {
                 kind: kind.clone(),
                 id: message_id.into(),
@@ -70,6 +86,7 @@ impl Connection for FakeConnection {
 pub(crate) fn publisher() -> (Arc<Publisher>, Arc<Fake>) {
     let publisher = Arc::new(Publisher::new(Arc::new(Gauges::default())));
     let fake = Arc::new(Fake::default());
+    *fake.readable.lock().unwrap() = Some(Arc::downgrade(&publisher));
     publisher.connect(Arc::new(fake.clone()));
     (publisher, fake)
 }
@@ -221,8 +238,26 @@ async fn bus_notice_bodies_and_ids_are_narrow_and_stable() {
     );
     assert_eq!(writes[0].id, writes[1].id);
     assert_ne!(writes[0].id, writes[2].id);
-    assert_eq!(writes[3].kind, Kind::ToolDisplay);
-    assert_eq!(writes[3].bytes, serde_json::to_vec(&record).unwrap());
+    assert_eq!(writes[3].kind, Kind::DisplayRecordReady);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&writes[3].bytes).unwrap(),
+        json!({"record_id": writes[3].id})
+    );
+    let pointer: cortexkit_role_tool_display::DisplayRecordReady =
+        serde_json::from_slice(&writes[3].bytes).unwrap();
+    pointer.validate().unwrap();
+    assert_eq!(
+        publisher.display_read(&writes[3].id).unwrap().unwrap(),
+        serde_json::to_vec(&changed).unwrap()
+    );
+    assert_eq!(
+        writes[3].kind.subject("test").unwrap(),
+        "ck.test.event.cerebellum.display_record_ready.v1"
+    );
+    assert_eq!(
+        writes[0].kind.subject("test").unwrap(),
+        "ck.test.event.cerebellum.late_result_ready.v1.broca"
+    );
     assert_eq!(
         writes[3].id, writes[4].id,
         "display identity excludes body and schema pin"
@@ -333,4 +368,18 @@ fn bus_notice_health_is_counts_and_reason_words_only() {
     gauges.failed(Failure::Unavailable);
     gauges.insert_into(&mut metrics);
     assert_eq!(metrics, json!({"busEventsPublished":0, "busEventsFailed":1, "busEventsLastFailureReason":"unavailable"}).as_object().unwrap().clone());
+}
+
+#[tokio::test]
+async fn record_capacity_drops_only_the_new_pointer_and_counts_its_reason() {
+    let (publisher, fake) = publisher();
+    *publisher.records.lock().unwrap() = records::Records::with_limits(1, 32 * 1024);
+    publisher.tool_display(&write(DisplayKind::Record));
+    publisher.tool_display(&write(DisplayKind::Completion));
+    settle().await;
+    assert_eq!(fake.writes.lock().unwrap().len(), 1);
+    let mut metrics = Map::new();
+    publisher.gauges.insert_into(&mut metrics);
+    assert_eq!(metrics["busEventsLastFailureReason"], "record_capacity");
+    assert_eq!(metrics["busEventsFailed"], 1);
 }

@@ -51,13 +51,16 @@ path = "src/lib.rs"
 [dependencies]
 cerebellum-ability = { path = "../cerebellum-ability" }
 base64 = "0.22"
-cortexkit-bus-naming = "=0.2.10"
+cortexkit-bus-naming = "=0.4.3"
+cortexkit-bus-client = "=0.1.2"
+cortexkit-bus-nats = "=0.5.0"
 cortexkit-resource-busy = { workspace = true }
 cerebellum-bridge-protocol = { path = "../cerebellum-bridge-protocol" }
 cortexkit-paths = "=0.1.2"
 cerebellum-core = { path = "../cerebellum-core" }
 cerebellum-computer = { path = "../cerebellum-computer" }
 subc-protocol = { workspace = true }
+subc-client-rs = "=0.41.0"
 subc-control = { workspace = true }
 subc-transport = { workspace = true }
 subc-jsonc = { workspace = true }
@@ -73,7 +76,7 @@ zeroize = "=1.9.1"
 # The conformance companion shares the production protocol version so catalog,
 # schema-pin and late-result checks use the same wire types.
 cortexkit-role-tool-provider = "=0.15.8"
-cortexkit-role-tool-display = "=0.1.7"
+cortexkit-role-tool-display = "=0.1.8"
 getrandom = "=0.2.17"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -86,7 +89,6 @@ signal-hook = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-cortexkit-bus-nats = "=0.3.0"
 async-nats = { version = "=0.50.0", default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 cerebellum-macos = { path = "../cerebellum-macos" }
@@ -101,6 +103,7 @@ cerebellum-core = { path = "../cerebellum-core", features = ["test-support"] }
 async-trait = "0.1"
 cortexkit-role-tool-provider-conformance = "=0.15.9"
 cortexkit-role-tool-provider = { version = "=0.15.8", features = ["test-vectors"] }
+cortexkit-role-tool-display = { version = "=0.1.8", features = ["test-vectors"] }
 tokio = { workspace = true, features = ["test-util"] }
 # The in-process daemon the live tests boot moved out of subc-core when the
 # publishable daemon package was split off; the harness follows the code.

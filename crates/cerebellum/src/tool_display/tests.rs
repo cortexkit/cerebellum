@@ -243,7 +243,19 @@ async fn bus_notice_waits_for_flush_and_failure_leaves_reply_and_direct_display_
                 let bus = fake.writes.lock().unwrap();
                 assert_eq!(direct.len(), 1);
                 assert_eq!(bus.len(), 1);
-                assert_eq!(bus[0].bytes, serde_json::to_vec(&direct[0]).unwrap());
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&bus[0].bytes).unwrap(),
+                    json!({"record_id":bus[0].id})
+                );
+                let retained = planes
+                    .routes
+                    .display
+                    .events
+                    .display_read(&bus[0].id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(retained, serde_json::to_vec(&direct[0]).unwrap());
+                assert!(!String::from_utf8_lossy(&retained).contains("planted-screen-text"));
                 assert!(!String::from_utf8_lossy(&bus[0].bytes).contains("planted-screen-text"));
             }
             tokio::time::advance(Duration::from_secs(4)).await;
@@ -678,7 +690,7 @@ async fn only_the_single_attested_display_can_read_catalog_and_views() {
         None,
     )
     .await;
-    assert_eq!(bind.header.ty, FrameType::Error);
+    assert_eq!(bind.header.ty, FrameType::Response);
 }
 
 #[test]
@@ -812,6 +824,8 @@ async fn legacy_login_handoff_has_one_completion_without_changing_durable_state(
 #[tokio::test]
 async fn failed_reply_flush_never_starts_a_display_write() {
     let planes = planes();
+    let bus = Arc::new(crate::event_publish::tests::Fake::default());
+    planes.routes.display.events.connect(Arc::new(bus.clone()));
     let display = DisplayDouble::new(&["display"]);
     planes.routes.display.connect(display.clone());
     let facts = install(&planes);
@@ -834,6 +848,7 @@ async fn failed_reply_flush_never_starts_a_display_write() {
     );
     tokio::task::yield_now().await;
     assert!(display.writes.lock().unwrap().is_empty());
+    assert!(bus.writes.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1244,4 +1259,137 @@ async fn unconfirmed_fronting_restore_is_an_error_in_the_delivered_display_recor
         .unwrap()
         .contains("restored"));
     cortexkit_role_tool_display::schema::validate_record(&writes[0].body, &schema()).unwrap();
+}
+
+fn read_vector() -> Value {
+    let (_, bytes) = cortexkit_role_tool_display::vectors::FILES
+        .iter()
+        .find(|(name, _)| *name == "reads.json")
+        .unwrap();
+    serde_json::from_str(bytes).unwrap()
+}
+
+async fn read_request(planes: &Planes, principal: Principal, params: Value) -> Frame {
+    let facts = AcceptedBindFacts::from_bind(
+        &subc_protocol::BindIdentity::new("test", "reader"),
+        Some(principal),
+        None,
+        None,
+        &subc_protocol::RouteTarget::ManagementSurface {
+            module_id: "cerebellum".into(),
+        },
+    );
+    planes.routes.insert(7, 1, facts);
+    let (writer, mut replies) = mpsc::channel(8);
+    handle_route_request(
+        frame(json!({"method":cortexkit_role_tool_display::DISPLAY_READ,"params":params})),
+        &writer,
+        planes,
+    )
+    .await
+    .unwrap();
+    replies.recv().await.unwrap()
+}
+
+#[tokio::test]
+async fn display_read_wire_vector_round_trips_through_management_and_fails_closed() {
+    let vector = read_vector();
+    let reserved = |module: &str| Principal::Reserved {
+        module_id: module.into(),
+    };
+    for modules in [vec!["reader"], vec!["reader", "other"], vec![]] {
+        for principal in [
+            reserved("reader"),
+            reserved("wrong"),
+            Principal::Direct,
+            Principal::Unverified,
+        ] {
+            let planes = planes();
+            planes.routes.display.connect(DisplayDouble::new(&modules));
+            let write: DisplayWrite = serde_json::from_value(vector["reply"].clone()).unwrap();
+            planes
+                .routes
+                .display
+                .events
+                .seed_display("record:1", &write);
+            let reply = read_request(
+                &planes,
+                principal.clone(),
+                vector["request"]["arguments"].clone(),
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            if modules == ["reader"] && principal == reserved("reader") {
+                assert_eq!(reply.header.ty, FrameType::Response);
+                assert_eq!(body, vector["reply"]);
+                assert_eq!(
+                    serde_json::to_value(serde_json::from_value::<DisplayWrite>(body).unwrap())
+                        .unwrap(),
+                    vector["reply"]
+                );
+            } else {
+                assert_eq!(reply.header.ty, FrameType::Error);
+                assert_eq!(body, vector["refusals"][0]);
+            }
+        }
+    }
+    let planes = planes();
+    planes
+        .routes
+        .display
+        .connect(DisplayDouble::new(&["reader"]));
+    for (params, refusal) in [
+        (json!({"record_id":"unknown"}), 1),
+        (json!({"record_id":"bad id"}), 2),
+    ] {
+        let reply = read_request(&planes, reserved("reader"), params).await;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&reply.body).unwrap(),
+            vector["refusals"][refusal]
+        );
+    }
+    planes.routes.display.events.unavailable_display();
+    let reply = read_request(&planes, reserved("reader"), json!({"record_id":"record:1"})).await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reply.body).unwrap(),
+        vector["refusals"][3]
+    );
+}
+
+#[tokio::test]
+async fn display_read_catalog_failure_never_admits_by_default() {
+    let planes = planes();
+    let reply = read_request(
+        &planes,
+        Principal::Reserved {
+            module_id: "reader".into(),
+        },
+        json!({"record_id":"x"}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reply.body).unwrap()["code"],
+        cortexkit_role_tool_display::DISPLAY_READ_DENIED
+    );
+}
+
+#[tokio::test]
+async fn full_display_map_drops_the_wake_but_keeps_direct_write() {
+    let planes = planes();
+    let display = DisplayDouble::new(&["display"]);
+    planes.routes.display.connect(display.clone());
+    let bus = Arc::new(crate::event_publish::tests::Fake::default());
+    planes.routes.display.events.connect(Arc::new(bus.clone()));
+    planes.routes.display.events.limit_display(0, 0);
+    let facts = install(&planes);
+    planes
+        .routes
+        .display
+        .arm(&frame(request()), &facts)
+        .unwrap();
+    deliver(&planes, json!({"outcome":"ok"})).await;
+    display.count(1).await;
+    crate::event_publish::tests::settle().await;
+    assert!(bus.writes.lock().unwrap().is_empty());
+    assert_eq!(display.writes.lock().unwrap().len(), 1);
 }

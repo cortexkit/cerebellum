@@ -125,6 +125,7 @@ fn management_surface() -> ProviderRole {
         // it by claiming no ordering matters, which is false for that lane.
         concurrency: Concurrency::ModuleManaged,
         operations: [
+            (cortexkit_role_tool_display::DISPLAY_READ, "Read recent call-time display arguments by record id. Only the single attested tool-display module may read them."),
             (crate::ability::DESCRIBE, "Describe declared personal-data abilities, their schemas and current source availability."),
             (crate::ability::SCOPE_CHOICES, "List the personal-data sources a person may bind on an install card. Prefrontal core's own calls only."),
             (crate::ability::SETUP, "Settle system access for one personal-data ability. Prefrontal core's own calls only; may ask the person."),

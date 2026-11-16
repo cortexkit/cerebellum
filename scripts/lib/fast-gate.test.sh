@@ -305,15 +305,26 @@ fixture = r'''
 set -eu
 part=linux
 packages=(cerebellum)
+not_verified=()
 start_static_phase() { :; }
 run_serial_phase() { shift; if [ "$1" = cargo ]; then "$@"; fi; }
 cargo() { printf '%s\n' "$*" >>"$CALL_LOG"; }
+rustc() { printf '%s\n' "$ARM_LIBDIR"; }
 '''
-subprocess.run(['bash', '-c', 'CALL_LOG="$1"\n' + fixture + source[start:end],
-                'windows-clippy-fixture', sys.argv[2]], check=True)
+subprocess.run(['bash', '-c', 'CALL_LOG="$1"\nARM_LIBDIR="$2"\n' + fixture + source[start:end],
+                'windows-clippy-fixture', sys.argv[2], str(Path(sys.argv[2]).parent)], check=True)
 calls = Path(sys.argv[2]).read_text().splitlines()
-assert 'clippy --locked --workspace --all-targets --target x86_64-pc-windows-msvc --quiet -- -D warnings' in calls, calls
-assert 'clippy --locked --workspace --target aarch64-pc-windows-msvc --quiet -- -D warnings' in calls, calls
+assert 'clippy --locked --workspace --all-targets --target x86_64-pc-windows-gnu --quiet -- -D warnings' in calls, calls
+assert 'clippy --locked --workspace --target aarch64-pc-windows-gnullvm --quiet -- -D warnings' in calls, calls
+Path(sys.argv[2]).unlink()
+missing = subprocess.run(['bash', '-c', 'CALL_LOG="$1"\nARM_LIBDIR="$2"\n' + fixture + source[start:end] + '\nprintf "SUMMARY %s\\n" "${not_verified[@]}"',
+                         'windows-clippy-fixture', sys.argv[2], str(Path(sys.argv[2]).parent / 'not-installed')],
+                         check=True, text=True, capture_output=True)
+calls = Path(sys.argv[2]).read_text().splitlines()
+assert any('--target x86_64-pc-windows-gnu ' in call for call in calls), calls
+assert not any('aarch64' in call for call in calls), calls
+assert 'NOT VERIFIED: aarch64-pc-windows-gnullvm not installed' in missing.stdout, missing.stdout
+assert 'SUMMARY aarch64-pc-windows-gnullvm not installed' in missing.stdout, missing.stdout
 PY
 }
 

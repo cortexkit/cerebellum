@@ -20,8 +20,14 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::{sync::mpsc, time::Instant};
 
+mod records;
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(not(test))]
+mod transport;
+
+#[cfg(not(test))]
+pub(crate) use transport::BusTransport;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 const CAPACITY: usize = 128;
@@ -35,7 +41,35 @@ const LINGER: Duration = Duration::from_secs(30);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
     LateResultReady { custodian_module: Option<String> },
-    ToolDisplay,
+    DisplayRecordReady,
+}
+
+impl Kind {
+    pub(crate) fn subject(&self, account: &str) -> Result<String, Failure> {
+        let names = cortexkit_bus_naming::AccountNames::derive(account)
+            .map_err(|_| Failure::Unavailable)?;
+        let (event, version, reader) = self.parts();
+        match reader {
+            Some(reader) => names.event_subject_with_reader("cerebellum", event, version, reader),
+            None => names.event_subject("cerebellum", event, version),
+        }
+        .map_err(|_| Failure::Unavailable)
+    }
+
+    fn parts(&self) -> (&'static str, u32, Option<&str>) {
+        match self {
+            Self::LateResultReady { custodian_module } => {
+                ("late_result_ready", 1, custodian_module.as_deref())
+            }
+            Self::DisplayRecordReady => (
+                cortexkit_role_tool_display::DISPLAY_RECORD_READY_EVENT,
+                cortexkit_role_tool_display::DISPLAY_RECORD_READY_VERSION
+                    .try_into()
+                    .expect("display event version fits u32"),
+                None,
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +79,7 @@ pub(crate) enum Failure {
     Timeout,
     Overflow,
     Expired,
+    RecordCapacity,
 }
 
 pub(crate) trait Transport: Send + Sync {
@@ -92,6 +127,7 @@ impl Gauges {
             2 => Some("timeout"),
             3 => Some("overflow"),
             4 => Some("expired"),
+            5 => Some("record_capacity"),
             _ => None,
         };
         metrics.insert("busEventsLastFailureReason".into(), json!(reason));
@@ -103,6 +139,7 @@ pub(crate) struct Publisher {
     receiver: Mutex<Option<mpsc::Receiver<Event>>>,
     transport_installed: AtomicBool,
     gauges: Arc<Gauges>,
+    records: Mutex<records::Records>,
 }
 
 impl Default for Publisher {
@@ -136,15 +173,11 @@ impl Publisher {
             receiver: Mutex::new(Some(receiver)),
             transport_installed: AtomicBool::new(false),
             gauges,
+            records: Mutex::new(records::Records::default()),
         }
     }
 
-    // The shared bus client's adapter will install the production transport.
     // Recovery can queue notices before installation, without a task or timer.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "The shared bus client adapter has not landed yet")
-    )]
     pub(crate) fn connect(&self, transport: Arc<dyn Transport>) {
         if let Some(receiver) = self.receiver.lock().unwrap().take() {
             tokio::spawn(run(transport, receiver, self.gauges.clone()));
@@ -167,9 +200,12 @@ impl Publisher {
     }
 
     pub(crate) fn tool_display(&self, write: &DisplayWrite) {
-        // Direct display writes already carry these records. Retaining them
-        // while bus publication is disabled would only fill the recovery queue.
-        if !self.transport_installed.load(Acquire) {
+        use cortexkit_role_tool_display::{
+            DisplayLimits, MAX_COMPLETION_BYTES, MAX_DETAIL_BYTES, MAX_RECORD_BYTES,
+        };
+        let limits =
+            DisplayLimits::new(MAX_RECORD_BYTES, MAX_DETAIL_BYTES, MAX_COMPLETION_BYTES, 0);
+        if cortexkit_role_tool_display::validate_write(write, &limits).is_err() {
             return;
         }
         let writer = subc_protocol::Principal::Reserved {
@@ -177,11 +213,51 @@ impl Publisher {
         };
         let key = cortexkit_role_tool_display::idempotency_key(&writer, write)
             .expect("display identity serializes");
-        self.enqueue(
-            Kind::ToolDisplay,
-            identity(&key),
+        let record_id = identity(&key);
+        if !self.records.lock().unwrap().insert(
+            &record_id,
             serde_json::to_vec(write).expect("display write serializes"),
-        );
+            Instant::now(),
+        ) {
+            self.gauges.failed(Failure::RecordCapacity);
+            return;
+        }
+        if self.transport_installed.load(Acquire) {
+            self.enqueue(
+                Kind::DisplayRecordReady,
+                record_id.clone(),
+                display_pointer(&record_id),
+            );
+        }
+    }
+
+    pub(crate) fn display_read(&self, id: &str) -> Result<Option<Vec<u8>>, ()> {
+        self.records
+            .try_lock()
+            .map_err(|_| ())
+            .map(|mut records| records.read(id, Instant::now()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_display(&self, id: &str, write: &DisplayWrite) {
+        assert!(self.records.lock().unwrap().insert(
+            id,
+            serde_json::to_vec(write).unwrap(),
+            Instant::now()
+        ));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn limit_display(&self, count: usize, bytes: usize) {
+        *self.records.lock().unwrap() = records::Records::with_limits(count, bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unavailable_display(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.records.lock().unwrap();
+            panic!("simulate unavailable display map");
+        }));
     }
 
     fn enqueue(&self, kind: Kind, message_id: String, bytes: Vec<u8>) {
@@ -198,6 +274,12 @@ impl Publisher {
             });
         }
     }
+}
+
+fn display_pointer(record_id: &str) -> Vec<u8> {
+    let ready = cortexkit_role_tool_display::DisplayRecordReady::new(record_id);
+    debug_assert!(ready.validate().is_ok());
+    serde_json::to_vec(&ready).expect("display pointer serializes")
 }
 
 async fn run(

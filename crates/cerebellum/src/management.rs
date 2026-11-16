@@ -78,7 +78,8 @@ pub const LIST_GRANTS: &str = "grants.list";
 /// only. Interim: to be replaced by a subscription to the harness module's
 /// turn-ended event, after which core's direct call goes away.
 pub const SESSION_TURN_ENDED: &str = "session.turn_ended";
-pub const OPERATIONS: [&str; 22] = [
+pub const OPERATIONS: [&str; 23] = [
+    cortexkit_role_tool_display::DISPLAY_READ,
     crate::ability::DESCRIBE,
     crate::ability::SCOPE_CHOICES,
     crate::ability::SETUP,

@@ -370,17 +370,17 @@ fi
 # A runner can execute both Windows targets, so keep the local lanes as the
 # default but allow both to be delegated together when requested.
 if [ "${CEREBELLUM_GATE_WINDOWS_LINT:-}" = remote ]; then
-  for windows_target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+  for windows_target in x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm; do
     printf '==> SKIPPED: run remotely instead: cargo clippy --locked --workspace --target %s -- -D warnings\n' "$windows_target"
   done
   not_verified="$not_verified; windows lint x86_64+aarch64 (run remotely)"
 else
-  for windows_target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+  for windows_target in x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm; do
     if [ -d "$(rustc --print target-libdir --target "$windows_target" 2>/dev/null)" ]; then
       run_phase "cargo clippy --locked --workspace --target $windows_target -- -D warnings" \
         cargo clippy --locked --workspace --target "$windows_target" --quiet -- -D warnings
     else
-      printf '==> SKIPPED: %s is not installed, so that windows build was not checked\n' "$windows_target"
+      printf 'NOT VERIFIED: %s not installed\n' "$windows_target"
       not_verified="$not_verified; $windows_target build (target not installed)"
       printf '    install it with: rustup target add %s\n' "$windows_target"
     fi
