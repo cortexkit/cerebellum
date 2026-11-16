@@ -47,6 +47,28 @@ fn every_generic_card_fact_uses_plain_words() {
         for fact in body["params"]["facts"].as_array().unwrap() {
             let label = fact["label"].as_str().unwrap();
             let value = fact["value"].as_str().unwrap();
+            if matches!(
+                kind,
+                CardKind::ProfileReidentification | CardKind::StuckProfileClearance
+            ) {
+                let lower = value.to_ascii_lowercase();
+                for forbidden in ["module", "registry", "profile directory", "process"] {
+                    assert!(
+                        !lower.contains(forbidden),
+                        "{name}: {label} contains {forbidden}: {value}"
+                    );
+                }
+                if !matches!(label, "Location" | "Profiles affected" | "Browser launched") {
+                    assert!(
+                        !value
+                            .split(|c: char| !c.is_ascii_alphanumeric())
+                            .any(
+                                |word| !word.is_empty() && word.bytes().all(|c| c.is_ascii_digit())
+                            ),
+                        "{name}: {label} contains a number: {value}"
+                    );
+                }
+            }
             for word in value.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
                 assert!(
                     !word.contains('_'),
