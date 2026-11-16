@@ -561,7 +561,7 @@ pub fn browser_tool(admitted: &[String]) -> Option<Tool> {
             };
             let description = match output_name {
                 "url" => Some("URL to navigate to."),
-                "wait" => Some("Use settle to wait for page stability before reading, or none to return immediately."),
+                "wait" => Some("settle waits for stability; none returns now. browser:user refuses settle: settlement isn't observed."),
                 "ref" => Some("Element reference returned by the named snapshot."),
                 "snapshot_id" => Some("Snapshot identifier that prevents acting on stale page data."),
                 "image_width_px" | "image_height_px" => Some("Echoed screenshot dimension; coordinates are meaningful only in the exact frame the model saw."),
@@ -1300,29 +1300,17 @@ mod tests {
 
     #[test]
     fn every_advertised_property_declares_its_type() {
-        let browser_names: Vec<String> = [
-            "launch",
-            "status",
-            "close",
-            "navigate",
-            "snapshot",
-            "screenshot",
-            "click",
-            "type",
-            "click_point",
-        ]
-        .into_iter()
-        .map(|action| browser_capability(action).unwrap().to_string())
-        .collect();
+        let browser = browser_tool(&browser_names()).unwrap();
+        assert!(browser.schema["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("fill_login")));
         let mut schemas = vec![
             (
                 "computer_use".to_string(),
                 computer_tool(&computer_names()).unwrap().schema,
             ),
-            (
-                "browser_use".to_string(),
-                browser_tool(&browser_names).unwrap().schema,
-            ),
+            ("browser_use".to_string(), browser.schema),
         ];
         for (name, _, request_schema) in crate::browser::tool_definitions() {
             schemas.push((name.to_string(), request_schema));
@@ -1346,6 +1334,56 @@ mod tests {
             untyped.is_empty(),
             "these properties declare no type, which Gemini and Vertex refuse: {untyped:#?}"
         );
+    }
+
+    #[test]
+    fn release_shaped_flat_schemas_pass_provider_portability_lint() {
+        // Linux has no native computer catalog. Check the definition with the
+        // shipping macOS actions without adding tools to Linux's catalog.
+        let computer_names: Vec<_> = computer_names()
+            .into_iter()
+            .filter(|name| name != "computer.takeover_click")
+            .collect();
+        for tool in [
+            browser_tool(&browser_names()).unwrap(),
+            computer_tool(&computer_names).unwrap(),
+        ] {
+            let findings = cortexkit_role_tool_provider::lint_input_schema(&tool.schema);
+            assert!(
+                findings.is_empty(),
+                "{} input_schema: {findings:?}",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn provider_portability_lint_names_untyped_enum_and_nested_properties() {
+        let mut browser = browser_tool(&browser_names()).unwrap();
+        for field in ["mode", "wait"] {
+            browser.schema["properties"][field]
+                .as_object_mut()
+                .unwrap()
+                .remove("type");
+        }
+        let findings = cortexkit_role_tool_provider::lint_input_schema(&browser.schema);
+        let paths: Vec<_> = findings
+            .iter()
+            .map(|finding| finding.path.as_str())
+            .collect();
+        assert_eq!(paths, ["/properties/mode", "/properties/wait"]);
+
+        let mut computer = computer_tool(&computer_names()).unwrap();
+        computer.schema["properties"]["to"]["properties"]["x"]
+            .as_object_mut()
+            .unwrap()
+            .remove("type");
+        let findings = cortexkit_role_tool_provider::lint_input_schema(&computer.schema);
+        let paths: Vec<_> = findings
+            .iter()
+            .map(|finding| finding.path.as_str())
+            .collect();
+        assert_eq!(paths, ["/properties/to/properties/x"]);
     }
 
     #[test]
@@ -1644,6 +1682,16 @@ mod tests {
         assert!(BROWSER_DESCRIPTION.contains("after consent/window handover, capture_pending"));
         assert!(BROWSER_DESCRIPTION.contains("Result arrives as a notice; do not poll"));
         assert!(BROWSER_DESCRIPTION.contains("Cookies: vault only"));
+        let browser = browser_tool(&browser_names()).unwrap();
+        let text_filter = browser.schema["properties"]["text_filter"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(text_filter.contains("Literal, case-insensitive label/value substring"));
+        let wait = browser.schema["properties"]["wait"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(wait.contains("browser:user refuses settle"));
+        assert!(wait.contains("settlement isn't observed"));
         let computer = computer_tool(&computer_names()).unwrap();
         let keys = computer.schema["properties"]["keys"]["description"]
             .as_str()

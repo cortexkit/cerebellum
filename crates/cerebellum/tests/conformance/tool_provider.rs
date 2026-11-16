@@ -100,6 +100,10 @@ async fn bind_route(
     consumer_capabilities: Option<Vec<String>>,
 ) -> Result<Route, HarnessError> {
     let channel = u16::try_from(NEXT.fetch_add(1, Ordering::Relaxed)).unwrap();
+    let browser_operations: Vec<_> = cerebellum::browser_wire_surface(true)
+        .into_iter()
+        .filter_map(|(name, reachable)| reachable.then_some(name))
+        .collect();
     let bind = ModuleControlRequest::RouteBind {
         role_versions: None,
         call_mode,
@@ -112,7 +116,7 @@ async fn bind_route(
         principal: Some(principal),
         consumer_capabilities,
         admission_facts: Some(
-            json!({"agentProjectId":"conformance","sessionKind":"primary","effectiveCapabilityScope":["*"],"browserControlOperations":["browser.status"]}),
+            json!({"agentProjectId":"conformance","sessionKind":"primary","effectiveCapabilityScope":["*"],"browserControlOperations":browser_operations}),
         ),
         scope,
     };
@@ -292,6 +296,22 @@ impl ToolProviderSubject for Subject {
 #[tokio::test]
 async fn tool_provider_role_conforms_on_production_handler() {
     let root = live_daemon_directory(0);
+    let planes = Subject.spawn(&root).await.unwrap();
+    let route = Subject
+        .route(&planes, &Subject.plain_stamp())
+        .await
+        .unwrap();
+    let catalog = served_catalog(&route).await;
+    let browser = catalog
+        .tools
+        .iter()
+        .find(|tool| tool.name == "browser_use")
+        .expect("the portability case must check the shipped browser tool");
+    assert!(browser.input_schema["properties"]["action"]["enum"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("fill_login")));
+    drop((route, planes));
     let report = run_suite(&Subject, &root).await.unwrap();
     let report_text = report.render();
     println!("{report_text}");
@@ -310,6 +330,50 @@ async fn tool_provider_role_conforms_on_production_handler() {
         report.verdict,
         SuiteVerdict::ConformingForDeclaredCapabilities { .. }
     ));
+    let _ = fs::remove_dir_all(root);
+}
+
+async fn served_catalog(route: &Route) -> cortexkit_role_tool_provider::catalog::CatalogAnswer {
+    let exchange = route
+        .request(json!({"name":"tool.catalog","arguments":Subject.catalog_arguments()}))
+        .await
+        .unwrap();
+    let [ObservedFrame::Response(answer)] = exchange.frames.as_slice() else {
+        panic!("catalog did not return one response: {:?}", exchange.frames);
+    };
+    serde_json::from_value(answer.clone()).unwrap()
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "explicit served-catalog export; requires the release build attestations"]
+async fn export_served_flat_tools() {
+    let root = live_daemon_directory(0);
+    let planes = Subject.spawn(&root).await.unwrap();
+    let route = Subject
+        .route(&planes, &Subject.plain_stamp())
+        .await
+        .unwrap();
+    let catalog = served_catalog(&route).await;
+    let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/scratch");
+    fs::create_dir_all(&scratch).unwrap();
+    for name in ["browser_use", "computer_use"] {
+        let tool = catalog.tools.iter().find(|tool| tool.name == name).unwrap();
+        let bytes = serde_json::to_vec(tool).unwrap();
+        fs::write(scratch.join(format!("served-{name}.json")), &bytes).unwrap();
+        let definition = serde_json::to_vec(&json!({
+            "name":tool.name,"description":tool.description,"input_schema":tool.input_schema
+        }))
+        .unwrap();
+        println!(
+            "{name}: served entry {} bytes sha256={}; definition {} bytes sha256={}; schema={}",
+            bytes.len(),
+            cerebellum::manifest::sha256_hex(&bytes),
+            definition.len(),
+            cerebellum::manifest::sha256_hex(&definition),
+            tool.schema_digest
+        );
+    }
     let _ = fs::remove_dir_all(root);
 }
 

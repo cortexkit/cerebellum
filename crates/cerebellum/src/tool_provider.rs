@@ -548,7 +548,7 @@ mod tests {
                 let bytes = serde_json::to_vec(&json!({"name":definition.name,"description":definition.description,"input_schema":definition.input_schema})).unwrap();
                 let frozen = match definition.name.as_str() {
                     "browser_use" => {
-                        "b2d46d21d47cfd4ff91322813afd724de226af271eb06f5f4bce179e6e156bdd"
+                        "26d4941ed9f8f95aa0d823e45ad8ffc5f9fae85286410d53bf717508a0b2c130"
                     }
                     "computer_use" if !pointer_fronting => {
                         "fbef38d68cd09cb42c8283f195871cb13c88180570f989314bc89a833258ac1c"

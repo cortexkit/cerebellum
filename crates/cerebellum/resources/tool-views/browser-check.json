@@ -230,7 +230,7 @@
         "type": "string"
       },
       "text_filter": {
-        "description": "Keep label/value matches beneath labelled ancestors. Default mode only.",
+        "description": "Literal, case-insensitive label/value substring; keeps labelled ancestors. Default mode only.",
         "maxLength": 4096,
         "type": "string"
       },
@@ -243,7 +243,7 @@
         "type": "string"
       },
       "wait": {
-        "description": "Use settle to wait for page stability before reading, or none to return immediately.",
+        "description": "settle waits for stability; none returns now. browser:user refuses settle: settlement isn't observed.",
         "enum": [
           "settle",
           "none"
