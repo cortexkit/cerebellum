@@ -472,6 +472,7 @@ struct ScreenState {
     last_input_ms: Option<u64>,
     /// A chord's post fails with its keys possibly still held.
     post_unknown: bool,
+    post_cost_ms: u64,
     /// Whether the paired release of held keys returns.
     release_ok: bool,
     /// These elements of the desk read enabled while the target is
@@ -529,7 +530,8 @@ impl Screen {
                 front_delay_ms: None,
                 pending_front_at: None,
                 late_watch_gate: None,
-                late_watch_after_ms: 400,
+                late_watch_after_ms: crate::budgets::FRONTING_BRACKET_MS
+                    + cerebellum_computer::dispatch::RESTORE_WAIT_MS,
                 coverage_start_ms: 0,
                 restore_started: None,
                 restore_until: None,
@@ -537,6 +539,7 @@ impl Screen {
                 log: Vec::new(),
                 last_input_ms: None,
                 post_unknown: false,
+                post_cost_ms: 0,
                 release_ok: true,
                 enable_on_front: Vec::new(),
                 hold_until_stopped: None,
@@ -814,15 +817,17 @@ impl FrontingBracketHost for FakeBracket {
         seen(probe)
     }
     fn post_unit(&mut self, _index: usize) -> Result<UnitPosted, SequencePostFailure> {
-        let (mut unknown, hold, posting) = {
+        let (mut unknown, hold, posting, post_cost_ms) = {
             let mut state = self.0.state();
             state.log.push("post".into());
             (
                 state.post_unknown,
                 state.hold_until_stopped.clone(),
                 state.posting.take(),
+                state.post_cost_ms,
             )
         };
+        self.0.advance(post_cost_ms);
         if let Some(posting) = posting {
             posting.notify_one();
         }
@@ -1674,6 +1679,36 @@ async fn a_background_command_chord_fronts_posts_and_restores() {
         !rig.lock.held(),
         "released when the restore decision completed"
     );
+}
+
+#[tokio::test]
+async fn a_needs_front_shortcut_accepts_a_150_ms_bracket_but_not_210_ms() {
+    for (interval_ms, target_fronted) in [(150, true), (210, false)] {
+        let rig = rig(AppUse::Background, mail_desk()).await;
+        rig.read().await;
+        {
+            let mut state = rig.screen.state();
+            state.front_delay_ms = Some(50);
+            state.post_cost_ms = interval_ms - 50;
+        }
+        let reply = rig
+            .call_under(&under_terminal(), "computer.keys", command_chord())
+            .await;
+        assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+        assert_eq!(reply["target_fronted"], target_fronted, "{reply}");
+        if target_fronted {
+            assert!(reply["containment_forfeited_because"].is_null(), "{reply}");
+        } else {
+            assert_eq!(
+                reply["containment_forfeited_because"], "fronting_bound_exceeded",
+                "{reply}"
+            );
+        }
+        assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
+        assert_eq!(rig.screen.log(), ["front:4242", "post", "restore:100"]);
+        assert_eq!(rig.screen.state().now, interval_ms);
+        assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
+    }
 }
 
 #[tokio::test]
@@ -3608,11 +3643,14 @@ async fn a_new_app_call_before_watcher_start_still_ends_the_pending_watch() {
         .unwrap();
     assert_eq!(record["restore"], "failed");
     assert_eq!(rig.screen.log(), ["front:4242"]);
-    assert_eq!(rig.screen.state().now, 400);
+    assert_eq!(
+        rig.screen.state().now,
+        crate::budgets::FRONTING_BRACKET_MS + cerebellum_computer::dispatch::RESTORE_WAIT_MS
+    );
 }
 
-/// Serve a needs-front chord whose front lands 109 ms after its request,
-/// past the 100 ms bound, then run the late watch the route starts after
+/// Serve a needs-front chord whose front lands just after its bound,
+/// then run the late watch the route starts after
 /// the reply, and return the reply and the watch's audit record.
 async fn chord_landing_after_its_bound(
     rig: &Rig,
@@ -3621,7 +3659,7 @@ async fn chord_landing_after_its_bound(
     rig.read().await;
     {
         let mut state = rig.screen.state();
-        state.front_delay_ms = Some(109);
+        state.front_delay_ms = Some(crate::budgets::FRONTING_BRACKET_MS + 9);
         configure(&mut state);
     }
     let terminal = under_terminal();

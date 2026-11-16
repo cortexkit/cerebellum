@@ -36,7 +36,9 @@ pub const MOVE_OBSERVE_MS: u64 = 200;
 pub const DRAG_OBSERVE_MS: u64 = 2_000;
 pub const SCROLL_OBSERVE_MS: u64 = 500;
 pub const FRONTING_READ_MS: u64 = 300;
-pub const FRONTING_BRACKET_MS: u64 = 100;
+/// Needs-front app-grant shortcut bracket, from the front request through
+/// confirmed restore. Takeover chords keep their frozen vocabulary bound.
+pub const FRONTING_BRACKET_MS: u64 = 200;
 // Bringing the target app to the front, for an action that needs it there.
 // Only one call fronts an app at a time, process-wide; a caller waits this
 // long for that lock, then stops with `fronting_busy`.
@@ -1513,6 +1515,25 @@ mod tests {
         assert_eq!(expected.len(), MANAGEMENT_ACTIONS.len());
         for (budget, total) in expected {
             assert_eq!(budget.work_ms, total, "{}", budget.action);
+        }
+    }
+
+    #[test]
+    fn needs_front_shortcut_replies_fit_the_advertised_deadline() {
+        for budget in [COMPUTER_TYPE, COMPUTER_KEYS] {
+            let fronting = budget
+                .phases
+                .iter()
+                .find(|phase| phase.name == "fronting")
+                .unwrap();
+            assert_eq!(fronting.cap_ms, FRONTING_BRACKET_MS);
+            assert_eq!(fronting.count, 1);
+            let reply_ms = reply_max_ms(
+                COMPUTER_QUEUE_WAIT_LIMIT_MS,
+                COMPUTER_MAX_PARK_MS,
+                budget.work_ms,
+            );
+            assert!(reply_ms <= COMPUTER_REPLY_MAX_MS, "{}", budget.action);
         }
     }
 
