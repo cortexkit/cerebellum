@@ -88,9 +88,10 @@ pub fn is_prefrontal(principal: &Principal) -> bool {
     matches!(principal, Principal::Reserved { module_id } if PREFRONTAL_MODULE_IDS.contains(&module_id.as_str()))
 }
 
-/// Identity projection for session scope owners across the orchestrator rename.
-/// Keep the original owner in stored records and daemon requests; only keys and
-/// comparisons use this projection.
+/// Treats `prefrontal-core` and `prefrontal` as one session-scope owner, so a
+/// scope prefrontal re-syncs under its new name (same ref and epoch) is the same
+/// session. Keep the original owner in stored records and daemon requests; only
+/// keys and comparisons use this projection.
 pub fn canonical_scope_owner(owner: &Principal) -> Principal {
     if is_prefrontal(owner) {
         Principal::Reserved {
