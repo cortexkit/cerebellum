@@ -2195,21 +2195,10 @@ mod desk {
     }
 
     pub fn run(baseline: bool) -> i32 {
-        if baseline {
-            println!(
-                "RECORD baseline startup: screen-recording preflight={}",
-                cerebellum_macos::screen_capture_is_permitted()
-            );
-            match cerebellum_macos::enumerate_windows(Duration::from_secs(2)) {
-                Ok(windows) => println!(
-                    "RECORD baseline startup: direct window-list count={}",
-                    windows.len()
-                ),
-                Err(reason) => {
-                    println!("RECORD baseline startup: direct window-list error={reason}")
-                }
-            }
-        }
+        // Both runs start the same way: AppKit first, then the capture warm-up,
+        // with no ScreenCaptureKit use before AppKit. The baseline used to read
+        // the window list before AppKit started, and only the baseline failed
+        // its capture check afterwards, so that read now waits until after.
         // A failed exclusion check still fails the run, but the desk phases
         // below still run: each desk session costs the person's time, so one
         // session should report every check rather than stop at the first.
@@ -2236,6 +2225,21 @@ mod desk {
         // thread after AppKit starts, then five times each from the
         // measurement's worker thread while the main thread pumps and from
         // Tokio workers.
+        if baseline {
+            println!(
+                "RECORD baseline startup: screen-recording preflight={}",
+                cerebellum_macos::screen_capture_is_permitted()
+            );
+            match cerebellum_macos::enumerate_windows(Duration::from_secs(2)) {
+                Ok(windows) => println!(
+                    "RECORD baseline startup: direct window-list count={}",
+                    windows.len()
+                ),
+                Err(reason) => {
+                    println!("RECORD baseline startup: direct window-list error={reason}")
+                }
+            }
+        }
         println!("{}", window_list_check("main_thread_after_appkit_startup"));
         println!(
             "TIME BUDGET: allow about {} s (launch {} s, covering the window up to {} s, \
