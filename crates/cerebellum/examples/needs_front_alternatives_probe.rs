@@ -442,7 +442,7 @@ mod desk {
         if mac::screen_is_locked() != Some(false) {
             return Err("desk locked; no more actions");
         }
-        if ax::front_pid()? != person {
+        if ax::front_pid_patient()? != person {
             return Err("person's front app changed; no more actions");
         }
         Ok(())
@@ -473,7 +473,7 @@ mod desk {
     impl Restore<'_> {
         fn restore(&mut self) -> Result<(f64, f64)> {
             let start = Instant::now();
-            let focus = ax::front_pid()?;
+            let focus = ax::front_pid_patient()?;
             if focus == self.scratch.pid as i32 {
                 if !mac::activate_application(self.person as u32, self.person_start)
                     || !wait_front(self.person)
@@ -723,7 +723,7 @@ mod desk {
                     },
                 )
                 .map_err(|_| "Command-A construction failed")?;
-                if ax::front_pid()? == scratch.pid as i32 {
+                if ax::front_pid_patient()? == scratch.pid as i32 {
                     position_at_post = ax::point(&window).ok();
                     let post = Instant::now();
                     for event in &events {
@@ -762,7 +762,7 @@ mod desk {
             }
             .map_err(|_| "interrupt handler installation failed")?;
         }
-        let person = ax::front_pid()?;
+        let person = ax::front_pid_patient()?;
         let person_start = mac::process_start_time_micros(person as u32)
             .ok_or("person's app generation unreadable")?;
         log.event("start",json!({"sampling_target_ms":10,"privacy":"no screen capture, menu titles, external text, pasteboard, daemon or journal access"}));
@@ -1139,11 +1139,26 @@ mod desk {
             }
             Ok(())
         }
+        /// The focused application for the 10 ms sampler: a short timeout, so a
+        /// slow answer becomes an unknown sample rather than a stalled sampler.
         pub fn front_pid() -> Result<i32> {
+            front_pid_within(0.05)
+        }
+        /// The person's app before the probe starts. On a busy Mac the window
+        /// server can take far longer than the sampler's 50 ms to answer, and the
+        /// run cannot start without this answer, so it waits up to a second.
+        pub fn front_pid_patient() -> Result<i32> {
+            // The system-wide AX element answered -25204 at once on the desk run of
+            // 17 Nov, so a decision point falls back to the workspace's frontmost
+            // application, which reflects activation the same way.
+            front_pid_within(1.0)
+                .or_else(|_| workspace_pid(c"frontmostApplication").ok_or("front app unreadable"))
+        }
+        fn front_pid_within(timeout_s: f32) -> Result<i32> {
             // SAFETY: creation transfers one ownership; timeout bounds the live
             // system-wide focus read independently of the window's visibility.
             let system = owned(unsafe { AXUIElementCreateSystemWide() })?;
-            status(unsafe { AXUIElementSetMessagingTimeout(system.0, 0.05) })?;
+            status(unsafe { AXUIElementSetMessagingTimeout(system.0, timeout_s) })?;
             let focused = attr(&system, "AXFocusedApplication")?;
             let mut pid = 0;
             // SAFETY: focused is an AX application; pid is writable storage.
@@ -1155,6 +1170,9 @@ mod desk {
             }
         }
         pub fn menu_owner() -> Option<i32> {
+            workspace_pid(c"menuBarOwningApplication")
+        }
+        fn workspace_pid(selector: &std::ffi::CStr) -> Option<i32> {
             // SAFETY: documented NSWorkspace/NSRunningApplication selectors;
             // objc_msgSend is cast to their exact pointer/i32 ABIs. The process
             // runs the AppKit main loop so workspace caches receive updates.
@@ -1170,10 +1188,7 @@ mod desk {
                         return None;
                     }
                     let workspace = send(class, sel_registerName(c"sharedWorkspace".as_ptr()));
-                    let app = send(
-                        workspace,
-                        sel_registerName(c"menuBarOwningApplication".as_ptr()),
-                    );
+                    let app = send(workspace, sel_registerName(selector.as_ptr()));
                     if app.is_null() {
                         return None;
                     }
