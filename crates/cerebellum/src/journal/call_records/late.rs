@@ -210,7 +210,7 @@ pub(super) fn next_seq(inner: &mut Inner, key: &Key) {
         .late_seq = Some(*head);
 }
 
-pub(super) fn reconcile(inner: &mut Inner, now_ms: u64) -> Vec<(Key, &'static str)> {
+pub(super) fn reconcile(inner: &mut Inner, now_ms: u64) -> Vec<Key> {
     let mut ready = Vec::new();
     let mut keys = Vec::new();
     for (key, entry) in &mut inner.entries {
@@ -234,7 +234,7 @@ pub(super) fn reconcile(inner: &mut Inner, now_ms: u64) -> Vec<(Key, &'static st
                 CallState::Replied
             };
             entry.record.settled_at_ms = Some(now_ms);
-            ready.push((key.clone(), outcome.as_str()));
+            ready.push(key.clone());
         }
         if let Phase::Result { settled_at, .. } | Phase::Expired { settled_at, .. } = handoff.phase
         {
@@ -334,6 +334,19 @@ fn result_body(held: &HeldHandoff, outcome: &str) -> Value {
 }
 
 impl CallRecords {
+    pub(super) fn publish_late_notice(&self, inner: &Inner, key: &Key, outcome: &str) {
+        // Use the same settlement identity the reader pulls through late_results.
+        // An acknowledgement or retention drop leaves nothing to announce.
+        if let Some(entry) = inner
+            .entries
+            .get(key)
+            .and_then(|entry| wire_entry(&entry.record))
+        {
+            self.events
+                .late_result(&entry.custodian, &entry.call_key, &entry.event_id, outcome);
+        }
+    }
+
     /// Persist the call record before forwarding the held first reply. The
     /// original browser request, if resumable, stays only in bounded memory.
     pub fn hold_consent(
@@ -701,7 +714,11 @@ impl CallRecords {
         inner.handoffs.retain(|_, held_key| held_key != key);
         next_seq(inner, key);
         self.bound_late(inner, now_ms)?;
-        self.events.late_result(&key.0, &key.1, outcome.as_str());
+        self.publish_late_notice(
+            inner,
+            key,
+            crate::event_publish::late_result_outcome(&result, false),
+        );
         if let Some(display) = self.display.get().and_then(std::sync::Weak::upgrade) {
             display.completed(&key.0, &key.1, &result);
         }
@@ -1063,7 +1080,7 @@ mod tests {
             );
             assert_eq!(
                 serde_json::from_slice::<Value>(&writes[0].bytes).unwrap(),
-                json!({"call_key":"opaque:key", "outcome":"login_observed"})
+                json!({"call_key":"opaque:key", "outcome":"ok"})
             );
             assert!(!String::from_utf8_lossy(&writes[0].bytes).contains("planted-screen-text"));
             // Reopening from committed bytes, not the live in-memory entries,
@@ -1073,6 +1090,10 @@ mod tests {
                 .late_results(OWNER, &LateResultsRequest::new(), 101)
                 .unwrap();
             assert_eq!(late.entries.len(), 1);
+            assert_eq!(
+                writes[0].id,
+                format!("{}:prefrontal-core", late.entries[0].event_id)
+            );
             let body = serde_json::to_value(&late.entries[0]).unwrap();
             assert_eq!(body["call_key"], "opaque:key");
             assert_eq!(body["result"]["outcome"], "login_observed");

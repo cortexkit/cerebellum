@@ -956,8 +956,18 @@ impl CallRecords {
                     inner.broken = Some(error);
                 }
                 if inner.broken.is_none() {
-                    for (key, outcome) in ready {
-                        records.events.late_result(&key.0, &key.1, outcome);
+                    for key in ready {
+                        if let Some(result) = inner
+                            .entries
+                            .get(&key)
+                            .and_then(|entry| late::settled_result(&entry.record))
+                        {
+                            records.publish_late_notice(
+                                &inner,
+                                &key,
+                                crate::event_publish::late_result_outcome(&result, false),
+                            );
+                        }
                     }
                 }
             }

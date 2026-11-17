@@ -252,6 +252,9 @@ impl CallRecords {
         }
         let value: Value = serde_json::from_slice(&reply.body)
             .unwrap_or_else(|_| json!({"outcome":"outcome_unknown"}));
+        let notice_outcome =
+            crate::event_publish::late_result_outcome(&value, reply.header.ty == FrameType::Error)
+                .to_owned();
         let mut body = value.get("structuredContent").cloned().unwrap_or(value);
         if reply.header.ty == FrameType::Error && !dispatched {
             body = json!({"outcome":"not_started","reason":body["code"],"detail":{"refusal":body}});
@@ -308,7 +311,7 @@ impl CallRecords {
         }
         super::late::next_seq(&mut inner, &key);
         self.bound_late(&mut inner, now)?;
-        self.events.late_result(principal, call_key, "unknown");
+        self.publish_late_notice(&inner, &key, &notice_outcome);
         if let Some(display) = self.display.get().and_then(std::sync::Weak::upgrade) {
             display.completed(principal, call_key, &body);
         }

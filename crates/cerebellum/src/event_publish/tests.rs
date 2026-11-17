@@ -5,6 +5,9 @@ use subc_protocol::Principal;
 
 use super::*;
 
+mod bus_names;
+mod late_result_ready;
+
 #[derive(Clone, Debug)]
 pub(crate) struct Captured {
     pub(crate) kind: Kind,
@@ -179,14 +182,25 @@ fn bus_notice_disabled_display_does_not_queue_but_recovered_late_result_does() {
         json!({"call_key":"opaque:recovered", "outcome":"handoff_interrupted"})
     );
     assert_eq!(recovered.events.sender.capacity(), CAPACITY);
+    let late = recovered
+        .late_results(
+            owner,
+            &cortexkit_role_tool_provider::late_results::LateResultsRequest::new(),
+            101,
+        )
+        .unwrap();
+    assert_eq!(
+        queued.message_id,
+        format!("{}:prefrontal-core", late.entries[0].event_id)
+    );
 }
 
 #[test]
 fn custodian_tail_requires_exact_reserved_module_label() {
     for module in ["thalamus-harness", "prefrontal-core", "broca"] {
         assert_eq!(
-            custodian_module(&format!("reserved:{module}")),
-            Some(module.into())
+            late_result_ready_reader(&format!("reserved:{module}")),
+            Some(module)
         );
     }
     for label in [
@@ -206,16 +220,16 @@ fn custodian_tail_requires_exact_reserved_module_label() {
         "reserved:broca.*",
         "reserved:broca.>",
     ] {
-        assert_eq!(custodian_module(label), None, "{label:?}");
+        assert_eq!(late_result_ready_reader(label), None, "{label:?}");
     }
 }
 
 #[tokio::test]
 async fn bus_notice_bodies_and_ids_are_narrow_and_stable() {
     let (publisher, fake) = publisher();
-    publisher.late_result("reserved:broca", "opaque:key", "login_observed");
-    publisher.late_result("reserved:broca", "opaque:key", "login_observed");
-    publisher.late_result("reserved:broca", "opaque:key", "closed_by_caller");
+    publisher.late_result("reserved:broca", "opaque:key", "settlement:1", "ok");
+    publisher.late_result("reserved:broca", "opaque:key", "settlement:1", "ok");
+    publisher.late_result("reserved:broca", "opaque:key", "settlement:2", "ok");
     let record = write(DisplayKind::Record);
     publisher.tool_display(&record);
     let mut changed = record.clone();
@@ -234,7 +248,7 @@ async fn bus_notice_bodies_and_ids_are_narrow_and_stable() {
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&writes[0].bytes).unwrap(),
-        json!({"call_key":"opaque:key", "outcome":"login_observed"})
+        json!({"call_key":"opaque:key", "outcome":"ok"})
     );
     assert_eq!(writes[0].id, writes[1].id);
     assert_ne!(writes[0].id, writes[2].id);
@@ -279,7 +293,7 @@ async fn bus_notice_idle_close_is_thirty_seconds_after_last_publish() {
         0,
         "idle publisher must not connect"
     );
-    publisher.late_result("reserved:broca", "first", "declined");
+    publisher.late_result("reserved:broca", "first", "settlement:1", "declined");
     settle().await;
     tokio::time::advance(Duration::from_secs(29)).await;
     settle().await;
@@ -304,7 +318,7 @@ async fn bus_notice_idle_close_is_thirty_seconds_after_last_publish() {
         1,
         "idle close must not start a reconnect timer"
     );
-    publisher.late_result("reserved:broca", "second", "declined");
+    publisher.late_result("reserved:broca", "second", "settlement:2", "declined");
     settle().await;
     assert_eq!(fake.opened.load(Relaxed), 2);
 }
@@ -313,12 +327,12 @@ async fn bus_notice_idle_close_is_thirty_seconds_after_last_publish() {
 async fn bus_notice_waits_are_bounded_and_overflow_never_blocks() {
     let (publisher, fake) = publisher();
     fake.hang_publish.store(true, Relaxed);
-    publisher.late_result("direct", "first", "declined");
+    publisher.late_result("reserved:reader", "first", "settlement:1", "declined");
     settle().await;
     for _ in 0..CAPACITY {
-        publisher.late_result("direct", "queued", "declined");
+        publisher.late_result("reserved:reader", "queued", "settlement:2", "declined");
     }
-    publisher.late_result("direct", "dropped", "declined");
+    publisher.late_result("reserved:reader", "dropped", "settlement:3", "declined");
     assert_eq!(publisher.gauges.failed.load(Relaxed), 1);
     assert_eq!(
         publisher.gauges.last_failure.load(Relaxed),
@@ -347,7 +361,7 @@ async fn bus_notice_waits_are_bounded_and_overflow_never_blocks() {
 
     let (publisher, fake) = self::publisher();
     fake.hang_open.store(true, Relaxed);
-    publisher.late_result("direct", "open", "declined");
+    publisher.late_result("reserved:reader", "open", "settlement:4", "declined");
     settle().await;
     tokio::time::advance(OPEN_WINDOW).await;
     settle().await;
