@@ -933,6 +933,8 @@ fn a_new_process_generation_starts_a_new_session() {
         super::person::SeenMarks {
             focused: super::person::Reading::Read(None),
             window: super::person::Reading::Read(None),
+            windows: super::person::Reading::Read(Vec::new()),
+            after_agent_input: false,
             at: std::time::Instant::now(),
         },
     );
