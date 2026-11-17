@@ -245,6 +245,15 @@ export CEREBELLUM_PRIVATE_INPUT_ROUTE_REVIEW_REVISION="private-input-route-revie
 # 200 ms needs-front bound Ufuk set. Bind it only on builds from d5c517a7 or later.
 export CEREBELLUM_APP_USE_FRONTING_REVIEW_REVISION="app-use-fronting-review/v1@d5c517a7"
 
+# Takeover pointer gestures (move, scroll, click, drag) on a covered app: the
+# module brings the app forward for the one gesture, then restores the person's
+# app. Click and drag also depend on the measured mouse-up routing
+# (DOWN_GESTURE_RECOVERY_MEASURED). Minted by SUBC as v2 against ck-cerebellum
+# c1b894e8. Binding it changes the computer_use definition (it adds
+# takeover_click), so heads re-pin the tool after one tool_schema_changed
+# refusal.
+export CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION="takeover-pointer-fronting-review/v2@c1b894e8"
+
 # When a new identifier is added, leave it UNSET here until its review exists,
 # rather than filling it with a placeholder. The gate rejects "placeholder",
 # "tbd" and "unknown" outright, so a stand-in fails louder than absence -- but
@@ -256,11 +265,6 @@ export CEREBELLUM_APP_USE_FRONTING_REVIEW_REVISION="app-use-fronting-review/v1@d
 
 # The identifiers the compiler reads. Kept as one list so the loop below and
 # the check after it cannot disagree about what exists.
-# Temporary front/act/restore for takeover pointer gestures and takeover_click
-# needs an independent safety review. Leave its key UNSET until that review
-# approves these paths and supplies its revision. Binding the key also changes
-# computer_use definition bytes. OpenCode caches those definitions until
-# restart, so bind the key only at a coordinated host restart.
 readonly ATTESTATIONS=(
   CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION
   CEREBELLUM_CAPTURE_REVIEW_REVISION
