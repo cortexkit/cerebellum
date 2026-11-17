@@ -1683,6 +1683,10 @@ async fn a_background_command_chord_fronts_posts_and_restores() {
 
 #[tokio::test]
 async fn a_needs_front_shortcut_accepts_a_150_ms_bracket_but_not_210_ms() {
+    use cerebellum_computer::audit::{
+        ActuationOutcome, FrontingRecordMode, FrontingRecordPurpose, FrontingRecordRestore,
+        RecordedActuationOutcome,
+    };
     for (interval_ms, target_fronted) in [(150, true), (210, false)] {
         let rig = rig(AppUse::Background, mail_desk()).await;
         rig.read().await;
@@ -1695,6 +1699,8 @@ async fn a_needs_front_shortcut_accepts_a_150_ms_bracket_but_not_210_ms() {
             .call_under(&under_terminal(), "computer.keys", command_chord())
             .await;
         assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+        assert_eq!(reply["containment_rung"], "pid_structural", "{reply}");
+        assert_eq!(reply["effect_status"], "effect_indeterminate", "{reply}");
         assert_eq!(reply["target_fronted"], target_fronted, "{reply}");
         if target_fronted {
             assert!(reply["containment_forfeited_because"].is_null(), "{reply}");
@@ -1708,6 +1714,26 @@ async fn a_needs_front_shortcut_accepts_a_150_ms_bracket_but_not_210_ms() {
         assert_eq!(rig.screen.log(), ["front:4242", "post", "restore:100"]);
         assert_eq!(rig.screen.state().now, interval_ms);
         assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
+        if interval_ms == 150 {
+            let rows = journal_results(&rig);
+            let actuation = rows
+                .iter()
+                .find(|row| row.get("fronting").is_some() && row["outcome"] == "handler_returned")
+                .unwrap_or_else(|| panic!("no chord actuation row in {rows:?}"));
+            let recorded: RecordedActuationOutcome =
+                serde_json::from_value(actuation.clone()).unwrap();
+            assert_eq!(
+                recorded.outcome,
+                ActuationOutcome::HandlerReturned {
+                    unreadable_subtrees: 0
+                }
+            );
+            let fronting = recorded.fronting.expect("the chord records its front");
+            assert_eq!(fronting.mode, FrontingRecordMode::Background);
+            assert!(fronting.fronted);
+            assert_eq!(fronting.purpose, FrontingRecordPurpose::NeedsFront);
+            assert_eq!(fronting.restore, FrontingRecordRestore::Restored);
+        }
     }
 }
 
