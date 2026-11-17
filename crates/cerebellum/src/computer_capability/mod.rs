@@ -2455,13 +2455,7 @@ where
         }
         let front_with_app_grant = route == fronting::ChordRoute::FrontWithAppGrant;
         if front_with_app_grant {
-            bracket_bound = Some(
-                cerebellum_computer::platform::vocabulary::frozen_row_bound_ms(
-                    capability_id,
-                    "maximum_fronting_bracket_interval_ms",
-                )
-                .unwrap_or(100),
-            );
+            bracket_bound = Some(crate::budgets::FRONTING_BRACKET_MS);
         }
         if route == fronting::ChordRoute::TakeoverBracket {
             match management

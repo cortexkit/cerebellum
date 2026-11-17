@@ -5,9 +5,10 @@ use cerebellum_computer::capture_custody::{
 use cerebellum_computer::dispatch::post_condition::PostCondition;
 use cerebellum_computer::dispatch::{
     authorize_escalation, retry_decision, AbortDecision, AbortReason, AttemptDisposition,
-    AttendanceContext, AttendanceLease, ConsentDecision, DispatchError, DispatchPhase,
-    DispatchRequest, Dispatcher, ExpectedPostCondition, FocusCheckPlan, FrozenDispatchRow,
-    ReconciliationResult, RetryDecision, SeizeWatcher, SourcedInputKind,
+    AttendanceContext, AttendanceLease, BracketReport, ConsentDecision, DispatchError,
+    DispatchPhase, DispatchRequest, Dispatcher, ExpectedPostCondition, FocusCheckPlan,
+    FrozenDispatchRow, ReconciliationResult, RestoreStatus, RetryDecision, SeizeWatcher,
+    SourcedInputKind,
 };
 use cerebellum_computer::platform::containment::IdentityAtomicBinding;
 use cerebellum_computer::platform::*;
@@ -210,6 +211,8 @@ fn decode_embedded_json(value: &Value) -> Value {
 struct RecordingDriver {
     semantic_result: Result<cerebellum_computer::platform::DispatchResult, DriverError>,
     per_pid_result: cerebellum_computer::platform::DispatchResult,
+    fronted_result: Option<BracketReport>,
+    fronted_bounds: Vec<u64>,
     effect: Result<EffectObservationResult, DriverError>,
     liveness: InputObserverLiveness,
     input: Result<InputObservationResult, DriverError>,
@@ -252,6 +255,8 @@ impl Default for RecordingDriver {
                 delivery_posts_returned: 2,
                 delivery_generation_verifications: 4,
             },
+            fronted_result: None,
+            fronted_bounds: Vec::new(),
             effect: Ok(EffectObservationResult {
                 status: EffectStatus::EffectObserved,
                 failure_reason: None,
@@ -352,6 +357,17 @@ impl PlatformDriver for RecordingDriver {
         self.per_pid_calls += 1;
         Ok(self.per_pid_result.clone())
     }
+    fn dispatch_fronted(
+        &mut self,
+        request: FrontedDispatchRequest,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<BracketReport, DriverError> {
+        self.fronted_bounds.push(request.maximum_interval_ms);
+        self.fronted_result
+            .clone()
+            .ok_or(DriverError::Unsupported("fronted dispatch"))
+    }
+
     fn dispatch_global(
         &mut self,
         request: GlobalDispatchRequest,
@@ -1067,6 +1083,74 @@ fn per_pid_synthetic_delivery_reports_the_structural_rung_not_the_semantic_one()
         reply_rung, journal_rung,
         "the reply and durable journal recorded different containment rungs"
     );
+}
+
+#[test]
+fn a_fronted_dispatch_compares_against_its_plan_and_other_dispatches_keep_the_row_bound() {
+    let row_bound = FrozenDispatchRow::for_capability("computer.type")
+        .unwrap()
+        .maximum_fronting_bracket_interval_ms;
+    for (plan_bound, interval_ms, stable) in [
+        (Some(200), 150, true),
+        (Some(200), 210, false),
+        (Some(row_bound), 150, false),
+        (None, 150, false),
+    ] {
+        let mut request = typing_request("x");
+        let observation_window_ms = request.row.fronting_observation_window_ms;
+        // The pre snapshot precedes dispatch, and the post snapshot lands at
+        // dispatch plus the unchanged observation window in every case.
+        request.now_ms = interval_ms - observation_window_ms;
+        if let Some(bound) = plan_bound {
+            request = request.with_fronting_bracket(bound);
+        }
+        let driver = RecordingDriver {
+            fronting: VecDeque::from([fronting(0), fronting(interval_ms)]),
+            fronted_result: Some(BracketReport {
+                previous_frontmost: Some(99),
+                chunks: 1,
+                units_posted: 1,
+                posts_returned: 2,
+                generation_verifications: 4,
+                longest_fronted_interval_ms: interval_ms,
+                slowest_unit_ms: interval_ms,
+                slowest_restore_ms: 0,
+                restore: RestoreStatus::Restored,
+                stop: None,
+                waiting_out_slow_post: false,
+                waiting_out_slow_restore: false,
+            }),
+            ..RecordingDriver::default()
+        };
+        let mut audit = audit();
+        let mut dispatcher = Dispatcher::new(
+            driver,
+            &cerebellum_computer::platform::process_event::never_cancelled,
+        );
+        let report = dispatcher
+            .dispatch(&mut audit, audit_identity(), request)
+            .expect("the scripted delivery succeeds");
+        assert_eq!(report.containment.fronting_stable, stable, "{report:?}");
+        let comparison = report.fronting.expect("input compares fronting");
+        assert_eq!(comparison.unchanged(), stable);
+        assert_eq!(comparison.measured_bracket_interval_ms, Some(interval_ms));
+        assert_eq!(
+            comparison.maximum_fronting_bracket_interval_ms,
+            plan_bound.unwrap_or(row_bound)
+        );
+        assert_eq!(
+            comparison.declared_observation_window_ms,
+            observation_window_ms
+        );
+        assert_eq!(
+            dispatcher.driver().fronted_bounds,
+            plan_bound.into_iter().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serde_json::to_value(report.containment.rung().unwrap()).unwrap(),
+            json!("pid_structural")
+        );
+    }
 }
 
 #[test]

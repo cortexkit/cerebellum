@@ -56,8 +56,8 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
         .hooks
         .as_ref()
         .ok_or(ImageUnavailable::FrontingUnavailable)?;
-    // The declared 300 ms read bound is provisional pending a live measurement
-    // by the placed module. Keys retain their independently sized 100 ms bound.
+    // The declared 300 ms read bound is provisional pending live measurement.
+    // Shortcut brackets have an independent bound.
     let bound = cerebellum_computer::platform::vocabulary::frozen_row_bound_ms(
         "computer.read_state",
         "maximum_fronting_read_interval_ms",

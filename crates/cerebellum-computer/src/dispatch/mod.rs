@@ -765,13 +765,20 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
             None
         };
         let fronting = if input {
+            // Judge a temporary front against the bound used to run it.
+            // Dispatches without a bracket keep the frozen row's bound.
+            let maximum_interval_ms = request
+                .fronting_bracket
+                .map_or(request.row.maximum_fronting_bracket_interval_ms, |plan| {
+                    plan.maximum_interval_ms
+                });
             Some(crate::platform::containment::compare_fronting(
                 &request.target,
                 pre_fronting,
                 post_fronting,
                 request.now_ms,
                 request.row.fronting_observation_window_ms,
-                request.row.maximum_fronting_bracket_interval_ms,
+                maximum_interval_ms,
             ))
         } else {
             None
