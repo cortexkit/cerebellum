@@ -865,26 +865,84 @@ async fn declarer_cache_caches_empty_and_ambiguous_answers() {
     }
 }
 
-/// A display module that restarts binds before the catalog lists it again. The
-/// answer that leaves it out refuses it for two seconds, not the full 30.
+/// An absent module re-reads the catalog on its first bind, then at most once
+/// per two seconds; an answer that names it is held for the full TTL.
 #[tokio::test(start_paused = true)]
-async fn declarer_cache_rereads_an_answer_missing_the_binder_after_two_seconds() {
+async fn declarer_cache_rereads_an_answer_missing_the_binder_at_most_every_two_seconds() {
     let planes = planes();
     let catalog = CatalogDouble::new(&[]);
     planes.routes.display.connect(catalog.clone());
+    // A cold read that already leaves the binder out is not read again.
     assert_eq!(bind_display(&planes).await.header.ty, FrameType::Error);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_millis(500)).await;
+    assert_eq!(bind_display(&planes).await.header.ty, FrameType::Error);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 2);
     *catalog.answer.lock().unwrap() = Some(vec!["display-vendor".into()]);
     tokio::time::advance(Duration::from_millis(1_999)).await;
     assert_eq!(bind_display(&planes).await.header.ty, FrameType::Error);
-    assert_eq!(catalog.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 2);
     tokio::time::advance(Duration::from_millis(1)).await;
     assert_eq!(bind_display(&planes).await.header.ty, FrameType::Response);
-    assert_eq!(catalog.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 3);
     // The fresh answer names the binder, so it is held for the full TTL again.
     *catalog.answer.lock().unwrap() = Some(vec![]);
     tokio::time::advance(Duration::from_secs(29)).await;
     assert_eq!(bind_display(&planes).await.header.ty, FrameType::Response);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 3);
+}
+
+/// Occipital's restart on 17 Nov: another module's bind cached an answer read
+/// while the display module was away, and the display module bound a moment
+/// later. Its first bind must read the catalog again rather than wait out the
+/// answer's age.
+#[tokio::test(start_paused = true)]
+async fn declarer_cache_restarted_display_module_is_admitted_on_its_first_bind() {
+    let planes = planes();
+    let catalog = CatalogDouble::new(&[]);
+    planes.routes.display.connect(catalog.clone());
+    let other = bind_scope_carrier(
+        &planes,
+        Principal::Reserved {
+            module_id: "basal".into(),
+        },
+        subc_protocol::RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+        None,
+    )
+    .await;
+    assert_eq!(other.header.ty, FrameType::Error);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 1);
+    *catalog.answer.lock().unwrap() = Some(vec!["display-vendor".into()]);
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert_eq!(bind_display(&planes).await.header.ty, FrameType::Response);
     assert_eq!(catalog.reads.load(Ordering::SeqCst), 2);
+}
+
+/// First-party binds are admitted without the display check, so however often
+/// they bind, they never make cerebellum read the catalog again.
+#[tokio::test(start_paused = true)]
+async fn declarer_cache_first_party_binds_never_reread_the_catalog() {
+    let planes = planes();
+    let catalog = CatalogDouble::new(&[]);
+    planes.routes.display.connect(catalog.clone());
+    for _ in 0..20 {
+        let reply = bind_scope_carrier(
+            &planes,
+            Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            subc_protocol::RouteTarget::ToolProvider {
+                module_id: "cerebellum".into(),
+            },
+            None,
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        tokio::time::advance(Duration::from_secs(5)).await;
+    }
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(start_paused = true)]

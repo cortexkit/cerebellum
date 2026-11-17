@@ -215,10 +215,13 @@ pub(super) async fn handle_control_request(
             // permissions.list/revoke before any grant lookup. Neither needs
             // the unrelated powers that first-party membership would confer.
             let trust = trust_for_principal(&principal);
-            let view_reader = route_bindings
-                .display
-                .admits_view_reader(principal.as_ref(), &target)
-                .await;
+            // First-party binds are admitted without it, and they are the busiest
+            // binders, so they must not drive catalog re-reads.
+            let view_reader = !trust.is_first_party()
+                && route_bindings
+                    .display
+                    .admits_view_reader(principal.as_ref(), &target)
+                    .await;
             if matches!(principal, Some(subc_protocol::Principal::Reserved { .. }))
                 && scope
                     .as_ref()

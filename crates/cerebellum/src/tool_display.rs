@@ -39,11 +39,13 @@ pub(crate) trait Backend: Send + Sync {
 
 const WRITE_WINDOW: Duration = Duration::from_secs(3);
 const DECLARER_TTL: Duration = Duration::from_secs(30);
-/// How long a catalog answer that leaves a module out keeps refusing that
-/// module. A display module that restarts can bind before the catalog lists its
-/// capabilities again; holding that answer for the full TTL would refuse it for
-/// 30 s after every restart.
-const ABSENT_DECLARER_TTL: Duration = Duration::from_secs(2);
+/// How often one module left out of the cached catalog answer may make
+/// cerebellum read the catalog again. A display module that restarts binds
+/// within a second of its HELLO, and the cached answer may have been read by
+/// another module's bind while it was away. So the first bind of an absent
+/// module re-reads at once, whatever the answer's age, and its later binds
+/// re-read at most this often.
+const ABSENT_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_WAITING: usize = 16_384;
 const MAX_RECENT_CONSENTS: usize = 16_384;
 const MAX_RECENT_CALLS: usize = 65_536;
@@ -74,6 +76,10 @@ struct ArmMetrics {
 struct DeclarerCache {
     cached: Option<(tokio::time::Instant, Vec<String>)>,
     in_flight: Option<tokio::sync::watch::Receiver<Option<Vec<String>>>>,
+    /// When each absent module last made the catalog be read again. Only
+    /// non-first-party reserved principals binding to cerebellum reach it, so
+    /// it holds a handful of module ids.
+    absent_rechecked: HashMap<String, tokio::time::Instant>,
 }
 
 #[derive(Default)]
@@ -332,27 +338,39 @@ impl Records {
         {
             return false;
         }
+        let asked = tokio::time::Instant::now();
         if self.declarers().await.as_slice() == [module_id.as_str()] {
             return true;
         }
-        self.expire_if_absent(module_id)
+        self.expire_if_absent(module_id, asked)
             && self.declarers().await.as_slice() == [module_id.as_str()]
     }
 
-    /// Drops a cached answer that leaves `module_id` out once it is older than
-    /// [`ABSENT_DECLARER_TTL`], so the caller reads the catalog again. Returns
-    /// whether it did. Failed reads are never cached, so only a successful
-    /// answer can be dropped here.
-    fn expire_if_absent(&self, module_id: &str) -> bool {
+    /// Drops a cached answer that leaves `module_id` out, so the caller reads
+    /// the catalog again. It keeps the answer when it was read at or after
+    /// `asked` (the caller's own read already saw the module absent), or when
+    /// this module caused a re-read within [`ABSENT_RECHECK_INTERVAL`]. Returns
+    /// whether it dropped it. Failed reads are never cached, so only a
+    /// successful answer can be dropped here.
+    fn expire_if_absent(&self, module_id: &str, asked: tokio::time::Instant) -> bool {
         let mut cache = self.declarers.lock().unwrap();
-        let stale = cache.cached.as_ref().is_some_and(|(refreshed, modules)| {
-            !modules.iter().any(|module| module == module_id)
-                && refreshed.elapsed() >= ABSENT_DECLARER_TTL
+        let absent = cache.cached.as_ref().is_some_and(|(refreshed, modules)| {
+            *refreshed < asked && !modules.iter().any(|module| module == module_id)
         });
-        if stale {
-            cache.cached = None;
+        let recently = cache
+            .absent_rechecked
+            .get(module_id)
+            .is_some_and(|at| at.elapsed() < ABSENT_RECHECK_INTERVAL);
+        if !absent || recently {
+            return false;
         }
-        stale
+        let now = tokio::time::Instant::now();
+        cache
+            .absent_rechecked
+            .retain(|_, at| now.duration_since(*at) < ABSENT_RECHECK_INTERVAL);
+        cache.absent_rechecked.insert(module_id.to_owned(), now);
+        cache.cached = None;
+        true
     }
 
     pub(crate) async fn read(
