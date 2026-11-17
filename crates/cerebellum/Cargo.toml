@@ -162,6 +162,11 @@ test = true
 required-features = ["desk-probe"]
 
 [[example]]
+name = "needs_front_alternatives_probe"
+test = true
+required-features = ["desk-probe"]
+
+[[example]]
 name = "mouse_up_routing_probe"
 required-features = ["desk-probe"]
 
