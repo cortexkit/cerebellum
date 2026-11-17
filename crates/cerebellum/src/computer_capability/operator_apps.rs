@@ -667,8 +667,14 @@ impl Lookup {
             .source
             .running_apps()
             .ok()
-            .and_then(|apps| apps.into_iter().find(|app| app.pid == grant.pid))
-            .map(|app| app.name)
+            .and_then(|apps| {
+                apps.into_iter().find(|app| {
+                    app.pid == grant.pid
+                        && !app.name.trim().is_empty()
+                        && !app.name.eq_ignore_ascii_case(&grant.bundle_identity)
+                })
+            })
+            .map(|app| app.name.trim().to_string())
             .unwrap_or_else(|| self.management.application_name(grant));
         let name = cerebellum_computer::app_state::render::one_line(&name);
         reply["remedy"] = json!(format!(

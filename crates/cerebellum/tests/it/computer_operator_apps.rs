@@ -379,6 +379,47 @@ async fn open_app_refuses_an_installed_operator_app_found_by_name() {
 }
 
 #[tokio::test]
+async fn pointer_refusals_prefer_display_names_and_fall_back_only_when_unknown() {
+    for (name, expected) in [
+        (Some("iPhone Mirroring"), "iPhone Mirroring"),
+        (Some(""), MIRRORING),
+        (None, MIRRORING),
+    ] {
+        let rig = fixture();
+        {
+            let mut desk = rig.desk.state();
+            desk.real_cursor = Some((10.0, 10.0));
+            desk.system_wide_hit = Some((99, Some(MIRRORING_PID)));
+            let apps = desk.running.as_mut().unwrap();
+            if let Some(name) = name {
+                apps.iter_mut()
+                    .find(|app| app.pid == MIRRORING_PID)
+                    .unwrap()
+                    .name = name.into();
+            } else {
+                apps.retain(|app| app.pid != MIRRORING_PID);
+            }
+        }
+        let carrier = ScriptedCarrier::default();
+        let reply = serve(
+            &rig,
+            "computer.takeover_scroll",
+            &json!({"target": TARGET_BUNDLE_ID, "axis": "vertical", "amount_lines": 1}),
+            relayed(&carrier),
+        )
+        .await;
+        assert_eq!(reply["reason"], "operator_app_blocked", "{reply}");
+        assert!(
+            reply["remedy"].as_str().unwrap().starts_with(&format!(
+                "The pointer is over {expected}, which agents may not use"
+            )),
+            "{name:?}: {reply}"
+        );
+        assert!(carrier.questions().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn pointer_refusals_name_the_operator_app_under_the_pointer_not_the_target() {
     let rig = fixture();
     {

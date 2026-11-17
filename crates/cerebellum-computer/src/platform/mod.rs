@@ -2805,15 +2805,17 @@ mod hooked_fronted_tests {
             for cost in costs {
                 let (outcome, screen) = run_with_restore_cost(true, true, false, cost);
                 let screen = screen.lock().unwrap();
-                assert_eq!(outcome.report.restore, RestoreStatus::Restored);
-                assert_eq!(
-                    screen.requests,
-                    [("bracket", TARGET), ("restore_host", PREVIOUS)]
-                );
                 if cost == 0 {
+                    assert_eq!(outcome.report.restore, RestoreStatus::Restored);
+                    assert_eq!(
+                        screen.requests,
+                        [("bracket", TARGET), ("restore_host", PREVIOUS)]
+                    );
                     assert_eq!(outcome.report.stop, None);
                     assert_eq!(outcome.report.units_posted, 1);
                 } else {
+                    assert_eq!(outcome.report.restore, RestoreStatus::NotNeeded);
+                    assert!(screen.requests.is_empty());
                     assert_eq!(outcome.report.stop, Some(BracketStop::BoundExceeded));
                     assert_eq!(outcome.report.units_posted, 0);
                 }

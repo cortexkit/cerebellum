@@ -321,6 +321,11 @@ fn replies(capability: ComputerCapability) -> Vec<Value> {
         ComputerCapability::Keys => replies.extend([
             chord_blocked_refusal("command+option+escape", "session_ending"),
             json!({"outcome": "modifier_chord_needs_foreground"}),
+            json!({"outcome":"completed", "effect_status":"effect_observed",
+                "containment_rung":"semantic_element", "target_fronted":false, "posts_returned":0}),
+            json!({"outcome":"delivery_unconfirmed", "effect_status":"effect_indeterminate",
+                "containment_rung":"semantic_element", "target_fronted":false, "posts_returned":0,
+                "remedy":"The selection could not be read; selecting all again is safe."}),
         ]),
         _ => unreachable!(),
     }
@@ -557,7 +562,11 @@ fn every_type_outcome_survives_withholding() {
 fn every_keys_outcome_survives_withholding() {
     check_outcomes(
         ComputerCapability::Keys,
-        &["chord_blocked", "modifier_chord_needs_foreground"],
+        &[
+            "chord_blocked",
+            "modifier_chord_needs_foreground",
+            "completed",
+        ],
     );
 }
 

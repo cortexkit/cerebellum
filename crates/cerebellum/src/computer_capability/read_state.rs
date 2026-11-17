@@ -499,7 +499,7 @@ where
         };
         // Screen Recording serves only the optional image, never the tree.
         // Do not construct a capture backend when the startup reading was not
-        // live: a later grant still requires restarting this plane.
+        // live: a later grant still requires restarting cerebellum.
         let image_permission_live = self
             .permissions
             .state(cerebellum_computer::platform::PermissionService::ScreenRecording)

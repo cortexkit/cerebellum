@@ -1738,7 +1738,7 @@ async fn a_needs_front_shortcut_accepts_a_150_ms_bracket_but_not_210_ms() {
 }
 
 #[tokio::test]
-async fn a_cold_hooked_chord_refuses_not_dispatched_and_a_retry_posts() {
+async fn a_cold_hooked_chord_refuses_before_activation_and_posts_after_a_measured_restore() {
     let rig = rig(AppUse::Background, mail_desk()).await;
     rig.read().await;
     rig.screen.state().measured_restore_ms = None;
@@ -1748,26 +1748,22 @@ async fn a_cold_hooked_chord_refuses_not_dispatched_and_a_retry_posts() {
     assert_eq!(reply["outcome"], "fronting_bound_exceeded", "{reply}");
     assert_eq!(reply["effect_status"], "not_dispatched", "{reply}");
     assert_eq!(reply["posts_returned"], 0, "{reply}");
-    assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
-    assert_eq!(rig.screen.log(), ["front:4242", "restore:100"]);
+    assert_eq!(reply["fronting"]["restore"], "not_needed", "{reply}");
+    assert_eq!(reply["fronting"]["fronted"], false, "{reply}");
+    assert!(rig.screen.log().is_empty());
+    assert_eq!(rig.screen.state().measured_restore_ms, None);
     assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
     assert!(!rig.lock.held());
 
+    // An independently measured restore can admit a later chord; a refused
+    // call must never activate an app just to obtain that measurement.
+    rig.screen.state().measured_restore_ms = Some(10);
     let retry = rig
         .call_under(&under_terminal(), "computer.keys", command_chord())
         .await;
     assert_eq!(retry["outcome"], "delivery_unconfirmed", "{retry}");
     assert_eq!(retry["fronting"]["restore"], "restored", "{retry}");
-    assert_eq!(
-        rig.screen.log(),
-        [
-            "front:4242",
-            "restore:100",
-            "front:4242",
-            "post",
-            "restore:100"
-        ],
-    );
+    assert_eq!(rig.screen.log(), ["front:4242", "post", "restore:100"],);
 }
 
 /// A chord whose post failed with a key possibly held: the previous
