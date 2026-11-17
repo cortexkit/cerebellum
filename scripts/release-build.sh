@@ -241,7 +241,9 @@ export CEREBELLUM_PRIVATE_INPUT_ROUTE_REVIEW_REVISION="private-input-route-revie
 # consults it, a build without it acts in foreground mode without fronting,
 # refuses a press on a disabled element with element_disabled, keeps the
 # takeover bracket for chords, and shows the application's icon in the preview.
-# Left UNSET: its review does not exist yet.
+# Minted by SUBC over dccb87c9..d5c517a7, after the 2026-11-17 desk run at the
+# 200 ms needs-front bound Ufuk set. Bind it only on builds from d5c517a7 or later.
+export CEREBELLUM_APP_USE_FRONTING_REVIEW_REVISION="app-use-fronting-review/v1@d5c517a7"
 
 # When a new identifier is added, leave it UNSET here until its review exists,
 # rather than filling it with a placeholder. The gate rejects "placeholder",
