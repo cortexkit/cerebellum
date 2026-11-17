@@ -519,13 +519,31 @@ fn a_measured_slow_restore_refuses_the_next_call_before_posting() {
     assert_eq!(next.report.units_posted, 0);
     assert_eq!(next.report.posts_returned, 0);
     assert!(desk.posted.is_empty());
-    assert_eq!(desk.front_requests, vec![TARGET, PREVIOUS]);
-    assert_eq!(next.report.restore, RestoreStatus::Restored);
+    assert!(desk.front_requests.is_empty());
+    assert_eq!(next.report.restore, RestoreStatus::NotNeeded);
     assert_eq!(desk.frontmost, Some(PREVIOUS));
 }
 
 #[test]
-fn a_cold_predictor_refuses_before_posting_and_learns_for_a_retry() {
+fn a_cold_or_unfit_restore_reserve_refuses_before_any_activation() {
+    for reserve in [None, Some(1046)] {
+        let mut desk = FakeDesk::new();
+        desk.restore_latencies = latency::RestoreLatencies::new();
+        if let Some(cost) = reserve {
+            desk.restore_latencies.record(cost);
+        }
+        let outcome = run_admitted(&mut desk, 1);
+        assert_eq!(outcome.report.stop, Some(BracketStop::BoundExceeded));
+        assert_eq!(outcome.report.posts_returned, 0);
+        assert_eq!(outcome.report.chunks, 0);
+        assert!(desk.front_requests.is_empty(), "{reserve:?}");
+        assert!(desk.posted.is_empty());
+        assert_eq!(desk.measured_restore_latency_ms(), reserve);
+    }
+}
+
+#[test]
+fn a_cold_predictor_does_not_learn_by_fronting_a_refused_call() {
     let mut desk = FakeDesk::new();
     desk.restore_latencies = latency::RestoreLatencies::new();
     desk.front_latency_ms = 25;
@@ -535,10 +553,12 @@ fn a_cold_predictor_refuses_before_posting_and_learns_for_a_retry() {
     assert_eq!(first.report.units_posted, 0);
     assert_eq!(first.report.posts_returned, 0);
     assert!(desk.posted.is_empty());
-    assert_eq!(desk.front_requests, vec![TARGET, PREVIOUS]);
-    assert_eq!(first.report.restore, RestoreStatus::Restored);
-    assert_eq!(desk.measured_restore_latency_ms(), Some(10));
+    assert!(desk.front_requests.is_empty());
+    assert_eq!(first.report.restore, RestoreStatus::NotNeeded);
+    assert_eq!(desk.measured_restore_latency_ms(), None);
 
+    // Only a genuine restore elsewhere may warm the predictor.
+    desk.restore_latencies.record(10);
     let retry = run_admitted(&mut desk, 1);
     assert_eq!(retry.report.stop, None);
     assert_eq!(retry.report.units_posted, 1);
@@ -546,7 +566,7 @@ fn a_cold_predictor_refuses_before_posting_and_learns_for_a_retry() {
 }
 
 #[test]
-fn a_slow_restore_ages_out_after_eight_later_refused_call_restores() {
+fn a_slow_restore_does_not_age_out_through_refused_activation_attempts() {
     let mut desk = FakeDesk::new();
     desk.restore_latencies.record(1046);
     desk.restore_latency_ms = Some(4);
@@ -554,14 +574,15 @@ fn a_slow_restore_ages_out_after_eight_later_refused_call_restores() {
         let outcome = run_admitted(&mut desk, 1);
         assert_eq!(outcome.report.stop, Some(BracketStop::BoundExceeded));
         assert_eq!(outcome.report.units_posted, 0);
-        assert_eq!(outcome.report.restore, RestoreStatus::Restored);
+        assert_eq!(outcome.report.restore, RestoreStatus::NotNeeded);
         assert_eq!(desk.frontmost, Some(PREVIOUS));
-        assert_eq!(
-            desk.measured_restore_latency_ms(),
-            Some(if later_restore < 8 { 1046 } else { 4 }),
-        );
+        assert_eq!(desk.measured_restore_latency_ms(), Some(1046),);
+        assert!(desk.front_requests.is_empty(), "attempt {later_restore}");
     }
     assert!(desk.posted.is_empty());
+    for _ in 0..8 {
+        desk.restore_latencies.record(4);
+    }
     let retry = run_admitted(&mut desk, 1);
     assert_eq!(retry.report.stop, None);
     assert_eq!(retry.report.units_posted, 1);

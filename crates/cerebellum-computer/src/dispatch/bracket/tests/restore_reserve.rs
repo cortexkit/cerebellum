@@ -15,10 +15,11 @@ const FRONTS: [u64; 19] = [
 const RESTORE_MS: u64 = 175;
 const ATTEMPT_SPACING_MS: u64 = 5_100;
 
-/// Replay the attempts in one process, as after a restart, with a 3 ms post
+/// Replay the attempts with the run's measured restore cost, a 3 ms post
 /// and the call's 300 ms restore wait. Returns each attempt's report.
 fn replay() -> Vec<BracketReport> {
     let mut restores = RestoreLatencies::new();
+    restores.record(RESTORE_MS);
     let mut units = Some(UnitPostCosts::new());
     let origin = std::time::Instant::now();
     let mut reports = Vec::new();
@@ -39,11 +40,8 @@ fn replay() -> Vec<BracketReport> {
     reports
 }
 
-/// Every chord refuses before posting. The first refuses with no restore
-/// measured yet, and the eighteenth's 62 ms front, counted again for its own
-/// restore, overruns by itself; every other refusal is only the measured
-/// slow restores, and says so, so the agent is told the person's application
-/// was slow to come back rather than to send shorter text.
+/// Every chord refuses before activation because the measured restore alone
+/// exceeds the allowance. A refused call cannot obtain a new restore sample.
 #[test]
 fn slow_restores_refuse_later_chords_and_mark_the_refusal_as_waiting_on_them() {
     let reports = replay();
@@ -59,11 +57,11 @@ fn slow_restores_refuse_later_chords_and_mark_the_refusal_as_waiting_on_them() {
             !report.waiting_out_slow_post,
             "attempt {attempt}: {report:?}"
         );
-        assert_eq!(
+        assert!(
             report.waiting_out_slow_restore,
-            ![1, 18].contains(&attempt),
             "attempt {attempt}: {report:?}"
         );
+        assert_eq!(report.chunks, 0, "attempt {attempt}: {report:?}");
     }
 }
 

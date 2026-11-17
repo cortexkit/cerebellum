@@ -491,6 +491,24 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
             report.stop = Some(BracketStop::PostFailed(failure));
             break;
         }
+        // A refusal must not briefly cover the person's work just to learn
+        // the restore cost. Unknown cost reserves the full cleanup allowance.
+        let measured_restore = host.borrow_mut().measured_restore_latency_ms();
+        let restore_reserve = if previous == plan.target_pid {
+            0
+        } else {
+            measured_restore.unwrap_or(RESTORE_WAIT_MS)
+        };
+        let unit_reserve = host.borrow_mut().measured_unit_post_cost_ms().unwrap_or(0);
+        if restore_reserve.saturating_add(unit_reserve) > bound {
+            report.stop = Some(BracketStop::BoundExceeded);
+            report.waiting_out_slow_post = restore_reserve <= bound;
+            report.waiting_out_slow_restore = previous != plan.target_pid
+                && measured_restore.is_some()
+                && !report.waiting_out_slow_post
+                && unit_reserve <= bound;
+            break;
+        }
         let fronted_at = host.borrow_mut().now_ms();
         report.chunks += 1;
         let requested =
@@ -546,7 +564,8 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
             let elapsed = now.saturating_sub(fronted_at);
             // Without a restore measurement, reserve the full restore allowance.
             // The person's app may return more slowly than the target fronts.
-            // A refused first call still restores and learns its cost.
+            // The same reserve was checked before activation; elapsed front
+            // time can still make the remaining allowance too small here.
             let measured_restore = if previous == plan.target_pid {
                 None
             } else {
