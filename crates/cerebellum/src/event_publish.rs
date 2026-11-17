@@ -14,13 +14,18 @@ use std::{
     time::Duration,
 };
 
-use cortexkit_bus_naming::{validate_token, TokenKind};
 use cortexkit_role_tool_display::DisplayWrite;
+use cortexkit_role_tool_provider::{
+    late_result_ready_msg_id, late_result_ready_reader, LateResultReady, LATE_RESULT_READY_EVENT,
+    LATE_RESULT_READY_VERSION,
+};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::{sync::mpsc, time::Instant};
 
+mod late_result;
 mod records;
+pub(crate) use late_result::outcome as late_result_outcome;
 #[cfg(test)]
 pub(crate) mod tests;
 #[cfg(not(test))]
@@ -59,9 +64,13 @@ impl Kind {
 
     fn parts(&self) -> (&'static str, u32, Option<&str>) {
         match self {
-            Self::LateResultReady { custodian_module } => {
-                ("late_result_ready", 1, custodian_module.as_deref())
-            }
+            Self::LateResultReady { custodian_module } => (
+                LATE_RESULT_READY_EVENT,
+                LATE_RESULT_READY_VERSION
+                    .try_into()
+                    .expect("late-result event version fits u32"),
+                custodian_module.as_deref(),
+            ),
             Self::DisplayRecordReady => (
                 cortexkit_role_tool_display::DISPLAY_RECORD_READY_EVENT,
                 cortexkit_role_tool_display::DISPLAY_RECORD_READY_VERSION
@@ -164,12 +173,6 @@ fn identity(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn custodian_module(principal: &str) -> Option<String> {
-    let module = principal.strip_prefix("reserved:")?;
-    validate_token(TokenKind::ModuleId, module).ok()?;
-    Some(module.to_owned())
-}
-
 impl Publisher {
     fn new(gauges: Arc<Gauges>) -> Self {
         let (sender, receiver) = mpsc::channel(CAPACITY);
@@ -204,16 +207,23 @@ impl Publisher {
         }
     }
 
-    pub(crate) fn late_result(&self, principal: &str, call_key: &str, outcome: &str) {
+    pub(crate) fn late_result(
+        &self,
+        principal: &str,
+        call_key: &str,
+        event_id: &str,
+        outcome: &str,
+    ) {
+        let Some(reader) = late_result_ready_reader(principal) else {
+            self.gauges.failed(Failure::Unavailable);
+            return;
+        };
         self.enqueue(
             Kind::LateResultReady {
-                custodian_module: custodian_module(principal),
+                custodian_module: Some(reader.to_owned()),
             },
-            identity(
-                &serde_json::to_vec(&("late_result_ready", principal, call_key, outcome))
-                    .expect("identity serializes"),
-            ),
-            serde_json::to_vec(&json!({"call_key":call_key, "outcome":outcome}))
+            late_result_ready_msg_id(event_id, reader),
+            serde_json::to_vec(&LateResultReady::new(call_key, outcome))
                 .expect("notice serializes"),
         );
     }

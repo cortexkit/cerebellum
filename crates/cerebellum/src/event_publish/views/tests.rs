@@ -305,7 +305,7 @@ async fn startup_reconcile_closes_idle_connection_without_a_retry() {
 async fn startup_reconcile_reuses_connection_for_already_queued_notices() {
     let transport = startup_transport(FakeBucket::default());
     let publisher = Publisher::new(Arc::new(Gauges::default()));
-    publisher.late_result("direct", "call", "success");
+    publisher.late_result("reserved:reader", "call", "settlement:1", "ok");
     publisher.connect_and_reconcile(transport.clone());
     super::super::tests::settle().await;
     assert_eq!(transport.opened.load(Relaxed), 1);
