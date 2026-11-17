@@ -78,7 +78,8 @@ fn worker_parent(facts: &AcceptedBindFacts) -> Option<ScopeKey> {
     (stamp.kind == ScopeKind::Worker
         && stamp.owner_authorized
         && cerebellum_core::principal::is_prefrontal(&stamp.owner)
-        && parent.owner == stamp.owner
+        && cerebellum_core::principal::canonical_scope_owner(&parent.owner)
+            == cerebellum_core::principal::canonical_scope_owner(&stamp.owner)
         && facts
             .principal
             .as_ref()
@@ -107,16 +108,52 @@ pub(crate) async fn resolve_worker(
         .map_or(scopes.describe_timeout, |remaining| {
             remaining.min(scopes.describe_timeout)
         });
-    let answer = scopes
-        .control
-        .request_connected(
-            &ModuleControlRequestFromModule::ScopeDescribe {
-                owner: parent.owner.clone(),
-                scope_ref: parent.scope_ref.clone(),
-            },
-            timeout,
-        )
-        .await;
+    let mut owners = vec![parent.owner.clone()];
+    owners.extend(
+        cerebellum_core::principal::PREFRONTAL_MODULE_IDS
+            .iter()
+            .map(|id| subc_protocol::Principal::Reserved {
+                module_id: (*id).into(),
+            })
+            .filter(|owner| owner != &parent.owner),
+    );
+    let mut refusal = HeadRefusal::NoHolder;
+    let mut agent_id = None;
+    for owner in owners {
+        let answer = scopes
+            .control
+            .request_connected(
+                &ModuleControlRequestFromModule::ScopeDescribe {
+                    owner,
+                    scope_ref: parent.scope_ref.clone(),
+                },
+                timeout,
+            )
+            .await;
+        match described_head_agent(answer, &parent) {
+            Ok(agent) => {
+                agent_id = Some(agent);
+                break;
+            }
+            Err(HeadRefusal::Unavailable) => refusal = HeadRefusal::Unavailable,
+            Err(HeadRefusal::NoHolder) => {}
+        }
+    }
+    Ok(Some(ResolvedWorker {
+        parent,
+        worker: ScopeKey::from_stamp(stamp),
+        holder: GrantHolder::Worker {
+            agent_id: agent_id.ok_or(refusal)?,
+            // Revival keeps this ref; a fresh task gets a different one.
+            scope_ref: stamp.scope_ref.clone(),
+        },
+    }))
+}
+
+fn described_head_agent(
+    answer: Option<ControlAnswer>,
+    parent: &ScopeKey,
+) -> Result<String, HeadRefusal> {
     let Some(ControlAnswer::Response(body)) = answer else {
         return Err(HeadRefusal::Unavailable);
     };
@@ -139,27 +176,13 @@ pub(crate) async fn resolve_worker(
         return Err(HeadRefusal::NoHolder);
     }
     let head = scope.ok_or(HeadRefusal::NoHolder)?;
-    if head.kind != ScopeKind::Head
-        || head.owner != parent.owner
-        || head.scope_ref != parent.scope_ref
-        || head.scope_epoch != parent.scope_epoch
-    {
+    if head.kind != ScopeKind::Head || !parent.names(&head) {
         return Err(HeadRefusal::NoHolder);
     }
-    let agent_id = head
-        .attributes
+    head.attributes
         .agent_id
         .filter(|id| !id.is_empty())
-        .ok_or(HeadRefusal::NoHolder)?;
-    Ok(Some(ResolvedWorker {
-        parent,
-        worker: ScopeKey::from_stamp(stamp),
-        holder: GrantHolder::Worker {
-            agent_id,
-            // Revival keeps this ref; a fresh task gets a different one.
-            scope_ref: stamp.scope_ref.clone(),
-        },
-    }))
+        .ok_or(HeadRefusal::NoHolder)
 }
 
 /// Resolve authority from accepted admission facts and this call's daemon lookup.

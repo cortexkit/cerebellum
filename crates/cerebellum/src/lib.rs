@@ -3389,7 +3389,21 @@ async fn handle_frame(
                         })
                         .collect();
                     for scope in scopes {
-                        settle_scope_holds(planes, &scope);
+                        if cerebellum_core::principal::is_prefrontal(&scope.owner) {
+                            // This push ends only one raw registration. Its
+                            // renamed copy may still own the held call.
+                            if planes.scopes.note_retained(&scope) {
+                                tokio::spawn(watch_run_scope_holds(
+                                    planes.clone(),
+                                    writer.clone(),
+                                    scope,
+                                ));
+                            } else {
+                                planes.scopes.closed_again(&scope).notify_one();
+                            }
+                        } else {
+                            settle_scope_holds(planes, &scope);
+                        }
                     }
                 }
             }

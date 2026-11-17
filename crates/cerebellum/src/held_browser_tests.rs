@@ -451,6 +451,66 @@ async fn scope_end_removes_the_original_request() {
 }
 
 #[tokio::test]
+async fn rename_cleanup_scope_end_push_does_not_settle_live_alias_holds() {
+    for (before, after) in [
+        ("prefrontal-core", "prefrontal"),
+        ("prefrontal", "prefrontal-core"),
+    ] {
+        let (planes, _, _, _) = fixture().await;
+        let mut facts = planes.routes.get(9, 3).unwrap();
+        facts.scope.as_mut().unwrap().owner = subc_protocol::Principal::Reserved {
+            module_id: before.into(),
+        };
+        planes.routes.insert(9, 3, facts);
+        start_navigation(&planes).await;
+        let scope = scope_watch::ScopeKey::from_stamp(
+            planes.routes.get(9, 3).unwrap().scope.as_ref().unwrap(),
+        );
+        let push = json!({"op":"route.closed", "module_id":"cerebellum", "reason":"scope_ended", "channels":[9], "drained":true, "abandoned":0});
+        serde_json::from_value::<subc_control::ClientControlPush>(push.clone()).unwrap();
+        let frame = Frame::build(
+            FrameType::Push,
+            crate::control_flags(),
+            0,
+            0,
+            0,
+            serde_json::to_vec(&push).unwrap(),
+        )
+        .unwrap();
+        let (writer, mut requests) = mpsc::channel(16);
+        handle_frame_for_test(frame, &writer, &planes)
+            .await
+            .unwrap();
+        assert!(planes.calls.has_pending_scope(&held_scope_identity(&scope)));
+        // The raw owner has ended, but its renamed copy is still live.
+        for (owner, status) in [(before, "ended"), (after, "live")] {
+            let request = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["owner"]["module_id"], owner);
+            planes.scopes.control.deliver(
+                request.header.corr,
+                scope_watch::ControlAnswer::Response(json!({
+                    "op":"scope.describe", "status":status, "scope_epoch":scope.scope_epoch,
+                    "daemon_incarnation":"test", "owner_synced":true, "owner_configured":true,
+                })),
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while planes.scopes.control.outstanding() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(planes.calls.has_pending_scope(&held_scope_identity(&scope)));
+        planes.drain_signal.send_replace(true);
+    }
+}
+
+#[tokio::test]
 async fn session_end_removes_the_original_request() {
     let (planes, _, page, _) = fixture().await;
     start_navigation(&planes).await;

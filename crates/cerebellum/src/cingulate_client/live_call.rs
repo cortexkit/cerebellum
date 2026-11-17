@@ -45,13 +45,105 @@ impl CallHold for InboundCallHold {
 /// The session a card belongs to: the scope's owner, ref and epoch. Cingulate
 /// scopes ownership of cards the same way, so an answer read under one
 /// session is never applied for another.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionKey {
     pub owner: String,
     pub scope_ref: String,
     pub scope_epoch: u64,
+}
+
+impl SessionKey {
+    fn projection(&self) -> (String, &str, u64) {
+        let owner = serde_json::from_str::<subc_protocol::Principal>(&self.owner)
+            .ok()
+            .filter(cerebellum_core::principal::is_prefrontal)
+            .and_then(|owner| {
+                serde_json::to_string(&cerebellum_core::principal::canonical_scope_owner(&owner))
+                    .ok()
+            })
+            .unwrap_or_else(|| self.owner.clone());
+        (owner, &self.scope_ref, self.scope_epoch)
+    }
+
+    pub(super) fn precedes(&self, owner: &str, scope_ref: &str, epoch: u64) -> bool {
+        self.scope_epoch < epoch
+            && self
+                == &Self {
+                    owner: owner.into(),
+                    scope_ref: scope_ref.into(),
+                    scope_epoch: self.scope_epoch,
+                }
+    }
+}
+
+impl PartialEq for SessionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.projection() == other.projection()
+    }
+}
+
+impl std::hash::Hash for SessionKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.projection().hash(state);
+    }
+}
+
+impl PartialOrd for SessionKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SessionKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.projection().cmp(&other.projection())
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+    use std::hash::{Hash, Hasher};
+
+    #[test]
+    fn prefrontal_rename_consent_session_preserves_bytes_and_keys() {
+        for (before, after) in [
+            ("prefrontal-core", "prefrontal"),
+            ("prefrontal", "prefrontal-core"),
+        ] {
+            let make = |name: &str, scope_ref: &str, scope_epoch| SessionKey {
+                owner: serde_json::to_string(&subc_protocol::Principal::Reserved {
+                    module_id: name.into(),
+                })
+                .unwrap(),
+                scope_ref: scope_ref.into(),
+                scope_epoch,
+            };
+            let old = make(before, "head", 7);
+            let new = make(after, "head", 7);
+            let bytes = serde_json::to_vec(&old).unwrap();
+            let loaded: SessionKey = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(serde_json::to_vec(&loaded).unwrap(), bytes);
+            assert_eq!(loaded.owner, old.owner);
+            assert_eq!(loaded, new);
+            assert_eq!(loaded.cmp(&new), std::cmp::Ordering::Equal);
+            let hash = |key: &SessionKey| {
+                let mut state = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut state);
+                state.finish()
+            };
+            assert_eq!(hash(&loaded), hash(&new));
+            assert_ne!(loaded, make(after, "other", 7));
+            assert_ne!(loaded, make(after, "head", 8));
+            assert_ne!(loaded, make("aft", "head", 7));
+            let aft = make("aft", "head", 7);
+            let mut differently_encoded_aft = aft.clone();
+            differently_encoded_aft.owner.insert(0, ' ');
+            assert_ne!(aft, differently_encoded_aft);
+            let entries = std::collections::BTreeMap::from([(loaded, "card")]);
+            assert_eq!(entries.get(&new), Some(&"card"));
+        }
+    }
 }
 
 /// A held inbound call under a head or worker session scope.

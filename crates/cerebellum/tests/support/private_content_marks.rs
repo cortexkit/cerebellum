@@ -771,6 +771,47 @@ async fn marks_survive_reload_and_raise_the_format_floor() {
 }
 
 #[tokio::test]
+async fn rename_private_marks_survive_disk_reload_and_broca_queries_from_resynced_refs() {
+    for (before, after) in [
+        ("prefrontal-core", "prefrontal"),
+        ("prefrontal", "prefrontal-core"),
+    ] {
+        let scratch = Scratch::new();
+        let mut planes = isolated_test_planes(&Arc::new(HealthState::new()));
+        planes.private_content = Arc::new(durable_store(scratch.path()));
+        let mut stamp = scoped("rename-head", ScopeKind::Head).scope.unwrap();
+        stamp.owner = principal(before).unwrap();
+        let old = facts(before).with_scope(Some(stamp.clone()));
+        reply(
+            &planes,
+            &old,
+            ReplyPlane::PersonBrowser,
+            json!({"state_text":"not stored"}),
+        )
+        .await;
+        let bytes = std::fs::read(scratch.path()).unwrap();
+        planes.private_content.shut_down_cleanly();
+        planes.private_content = Arc::new(durable_store(scratch.path()));
+        stamp.owner = principal(after).unwrap();
+        let new = facts(after).with_scope(Some(stamp));
+        let scope_ref = private_content::capture_scope(&new).unwrap();
+        planes.routes.insert(1, 1, new);
+        assert_eq!(
+            query(&planes, &scope_ref).await,
+            json!({"private_content":true,"sources":["person_browser"]})
+        );
+        let (ty, answer) = wire(&planes, facts("broca"), json!({
+            "method":private_content::QUERY, "params":{"scope_ref":"new-run","parent_scope_ref":scope_ref},
+        })).await;
+        assert_eq!(ty, FrameType::Response);
+        assert_eq!(answer["private_content"], true);
+        assert_eq!(query(&planes, "different").await["private_content"], false);
+        assert_eq!(std::fs::read(scratch.path()).unwrap(), bytes);
+        planes.private_content.shut_down_cleanly();
+    }
+}
+
+#[tokio::test]
 async fn repeat_marks_write_only_when_new_or_an_hour_old() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let scratch = Scratch::new();

@@ -7323,27 +7323,40 @@ async fn next_describe(rx: &mut mpsc::Receiver<Frame>) -> Frame {
     question
 }
 
-/// Answer a `scope.describe` as the daemon would.
+/// Answer both raw owner lookups for the logical scope as the daemon would.
 async fn answer_describe(
     planes: &Planes,
     tx: &mpsc::Sender<Frame>,
+    rx: &mut mpsc::Receiver<Frame>,
     question: &Frame,
     ty: FrameType,
     answer: Value,
 ) {
-    let frame = Frame::build_with_version(
-        PROTOCOL_VERSION,
-        ty,
-        cerebellum::control_flags(),
-        0,
-        0,
-        question.header.corr,
-        serde_json::to_vec(&answer).unwrap(),
-    )
-    .unwrap();
-    cerebellum::handle_frame_for_test(frame, tx, planes)
-        .await
+    let mut current = question.clone();
+    for index in 0..2 {
+        let frame = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            ty,
+            cerebellum::control_flags(),
+            0,
+            0,
+            current.header.corr,
+            serde_json::to_vec(&answer).unwrap(),
+        )
         .unwrap();
+        cerebellum::handle_frame_for_test(frame, tx, planes)
+            .await
+            .unwrap();
+        if index == 0 {
+            current = tokio::time::timeout(HANG_GUARD, rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut expected = body(question);
+            expected["owner"]["module_id"] = json!("prefrontal");
+            assert_eq!(body(&current), expected);
+        }
+    }
 }
 
 fn describe_answer(
@@ -7392,7 +7405,15 @@ async fn a_definitive_scope_end_closes_the_browser_and_question_but_keeps_agent_
         let ask_id = scoped_browser(&planes).await;
         let (tx, mut rx) = mpsc::channel(8);
         let question = close_scoped_route(&planes, &tx, &mut rx).await;
-        answer_describe(&planes, &tx, &question, FrameType::Response, answer.clone()).await;
+        answer_describe(
+            &planes,
+            &tx,
+            &mut rx,
+            &question,
+            FrameType::Response,
+            answer.clone(),
+        )
+        .await;
         wait_until_closed(&planes).await;
         assert_eq!(
             permission_support::count(&planes),
@@ -7762,7 +7783,7 @@ async fn a_non_definitive_answer_leaves_the_browser_the_grants_and_the_question(
         let ask_id = scoped_browser(&planes).await;
         let (tx, mut rx) = mpsc::channel(8);
         let question = close_scoped_route(&planes, &tx, &mut rx).await;
-        answer_describe(&planes, &tx, &question, ty, answer.clone()).await;
+        answer_describe(&planes, &tx, &mut rx, &question, ty, answer.clone()).await;
         // Asked again once the interval passes, because the browser is still
         // open and no route under the scope is bound.
         let again = next_describe(&mut rx).await;
@@ -7776,6 +7797,7 @@ async fn a_non_definitive_answer_leaves_the_browser_the_grants_and_the_question(
         answer_describe(
             &planes,
             &tx,
+            &mut rx,
             &again,
             FrameType::Response,
             describe_answer("ended", Some(4), true, true),
@@ -7802,6 +7824,7 @@ async fn an_unanswered_describe_leaves_everything_in_place() {
     answer_describe(
         &planes,
         &tx,
+        &mut rx,
         &question,
         FrameType::Response,
         describe_answer("ended", Some(4), true, true),
@@ -7836,6 +7859,7 @@ async fn a_scope_with_a_route_still_bound_is_not_polled() {
     answer_describe(
         &planes,
         &tx,
+        &mut rx,
         &question,
         FrameType::Response,
         describe_answer("live", Some(4), true, true),

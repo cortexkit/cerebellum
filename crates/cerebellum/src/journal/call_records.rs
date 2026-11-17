@@ -149,7 +149,7 @@ pub fn principal_label(principal: Option<&Principal>) -> String {
 /// These are identifiers (a principal label, the owner's opaque session ref,
 /// a number), not screen text. The field has been part of this file's format
 /// since its first version, so recording it changes no format version.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeIdentity {
     pub owner: String,
@@ -159,12 +159,95 @@ pub struct ScopeIdentity {
 }
 
 impl ScopeIdentity {
+    pub(crate) fn owner_key(&self) -> String {
+        self.projection().0
+    }
+
+    fn projection(&self) -> (String, &str, u64) {
+        let owner = self.owner.strip_prefix("reserved:").map_or_else(
+            || self.owner.clone(),
+            |module_id| {
+                principal_label(Some(&cerebellum_core::principal::canonical_scope_owner(
+                    &Principal::Reserved {
+                        module_id: module_id.into(),
+                    },
+                )))
+            },
+        );
+        (owner, &self.reference, self.scope_epoch)
+    }
+
     /// The identity a daemon scope stamp names.
     pub fn from_stamp(stamp: &subc_protocol::scope::ScopeStamp) -> Self {
         Self {
             owner: principal_label(Some(&stamp.owner)),
             reference: stamp.scope_ref.clone(),
             scope_epoch: stamp.scope_epoch,
+        }
+    }
+}
+
+impl PartialEq for ScopeIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.projection() == other.projection()
+    }
+}
+
+impl std::hash::Hash for ScopeIdentity {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.projection().hash(state);
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+    use std::hash::{Hash, Hasher};
+
+    #[test]
+    fn prefrontal_rename_call_scope_identity_preserves_bytes_and_keys() {
+        for (before, after) in [
+            ("prefrontal-core", "prefrontal"),
+            ("prefrontal", "prefrontal-core"),
+        ] {
+            let make = |owner: &str, reference: &str, scope_epoch| ScopeIdentity {
+                owner: format!("reserved:{owner}"),
+                reference: reference.into(),
+                scope_epoch,
+            };
+            let old = make(before, "head", 7);
+            let new = make(after, "head", 7);
+            let bytes = serde_json::to_vec(&old).unwrap();
+            let loaded: ScopeIdentity = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(serde_json::to_vec(&loaded).unwrap(), bytes);
+            assert_eq!(loaded.owner, format!("reserved:{before}"));
+            assert_eq!(loaded, new);
+            let hash = |key: &ScopeIdentity| {
+                let mut state = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut state);
+                state.finish()
+            };
+            assert_eq!(hash(&loaded), hash(&new));
+            assert_ne!(loaded, make(after, "other", 7));
+            assert_ne!(loaded, make(after, "head", 8));
+            assert_ne!(loaded, make("aft", "head", 7));
+            assert_ne!(loaded, make("prefrontal-corex", "head", 7));
+            let entries = std::collections::HashMap::from([(loaded, "held-call")]);
+            assert_eq!(entries.get(&new), Some(&"held-call"));
+            let calls = CallRecords::in_memory();
+            assert!(matches!(
+                calls.begin_scoped("reserved:basal", "call", "conversation", Some(old), 1),
+                Begin::Execute(_)
+            ));
+            calls
+                .hold_consent("reserved:basal", "call", "card", 2)
+                .unwrap();
+            let different = make(after, "different", 7);
+            calls.end_held_scope(&different, 3).unwrap();
+            assert!(calls.has_pending_scope(&new));
+            calls.end_held_scope(&new, 4).unwrap();
+            assert!(!calls.has_pending_scope(&new));
+            assert!(calls.held_scope_ended(&make(before, "head", 7)));
         }
     }
 }

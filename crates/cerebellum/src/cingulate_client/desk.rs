@@ -1002,9 +1002,7 @@ impl ConsentDesk {
         scope_ref: &str,
         epoch: u64,
     ) -> Result<(), String> {
-        let ended = |session: &SessionKey| {
-            session.owner == owner && session.scope_ref == scope_ref && session.scope_epoch < epoch
-        };
+        let ended = |session: &SessionKey| session.precedes(owner, scope_ref, epoch);
         self.end_sessions(ended);
         lock(&self.single_use)
             .approvals

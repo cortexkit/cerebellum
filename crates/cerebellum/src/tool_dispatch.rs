@@ -928,10 +928,26 @@ async fn handle_tool_withdraw(
     use cortexkit_role_tool_provider::withdraw::{
         check_record_scope, resolve_carrier, CallerProblem, CarrierResolution, WithdrawArguments,
     };
-    let to_wire = |scope: &ScopeIdentity| WireScope {
-        owner: scope.owner.clone(),
-        scope_ref: scope.reference.clone(),
-        scope_epoch: scope.scope_epoch,
+    let caller_owner = ScopeIdentity {
+        owner: principal.clone(),
+        reference: String::new(),
+        scope_epoch: 0,
+    }
+    .owner_key();
+    let to_wire = |scope: &ScopeIdentity| {
+        let owner = scope.owner_key();
+        WireScope {
+            // The wire checker compares literal owner labels to the caller.
+            // Use its raw spelling for an equivalent owner, so resolving
+            // authority never changes the raw carrier chosen for the journal.
+            owner: if owner == caller_owner {
+                principal.clone()
+            } else {
+                owner
+            },
+            scope_ref: scope.reference.clone(),
+            scope_epoch: scope.scope_epoch,
+        }
     };
     let stamped = facts.scope.as_ref().map(ScopeIdentity::from_stamp);
     let wire_stamp = stamped.as_ref().map(to_wire);

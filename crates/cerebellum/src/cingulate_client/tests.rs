@@ -2074,6 +2074,42 @@ async fn unapplied_lists_one_sessions_open_cards() {
     assert_eq!(ids(&other), vec!["el_2".to_string()]);
 }
 
+#[tokio::test]
+async fn rename_cleanup_consent_cards_follow_alias_and_epoch_boundary() {
+    for (before, after) in [
+        ("prefrontal-core", "prefrontal"),
+        ("prefrontal", "prefrontal-core"),
+    ] {
+        let cingulate = ScriptedCingulate::new();
+        cingulate.then(wire::CONSENT_REQUEST, created());
+        let desk = ConsentDesk::new(Arc::new(cingulate));
+        let hold = Arc::new(TestHold(AtomicBool::new(true)));
+        let mut old = stamp("head", Some("test-project"));
+        old.owner = subc_protocol::Principal::Reserved {
+            module_id: before.into(),
+        };
+        let live = LiveCall::new(Some(&old), hold.clone()).unwrap();
+        desk.session(&live)
+            .await
+            .unwrap()
+            .raise(vector_card(CardKind::AppControl), "app")
+            .await
+            .unwrap();
+        let owner = serde_json::to_string(&subc_protocol::Principal::Reserved {
+            module_id: after.into(),
+        })
+        .unwrap();
+        desk.forget_sessions_before(&owner, "different", old.scope_epoch + 1)
+            .unwrap();
+        desk.forget_sessions_before(&owner, "head", old.scope_epoch)
+            .unwrap();
+        assert_eq!(desk.unapplied(live.session()).len(), 1);
+        desk.forget_sessions_before(&owner, "head", old.scope_epoch + 1)
+            .unwrap();
+        assert!(desk.unapplied(live.session()).is_empty());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Subjects
 // ---------------------------------------------------------------------------
