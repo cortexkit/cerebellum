@@ -203,7 +203,7 @@ fn session_call(frame: &Frame, planes: &Planes) -> Option<SessionCall> {
             plane_capability(body.get("method")?.as_str()?)?,
             body.get("params").cloned().unwrap_or(Value::Null),
         ),
-        RouteSurface::Unsupported => return None,
+        RouteSurface::Unsupported | RouteSurface::AgentData => return None,
     };
     Some(SessionCall {
         route_key: facts.identity.conversation_key.clone(),
@@ -305,7 +305,7 @@ pub(crate) fn arrive(frame: &Frame, planes: &Planes) -> Option<ConversationPosit
             let method = body.get("method")?.as_str()?;
             method.starts_with("browser.") && method != crate::browser_session::BROWSER_STATUS
         }
-        RouteSurface::Unsupported => false,
+        RouteSurface::Unsupported | RouteSurface::AgentData => false,
     };
     let bypass = || {
         session_call(frame, planes).is_some_and(|call| {

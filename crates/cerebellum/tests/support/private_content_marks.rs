@@ -750,7 +750,7 @@ async fn marks_survive_reload_and_raise_the_format_floor() {
     .unwrap();
     assert_eq!(
         floor.get(private_content::PRIVATE_CONTENT_FORMAT.name),
-        Some(&2)
+        Some(&3)
     );
     assert!(durable_formats::readable_formats().contains(&private_content::PRIVATE_CONTENT_FORMAT));
     assert!(cerebellum_core::format_floor::FLOOR_TREES.contains(&"private-content"));
