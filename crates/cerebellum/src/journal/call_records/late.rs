@@ -22,6 +22,64 @@ enum RetentionGroup {
     ExpiredOwner(String),
 }
 
+fn retention_group(scope: &ScopeIdentity, expired: bool) -> RetentionGroup {
+    let owner = scope.owner_key();
+    if expired {
+        RetentionGroup::ExpiredOwner(owner)
+    } else {
+        RetentionGroup::Session {
+            owner,
+            reference: scope.reference.clone(),
+            epoch: scope.scope_epoch,
+        }
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+    use std::hash::{Hash, Hasher};
+
+    #[test]
+    fn rename_followup_late_retention_groups_share_owner_identity() {
+        for (before, after) in [
+            ("prefrontal-core", "prefrontal"),
+            ("prefrontal", "prefrontal-core"),
+        ] {
+            let old = ScopeIdentity {
+                owner: format!("reserved:{before}"),
+                reference: "head".into(),
+                scope_epoch: 7,
+            };
+            let mut new = old.clone();
+            new.owner = format!("reserved:{after}");
+            for expired in [false, true] {
+                let old_group = retention_group(&old, expired);
+                let new_group = retention_group(&new, expired);
+                assert!(old_group == new_group);
+                let hash = |key: &RetentionGroup| {
+                    let mut state = std::collections::hash_map::DefaultHasher::new();
+                    key.hash(&mut state);
+                    state.finish()
+                };
+                assert_eq!(hash(&old_group), hash(&new_group));
+                assert_eq!(
+                    std::collections::HashMap::from([(old_group, 1)]).get(&new_group),
+                    Some(&1)
+                );
+            }
+            new.reference = "different".into();
+            assert!(retention_group(&old, false) != retention_group(&new, false));
+            new.reference = old.reference.clone();
+            new.scope_epoch += 1;
+            assert!(retention_group(&old, false) != retention_group(&new, false));
+            new = old.clone();
+            new.owner = "reserved:aft".into();
+            assert!(retention_group(&old, false) != retention_group(&new, false));
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HandoffEnding {
@@ -772,15 +830,7 @@ impl CallRecords {
                 Phase::Expired { settled_at, .. } => (true, settled_at),
                 _ => continue,
             };
-            let group = if expired {
-                RetentionGroup::ExpiredOwner(handoff.scope.owner.clone())
-            } else {
-                RetentionGroup::Session {
-                    owner: handoff.scope.owner.clone(),
-                    reference: handoff.scope.reference.clone(),
-                    epoch: handoff.scope.scope_epoch,
-                }
-            };
+            let group = retention_group(&handoff.scope, expired);
             groups
                 .entry(group)
                 .or_default()

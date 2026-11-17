@@ -806,9 +806,35 @@ fn assert_scope_ended(entries: &Value) {
     assert_eq!(entry["call_key"], "scope-held");
 }
 
+async fn confirm_scope_end(planes: &Planes, rx: &mut mpsc::Receiver<Frame>) {
+    let scope = journal::call_records::ScopeIdentity::from_stamp(
+        planes.routes.get(9, 3).unwrap().scope.as_ref().unwrap(),
+    );
+    for _ in 0..2 {
+        let question = tokio::time::timeout(HANG_GUARD, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        planes.scopes.control.deliver(
+            question.header.corr,
+            scope_watch::ControlAnswer::Response(json!({
+                "op":"scope.describe", "status":"ended", "scope_epoch":scope.scope_epoch,
+                "daemon_incarnation":"scope-test", "owner_synced":true, "owner_configured":true,
+            })),
+        );
+    }
+    tokio::time::timeout(HANG_GUARD, async {
+        while !planes.calls.held_scope_ended(&scope) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 async fn closed_scope_settles_once(login: bool) {
     let (planes, consent) = scope_end_fixture(login).await;
-    let (tx, _rx) = mpsc::channel(16);
+    let (tx, mut rx) = mpsc::channel(16);
     for reason in ["restart", "scope_carrier_removed", "not_live"] {
         handle_frame_for_test(scope_push(reason), &tx, &planes)
             .await
@@ -821,7 +847,30 @@ async fn closed_scope_settles_once(login: bool) {
     handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
         .await
         .unwrap();
-    let first = held_scope_entries(&planes);
+    for _ in 0..2 {
+        let question = tokio::time::timeout(HANG_GUARD, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        planes.scopes.control.deliver(
+            question.header.corr,
+            scope_watch::ControlAnswer::Response(json!({
+                "op":"scope.describe", "status":"ended", "scope_epoch":1,
+                "daemon_incarnation":"scope-test", "owner_synced":true, "owner_configured":true,
+            })),
+        );
+    }
+    let first = tokio::time::timeout(HANG_GUARD, async {
+        loop {
+            let entries = held_scope_entries(&planes);
+            if !entries["entries"].as_array().unwrap().is_empty() {
+                break entries;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_scope_ended(&first);
     handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
         .await
@@ -907,34 +956,36 @@ async fn described_scope_settles_once(login: bool) {
         ("ended", Some(key.scope_epoch + 1)),
         ("ended", Some(key.scope_epoch)),
     ] {
-        let question = tokio::time::timeout(HANG_GUARD, rx.recv())
-            .await
-            .expect("closed run with a held call asks scope.describe")
-            .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&question.body).unwrap()["op"],
-            "scope.describe"
-        );
-        assert!(
-            held_scope_entries(&planes)["entries"]
-                .as_array()
-                .unwrap()
-                .is_empty(),
-            "only ended at the exact epoch settles a hold"
-        );
-        let answer = json!({"op":"scope.describe","status":status,"scope_epoch":epoch,
+        for _ in 0..2 {
+            let question = tokio::time::timeout(HANG_GUARD, rx.recv())
+                .await
+                .expect("closed run with a held call asks scope.describe")
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&question.body).unwrap()["op"],
+                "scope.describe"
+            );
+            assert!(
+                held_scope_entries(&planes)["entries"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "only ended at the exact epoch settles a hold"
+            );
+            let answer = json!({"op":"scope.describe","status":status,"scope_epoch":epoch,
             "daemon_incarnation":"scope-test","owner_synced":true,"owner_configured":true});
-        let response = Frame::build_with_version(
-            PROTOCOL_VERSION,
-            FrameType::Response,
-            control_flags(),
-            0,
-            0,
-            question.header.corr,
-            serde_json::to_vec(&answer).unwrap(),
-        )
-        .unwrap();
-        handle_frame_for_test(response, &tx, &planes).await.unwrap();
+            let response = Frame::build_with_version(
+                PROTOCOL_VERSION,
+                FrameType::Response,
+                control_flags(),
+                0,
+                0,
+                question.header.corr,
+                serde_json::to_vec(&answer).unwrap(),
+            )
+            .unwrap();
+            handle_frame_for_test(response, &tx, &planes).await.unwrap();
+        }
         planes.scopes.closed_again(&key).notify_one();
     }
     let first = tokio::time::timeout(HANG_GUARD, async {
@@ -1017,10 +1068,11 @@ async fn capture_scope_ended_settles_once_and_disposes_without_deposit() {
         "{waiting}"
     );
     assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 1);
-    let (tx, _rx) = mpsc::channel(16);
+    let (tx, mut rx) = mpsc::channel(16);
     handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
         .await
         .unwrap();
+    confirm_scope_end(&planes, &mut rx).await;
     let first = held_scope_entries(&planes);
     assert_scope_ended(&first);
     tokio::time::timeout(HANG_GUARD, finalized)
@@ -1063,10 +1115,11 @@ async fn capture_scope_ended_before_consent_approval_never_launches_or_deposits(
     );
     assert_eq!(consent.cards().len(), 1);
     assert_eq!(fixture.launcher.launches.load(Ordering::SeqCst), 0);
-    let (tx, _rx) = mpsc::channel(16);
+    let (tx, mut rx) = mpsc::channel(16);
     handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
         .await
         .unwrap();
+    confirm_scope_end(&planes, &mut rx).await;
     let first = held_scope_entries(&planes);
     assert_scope_ended(&first);
     consent.feed(json!([answered("scope-capture-card", "allow")]));
@@ -1225,10 +1278,11 @@ async fn scope_ended_floor_is_lazy_and_settlement_survives_restart_retention_and
         Some(&5),
         "a consent hold still needs only reader 5"
     );
-    let (tx, _rx) = mpsc::channel(16);
+    let (tx, mut rx) = mpsc::channel(16);
     handle_frame_for_test(scope_push("scope_ended"), &tx, &planes)
         .await
         .unwrap();
+    confirm_scope_end(&planes, &mut rx).await;
     assert_eq!(read_floors(&floor).unwrap().get("call-records"), Some(&6));
     assert!(std::fs::read_to_string(&path)
         .unwrap()

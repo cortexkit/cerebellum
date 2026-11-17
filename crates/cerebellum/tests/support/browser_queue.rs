@@ -379,6 +379,7 @@ async fn browser_queue_goodbye_removes_queued_call() {
             answer_describe(
                 &planes,
                 &tx,
+                &mut rx,
                 &frame,
                 FrameType::Response,
                 describe_answer("active", Some(1), true, true),
@@ -423,6 +424,7 @@ async fn browser_queue_goodbye_removes_queued_call() {
             answer_describe(
                 &planes,
                 &tx,
+                &mut rx,
                 &frame,
                 FrameType::Response,
                 describe_answer("active", Some(1), true, true),

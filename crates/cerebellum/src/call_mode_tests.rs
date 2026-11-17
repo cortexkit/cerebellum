@@ -914,6 +914,65 @@ async fn authorized_owner_can_withdraw_basal_but_other_scopes_cannot() {
 }
 
 #[tokio::test]
+async fn rename_withdraw_preserves_raw_carrier_and_refuses_other_scope_identities() {
+    for (before, after) in [
+        ("prefrontal-core", "prefrontal"),
+        ("prefrontal", "prefrontal-core"),
+    ] {
+        let planes = bound_run().await;
+        let owner = |name: &str| subc_protocol::Principal::Reserved {
+            module_id: name.into(),
+        };
+        let mut facts = planes.routes.get(9, 3).unwrap();
+        facts.scope.as_mut().unwrap().owner = owner(before);
+        planes.routes.insert(9, 3, facts);
+        let (lane, _) = planes
+            .browser_queue
+            .arrive("head-conversation".into(), None)
+            .acquire()
+            .await;
+        let (mut replies, cancel) = start_queued_run(&planes, "rename-withdraw").await;
+        for mismatch in ["owner", "ref", "epoch", "authorization"] {
+            let mut wrong = run_stamp();
+            wrong.owner = owner(after);
+            match mismatch {
+                "owner" => wrong.owner = owner("basal"),
+                "ref" => wrong.scope_ref = "different-run".into(),
+                "epoch" => wrong.scope_epoch += 1,
+                "authorization" => wrong.owner_authorized = false,
+                _ => unreachable!(),
+            }
+            bind_carrier(&planes, after, wrong).await;
+            let answer = withdraw(&planes, 10, "rename-withdraw", Some("reserved:basal")).await;
+            let expected = if mismatch == "owner" {
+                "withdraw_carrier_mismatch"
+            } else {
+                "withdraw_not_permitted"
+            };
+            assert_eq!(answer["code"], expected, "{mismatch}: {answer}");
+            assert!(!cancel.is_cancelled());
+        }
+        let mut stamp = run_stamp();
+        stamp.owner = owner(after);
+        bind_carrier(&planes, after, stamp).await;
+        let answer = withdraw(&planes, 10, "rename-withdraw", Some("reserved:basal")).await;
+        assert_eq!(answer["answer"], "already_started", "{answer}");
+        assert!(cancel.is_cancelled());
+        let journal::call_records::Lookup::Own(record) =
+            planes.calls.lookup("reserved:basal", "rename-withdraw")
+        else {
+            panic!("raw carrier lookup must survive");
+        };
+        assert_eq!(record.scope.unwrap().owner, format!("reserved:{before}"));
+        tokio::time::timeout(HANG_GUARD, replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(lane);
+    }
+}
+
+#[tokio::test]
 async fn flow_and_worker_admission_stay_separate_from_run_context() {
     let planes = isolated_test_planes(&Arc::new(HealthState::new()));
     let mut stamp = run_stamp();

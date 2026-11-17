@@ -88,6 +88,19 @@ pub fn is_prefrontal(principal: &Principal) -> bool {
     matches!(principal, Principal::Reserved { module_id } if PREFRONTAL_MODULE_IDS.contains(&module_id.as_str()))
 }
 
+/// Identity projection for session scope owners across the orchestrator rename.
+/// Keep the original owner in stored records and daemon requests; only keys and
+/// comparisons use this projection.
+pub fn canonical_scope_owner(owner: &Principal) -> Principal {
+    if is_prefrontal(owner) {
+        Principal::Reserved {
+            module_id: "prefrontal".into(),
+        }
+    } else {
+        owner.clone()
+    }
+}
+
 /// Whether a daemon-spawned module id is a trusted first-party consumer of
 /// cerebellum capabilities.
 fn is_first_party_module_id(module_id: &str) -> bool {

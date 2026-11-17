@@ -285,26 +285,35 @@ pub fn classify(answer: Option<&DescribeAnswer>, recorded_epoch: u64) -> ScopeVe
 }
 
 /// One session scope, as a stamp names it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub struct ScopeKey {
     pub owner: Principal,
     pub scope_ref: String,
     pub scope_epoch: u64,
 }
 
+impl PartialEq for ScopeKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.projection() == other.projection()
+    }
+}
+
 impl std::hash::Hash for ScopeKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // `Principal` does not implement `Hash`, so its label (the
-        // `reserved:<module>` form call records use) is hashed instead. Two
-        // principals have the same label exactly when they are equal, so this
-        // agrees with `Eq`.
-        crate::journal::call_records::principal_label(Some(&self.owner)).hash(state);
-        self.scope_ref.hash(state);
-        self.scope_epoch.hash(state);
+        self.projection().hash(state);
     }
 }
 
 impl ScopeKey {
+    fn projection(&self) -> (String, &str, u64) {
+        let owner = cerebellum_core::principal::canonical_scope_owner(&self.owner);
+        (
+            crate::journal::call_records::principal_label(Some(&owner)),
+            &self.scope_ref,
+            self.scope_epoch,
+        )
+    }
+
     pub fn from_stamp(stamp: &ScopeStamp) -> Self {
         Self {
             owner: stamp.owner.clone(),
@@ -315,9 +324,7 @@ impl ScopeKey {
 
     /// Whether `stamp` names this scope.
     pub fn names(&self, stamp: &ScopeStamp) -> bool {
-        self.owner == stamp.owner
-            && self.scope_ref == stamp.scope_ref
-            && self.scope_epoch == stamp.scope_epoch
+        self == &Self::from_stamp(stamp)
     }
 }
 
@@ -408,7 +415,7 @@ impl ScopeRevocation {
     /// stops holding its conversations: they are returned here to be ended
     /// now, rather than after that watcher's next answer.
     pub fn note_bind(&self, stamp: &ScopeStamp, conversation_key: &str) -> BindEpoch {
-        let owner = crate::journal::call_records::principal_label(Some(&stamp.owner));
+        let owner = ScopeKey::from_stamp(stamp).projection().0;
         let mut epochs = self.epochs.lock().unwrap_or_else(PoisonError::into_inner);
         let seen = epochs
             .entry((owner, stamp.scope_ref.clone()))
@@ -428,7 +435,8 @@ impl ScopeRevocation {
             let superseded: Vec<ScopeKey> = watched
                 .keys()
                 .filter(|key| {
-                    key.owner == stamp.owner
+                    cerebellum_core::principal::canonical_scope_owner(&key.owner)
+                        == cerebellum_core::principal::canonical_scope_owner(&stamp.owner)
                         && key.scope_ref == stamp.scope_ref
                         && key.scope_epoch < stamp.scope_epoch
                 })
@@ -453,7 +461,7 @@ impl ScopeRevocation {
     /// means `stamp`'s session has ended. A route still bound under it (its
     /// close not yet delivered) must serve nothing more.
     pub fn is_superseded(&self, stamp: &ScopeStamp) -> bool {
-        let owner = crate::journal::call_records::principal_label(Some(&stamp.owner));
+        let owner = ScopeKey::from_stamp(stamp).projection().0;
         self.epochs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -517,27 +525,119 @@ impl ScopeRevocation {
         self.watched().contains_key(key)
     }
 
-    /// Ask the daemon about `key`'s scope.
+    /// Ask about every raw owner of the logical scope. Either registration may
+    /// still carry the session, so an uncertain answer must retain its state.
     pub async fn describe(
         &self,
         writer: &mpsc::Sender<Frame>,
         key: &ScopeKey,
     ) -> Option<DescribeAnswer> {
-        let request = ModuleControlRequestFromModule::ScopeDescribe {
-            owner: key.owner.clone(),
-            scope_ref: key.scope_ref.clone(),
-        };
-        DescribeAnswer::from_control(
-            self.control
-                .request(writer, &request, self.describe_timeout)
-                .await,
-        )
+        let mut owners = vec![key.owner.clone()];
+        if cerebellum_core::principal::is_prefrontal(&key.owner) {
+            owners.extend(
+                cerebellum_core::principal::PREFRONTAL_MODULE_IDS
+                    .iter()
+                    .map(|id| Principal::Reserved {
+                        module_id: (*id).into(),
+                    })
+                    .filter(|owner| owner != &key.owner),
+            );
+        }
+        let mut answers = Vec::new();
+        for owner in owners {
+            let request = ModuleControlRequestFromModule::ScopeDescribe {
+                owner,
+                scope_ref: key.scope_ref.clone(),
+            };
+            answers.push(DescribeAnswer::from_control(
+                self.control
+                    .request(writer, &request, self.describe_timeout)
+                    .await,
+            ));
+        }
+        let answers = answers.into_iter().collect::<Option<Vec<_>>>()?;
+        // A live higher epoch ends the recorded epoch, but must keep the
+        // epoch-independent tab claim even if the other owner reports ended.
+        answers
+            .iter()
+            .find(|answer| classify(Some(answer), key.scope_epoch) == ScopeVerdict::Unresolved)
+            .or_else(|| {
+                answers
+                    .iter()
+                    .find(|answer| answer.status == ScopeStatus::Live)
+            })
+            .or_else(|| answers.first())
+            .cloned()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefrontal_rename_scope_keys_share_state() {
+        use std::hash::{Hash, Hasher};
+        for (before, after) in [
+            ("prefrontal-core", "prefrontal"),
+            ("prefrontal", "prefrontal-core"),
+        ] {
+            let mut stamp = crate::computer_grants::tests::stamp("rename-scope");
+            stamp.owner = Principal::Reserved {
+                module_id: before.into(),
+            };
+            let old = ScopeKey::from_stamp(&stamp);
+            let scopes = ScopeRevocation::default();
+            assert_eq!(scopes.note_bind(&stamp, "conversation"), BindEpoch::Current);
+            assert!(scopes.note_closed(&old, "conversation"));
+            stamp.owner = Principal::Reserved {
+                module_id: after.into(),
+            };
+            let new = ScopeKey::from_stamp(&stamp);
+            assert_eq!(
+                old.owner,
+                Principal::Reserved {
+                    module_id: before.into()
+                }
+            );
+            assert_eq!(
+                new.owner,
+                Principal::Reserved {
+                    module_id: after.into()
+                }
+            );
+            assert_eq!(old, new);
+            assert!(old.names(&stamp));
+            let hash = |key: &ScopeKey| {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut hasher);
+                hasher.finish()
+            };
+            assert_eq!(hash(&old), hash(&new));
+            assert!(!scopes.note_closed(&new, "second"));
+            assert_eq!(scopes.conversations(&new).len(), 2);
+            stamp.scope_ref.push_str("-different");
+            assert_ne!(old, ScopeKey::from_stamp(&stamp));
+            stamp.scope_ref = old.scope_ref.clone();
+            stamp.scope_epoch += 1;
+            assert_ne!(old, ScopeKey::from_stamp(&stamp));
+            assert!(matches!(
+                scopes.note_bind(&stamp, "new"),
+                BindEpoch::Advanced { .. }
+            ));
+            assert!(scopes.is_superseded(&subc_protocol::scope::ScopeStamp::new(
+                old.owner.clone(),
+                old.scope_ref.clone(),
+                old.scope_epoch,
+                subc_protocol::scope::ScopeKind::Head,
+            )));
+            stamp.scope_epoch = old.scope_epoch;
+            stamp.owner = Principal::Reserved {
+                module_id: "prefrontal-corex".into(),
+            };
+            assert_ne!(old, ScopeKey::from_stamp(&stamp));
+        }
+    }
 
     #[test]
     fn retained_consent_and_closed_routes_share_one_watch_without_inventing_a_conversation() {
@@ -570,6 +670,54 @@ mod tests {
             scope_epoch,
             owner_synced,
             owner_configured,
+        }
+    }
+
+    #[tokio::test]
+    async fn rename_followup_scope_end_checks_both_raw_owners() {
+        for (before, after) in [
+            ("prefrontal-core", "prefrontal"),
+            ("prefrontal", "prefrontal-core"),
+        ] {
+            for (status, synced, expected) in [
+                (ScopeStatus::Live, true, ScopeVerdict::Unresolved),
+                (ScopeStatus::NotLive, false, ScopeVerdict::Unresolved),
+                (ScopeStatus::Ended, true, ScopeVerdict::Ended),
+            ] {
+                let scopes = ScopeRevocation::default();
+                let key = ScopeKey {
+                    owner: Principal::Reserved {
+                        module_id: before.into(),
+                    },
+                    scope_ref: "head".into(),
+                    scope_epoch: 7,
+                };
+                let (writer, mut sent) = mpsc::channel::<Frame>(4);
+                let respond = async {
+                    let mut owners = Vec::new();
+                    for index in 0..2 {
+                        let Ok(Some(frame)) =
+                            tokio::time::timeout(Duration::from_secs(1), sent.recv()).await
+                        else {
+                            break;
+                        };
+                        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                        assert_eq!(body["ref"], "head");
+                        owners.push(body["owner"]["module_id"].as_str().unwrap().to_owned());
+                        let response = serde_json::json!({
+                            "op":"scope.describe", "status": if index == 0 { ScopeStatus::Ended } else { status },
+                            "scope_epoch":7, "daemon_incarnation":"test", "owner_synced": if index == 0 { true } else { synced }, "owner_configured":true,
+                        });
+                        assert!(scopes
+                            .control
+                            .deliver(frame.header.corr, ControlAnswer::Response(response)));
+                    }
+                    owners
+                };
+                let (result, owners) = tokio::join!(scopes.describe(&writer, &key), respond);
+                assert_eq!(classify(result.as_ref(), 7), expected);
+                assert_eq!(owners, [before, after]);
+            }
         }
     }
 

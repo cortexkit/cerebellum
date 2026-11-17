@@ -3,17 +3,102 @@
 
 use super::*;
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq)]
 struct SessionKey {
     owner: String,
     scope_ref: String,
 }
 
 impl SessionKey {
+    fn projection(&self) -> crate::cingulate_client::live_call::SessionKey {
+        // Head moves advance the epoch without changing tab custody. Reuse
+        // the scope-owner projection with a fixed, non-identifying epoch.
+        crate::cingulate_client::live_call::SessionKey {
+            owner: self.owner.clone(),
+            scope_ref: self.scope_ref.clone(),
+            scope_epoch: 0,
+        }
+    }
+
     fn new(scope: &subc_protocol::scope::ScopeStamp) -> Self {
         Self {
             owner: serde_json::to_string(&scope.owner).expect("principal serializes"),
             scope_ref: scope.scope_ref.clone(),
+        }
+    }
+}
+
+impl PartialEq for SessionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.projection() == other.projection()
+    }
+}
+
+impl PartialOrd for SessionKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SessionKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.projection().cmp(&other.projection())
+    }
+}
+
+impl std::hash::Hash for SessionKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.projection().hash(state);
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+
+    #[test]
+    fn prefrontal_rename_tab_claim_session_survives_owner_and_epoch_changes() {
+        use std::hash::{Hash, Hasher};
+        for (before, after) in [
+            ("prefrontal-core", "prefrontal"),
+            ("prefrontal", "prefrontal-core"),
+        ] {
+            let mut stamp = crate::computer_grants::tests::stamp("head");
+            stamp.owner = subc_protocol::Principal::Reserved {
+                module_id: before.into(),
+            };
+            let old = SessionKey::new(&stamp);
+            let mut claims = SessionClaims::default();
+            let alias = Route {
+                channel: 1,
+                epoch: 1,
+            };
+            claims.owners.insert(
+                old.clone(),
+                SessionClaim {
+                    alias,
+                    last_call: std::time::Instant::now(),
+                },
+            );
+            stamp.owner = subc_protocol::Principal::Reserved {
+                module_id: after.into(),
+            };
+            stamp.scope_epoch += 1;
+            let new = SessionKey::new(&stamp);
+            assert_eq!(old, new);
+            assert_eq!(old.cmp(&new), std::cmp::Ordering::Equal);
+            let hash = |key: &SessionKey| {
+                let mut state = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut state);
+                state.finish()
+            };
+            assert_eq!(hash(&old), hash(&new));
+            assert_eq!(claims.owners.remove(&new).unwrap().alias, alias);
+            stamp.scope_ref.push_str("-different");
+            assert_ne!(old, SessionKey::new(&stamp));
+            stamp.scope_ref = "head".into();
+            stamp.owner = subc_protocol::Principal::Direct;
+            assert_ne!(old, SessionKey::new(&stamp));
         }
     }
 }
