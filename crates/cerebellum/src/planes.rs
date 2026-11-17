@@ -266,6 +266,10 @@ impl Planes {
             compiled_release_inputs().takeover_dispatch_review_revision;
         Self {
             health,
+            agent_data: Arc::new(match journal {
+                JournalPersistence::Durable => crate::agent_data::Participant::production(),
+                JournalPersistence::Isolated => crate::agent_data::Participant::in_memory(),
+            }),
             private_content: Arc::new(match journal {
                 JournalPersistence::Durable => private_content::PrivateContent::production(),
                 JournalPersistence::Isolated => private_content::PrivateContent::in_memory(),
@@ -394,6 +398,7 @@ impl Clone for Planes {
             computer_for_test: self.computer_for_test.clone(),
             health: Arc::clone(&self.health),
             private_content: Arc::clone(&self.private_content),
+            agent_data: Arc::clone(&self.agent_data),
             image_handles: Arc::clone(&self.image_handles),
             signed_in: Arc::clone(&self.signed_in),
             cancellations: self.cancellations.clone(),

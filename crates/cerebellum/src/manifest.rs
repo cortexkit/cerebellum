@@ -455,6 +455,15 @@ fn build_with_browser_config_and_provenance(
                 sub_supervises: false,
             },
             management_surface(),
+            ProviderRole::InternalService {
+                service_id: cortexkit_role_agent_data::SERVICE_ID.into(),
+                transport: subc_protocol::manifest::InternalTransport::Bulk,
+                agent_facing: false,
+                operations: cortexkit_role_agent_data::Op::ALL
+                    .into_iter()
+                    .map(|op| op.method().into())
+                    .collect(),
+            },
         ])
         // No capability is denied to this module as a caller.
         //
@@ -476,6 +485,7 @@ fn build_with_browser_config_and_provenance(
             provides: vec![
                 crate::permissions::CAPABILITY.to_string(),
                 crate::private_content::CAPABILITY.to_string(),
+                cortexkit_role_agent_data::PROVIDES.to_string(),
                 SCOPE_ADMISSION_CAPABILITY.to_string(),
                 subc_protocol::scope::BIND_NO_PROJECT_CAPABILITY.to_string(),
                 subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),

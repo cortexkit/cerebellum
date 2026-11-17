@@ -253,6 +253,7 @@ pub(super) async fn handle_control_request(
                 })
                 && !permissions::bind_admitted(&principal, &target)
                 && !private_content::bind_admitted(&principal, &target)
+                && !crate::agent_data::bind_admitted(&principal, &target)
                 && !view_reader
             {
                 return send_principal_denied(

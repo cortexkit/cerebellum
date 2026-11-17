@@ -368,6 +368,7 @@ dependencies = [
  "cortexkit-bus-nats",
  "cortexkit-paths",
  "cortexkit-resource-busy",
+ "cortexkit-role-agent-data",
  "cortexkit-role-tool-display",
  "cortexkit-role-tool-provider",
  "cortexkit-role-tool-provider-conformance",
@@ -688,6 +689,16 @@ version = "0.1.0"
 source = "git+https://github.com/cortexkit/commons?rev=067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7#067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "cortexkit-role-agent-data"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14375c604e88e22f31c67bc4dc6fd3f055ecd9bb84d8f976d2e221a8dab7f82d"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

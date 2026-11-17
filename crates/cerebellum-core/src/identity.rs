@@ -208,6 +208,8 @@ impl RouteIdentity {
 /// statement, and it belongs to the route rather than to any request on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteSurface {
+    /// The internal agent-data participant, never an agent tool.
+    AgentData,
     /// Tool calls.
     Tools,
     /// Management operations.
@@ -226,6 +228,10 @@ impl RouteSurface {
         match target {
             RouteTarget::ToolProvider { .. } => Self::Tools,
             RouteTarget::ManagementSurface { .. } => Self::Management,
+            RouteTarget::InternalService {
+                module_id,
+                service_id,
+            } if module_id == "cerebellum" && service_id == "agent-data" => Self::AgentData,
             RouteTarget::InternalService { .. } => Self::Unsupported,
         }
     }

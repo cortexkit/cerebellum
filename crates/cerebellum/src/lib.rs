@@ -27,6 +27,7 @@ use tool_dispatch::*;
 mod ability;
 pub mod ability_helper;
 pub mod ability_source;
+mod agent_data;
 pub mod agent_grants;
 pub mod authorization;
 mod blocking_permits;
@@ -2249,6 +2250,12 @@ async fn run(
             config.connection_file_path.clone(),
             config.module_id.clone(),
         )));
+    planes
+        .agent_data
+        .set_door(Arc::new(agent_data::door::DaemonDoor::new(
+            config.connection_file_path.clone(),
+            config.module_id.clone(),
+        )));
     // Captures deposit into the vault over a connection of their own, opened
     // with the same connection file as this one. Set before `prepare`, so a
     // test can put its own vault in its place.
@@ -3142,6 +3149,7 @@ impl Drop for RequestCancellationGuard {
 /// need the same set, and threading them one by one meant every new one touched
 /// every signature in the chain.
 pub struct Planes {
+    agent_data: Arc<agent_data::Participant>,
     #[cfg(test)]
     route_test_handler: Option<RouteTestHandler>,
     /// A cursor coordinator for the frame loop's end signals, on every
@@ -3763,6 +3771,9 @@ async fn handle_route_request(
         )
         .await;
     }
+    if facts.surface == RouteSurface::AgentData {
+        return Box::pin(agent_data::handle(&frame, writer, &facts, planes)).await;
+    }
     if facts.surface == RouteSurface::Management {
         let body = serde_json::from_slice::<Value>(&frame.body).ok();
         if body
@@ -4019,6 +4030,9 @@ async fn dispatch_bound_route(
         frame.header.corr,
     );
     match facts.surface {
+        RouteSurface::AgentData => {
+            Box::pin(agent_data::handle(&frame, writer, facts, planes)).await
+        }
         // Boxed for the same stack-frame reason as the route worker's handler.
         RouteSurface::Tools => Box::pin(handle_keyed_tool_request(frame, writer, planes)).await,
         RouteSurface::Management => {

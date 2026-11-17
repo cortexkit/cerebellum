@@ -1483,6 +1483,7 @@ async fn an_unsolicited_answer_is_dropped_without_closing_the_route() {
 
     let planes = Planes {
         private_content: Arc::new(private_content::PrivateContent::in_memory()),
+        agent_data: Arc::new(agent_data::Participant::in_memory()),
         image_handles: Arc::new(image_handles::ImageHandles::default()),
         signed_in: Arc::new(browser_signed_in::SignedInDomains::default()),
         cancellations: RequestCancellations::default(),
@@ -3463,6 +3464,7 @@ async fn an_unsupported_surface_is_refused_by_name() {
     let (writer_tx, mut writer_rx) = mpsc::channel::<Frame>(8);
     let planes = Planes {
         private_content: Arc::new(private_content::PrivateContent::in_memory()),
+        agent_data: Arc::new(agent_data::Participant::in_memory()),
         image_handles: Arc::new(image_handles::ImageHandles::default()),
         signed_in: Arc::new(browser_signed_in::SignedInDomains::default()),
         cancellations: RequestCancellations::default(),
@@ -3560,6 +3562,7 @@ pub(super) fn management_bound_planes_with_admission_facts(
 ) -> Planes {
     let planes = Planes {
         private_content: Arc::new(private_content::PrivateContent::in_memory()),
+        agent_data: Arc::new(agent_data::Participant::in_memory()),
         image_handles: Arc::new(image_handles::ImageHandles::default()),
         signed_in: Arc::new(browser_signed_in::SignedInDomains::default()),
         cancellations: RequestCancellations::default(),
@@ -3865,7 +3868,7 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
     // measured. Subtract exactly their admission, including the selected
     // flat definition and release-evidence counts, without repinning history.
     let before_measurement = if cfg!(target_os = "macos") {
-        let mut previous = value.clone();
+        let mut previous = agent_data::tests::without_agent_data(&value);
         let release = &mut previous["computer_plane_release"];
         let down = ["computer.takeover_click", "computer.takeover_drag"];
         for field in ["gate_admitted_capabilities", "advertised_capabilities"] {
@@ -3907,7 +3910,7 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
         );
         previous
     } else {
-        value.clone()
+        agent_data::tests::without_agent_data(&value)
     };
     // Subtract only display.read for comparisons with older manifests.
     // Every pre-existing operation and tool definition remains pinned.
@@ -3927,7 +3930,8 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
         previous
     };
     let before_read = without_display_read(&before_measurement);
-    let before_read_unbound = without_display_read(&unbound);
+    let before_read_unbound =
+        without_display_read(&agent_data::tests::without_agent_data(&unbound));
     #[cfg(target_os = "linux")]
     let before_read_pins = [
         "7e31cf93aff05066e6057747b36fb780f6972b37c6eea61c67f5acd17a64289e",
@@ -4048,17 +4052,16 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
         "129c9cf0b18bcd2f225d4a8aa0189f097991ec4685348e0e3fa294cc495829ff";
     assert_eq!(digest(&legacy), before_pointer_fronting);
 
-    // Full HELLO pins are separate from the computer_use prompt pin:
-    // Binding CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION now admits
-    // measured click/drag alongside the fronted move/scroll definition.
+    // Full HELLO pins include the internal move participant. Historical
+    // comparisons above remove that role and capability, not tool definitions.
     #[cfg(target_os = "linux")]
-    let expected = "b9c8213a01901103879372dddf9c66b24e1f863e7498fe4214089a031cbacb37";
+    let expected = "5e4cf4f41c7b6fde17ee788a3f8250ed8e8ca25e1e32bdfbd6aad915f1249e45";
     #[cfg(target_os = "macos")]
-    let expected = "e58eb1b873306e0eea2790edacddabb2db934813ca44e5881d5f3671602bf70a";
+    let expected = "2b229d687f88fff67aa6ebfe2bea7cc48d534d97c5c85232f5705b7348b8e1ae";
     #[cfg(target_os = "linux")]
-    let expected_unbound = "0cbf726cba749725308de4a6daefc75d2911e22501732f9a5adf47cbeb88b074";
+    let expected_unbound = "beddf7ef0765904a344b386bc49380d88187854fe5c8c341334970b9218ee1c3";
     #[cfg(target_os = "macos")]
-    let expected_unbound = "5a61bd4809b2145ca1f1d9b76dd74f7ac0f3a367f9746177147d6f587ecb5bb1";
+    let expected_unbound = "9140c4593045fc0e40510ed767652c0df83be83223a2ab474bd6e5d81dc2f2e3";
     assert_eq!(digest(&value), expected);
     assert_eq!(digest(&unbound), expected_unbound);
 }
