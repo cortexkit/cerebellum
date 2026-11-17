@@ -77,8 +77,10 @@ pub fn trust_for_principal(principal: &Option<Principal>) -> PrincipalTrust {
 /// the old one only once no module registers under it.
 pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] = &["striatum", "aft", "broca"];
 
-/// Both registration names identify the agent's orchestrator during its rename.
-/// Remove the old id only after all orchestrators register under the new name.
+/// The agent's orchestrator (prefrontal) registers as `prefrontal-core` today
+/// and as `prefrontal` after its rename; both are accepted until the rename is
+/// done everywhere. Remove `prefrontal-core` only once no orchestrator
+/// registers under it.
 pub const PREFRONTAL_MODULE_IDS: &[&str] = &["prefrontal-core", "prefrontal"];
 
 /// Whether a reserved principal identifies the agent's orchestrator.
