@@ -437,6 +437,17 @@ where
             STATE_TEXT_FIELD: rendered.text,
             "unreadable_subtrees": observed.unreadable_subtrees,
         });
+        fn has_window(nodes: &[cerebellum_computer::app_state::source::RawElement]) -> bool {
+            nodes
+                .iter()
+                .any(|node| node.role.as_deref() == Some("AXWindow") || has_window(&node.children))
+        }
+        if raw.is_complete() && !has_window(&raw.roots) && parsed.zoom.is_none() {
+            if let Some(text) = reply[STATE_TEXT_FIELD].as_str() {
+                reply[STATE_TEXT_FIELD] =
+                    json!(format!("{text}\nThis application has no open window.\n"));
+            }
+        }
         if let Some(focused) = observed.focused_element_id {
             reply["focused_element_id"] = json!(focused);
         }

@@ -272,6 +272,9 @@ pub(crate) fn unreadable_remedy(
 ) -> &'static str {
     use cerebellum_computer::platform::UnreadableReason;
     match reason {
+        UnreadableReason::RunningAppListUnavailable => {
+            "the list of running applications could not be read; nothing was done, retry shortly"
+        }
         UnreadableReason::WindowListUnavailable => {
             "the window list could not be read, so nothing is known about this application; \
              retry, and if it persists check that the process that launched this module still \

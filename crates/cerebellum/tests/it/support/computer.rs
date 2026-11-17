@@ -797,6 +797,7 @@ pub struct DeskState {
     pub selections: Vec<(u64, (usize, usize))>,
     pub accepts_selection: bool,
     pub applies_selection: bool,
+    pub selection_read_error: Option<ElementActionError>,
     /// Answer element facts for an element found only in `roots` (its role
     /// alone), so parent walks over the read tree work. A suite that clears
     /// `elements` to make facts unreadable must also turn this off, or the
@@ -891,6 +892,7 @@ impl Desk {
             selections: Vec::new(),
             accepts_selection: true,
             applies_selection: true,
+            selection_read_error: None,
             facts_from_roots: true,
             hit_scopes: Vec::new(),
             focus_reads: 0,
@@ -1168,6 +1170,9 @@ impl AppStateSource for Desk {
         element: &ElementHandle,
     ) -> Result<Option<(usize, usize)>, ElementActionError> {
         let token = token_of(element).ok_or(ElementActionError::Gone)?;
+        if let Some(error) = self.state().selection_read_error {
+            return Err(error);
+        }
         Ok(self
             .state()
             .elements

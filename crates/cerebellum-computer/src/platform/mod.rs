@@ -842,6 +842,9 @@ pub enum TargetResolution {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "reason")]
 pub enum UnreadableReason {
+    /// The running-application registry did not answer; retry without launching
+    /// a second copy of an application that may already be running.
+    RunningAppListUnavailable,
     /// The window server (macOS) or `EnumWindows` (Windows) did not answer.
     /// Remedy: retry; if it persists, the platform's permission or
     /// window-server state is the thing to check.
@@ -870,6 +873,28 @@ pub enum UnreadableReason {
 }
 
 impl TargetResolution {
+    /// Resolve registered running applications, including those without windows.
+    pub fn decide_running<F: FnOnce(u32) -> Option<String>>(
+        bundle_identity: &str,
+        running: &[(u32, String)],
+        windows: Option<&[(u32, String)]>,
+        read_generation: F,
+    ) -> Self {
+        let mut counts = BTreeMap::new();
+        for (pid, identity) in running {
+            if identity == bundle_identity {
+                counts.entry(*pid).or_insert_with(|| {
+                    windows
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|(owner, _)| owner == pid)
+                        .count()
+                });
+            }
+        }
+        Self::decide_instances(bundle_identity, counts, read_generation)
+    }
+
     /// Decide what a bundle identity names, given every window on the machine.
     ///
     /// Takes the whole window list rather than a filtered one so the ambiguity
@@ -899,6 +924,14 @@ impl TargetResolution {
             }
         }
 
+        Self::decide_instances(bundle_identity, counts, read_generation)
+    }
+
+    fn decide_instances<F: FnOnce(u32) -> Option<String>>(
+        bundle_identity: &str,
+        counts: BTreeMap<u32, usize>,
+        read_generation: F,
+    ) -> Self {
         let mut instances = counts.into_iter();
         let Some((pid, window_count)) = instances.next() else {
             return Self::NotRunning;
@@ -2374,6 +2407,27 @@ mod target_resolution_tests {
     fn an_identity_nothing_answers_to_is_not_running() {
         assert_eq!(
             TargetResolution::decide("com.example.Absent", Some(&windows()), generation),
+            TargetResolution::NotRunning
+        );
+    }
+
+    #[test]
+    fn a_running_windowless_application_resolves_but_an_absent_one_does_not() {
+        let running = vec![(42, "com.example.Editor".to_string())];
+        assert_eq!(
+            TargetResolution::decide_running("com.example.Editor", &running, Some(&[]), |_| {
+                Some("generation-42".to_string())
+            }),
+            TargetResolution::Resolved(ProcessGrant {
+                pid: 42,
+                bundle_identity: "com.example.Editor".to_string(),
+                process_generation_evidence: "generation-42".to_string(),
+            })
+        );
+        assert_eq!(
+            TargetResolution::decide_running("com.example.Absent", &running, Some(&[]), |_| {
+                panic!("an absent application has no generation")
+            }),
             TargetResolution::NotRunning
         );
     }

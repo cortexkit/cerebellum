@@ -1501,6 +1501,14 @@ fn background(desk: Desk) -> Desk {
     desk
 }
 
+/// Tests of temporary app fronting still post Command-A when the focused
+/// element cannot select text semantically; the no-front path has separate tests.
+fn background_chord_without_semantic_selection() -> Desk {
+    let desk = background(focused_text_desk());
+    desk.state().accepts_selection = false;
+    desk
+}
+
 /// A secure field focused in the target refuses both keystroke rows before
 /// anything is posted or fronted.
 #[tokio::test]
@@ -1646,6 +1654,174 @@ async fn assert_fallback_focus_refuses(failed: bool, cut: bool, unreadable_subtr
 }
 
 #[tokio::test]
+#[cfg(target_os = "macos")]
+async fn a_windowless_running_app_reads_its_menu_bar_and_accepts_a_new_window_chord() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    {
+        let mut state = desk.state();
+        state.focus = DeskFocus::Nothing;
+        state.frontmost = Some(OTHER_APPLICATION_PID);
+        state.roots[0].role = Some("AXMenuBar".into());
+        state.roots[0].title = Some("Menu bar".into());
+        state.roots[0].children.clear();
+    }
+    let plane = plane_on(&shared, &desk, true).with_app_use_fronting_admitted(true);
+    let management = granted_management().await;
+    let read = serve(
+        &plane,
+        "computer.read_state",
+        json!({"target": TARGET_BUNDLE_ID}),
+        &management,
+        &FakeClock::new(),
+    )
+    .await;
+    assert_eq!(read["outcome"], "completed", "{read}");
+    let text = read["state_text"].as_str().unwrap();
+    assert!(text.contains("Menu bar"), "{text}");
+    assert!(
+        text.contains("This application has no open window."),
+        "{text}"
+    );
+    let reply = with_terminal(
+        "computer.keys",
+        serve(
+            &plane,
+            "computer.keys",
+            keys_request(&["command", "n"]),
+            &management,
+            &FakeClock::new(),
+        ),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+    assert!(matches!(
+        dispatched_calls(&shared).as_slice(),
+        [DispatchedCall::Fronted(_)]
+    ));
+}
+
+#[tokio::test]
+#[cfg(target_os = "macos")]
+async fn background_command_a_selects_utf16_semantically_without_posting_or_fronting() {
+    let shared = Shared::handle();
+    let desk = focused_text_desk();
+    {
+        let mut state = desk.state();
+        state.frontmost = Some(OTHER_APPLICATION_PID);
+        state.elements.get_mut(&2).unwrap().value = Some("a😀b".into());
+    }
+    let plane = plane_on(&shared, &desk, true).with_app_use_fronting_admitted(true);
+    let management = granted_management().await;
+    let reply = with_terminal(
+        "computer.keys",
+        serve(
+            &plane,
+            "computer.keys",
+            keys_request(&["command", "a"]),
+            &management,
+            &FakeClock::new(),
+        ),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["effect_status"], "effect_observed", "{reply}");
+    assert_eq!(reply["target_fronted"], false);
+    assert!(reply.get("fronting").is_none());
+    assert_eq!(desk.state().selections, vec![(2, (0, 4))]);
+    assert!(dispatched_calls(&shared).is_empty());
+    assert!(shared.lock().unwrap().image_front_requests.is_empty());
+}
+
+#[tokio::test]
+#[cfg(target_os = "macos")]
+async fn semantic_select_all_falls_back_only_when_unavailable_and_never_touches_secure_fields() {
+    use cerebellum_computer::app_state::source::ElementActionError;
+    for case in [
+        "unsupported",
+        "mismatched",
+        "no_focus",
+        "non_text",
+        "unreadable",
+        "secure",
+    ] {
+        let shared = Shared::handle();
+        let desk = focused_text_desk();
+        {
+            let mut state = desk.state();
+            state.frontmost = Some(OTHER_APPLICATION_PID);
+            match case {
+                "unsupported" => state.accepts_selection = false,
+                "mismatched" => state.applies_selection = false,
+                "unreadable" => state.selection_read_error = Some(ElementActionError::Failed),
+                "no_focus" => {
+                    state.focus = DeskFocus::Nothing;
+                    state.roots[0].children.clear();
+                }
+                "non_text" => {
+                    state.elements.get_mut(&2).unwrap().facts.role = Some("AXButton".into())
+                }
+                "secure" => {
+                    state.elements.get_mut(&2).unwrap().facts.subrole =
+                        Some("AXSecureTextField".into())
+                }
+                _ => unreachable!(),
+            }
+        }
+        let plane = plane_on(&shared, &desk, true).with_app_use_fronting_admitted(true);
+        let management = granted_management().await;
+        serve(
+            &plane,
+            "computer.read_state",
+            json!({"target":TARGET_BUNDLE_ID}),
+            &management,
+            &FakeClock::new(),
+        )
+        .await;
+        let reply = with_terminal(
+            "computer.keys",
+            serve(
+                &plane,
+                "computer.keys",
+                keys_request(&["command", "a"]),
+                &management,
+                &FakeClock::new(),
+            ),
+        )
+        .await;
+        match case {
+            "unsupported" | "mismatched" | "no_focus" | "non_text" => {
+                assert_eq!(reply["outcome"], "delivery_unconfirmed", "{case}: {reply}");
+                assert!(
+                    matches!(
+                        dispatched_calls(&shared).as_slice(),
+                        [DispatchedCall::Fronted(_)]
+                    ),
+                    "{case}: {reply}"
+                );
+            }
+            "unreadable" => {
+                assert_eq!(reply["outcome"], "delivery_unconfirmed", "{reply}");
+                assert_eq!(reply["effect_status"], "effect_indeterminate");
+                assert!(reply["remedy"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Selecting all again is safe"));
+                assert!(reply.get("fronting").is_none());
+                assert!(dispatched_calls(&shared).is_empty());
+                assert!(shared.lock().unwrap().image_front_requests.is_empty());
+            }
+            "secure" => {
+                assert_eq!(reply["outcome"], "secure_field_refused", "{reply}");
+                assert!(desk.state().selections.is_empty());
+                assert!(dispatched_calls(&shared).is_empty());
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_complete_fallback_without_focus_still_dispatches_type_and_keys() {
     let shared = Shared::handle();
     let desk = focused_text_desk();
@@ -1742,7 +1918,7 @@ async fn background_plain_and_shift_typing_use_per_process_without_takeover() {
 #[tokio::test]
 async fn background_modifier_chords_refuse_without_takeover_and_post_nothing() {
     let shared = Shared::handle();
-    let desk = background(focused_text_desk());
+    let desk = background_chord_without_semantic_selection();
     let plane = plane_on(&shared, &desk, true);
     let management = granted_management().await;
     let carrier = ScriptedCarrier::default();
@@ -1787,7 +1963,7 @@ async fn grant_takeover(management: &Arc<ManagementPlane>) {
 #[tokio::test]
 async fn a_background_target_with_the_takeover_grant_is_posted_through_the_bracket() {
     let shared = Shared::handle();
-    let desk = background(focused_text_desk());
+    let desk = background_chord_without_semantic_selection();
     let plane = plane_on(&shared, &desk, true);
     let management = granted_management().await;
     grant_takeover(&management).await;
@@ -1817,7 +1993,7 @@ async fn separate_fake_desks_keep_their_restore_predictions_in_either_order() {
         for cost in costs {
             let shared = Shared::handle();
             shared.lock().unwrap().fronted.measured_restore_ms = cost;
-            let desk = background(focused_text_desk());
+            let desk = background_chord_without_semantic_selection();
             let plane = plane_on(&shared, &desk, true);
             let reply = serve_asking(
                 &plane,
@@ -1883,7 +2059,7 @@ async fn a_chord_whose_restore_overran_the_bound_is_reported_delivered_not_refus
         state.fronted.measured_restore_ms = 25;
         state.fronted.restore_latency_ms = Some(124);
     }
-    let desk = background(focused_text_desk());
+    let desk = background_chord_without_semantic_selection();
     let plane = plane_on(&shared, &desk, true);
     let management = granted_management().await;
     grant_takeover(&management).await;
@@ -1911,7 +2087,7 @@ async fn a_chord_whose_restore_overran_the_bound_is_reported_delivered_not_refus
 async fn a_failed_restore_is_reported_naming_the_application_left_in_front() {
     let shared = Shared::handle();
     shared.lock().unwrap().fronted.refuse_restore = true;
-    let desk = background(focused_text_desk());
+    let desk = background_chord_without_semantic_selection();
     let plane = plane_on(&shared, &desk, true);
     let management = granted_management().await;
     grant_takeover(&management).await;
@@ -2380,7 +2556,7 @@ async fn a_bracket_whose_front_is_slower_than_the_bound_reports_not_dispatched()
     // Coming forward takes 60 ms, and the restore is predicted to take as
     // long, so no unit fits inside the 100 ms bound.
     shared.lock().unwrap().fronted.front_latency_ms = Some(60);
-    let desk = background(focused_text_desk());
+    let desk = background_chord_without_semantic_selection();
     let plane = plane_on(&shared, &desk, true);
     let management = granted_management().await;
     grant_takeover(&management).await;
@@ -2420,7 +2596,7 @@ async fn refusals_made_before_dispatch_report_not_dispatched() {
         assert_not_dispatched(&reply);
     }
 
-    let desk = background(focused_text_desk());
+    let desk = background_chord_without_semantic_selection();
     let plane = plane_on(&shared, &desk, true);
     let reply = serve_asking(
         &plane,
@@ -2549,7 +2725,7 @@ async fn a_stop_after_posting_stays_indeterminate_with_its_count() {
         held_state: HeldStateDisposition::NoneHeld,
     });
     grant_takeover(&management).await;
-    let desk = background(focused_text_desk());
+    let desk = background_chord_without_semantic_selection();
     let plane = plane_on(&shared, &desk, true);
     let reply = serve_asking(
         &plane,
@@ -2569,7 +2745,7 @@ async fn a_stop_after_posting_stays_indeterminate_with_its_count() {
     // the refusal it ends in carries none.
     let shared = Shared::handle();
     shared.lock().unwrap().fronted.seize_after_first_unit = true;
-    let desk = background(focused_text_desk());
+    let desk = background_chord_without_semantic_selection();
     let plane = plane_on(&shared, &desk, true);
     let reply = serve_asking(
         &plane,

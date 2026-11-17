@@ -114,6 +114,8 @@ mod settle_tests;
 use image_freshness::{ImageFreshnessSource, NativeImageFreshnessSource};
 mod read_image;
 mod read_state;
+#[cfg(target_os = "macos")]
+mod select_all;
 use read_image::ImageReadPlan;
 #[cfg(test)]
 mod development_build_tests;
@@ -1588,6 +1590,15 @@ where
         {
             admission.decorate(&mut unconfirmed);
             return unposted(unconfirmed);
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Some(mut reply) = self
+            .try_semantic_select_all(&parsed, &grant, &identity, management, &work)
+            .await
+        {
+            admission.decorate(&mut reply);
+            return reply;
         }
 
         if consent.unattended
@@ -3368,7 +3379,7 @@ fn synthetic_dispatch_refusal(refusal: &DispatchError) -> Value {
 /// Its outcome is `delivery_unconfirmed`: a post call returning says nothing
 /// about whether the application received the keystrokes. Typed text is
 /// upgraded to `completed` afterwards only when a read-back shows it arrived;
-/// a chord never is.
+/// a posted chord never is. Semantic selection is confirmed separately.
 ///
 /// Extracted from its one production call site so a test can assert the exact
 /// shape this surface emits against the frozen result schema. The two had no

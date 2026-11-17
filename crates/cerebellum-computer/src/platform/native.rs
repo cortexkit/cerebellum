@@ -202,16 +202,23 @@ pub fn application_name(pid: u32, timeout: Duration) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-/// Resolve a bundle identity against the windows this system currently reports.
+/// Resolve a bundle identity against the running-application registry.
 ///
-/// Thin on purpose: the decision lives in [`TargetResolution::decide`], which is
+/// Thin on purpose: the decision lives in [`TargetResolution::decide_running`], which is
 /// platform-neutral and therefore built and tested on every host. This half only
 /// supplies the readings, and it is the half no continuous build compiles.
 pub fn resolve_target(bundle_identity: &str, timeout: Duration) -> TargetResolution {
-    // A failed reading is passed through as absence rather than converted here,
-    // so the decision that a silent window server is not the same as an absent
-    // application lives in the platform-neutral half that every host tests. This
-    // half only supplies the reading.
+    let running = match cerebellum_macos::workspace_running_applications() {
+        Ok(apps) => apps
+            .into_iter()
+            .map(|app| (app.pid, app.bundle_identifier))
+            .collect::<Vec<_>>(),
+        Err(_) => {
+            return TargetResolution::Unreadable(super::UnreadableReason::RunningAppListUnavailable)
+        }
+    };
+    // Window ownership only describes ambiguous candidates. An application
+    // need not have opened its first window to receive menu-bar shortcuts.
     let owners: Option<Vec<(u32, String)>> =
         cerebellum_macos::enumerate_windows(timeout)
             .ok()
@@ -222,7 +229,7 @@ pub fn resolve_target(bundle_identity: &str, timeout: Duration) -> TargetResolut
                     .collect()
             });
 
-    TargetResolution::decide(bundle_identity, owners.as_deref(), |pid| {
+    TargetResolution::decide_running(bundle_identity, &running, owners.as_deref(), |pid| {
         cerebellum_macos::process_start_time_micros(pid).map(|micros| micros.to_string())
     })
 }

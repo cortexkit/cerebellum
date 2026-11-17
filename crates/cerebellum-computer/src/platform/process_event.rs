@@ -667,7 +667,17 @@ impl PerProcessEventTransport for MacOsPerProcessEventTransport {
             Ok(windows) if windows.iter().any(|window| window.owner_pid == pid) => {
                 WindowServerVisibility::Visible
             }
-            Ok(_) => WindowServerVisibility::NotVisible,
+            // A running application can receive menu-bar commands before it
+            // opens its first window. Generation is still checked per post.
+            Ok(_) => {
+                if cerebellum_macos::workspace_running_applications()
+                    .is_ok_and(|apps| apps.iter().any(|app| app.pid == pid))
+                {
+                    WindowServerVisibility::Visible
+                } else {
+                    WindowServerVisibility::NotVisible
+                }
+            }
             Err(reason) => WindowServerVisibility::Unreadable(reason),
         }
     }
