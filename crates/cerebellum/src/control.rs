@@ -323,7 +323,7 @@ pub(super) async fn handle_control_request(
                 consumer_capabilities.as_deref(),
                 &target,
             )
-            // An authorized prefrontal-core scope stamp supplies identity and
+            // An authorized orchestrator scope stamp supplies identity and
             // delegation. Retaining it also lets call records name the scope
             // and lets its owner withdraw calls when the scope is revoked.
             .with_scope(scope);

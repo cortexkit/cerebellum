@@ -1,4 +1,4 @@
-//! Only `reserved:prefrontal-core` may dispatch browser calls for an admitted agent.
+//! Only the agent's orchestrator may dispatch browser calls for an admitted agent.
 //! Naming an agent or conversation in route metadata is not enough authority.
 //!
 //! These tests seed a site permission for one agent, bind a route from each
@@ -211,7 +211,7 @@ fn assert_refused_as_not_admitted(frames: &[Frame], label: &str) {
     assert!(
         detail["remedy"]
             .as_str()
-            .is_some_and(|remedy| remedy.contains("reserved:prefrontal-core")),
+            .is_some_and(|remedy| remedy.contains("Prefrontal's forwarding operations")),
         "{label}: the remedy names the caller that is admitted: {detail}"
     );
 }
@@ -223,6 +223,57 @@ fn other_first_party_principals() -> Vec<(Option<Principal>, &'static str)> {
         (reserved("aft"), "reserved:aft"),
         (reserved("striatum"), "reserved:striatum"),
     ]
+}
+
+#[tokio::test]
+async fn prefrontal_aliases_dispatch_through_tool_and_management_routes() {
+    for (principal, admitted, bind_allowed) in [
+        (reserved("prefrontal-core"), true, true),
+        (reserved("prefrontal"), true, true),
+        (reserved("prefrontal-corex"), false, false),
+        (Some(Principal::Unverified), false, false),
+        (Some(Principal::Direct), false, true),
+    ] {
+        for (target, request) in [
+            (tool_route(), navigate(1, GRANTED_ORIGIN)),
+            (
+                management_route(),
+                route_request(
+                    1,
+                    json!({"method": "browser.open_grant", "params": {
+                        "origins": [UNGRANTED_ORIGIN], "hazards": []
+                    }}),
+                ),
+            ),
+        ] {
+            let planes = planes_with_a_grant().await;
+            let bound = bind(&planes, principal.clone(), target).await;
+            assert_eq!(
+                bound.header.ty == FrameType::Response,
+                bind_allowed,
+                "{principal:?}"
+            );
+            let frames = frames_for(&planes, request).await;
+            assert_eq!(frames.len(), 1, "{principal:?}");
+            assert_eq!(
+                frames[0].header.ty == FrameType::Response,
+                admitted,
+                "{principal:?}"
+            );
+            if !admitted {
+                let error: ErrorBody = serde_json::from_slice(&frames[0].body).unwrap();
+                assert_eq!(
+                    error.code,
+                    if bind_allowed {
+                        "session_caller_not_admitted"
+                    } else {
+                        "route_not_bound"
+                    },
+                    "{principal:?}"
+                );
+            }
+        }
+    }
 }
 
 /// The admitted caller reaches its agent's grant: navigating to the

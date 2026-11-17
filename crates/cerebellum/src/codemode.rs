@@ -6,7 +6,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use subc_protocol::scope::{ParentState, ScopeKind, ScopeParent, ScopeStamp};
-use subc_protocol::Principal;
 
 type CallKey = (String, String);
 type InFlight = (
@@ -362,16 +361,16 @@ pub(crate) fn user_browser_route(
 
 /// Keep direct head calls and linked runs behind the same admission checks.
 fn admitted_head_scope(facts: &AcceptedBindFacts) -> Option<&ScopeStamp> {
-    let core = Principal::Reserved {
-        module_id: "prefrontal-core".into(),
-    };
     facts.scope.as_ref().filter(|stamp| {
         stamp.kind == ScopeKind::Head
             && stamp.owner_authorized
-            && stamp.owner == core
+            && cerebellum_core::principal::is_prefrontal(&stamp.owner)
             && stamp.attributes.run_id.is_none()
             && stamp.attributes.flow_id.is_none()
-            && facts.principal.as_ref() == Some(&core)
+            && facts
+                .principal
+                .as_ref()
+                .is_some_and(cerebellum_core::principal::is_prefrontal)
             && facts.agent_project_id_attested
             && facts.session_kind_attested
             && stamp.attributes.agent_id.as_deref()
@@ -458,3 +457,6 @@ impl RouteBindings {
         heads
     }
 }
+
+#[cfg(test)]
+mod prefrontal_alias_tests;

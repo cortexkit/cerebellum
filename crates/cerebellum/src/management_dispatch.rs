@@ -269,7 +269,7 @@ pub(super) async fn handle_management_request_observed(
             epoch,
             corr,
             "principal_denied",
-            "grants.would_ask requires reserved:prefrontal-core or an owner-authorized reserved:basal flow",
+            "grants.would_ask requires the agent's orchestrator or an owner-authorized reserved:basal flow",
         )
         .await;
     }
@@ -1706,7 +1706,7 @@ pub(super) async fn resume_browser_handoff(planes: &Planes, identity: &RouteIden
 /// subscription calls [`computer_capability::cursor::Coordinator::turn_ended`]
 /// the same way.
 ///
-/// Only `reserved:prefrontal-core` may call it, by exact principal. A flow
+/// Only the agent's orchestrator may call it, by exact reserved principal. A flow
 /// carrier or another first-party module is refused like any other caller of
 /// a Prefrontal-only operation. Once admitted and well formed, the reply is
 /// always an acknowledgement, even for a session that drew no badge: the
@@ -1730,7 +1730,7 @@ async fn handle_session_turn_ended(
             epoch,
             corr,
             "principal_denied",
-            "session.turn_ended requires reserved:prefrontal-core",
+            "session.turn_ended requires the agent's orchestrator",
         )
         .await;
     }

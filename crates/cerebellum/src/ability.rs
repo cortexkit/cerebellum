@@ -453,7 +453,10 @@ fn admitted(facts: &AcceptedBindFacts, method: &str, origin_present: bool) -> bo
         .scope
         .as_ref()
         .and_then(|stamp| stamp.attributes.flow_id.as_ref());
-    let core = matches!(&facts.principal, Some(Principal::Reserved { module_id }) if module_id == "prefrontal-core")
+    let core = facts
+        .principal
+        .as_ref()
+        .is_some_and(cerebellum_core::principal::is_prefrontal)
         && facts.flow_id.is_none()
         && stamped_flow.is_none()
         && facts.call_mode == CallMode::Classic

@@ -44,6 +44,33 @@ fn stamp(kind: ScopeKind, attrs: ScopeAttributes) -> ScopeStamp {
     .with_attributes(attrs)
 }
 
+#[test]
+fn prefrontal_aliases_admit_only_core_ability_operations() {
+    for (principal, expected) in [
+        (principal("prefrontal-core"), true),
+        (principal("prefrontal"), true),
+        (principal("prefrontal-corex"), false),
+        (Some(Principal::Unverified), false),
+        (Some(Principal::Direct), false),
+        (None, false),
+    ] {
+        let mut route = facts("unused");
+        route.principal = principal;
+        for method in [DESCRIBE, SCOPE_CHOICES, SETUP] {
+            assert_eq!(
+                admitted(&route, method, false),
+                expected,
+                "{method}: {:?}",
+                route.principal
+            );
+        }
+        assert!(!admitted(&route, CALL, false));
+        for method in [SCOPE_CHOICES, SETUP] {
+            assert!(!admitted(&route, method, true));
+        }
+    }
+}
+
 fn flow() -> AcceptedBindFacts {
     facts("basal").with_scope(Some(stamp(
         ScopeKind::Ephemeral,

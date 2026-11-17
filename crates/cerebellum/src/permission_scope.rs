@@ -75,14 +75,14 @@ pub(crate) fn cursor_session(
 fn worker_parent(facts: &AcceptedBindFacts) -> Option<ScopeKey> {
     let stamp = facts.scope.as_ref()?;
     let parent = stamp.parent.as_ref()?;
-    let core = subc_protocol::Principal::Reserved {
-        module_id: "prefrontal-core".into(),
-    };
     (stamp.kind == ScopeKind::Worker
         && stamp.owner_authorized
-        && stamp.owner == core
+        && cerebellum_core::principal::is_prefrontal(&stamp.owner)
         && parent.owner == stamp.owner
-        && facts.principal.as_ref() == Some(&core)
+        && facts
+            .principal
+            .as_ref()
+            .is_some_and(cerebellum_core::principal::is_prefrontal)
         && stamp.attributes.flow_id.is_none()
         && facts.flow_id.is_none())
     .then(|| ScopeKey {
@@ -287,3 +287,6 @@ pub(crate) mod test_support {
         (answer, requests)
     }
 }
+
+#[cfg(test)]
+mod prefrontal_alias_tests;
