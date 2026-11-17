@@ -154,6 +154,8 @@ type Decision = (
 /// The lines actions wait for, by agent and serial.
 type AwaitedWrites = HashMap<(String, u64), WriteNote>;
 
+#[cfg(any(target_os = "macos", test))]
+mod agent_names;
 #[cfg(target_os = "macos")]
 pub(crate) mod avatar;
 mod preview_draw;

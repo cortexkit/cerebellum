@@ -581,6 +581,23 @@ impl Schedule {
         self.shown.remove(agent).is_some()
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    fn update_heading(
+        &mut self,
+        agent: &str,
+        generation: u64,
+        heading: String,
+        now: Instant,
+    ) -> Option<CursorPreview> {
+        let shown = self.shown.get_mut(agent)?;
+        if shown.generation() != generation || shown.idle(now) || shown.line.preview_app == heading
+        {
+            return None;
+        }
+        shown.line.preview_app = heading;
+        Some(shown.shown_line())
+    }
+
     /// An action of the agent's has started: its preview refreshes at most
     /// twice a second until the action settles.
     pub(crate) fn action_started(&mut self, agent: &str, now: Instant) {
@@ -1051,6 +1068,18 @@ impl PreviewWorker {
         outcome
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn update_heading(&self, agent: &str, generation: u64, heading: String) {
+        let mut locked = self.shared.lock();
+        if let Some(line) =
+            locked
+                .schedule
+                .update_heading(agent, generation, heading, Instant::now())
+        {
+            self.shared.output.preview(line);
+        }
+    }
+
     /// Hide the agent's preview. The caller sends the agent's hide line,
     /// which takes its badge and preview off the screen.
     pub(crate) fn hide(&self, agent: &str) {
@@ -1232,6 +1261,38 @@ mod tests {
 
     fn icon(line: &CursorPreview) -> bool {
         line.preview_fallback == Some(PreviewFallback::CaptureRefused)
+    }
+
+    #[test]
+    fn a_verified_name_update_changes_only_its_current_preview_heading() {
+        let now = Instant::now();
+        let mut schedule = admitted();
+        let first = schedule.show(request("agent-a", 10), now).0;
+        let second = schedule.show(request("agent-b", 11), now).0;
+        let generation = match first {
+            ShowOutcome::Shown { generation, .. } => generation,
+            _ => panic!("preview missing"),
+        };
+        let other_generation = match second {
+            ShowOutcome::Shown { generation, .. } => generation,
+            _ => panic!("preview missing"),
+        };
+        let line = schedule
+            .update_heading("agent-a", generation, "CEREB is using TextEdit".into(), now)
+            .unwrap();
+        assert_eq!(line.preview_app, "CEREB is using TextEdit");
+        assert_eq!(line.preview_agent, "agent-a");
+        assert!(schedule
+            .update_heading("agent-a", generation, line.preview_app, now)
+            .is_none());
+        assert!(schedule
+            .update_heading("agent-b", generation, "wrong agent".into(), now)
+            .is_none());
+        assert_eq!(schedule.shown["agent-b"].generation(), other_generation);
+        schedule.hide("agent-a");
+        assert!(schedule
+            .update_heading("agent-a", generation, "late response".into(), now)
+            .is_none());
     }
 
     #[test]

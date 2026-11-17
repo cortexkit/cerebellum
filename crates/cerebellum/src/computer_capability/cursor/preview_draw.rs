@@ -2,7 +2,7 @@ use super::*;
 
 impl Coordinator {
     /// Show an agent's preview, or point it at another window. It may start
-    /// the helper.
+    /// the cursor-overlay process.
     pub(crate) fn send_preview(&self, preview: CursorPreview) -> bool {
         self.send_line(CursorLine::Preview(preview))
     }
@@ -23,7 +23,8 @@ impl Coordinator {
             .writes_confirmed
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            // No writer: whoever reads the channel stands for the pipe.
+            // Without a confirmed pipe writer, send the frame directly to
+            // the channel reader instead of storing it for a later write.
             return sender.try_send(CursorLine::Frame(frame)).is_ok();
         }
         let mut frames = self.frames();
@@ -270,6 +271,17 @@ impl Coordinator {
             worker,
             call,
         } = draw;
+        #[cfg(target_os = "macos")]
+        let heading = agent_names::heading(
+            avatar_agent
+                .as_deref()
+                .and_then(|agent| self.0.avatars.get()?.known_name(agent))
+                .as_deref(),
+            &app,
+        );
+        #[cfg(not(target_os = "macos"))]
+        let heading = app.clone();
+        let mut preview_generation = None;
         let now = tokio::time::Instant::now();
         let sent = {
             // Held across the show, the same record `end` hides previews
@@ -290,7 +302,7 @@ impl Coordinator {
                 agent: agent.clone(),
                 target: grant,
                 window: aimed.window,
-                app,
+                app: heading,
                 icon_path: aimed.icon_path,
                 label: aimed.label,
                 backing_scale: PREVIEW_BACKING_SCALE,
@@ -308,6 +320,7 @@ impl Coordinator {
                     icon,
                     ..
                 } => {
+                    preview_generation = Some(generation);
                     if let Some(call) = &call {
                         call.showing(&worker, &agent);
                     }
@@ -337,29 +350,46 @@ impl Coordinator {
         let drew = sent.is_some();
         tokio::spawn(self.clone().decide(decided, sent, queued, cap));
         #[cfg(target_os = "macos")]
-        if drew {
-            self.send_avatar(
-                avatar_agent,
-                CursorEvent {
-                    initial: agent.chars().next().unwrap_or('A').to_ascii_uppercase(),
-                    agent,
-                    // Ignored for a badge inside a preview.
-                    to: [0.0, 0.0],
-                    target: None,
-                    window: None,
-                    resting: true,
-                    label: None,
-                    kind,
-                    serial,
-                    avatar_rgba: None,
-                    avatar_update: false,
-                    avatar_tint: None,
-                    motion: PictureMotion::still(),
-                },
-            )
-            .await;
+        if preview_generation.is_some() {
+            if drew {
+                self.send_avatar(
+                    avatar_agent.clone(),
+                    CursorEvent {
+                        initial: agent.chars().next().unwrap_or('A').to_ascii_uppercase(),
+                        agent: agent.clone(),
+                        // Ignored for a badge inside a preview.
+                        to: [0.0, 0.0],
+                        target: None,
+                        window: None,
+                        resting: true,
+                        label: None,
+                        kind,
+                        serial,
+                        avatar_rgba: None,
+                        avatar_update: false,
+                        avatar_tint: None,
+                        motion: PictureMotion::still(),
+                    },
+                )
+                .await;
+            } else if let (Some(agent_id), Some(avatars)) =
+                (avatar_agent.as_deref(), self.0.avatars.get())
+            {
+                let _ = avatars.fetch_and_render(agent_id).await;
+            }
+            if let (Some(generation), Some(agent_id), Some(avatars)) = (
+                preview_generation,
+                avatar_agent.as_deref(),
+                self.0.avatars.get(),
+            ) {
+                worker.update_heading(
+                    &agent,
+                    generation,
+                    agent_names::heading(avatars.known_name(agent_id).as_deref(), &app),
+                );
+            }
         }
         #[cfg(not(target_os = "macos"))]
-        let _ = (drew, avatar_agent);
+        let _ = (drew, avatar_agent, preview_generation);
     }
 }
