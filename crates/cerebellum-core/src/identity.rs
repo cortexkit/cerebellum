@@ -351,7 +351,7 @@ pub struct AcceptedBindFacts {
     /// Its **owner** is the agent it acts for, named by `agent_id` in the scope stamp.
     /// A **scope stamp** is session identity the daemon attaches to a route's bind;
     /// the session owner writes it, not the caller. It is **authorized** when its
-    /// stamp owner is `reserved:prefrontal-core` and the daemon reports that owner
+    /// stamp owner is the agent's orchestrator and the daemon reports that owner
     /// as a configured scope authority (`owner_authorized`). The **carrier** is
     /// the module that opened the route; for a flow it must be `reserved:basal`.
     pub flow_id: Option<String>,
@@ -516,7 +516,7 @@ impl AcceptedBindFacts {
     /// adding caller-controlled request fields or enabling a legacy carrier.
     pub fn control_refusal_remedy(&self, refusal: ControlOperationRefusal) -> &'static str {
         if self.scope.is_some() && !self.agent_project_id_attested {
-            "this scoped route has no attested agent; ask prefrontal-core to open a non-flow scope with agent_id under its authorized owner, or use a route with daemon admission facts"
+            "this scoped route has no attested agent; ask the agent's orchestrator to open a non-flow scope with agent_id under its authorized owner, or use a route with daemon admission facts"
         } else {
             refusal.remedy()
         }
@@ -639,10 +639,7 @@ pub fn codemode_carrier_candidate(
         && stamp.attributes.run_id.is_some()
         && stamp.attributes.flow_id.is_none()
         && stamp.owner_authorized
-        && stamp.owner
-            == Principal::Reserved {
-                module_id: "prefrontal-core".into(),
-            }
+        && crate::principal::is_prefrontal(&stamp.owner)
         && principal.as_ref()
             == Some(&Principal::Reserved {
                 module_id: "basal".into(),
@@ -654,18 +651,17 @@ fn scope_admission_eligible(
     stamp: &subc_protocol::scope::ScopeStamp,
     principal: &Option<Principal>,
 ) -> bool {
-    let core = Principal::Reserved {
-        module_id: "prefrontal-core".to_string(),
-    };
     flow_carrier_admitted(stamp, principal)
         || (stamp.owner_authorized
-            && stamp.owner == core
-            && principal.as_ref() == Some(&core)
+            && crate::principal::is_prefrontal(&stamp.owner)
+            && principal
+                .as_ref()
+                .is_some_and(crate::principal::is_prefrontal)
             && stamp.attributes.flow_id.is_none())
 }
 
 /// Check that `flow_id` is present, `owner_authorized` is true, the stamp owner
-/// is `reserved:prefrontal-core`, and the route principal is `reserved:basal`.
+/// is the agent's orchestrator, and the route principal is `reserved:basal`.
 /// This admits flow carriers without first-party membership. Codemode runs
 /// require a separate resolution of the provider's own admitted head route.
 /// For flow vocabulary, see [`AcceptedBindFacts::flow_id`].
@@ -675,10 +671,7 @@ pub fn flow_carrier_admitted(
 ) -> bool {
     stamp.attributes.flow_id.is_some()
         && stamp.owner_authorized
-        && stamp.owner
-            == Principal::Reserved {
-                module_id: "prefrontal-core".into(),
-            }
+        && crate::principal::is_prefrontal(&stamp.owner)
         && principal.as_ref()
             == Some(&Principal::Reserved {
                 module_id: "basal".into(),
@@ -1748,6 +1741,130 @@ mod tests {
         // Kept: who opened the route and which surface it reaches.
         assert_eq!(operator.principal, Some(Principal::Direct));
         assert_eq!(operator.surface, RouteSurface::Management);
+    }
+
+    fn prefrontal_alias_cases() -> Vec<(Principal, bool)> {
+        vec![
+            (
+                Principal::Reserved {
+                    module_id: "prefrontal-core".into(),
+                },
+                true,
+            ),
+            (
+                Principal::Reserved {
+                    module_id: "prefrontal".into(),
+                },
+                true,
+            ),
+            (
+                Principal::Reserved {
+                    module_id: "prefrontal-corex".into(),
+                },
+                false,
+            ),
+            (Principal::Unverified, false),
+            (Principal::Direct, false),
+        ]
+    }
+
+    fn prefrontal_alias_stamp(owner: Principal) -> subc_protocol::scope::ScopeStamp {
+        subc_protocol::scope::ScopeStamp::new(
+            owner,
+            "scope-alias",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        )
+        .with_owner_authorized(true)
+        .with_attributes(
+            subc_protocol::scope::ScopeAttributes::new()
+                .with_agent_id(Some("pj-agent".into()))
+                .with_delegates(true),
+        )
+    }
+
+    #[test]
+    fn prefrontal_aliases_admit_scope_identity() {
+        for (owner, owner_admitted) in prefrontal_alias_cases() {
+            for (caller, caller_admitted) in prefrontal_alias_cases() {
+                for authorized in [true, false] {
+                    let stamp =
+                        prefrontal_alias_stamp(owner.clone()).with_owner_authorized(authorized);
+                    let accepted = AcceptedBindFacts::from_bind(
+                        &bind_identity("conversation"),
+                        Some(caller.clone()),
+                        None,
+                        None,
+                        &tool_route(),
+                    )
+                    .with_scope(Some(stamp));
+                    let expected = owner_admitted && caller_admitted && authorized;
+                    assert_eq!(
+                        accepted.agent_project_id_attested, expected,
+                        "owner={owner:?}, caller={caller:?}, authorized={authorized}"
+                    );
+                    assert_eq!(accepted.acts_as_agent, expected);
+                    assert_eq!(
+                        accepted.allows_control_operation("browser.launch"),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefrontal_aliases_admit_flow_owners() {
+        let basal = Some(Principal::Reserved {
+            module_id: "basal".into(),
+        });
+        for (owner, expected) in prefrontal_alias_cases() {
+            let mut stamp = prefrontal_alias_stamp(owner.clone());
+            stamp.attributes.flow_id = Some("flow".into());
+            assert_eq!(flow_carrier_admitted(&stamp, &basal), expected, "{owner:?}");
+            for (caller, _) in prefrontal_alias_cases() {
+                assert!(!flow_carrier_admitted(&stamp, &Some(caller)));
+            }
+            stamp.owner_authorized = false;
+            assert!(!flow_carrier_admitted(&stamp, &basal));
+            stamp.owner_authorized = true;
+            stamp.attributes.flow_id = None;
+            assert!(!flow_carrier_admitted(&stamp, &basal));
+        }
+    }
+
+    #[test]
+    fn prefrontal_aliases_admit_codemode_owners() {
+        use subc_protocol::call_mode::CallMode;
+        let basal = Some(Principal::Reserved {
+            module_id: "basal".into(),
+        });
+        for (owner, expected) in prefrontal_alias_cases() {
+            let mut stamp = prefrontal_alias_stamp(owner.clone());
+            stamp.kind = subc_protocol::scope::ScopeKind::Ephemeral;
+            stamp.attributes.run_id = Some("run".into());
+            assert_eq!(
+                codemode_carrier_candidate(&stamp, &basal, &CallMode::Codemode),
+                expected,
+                "{owner:?}"
+            );
+            for (caller, _) in prefrontal_alias_cases() {
+                assert!(!codemode_carrier_candidate(
+                    &stamp,
+                    &Some(caller),
+                    &CallMode::Codemode
+                ));
+            }
+            for mode in [CallMode::Classic, CallMode::Flow] {
+                assert!(!codemode_carrier_candidate(&stamp, &basal, &mode));
+            }
+            stamp.owner_authorized = false;
+            assert!(!codemode_carrier_candidate(
+                &stamp,
+                &basal,
+                &CallMode::Codemode
+            ));
+        }
     }
 
     #[test]

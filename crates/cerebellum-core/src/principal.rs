@@ -61,8 +61,8 @@ pub fn trust_for_principal(principal: &Option<Principal>) -> PrincipalTrust {
     }
 }
 
-/// The daemon-spawned module ids trusted as first-party consumers of cerebellum
-/// capabilities.
+/// Other daemon-spawned module ids trusted as first-party consumers of cerebellum
+/// capabilities, alongside [`PREFRONTAL_MODULE_IDS`].
 ///
 /// Membership is deliberately tight: a module belongs here only if driving
 /// browser or computer use is part of its normal orchestration. The subc-mcp
@@ -75,12 +75,21 @@ pub fn trust_for_principal(principal: &Option<Principal>) -> PrincipalTrust {
 /// loses access, and the failure shows up here as a permission refusal rather
 /// than as a rename. Carry both the old and new ids across a rename, and drop
 /// the old one only once no module registers under it.
-pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] = &["prefrontal-core", "striatum", "aft", "broca"];
+pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] = &["striatum", "aft", "broca"];
+
+/// Both registration names identify the agent's orchestrator during its rename.
+/// Remove the old id only after all orchestrators register under the new name.
+pub const PREFRONTAL_MODULE_IDS: &[&str] = &["prefrontal-core", "prefrontal"];
+
+/// Whether a reserved principal identifies the agent's orchestrator.
+pub fn is_prefrontal(principal: &Principal) -> bool {
+    matches!(principal, Principal::Reserved { module_id } if PREFRONTAL_MODULE_IDS.contains(&module_id.as_str()))
+}
 
 /// Whether a daemon-spawned module id is a trusted first-party consumer of
 /// cerebellum capabilities.
 fn is_first_party_module_id(module_id: &str) -> bool {
-    FIRST_PARTY_MODULE_IDS.contains(&module_id)
+    PREFRONTAL_MODULE_IDS.contains(&module_id) || FIRST_PARTY_MODULE_IDS.contains(&module_id)
 }
 
 /// The one module admitted to call cerebellum in a conversation's name.
@@ -94,10 +103,9 @@ fn is_first_party_module_id(module_id: &str) -> bool {
 /// conversation and act on the permissions given there without anyone being
 /// asked.
 ///
-/// A single exact id rather than a list: the older `alfonso-core` and bare
-/// `prefrontal` spellings stay first-party for the operator's own operations,
-/// but they do not carry sessions, so they are not admitted here.
-pub const SESSION_CALLER_MODULE_ID: &str = "prefrontal-core";
+/// Kept for callers that need to stamp a representative session caller. Admission
+/// accepts every id in [`PREFRONTAL_MODULE_IDS`], not just this representative.
+pub const SESSION_CALLER_MODULE_ID: &str = PREFRONTAL_MODULE_IDS[0];
 
 /// The refusal code for a call that needs a conversation, made by a caller
 /// not admitted to act in one.
@@ -106,7 +114,7 @@ pub const SESSION_CALLER_NOT_ADMITTED: &str = "session_caller_not_admitted";
 /// What a caller refused with [`SESSION_CALLER_NOT_ADMITTED`] does next.
 pub const SESSION_CALLER_NOT_ADMITTED_REMEDY: &str =
     "calls made in a conversation's name reach cerebellum only through Prefrontal's forwarding \
-     operations (reserved:prefrontal-core); route this call through them. Only the operator's \
+     operations; route this call through them. Only the operator's \
      own operations (browser.rebind_profile_root, browser.clear_launch_recovery, \
      computer.list_app_grants, computer.revoke_app_grant) are served to other callers, and \
      those run outside any conversation";
@@ -117,10 +125,7 @@ pub const SESSION_CALLER_NOT_ADMITTED_REMEDY: &str =
 /// whitespace tolerance, since the daemon issues other reserved ids that
 /// share a prefix with this one and a looser match would admit them.
 pub fn admits_session_calls(principal: &Option<Principal>) -> bool {
-    matches!(
-        principal,
-        Some(Principal::Reserved { module_id }) if module_id == SESSION_CALLER_MODULE_ID
-    )
+    principal.as_ref().is_some_and(is_prefrontal)
 }
 
 /// A principal as the refusal messages name it: `reserved:<id>`, `direct`,
@@ -277,6 +282,55 @@ mod tests {
     }
 
     #[test]
+    fn prefrontal_aliases_require_reserved_principals() {
+        for (principal, admitted) in [
+            (reserved("prefrontal-core"), true),
+            (reserved("prefrontal"), true),
+            (reserved("prefrontal-corex"), false),
+            (Some(Principal::Unverified), false),
+            (Some(Principal::Direct), false),
+            (None, false),
+        ] {
+            assert_eq!(
+                principal.as_ref().is_some_and(is_prefrontal),
+                admitted,
+                "{principal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefrontal_aliases_have_first_party_trust() {
+        for (principal, trusted) in [
+            (reserved("prefrontal-core"), true),
+            (reserved("prefrontal"), true),
+            (reserved("prefrontal-corex"), false),
+            (Some(Principal::Unverified), false),
+            (None, false),
+        ] {
+            assert_eq!(
+                trust_for_principal(&principal).is_first_party(),
+                trusted,
+                "{principal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefrontal_aliases_admit_session_calls() {
+        for (principal, admitted) in [
+            (reserved("prefrontal-core"), true),
+            (reserved("prefrontal"), true),
+            (reserved("prefrontal-corex"), false),
+            (Some(Principal::Unverified), false),
+            (Some(Principal::Direct), false),
+            (None, false),
+        ] {
+            assert_eq!(admits_session_calls(&principal), admitted, "{principal:?}");
+        }
+    }
+
+    #[test]
     fn only_prefrontal_core_makes_session_calls() {
         assert!(admits_session_calls(&reserved("prefrontal-core")));
     }
@@ -286,12 +340,7 @@ mod tests {
     /// widening the rule back to "any first-party principal" fails here.
     #[test]
     fn other_first_party_principals_make_no_session_calls() {
-        for retired_id in [
-            "alfonso-core",
-            "prefrontal",
-            "alfonso-routing",
-            "prefrontal-routing",
-        ] {
+        for retired_id in ["alfonso-core", "alfonso-routing", "prefrontal-routing"] {
             assert_eq!(
                 trust_for_principal(&reserved(retired_id)),
                 PrincipalTrust::Untrusted,

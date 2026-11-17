@@ -891,7 +891,7 @@ async fn handle_tool_withdraw(
                 }
             }
         };
-        // The carrier is a principal label such as `reserved:prefrontal-core`,
+        // The carrier is a principal label such as `reserved:basal`,
         // the form call records are kept under.
         let carrier = match arguments.get("carrier") {
             None => None,
