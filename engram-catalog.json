@@ -22,6 +22,13 @@
       "reason": "Private-content marks hold only scope ids, sources and times, never page or app content, and are backed up so a restore after a disk loss brings back head marks, which never expire, and the in-use marker, which keeps every answer marked for a day after an unclean stop.",
       "mechanism": "filetree",
       "path": "private-content"
+    },
+    {
+      "entry_id": "cerebellum/agent-data-cuts",
+      "class": "portable",
+      "reason": "Move participant checkpoints retain cut steps, replay replies and compact agent source sets, never page or app content, so a restored participant can safely resume an interrupted move.",
+      "mechanism": "filetree",
+      "path": "agent-data"
     }
   ]
 }

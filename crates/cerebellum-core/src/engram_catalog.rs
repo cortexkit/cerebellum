@@ -269,7 +269,8 @@ mod tests {
             [
                 ("browser", Class::Excluded),
                 ("journal", Class::Portable),
-                ("private-content", Class::Portable)
+                ("private-content", Class::Portable),
+                ("agent-data", Class::Portable)
             ]
         );
         // Every tree that keeps a format floor holds durable data the module

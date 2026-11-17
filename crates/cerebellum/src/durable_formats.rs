@@ -43,6 +43,7 @@ pub fn readable_formats() -> Vec<DurableFormat> {
         // A separate tree keeps rollback to builds predating this optional
         // store a plain swap: their staging gate ignores this tree's floor.
         crate::private_content::PRIVATE_CONTENT_FORMAT,
+        crate::agent_data::CHECKPOINT_FORMAT,
     ]
 }
 
