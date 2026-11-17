@@ -15,9 +15,11 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v34.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v35.json");
 const V33_ARTIFACT_SHA256: &str =
     "bec5b6cad004606960c684bafea3c7b219fc780cec9630158c29ff935833c849";
+const V34_ARTIFACT_SHA256: &str =
+    "7c36bfd082d83e1dd24db1fcf9110eb58c1ad2059aeea7b9b4068f7c9c0ab4bd";
 /// The digests of retained historical artifacts: operator-app refusal, image
 /// handles and terminal-keystroke result envelopes, respectively.
 const V30_ARTIFACT_SHA256: &str =
@@ -141,6 +143,8 @@ fn every_repository_vocabulary_mirror_names_the_current_revision() {
                 V32_ARTIFACT_SHA256
             } else if path.ends_with("v33.json") {
                 V33_ARTIFACT_SHA256
+            } else if path.ends_with("v34.json") {
+                V34_ARTIFACT_SHA256
             } else {
                 panic!("{path} is a vocabulary artifact with no pinned digest")
             };
@@ -818,7 +822,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v32_from_v31(&generated, historical_revision(32).as_str().unwrap());
     let generated =
         vocabulary_mint::v33_from_v32(&generated, historical_revision(33).as_str().unwrap());
-    let generated = vocabulary_mint::v34_from_v33(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v34_from_v33(&generated, historical_revision(34).as_str().unwrap());
+    let generated = vocabulary_mint::v35_from_v34(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -2072,14 +2078,14 @@ fn mint_current_vocabulary_artifact() {
     let resources = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
     let previous_path = resources.join(format!(
         "{}.json",
-        historical_revision(33).as_str().unwrap()
+        historical_revision(34).as_str().unwrap()
     ));
     let previous: Value = serde_json::from_slice(&std::fs::read(previous_path).unwrap()).unwrap();
     assert_eq!(
         hex_digest(&canonical_json_bytes(&previous).unwrap()),
-        V33_ARTIFACT_SHA256
+        "7c36bfd082d83e1dd24db1fcf9110eb58c1ad2059aeea7b9b4068f7c9c0ab4bd"
     );
-    let generated = vocabulary_mint::v34_from_v33(&previous, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated = vocabulary_mint::v35_from_v34(&previous, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     std::fs::write(
         resources.join(format!("{COMPUTER_ACTION_VOCABULARY_REVISION}.json")),
@@ -2187,7 +2193,7 @@ fn recreated_v33() -> Value {
         hex_digest(&canonical_json_bytes(&previous).unwrap()),
         V33_ARTIFACT_SHA256
     );
-    let mut current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut current = recreated_v34();
     current["revision"] = historical_revision(33);
     let rows = current["rows"].as_array_mut().unwrap();
     let click = rows
@@ -2220,9 +2226,121 @@ fn recreated_v33() -> Value {
 #[test]
 fn v34_only_adds_click_and_the_pointer_fronting_contract() {
     let previous = recreated_v33();
+    let current = recreated_v34();
+    assert_eq!(
+        current,
+        vocabulary_mint::v34_from_v33(&previous, historical_revision(34).as_str().unwrap())
+    );
+}
+
+fn recreated_v34() -> Value {
+    fn remove_reason(value: &mut Value) {
+        match value {
+            Value::Object(object) => object.values_mut().for_each(remove_reason),
+            Value::Array(values) => {
+                values.retain(|value| value != "running_app_list_unavailable");
+                values.iter_mut().for_each(remove_reason);
+            }
+            _ => {}
+        }
+    }
+    let mut current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    current["revision"] = historical_revision(34);
+    remove_reason(&mut current);
+    let previous: Value = serde_json::from_slice(
+        &std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("resources")
+                .join(format!(
+                    "{}.json",
+                    historical_revision(34).as_str().unwrap()
+                )),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let before = previous["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["capability_id"] == "computer.keys")
+        .unwrap();
+    let keys = current["rows"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["capability_id"] == "computer.keys")
+        .unwrap();
+    let schema = &mut keys["result_schema"];
+    let branches = schema["anyOf"].as_array_mut().unwrap();
+    assert_eq!(
+        branches.len(),
+        before["result_schema"]["anyOf"].as_array().unwrap().len() + 2
+    );
+    let unconfirmed = branches.pop().unwrap();
+    let confirmed = branches.pop().unwrap();
+    assert_eq!(
+        unconfirmed["properties"]["outcome"]["enum"],
+        json!(["delivery_unconfirmed", "audit_unavailable"])
+    );
+    assert_eq!(
+        confirmed["properties"]["outcome"]["enum"],
+        json!(["completed"])
+    );
+    for (field, word) in [
+        ("outcome", "completed"),
+        ("containment_rung", "semantic_element"),
+    ] {
+        if !before["result_schema"]["properties"][field]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(word))
+        {
+            let words = schema["properties"][field]["enum"].as_array_mut().unwrap();
+            let old_len = words.len();
+            words.retain(|value| value != word);
+            assert_eq!(words.len() + 1, old_len);
+        }
+    }
+    assert_eq!(
+        hex_digest(&canonical_json_bytes(&current).unwrap()),
+        "7c36bfd082d83e1dd24db1fcf9110eb58c1ad2059aeea7b9b4068f7c9c0ab4bd"
+    );
+    current
+}
+
+#[test]
+fn v35_only_adds_running_list_failure_and_semantic_select_all_results() {
     let current: Value = serde_json::from_str(VOCABULARY).unwrap();
     assert_eq!(
         current,
-        vocabulary_mint::v34_from_v33(&previous, COMPUTER_ACTION_VOCABULARY_REVISION)
+        vocabulary_mint::v35_from_v34(&recreated_v34(), COMPUTER_ACTION_VOCABULARY_REVISION)
     );
+}
+
+#[test]
+fn semantic_select_all_results_never_claim_posts_or_fronting() {
+    use cerebellum_computer::platform::vocabulary::validate_capability_result;
+    let success = json!({"outcome":"completed","effect_status":"effect_observed","target_fronted":false,"containment_rung":"semantic_element","posts_returned":0});
+    validate_capability_result("computer.keys", &success).unwrap();
+    for (field, value) in [
+        ("target_fronted", json!(true)),
+        ("posts_returned", json!(1)),
+        ("effect_status", json!("effect_indeterminate")),
+        ("fronting", json!({})),
+    ] {
+        let mut invalid = success.clone();
+        invalid[field] = value;
+        assert!(
+            validate_capability_result("computer.keys", &invalid).is_err(),
+            "{invalid}"
+        );
+    }
+    let mut unconfirmed = success;
+    unconfirmed["outcome"] = json!("delivery_unconfirmed");
+    unconfirmed["effect_status"] = json!("effect_indeterminate");
+    assert!(validate_capability_result("computer.keys", &unconfirmed).is_err());
+    unconfirmed["remedy"] =
+        json!("Selecting all again is safe; nothing was posted or brought forward.");
+    validate_capability_result("computer.keys", &unconfirmed).unwrap();
 }

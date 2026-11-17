@@ -38,11 +38,12 @@ const ATTEMPT_SPACING_MS: u64 = 5_100;
 const POST_WITHOUT_LISTING_MS: u64 = 3;
 
 /// Replay the measured attempts (`RUN`) in one process: the restore and unit post costs carry
-/// from attempt to attempt, starting empty as after a restart. `post`
+/// from attempt to attempt, seeded with the run's first measured restore. `post`
 /// gives each attempt's post cost from the measured one. Returns each attempt's
 /// report, in order.
 fn replay(post: impl Fn(u64) -> u64) -> Vec<BracketReport> {
     let mut restores = RestoreLatencies::new();
+    restores.record(RUN[0].2);
     let mut units = Some(UnitPostCosts::new());
     let origin = std::time::Instant::now();
     let mut reports = Vec::new();
@@ -91,11 +92,11 @@ fn the_desk_runs_slow_posts_refuse_later_chords_before_posting() {
             Some(BracketStop::BoundExceeded),
             "attempt {attempt}: {report:?}"
         );
-        // Attempt 1 has no restore measured yet, and attempt 18's front alone
-        // took 60 ms; every other refusal is only the slow-post reserve.
+        // Attempt 1's front fills the allowance. Later slow-post reserves
+        // refuse before activation, so their unmeasured front cost is irrelevant.
         assert_eq!(
             report.waiting_out_slow_post,
-            ![1, 18].contains(&attempt),
+            attempt != 1,
             "attempt {attempt}: {report:?}"
         );
     }
@@ -131,7 +132,7 @@ fn a_slow_post_is_waited_out_and_then_ages_out() {
 
 /// Once the listing is read before the front, a chord's post is a few
 /// milliseconds, and the reserve for it admits every attempt whose front and
-/// restore fit. Attempt 1 has no restore measured; attempts 18 and 19 came
+/// restore fit. Attempt 1's front fills the allowance; attempts 18 and 19 came
 /// forward in 60 and 50 ms, and that front time is also reserved for the
 /// restore. Attempt 19's front and restore fill the bound exactly, so its
 /// 3 ms post reserve is what refuses it, and a retry may fit. Every admitted

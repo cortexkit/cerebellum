@@ -96,6 +96,10 @@ impl TargetResolver for TwoApplications {
             .find(|process| process.pid == pid)
     }
 
+    fn display_name(&self, grant: &ProcessGrant) -> Option<String> {
+        (grant.bundle_identity == OPERATOR_BUNDLE_ID).then(|| "iPhone Mirroring".into())
+    }
+
     fn app_code(&self, _grant: &ProcessGrant) -> Arc<dyn AppCode> {
         Arc::new(InjectedCode::default())
     }
@@ -824,7 +828,19 @@ async fn a_scroll_refuses_another_app_under_the_real_pointer_even_when_target_is
         )
         .await;
         assert!(rig.posts().is_empty(), "owner {owner}: {reply}");
-        assert_eq!(reply["reason"], "point_in_another_window", "{reply}");
+        if owner == OPERATOR_PID {
+            assert_eq!(reply["outcome"], "authorization_denied", "{reply}");
+            assert_eq!(reply["reason"], "operator_app_blocked", "{reply}");
+            assert!(
+                reply["remedy"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("The pointer is over iPhone Mirroring, which agents may not use"),
+                "{reply}"
+            );
+        } else {
+            assert_eq!(reply["reason"], "point_in_another_window", "{reply}");
+        }
         assert!(carrier.questions().is_empty());
     }
 }
@@ -977,8 +993,9 @@ async fn a_target_that_is_not_frontmost_is_refused_at_the_post() {
     assert!(rig.posts().is_empty());
 }
 
-/// An image id the conversation does not hold, and a point outside the
-/// image, are refused before anything is looked up under the pointer.
+/// Invalid image references and points are refused before placement. The
+/// current pointer's app can still be identified to check whether agents are
+/// forbidden to use it.
 #[tokio::test]
 async fn a_stale_image_and_a_point_outside_it_are_refused_by_name() {
     let rig = granted_rig().await;
@@ -997,7 +1014,13 @@ async fn a_stale_image_and_a_point_outside_it_are_refused_by_name() {
     )
     .await;
     assert_eq!(reply["outcome"], "point_out_of_bounds", "{reply}");
-    assert!(rig.desk.state().hit_scopes.is_empty());
+    assert_eq!(
+        rig.desk.state().hit_scopes,
+        vec![
+            cerebellum_computer::app_state::source::HitScope::SystemWide,
+            cerebellum_computer::app_state::source::HitScope::SystemWide,
+        ]
+    );
     assert!(rig.dispatched().is_empty());
 }
 

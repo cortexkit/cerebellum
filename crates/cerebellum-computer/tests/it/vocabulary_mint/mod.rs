@@ -2679,3 +2679,80 @@ pub fn v34_from_v33(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// Revision 35 distinguishes an unreadable running-application registry and
+/// admits verified semantic Select All results without claiming posted keys.
+pub fn v35_from_v34(previous: &Value, revision: &str) -> Value {
+    fn extend(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                if let Some(words) = object.get_mut("enum").and_then(Value::as_array_mut) {
+                    if words.contains(&json!("window_list_unavailable")) {
+                        assert!(!words.contains(&json!("running_app_list_unavailable")));
+                        words.push(json!("running_app_list_unavailable"));
+                    }
+                }
+                for child in object.values_mut() {
+                    extend(child);
+                }
+            }
+            Value::Array(values) => values.iter_mut().for_each(extend),
+            _ => {}
+        }
+    }
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    for row in next["rows"].as_array_mut().unwrap() {
+        extend(&mut row["result_schema"]);
+        if row["capability_id"] == "computer.keys" {
+            let schema = &mut row["result_schema"];
+            for (field, word) in [
+                ("outcome", "completed"),
+                ("containment_rung", "semantic_element"),
+            ] {
+                let words = schema["properties"][field]["enum"].as_array_mut().unwrap();
+                if !words.contains(&json!(word)) {
+                    words.push(json!(word));
+                }
+            }
+            let ordinary = schema["anyOf"][0].clone();
+            for confirmed in [true, false] {
+                let mut semantic = ordinary.clone();
+                let fields = semantic["properties"].as_object_mut().unwrap();
+                fields.remove("fronting");
+                fields.remove("fronting_bound_exceeded");
+                fields.get_mut("outcome").unwrap()["enum"] = if confirmed {
+                    json!(["completed"])
+                } else {
+                    json!(["delivery_unconfirmed", "audit_unavailable"])
+                };
+                fields.get_mut("containment_rung").unwrap()["enum"] = json!(["semantic_element"]);
+                fields.get_mut("effect_status").unwrap()["enum"] = json!([if confirmed {
+                    "effect_observed"
+                } else {
+                    "effect_indeterminate"
+                }]);
+                fields.get_mut("target_fronted").unwrap()["enum"] = json!([false]);
+                fields.insert(
+                    "posts_returned".into(),
+                    json!({"type":"integer","enum":[0]}),
+                );
+                semantic["required"] = json!([
+                    "outcome",
+                    "effect_status",
+                    "target_fronted",
+                    "containment_rung",
+                    "posts_returned"
+                ]);
+                if !confirmed {
+                    semantic["required"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("remedy"));
+                }
+                schema["anyOf"].as_array_mut().unwrap().push(semantic);
+            }
+        }
+    }
+    next
+}

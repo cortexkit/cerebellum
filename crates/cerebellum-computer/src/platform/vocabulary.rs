@@ -25,9 +25,9 @@ use std::sync::OnceLock;
 // the format to /v2. A reviewer read the mismatch as a mistake before finding
 // both fields in the artifact, so it is stated here rather than re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v2";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v34";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v35";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v34.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v35.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "7c36bfd082d83e1dd24db1fcf9110eb58c1ad2059aeea7b9b4068f7c9c0ab4bd";
+    "53779c253a1ceae727b8a19b1fe3bded97b88523ba33bfdb7630fb778877cfeb";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {

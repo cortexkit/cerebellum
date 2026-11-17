@@ -486,13 +486,18 @@ pub fn pointer_window_at(x: f64, y: f64) -> Option<u32> {
     // SAFETY: CoreGraphics returns the primary display's value-type bounds.
     let primary = unsafe { CGDisplayBounds(objc2_core_graphics::CGMainDisplayID()) };
     let windows = cursor_window_list()?;
-    crate::window_visibility::mouse_down_window_at([x, y], primary.size.height, &windows, |point| {
-        // SAFETY: the query runs on the helper/probe main thread. The selector's NSInteger return and
-        // NSPoint argument match the documented AppKit method signature.
-        unsafe {
-            objc2::msg_send![objc2::class!(NSWindow), windowNumberAtPoint: objc2_foundation::NSPoint::new(point[0], point[1]), belowWindowWithWindowNumber: 0isize]
-        }
-    })
+    crate::window_visibility::mouse_down_window_at(
+        [x, y],
+        primary.size.height,
+        &windows,
+        |point, below| {
+            // SAFETY: MainThreadMarker above ensures this runs on the main thread. The selector's NSInteger return and
+            // NSPoint argument match the documented AppKit method signature.
+            unsafe {
+                objc2::msg_send![objc2::class!(NSWindow), windowNumberAtPoint: objc2_foundation::NSPoint::new(point[0], point[1]), belowWindowWithWindowNumber: below]
+            }
+        },
+    )
 }
 
 /// Snapshot the real cursor without moving it or posting an event.

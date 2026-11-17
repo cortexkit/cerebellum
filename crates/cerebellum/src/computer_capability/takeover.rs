@@ -720,7 +720,7 @@ where
                         Ok::<_, &'static str>(window)
                     }).await.unwrap_or(Err("scroll cursor placement worker failed")).map_err(|step| {
                         let mut refusal = nothing_identifiable_at_point();
-                        refusal["remedy"] = json!(format!("{step}; nothing was posted"));
+                        refusal["remedy"] = json!(format!("The scroll could not start: {step}; nothing was posted. Move the pointer over the intended application's window, then retry."));
                         refusal
                     })?);
                 } else {
@@ -773,7 +773,7 @@ where
             let grant = image_grant(&image);
             if let Some(refusal) = self
                 .operator_lookup(management, caller)
-                .process_refusal(&grant, Vec::new())
+                .pointer_refusal(&grant)
             {
                 return Err(refusal);
             }
@@ -836,7 +836,7 @@ where
                         // looked up.
                         application_under(source.as_ref(), &hit_management, &hit_image, *point)
                             .and_then(|owner| {
-                                if let Some(refusal) = lookup.process_refusal(&owner, Vec::new()) {
+                                if let Some(refusal) = lookup.pointer_refusal(&owner) {
                                     Err(refusal)
                                 } else {
                                     Ok(owner)

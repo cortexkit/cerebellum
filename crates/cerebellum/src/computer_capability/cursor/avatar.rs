@@ -203,6 +203,7 @@ pub(crate) struct Avatars {
     /// may fail or arrive late; neither should replace a known avatar with
     /// the fallback initial on the next action.
     agents: Mutex<VecDeque<(String, Rendered)>>,
+    names: Mutex<super::agent_names::Names>,
     slots: Arc<tokio::sync::Semaphore>,
 }
 
@@ -220,6 +221,7 @@ impl Avatars {
             route,
             cache: Mutex::new(Cache::default()),
             agents: Mutex::new(VecDeque::new()),
+            names: Mutex::new(super::agent_names::Names::default()),
             slots: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
@@ -232,6 +234,13 @@ impl Avatars {
             .iter()
             .find(|(known, _)| known == agent)
             .map(|(_, rendered)| rendered.clone())
+    }
+
+    pub(super) fn known_name(&self, agent: &str) -> Option<String> {
+        self.names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .known(agent)
     }
 
     fn remember(&self, agent: &str, rendered: Rendered) {
@@ -251,8 +260,23 @@ impl Avatars {
         let permit = self.slots.clone().try_acquire_owned().ok()?;
         let row = tokio::time::timeout(FETCH_BUDGET, async {
             let mut route = self.route.open().await.ok()?;
-            let reply = route.call(&avatar_read_request(&[agent])).await.ok()?;
-            decode_reply(&reply, agent)
+            let row = route
+                .call(&avatar_read_request(&[agent]))
+                .await
+                .ok()
+                .and_then(|reply| decode_reply(&reply, agent));
+            let request = self
+                .names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .request();
+            if let Ok(reply) = route.call(&request).await {
+                self.names
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .apply(&reply);
+            }
+            row
         })
         .await
         .ok()
@@ -544,6 +568,16 @@ mod tests {
         ) -> BoxFuture<'a, Result<Vec<u8>, VaultReachError>> {
             Box::pin(async move {
                 let request: serde_json::Value = serde_json::from_slice(request).unwrap();
+                if request["method"] == "agent.fleet_identity" {
+                    assert!(
+                        request["params"] == serde_json::json!({})
+                            || request["params"] == serde_json::json!({"token":"names-1"})
+                    );
+                    if self.fail {
+                        return Err(VaultReachError::Unreachable);
+                    }
+                    return Ok(serde_json::to_vec(&serde_json::json!({"result":{"token":"names-1","agents":[{"agentId":"agent-a","displayName":"CEREB"}]}})).unwrap());
+                }
                 assert_eq!(request["method"], "agent.avatar_read");
                 assert_eq!(
                     request["params"]["agentIds"],

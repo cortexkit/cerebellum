@@ -42,7 +42,7 @@ pub fn pointer_target_check_until(
     deadline: std::time::Instant,
 ) -> Result<(), &'static str> {
     if source.pointer_recipient_until(point, deadline)? != Some(window) {
-        return Err("mouse-down recipient window changed or unavailable");
+        return Err("pointer recipient window changed or unavailable");
     }
     if !pointer_target_safe(source, target, point, window) {
         return Err("pointer accessibility sensitivity step failed");

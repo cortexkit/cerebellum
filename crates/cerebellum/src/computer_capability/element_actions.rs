@@ -264,6 +264,27 @@ pub(crate) fn person_check_before_action(
         return Ok(PersonCheck::Unchanged);
     };
     let now = SeenMarks::read(source, grant);
+    // Autosave can retitle the same window after our input returns. A title
+    // alone is not evidence of a person when the input watcher covered the
+    // entire interval and saw no hardware input. Keep window identity, window
+    // inventory and focus strict, including for a background application.
+    if seen.after_agent_input
+        && matches!((&seen.window, &now.window),
+            (Reading::Read(Some(before)), Reading::Read(Some(after)))
+                if before.handle.same_element(after.handle.as_ref()))
+        && matches!((&seen.windows, &now.windows),
+            (Reading::Read(before), Reading::Read(after)) if before == after)
+        && matches!(source.hardware_input(grant),
+            Ok((since, latest)) if since <= seen.at && latest.is_none_or(|at| at <= seen.at))
+    {
+        let without_title = SeenMarks {
+            window: now.window.clone(),
+            ..seen.clone()
+        };
+        if person_change(&without_title, &now, false, None).is_none() {
+            return Ok(PersonCheck::Unchanged);
+        }
+    }
     match person_change(&seen, &now, false, None) {
         Some(PersonChange::FocusChanged) => {
             // Compared with the new focused element in place of the old one,
@@ -1437,6 +1458,10 @@ pub(crate) fn settle_and_observe_view(
                     };
                 if done {
                     let observed = sessions.observe(conversation_key, grant, &read);
+                    let seen = SeenMarks {
+                        after_agent_input: true,
+                        ..seen
+                    };
                     sessions.remember_seen(conversation_key, grant, seen);
                     let pressed_shown = pressed_before.as_ref().is_some_and(|(pressed, _)| {
                         let id = pressed.element_id;

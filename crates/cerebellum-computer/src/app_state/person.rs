@@ -54,6 +54,10 @@ impl<T> Reading<T> {
 pub struct SeenMarks {
     pub focused: Reading<Option<ElementHandle>>,
     pub window: Reading<Option<WindowMark>>,
+    pub windows: Reading<Vec<u32>>,
+    /// These marks came from an action reply after the agent dispatched input,
+    /// rather than from an explicit read.
+    pub after_agent_input: bool,
     /// Taken before either reading, so input that arrives while they are
     /// read counts as unseen. That errs towards asking the agent to read
     /// again, never towards acting on a change it did not see.
@@ -70,6 +74,14 @@ impl SeenMarks {
         Self {
             focused: Reading::from_result(source.focused_element(target)),
             window: Reading::from_result(source.focused_window(target)),
+            windows: source.visible_window_numbers(target).map_or(
+                Reading::Unreadable,
+                |mut windows| {
+                    windows.sort_unstable();
+                    Reading::Read(windows)
+                },
+            ),
+            after_agent_input: false,
             at,
         }
     }
@@ -114,6 +126,11 @@ pub fn person_change(
     frontmost_now: bool,
     person_input_at: Option<Instant>,
 ) -> Option<PersonChange> {
+    if let (Reading::Read(before), Reading::Read(after)) = (&seen.windows, &now.windows) {
+        if before != after {
+            return Some(PersonChange::WindowChanged);
+        }
+    }
     if let (Reading::Read(before), Reading::Read(after)) = (&seen.focused, &now.focused) {
         let same = match (before, after) {
             (Some(before), Some(after)) => before.same_element(after.as_ref()),

@@ -354,6 +354,15 @@ pub(crate) fn dispatch_refusal_reply(
     }
     let mut reply = super::synthetic_dispatch_refusal(refusal);
     let remedy = match refusal {
+        DispatchError::FrontingBoundExceeded
+            if bracket.is_some_and(|bracket| bracket.chunks == 0) =>
+        {
+            Some(
+                "the measured restore and send costs are unknown or cannot fit the fronting \
+                 allowance. Nothing was sent and nothing was brought forward; retrying is safe. \
+                 Use write_text on a settable element when possible",
+            )
+        }
         DispatchError::FrontingFailed => Some(
             "the application did not come to the front in time, so nothing more was posted; \
              use write_text on a settable element, or retry",

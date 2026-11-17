@@ -299,6 +299,10 @@ async fn an_unreadable_reason_reaches_the_wire_with_its_own_remedy() {
             UnreadableReason::WindowListUnavailable,
             "window-reading permission",
         ),
+        (
+            UnreadableReason::RunningAppListUnavailable,
+            "the list of running applications could not be read; nothing was done, retry shortly",
+        ),
     ] {
         let plane = Arc::new(ManagementPlane::new(Arc::new(Fixed(
             TargetResolution::Unreadable(reason.clone()),
@@ -323,7 +327,7 @@ async fn an_unreadable_reason_reaches_the_wire_with_its_own_remedy() {
             remedy.contains(remedy_names),
             "the remedy for {reason:?} does not name its own fix: {remedy}"
         );
-        // Five reasons, five distinct remedies. A shared remedy would mean a
+        // Every reason has a distinct remedy. A shared remedy would mean a
         // reason with nothing to say for itself, which is the collapse again.
         assert!(
             seen.insert(remedy.to_string()),

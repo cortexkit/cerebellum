@@ -661,6 +661,45 @@ impl Lookup {
         self.process_refusal(grant, titles).is_some()
     }
 
+    pub(super) fn pointer_refusal(&self, grant: &ProcessGrant) -> Option<Value> {
+        let mut reply = self.process_refusal(grant, Vec::new())?;
+        let name = self
+            .source
+            .running_apps()
+            .ok()
+            .and_then(|apps| {
+                apps.into_iter().find(|app| {
+                    app.pid == grant.pid
+                        && !app.name.trim().is_empty()
+                        && !app.name.eq_ignore_ascii_case(&grant.bundle_identity)
+                })
+            })
+            .map(|app| app.name.trim().to_string())
+            .unwrap_or_else(|| self.management.application_name(grant));
+        let name = cerebellum_computer::app_state::render::one_line(&name);
+        reply["remedy"] = json!(format!(
+            "The pointer is over {name}, which agents may not use because it confirms the person's own actions. Nothing was read or done in it, and nobody was asked. Move the pointer to the intended application's window, then retry; to use {name}, ask the person to act in the app themselves."
+        ));
+        Some(reply)
+    }
+
+    fn pointer_location_refusal(&self) -> Option<Value> {
+        let point = self.source.cursor_position()?;
+        let (_, Some(pid)) = self
+            .source
+            .element_at(
+                cerebellum_computer::app_state::source::HitScope::SystemWide,
+                point,
+            )
+            .ok()
+            .flatten()?
+        else {
+            return None;
+        };
+        let grant = self.management.process_for_pid(pid)?;
+        self.pointer_refusal(&grant)
+    }
+
     /// The refusal for a target given by name or app identity, if it is an operator app.
     ///
     /// The target as given is checked first, so naming an operator app is
@@ -912,7 +951,11 @@ where
                 return Some(refused);
             }
             frontmost
-                .then(|| lookup.frontmost_refusal())
+                .then(|| {
+                    lookup
+                        .pointer_location_refusal()
+                        .or_else(|| lookup.frontmost_refusal())
+                })
                 .flatten()
                 .map(|reply| ("frontmost application".to_string(), reply))
         })

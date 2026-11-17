@@ -768,6 +768,7 @@ fn the_keystroke_settle_reads_nothing_once_the_call_is_answered() {
 struct FocusDesk {
     focused: AtomicUsize,
     window_title: std::sync::Mutex<String>,
+    windows: std::sync::Mutex<Vec<u32>>,
     frontmost: std::sync::Mutex<Option<u32>>,
     hardware: std::sync::Mutex<Result<(std::time::Instant, Option<std::time::Instant>), ()>>,
 }
@@ -777,6 +778,7 @@ impl FocusDesk {
         Self {
             focused: AtomicUsize::new(1),
             window_title: std::sync::Mutex::new("General".into()),
+            windows: std::sync::Mutex::new(vec![100]),
             frontmost: std::sync::Mutex::new(Some(42)),
             hardware: std::sync::Mutex::new(Ok((covered_since, None))),
         }
@@ -835,9 +837,12 @@ impl cerebellum_computer::app_state::source::AppStateSource for FocusDesk {
         Option<cerebellum_computer::app_state::source::WindowMark>,
         cerebellum_computer::app_state::source::ElementActionError,
     > {
+        let Some(window) = self.windows.lock().unwrap().first().copied() else {
+            return Ok(None);
+        };
         Ok(Some(cerebellum_computer::app_state::source::WindowMark {
             handle: Arc::new(cerebellum_computer::app_state::source::FixtureElementToken(
-                100,
+                u64::from(window),
             )),
             title: Some(self.window_title.lock().unwrap().clone()),
         }))
@@ -845,6 +850,10 @@ impl cerebellum_computer::app_state::source::AppStateSource for FocusDesk {
 
     fn frontmost_pid(&self) -> Option<u32> {
         *self.frontmost.lock().unwrap()
+    }
+
+    fn visible_window_numbers(&self, _: &ProcessGrant) -> Option<Vec<u32>> {
+        Some(self.windows.lock().unwrap().clone())
     }
 
     fn hardware_input(
@@ -869,6 +878,17 @@ fn person_check_after(
     cerebellum_computer::app_state::session::AppStateSessions,
     FocusDesk,
 ) {
+    person_check_after_read(false, change)
+}
+
+fn person_check_after_read(
+    after_agent_input: bool,
+    change: impl FnOnce(&FocusDesk),
+) -> (
+    Result<super::element_actions::PersonCheck, ()>,
+    cerebellum_computer::app_state::session::AppStateSessions,
+    FocusDesk,
+) {
     use cerebellum_computer::app_state::person::SeenMarks;
     let target = grant(42, EDITOR);
     let desk = FocusDesk::new(std::time::Instant::now());
@@ -883,7 +903,9 @@ fn person_check_after(
             read_bound_reached: false,
         },
     );
-    sessions.remember_seen("conversation", &target, SeenMarks::read(&desk, &target));
+    let mut seen = SeenMarks::read(&desk, &target);
+    seen.after_agent_input = after_agent_input;
+    sessions.remember_seen("conversation", &target, seen);
     change(&desk);
     let checked = super::element_actions::person_check_before_action(
         &desk,
@@ -892,6 +914,59 @@ fn person_check_after(
         &target,
     );
     (checked, sessions, desk)
+}
+
+#[test]
+fn an_autosave_retitle_after_agent_input_is_not_person_activity() {
+    use super::element_actions::PersonCheck;
+    for background in [false, true] {
+        let (checked, _, _) = person_check_after_read(true, |desk| {
+            *desk.window_title.lock().unwrap() = "Untitled.rtf".into();
+            if background {
+                *desk.frontmost.lock().unwrap() = Some(7);
+            }
+        });
+        assert!(matches!(checked, Ok(PersonCheck::Unchanged)), "{checked:?}");
+    }
+}
+
+#[test]
+fn an_agent_retitle_exception_never_absorbs_person_input_or_window_changes() {
+    use super::element_actions::PersonCheck;
+    type Change = (&'static str, fn(&FocusDesk));
+    let cases: [Change; 6] = [
+        ("person input", |desk| {
+            desk.hardware.lock().unwrap().as_mut().unwrap().1 = Some(std::time::Instant::now())
+        }),
+        ("observer gap", |desk| {
+            desk.hardware.lock().unwrap().as_mut().unwrap().0 = std::time::Instant::now()
+        }),
+        ("observer unavailable", |desk| {
+            *desk.hardware.lock().unwrap() = Err(())
+        }),
+        ("new window", |desk| desk.windows.lock().unwrap().push(200)),
+        ("closed window", |desk| desk.windows.lock().unwrap().clear()),
+        ("different focused window", |desk| {
+            desk.windows.lock().unwrap()[0] = 200
+        }),
+    ];
+    for (name, change) in cases {
+        let (checked, _, _) = person_check_after_read(true, |desk| {
+            *desk.window_title.lock().unwrap() = "Untitled.rtf".into();
+            change(desk);
+        });
+        assert!(
+            matches!(checked, Ok(PersonCheck::Changed(_))),
+            "{name}: {checked:?}"
+        );
+    }
+    let (checked, _, _) = person_check_after(|desk| {
+        *desk.window_title.lock().unwrap() = "another tab".into();
+    });
+    assert!(
+        matches!(checked, Ok(PersonCheck::Changed(_))),
+        "a title changed before agent input: {checked:?}"
+    );
 }
 
 /// The application moved its own focus (Discord after a server switch) while
