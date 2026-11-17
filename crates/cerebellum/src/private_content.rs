@@ -20,12 +20,13 @@ use serde_json::{json, Value};
 
 use crate::{AcceptedBindFacts, Frame, ModuleError, Planes};
 
+mod agent_marks;
+
 pub(crate) const QUERY: &str = "private_content.query";
 pub(crate) const CAPABILITY: &str = "private-content-marks/v1";
-/// Version 2 keeps head marks apart from run marks. Version 1 files (a single
-/// `scopes` map) are still read, and are rewritten as version 2 only by the
-/// first write, which raises the format floor first.
-pub const PRIVATE_CONTENT_FORMAT: DurableFormat = DurableFormat::new("private-content-marks", 2);
+/// Agent attribution and imported agent marks require version 3. Unattributed
+/// writes still use version 2, leaving rollback possible until attribution is used.
+pub const PRIVATE_CONTENT_FORMAT: DurableFormat = DurableFormat::new("private-content-marks", 3);
 const RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 const REFRESH_MS: u64 = 60 * 60 * 1000;
 const FILE_NAME: &str = "private-content-marks.json";
@@ -41,6 +42,7 @@ pub(crate) enum Source {
     PersonBrowser,
     DesktopApp,
     SignedInSite,
+    Unattributed,
 }
 
 const SOURCES: [Source; 3] = [
@@ -61,7 +63,30 @@ pub(crate) enum Retention {
     Run,
 }
 
-type Marks = BTreeMap<String, BTreeMap<Source, u64>>;
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum Mark {
+    Legacy(u64),
+    Attributed { at_ms: u64, agent_id: String },
+}
+
+impl Mark {
+    fn time(&self) -> u64 {
+        match self {
+            Self::Legacy(time) => *time,
+            Self::Attributed { at_ms, .. } => *at_ms,
+        }
+    }
+
+    fn agent(&self) -> Option<&str> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Attributed { agent_id, .. } => Some(agent_id),
+        }
+    }
+}
+
+type Marks = BTreeMap<String, BTreeMap<Source, Mark>>;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +94,8 @@ struct Document {
     version: u64,
     heads: Marks,
     runs: Marks,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    agents: BTreeMap<String, BTreeSet<Source>>,
 }
 
 /// The first stored shape: one map, every entry kept 24 hours.
@@ -82,7 +109,7 @@ struct DocumentV1 {
 impl Document {
     fn empty() -> Self {
         Self {
-            version: PRIVATE_CONTENT_FORMAT.version,
+            version: 2,
             ..Self::default()
         }
     }
@@ -114,11 +141,22 @@ impl Document {
             for (scope, sources) in other.marks(retention) {
                 let mine = self.marks_mut(retention).entry(scope.clone()).or_default();
                 for (source, time) in sources {
-                    let entry = mine.entry(*source).or_insert(*time);
-                    *entry = (*entry).max(*time);
+                    let entry = mine.entry(*source).or_insert_with(|| time.clone());
+                    if time.agent() != entry.agent() {
+                        *entry = Mark::Legacy(time.time().max(entry.time()));
+                    } else if time.time() > entry.time() {
+                        *entry = time.clone();
+                    }
                 }
             }
         }
+        for (agent, sources) in &other.agents {
+            self.agents
+                .entry(agent.clone())
+                .or_default()
+                .extend(sources);
+        }
+        self.version = self.version.max(other.version);
     }
 }
 
@@ -147,7 +185,7 @@ fn load(path: &Path) -> io::Result<Option<Document>> {
                 ..Document::empty()
             }
         }
-        Some(2) => serde_json::from_value(value)?,
+        Some(2 | 3) => serde_json::from_value(value)?,
         _ => return Err(invalid()),
     };
     if document
@@ -158,12 +196,30 @@ fn load(path: &Path) -> io::Result<Option<Document>> {
     {
         return Err(invalid());
     }
+    if document.agents.keys().any(|agent| agent.is_empty())
+        || document
+            .heads
+            .values()
+            .chain(document.runs.values())
+            .flat_map(|marks| marks.values())
+            .any(|mark| mark.agent().is_some_and(str::is_empty))
+        || (document.version < 3
+            && (!document.agents.is_empty()
+                || document
+                    .heads
+                    .values()
+                    .chain(document.runs.values())
+                    .flat_map(|marks| marks.values())
+                    .any(|mark| mark.agent().is_some())))
+    {
+        return Err(invalid());
+    }
     Ok(Some(document))
 }
 
 /// Written atomically, owner-only: a temporary file, synced, renamed over the
 /// target, then the directory synced.
-fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let directory = path.parent().expect("private-content directory");
     let temporary = path.with_extension(format!(
         "{}.{}.tmp",
@@ -416,17 +472,32 @@ impl PrivateContent {
             .store(deadline.as_millis() as u64, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     pub(crate) fn answer(&self, scopes: &[&str], now: u64) -> Value {
+        self.answer_agents(scopes, &[], now)
+    }
+
+    fn answer_agents(&self, scopes: &[&str], agents: &[Option<String>], now: u64) -> Value {
         let mut state = self.state.lock().unwrap();
         prune(&mut state.document, now);
-        let sources: BTreeSet<_> = if state.fails_closed(now) {
-            SOURCES.into_iter().collect()
-        } else {
-            scopes
-                .iter()
-                .flat_map(|scope| state.document.sources(scope))
-                .collect()
-        };
+        let mut sources: BTreeSet<_> =
+            if state.fails_closed(now) || agents.iter().any(Option::is_none) {
+                SOURCES.into_iter().collect()
+            } else {
+                scopes
+                    .iter()
+                    .flat_map(|scope| state.document.sources(scope))
+                    .collect()
+            };
+        for agent in agents.iter().flatten() {
+            if let Some(marks) = state.document.agents.get(agent) {
+                sources.extend(marks);
+            }
+        }
+        // Broca's v1 decoder accepts only these three source words.
+        if sources.remove(&Source::Unattributed) {
+            sources.extend(SOURCES);
+        }
         json!({"private_content": !sources.is_empty(), "sources": sources})
     }
 
@@ -451,6 +522,7 @@ impl PrivateContent {
 
     /// Records `source` for every target in memory, then waits a bounded time
     /// for the file to catch up when it must.
+    #[cfg(test)]
     async fn mark_all(self: &Arc<Self>, targets: &[(String, Retention)], source: Source, now: u64) {
         if let Some(failures) = self.record(targets, &[source], now) {
             self.write(failures, now).await;
@@ -460,17 +532,49 @@ impl PrivateContent {
     /// Records the marks in memory. Returns the failure count to write
     /// against when the file must be written, `None` when it need not be.
     fn record(&self, targets: &[(String, Retention)], sources: &[Source], now: u64) -> Option<u64> {
+        self.record_agent(targets, sources, now, None)
+    }
+
+    fn record_agent(
+        &self,
+        targets: &[(String, Retention)],
+        sources: &[Source],
+        now: u64,
+        agent: Option<&str>,
+    ) -> Option<u64> {
         let mut state = self.state.lock().unwrap();
         prune(&mut state.document, now);
         let mut needed = false;
         for (scope, retention) in targets {
             for source in sources {
+                let previous = state
+                    .document
+                    .marks(*retention)
+                    .get(scope)
+                    .and_then(|marks| marks.get(source));
+                // An old unattributed read must not become somebody's private
+                // read by inference. Conflicting ownership also stays unknown.
+                let agent = agent
+                    .filter(|id| !id.is_empty())
+                    .filter(|id| previous.is_none_or(|mark| mark.agent() == Some(*id)));
                 state
                     .document
                     .marks_mut(*retention)
                     .entry(scope.clone())
                     .or_default()
-                    .insert(*source, now);
+                    .insert(
+                        *source,
+                        match agent {
+                            Some(agent_id) => Mark::Attributed {
+                                at_ms: now,
+                                agent_id: agent_id.to_owned(),
+                            },
+                            None => Mark::Legacy(now),
+                        },
+                    );
+                if agent.is_some() {
+                    state.document.version = 3;
+                }
                 // Memory always holds the newest timestamp, but the file is
                 // rewritten only for a new (scope, source) pair or, for a run,
                 // when the persisted timestamp is at least an hour old, so
@@ -485,8 +589,9 @@ impl PrivateContent {
                     .and_then(|marks| marks.get(source));
                 needed |= match (retention, saved) {
                     (_, None) => true,
+                    (_, Some(saved)) if saved.agent() != agent => true,
                     (Retention::Head, Some(_)) => false,
-                    (Retention::Run, Some(saved)) => now.saturating_sub(*saved) >= REFRESH_MS,
+                    (Retention::Run, Some(saved)) => now.saturating_sub(saved.time()) >= REFRESH_MS,
                 };
             }
         }
@@ -495,7 +600,7 @@ impl PrivateContent {
         (needed || repairable).then_some(state.failures)
     }
 
-    async fn write(self: &Arc<Self>, failures: u64, now: u64) {
+    async fn write(self: &Arc<Self>, failures: u64, now: u64) -> bool {
         // One deadline covers waiting for the single writer permit and the
         // write itself, so a slow or hung disk delays a content reply by at
         // most this phase. Writes are serialized by the one-permit pool: each
@@ -532,7 +637,9 @@ impl PrivateContent {
             // query as marked until a later write succeeds, and keeps its
             // in-use marker so a restart does too.
             self.fail_closed();
+            return false;
         }
+        true
     }
 
     fn fail_closed(&self) {
@@ -582,7 +689,10 @@ impl PrivateContent {
             return Err(io::Error::other("private-content marks exceed size limit"));
         }
         self.floor
-            .raise(PRIVATE_CONTENT_FORMAT)
+            .raise(DurableFormat::new(
+                PRIVATE_CONTENT_FORMAT.name,
+                document.version,
+            ))
             .map_err(io::Error::other)?;
         write_atomically(path, &bytes)?;
         // Recorded while still holding the writer permit, so the persisted
@@ -602,7 +712,7 @@ impl PrivateContent {
 /// Run marks lapse 24 hours after their latest read; head marks never do.
 fn prune(document: &mut Document, now: u64) {
     document.runs.retain(|_, sources| {
-        sources.retain(|_, timestamp| now.saturating_sub(*timestamp) < RETENTION_MS);
+        sources.retain(|_, mark| now.saturating_sub(mark.time()) < RETENTION_MS);
         !sources.is_empty()
     });
 }
@@ -881,10 +991,26 @@ pub(crate) async fn mark_delivered(
         ReplyPlane::OwnBrowserReplay => content.then_some(Source::SignedInSite),
     };
     if let Some(source) = source {
-        planes
-            .private_content
-            .mark_all(&mark_targets(facts), source, crate::wall_clock_ms())
-            .await;
+        let now = crate::wall_clock_ms();
+        let mut pending = None;
+        for target in mark_targets(facts) {
+            let agent = facts
+                .scope
+                .as_ref()
+                .filter(|stamp| stamp.scope_ref == target.0)
+                .and_then(|stamp| stamp.attributes.agent_id.clone())
+                .or_else(|| agent_marks::bound_agent(planes, &target.0));
+            if let Some(failures) =
+                planes
+                    .private_content
+                    .record_agent(&[target], &[source], now, agent.as_deref())
+            {
+                pending = Some(failures);
+            }
+        }
+        if let Some(failures) = pending {
+            planes.private_content.write(failures, now).await;
+        }
     }
 }
 
@@ -983,9 +1109,7 @@ pub(crate) async fn handle(
     };
     let scopes = scope_union(planes, scope, parent);
     let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
-    let reply = planes
-        .private_content
-        .answer(&scopes, crate::wall_clock_ms());
+    let reply = agent_marks::query(planes, &scopes).await;
     crate::send_tool_response(writer, ver, channel, epoch, corr, reply).await
 }
 
