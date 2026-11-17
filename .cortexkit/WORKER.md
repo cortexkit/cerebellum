@@ -64,3 +64,14 @@ These still come to the head before you change them:
 
 - Tests never read `~/.config/cortexkit/cerebellum.jsonc` and never write the live journal. Use the isolated constructors (`JournalMode::Isolated`, `new_in_memory`).
 - Test binaries that relaunch themselves, and fixture executables, go under `/tmp`, never `$TMPDIR` or the build folder.
+
+## Desk probes
+
+A desk probe is an `examples/` program that drives real windows. Workers build desk probes but never run them. The head runs them with the person, after an announced notice.
+
+- **Feature:** build behind `--features desk-probe`.
+- **Approval:** refuse to run unless `CK_DESK_PROBE_APPROVED=1`.
+- **Scratch data:** require an explicit `XDG_DATA_HOME` that is an existing owner-only (0700), non-symlink directory under `/tmp/cereb-desk/`. Exit with code 2 when it is missing, so a probe never reads or writes the operator's live journals. Leave `HOME` unchanged.
+- **Own windows only:** act only on windows the probe opened itself, behind the front app through LaunchServices. Keep them in a 0700 scratch folder with 0600 documents. Close only what the probe proves it launched.
+- **No clipboard:** never read, write or restore the shared clipboard.
+- **Output:** write it only to `/tmp/cereb-desk/run-*.log`, with no screen text beyond the probe's own scratch text.
