@@ -22,13 +22,13 @@ where
         management: &Arc<ManagementPlane>,
         work: &quarantine::CallWork,
     ) -> Option<Value> {
-        if AppUse::Background != app_use::call_mode().unwrap_or(AppUse::Background)
+        if !matches!(&parsed.action, SyntheticAction::KeyCombination { key: SyntheticKey::A, modifiers }
+                if modifiers.command && !modifiers.shift && !modifiers.control && !modifiers.option && !modifiers.windows)
+            || AppUse::Background != app_use::call_mode().unwrap_or(AppUse::Background)
             || self
                 .app_state_source
                 .frontmost_pid()
                 .is_none_or(|pid| pid == grant.pid)
-            || !matches!(&parsed.action, SyntheticAction::KeyCombination { key: SyntheticKey::A, modifiers }
-                if modifiers.command && !modifiers.shift && !modifiers.control && !modifiers.option && !modifiers.windows)
         {
             return None;
         }

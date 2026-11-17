@@ -975,9 +975,13 @@ fn pointer_recipient_skips_our_panels_and_bounds_repeated_panel_answers() {
     ] {
         let mut answers = answers.into_iter();
         let calls = std::cell::Cell::new(0);
-        let got = mouse_down_window_at([100.0, 100.0], 900.0, &windows, |_, _| {
+        let previous_answer = std::cell::Cell::new(0);
+        let got = mouse_down_window_at([100.0, 100.0], 900.0, &windows, |_, below| {
+            assert_eq!(below, previous_answer.get());
             calls.set(calls.get() + 1);
-            answers.next().unwrap()
+            let answer = answers.next().unwrap();
+            previous_answer.set(answer);
+            answer
         });
         assert_eq!(got, expected);
         assert!(calls.get() <= 5);
