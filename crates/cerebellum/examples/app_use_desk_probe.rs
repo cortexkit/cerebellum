@@ -204,8 +204,12 @@ fn print_timing_summary(name: &str, values: &[f64]) {
     }
 }
 
+fn needs_front_summary_header(attempt_count: usize) -> String {
+    format!("SUMMARY needs-front attempts: {attempt_count}; production bound unchanged at {} ms; median averages the middle pair, p90 is nearest-rank", cerebellum::budgets::FRONTING_BRACKET_MS)
+}
+
 fn print_needs_front_summary(attempts: &[AttemptTiming]) {
-    println!("SUMMARY needs-front attempts: {}; production bound unchanged at 100 ms; median averages the middle pair, p90 is nearest-rank", attempts.len());
+    println!("{}", needs_front_summary_header(attempts.len()));
     for (name, values) in [
         (
             "request→frontmost (in-call or late)",
@@ -2905,6 +2909,16 @@ mod tests {
 
     const PERSON: i32 = 100;
     const TARGET: i32 = 200;
+
+    #[test]
+    fn needs_front_summary_reports_the_production_bound() {
+        let header = needs_front_summary_header(7);
+        assert!(header.starts_with("SUMMARY needs-front attempts: 7;"));
+        assert!(header.contains(&format!(
+            "production bound unchanged at {} ms;",
+            cerebellum::budgets::FRONTING_BRACKET_MS
+        )));
+    }
 
     fn sample(at_ms: u128, front: i32, needs_front: bool) -> FrontSample {
         FrontSample {
