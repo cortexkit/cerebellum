@@ -187,18 +187,32 @@ pub(crate) fn mouse_down_window_at(
     point: [f64; 2],
     primary_height: f64,
     windows: &[Window],
-    query: impl FnOnce([f64; 2]) -> isize,
+    mut query: impl FnMut([f64; 2], isize) -> isize,
 ) -> Option<u32> {
     if !point.iter().all(|v| v.is_finite()) || !primary_height.is_finite() || primary_height <= 0.0
     {
         return None;
     }
-    let number = u32::try_from(query([point[0], primary_height - point[1]]))
-        .ok()
-        .filter(|number| *number != 0)?;
-    let window = windows
-        .iter()
-        .find(|window| window.id == Some(number) && window.pid.is_some())?;
+    let mut below = 0;
+    // Our previews and badge ignore mouse events. Some AppKit queries still
+    // return their panel number, so ask below it just as a real click passes
+    // through. Four panels plus the recipient fit; repeated answers fail closed.
+    let mut recipient = None;
+    for _ in 0..5 {
+        let number = u32::try_from(query([point[0], primary_height - point[1]], below))
+            .ok()
+            .filter(|number| *number != 0)?;
+        let window = windows
+            .iter()
+            .find(|window| window.id == Some(number) && window.pid.is_some())?;
+        if window.cursor_picture {
+            below = isize::try_from(number).ok()?;
+        } else {
+            recipient = Some((number, window));
+            break;
+        }
+    }
+    let (number, window) = recipient?;
     let bounds = window.bounds?;
     (bounds.valid()
         && [bounds.x, bounds.y, bounds.width, bounds.height]
@@ -915,18 +929,57 @@ fn native_mouse_hit_test_uses_appkit_recipient_below_a_fullscreen_clickthrough_o
     // mouse-down. The same list would otherwise pick the overlay's rectangle.
     assert_eq!(topmost_window_at([220.0, 220.0], &windows), Some(23));
     assert_eq!(
-        mouse_down_window_at([220.0, 220.0], 900.0, &windows, |point| {
+        mouse_down_window_at([220.0, 220.0], 900.0, &windows, |point, below| {
             assert_eq!(point, [220.0, 680.0]);
+            assert_eq!(below, 0);
             77
         }),
         Some(77)
     );
     assert_eq!(
-        mouse_down_window_at([220.0, 220.0], 900.0, &windows, |_| 0),
+        mouse_down_window_at([220.0, 220.0], 900.0, &windows, |_, _| 0),
         None
     );
     assert_eq!(
-        mouse_down_window_at([220.0, 220.0], 900.0, &windows, |_| 78),
+        mouse_down_window_at([220.0, 220.0], 900.0, &windows, |_, _| 78),
         None
     );
+}
+
+#[cfg(test)]
+#[test]
+fn pointer_recipient_skips_our_panels_and_bounds_repeated_panel_answers() {
+    let window = |id, ours| Window {
+        id: Some(id),
+        pid: Some(41),
+        bounds: Some(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 500.0,
+            height: 500.0,
+        }),
+        alpha: Some(1.0),
+        layer: Some(if ours { 20 } else { 0 }),
+        cursor_picture: ours,
+    };
+    let windows = [
+        window(11, true),
+        window(12, true),
+        window(77, false),
+        window(88, false),
+    ];
+    for (answers, expected) in [
+        (vec![11, 77], Some(77)),
+        (vec![11, 12, 88], Some(88)),
+        (vec![11; 9], None),
+    ] {
+        let mut answers = answers.into_iter();
+        let calls = std::cell::Cell::new(0);
+        let got = mouse_down_window_at([100.0, 100.0], 900.0, &windows, |_, _| {
+            calls.set(calls.get() + 1);
+            answers.next().unwrap()
+        });
+        assert_eq!(got, expected);
+        assert!(calls.get() <= 5);
+    }
 }

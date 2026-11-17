@@ -174,36 +174,56 @@ async fn read(
     if takeover {
         grant_takeover(&management).await;
     }
-    let carrier = ScriptedCarrier::default();
+    let carrier = ScriptedCarrier::answering(&["computer_30m"]);
     let clock = FakeClock::new();
-    let reply = with_terminal(
-        "computer.read_state",
-        plane.serve(
-            servable("computer.read_state").unwrap(),
-            &json!({"target":TARGET_BUNDLE_ID,"include_image":true,"bring_to_front":true}),
-            ServeContext {
-                cancel: cerebellum::CancelHandle::pending(),
-                grantee: GRANTEE,
-                identity: identity(),
-                management: &management,
-                consent: relayed(&carrier),
-                clock: &clock,
-                now_ms: 10,
-            },
-            |_| TrackedCapture {
-                inner: capturing(jpeg(1250, 750, 0)),
-                captures: captures.clone(),
-                encodes: encodes.clone(),
-                frontmost,
-            },
-        ),
-    )
-    .await
-    .expect("the fronted read passes the closed v21 reply schema");
-    assert!(
-        carrier.questions().is_empty(),
-        "read_state never asks for takeover"
-    );
+    let invoke = || async {
+        with_terminal(
+            "computer.read_state",
+            plane.serve(
+                servable("computer.read_state").unwrap(),
+                &json!({"target":TARGET_BUNDLE_ID,"include_image":true,"bring_to_front":true}),
+                ServeContext {
+                    cancel: cerebellum::CancelHandle::pending(),
+                    grantee: GRANTEE,
+                    identity: identity(),
+                    management: &management,
+                    consent: relayed(&carrier),
+                    clock: &clock,
+                    now_ms: 10,
+                },
+                |_| TrackedCapture {
+                    inner: capturing(jpeg(1250, 750, 0)),
+                    captures: captures.clone(),
+                    encodes: encodes.clone(),
+                    frontmost: frontmost.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("the fronted read passes the closed reply schema")
+    };
+    let mut reply = invoke().await;
+    if !takeover {
+        assert_eq!(reply["outcome"], "consent_granted_not_executed", "{reply}");
+        assert!(reply["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("Nothing was brought forward"));
+        assert!(shared.lock().unwrap().image_front_requests.is_empty());
+        assert_eq!(captures.load(Ordering::SeqCst), 0);
+        assert_eq!(carrier.questions().len(), 1);
+        reply = invoke().await;
+        assert_eq!(
+            carrier.questions().len(),
+            1,
+            "the re-issued read uses the held grant"
+        );
+    } else {
+        assert!(
+            carrier.questions().is_empty(),
+            "a held takeover never asks again"
+        );
+    }
     assert!(plane.result_schema_findings().is_empty());
     assert_eq!(
         encodes.load(Ordering::SeqCst),
@@ -241,20 +261,15 @@ async fn read(
 }
 
 #[tokio::test]
-async fn covered_without_takeover_returns_tree_and_never_fronts() {
+async fn approving_a_covered_read_never_fronts_but_a_reissued_read_uses_the_grant() {
     let (reply, row, shared, captures) = read(false, FrontingScript::default(), false, false).await;
-    assert_eq!(reply["image_unavailable"]["reason"], "image_needs_takeover");
-    assert_eq!(reply["image_unavailable"]["detail"]["grant"], "takeover");
+    assert!(reply.get("image").is_some(), "{reply}");
+    assert_eq!(captures, 1);
     assert_eq!(
-        reply["image_unavailable"]["detail"]["scope"],
-        json!({"takeover":"machine"})
+        shared.lock().unwrap().image_front_requests,
+        vec![grant().pid, OTHER_APPLICATION_PID]
     );
-    assert!(reply.get("image").is_none());
-    assert!(shared.lock().unwrap().image_front_requests.is_empty());
-    assert_eq!(captures, 0);
-    assert_eq!(row["image_decision"], "covered_by_window");
-    assert_eq!(row["image_returned"], false);
-    assert!(row.get("image_fronting").is_none());
+    assert_eq!(row["image_returned"], true);
 }
 
 #[tokio::test]
@@ -404,7 +419,7 @@ async fn person_change_refuses_fronting_but_does_not_block_an_unfronted_read() {
         let reply = serve_asking(
             &plane,
             "computer.read_state",
-            json!({"target": TARGET_BUNDLE_ID, "include_image": true, "bring_to_front": true}),
+            json!({"target": TARGET_BUNDLE_ID, "include_image": true, "bring_to_front": takeover}),
             &management,
             no_relay(),
         )
@@ -414,7 +429,10 @@ async fn person_change_refuses_fronting_but_does_not_block_an_unfronted_read() {
             assert_eq!(reply["reason"], "window_changed");
         } else {
             assert_eq!(reply["outcome"], "completed");
-            assert_eq!(reply["image_unavailable"]["reason"], "image_needs_takeover");
+            assert_eq!(
+                reply["image_unavailable"]["reason"],
+                "window_covered_may_be_stale"
+            );
         }
         assert!(shared.lock().unwrap().image_front_requests.is_empty());
     }

@@ -1343,6 +1343,14 @@ fn run_cursor_loop(
     };
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    if let crate::ProcessStartTime::Started(start_time_micros) =
+        crate::process_start_time(std::process::id())
+    {
+        crate::register_cursor_generation(Some(crate::ProcessGeneration {
+            pid: std::process::id(),
+            start_time_micros,
+        }));
+    }
     app.disableRelaunchOnLogin();
     app.finishLaunching();
     let mut pictures = CursorSchedule::<Picture>::new();

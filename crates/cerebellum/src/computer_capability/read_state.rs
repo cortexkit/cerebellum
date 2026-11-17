@@ -51,6 +51,35 @@ where
         if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
             return locked;
         }
+        if parsed.include_image && parsed.bring_to_front && !consent.unattended {
+            match management
+                .computer_grants()
+                .require(
+                    &crate::computer_grants::GrantNeed::Takeover,
+                    &consent,
+                    &cancel,
+                )
+                .await
+            {
+                Ok(takeover) if takeover.waited => {
+                    // Approval can arrive long after the read was requested.
+                    // Store the grant, but never cover the person's work late.
+                    let mut reply = json!({
+                        "outcome":"consent_granted_not_executed",
+                        "remedy":"Allowed. Nothing was brought forward; read again with include_image and bring_to_front to get the picture."
+                    });
+                    takeover.decorate(&mut reply);
+                    admission.decorate(&mut reply);
+                    return reply;
+                }
+                Ok(_) => {}
+                Err(refusal) => {
+                    let mut reply = refusal.reply(None);
+                    admission.decorate(&mut reply);
+                    return reply;
+                }
+            }
+        }
         let work = quarantine::CallWork::current();
         if let Some(mut busy) = work.bind(&self.serializer.quarantine, &grant).await {
             admission.decorate(&mut busy);

@@ -379,6 +379,47 @@ async fn open_app_refuses_an_installed_operator_app_found_by_name() {
 }
 
 #[tokio::test]
+async fn pointer_refusals_name_the_operator_app_under_the_pointer_not_the_target() {
+    let rig = fixture();
+    {
+        let mut desk = rig.desk.state();
+        desk.real_cursor = Some((10.0, 10.0));
+        desk.system_wide_hit = Some((99, Some(ALFONSO_PID)));
+    }
+    let ordinary = image(&rig, &grant());
+    for (name, arguments) in [
+        (
+            "computer.takeover_move",
+            json!({"image_id":ordinary,"to":{"x":10,"y":10}}),
+        ),
+        (
+            "computer.takeover_click",
+            json!({"image_id":ordinary,"x":10,"y":10}),
+        ),
+        (
+            "computer.takeover_drag",
+            json!({"image_id":ordinary,"from":{"x":10,"y":10},"to":{"x":20,"y":20}}),
+        ),
+        (
+            "computer.takeover_scroll",
+            json!({"target":TARGET_BUNDLE_ID,"axis":"vertical","amount_lines":1}),
+        ),
+    ] {
+        let carrier = ScriptedCarrier::answering(&["allow_30m"; 4]);
+        let reply = serve(&rig, name, &arguments, relayed(&carrier)).await;
+        assert_eq!(reply["reason"], "operator_app_blocked", "{reply}");
+        assert!(
+            reply["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("The pointer is over Alfonso, which agents may not use"),
+            "{reply}"
+        );
+        assert!(carrier.questions().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn a_takeover_aimed_at_or_over_an_operator_app_is_refused_before_posting() {
     let point = json!({"x": 10, "y": 10});
     // The image shows an operator app.
