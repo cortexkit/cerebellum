@@ -233,13 +233,6 @@ mod tests {
         assert!(
             ThalamusNotice::parse(&names, &foreign, Some(&id), Some("a"), Some(session)).is_none()
         );
-        assert_eq!(
-            subjects(&names, "cerebellum").unwrap(),
-            [
-                "ck.test.live.thalamus-harness.turn_started.v1",
-                "ck.test.live.thalamus-harness.turn_ended.v1"
-            ]
-        );
         let retired = names.live_subject("thalamus-pi", "turn_ended", 1).unwrap();
         assert!(
             ThalamusNotice::parse(&names, &retired, Some(&id), Some("a"), Some(session)).is_none()
@@ -247,9 +240,24 @@ mod tests {
     }
 
     #[test]
-    fn pinned_grants_keep_broca_off_and_an_end_only_grant_enables_just_ends() {
+    fn pinned_grants_subscribe_cerebellum_to_all_broca_run_events() {
         let names = AccountNames::derive("test").unwrap();
-        let thalamus_only = subjects(&names, "cerebellum").unwrap();
+        assert_eq!(
+            subjects(&names, "cerebellum").unwrap(),
+            [
+                "ck.test.live.thalamus-harness.turn_started.v1",
+                "ck.test.live.thalamus-harness.turn_ended.v1",
+                "ck.test.event.broca.run.started.v1",
+                "ck.test.event.broca.run.paused.v1",
+                "ck.test.event.broca.run.ended.v1",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_end_only_grant_enables_just_broca_run_ends() {
+        let names = AccountNames::derive("test").unwrap();
+        let thalamus_only = subjects_with_grant(&names, |_| false).unwrap();
         assert_eq!(thalamus_only.len(), 2);
         let end = names.event_subject("broca", "run.ended", 1).unwrap();
         let end_only = subjects_with_grant(&names, |subject| subject == end).unwrap();
