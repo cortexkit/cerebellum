@@ -35,8 +35,10 @@
 //!   callback, accessibility messages to the target) ends at the start of
 //!   the restore reserve, the deadline minus the measured restore reserve.
 //! - A post, a capture or the target's front write may start only before the
-//!   reserve starts. No new press or self-contained post begins preparation
-//!   in the reserve; work already in flight can still finish there, as can
+//!   reserve starts. No new press (a key or button down that leaves input
+//!   held until its paired release) or self-contained post (an event that
+//!   leaves nothing held once it returns) begins preparation in the
+//!   reserve; work already in flight can still finish there, as can
 //!   held-input releases. The reserve accounts for time between its start
 //!   and the owner's decision, restore-thread startup, and preparation for
 //!   the first restore request.
