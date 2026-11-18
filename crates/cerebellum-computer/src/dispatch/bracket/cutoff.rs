@@ -39,8 +39,8 @@ use std::time::{Duration, Instant};
 /// on the cutoff gate. The sequence runs them after the window listing and
 /// transport authentication. Focus is read once, then the focused pid's
 /// generation is validated, so a pid reused by another process fails; stop,
-/// the deadline and commitment follow, with no further read between that
-/// validation and the post. Focus moving to another application during the
+/// the deadline and commitment follow, with no further focus or
+/// process-generation read between that validation and the post. Focus moving to another application during the
 /// generation lookup is the accepted race with delivery: the post still goes
 /// only to the granted process.
 ///

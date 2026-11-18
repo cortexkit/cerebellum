@@ -3271,8 +3271,8 @@ mod restore_slot_tests {
     ) {
         let shared = screen(true);
         {
-            // The activation has not landed, so the owner watches for it
-            // with real poll sleeps until the reserve starts.
+            // The target has not yet become frontmost, so the owner watches
+            // for it with real poll sleeps until the reserve starts.
             let mut screen = shared.lock().unwrap();
             screen.frontmost = Some(PREVIOUS);
             screen.real_pause = true;
@@ -3982,8 +3982,8 @@ mod restore_slot_tests {
                 assert!(cell.begin_front_attempt(0));
                 cell.front_confirmed();
                 cell.front_attempt_returned();
-                // The bound has passed since: the first restore write is
-                // refused.
+                // The bound is already in the past, so the first restore
+                // write is refused.
                 let past = std::time::Instant::now() - Duration::from_millis(1);
                 gate.set_bound(past, past);
                 own_until_stopped(Arc::clone(&cell), Owner::Restores);
