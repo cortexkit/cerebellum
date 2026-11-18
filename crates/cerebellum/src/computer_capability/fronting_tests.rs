@@ -818,7 +818,9 @@ struct FakeBracket(Screen);
 
 impl RestoreHostSource for FakeBracket {
     fn restore_host(&self) -> Box<dyn FrontingRestoreHost> {
-        let blocks = self.0.state().register_blocks_ms;
+        // Registration's cost, paid once: the cutoff timer's own restore host
+        // is made right after the obligation's and adds nothing here.
+        let blocks = std::mem::take(&mut self.0.state().register_blocks_ms);
         if blocks > 0 {
             std::thread::sleep(Duration::from_millis(blocks));
         }
@@ -1980,8 +1982,14 @@ async fn a_third_app_switch_is_left_alone_with_or_without_hardware_evidence() {
 struct CleanupFirst(CellHooks);
 
 impl FrontedDispatchHooks for CleanupFirst {
-    fn register(&mut self, previous: u32, target: u32, host: Box<dyn FrontingRestoreHost>) -> bool {
-        let registered = self.0.register(previous, target, host);
+    fn register(
+        &mut self,
+        previous: u32,
+        target: u32,
+        host: Box<dyn FrontingRestoreHost>,
+        gate: &Arc<cerebellum_computer::dispatch::CutoffGate>,
+    ) -> bool {
+        let registered = self.0.register(previous, target, host, gate);
         if let Some(cell) = self.0.cell() {
             let decided = std::thread::scope(|scope| scope.spawn(|| cell.decide()).join().unwrap());
             assert_eq!(decided.restore, RestoreStatus::NotNeeded);

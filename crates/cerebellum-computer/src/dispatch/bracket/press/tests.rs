@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::dispatch::bracket::{
-    not_fronted_reason, CleanupTake, FrontAttempt, HardwareInputSnapshot, NotFrontedReason,
+    not_fronted_reason, CutoffGate, HardwareInputSnapshot, NotFrontedReason, OrdinaryClaim,
     UnitPosted,
 };
 use crate::dispatch::seize::{
@@ -86,7 +86,7 @@ struct PressDesk {
     /// Cleanup takes the obligation as soon as it is registered, as if the
     /// worker were paused right after registering it.
     cleanup_takes_at_registration: bool,
-    attempt: FrontAttempt,
+    attempt: CutoffGate,
     press_ms: u64,
     /// `None`: each settle takes its whole bound.
     settle_ms: Option<u64>,
@@ -122,7 +122,7 @@ impl PressDesk {
             pending_tap_input: false,
             cancel_once_fronted: false,
             cleanup_takes_at_registration: false,
-            attempt: FrontAttempt::new(),
+            attempt: CutoffGate::new(),
             press_ms: 10,
             settle_ms: None,
             settled_ms: Vec::new(),
@@ -280,15 +280,15 @@ impl FrontingPressHost for PressDesk {
         assert_eq!((previous, target), (PREVIOUS, TARGET));
         self.log.push("register");
         if self.cleanup_takes_at_registration {
-            assert_eq!(self.attempt.take(), CleanupTake::PreventedFront);
+            assert_eq!(self.attempt.claim_ordinary(), OrdinaryClaim::PreventedFront);
         }
         true
     }
     fn begin_front_attempt(&mut self, front_instant_ms: u64) -> bool {
-        self.attempt.begin_dispatch(front_instant_ms)
+        self.attempt.begin_front_attempt(front_instant_ms)
     }
     fn front_attempt_returned(&mut self) {
-        self.attempt.attempt_returned();
+        self.attempt.front_attempt_returned();
     }
     fn admit_fronted_step(&mut self, _step: usize) -> bool {
         true
@@ -353,7 +353,7 @@ impl FrontingPressHost for PressDesk {
     }
     fn claim_restore(&mut self) -> RestoreClaim {
         self.log.push("claim");
-        if self.attempt.taken() {
+        if self.attempt.restore_taken() {
             return RestoreClaim::TakenByCleanup(RestoreStatus::NotNeeded);
         }
         RestoreClaim::Run

@@ -343,7 +343,7 @@ where
         let Some(parts) = self.parts.as_mut() else {
             return false;
         };
-        match parts.register(previous, target, host) {
+        match parts.register(previous, target, host, None) {
             Some(cell) => {
                 self.cell = Some(cell);
                 true

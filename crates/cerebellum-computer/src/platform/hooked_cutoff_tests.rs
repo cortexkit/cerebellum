@@ -266,6 +266,7 @@ impl FrontedDispatchHooks for Hooks {
         previous: u32,
         _target: u32,
         host: Box<dyn FrontingRestoreHost>,
+        _gate: &Arc<CutoffGate>,
     ) -> bool {
         let mut decision = self
             .0
@@ -282,7 +283,10 @@ impl FrontedDispatchHooks for Hooks {
     fn decide_restore(&mut self) -> HookedRestore {
         self.decide()
     }
-    fn cutoff_restore(&mut self) -> Option<Box<dyn FnOnce(crate::dispatch::CutoffWake) + Send>> {
+    fn cutoff_restore(
+        &mut self,
+        _host: Box<dyn FrontingRestoreHost>,
+    ) -> Option<Box<dyn FnOnce(crate::dispatch::CutoffWake) + Send>> {
         let hooks = self.clone();
         Some(Box::new(move |_| {
             hooks.decide();

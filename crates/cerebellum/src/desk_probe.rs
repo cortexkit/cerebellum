@@ -204,6 +204,7 @@ mod tests {
                         purpose: FrontingPurpose::NeedsFront,
                         lock: Box::new(()),
                         host: Box::new(FakeHost(Arc::clone(&worker_screen))),
+                        gate: None,
                     })
                     .unwrap();
                 assert!(cell.begin_front_attempt(10));

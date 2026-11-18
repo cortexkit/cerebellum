@@ -1,5 +1,5 @@
 //! The one restore decision every temporary front ends with, and the state of
-//! a front attempt that cleanup may race.
+//! a front attempt.
 //!
 //! After this module fronts an application for a moment, the previous
 //! application is put back only with continuous observation and a readable
@@ -262,9 +262,9 @@ fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
         Activation::ConfirmedByAction | Activation::ObservedByWatcher
     );
     if previous != target && matches!(activation, Activation::ObserveIfTime) {
-        // Keep the reserve for the final safety reads and native write. Do
-        // not start another observation read after the cutoff.
-        while host.restore_observation_open() {
+        // Observe only while this owner holds the decision: once the timer
+        // owns it, nothing read here is used.
+        while host.restore_decision_held() {
             let frontmost = host.frontmost_pid();
             let snapshot = host.hardware_input_snapshot();
             let input = observed_input_since(snapshot, front_instant_ms);
@@ -310,9 +310,12 @@ fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
                     restore_ms: None,
                 };
             }
-            if host.restore_observation_open() {
+            if host.restore_decision_held() {
                 host.pause_ms(FRONTING_POLL_MS);
             }
+        }
+        if !host.restore_decision_held() {
+            return lost_decision(host);
         }
     }
     let wait_ms = wait_ms.saturating_sub(host.now_ms().saturating_sub(started));
@@ -337,6 +340,11 @@ fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
     let input = observed_input_since(snapshot, front_instant_ms);
     let input_coverage_unavailable =
         !covers(first_snapshot, front_instant_ms) || !covers(snapshot, front_instant_ms);
+    if !host.restore_decision_held() {
+        // The reads above may have outlasted this owner's phase: they are
+        // not evidence the decision may act on.
+        return lost_decision(host);
+    }
     if input_coverage_unavailable
         || (require_quiet && input)
         || first_front != frontmost
@@ -390,6 +398,20 @@ fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
                 restore_ms: None,
             }
         }
+    }
+}
+
+/// What a decision returns once its owner lost the decision to the timer.
+/// Nothing is requested; the caller discards it and awaits the timer's.
+fn lost_decision<H: FrontingBracketHost + ?Sized>(host: &mut H) -> RestoreOutcome {
+    RestoreOutcome {
+        restore: RestoreStatus::Failed {
+            left_in_front: None,
+        },
+        person_input_during_fronting: false,
+        input_coverage_unavailable: false,
+        finished_at_ms: host.now_ms(),
+        restore_ms: None,
     }
 }
 
@@ -598,6 +620,12 @@ pub(super) fn request_restore<H: FrontingBracketHost + ?Sized>(
 ) -> RestoreStatus {
     let previous = request.previous;
     let first_accepted = host.request_front(previous);
+    if !host.restore_decision_held() {
+        // Lost before the request was committed: the timer requests it.
+        return RestoreStatus::Failed {
+            left_in_front: None,
+        };
+    }
     let first_wait = if first_accepted {
         RESTORE_FALLBACK_AFTER_MS.min(wait_ms)
     } else {
@@ -633,6 +661,9 @@ pub(super) fn wait_for_front<H: FrontingBracketHost + ?Sized>(
     budget_ms: u64,
 ) -> bool {
     loop {
+        if !host.restore_decision_held() {
+            return false;
+        }
         if host.frontmost_pid() == Some(pid) {
             return true;
         }
@@ -646,111 +677,17 @@ pub(super) fn wait_for_front<H: FrontingBracketHost + ?Sized>(
 /// Where one front attempt is, as the restore obligation records it.
 ///
 /// It moves only forward, `NotStarted` to `Dispatching` to `Dispatched`, and
-/// only under the obligation's own lock, so the worker that fronts and the
-/// cleanup that may end the call early always agree on whether a front can
-/// have happened.
+/// only under the [`super::CutoffGate`]'s lock, together with the restore
+/// owner, so the worker that fronts and the cleanup that may end the call
+/// early always agree on whether a front can have happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrontAttemptState {
-    /// No front has been requested, and none will be once cleanup has taken
-    /// the obligation.
+    /// No front has been requested, and none will be once an owner has taken
+    /// the restore decision.
     NotStarted,
     /// The front request is being made and waited for. The instant is when
     /// it was made, and is the floor for hardware input afterwards.
     Dispatching { front_instant_ms: u64 },
     /// The front attempt returned, whether or not the target came forward.
     Dispatched { front_instant_ms: u64 },
-}
-
-/// What cleanup must do with the obligation it has just taken.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CleanupTake {
-    /// Taken before any front: the worker will not front, the restore is
-    /// `not_needed`, and the fronting lock can be released.
-    PreventedFront,
-    /// A front attempt is in flight: wait for it to return (at most the
-    /// front wait), then run the restore decision.
-    AwaitFrontAttempt,
-    /// The front was requested at this instant: run the restore decision with
-    /// it as the floor.
-    Decide { front_instant_ms: u64 },
-    /// The other side took the obligation first; await its decision instead
-    /// of running a second one.
-    AlreadyTaken,
-}
-
-/// The front-attempt half of a restore obligation: the state, and whether
-/// cleanup has taken it. Whichever of the worker's own cleanup or the
-/// terminal cleanup calls [`FrontAttempt::take`] first runs the restore
-/// decision; the other gets [`CleanupTake::AlreadyTaken`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrontAttempt {
-    state: FrontAttemptState,
-    taken: bool,
-}
-
-impl Default for FrontAttempt {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FrontAttempt {
-    pub const fn new() -> Self {
-        Self {
-            state: FrontAttemptState::NotStarted,
-            taken: false,
-        }
-    }
-
-    pub fn state(&self) -> FrontAttemptState {
-        self.state
-    }
-
-    /// Whether cleanup has taken the obligation.
-    pub fn taken(&self) -> bool {
-        self.taken
-    }
-
-    /// The worker is about to request the front at `front_instant_ms`.
-    /// `false` means cleanup took the obligation first, or a front was
-    /// already attempted, and the worker must not front.
-    pub fn begin_dispatch(&mut self, front_instant_ms: u64) -> bool {
-        if self.taken || self.state != FrontAttemptState::NotStarted {
-            return false;
-        }
-        self.state = FrontAttemptState::Dispatching { front_instant_ms };
-        true
-    }
-
-    /// The front request and its wait returned. Recorded even when cleanup
-    /// took the obligation meanwhile, because that cleanup is waiting for it.
-    pub fn attempt_returned(&mut self) {
-        if let FrontAttemptState::Dispatching { front_instant_ms } = self.state {
-            self.state = FrontAttemptState::Dispatched { front_instant_ms };
-        }
-    }
-
-    /// Take the obligation for cleanup.
-    pub fn take(&mut self) -> CleanupTake {
-        if self.taken {
-            return CleanupTake::AlreadyTaken;
-        }
-        self.taken = true;
-        match self.state {
-            FrontAttemptState::NotStarted => CleanupTake::PreventedFront,
-            FrontAttemptState::Dispatching { .. } => CleanupTake::AwaitFrontAttempt,
-            FrontAttemptState::Dispatched { front_instant_ms } => {
-                CleanupTake::Decide { front_instant_ms }
-            }
-        }
-    }
-
-    /// The floor for the restore decision once the attempt has returned:
-    /// `None` while it is still in flight or when no front was requested.
-    pub fn decision_floor(&self) -> Option<u64> {
-        match self.state {
-            FrontAttemptState::Dispatched { front_instant_ms } => Some(front_instant_ms),
-            FrontAttemptState::NotStarted | FrontAttemptState::Dispatching { .. } => None,
-        }
-    }
 }

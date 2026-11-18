@@ -50,7 +50,7 @@ struct FakeDesk {
     frontmost_at_post: Vec<Option<u32>>,
     /// Every fronting request, in order.
     front_requests: Vec<u32>,
-    restore_observation_until_ms: Option<u64>,
+    decision_held_until_ms: Option<u64>,
     /// The desk-clock instant of each entry in `front_requests`.
     front_request_times: Vec<u64>,
     /// The newest hardware input the process-wide observer saw.
@@ -118,7 +118,7 @@ impl FakeDesk {
             fronted_intervals: Vec::new(),
             frontmost_at_post: Vec::new(),
             front_requests: Vec::new(),
-            restore_observation_until_ms: None,
+            decision_held_until_ms: None,
             front_request_times: Vec::new(),
             hardware_input_ms: None,
             switch_after_unit: None,
@@ -179,8 +179,8 @@ impl FakeDesk {
 }
 
 impl FrontingBracketHost for FakeDesk {
-    fn restore_observation_open(&self) -> bool {
-        self.restore_observation_until_ms
+    fn restore_decision_held(&self) -> bool {
+        self.decision_held_until_ms
             .is_none_or(|cutoff| self.now < cutoff)
     }
     type Tap = ();
@@ -1140,50 +1140,59 @@ fn restore_after_front_requests_nothing_when_it_skips() {
     assert!(desk.front_requests.is_empty());
 }
 
-/// The front attempt moves only forward, and whoever takes it first decides.
+/// The front attempt moves only forward, and the first ordinary owner to
+/// claim the decision decides; the next one waits.
 #[test]
 fn the_front_attempt_states_decide_what_cleanup_does() {
-    // Taken before any front: the worker may not front.
-    let mut attempt = FrontAttempt::new();
-    assert_eq!(attempt.state(), FrontAttemptState::NotStarted);
-    assert_eq!(attempt.take(), CleanupTake::PreventedFront);
-    assert!(!attempt.begin_dispatch(5));
-    assert_eq!(attempt.state(), FrontAttemptState::NotStarted);
-    assert_eq!(attempt.take(), CleanupTake::AlreadyTaken);
+    // Claimed before any front: the worker may not front.
+    let gate = CutoffGate::new();
+    assert_eq!(gate.attempt_state(), FrontAttemptState::NotStarted);
+    assert_eq!(gate.claim_ordinary(), OrdinaryClaim::PreventedFront);
+    assert!(!gate.begin_front_attempt(5));
+    assert_eq!(gate.attempt_state(), FrontAttemptState::NotStarted);
+    assert_eq!(gate.claim_ordinary(), OrdinaryClaim::Await);
 
-    // Taken while the front is in flight: wait for it, then decide.
-    let mut attempt = FrontAttempt::new();
-    assert!(attempt.begin_dispatch(5));
+    // Claimed while the front is in flight: decide, told it is in flight.
+    let gate = CutoffGate::new();
+    assert!(gate.begin_front_attempt(5));
     assert_eq!(
-        attempt.state(),
+        gate.attempt_state(),
         FrontAttemptState::Dispatching {
             front_instant_ms: 5
         }
     );
-    assert_eq!(attempt.decision_floor(), None);
-    assert_eq!(attempt.take(), CleanupTake::AwaitFrontAttempt);
-    attempt.attempt_returned();
+    assert!(matches!(
+        gate.claim_ordinary(),
+        OrdinaryClaim::Decide {
+            front_instant_ms: 5,
+            in_flight: true,
+            write_deadline: true,
+            ..
+        }
+    ));
+    gate.front_attempt_returned();
     assert_eq!(
-        attempt.state(),
+        gate.attempt_state(),
         FrontAttemptState::Dispatched {
             front_instant_ms: 5
         }
     );
-    assert_eq!(attempt.decision_floor(), Some(5));
-    assert_eq!(attempt.take(), CleanupTake::AlreadyTaken);
+    assert_eq!(gate.claim_ordinary(), OrdinaryClaim::Await);
 
-    // Taken after the front returned: decide at once, floored at the front.
-    let mut attempt = FrontAttempt::new();
-    assert!(attempt.begin_dispatch(7));
-    assert!(!attempt.begin_dispatch(9), "one front per obligation");
-    attempt.attempt_returned();
-    assert_eq!(
-        attempt.take(),
-        CleanupTake::Decide {
-            front_instant_ms: 7
+    // Claimed after the front returned: decide at once, floored at the front.
+    let gate = CutoffGate::new();
+    assert!(gate.begin_front_attempt(7));
+    assert!(!gate.begin_front_attempt(9), "one front per obligation");
+    gate.front_attempt_returned();
+    assert!(matches!(
+        gate.claim_ordinary(),
+        OrdinaryClaim::Decide {
+            front_instant_ms: 7,
+            in_flight: false,
+            ..
         }
-    );
-    assert_eq!(attempt.take(), CleanupTake::AlreadyTaken);
+    ));
+    assert_eq!(gate.claim_ordinary(), OrdinaryClaim::Await);
 }
 
 /// Every fronting stop maps to its reason, and every reason is reached.
@@ -1473,23 +1482,27 @@ fn restore_new_activity_during_final_sampling_leaves_focus_alone() {
 }
 
 #[test]
-fn an_unconfirmed_activation_stops_observation_at_the_restore_reserve_without_claiming_success() {
+fn an_owner_watching_an_unconfirmed_activation_stops_at_the_restore_reserve_and_writes_nothing() {
     let mut desk = FakeDesk::new();
     desk.front_latency_ms = 800;
-    desk.restore_observation_until_ms = Some(150);
+    desk.decision_held_until_ms = Some(150);
     desk.request_front(TARGET);
     desk.advance(100);
 
     let reply = restore_after_front_attempt(&mut desk, PREVIOUS, TARGET, 0, 300, false);
     assert_eq!(
         desk.now, 150,
-        "the request does not wait out the restore reserve"
+        "the owner does not watch past the start of the restore reserve"
     );
-    assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
+    assert_eq!(
+        desk.front_requests,
+        [TARGET],
+        "the timer owns the request from the reserve on"
+    );
     assert_eq!(
         reply.restore,
         RestoreStatus::Failed {
-            left_in_front: Some(PREVIOUS)
+            left_in_front: None
         }
     );
     assert!(desk.posted.is_empty());

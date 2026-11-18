@@ -1864,9 +1864,17 @@ pub trait FrontedDispatchHooks: Send {
     }
     /// Register the restore obligation for a front of `target` over
     /// `previous`, read with the fronting lock held. `host` is on the
-    /// bracket's clock. `false` when the call's terminal reply is already
-    /// chosen: nothing may be fronted.
-    fn register(&mut self, previous: u32, target: u32, host: Box<dyn FrontingRestoreHost>) -> bool;
+    /// bracket's clock. `gate` is the bracket's: it holds the front attempt
+    /// and says who owns the restore decision, so the obligation must decide
+    /// through it. `false` when the call's terminal reply is already chosen:
+    /// nothing may be fronted.
+    fn register(
+        &mut self,
+        previous: u32,
+        target: u32,
+        host: Box<dyn FrontingRestoreHost>,
+        gate: &std::sync::Arc<crate::dispatch::CutoffGate>,
+    ) -> bool;
     /// The front request is about to be made at `front_instant_ms` on the
     /// bracket's clock. `false` when cleanup already took the obligation.
     fn begin_front_attempt(&mut self, front_instant_ms: u64) -> bool;
@@ -1880,11 +1888,16 @@ pub trait FrontedDispatchHooks: Send {
     fn front_confirmed(&mut self) {}
     /// Run, or await, the one restore decision.
     fn decide_restore(&mut self) -> HookedRestore;
-    /// The restore a cutoff timer starts when the front reaches the
-    /// bracket's bound while the bracket is still busy: the same once-only
-    /// decision as [`Self::decide_restore`], run on the timer's thread.
-    /// `None`, the default, arms no timer.
-    fn cutoff_restore(&mut self) -> Option<Box<dyn FnOnce(crate::dispatch::CutoffWake) + Send>> {
+    /// The restore a cutoff timer makes once the gate hands it the decision
+    /// at the start of the restore reserve: the same decision as
+    /// [`Self::decide_restore`], run on the timer's thread through `host`, a
+    /// restore host of the timer's own. An ordinary owner may still be inside
+    /// a blocking read on the obligation's host, and the timer must not wait
+    /// for it. `None`, the default, arms no timer.
+    fn cutoff_restore(
+        &mut self,
+        _host: Box<dyn FrontingRestoreHost>,
+    ) -> Option<Box<dyn FnOnce(crate::dispatch::CutoffWake) + Send>> {
         None
     }
     /// The cutoff timer for this front was armed on `gate`. A caller that
@@ -1920,8 +1933,9 @@ enum Registration {
 
 /// The bracket's host with the restore routed through the hooks: the real
 /// host fronts the target, and only the hooks' decision ever asks for the
-/// previous application back, so the decision runs once whichever of the
-/// worker or terminal cleanup gets there first.
+/// previous application back. The bracket's [`crate::dispatch::CutoffGate`]
+/// decides which of the worker, terminal cleanup or cutoff timer owns that
+/// one decision.
 struct HookedHost<'a, H> {
     inner: &'a mut H,
     hooks: &'a mut dyn FrontedDispatchHooks,
@@ -1993,10 +2007,12 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             let Some(Some(previous)) = self.previous else {
                 return false;
             };
-            if !self
-                .hooks
-                .register(previous, self.target, self.inner.restore_host())
-            {
+            if !self.hooks.register(
+                previous,
+                self.target,
+                self.inner.restore_host(),
+                &self.cutoff,
+            ) {
                 self.registration = Registration::Refused;
                 return false;
             }
@@ -2004,11 +2020,12 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             // bound is enforced on another thread, whatever the bracket's
             // own thread is doing. Without a timer nothing would enforce it,
             // so nothing is fronted; the obligation then reads as prevented.
-            if let Some(restore) = self.hooks.cutoff_restore() {
+            if let Some(restore) = self.hooks.cutoff_restore(self.inner.restore_host()) {
                 self.hooks.restore_deadline(deadline);
                 match crate::dispatch::CutoffTimer::arm_with_wake(
                     std::sync::Arc::clone(&self.cutoff),
                     cutoff_at,
+                    deadline,
                     restore,
                 ) {
                     Some(timer) => {
@@ -2055,7 +2072,6 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
         if matches!(self.registration, Registration::Registered { .. }) && self.decided.is_none() {
             self.decided = Some(self.hooks.decide_restore());
         }
-        self.cutoff.disarm();
         true
     }
     fn begin_without_switch(&mut self, pid: u32) -> bool {
@@ -2063,20 +2079,27 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             return true;
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(self.bound_ms);
-        if !self.hooks.register(pid, pid, self.inner.restore_host()) {
+        if !self
+            .hooks
+            .register(pid, pid, self.inner.restore_host(), &self.cutoff)
+        {
             self.registration = Registration::Refused;
             return false;
         }
         self.registration = Registration::Registered { prevented: false };
         // No activation is recorded: the timer can end the lock obligation,
         // but neither the timer nor terminal cleanup may change the focus.
-        let timer = self.hooks.cutoff_restore().and_then(|finish| {
-            crate::dispatch::CutoffTimer::arm_with_wake(
-                std::sync::Arc::clone(&self.cutoff),
-                deadline,
-                finish,
-            )
-        });
+        let timer = self
+            .hooks
+            .cutoff_restore(self.inner.restore_host())
+            .and_then(|finish| {
+                crate::dispatch::CutoffTimer::arm_with_wake(
+                    std::sync::Arc::clone(&self.cutoff),
+                    deadline,
+                    deadline,
+                    finish,
+                )
+            });
         if let Some(timer) = timer {
             self.timer = Some(timer);
             self.hooks.cutoff_armed(std::sync::Arc::clone(&self.cutoff));
@@ -2133,7 +2156,6 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
                 decided
             }
         };
-        self.cutoff.disarm();
         crate::dispatch::RestoreOutcome {
             restore: decided.restore,
             person_input_during_fronting: decided.person_input_during_fronting,
@@ -2901,6 +2923,7 @@ mod hooked_fronted_tests {
             previous: u32,
             target: u32,
             host: Box<dyn FrontingRestoreHost>,
+            _gate: &Arc<crate::dispatch::CutoffGate>,
         ) -> bool {
             assert_eq!(target, TARGET);
             self.screen.lock().unwrap().hooks.push("register");

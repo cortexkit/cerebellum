@@ -1,8 +1,8 @@
 //! The hard cutoff of an app-use front, run through the real hooks and
 //! restore cell: the timer starts the restore at the bound while the
 //! bracket's own thread is still blocked, the restore runs once whichever
-//! side reaches the cell first, and a unit that may hold a key is never
-//! restored under.
+//! owner the cell's gate gives the decision to, and a unit that may hold a
+//! key is never restored under.
 
 use super::*;
 use cerebellum_computer::dispatch::BracketPlan;
