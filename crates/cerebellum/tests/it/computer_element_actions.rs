@@ -327,6 +327,54 @@ async fn a_press_without_a_frame_dispatches_nothing() {
 }
 
 #[tokio::test]
+async fn a_hidden_menu_item_must_belong_to_the_menu_bar_to_be_pressed() {
+    let item = || DeskElement {
+        facts: facts("AXMenuItem", &["AXPress"]),
+        ..DeskElement::default()
+    };
+    let desk = desk().with_element(35, item()).with_element(52, item());
+    {
+        let mut state = desk.state();
+        state.press_frame = None;
+        state.roots[0]
+            .children
+            .push(RawElement::fixture(52, "AXMenuItem").titled("Window command"));
+    }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let tree = read(&plane, &management).await;
+    let menu = id_of(&tree, " menu item Save");
+    let in_window = id_of(&tree, " menu item Window command");
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": in_window}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "no_press_action", "{reply}");
+    assert!(
+        reply["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("isn't visible on screen"),
+        "{reply}"
+    );
+    assert!(desk.state().presses.is_empty());
+
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_element",
+        json!({"element_id": menu}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(desk.state().presses, vec![35]);
+    assert!(desk.state().shown_menus.is_empty());
+}
+
+#[tokio::test]
 async fn a_press_off_every_display_dispatches_nothing() {
     assert_invisible_press_refused(Some([2500.0, 10.0, 30.0, 20.0])).await;
 }
