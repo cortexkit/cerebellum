@@ -8,6 +8,7 @@ use crate::platform::{HeldStateDisposition, ProcessEventRefusal};
 
 mod calibration;
 mod listing;
+mod persisted_hints;
 mod restore_fallback;
 mod restore_reserve;
 mod unit_cost;

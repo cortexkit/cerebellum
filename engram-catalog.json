@@ -33,7 +33,7 @@
     {
       "entry_id": "cerebellum/restore-latency",
       "class": "device-local",
-      "reason": "Restore timings contain only millisecond samples and are specific to this desktop. The module measures them again if the file is missing.",
+      "reason": "Restore timings contain only millisecond samples and when each was measured, and are specific to this desktop. The module measures them again if the file is missing.",
       "mechanism": "filetree",
       "path": "restore-latency"
     }

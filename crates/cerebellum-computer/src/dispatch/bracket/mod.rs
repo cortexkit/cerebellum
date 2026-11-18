@@ -1036,14 +1036,23 @@ fn restore<H: FrontingBracketHost>(
         let interval = outcome.finished_at_ms.saturating_sub(fronted_at);
         let elapsed = outcome.finished_at_ms.saturating_sub(restore_at);
         if let Some(predictor) = predictor {
-            if outcome.restore == RestoreStatus::Restored {
-                report.restore_calibrated =
-                    calibrating && activation_observed && interval <= bound && !*person_input;
-                predictor.record(
-                    elapsed,
-                    report.restore_calibrated.then_some(bound),
-                    Instant::now(),
-                );
+            match outcome.restore {
+                RestoreStatus::Restored => {
+                    report.restore_calibrated =
+                        calibrating && activation_observed && interval <= bound && !*person_input;
+                    predictor.record(
+                        elapsed,
+                        report.restore_calibrated.then_some(bound),
+                        Instant::now(),
+                    );
+                }
+                // As for the in-memory history: a failed wait is only a lower
+                // bound on the restore's cost, so it counts as at least the
+                // full cleanup allowance and can never shrink the reserve.
+                RestoreStatus::Failed { .. } => {
+                    predictor.record(elapsed.max(RESTORE_WAIT_MS), None, Instant::now());
+                }
+                RestoreStatus::NotNeeded | RestoreStatus::SkippedPerson { .. } => {}
             }
         } else {
             remember_restore(*host.borrow_mut(), outcome.restore, elapsed);
