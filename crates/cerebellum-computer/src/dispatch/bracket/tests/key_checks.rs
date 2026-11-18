@@ -47,9 +47,6 @@ struct Keyboard {
     /// The process-generation reading with this number (from 1) takes past
     /// any deadline on the fake clock.
     slow_generation_read: Option<usize>,
-    /// During the process-generation reading with this number (from 1),
-    /// another application comes to the front; the target keeps its process.
-    focus_moves_during_generation_read: Option<usize>,
     generation_reads: Cell<usize>,
     /// The unit is stopped while focus is being read.
     stop_during_focus_read: bool,
@@ -72,7 +69,6 @@ impl Keyboard {
             record_hold_during_post: false,
             preparation_ms: 0,
             slow_generation_read: None,
-            focus_moves_during_generation_read: None,
             generation_reads: Cell::new(0),
             stop_during_focus_read: false,
             stopped: Cell::new(false),
@@ -91,9 +87,6 @@ impl PerProcessEventTransport for Transport<'_> {
         keyboard.generation_reads.set(reads);
         if keyboard.slow_generation_read == Some(reads) {
             keyboard.now.set(keyboard.now.get() + 1_000);
-        }
-        if keyboard.focus_moves_during_generation_read == Some(reads) {
-            keyboard.frontmost.set(Some(THIRD));
         }
         ProcessGenerationReading::Started(keyboard.generation.get())
     }
@@ -469,13 +462,93 @@ fn the_deadline_passing_during_the_final_generation_lookup_refuses_the_post() {
 }
 
 #[test]
-fn focus_moving_during_the_final_generation_lookup_refuses_the_post() {
+fn a_reused_pid_at_key_commit_is_refused() {
+    // The focused pid is still the target's, but by the commit another
+    // process holds it: the generation check after the focus read refuses.
     let mut keyboard = Keyboard::new();
-    // The first reading comes with the listing read; the second is the
-    // final lookup just before the post. The process is not replaced, so
-    // the lookup itself passes.
-    keyboard.focus_moves_during_generation_read = Some(2);
-    refused_before_any_post(&keyboard);
+    keyboard.replace_during_focus = true;
+    let failure = post_with(
+        &keyboard,
+        vec![press("a down"), release("a up")],
+        500,
+        &|| false,
+        &mut VisibilityMemo::uncached(),
+        Some(&keyboard.gate),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        failure.refusal,
+        ProcessEventRefusal::ProcessReplaced { .. }
+    ));
+    assert!(keyboard.posted.borrow().is_empty());
+    assert!(!keyboard.gate.input_held(), "nothing was committed");
+}
+
+#[test]
+fn key_commit_reads_nothing_between_the_generation_check_and_the_post() {
+    let keyboard = Keyboard::new();
+    let order = RefCell::new(Vec::new());
+    struct Ordered<'a>(&'a Keyboard, &'a RefCell<Vec<&'static str>>);
+    impl PerProcessEventTransport for Ordered<'_> {
+        type Event = &'static str;
+        fn process_generation(&mut self, pid: u32) -> ProcessGenerationReading {
+            self.1.borrow_mut().push("generation");
+            Transport(self.0).process_generation(pid)
+        }
+        fn window_server_visibility(&mut self, _pid: u32) -> WindowServerVisibility {
+            self.1.borrow_mut().push("listing");
+            WindowServerVisibility::Visible
+        }
+        fn post_to_pid(
+            &mut self,
+            pid: u32,
+            event: &'static str,
+        ) -> Result<PostCallMade, PostCallFailure> {
+            self.1.borrow_mut().push("post");
+            Transport(self.0).post_to_pid(pid, event)
+        }
+    }
+    let mut checks = FrontedKeyChecks {
+        target_pid: TARGET,
+        deadline_ms: 500,
+        now_ms: || {
+            order.borrow_mut().push("deadline");
+            keyboard.now.get()
+        },
+        frontmost_pid: || {
+            order.borrow_mut().push("focus");
+            keyboard.frontmost.get()
+        },
+        cutoff: Some(&keyboard.gate),
+    };
+    post_event_sequence_fronted(
+        ProcessEventTarget {
+            pid: TARGET,
+            start_time_micros: GENERATION,
+        },
+        vec![SyntheticStep {
+            role: SyntheticStepRole::SelfContained,
+            event: "scroll",
+        }],
+        &mut Ordered(&keyboard, &order),
+        &mut VisibilityMemo::uncached(),
+        &|| {
+            order.borrow_mut().push("stop");
+            false
+        },
+        &mut checks,
+    )
+    .unwrap();
+    let order = order.into_inner();
+    let commit = order
+        .iter()
+        .rposition(|step| *step == "focus")
+        .expect("focus was read at commit");
+    assert_eq!(
+        order[commit..],
+        ["focus", "generation", "stop", "deadline", "post"],
+        "focus, then the focused pid's generation, then stop, deadline, commit and post: {order:?}"
+    );
 }
 
 #[test]

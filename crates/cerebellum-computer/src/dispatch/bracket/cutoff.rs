@@ -33,13 +33,16 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// The per-post checks for a keystroke unit posted while its target is in
-/// front: the target is still the frontmost application, the unit has not
-/// been stopped, and the bracket's absolute deadline has not passed; then
-/// the post is committed on the cutoff gate. The sequence runs them after
-/// the window listing and transport authentication. Focus is read before
-/// and again after the final generation lookup, so neither a replacement
-/// during the first focus read nor a focus change during the lookup is
-/// missed; stop and commitment follow the last focus read.
+/// front: the target is still the frontmost application and still the
+/// granted process generation, the unit has not been stopped, and the
+/// bracket's absolute deadline has not passed; then the post is committed
+/// on the cutoff gate. The sequence runs them after the window listing and
+/// transport authentication. Focus is read once, then the focused pid's
+/// generation is validated, so a pid reused by another process fails; stop,
+/// the deadline and commitment follow, with no further read between that
+/// validation and the post. Focus moving to another application during the
+/// generation lookup is the accepted race with delivery: the post still goes
+/// only to the granted process.
 ///
 /// A post refused here was never made, so the refusal is
 /// [`ProcessEventRefusal::Cancelled`], which a reply reads as no post call
@@ -66,18 +69,15 @@ where
         cancelled: &dyn Fn() -> bool,
         revalidate: &mut dyn FnMut() -> Result<(), ProcessEventRefusal>,
     ) -> Result<(), ProcessEventRefusal> {
-        // A numeric PID can survive a replacement during the focus read.
-        // Check its identity once more before checking stop and committing.
+        // One consistent check: focus first, then the focused pid's
+        // generation against the granted one, so a pid that passed to
+        // another process fails here. Nothing but stop, the deadline and the
+        // commit follows it before the post: no further focus or identity
+        // read reopens the window between validation and commit.
         if (self.frontmost_pid)() != Some(self.target_pid) {
             return Err(ProcessEventRefusal::Cancelled);
         }
         revalidate()?;
-        // The identity lookup is itself a blocking system call, and focus
-        // can move to another application during it while the target keeps
-        // its process. The last focus answer must postdate it.
-        if (self.frontmost_pid)() != Some(self.target_pid) {
-            return Err(ProcessEventRefusal::Cancelled);
-        }
         if cancelled() {
             return Err(ProcessEventRefusal::Cancelled);
         }
