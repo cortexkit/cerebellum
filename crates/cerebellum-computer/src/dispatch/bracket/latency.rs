@@ -36,15 +36,6 @@ impl RestoreLatencies {
     pub(super) fn maximum(&self) -> Option<u64> {
         self.samples[..self.len].iter().copied().max()
     }
-
-    pub(super) fn oldest_first(&self) -> impl Iterator<Item = u64> + '_ {
-        let oldest = if self.len == RESTORE_SAMPLES {
-            self.next
-        } else {
-            0
-        };
-        (0..self.len).map(move |offset| self.samples[(oldest + offset) % RESTORE_SAMPLES])
-    }
 }
 
 pub(super) fn measured_restore_latency_ms() -> Option<u64> {

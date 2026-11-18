@@ -304,10 +304,11 @@ async fn without_either_review_a_bring_to_front_read_requests_no_front() {
 }
 
 /// A build carrying the takeover review but not the app-use review: a
-/// `bring_to_front` image read still needs held takeover, and now shares the
-/// focus lock so its cleanup cannot restore underneath another front.
+/// `bring_to_front` image read fronts nothing, held takeover or not, and so
+/// never waits for the focus lock either. Pictures are fronted under the
+/// app's own grant only where the app-use fronting review is bound.
 #[tokio::test(start_paused = true)]
-async fn without_the_review_a_bring_to_front_read_stops_when_the_lock_is_busy() {
+async fn without_the_app_use_review_a_bring_to_front_read_requests_no_front() {
     let rig = unadmitted(AppUse::Background, mail_desk(), true).await;
     grant_takeover(&rig).await;
     let held = rig
@@ -325,14 +326,59 @@ async fn without_the_review_a_bring_to_front_read_stops_when_the_lock_is_busy() 
         .await;
     assert_eq!(reply["outcome"], "completed", "{reply}");
     assert!(
-        started.elapsed() >= Duration::from_millis(crate::budgets::FRONTING_LOCK_WAIT_MS),
-        "the read did not wait for focus ownership: {:?}",
+        started.elapsed() < Duration::from_millis(crate::budgets::FRONTING_LOCK_WAIT_MS),
+        "the read waited for focus ownership: {:?}",
         started.elapsed()
     );
-    assert_eq!(reply["fronting"]["not_fronted_reason"], "fronting_busy");
+    assert!(reply.get("fronting").is_none(), "{reply}");
     assert!(reply.get("image").is_none());
     assert!(rig.screen.log().is_empty(), "{reply}");
     drop(held);
+}
+
+/// An older agent run (no head route, so no person to ask) holding a
+/// standing app grant, outside any flow: its `bring_to_front` picture fronts
+/// nothing, as the takeover grant it once needed refused agent runs.
+#[tokio::test]
+async fn an_older_agent_run_with_a_standing_app_grant_never_fronts_a_picture() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let who = Who::fixture();
+    let mut consent = who.consent();
+    consent.agent_run = true;
+    assert!(!consent.unattended, "not a flow");
+    let clock = cerebellum_core::clock::FakeClock::new();
+    let reply = crate::CALL_TERMINAL
+        .scope(under_terminal(), async {
+            rig.plane
+                .serve(
+                    servable("computer.read_state").expect("served"),
+                    &bring_to_front_read(),
+                    ServeContext {
+                        cancel: crate::CancelHandle::pending(),
+                        grantee: support::GRANTEE,
+                        identity: who.identity.clone(),
+                        management: &rig.management,
+                        consent,
+                        clock: &clock,
+                        now_ms: 10,
+                    },
+                    |_| InMemoryCaptureBackend::default(),
+                )
+                .await
+                .expect("read_state replies inside its row")
+        })
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert!(
+        !rig.screen
+            .log()
+            .iter()
+            .any(|entry| entry.starts_with("front:")),
+        "an agent run fronted a picture: {:?} {reply}",
+        rig.screen.log()
+    );
+    assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
+    assert!(!rig.lock.held());
 }
 
 #[path = "legacy_fronting_tests.rs"]

@@ -27,6 +27,7 @@ fn admission(mode: AppUse, attended: bool, admitted: bool, takeover_held: bool) 
         // today's release builds are.
         bracket_admitted: true,
         takeover_held,
+        agent_run: false,
     }
 }
 
@@ -74,9 +75,11 @@ fn mode_attendance_and_admission_decide_takeover_chords_and_fronting() {
                     ChordRoute::PerProcess
                 );
 
+                // A picture fronted under the app grant needs the app-use
+                // review itself, not only the takeover bracket's review.
                 assert_eq!(
                     without_takeover.may_front_image().is_ok(),
-                    attended,
+                    attended && admitted,
                     "{case}"
                 );
                 let no_bracket = Admission {
@@ -86,6 +89,17 @@ fn mode_attendance_and_admission_decide_takeover_chords_and_fronting() {
                 assert!(
                     no_bracket.may_front_image().is_err(),
                     "{case} without bracket review"
+                );
+                // An older agent run cannot ask a person, so it never fronts
+                // a picture, even with a standing app grant and no flow.
+                let agent_run = Admission {
+                    agent_run: true,
+                    ..without_takeover
+                };
+                assert_eq!(
+                    agent_run.may_front_image(),
+                    Err(FrontingStop::Unattended),
+                    "{case} agent run"
                 );
             }
         }
@@ -467,6 +481,9 @@ struct ScreenState {
     /// A chord's post fails with its keys possibly still held.
     post_unknown: bool,
     post_cost_ms: u64,
+    /// A chord's post blocks the bracket's thread for this long in real
+    /// time, logging `post-done` when it returns.
+    post_blocks_ms: u64,
     /// Whether the paired release of held keys returns.
     release_ok: bool,
     /// These elements of the desk read enabled while the target is
@@ -534,6 +551,7 @@ impl Screen {
                 last_input_ms: None,
                 post_unknown: false,
                 post_cost_ms: 0,
+                post_blocks_ms: 0,
                 release_ok: true,
                 enable_on_front: Vec::new(),
                 hold_until_stopped: None,
@@ -811,7 +829,7 @@ impl FrontingBracketHost for FakeBracket {
         seen(probe)
     }
     fn post_unit(&mut self, _index: usize) -> Result<UnitPosted, SequencePostFailure> {
-        let (mut unknown, hold, posting, post_cost_ms) = {
+        let (mut unknown, hold, posting, post_cost_ms, post_blocks_ms) = {
             let mut state = self.0.state();
             state.log.push("post".into());
             (
@@ -819,9 +837,14 @@ impl FrontingBracketHost for FakeBracket {
                 state.hold_until_stopped.clone(),
                 state.posting.take(),
                 state.post_cost_ms,
+                state.post_blocks_ms,
             )
         };
         self.0.advance(post_cost_ms);
+        if post_blocks_ms > 0 {
+            std::thread::sleep(Duration::from_millis(post_blocks_ms));
+            self.0.state().log.push("post-done".into());
+        }
         if let Some(posting) = posting {
             posting.notify_one();
         }
@@ -3542,6 +3565,9 @@ mod settle_read_budget {
 
 #[path = "pointer_fronting_tests.rs"]
 mod pointer_tests;
+
+#[path = "fronting_cutoff_tests.rs"]
+mod cutoff;
 
 #[tokio::test]
 async fn a_pending_chord_landing_after_its_reply_only_restores_and_never_posts() {

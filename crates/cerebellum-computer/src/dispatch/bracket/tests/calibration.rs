@@ -1,3 +1,4 @@
+use super::super::restore_predictor::{MIN_RESTORE_SAMPLE_MS, RESTORE_SAMPLE_MAX_AGE};
 use super::*;
 use cerebellum_core::format_floor::{floor_path, read_floors};
 use std::path::PathBuf;
@@ -33,7 +34,8 @@ fn empty_restore_history_does_not_deadlock_needs_front_shortcuts() {
     assert_eq!(first.restore, RestoreStatus::Restored);
     assert_eq!(first.longest_fronted_interval_ms, 12);
     assert!(first.restore_calibrated);
-    assert_eq!(predictor.maximum(), Some(6));
+    // The fake desk restores in 6 ms; a kept sample is never below the floor.
+    assert_eq!(predictor.maximum(), Some(MIN_RESTORE_SAMPLE_MS));
 
     let retry = shortcut(&mut desk, &predictor).report;
     assert_eq!(retry.units_posted, 1, "retry after first use: {retry:?}");
@@ -110,7 +112,9 @@ fn a_failed_cold_calibration_prevents_another_front_for_sixty_seconds() {
     let failed = shortcut(&mut desk, &predictor).report;
     assert_eq!(failed.stop, Some(BracketStop::RestoreFailed));
     assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
-    assert_eq!(predictor.maximum(), None);
+    // A failed restore counts as at least the full cleanup allowance.
+    assert!(predictor.maximum() >= Some(RESTORE_WAIT_MS));
+    let failed_sample = predictor.maximum();
 
     // The person put their previous app back; another shortcut would need
     // to front again, but must not while the calibration cooldown is active.
@@ -124,7 +128,7 @@ fn a_failed_cold_calibration_prevents_another_front_for_sixty_seconds() {
     assert_eq!(retry.stop, Some(BracketStop::BoundExceeded));
     assert_eq!(retry.posts_returned, 0);
     assert!(predictor
-        .try_calibrate(None, Instant::now() + Duration::from_secs(60))
+        .try_calibrate(failed_sample, Instant::now() + Duration::from_secs(60))
         .is_some());
 }
 
@@ -153,7 +157,7 @@ fn calibration_will_not_front_over_an_active_person_or_restore_over_their_switch
 }
 
 #[test]
-fn an_over_budget_calibration_finishes_cleanup_and_only_remembers_real_restores() {
+fn an_over_budget_calibration_finishes_cleanup_and_remembers_a_timeout_as_the_full_allowance() {
     let predictor = RestorePredictor::open(None);
     let mut desk = FakeDesk::new();
     desk.restore_wait_ms = Some(RESTORE_WAIT_MS);
@@ -161,7 +165,9 @@ fn an_over_budget_calibration_finishes_cleanup_and_only_remembers_real_restores(
     let failed = shortcut(&mut desk, &predictor).report;
     assert!(matches!(failed.stop, Some(BracketStop::RestoreFailed)));
     assert!(failed.longest_fronted_interval_ms > BOUND);
-    assert_eq!(predictor.maximum(), None, "a timeout is not a sample");
+    // A timeout says only that the restore took at least this long, so it
+    // is kept as no less than the cleanup allowance, never as a fast sample.
+    assert!(predictor.maximum() >= Some(RESTORE_WAIT_MS));
 
     let predictor = RestorePredictor::open(None);
     let mut desk = FakeDesk::new();
@@ -171,6 +177,13 @@ fn an_over_budget_calibration_finishes_cleanup_and_only_remembers_real_restores(
     assert_eq!(slow.stop, Some(BracketStop::BoundExceeded));
     assert!(!slow.restore_calibrated);
     assert_eq!(slow.restore, RestoreStatus::Restored);
+    // The restore is requested inside the bound. The previous application
+    // then takes 250 ms to come back, which no cutoff can shorten, so the
+    // overrun is reported rather than counted as a calibration.
+    assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
+    let fronted_at = desk.front_request_times[0];
+    assert!(desk.front_request_times[1] - fronted_at <= BOUND);
+    assert!(slow.longest_fronted_interval_ms > BOUND);
     assert_eq!(slow.longest_fronted_interval_ms, 256);
     assert_eq!(predictor.maximum(), Some(250));
     assert!(desk.posted.is_empty());
@@ -229,11 +242,11 @@ fn the_first_calibration_is_durable_and_a_restart_can_send_on_the_first_call() {
     let mut desk = FakeDesk::new();
     assert!(shortcut(&mut desk, &predictor).report.restore_calibrated);
     drop(predictor);
-    assert_eq!(read_floors(&floor).unwrap()["restore-latency"], 1);
+    assert_eq!(read_floors(&floor).unwrap()["restore-latency"], 2);
 
     let restarted = home.start();
     let mut new_desk = FakeDesk::new();
-    assert_eq!(restarted.maximum(), Some(6));
+    assert_eq!(restarted.maximum(), Some(MIN_RESTORE_SAMPLE_MS));
     let first = shortcut(&mut new_desk, &restarted).report;
     assert_eq!(first.units_posted, 1);
     assert!(!first.restore_calibrated);
@@ -255,7 +268,7 @@ fn a_malformed_history_loads_empty_and_can_be_replaced_by_calibration() {
     let mut desk = FakeDesk::new();
     assert!(shortcut(&mut desk, &predictor).report.restore_calibrated);
     assert!(desk.posted.is_empty());
-    assert_eq!(home.start().maximum(), Some(6));
+    assert_eq!(home.start().maximum(), Some(MIN_RESTORE_SAMPLE_MS));
 }
 
 #[test]
@@ -264,17 +277,24 @@ fn a_burst_only_checkpoints_once_and_the_next_checkpoint_keeps_eight_in_order() 
     let predictor = home.start();
     let start = Instant::now();
     predictor.record(99, None, start);
-    for sample in 2..=9 {
+    for sample in 41..=48 {
         predictor.record(sample, None, start + Duration::from_millis(sample));
     }
-    assert_eq!(predictor.maximum(), Some(9));
+    assert_eq!(predictor.maximum(), Some(48));
     assert_eq!(home.start().maximum(), Some(99));
-    predictor.record(10, None, start + Duration::from_secs(1));
+    predictor.record(50, None, start + Duration::from_secs(1));
     let bytes = std::fs::read(home.samples_path()).unwrap();
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
-        serde_json::json!({"version": 1, "samples_ms": [3, 4, 5, 6, 7, 8, 9, 10]})
-    );
+    let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(document["version"], 2);
+    let samples = document["samples"].as_array().unwrap();
+    let costs: Vec<u64> = samples
+        .iter()
+        .map(|sample| sample["ms"].as_u64().unwrap())
+        .collect();
+    assert_eq!(costs, [42, 43, 44, 45, 46, 47, 48, 50]);
+    assert!(samples
+        .iter()
+        .all(|sample| sample["at_unix_ms"].as_u64().is_some_and(|at| at > 0)));
 }
 
 #[test]
@@ -286,4 +306,14 @@ fn a_restore_slower_than_the_checkpoint_is_not_lost_to_an_immediate_restart() {
     predictor.record(8, None, start + Duration::from_millis(1));
     predictor.record(250, None, start + Duration::from_millis(2));
     assert_eq!(home.start().maximum(), Some(250));
+}
+
+#[test]
+fn samples_in_memory_stop_counting_after_the_maximum_age() {
+    let predictor = RestorePredictor::open(None);
+    let start = 1_800_000_000_000;
+    predictor.record_at(120, None, Instant::now(), start);
+    let age = u64::try_from(RESTORE_SAMPLE_MAX_AGE.as_millis()).unwrap();
+    assert_eq!(predictor.maximum_at(start + age - 1), Some(120));
+    assert_eq!(predictor.maximum_at(start + age), None);
 }

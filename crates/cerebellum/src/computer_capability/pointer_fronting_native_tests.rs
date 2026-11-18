@@ -73,6 +73,7 @@ impl PointerHost {
                 heartbeat: observation.heartbeat,
                 cancelled: observation.cancelled,
                 deadline_ms: observation.deadline_ms,
+                cutoff: observation.cutoff,
             },
         );
         self.abort = observation.watcher.abort_decision();

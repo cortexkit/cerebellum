@@ -28,12 +28,14 @@
 //! application back under a held modifier. Without admission a bracket
 //! behaves as it always has.
 
+mod cutoff;
 mod latency;
 mod press;
 mod reason;
 mod restore;
 mod restore_predictor;
 
+pub use cutoff::*;
 pub use latency::UNIT_POST_COST_MAX_AGE;
 // Only the macOS keystroke host keeps unit post costs process-wide.
 #[cfg(target_os = "macos")]
@@ -79,6 +81,10 @@ pub struct ObservedUnit<'a, T> {
     pub heartbeat: HeartbeatObservation,
     pub cancelled: &'a dyn Fn() -> bool,
     pub deadline_ms: u64,
+    /// The bracket's cutoff, when its host armed a timer for it. A unit
+    /// that checks it itself ([`FrontingBracketHost::unit_checks_cutoff`])
+    /// must call [`CutoffGate::begin_post`] before each post.
+    pub cutoff: Option<&'a CutoffGate>,
 }
 
 /// The platform a bracket runs on.
@@ -194,6 +200,18 @@ pub trait FrontingBracketHost {
     fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
         None
     }
+    /// The cutoff shared with a timer that starts the restore once a front
+    /// outlasts the bound, when this host arms one. The default arms none.
+    fn cutoff_gate(&mut self) -> Option<std::sync::Arc<CutoffGate>> {
+        None
+    }
+    /// Whether [`Self::post_observed_unit`] checks the cutoff before each of
+    /// its own posts and marks the presses it holds. When it does not, the
+    /// bracket holds the cutoff for the whole unit, so the timer never
+    /// restores while such a unit may hold a key or button down.
+    fn unit_checks_cutoff(&self) -> bool {
+        false
+    }
 }
 
 /// Whether the previous application is back in front.
@@ -268,8 +286,13 @@ pub struct BracketReport {
     /// fit. A refusal while no restore has been measured yet (the full restore
     /// allowance stands in) does not count: nothing was seen to be slow.
     pub waiting_out_slow_restore: bool,
-    /// A no-send calibration confirmed a restore within the allowance.
+    /// A calibration confirmed a restore within the allowance. It sends no
+    /// keys or clicks; like every bracket it posts the observer's liveness
+    /// marker (a pointer move to where the pointer already is) first.
     pub restore_calibrated: bool,
+    /// The cutoff timer, not the bracket, started the restore: the front
+    /// reached its bound while the bracket was still busy in a unit.
+    pub restore_started_by_cutoff: bool,
 }
 
 impl BracketReport {
@@ -424,6 +447,7 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
         waiting_out_slow_post: false,
         waiting_out_slow_restore: false,
         restore_calibrated: false,
+        restore_started_by_cutoff: false,
     };
     let Some(previous) = host.frontmost_pid() else {
         report.stop = Some(BracketStop::PreviousUnknown);
@@ -432,6 +456,8 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
     report.previous_frontmost = Some(previous);
 
     let our_pid = host.our_pid();
+    let cutoff = host.cutoff_gate();
+    let unit_checks_cutoff = host.unit_checks_cutoff();
     let host = RefCell::new(host);
     let mut watcher = SeizeWatcher::new(plan.maximum_seize_detection_latency_ms);
     for _ in 0..plan.units {
@@ -521,7 +547,9 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
         if cold || restore_reserve.saturating_add(unit_reserve) > bound {
             let restore_blocks =
                 previous != plan.target_pid && restore_reserve > bound && unit_reserve <= bound;
-            // Only app-use needs-front may measure without posting. A cold
+            // Only a bracket with a restore predictor (one fronting the target
+            // under the app's own grant because it needs it in front) may
+            // measure without posting any keys or clicks. A cold
             // predictor, or one whose slow restore prevents any newer sample,
             // can otherwise keep every later call from even requesting a front.
             if (cold || restore_blocks) && next_unit == 0 {
@@ -545,7 +573,8 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
         while front_ok {
             let drained = host.borrow_mut().drain(&tap);
             observe_drained_events(&mut watcher, drained, our_pid, next_unit);
-            if cancelled() || watcher.abort_decision().is_some() {
+            let cutoff_fired = cutoff.as_deref().is_some_and(CutoffGate::fired);
+            if cancelled() || watcher.abort_decision().is_some() || cutoff_fired {
                 front_ok = false;
                 break;
             }
@@ -638,6 +667,19 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
                 }
                 break;
             }
+            // No unit starts once the cutoff fired. A unit that cannot check
+            // the cutoff at each of its posts holds it for its whole length.
+            if let Some(gate) = cutoff.as_deref() {
+                let may_start = if unit_checks_cutoff {
+                    !gate.fired()
+                } else {
+                    gate.begin_post(true)
+                };
+                if !may_start {
+                    stop = Some(BracketStop::BoundExceeded);
+                    break;
+                }
+            }
             let index = next_unit;
             let posted = dispatch_observed_post_in_order(
                 &mut watcher,
@@ -657,9 +699,20 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
                         heartbeat,
                         cancelled,
                         deadline_ms: fronted_at.saturating_add(bound),
+                        cutoff: cutoff.as_deref(),
                     },
                 )
             });
+            // A key that may still be down keeps the cutoff held, so the
+            // timer never restores over it; the caller settles it first.
+            if let Some(gate) = cutoff.as_deref() {
+                if !matches!(
+                    &posted,
+                    Ok(Err(failure)) if failure.held_state == HeldStateDisposition::Unknown
+                ) {
+                    gate.all_released();
+                }
+            }
             match posted {
                 Ok(Ok(unit)) => {
                     watcher.take_post_slot();
@@ -962,6 +1015,32 @@ pub(crate) fn run_fronting_read_with_predictor<H: FrontingBracketHost>(
             (self.read)();
             Ok(UnitPosted::default())
         }
+        // A picture unit posts no keys or clicks and holds nothing down, so
+        // the cutoff may restore while the read is still running. The read itself starts
+        // only inside the bound, before the cutoff and before cancellation.
+        fn post_observed_unit(
+            &mut self,
+            index: usize,
+            observation: ObservedUnit<'_, Self::Tap>,
+        ) -> Result<UnitPosted, SequencePostFailure> {
+            if (observation.cancelled)()
+                || observation.cutoff.is_some_and(CutoffGate::fired)
+                || self.host.now_ms() >= observation.deadline_ms
+            {
+                return Err(SequencePostFailure {
+                    posts_returned: 0,
+                    refusal: crate::platform::ProcessEventRefusal::Cancelled,
+                    held_state: HeldStateDisposition::NoneHeld,
+                });
+            }
+            self.post_unit(index)
+        }
+        fn cutoff_gate(&mut self) -> Option<std::sync::Arc<CutoffGate>> {
+            self.host.cutoff_gate()
+        }
+        fn unit_checks_cutoff(&self) -> bool {
+            true
+        }
         // Forwarded, not left to the default: the default reports no input,
         // which would restore over a person's own switch.
         fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
@@ -1036,14 +1115,23 @@ fn restore<H: FrontingBracketHost>(
         let interval = outcome.finished_at_ms.saturating_sub(fronted_at);
         let elapsed = outcome.finished_at_ms.saturating_sub(restore_at);
         if let Some(predictor) = predictor {
-            if outcome.restore == RestoreStatus::Restored {
-                report.restore_calibrated =
-                    calibrating && activation_observed && interval <= bound && !*person_input;
-                predictor.record(
-                    elapsed,
-                    report.restore_calibrated.then_some(bound),
-                    Instant::now(),
-                );
+            match outcome.restore {
+                RestoreStatus::Restored => {
+                    report.restore_calibrated =
+                        calibrating && activation_observed && interval <= bound && !*person_input;
+                    predictor.record(
+                        elapsed,
+                        report.restore_calibrated.then_some(bound),
+                        Instant::now(),
+                    );
+                }
+                // As for the in-memory history: a failed wait is only a lower
+                // bound on the restore's cost, so it counts as at least the
+                // full cleanup allowance and can never shrink the reserve.
+                RestoreStatus::Failed { .. } => {
+                    predictor.record(elapsed.max(RESTORE_WAIT_MS), None, Instant::now());
+                }
+                RestoreStatus::NotNeeded | RestoreStatus::SkippedPerson { .. } => {}
             }
         } else {
             remember_restore(*host.borrow_mut(), outcome.restore, elapsed);

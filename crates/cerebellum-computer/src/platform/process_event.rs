@@ -374,6 +374,67 @@ fn post_paced_with_visibility<T: PerProcessEventTransport>(
     })
 }
 
+/// The checks a keystroke unit makes before each of its own posts while its
+/// target is temporarily in front.
+pub trait FrontedKeyGuard {
+    /// Runs before a press or self-contained post, never before a release
+    /// or a recovery release. `press` says the post may leave a key held
+    /// until its paired release. An error stops the unit before this post,
+    /// and the presses already posted are released as on any other stop.
+    fn before_post(&mut self, press: bool) -> Result<(), ProcessEventRefusal>;
+    /// Every press posted so far has been released.
+    fn all_released(&mut self) {}
+}
+
+/// [`post_event_sequence_with_visibility`] for a unit posted while its
+/// target is temporarily in front. `guard` runs before every press and
+/// self-contained post, after the caller's cancellation check, so focus and
+/// the bracket's deadline are checked at each post rather than once per
+/// unit. Releases are not held back by it: like every post here they go to
+/// the target process, and leaving a key down is worse than releasing it
+/// after the target lost focus.
+pub fn post_event_sequence_fronted<T: PerProcessEventTransport>(
+    target: ProcessEventTarget,
+    steps: Vec<SyntheticStep<T::Event>>,
+    transport: &mut T,
+    visibility: &mut VisibilityMemo,
+    cancelled: &dyn Fn() -> bool,
+    guard: &mut dyn FrontedKeyGuard,
+) -> Result<SequencePostReport, SequencePostFailure> {
+    let roles: Vec<SyntheticStepRole> = steps.iter().map(|step| step.role).collect();
+    let mut presses_down = 0_usize;
+    post_guarded_event_sequence(steps, cancelled, |index, event, recovery| {
+        transport.set_recovery(recovery);
+        let Some(event) = event else {
+            return Ok(0);
+        };
+        let role = roles[index];
+        if !recovery && role != SyntheticStepRole::Release {
+            guard.before_post(role == SyntheticStepRole::Press)?;
+        }
+        let routed = route_event_with_visibility(target, event, transport, visibility)
+            .map(|(_, checks)| checks);
+        if routed.is_ok() {
+            match role {
+                SyntheticStepRole::Press => presses_down += 1,
+                SyntheticStepRole::Release => {
+                    presses_down = presses_down.saturating_sub(1);
+                    if presses_down == 0 {
+                        guard.all_released();
+                    }
+                }
+                SyntheticStepRole::SelfContained => {}
+            }
+        }
+        routed
+    })
+    .map_err(|failure| SequencePostFailure {
+        posts_returned: failure.posts_returned,
+        refusal: failure.refusal.unwrap_or(ProcessEventRefusal::Cancelled),
+        held_state: failure.held_state,
+    })
+}
+
 /// An explicit observer for probes and callers with no interrupt source.
 pub fn never_cancelled() -> bool {
     false

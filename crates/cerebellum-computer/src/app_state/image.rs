@@ -372,6 +372,7 @@ mod tests {
             waiting_out_slow_post: false,
             waiting_out_slow_restore: false,
             restore_calibrated: false,
+            restore_started_by_cutoff: false,
         }
     }
 

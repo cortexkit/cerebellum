@@ -515,6 +515,20 @@ struct MacPointerUnit {
     observed_abort: Option<crate::dispatch::AbortDecision>,
 }
 
+impl MacBracketHost {
+    /// Request a front of `pid` through `front`, but only while `pid` is
+    /// still held by the admitted process generation.
+    fn request_front_with(&mut self, pid: u32, front: impl FnOnce() -> bool) -> bool {
+        let transport = &mut self.transport;
+        pointer::request_verified_front(
+            Some(self.target),
+            pid,
+            || transport.process_generation(pid),
+            front,
+        )
+    }
+}
+
 impl crate::dispatch::FrontingBracketHost for MacBracketHost {
     type Tap = cerebellum_macos::SessionEventTap;
 
@@ -530,13 +544,11 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
         cerebellum_macos::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok())
     }
 
+    // Every front is bound to the admitted process generation, whatever the
+    // unit: a picture or a keystroke is never fronted for a process that has
+    // since taken over the pid.
     fn request_front(&mut self, pid: u32) -> bool {
-        pointer::request_verified_front(
-            self.pointer.as_ref().map(|_| self.target),
-            pid,
-            || self.transport.process_generation(pid),
-            || cerebellum_macos::request_frontmost(pid).is_ok(),
-        )
+        self.request_front_with(pid, || cerebellum_macos::request_frontmost(pid).is_ok())
     }
 
     fn our_pid(&self) -> i64 {
@@ -601,6 +613,14 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
         ))
     }
 
+    // Keystroke units check the cutoff before each key post and mark the
+    // keys they hold. A pointer gesture does not, so the bracket holds the
+    // cutoff for the whole gesture: a restore under a held button would
+    // hand the button's release to the previous application's window.
+    fn unit_checks_cutoff(&self) -> bool {
+        self.pointer.is_none()
+    }
+
     fn observe_heartbeat(
         &mut self,
         tap: &Self::Tap,
@@ -610,25 +630,17 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
         heartbeat_observation(tap, watcher, probe, self.started)
     }
 
+    // Keystroke units are posted only through `post_observed_unit`, which
+    // checks focus, cancellation and the deadline before each key post. A
+    // keystroke post without those checks is refused before anything is sent.
     fn post_unit(
         &mut self,
-        index: usize,
+        _index: usize,
     ) -> Result<crate::dispatch::UnitPosted, SequencePostFailure> {
-        let steps = self
-            .units
-            .get_mut(index)
-            .and_then(Option::take)
-            .unwrap_or_default();
-        let report = post_event_sequence_with_visibility(
-            self.target,
-            steps,
-            &mut self.transport,
-            &mut self.visibility,
-            &|| false,
-        )?;
-        Ok(crate::dispatch::UnitPosted {
-            posts_returned: report.posts_returned,
-            generation_verifications: report.generation_verifications,
+        Err(SequencePostFailure {
+            posts_returned: 0,
+            refusal: super::process_event::ProcessEventRefusal::Cancelled,
+            held_state: HeldStateDisposition::NoneHeld,
         })
     }
 
@@ -638,7 +650,33 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
         observation: crate::dispatch::ObservedUnit<'_, Self::Tap>,
     ) -> Result<crate::dispatch::UnitPosted, SequencePostFailure> {
         let Some(pointer) = self.pointer.as_mut() else {
-            return self.post_unit(index);
+            let steps = self
+                .units
+                .get_mut(index)
+                .and_then(Option::take)
+                .unwrap_or_default();
+            let started = self.started;
+            let mut checks = crate::dispatch::FrontedKeyChecks {
+                target_pid: self.target.pid,
+                deadline_ms: observation.deadline_ms,
+                now_ms: || elapsed_millis(started),
+                frontmost_pid: || {
+                    cerebellum_macos::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok())
+                },
+                cutoff: observation.cutoff,
+            };
+            let report = super::process_event::post_event_sequence_fronted(
+                self.target,
+                steps,
+                &mut self.transport,
+                &mut self.visibility,
+                observation.cancelled,
+                &mut checks,
+            )?;
+            return Ok(crate::dispatch::UnitPosted {
+                posts_returned: report.posts_returned,
+                generation_verifications: report.generation_verifications,
+            });
         };
         let steps = self
             .units
@@ -2416,6 +2454,40 @@ impl PlatformDriver for MacOs26PlatformDriver {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    /// A picture bracket fronts only the admitted process generation: once
+    /// another process holds the pid, no front is requested at all.
+    #[test]
+    fn a_picture_bracket_never_fronts_a_reused_pid() {
+        let started = Instant::now();
+        let our_pid = std::process::id();
+        let mut host = MacBracketHost {
+            pointer_primitives: None,
+            started,
+            tap: None,
+            heartbeat: HeartbeatPoster {
+                marker: HeartbeatMarker::new(1),
+                event: None,
+                started,
+                our_pid: i64::from(our_pid),
+            },
+            // This pid, but an earlier process's start time.
+            target: ProcessEventTarget {
+                pid: our_pid,
+                start_time_micros: 1,
+            },
+            units: Vec::new(),
+            transport: MacOsPerProcessEventTransport::for_keyboard(WINDOW_LIST_READ_TIMEOUT),
+            visibility: VisibilityMemo::new(VISIBLE_READING_MAX_AGE),
+            pointer: None,
+        };
+        let mut requested = false;
+        assert!(!host.request_front_with(our_pid, || {
+            requested = true;
+            true
+        }));
+        assert!(!requested, "a front was requested for a replaced process");
+    }
 
     #[test]
     fn native_fronted_operations_require_restore_hooks_before_os_calls() {

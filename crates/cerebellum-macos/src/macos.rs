@@ -1212,6 +1212,20 @@ pub fn capture_window(
     timeout: Duration,
     source_rect: Option<CaptureSourceRect>,
 ) -> Result<RawCapture, CaptureError> {
+    capture_window_owned_by(window_id, timeout, source_rect, &mut |_| true)
+}
+
+/// [`capture_window`], asking `accept_owner` about the window's owning
+/// process before any pixels are requested. When it answers `false`, the
+/// capture fails without asking ScreenCaptureKit for the window's pixels.
+/// The owner the capture reports is the same reading, so a caller should
+/// still check it afterwards.
+pub fn capture_window_owned_by(
+    window_id: u32,
+    timeout: Duration,
+    source_rect: Option<CaptureSourceRect>,
+    accept_owner: &mut dyn FnMut(u32) -> bool,
+) -> Result<RawCapture, CaptureError> {
     // Before any filter is created. Without a window-server connection the
     // filter constructor does not fail -- it aborts the process, which for a
     // module means the whole module dies rather than refusing one capture.
@@ -1228,6 +1242,12 @@ pub fn capture_window(
             .map_err(CaptureError::Capture)?;
         (owner, window.frame())
     };
+    if !accept_owner(owner_pid_at_capture) {
+        return Err(CaptureError::Capture(format!(
+            "window {window_id} is owned by process {owner_pid_at_capture}, which this capture \
+             does not accept; no pixels were requested"
+        )));
+    }
     // SAFETY: the window is retained here and outlives the filter's creation.
     let filter = unsafe {
         SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &window)
