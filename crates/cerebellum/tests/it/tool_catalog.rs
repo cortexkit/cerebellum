@@ -284,13 +284,17 @@ async fn tool_views_are_advertised_and_match_catalog_pins() {
             panic!("catalog pin has no view: {pin}");
         };
         assert_eq!(view.record_schema.name, "cerebellum_call");
-        // Raised each time the templates named a new catalog 1.1 digest (to 2,
-        // then to 3 when the older digest was retired); the template sources
-        // otherwise match revision 1.
-        assert_eq!(view.template_revision, 3);
+        // The revision tracks the catalog digest so readers can replace retained views.
+        assert_eq!(view.template_revision, 4);
         assert!(view.reads.is_empty());
         assert_eq!(view.template["row"]["profile"], "tool_row");
         assert_eq!(view.template["page"]["profile"], "tool_page");
+        for profile in ["row", "page"] {
+            assert_eq!(
+                view.template[profile]["catalog"]["digest"],
+                "sha256:af4559652b832b8908f4dc39364874eea6950ab708567e70f17d304e8c0f9a32"
+            );
+        }
         // The view carries the definition behind its pin, so the display server
         // can recompute the pin and read the schema even once the tool changes.
         let kept = view
