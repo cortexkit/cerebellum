@@ -27,6 +27,7 @@ fn admission(mode: AppUse, attended: bool, admitted: bool, takeover_held: bool) 
         // today's release builds are.
         bracket_admitted: true,
         takeover_held,
+        agent_run: false,
     }
 }
 
@@ -74,9 +75,11 @@ fn mode_attendance_and_admission_decide_takeover_chords_and_fronting() {
                     ChordRoute::PerProcess
                 );
 
+                // A picture fronted under the app grant needs the app-use
+                // review itself, not only the takeover bracket's review.
                 assert_eq!(
                     without_takeover.may_front_image().is_ok(),
-                    attended,
+                    attended && admitted,
                     "{case}"
                 );
                 let no_bracket = Admission {
@@ -86,6 +89,17 @@ fn mode_attendance_and_admission_decide_takeover_chords_and_fronting() {
                 assert!(
                     no_bracket.may_front_image().is_err(),
                     "{case} without bracket review"
+                );
+                // An older agent run cannot ask a person, so it never fronts
+                // a picture, even with a standing app grant and no flow.
+                let agent_run = Admission {
+                    agent_run: true,
+                    ..without_takeover
+                };
+                assert_eq!(
+                    agent_run.may_front_image(),
+                    Err(FrontingStop::Unattended),
+                    "{case} agent run"
                 );
             }
         }

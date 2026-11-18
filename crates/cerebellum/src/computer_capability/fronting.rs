@@ -424,6 +424,10 @@ pub(crate) struct Admission {
     pub(crate) bracket_admitted: bool,
     /// The caller holds the takeover grant.
     pub(crate) takeover_held: bool,
+    /// An older agent run without a head route: it may use standing grants
+    /// but has no person to ask, so it is treated as unattended for
+    /// fronting a picture, as the takeover grant once required.
+    pub(crate) agent_run: bool,
 }
 
 impl Admission {
@@ -509,12 +513,13 @@ fn takeover_route(admission: Admission) -> ChordRoute {
 }
 
 impl Admission {
-    /// An image needs the bracket review, not the review for sending app
-    /// input or leaving the app in front.
+    /// A picture fronted under the app's own grant needs the app-use fronting
+    /// review (which a build binds only together with the bracket review),
+    /// an attended session, and a caller that is not an older agent run.
     pub(super) fn may_front_image(self) -> Result<(), FrontingStop> {
-        if !self.attended {
+        if !self.attended || self.agent_run {
             Err(FrontingStop::Unattended)
-        } else if !self.bracket_admitted {
+        } else if !self.app_use_fronting_admitted || !self.bracket_admitted {
             Err(FrontingStop::FrontingNotAdmitted)
         } else {
             Ok(())
@@ -991,6 +996,7 @@ where
             app_use_fronting_admitted: self.app_use_fronting_admitted,
             bracket_admitted: self.fronting_bracket_admitted,
             takeover_held,
+            agent_run: consent.agent_run,
         }
     }
 
