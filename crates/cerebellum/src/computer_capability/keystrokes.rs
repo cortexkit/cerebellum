@@ -359,8 +359,8 @@ pub(crate) fn dispatch_refusal_reply(
         {
             Some(
                 "the application was brought forward only to measure restoring the person's app, \
-                 which is back in front. Nothing was sent; retry the shortcut now that the \
-                 restore time is known",
+                 which is back in front. No keys or clicks were sent; retry the shortcut now \
+                 that the restore time is known",
             )
         }
         DispatchError::FrontingBoundExceeded
@@ -719,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn a_calibrated_shortcut_refusal_says_nothing_was_sent_and_to_retry() {
+    fn a_calibrated_shortcut_refusal_says_no_keys_or_clicks_were_sent_and_to_retry() {
         let mut bracket = bracket_stopped_before_front(1, 0);
         bracket.stop = Some(BracketStop::BoundExceeded);
         bracket.restore = RestoreStatus::Restored;
@@ -733,7 +733,7 @@ mod tests {
         let remedy = reply["remedy"].as_str().unwrap();
         assert!(remedy.contains("back in front"), "{reply}");
         assert!(
-            remedy.contains("Nothing was sent; retry the shortcut"),
+            remedy.contains("No keys or clicks were sent; retry the shortcut"),
             "{reply}"
         );
     }

@@ -1,7 +1,7 @@
 //! A restore history on disk may only make admission stricter. Each test
 //! writes a history this module would never have written itself and checks
 //! that the first shortcut after loading it is treated as cold: it may front
-//! once to calibrate, but sends nothing on the strength of the file.
+//! once to calibrate, but sends no keys or clicks on the strength of the file.
 
 use super::*;
 use std::path::PathBuf;

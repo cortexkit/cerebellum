@@ -286,7 +286,9 @@ pub struct BracketReport {
     /// fit. A refusal while no restore has been measured yet (the full restore
     /// allowance stands in) does not count: nothing was seen to be slow.
     pub waiting_out_slow_restore: bool,
-    /// A no-send calibration confirmed a restore within the allowance.
+    /// A calibration confirmed a restore within the allowance. It sends no
+    /// keys or clicks; like every bracket it posts the observer's liveness
+    /// marker (a pointer move to where the pointer already is) first.
     pub restore_calibrated: bool,
     /// The cutoff timer, not the bracket, started the restore: the front
     /// reached its bound while the bracket was still busy in a unit.
@@ -545,7 +547,8 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
         if cold || restore_reserve.saturating_add(unit_reserve) > bound {
             let restore_blocks =
                 previous != plan.target_pid && restore_reserve > bound && unit_reserve <= bound;
-            // Only app-use needs-front may measure without posting. A cold
+            // Only app-use needs-front may measure without posting any keys
+            // or clicks. A cold
             // predictor, or one whose slow restore prevents any newer sample,
             // can otherwise keep every later call from even requesting a front.
             if (cold || restore_blocks) && next_unit == 0 {
@@ -1011,8 +1014,8 @@ pub(crate) fn run_fronting_read_with_predictor<H: FrontingBracketHost>(
             (self.read)();
             Ok(UnitPosted::default())
         }
-        // A picture posts no input and holds nothing down, so the cutoff may
-        // restore while the read is still running. The read itself starts
+        // A picture unit posts no keys or clicks and holds nothing down, so
+        // the cutoff may restore while the read is still running. The read itself starts
         // only inside the bound, before the cutoff and before cancellation.
         fn post_observed_unit(
             &mut self,
