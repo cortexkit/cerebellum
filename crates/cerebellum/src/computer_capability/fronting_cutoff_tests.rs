@@ -333,3 +333,41 @@ fn a_picture_read_inside_the_bound_may_acquire() {
     assert_eq!(outcome.report.restore, RestoreStatus::Restored);
     assert_eq!(lock_releases(&releases), 1);
 }
+
+#[test]
+fn a_restore_the_cutoff_ran_is_sampled_at_its_own_cost_not_the_readers_wait() {
+    let screen = Screen::new(&mail_desk());
+    {
+        // The first request to put the previous application back is ignored,
+        // so the restore takes its fallback after the fallback delay.
+        let mut state = screen.state();
+        state.restores_ignored = 1;
+        state.fallback_works = true;
+    }
+    let (hooks, _releases) = app_use_hooks();
+    let mut boxed = boxed_hooks(&hooks);
+    let reader = screen.clone();
+    let mut read = || {
+        // Blocks until the previous application is back, so the bracket's
+        // thread reads the cutoff's decision only once the restore is done.
+        let give_up = Instant::now() + crate::test_support::HANG_GUARD;
+        while Instant::now() < give_up && reader.frontmost() != Some(PREVIOUS) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let outcome = cerebellum_computer::platform::run_hooked_fronted(
+        &mut FakeBracket(screen.clone()),
+        &mut UserIdleEstimator::new(),
+        plan(),
+        &|| false,
+        boxed.as_mut(),
+        Some(&mut read),
+    );
+    assert!(outcome.report.restore_started_by_cutoff);
+    assert_eq!(outcome.report.restore, RestoreStatus::Restored);
+    let sampled = screen.state().measured_restore_ms;
+    assert!(
+        sampled >= Some(cerebellum_computer::dispatch::RESTORE_FALLBACK_AFTER_MS),
+        "the restore took at least the fallback delay, but was sampled at {sampled:?}"
+    );
+}

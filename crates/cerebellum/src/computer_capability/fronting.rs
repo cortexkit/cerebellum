@@ -894,6 +894,7 @@ impl FrontedDispatchHooks for CellHooks {
                 restore: RestoreStatus::NotNeeded,
                 person_input_during_fronting: false,
                 input_coverage_unavailable: false,
+                restore_ms: None,
             };
         };
         let decided = decide_with_restore_budget(&cell);
@@ -902,6 +903,7 @@ impl FrontedDispatchHooks for CellHooks {
             restore: decided.restore,
             person_input_during_fronting: decided.person_input_during_fronting,
             input_coverage_unavailable: decided.input_coverage_unavailable,
+            restore_ms: decided.restore_ms,
         }
     }
 

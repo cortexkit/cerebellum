@@ -268,6 +268,9 @@ pub struct RestoreDecided {
     /// Hardware input arrived after the front.
     pub person_input_during_fronting: bool,
     pub input_coverage_unavailable: bool,
+    /// How long the restore took, timed by the side that ran the decision,
+    /// not by a side that only awaited it; `None` when no restore was timed.
+    pub restore_ms: Option<u64>,
     /// A front request was made. `false` when cleanup took the obligation
     /// before the worker fronted, so the worker never did.
     pub front_requested: bool,
@@ -434,6 +437,7 @@ impl RestoreCell {
                         restore: crate::computer::dispatch::RestoreStatus::NotNeeded,
                         person_input_during_fronting: false,
                         input_coverage_unavailable: false,
+                        restore_ms: None,
                         front_requested: false,
                     },
                 );
@@ -500,6 +504,7 @@ impl RestoreCell {
                     restore: outcome.restore,
                     person_input_during_fronting: outcome.person_input_during_fronting,
                     input_coverage_unavailable: outcome.input_coverage_unavailable,
+                    restore_ms: outcome.restore_ms,
                     front_requested: true,
                 }
             }
@@ -523,6 +528,7 @@ impl RestoreCell {
                 restore: crate::computer::dispatch::RestoreStatus::NotNeeded,
                 person_input_during_fronting: false,
                 input_coverage_unavailable: false,
+                restore_ms: None,
                 front_requested: false,
             },
             CleanupTake::AwaitFrontAttempt | CleanupTake::Decide { .. } => self.failed(),
@@ -547,6 +553,7 @@ impl RestoreCell {
                     restore: crate::computer::dispatch::RestoreStatus::NotNeeded,
                     person_input_during_fronting: false,
                     input_coverage_unavailable: false,
+                    restore_ms: None,
                     front_requested: false,
                 };
                 return Some(self.complete(inner, decided));
@@ -633,6 +640,7 @@ impl RestoreCell {
             },
             person_input_during_fronting: false,
             input_coverage_unavailable: false,
+            restore_ms: None,
             front_requested: true,
         }
     }
@@ -3056,6 +3064,7 @@ mod restore_slot_tests {
             },
             person_input_during_fronting: false,
             input_coverage_unavailable: false,
+            restore_ms: None,
             front_requested: true,
         };
         for outcome in [

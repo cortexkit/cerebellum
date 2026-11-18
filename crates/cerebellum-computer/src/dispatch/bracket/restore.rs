@@ -140,6 +140,12 @@ pub struct RestoreOutcome {
     /// When the previous application was seen back in front, or the decision
     /// otherwise finished, on the host's clock.
     pub finished_at_ms: u64,
+    /// How long this restore took, from the start of the decision that ran
+    /// it to `finished_at_ms`, as timed by whoever ran that decision. `None`
+    /// when the caller did not run it itself, for instance when it awaited
+    /// a decision another thread had already made: its own wait says
+    /// nothing about what the restore cost, so it is no timing sample.
+    pub restore_ms: Option<u64>,
 }
 
 /// Run the restore decision against `host` and carry it out: read the
@@ -192,6 +198,29 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
     require_quiet: bool,
 ) -> RestoreOutcome {
     let started = host.now_ms();
+    let mut outcome = untimed_restore_attempt(
+        host,
+        previous,
+        target,
+        front_instant_ms,
+        wait_ms,
+        activation_observed,
+        require_quiet,
+    );
+    outcome.restore_ms = Some(outcome.finished_at_ms.saturating_sub(started));
+    outcome
+}
+
+fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
+    host: &mut H,
+    previous: u32,
+    target: u32,
+    front_instant_ms: u64,
+    wait_ms: u64,
+    activation_observed: bool,
+    require_quiet: bool,
+) -> RestoreOutcome {
+    let started = host.now_ms();
     if previous != target && !activation_observed {
         loop {
             let frontmost = host.frontmost_pid();
@@ -210,6 +239,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
                     person_input_during_fronting: true,
                     input_coverage_unavailable,
                     finished_at_ms: host.now_ms(),
+                    restore_ms: None,
                 };
             }
             if frontmost == Some(target) {
@@ -223,6 +253,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
                     person_input_during_fronting: input,
                     input_coverage_unavailable,
                     finished_at_ms: host.now_ms(),
+                    restore_ms: None,
                 };
             }
             if host.now_ms().saturating_sub(started) >= wait_ms {
@@ -233,6 +264,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
                     person_input_during_fronting: input,
                     input_coverage_unavailable: false,
                     finished_at_ms: host.now_ms(),
+                    restore_ms: None,
                 };
             }
             host.pause_ms(FRONTING_POLL_MS);
@@ -245,6 +277,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
             person_input_during_fronting: false,
             input_coverage_unavailable: false,
             finished_at_ms: host.now_ms(),
+            restore_ms: None,
         };
     }
     let first_front = host.frontmost_pid();
@@ -271,6 +304,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
             person_input_during_fronting: input,
             input_coverage_unavailable,
             finished_at_ms: host.now_ms(),
+            restore_ms: None,
         };
     }
     match decide_restore(previous, target, frontmost, input) {
@@ -279,6 +313,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
             person_input_during_fronting: input,
             input_coverage_unavailable: false,
             finished_at_ms: host.now_ms(),
+            restore_ms: None,
         },
         RestoreDecision::Restore {
             person_input_during_fronting,
@@ -299,6 +334,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
                 person_input_during_fronting,
                 input_coverage_unavailable: false,
                 finished_at_ms: host.now_ms(),
+                restore_ms: None,
             }
         }
     }

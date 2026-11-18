@@ -1116,28 +1116,41 @@ fn restore<H: FrontingBracketHost>(
                 .max(outcome.finished_at_ms.saturating_sub(restore_at));
         }
         let interval = outcome.finished_at_ms.saturating_sub(fronted_at);
-        let elapsed = outcome.finished_at_ms.saturating_sub(restore_at);
+        // The sample is the restore's own cost as the side that ran it timed
+        // it. The time this thread spent reaching the decision says nothing
+        // about that cost: when the cutoff's timer ran the restore while a
+        // picture blocked this thread, reading the decision afterwards would
+        // otherwise record a near-zero restore.
+        let sample = outcome.restore_ms;
         if let Some(predictor) = predictor {
             match outcome.restore {
                 RestoreStatus::Restored => {
                     report.restore_calibrated =
                         calibrating && activation_observed && interval <= bound && !*person_input;
-                    predictor.record(
-                        elapsed,
-                        report.restore_calibrated.then_some(bound),
-                        Instant::now(),
-                    );
+                    if let Some(sample) = sample {
+                        predictor.record(
+                            sample,
+                            report.restore_calibrated.then_some(bound),
+                            Instant::now(),
+                        );
+                    }
                 }
                 // As for the in-memory history: a failed wait is only a lower
                 // bound on the restore's cost, so it counts as at least the
                 // full cleanup allowance and can never shrink the reserve.
                 RestoreStatus::Failed { .. } => {
-                    predictor.record(elapsed.max(RESTORE_WAIT_MS), None, Instant::now());
+                    predictor.record(
+                        sample.unwrap_or(0).max(RESTORE_WAIT_MS),
+                        None,
+                        Instant::now(),
+                    );
                 }
                 RestoreStatus::NotNeeded | RestoreStatus::SkippedPerson { .. } => {}
             }
-        } else {
-            remember_restore(*host.borrow_mut(), outcome.restore, elapsed);
+        } else if let Some(sample) = sample {
+            remember_restore(*host.borrow_mut(), outcome.restore, sample);
+        } else if matches!(outcome.restore, RestoreStatus::Failed { .. }) {
+            remember_restore(*host.borrow_mut(), outcome.restore, RESTORE_WAIT_MS);
         }
         report.longest_fronted_interval_ms = report.longest_fronted_interval_ms.max(interval);
         report.restore = outcome.restore;
