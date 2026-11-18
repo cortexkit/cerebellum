@@ -51,12 +51,17 @@ pub const FRONTING_BRACKET_MS: u64 = 200;
 /// native restore request is two frontmost readings (each a window-server
 /// window list), two reads of the hardware observer's timestamps, the
 /// previous application's start-time check and the accessibility write on an
-/// element resolved when the front was registered. Measured on a desk
+/// element resolved when the front was registered. The end-to-end sample
+/// starts at the planned timer wake, so it also covers wake-up latency,
+/// the cutoff and restore-cell locks, and setup before the OS checks.
+/// Measured on a desk
 /// (two window-list reads and a start-time read, 40 runs): median about
 /// 1 ms, 90th percentile about 5 ms, slowest 33 ms. This floor covers the
 /// slowest with room for scheduling; a preparation measured slower raises
 /// the reserve, up to `RESTORE_PREPARATION_RESERVE_MAX_MS`.
 pub const RESTORE_PREPARATION_RESERVE_MS: u64 = 50;
+/// Extra room above a measured preparation for variation in caller-side work.
+pub const RESTORE_PREPARATION_SLACK_MS: u64 = 10;
 /// The most the cutoff fires early: half the bracket, to leave time to act.
 /// Two exceptions can leave the target in front past the bound. An unsettled
 /// input release defers restore until settlement. If OS focus reads stall

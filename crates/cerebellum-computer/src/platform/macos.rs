@@ -830,16 +830,17 @@ impl FrontingRestoreHost for MacRestoreHost {
         self.request_front_while(pid, &mut || true)
     }
 
-    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
+    fn request_front_while(&mut self, pid: u32, check: &mut dyn super::RestoreWriteCheck) -> bool {
         // Only the process recorded as the previous application, and only
         // while it still holds the pid, checked again right before the
         // activation is written.
+        let check = std::cell::RefCell::new(check);
         pointer::request_previous_front(
             self.previous,
             pid,
-            cerebellum_macos::process_start_time_micros,
+            |pid| restore_start_time(pid, &mut **check.borrow_mut()),
             |still_ours| {
-                let permitted = &mut || still_ours() && permitted();
+                let permitted = &mut || still_ours() && check.borrow_mut().permit();
                 match &self.prepared {
                     Some(prepared) if prepared.pid() == pid => {
                         prepared.request_while(permitted).is_ok()
@@ -862,11 +863,17 @@ impl FrontingRestoreHost for MacRestoreHost {
     fn request_front_fallback_while(
         &mut self,
         pid: u32,
-        permitted: &mut dyn FnMut() -> bool,
+        check: &mut dyn super::RestoreWriteCheck,
     ) -> bool {
         match self.previous {
             Some((previous, start)) if previous == pid => {
-                cerebellum_macos::activate_application_while(pid, start, permitted)
+                let check = std::cell::RefCell::new(check);
+                cerebellum_macos::activate_application_while(
+                    pid,
+                    start,
+                    &mut |started, finished| check.borrow_mut().identity_read(started, finished),
+                    &mut || check.borrow_mut().permit(),
+                )
             }
             _ => false,
         }
@@ -881,6 +888,13 @@ impl FrontingRestoreHost for MacRestoreHost {
             last_input,
         ))
     }
+}
+
+fn restore_start_time(pid: u32, check: &mut dyn super::RestoreWriteCheck) -> Option<u64> {
+    let started = Instant::now();
+    let identity = cerebellum_macos::process_start_time_micros(pid);
+    check.identity_read(started, Instant::now());
+    identity
 }
 
 impl RestoreHostSource for MacBracketHost {

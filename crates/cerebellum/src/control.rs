@@ -610,6 +610,14 @@ pub(super) fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleCo
             "frontingRestoreExpiredAtWrite".to_string(),
             json!(crate::terminal_arbiter::restore_preparation::expired_writes()),
         );
+        metrics.insert(
+            "frontingRestoreExpiredAtWriteOsDelay".to_string(),
+            json!(crate::terminal_arbiter::restore_preparation::expired_os_delay()),
+        );
+        metrics.insert(
+            "frontingRestoreExpiredAtWriteInternal".to_string(),
+            json!(crate::terminal_arbiter::restore_preparation::expired_internal()),
+        );
     }
     report
 }

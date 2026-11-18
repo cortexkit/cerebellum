@@ -26,6 +26,13 @@
 //! A short-lived watcher can retry only while the target is still frontmost
 //! and observation shows the person has not intervened. Neither exception assumes focus or
 //! input is safe merely because time has passed.
+//! macOS is not a real-time scheduler: it can preempt even the ready cutoff
+//! thread. The reserve includes time from its planned wake through the last
+//! check, and the write is refused if that check is late. A timeout wake
+//! after the deadline or a stalled OS focus/identity read can explain the
+//! expiry; overruns in our own preparation are reported separately. Clock
+//! measurements cannot distinguish preemption inside our code from its own
+//! work, so those overruns are not attributed to an OS read.
 //!
 //! Everything platform-specific is behind [`FrontingBracketHost`], so the
 //! ordering, the chunking and the bound are driven by a fake clock in tests.

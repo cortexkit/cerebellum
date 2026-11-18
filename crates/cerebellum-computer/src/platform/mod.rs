@@ -1705,8 +1705,8 @@ pub trait FrontingRestoreHost: Send {
     fn frontmost_pid(&mut self) -> Option<u32>;
     fn request_front(&mut self, pid: u32) -> bool;
     /// Check `permitted` at the actual restore write, after native preparation.
-    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
-        permitted() && self.request_front(pid)
+    fn request_front_while(&mut self, pid: u32, check: &mut dyn RestoreWriteCheck) -> bool {
+        check.permit() && self.request_front(pid)
     }
     /// `None` when unavailable, which the decision reads as no input seen.
     fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot>;
@@ -1727,9 +1727,22 @@ pub trait FrontingRestoreHost: Send {
     fn request_front_fallback_while(
         &mut self,
         pid: u32,
-        permitted: &mut dyn FnMut() -> bool,
+        check: &mut dyn RestoreWriteCheck,
     ) -> bool {
-        permitted() && self.request_front_fallback(pid)
+        check.permit() && self.request_front_fallback(pid)
+    }
+}
+
+/// The final restore-write check, with optional attribution of time spent
+/// inside a native process-identity read to the OS rather than to its caller.
+pub trait RestoreWriteCheck {
+    fn permit(&mut self) -> bool;
+    fn identity_read(&mut self, _started: std::time::Instant, _finished: std::time::Instant) {}
+}
+
+impl<F: FnMut() -> bool> RestoreWriteCheck for F {
+    fn permit(&mut self) -> bool {
+        self()
     }
 }
 
@@ -1871,7 +1884,7 @@ pub trait FrontedDispatchHooks: Send {
     /// bracket's bound while the bracket is still busy: the same once-only
     /// decision as [`Self::decide_restore`], run on the timer's thread.
     /// `None`, the default, arms no timer.
-    fn cutoff_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+    fn cutoff_restore(&mut self) -> Option<Box<dyn FnOnce(crate::dispatch::CutoffWake) + Send>> {
         None
     }
     /// The cutoff timer for this front was armed on `gate`. A caller that
@@ -1993,7 +2006,7 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             // so nothing is fronted; the obligation then reads as prevented.
             if let Some(restore) = self.hooks.cutoff_restore() {
                 self.hooks.restore_deadline(deadline);
-                match crate::dispatch::CutoffTimer::arm(
+                match crate::dispatch::CutoffTimer::arm_with_wake(
                     std::sync::Arc::clone(&self.cutoff),
                     cutoff_at,
                     restore,
@@ -2039,10 +2052,10 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
         // decision does that, or decides not to. Nothing was fronted when
         // registration was refused, so there is nothing to ask for.
         self.returned();
-        self.cutoff.disarm();
         if matches!(self.registration, Registration::Registered { .. }) && self.decided.is_none() {
             self.decided = Some(self.hooks.decide_restore());
         }
+        self.cutoff.disarm();
         true
     }
     fn begin_without_switch(&mut self, pid: u32) -> bool {
@@ -2058,7 +2071,11 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
         // No activation is recorded: the timer can end the lock obligation,
         // but neither the timer nor terminal cleanup may change the focus.
         let timer = self.hooks.cutoff_restore().and_then(|finish| {
-            crate::dispatch::CutoffTimer::arm(std::sync::Arc::clone(&self.cutoff), deadline, finish)
+            crate::dispatch::CutoffTimer::arm_with_wake(
+                std::sync::Arc::clone(&self.cutoff),
+                deadline,
+                finish,
+            )
         });
         if let Some(timer) = timer {
             self.timer = Some(timer);
@@ -2099,7 +2116,6 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
         _activation_observed: bool,
     ) -> crate::dispatch::RestoreOutcome {
         self.returned();
-        self.cutoff.disarm();
         if !matches!(self.registration, Registration::Registered { .. }) {
             return crate::dispatch::RestoreOutcome {
                 restore: crate::dispatch::RestoreStatus::NotNeeded,
@@ -2117,6 +2133,7 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
                 decided
             }
         };
+        self.cutoff.disarm();
         crate::dispatch::RestoreOutcome {
             restore: decided.restore,
             person_input_during_fronting: decided.person_input_during_fronting,

@@ -175,8 +175,12 @@ pub trait RestoreHost: Send {
     /// Ask the application `pid` runs to become frontmost. `false` when the
     /// request itself was refused.
     fn request_front(&mut self, pid: u32) -> bool;
-    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
-        permitted() && self.request_front(pid)
+    fn request_front_while(
+        &mut self,
+        pid: u32,
+        check: &mut dyn crate::computer::platform::RestoreWriteCheck,
+    ) -> bool {
+        check.permit() && self.request_front(pid)
     }
     /// A second way to ask for `pid`, the application a restore puts back,
     /// to come to the front, for when [`Self::request_front`] has not taken
@@ -187,9 +191,9 @@ pub trait RestoreHost: Send {
     fn request_front_fallback_while(
         &mut self,
         pid: u32,
-        permitted: &mut dyn FnMut() -> bool,
+        check: &mut dyn crate::computer::platform::RestoreWriteCheck,
     ) -> bool {
-        permitted() && self.request_front_fallback(pid)
+        check.permit() && self.request_front_fallback(pid)
     }
     /// The process-wide session observer's hardware input timestamps, on
     /// this host's clock. `None` when unavailable, which the decision reads
@@ -535,7 +539,7 @@ impl RestoreCell {
     /// obligation first to finish it. Blocking: it reads the front, may
     /// request the previous application and waits for it.
     pub fn decide(&self) -> RestoreDecided {
-        self.decide_with(false)
+        self.decide_with(None)
     }
 
     /// [`Self::decide`] for the cutoff, at the bracket's deadline: the
@@ -545,14 +549,18 @@ impl RestoreCell {
     /// watch's to put back. It still leaves focus alone on person input
     /// since the front, or when the hardware input observer could not watch
     /// throughout since then.
-    pub fn decide_at_cutoff(&self) -> RestoreDecided {
-        self.decide_with(true)
+    pub fn decide_at_cutoff(&self, wake: crate::computer::dispatch::CutoffWake) -> RestoreDecided {
+        self.decide_with(Some(wake))
     }
 
-    fn decide_with(&self, at_cutoff: bool) -> RestoreDecided {
+    fn decide_with(&self, wake: Option<crate::computer::dispatch::CutoffWake>) -> RestoreDecided {
         use crate::computer::dispatch::{CleanupTake, FrontAttemptState};
         let started = std::time::Instant::now();
+        let at_cutoff = wake.is_some();
         let mut inner = self.inner();
+        // A timed restore must not spend its preparation window waiting on
+        // an activation, even when the terminal or bracket owns it first.
+        let timed = inner.restore_deadline.is_some();
         let front_instant_ms = match inner.attempt.take() {
             CleanupTake::AlreadyTaken => return self.await_decision(inner),
             CleanupTake::PreventedFront => {
@@ -568,7 +576,7 @@ impl RestoreCell {
                 );
             }
             CleanupTake::Decide { front_instant_ms } => front_instant_ms,
-            CleanupTake::AwaitFrontAttempt if at_cutoff => match inner.attempt.state() {
+            CleanupTake::AwaitFrontAttempt if timed || at_cutoff => match inner.attempt.state() {
                 FrontAttemptState::Dispatching { front_instant_ms }
                 | FrontAttemptState::Dispatched { front_instant_ms } => front_instant_ms,
                 FrontAttemptState::NotStarted => {
@@ -598,26 +606,28 @@ impl RestoreCell {
             }
         };
         let confirmed = inner.front_confirmed;
-        let deadline = inner.restore_deadline.filter(|_| {
-            inner
-                .cutoff
-                .as_ref()
-                .is_none_or(|cutoff| !cutoff.restore_deferred_for_post())
-        });
+        let deadline = inner.restore_deadline;
+        let cutoff = inner.cutoff.clone();
         let host = inner.host.take();
         drop(inner);
+        let deadline = deadline.filter(|_| {
+            at_cutoff
+                || cutoff
+                    .as_ref()
+                    .is_none_or(|cutoff| !cutoff.restore_deferred_for_post())
+        });
         let outcome = match host {
             Some(mut host) => {
                 let mut adapter = RestoreDecisionHost {
                     host: host.as_mut(),
                     _target: self.target_pid,
                     write_deadline: deadline.map(|deadline| {
-                        restore_preparation::WriteDeadline::new(deadline, started, at_cutoff)
+                        restore_preparation::WriteDeadline::new(deadline, started, wake)
                     }),
                     #[cfg(all(feature = "desk-probe", target_os = "macos"))]
                     probe_timing: &self.probe_timing,
                 };
-                let mut outcome = if at_cutoff && !confirmed {
+                let mut outcome = if (at_cutoff || deadline.is_some()) && !confirmed {
                     crate::computer::dispatch::restore_without_awaiting_activation(
                         &mut adapter,
                         self.previous_pid,
@@ -989,18 +999,17 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
         self.host.pause_ms(milliseconds);
     }
     fn frontmost_pid(&mut self) -> Option<u32> {
-        #[cfg(all(feature = "desk-probe", target_os = "macos"))]
-        {
-            let frontmost = self.host.frontmost_pid();
-            self.probe_timing.frontmost_observed(frontmost);
-            frontmost
+        let started = std::time::Instant::now();
+        let frontmost = self.host.frontmost_pid();
+        if let Some(guard) = &mut self.write_deadline {
+            guard.os_read(started, std::time::Instant::now());
         }
-        #[cfg(not(all(feature = "desk-probe", target_os = "macos")))]
-        self.host.frontmost_pid()
+        #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+        self.probe_timing.frontmost_observed(frontmost);
+        frontmost
     }
     fn request_front(&mut self, pid: u32) -> bool {
-        let guard = &mut self.write_deadline;
-        let mut permitted = || guard.as_mut().is_none_or(|guard| guard.permit());
+        let mut check = restore_preparation::NativeWriteCheck(self.write_deadline.as_mut());
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
         {
             probe_timing::request_restore(
@@ -1008,15 +1017,14 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
                 self.probe_timing,
                 pid,
                 probe_timing::RestoreSlot::First,
-                &mut permitted,
+                &mut check,
             )
         }
         #[cfg(not(all(feature = "desk-probe", target_os = "macos")))]
-        self.host.request_front_while(pid, &mut permitted)
+        self.host.request_front_while(pid, &mut check)
     }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
-        let guard = &mut self.write_deadline;
-        let mut permitted = || guard.as_mut().is_none_or(|guard| guard.permit());
+        let mut check = restore_preparation::NativeWriteCheck(self.write_deadline.as_mut());
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
         {
             probe_timing::request_restore(
@@ -1024,11 +1032,11 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
                 self.probe_timing,
                 pid,
                 probe_timing::RestoreSlot::Second,
-                &mut permitted,
+                &mut check,
             )
         }
         #[cfg(not(all(feature = "desk-probe", target_os = "macos")))]
-        self.host.request_front_fallback_while(pid, &mut permitted)
+        self.host.request_front_fallback_while(pid, &mut check)
     }
     fn late_activation_observed(&mut self, _latency_ms: u64) {
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
@@ -3082,7 +3090,11 @@ mod restore_slot_tests {
         // Terminal has stopped waiting before the deciding owner returns.
         terminal.start_late_fronting(Some(&cell));
         let expired = restore_preparation::expired_writes();
-        let decided = cell.decide_at_cutoff();
+        let woke_at = std::time::Instant::now();
+        let decided = cell.decide_at_cutoff(crate::computer::dispatch::CutoffWake {
+            scheduled_at: woke_at,
+            woke_at,
+        });
         assert_eq!(
             decided.restore,
             RestoreStatus::Failed {

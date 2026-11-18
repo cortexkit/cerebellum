@@ -978,13 +978,14 @@ fn activation_policy_is_regular(pid: i32) -> Option<bool> {
 /// process (or none), when no running application has it, or when the system
 /// refused to send the request.
 pub fn activate_application(pid: u32, start_time_micros: u64) -> bool {
-    activate_application_while(pid, start_time_micros, &mut || true)
+    activate_application_while(pid, start_time_micros, &mut |_, _| {}, &mut || true)
 }
 
 /// [`activate_application`] with a final caller check before the AppKit request.
 pub fn activate_application_while(
     pid: u32,
     start_time_micros: u64,
+    observed_identity_read: &mut dyn FnMut(std::time::Instant, std::time::Instant),
     permitted: &mut dyn FnMut() -> bool,
 ) -> bool {
     use objc2::msg_send;
@@ -993,9 +994,13 @@ pub fn activate_application_while(
     let Ok(raw_pid) = i32::try_from(pid) else {
         return false;
     };
-    // Checked immediately before the request, so a pid reused since the
-    // front by some other application is never activated in its place.
-    if process_start_time_micros(pid) != Some(start_time_micros) {
+    let mut still_ours = || {
+        let started = std::time::Instant::now();
+        let identity = process_start_time_micros(pid);
+        observed_identity_read(started, std::time::Instant::now());
+        identity == Some(start_time_micros)
+    };
+    if !still_ours() {
         return false;
     }
     let Some(class) = AnyClass::get(c"NSRunningApplication") else {
@@ -1007,7 +1012,7 @@ pub fn activate_application_while(
         let application: Option<Retained<NSRunningApplication>> =
             unsafe { msg_send![class, runningApplicationWithProcessIdentifier: raw_pid] };
         application.is_some_and(|application| {
-            process_start_time_micros(pid) == Some(start_time_micros)
+            still_ours()
                 && permitted()
                 && application
                     .activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows)

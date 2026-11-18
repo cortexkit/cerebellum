@@ -500,7 +500,7 @@ pub(super) fn request_restore(
     timing: &ProbeTiming,
     pid: u32,
     slot: RestoreSlot,
-    permitted: &mut dyn FnMut() -> bool,
+    check: &mut dyn crate::computer::platform::RestoreWriteCheck,
 ) -> bool {
     let activate_first = timing.0.lock().unwrap().timing.activate_first;
     let route = route_for(slot, activate_first);
@@ -509,7 +509,7 @@ pub(super) fn request_restore(
         RestoreRoute::AxFrontmost => {
             // Clear any record an earlier request on this thread left.
             let _ = cerebellum_macos::take_frontmost_call_for_probe();
-            let accepted = host.request_front_while(pid, permitted);
+            let accepted = host.request_front_while(pid, check);
             let ax = match cerebellum_macos::take_frontmost_call_for_probe() {
                 Some(call) if call.pid == pid => {
                     call.ax_error.map_or(AxCall::NotCalled, AxCall::Code)
@@ -518,9 +518,7 @@ pub(super) fn request_restore(
             };
             (accepted, Some(ax))
         }
-        RestoreRoute::ActivateAllWindows => {
-            (host.request_front_fallback_while(pid, permitted), None)
-        }
+        RestoreRoute::ActivateAllWindows => (host.request_front_fallback_while(pid, check), None),
     };
     timing.restore_request_returned(accepted, ax);
     accepted

@@ -670,8 +670,12 @@ impl RestoreHost for PlatformRestoreHost {
     fn request_front(&mut self, pid: u32) -> bool {
         self.host.request_front(pid)
     }
-    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
-        self.host.request_front_while(pid, permitted)
+    fn request_front_while(
+        &mut self,
+        pid: u32,
+        check: &mut dyn cerebellum_computer::platform::RestoreWriteCheck,
+    ) -> bool {
+        self.host.request_front_while(pid, check)
     }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
         self.fallback && self.host.request_front_fallback(pid)
@@ -679,9 +683,9 @@ impl RestoreHost for PlatformRestoreHost {
     fn request_front_fallback_while(
         &mut self,
         pid: u32,
-        permitted: &mut dyn FnMut() -> bool,
+        check: &mut dyn cerebellum_computer::platform::RestoreWriteCheck,
     ) -> bool {
-        self.fallback && self.host.request_front_fallback_while(pid, permitted)
+        self.fallback && self.host.request_front_fallback_while(pid, check)
     }
     fn hardware_input_snapshot(
         &mut self,
@@ -703,7 +707,7 @@ type RestoreDecision = fn(&RestoreCell) -> RestoreDecided;
 fn with_restore_budget(cell: &RestoreCell, decide: RestoreDecision) -> RestoreDecided {
     std::thread::scope(|scope| {
         scope
-            .spawn(|| with_restore_budget_here(cell, decide))
+            .spawn(|| with_restore_budget_here(|| decide(cell)))
             .join()
             .unwrap_or_else(|_| decide(cell))
     })
@@ -712,14 +716,14 @@ fn with_restore_budget(cell: &RestoreCell, decide: RestoreDecision) -> RestoreDe
 /// [`with_restore_budget`] on the calling thread, which must carry no outer
 /// accessibility deadline: the cutoff's own timer thread, already running,
 /// so the restore at the cutoff does not wait for a new thread to start.
-fn with_restore_budget_here(cell: &RestoreCell, decide: RestoreDecision) -> RestoreDecided {
+fn with_restore_budget_here(decide: impl FnOnce() -> RestoreDecided) -> RestoreDecided {
     #[cfg(target_os = "macos")]
     let _ax = cerebellum_macos::ax_budget::bound_messages_until(
         Instant::now() + Duration::from_millis(RESTORE_AX_MS),
     );
     #[cfg(not(target_os = "macos"))]
     let _ = RESTORE_AX_MS;
-    decide(cell)
+    decide()
 }
 
 /// What a temporary front's obligation carries before it is registered.
@@ -839,14 +843,6 @@ impl CellHooks {
     /// Run `decide` on the cell under the restore's own budget, and keep
     /// what it decided.
     fn decide_using(&self, decide: RestoreDecision) -> HookedRestore {
-        self.decide_with_budget(decide, with_restore_budget)
-    }
-
-    fn decide_with_budget(
-        &self,
-        decide: RestoreDecision,
-        budgeted: fn(&RestoreCell, RestoreDecision) -> RestoreDecided,
-    ) -> HookedRestore {
         let Some(cell) = self.cell() else {
             return HookedRestore {
                 restore: RestoreStatus::NotNeeded,
@@ -855,7 +851,7 @@ impl CellHooks {
                 restore_ms: None,
             };
         };
-        let decided = budgeted(&cell, decide);
+        let decided = with_restore_budget(&cell, decide);
         self.state().decided = Some(decided);
         HookedRestore {
             restore: decided.restore,
@@ -974,20 +970,25 @@ impl FrontedDispatchHooks for CellHooks {
     /// decision, which goes through the one restore cell, so the restore
     /// still runs exactly once; at the cutoff it is requested at once
     /// ([`RestoreCell::decide_at_cutoff`]).
-    fn cutoff_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
-        let app_use = self
-            .state()
+    fn cutoff_restore(
+        &mut self,
+    ) -> Option<Box<dyn FnOnce(cerebellum_computer::dispatch::CutoffWake) + Send>> {
+        let state = self.state();
+        if !state
             .parts
             .as_ref()
-            .is_some_and(|parts| parts.restore_fallback);
+            .is_some_and(|parts| parts.restore_fallback)
+        {
+            return None;
+        }
+        // Resolve the cell before arming. At cutoff the ready thread can
+        // claim it directly without taking the hooks' separate mutex.
+        let cell = state.cell.clone()?;
         let hooks = self.clone();
-        app_use.then(|| {
-            Box::new(move || {
-                // On the timer's own thread, already running: no thread is
-                // started between the cutoff firing and the restore request.
-                hooks.decide_with_budget(RestoreCell::decide_at_cutoff, with_restore_budget_here);
-            }) as Box<dyn FnOnce() + Send>
-        })
+        Some(Box::new(move |wake| {
+            let decided = with_restore_budget_here(|| cell.decide_at_cutoff(wake));
+            hooks.state().decided = Some(decided);
+        }))
     }
 
     /// App-use fronts' cutoffs fire early by the restore's measured

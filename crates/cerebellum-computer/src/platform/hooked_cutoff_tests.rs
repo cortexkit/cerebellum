@@ -282,9 +282,9 @@ impl FrontedDispatchHooks for Hooks {
     fn decide_restore(&mut self) -> HookedRestore {
         self.decide()
     }
-    fn cutoff_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+    fn cutoff_restore(&mut self) -> Option<Box<dyn FnOnce(crate::dispatch::CutoffWake) + Send>> {
         let hooks = self.clone();
-        Some(Box::new(move || {
+        Some(Box::new(move |_| {
             hooks.decide();
         }))
     }

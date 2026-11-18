@@ -206,6 +206,14 @@ pub struct CutoffTimer {
     thread: Option<JoinHandle<()>>,
 }
 
+/// The timer's planned wake and the time it returned from waiting, before
+/// taking any bracket locks or running restore code.
+#[derive(Clone, Copy, Debug)]
+pub struct CutoffWake {
+    pub scheduled_at: Instant,
+    pub woke_at: Instant,
+}
+
 impl CutoffTimer {
     /// `None` when no thread could be started; the caller must then not
     /// front, since nothing would enforce the bound.
@@ -214,21 +222,42 @@ impl CutoffTimer {
         deadline: Instant,
         restore: Box<dyn FnOnce() + Send>,
     ) -> Option<Self> {
+        Self::arm_with_wake(gate, deadline, Box::new(move |_| restore()))
+    }
+
+    /// Like [`Self::arm`], handing the restore its planned and actual wake
+    /// times so preparation accounting includes the entire cutoff path.
+    pub fn arm_with_wake(
+        gate: Arc<CutoffGate>,
+        deadline: Instant,
+        restore: Box<dyn FnOnce(CutoffWake) + Send>,
+    ) -> Option<Self> {
         gate.set_deadline(deadline);
         let (stop, stopped) = mpsc::channel::<()>();
+        let (ready, started) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("fronting-cutoff".into())
             .spawn(move || {
+                if ready.send(()).is_err() {
+                    return;
+                }
                 // Only the deadline passing fires the cutoff; the sender being
                 // dropped means the bracket finished first.
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(remaining) {
+                    let wake = CutoffWake {
+                        scheduled_at: deadline,
+                        woke_at: Instant::now(),
+                    };
                     if gate.fire() {
-                        restore();
+                        restore(wake);
                     }
                 }
             })
             .ok()?;
+        // Do not let activation outrun thread startup. The absolute cutoff
+        // still holds if the OS preempts this thread after it signals ready.
+        started.recv().ok()?;
         Some(Self {
             stop: Some(stop),
             thread: Some(thread),
