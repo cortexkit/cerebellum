@@ -2627,8 +2627,63 @@ async fn the_deadline_passing_during_the_release_restores_only_after_it() {
             assert_eq!(reply["outcome"], "restore_failed", "{reply}");
             assert_eq!(reply["fronting"]["restore"], "failed", "{reply}");
         }
+        // A release that settles unconfirmed after the reply releases the
+        // lock once it has settled, not when the reply is sent.
+        let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+        while rig.lock.held() && std::time::Instant::now() < give_up {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         assert!(!rig.lock.held());
     }
+}
+
+/// The release of a chord's held key outlives the call's release window, so
+/// the reply reports the restore failed. When that release later settles
+/// with every key confirmed up, the previous application is still put back,
+/// and only then is the fronting lock released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_that_settles_after_the_reply_still_restores() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    rig.read().await;
+    let finish_release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut state = rig.screen.state();
+        state.post_unknown = true;
+        state.release_ok = true;
+        state.release_until = Some(Arc::clone(&finish_release));
+    }
+    let mut routed = routed(
+        &rig,
+        "computer.keys",
+        command_chord(),
+        |rig, terminal| {
+            rig.screen.state().release_ends_call = Some((terminal, crate::TerminalCause::Deadline));
+        },
+        None,
+    )
+    .await;
+    let reply = routed.reply.clone();
+    assert_eq!(reply["outcome"], "restore_failed", "{reply}");
+    assert_eq!(reply["fronting"]["restore"], "failed", "{reply}");
+    assert_eq!(rig.screen.log(), ["front:4242", "post", "release"]);
+    assert!(rig.lock.held(), "kept while the release may still settle");
+    let (held_for_releases, oldest) = crate::terminal_arbiter::unsettled_release_fronting_locks();
+    assert!(
+        held_for_releases >= 1 && oldest.is_some(),
+        "module health shows the lock kept for the unsettled release"
+    );
+    finish_release.store(true, std::sync::atomic::Ordering::SeqCst);
+    routed.worker_finished_silently().await;
+    let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+    while rig.lock.held() && std::time::Instant::now() < give_up {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        rig.screen.log(),
+        ["front:4242", "post", "release", "restore:100"],
+        "the restore ran once the release was confirmed"
+    );
+    assert!(!rig.lock.held());
 }
 
 /// A cancel arriving while the worker settles the held key races its normal

@@ -14,6 +14,30 @@ use crate::{
     RequestCancellationGuard,
 };
 
+/// When each fronting lock still held for a held-key release that had not
+/// settled by its call's reply began to be held that way, in wall-clock
+/// milliseconds. Such a lock is the one fronting lock with no time bound
+/// (see [`RestoreCell::forgo_until_released`]), so module health reports it.
+static UNSETTLED_RELEASE_LOCKS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// How many fronting locks are held for unsettled releases, and since when
+/// the oldest of them has been, in wall-clock milliseconds.
+pub(crate) fn unsettled_release_fronting_locks() -> (usize, Option<u64>) {
+    let held = UNSETTLED_RELEASE_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (held.len(), held.iter().min().copied())
+}
+
+fn unsettled_release_lock_ended(since_ms: u64) {
+    let mut held = UNSETTLED_RELEASE_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(index) = held.iter().position(|at| *at == since_ms) {
+        held.swap_remove(index);
+    }
+}
+
 /// Tracks whether ordinary external mutations may start. Once a terminal
 /// decision stops dispatch, only held-input release may proceed.
 #[derive(Default)]
@@ -290,6 +314,11 @@ struct RestoreCellInner {
     /// fronting lock is kept until the last one returns, even when the
     /// decision completed first, so no other front starts under a capture.
     reads_in_flight: usize,
+    /// A restore held back until a release that had not settled by the
+    /// reply does (see [`RestoreCell::forgo_until_released`]): the front
+    /// instant, and the wall-clock milliseconds since which the fronting
+    /// lock has been held for it. The host and the lock are kept while set.
+    release_wait: Option<(u64, u64)>,
 }
 
 impl RestoreCell {
@@ -314,6 +343,7 @@ impl RestoreCell {
                 pending_since: None,
                 pending_restored: false,
                 reads_in_flight: 0,
+                release_wait: None,
             }),
             changed: std::sync::Condvar::new(),
             pending_watch: late_fronting::register_pending(
@@ -501,6 +531,100 @@ impl RestoreCell {
         Some(self.complete(inner, decided))
     }
 
+    /// [`Self::forgo`] for a release still running when the reply had to be
+    /// sent: the reply reports the restore failed now, but the host and the
+    /// fronting lock are kept, so that [`Self::restore_after_release`] can
+    /// still put the previous application back once the release settles
+    /// confirmed. `None` when the other side already took the obligation.
+    fn forgo_until_released(&self) -> Option<RestoreDecided> {
+        use crate::computer::dispatch::{CleanupTake, FrontAttemptState};
+        let mut inner = self.inner();
+        let front_instant_ms = match inner.attempt.take() {
+            CleanupTake::AlreadyTaken => return None,
+            CleanupTake::PreventedFront => {
+                inner.host.take();
+                let decided = RestoreDecided {
+                    restore: crate::computer::dispatch::RestoreStatus::NotNeeded,
+                    person_input_during_fronting: false,
+                    input_coverage_unavailable: false,
+                    front_requested: false,
+                };
+                return Some(self.complete(inner, decided));
+            }
+            CleanupTake::Decide { front_instant_ms } => front_instant_ms,
+            CleanupTake::AwaitFrontAttempt => match inner.attempt.state() {
+                FrontAttemptState::Dispatching { front_instant_ms }
+                | FrontAttemptState::Dispatched { front_instant_ms } => front_instant_ms,
+                FrontAttemptState::NotStarted => {
+                    unreachable!("a front attempt never moves back to not started")
+                }
+            },
+        };
+        let since_ms = wall_clock_ms();
+        UNSETTLED_RELEASE_LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(since_ms);
+        inner.release_wait = Some((front_instant_ms, since_ms));
+        let failed = self.failed();
+        Some(self.complete(inner, failed))
+    }
+
+    /// The release a [`Self::forgo_until_released`] waited on settled with
+    /// every key confirmed up. Puts the previous application back if the
+    /// target is still in front and no person input or observer gap has
+    /// occurred since the front, then releases the fronting lock. Returns
+    /// what the restore did, `None` when nothing was waiting for it.
+    pub(crate) fn restore_after_release(&self) -> Option<crate::computer::dispatch::RestoreStatus> {
+        let (since, mut host, lock) = {
+            let mut inner = self.inner();
+            let (since, held_since_ms) = inner.release_wait.take()?;
+            unsettled_release_lock_ended(held_since_ms);
+            let host = inner.host.take();
+            (since, host, inner.lock.take())
+        };
+        let restored = host.as_mut().map(|host| {
+            let mut adapter = RestoreDecisionHost {
+                host: host.as_mut(),
+                _target: self.target_pid,
+                #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+                probe_timing: &self.probe_timing,
+            };
+            // One attempt, only while the target is in front and nothing
+            // since the front says the person is using it; the release may
+            // have settled long after the reply.
+            crate::computer::dispatch::watch_late_activation(
+                &mut adapter,
+                self.previous_pid,
+                self.target_pid,
+                since,
+                u64::MAX,
+                crate::computer::dispatch::LateWatch::FirstAttempt,
+                &|| false,
+            )
+            .0
+        });
+        drop(host);
+        drop(lock);
+        restored
+    }
+
+    /// The release a [`Self::forgo_until_released`] waited on settled
+    /// without confirming every key up: no restore is requested, since a key
+    /// may still be down, and the fronting lock is released.
+    pub(crate) fn abandon_release_wait(&self) {
+        let (host, lock) = {
+            let mut inner = self.inner();
+            let Some((_, held_since_ms)) = inner.release_wait.take() else {
+                return;
+            };
+            unsettled_release_lock_ended(held_since_ms);
+            (inner.host.take(), inner.lock.take())
+        };
+        drop(host);
+        drop(lock);
+    }
+
     /// A restore reported failed with the target named as left in front.
     fn failed(&self) -> RestoreDecided {
         RestoreDecided {
@@ -530,7 +654,10 @@ impl RestoreCell {
         decided: RestoreDecided,
     ) -> RestoreDecided {
         inner.decided = Some(decided);
-        let lock = if inner.pending_since.is_none() && inner.reads_in_flight == 0 {
+        let lock = if inner.pending_since.is_none()
+            && inner.reads_in_flight == 0
+            && inner.release_wait.is_none()
+        {
             inner.lock.take()
         } else {
             None
@@ -626,6 +753,7 @@ impl Drop for ReadLockHold {
         let lock = if inner.reads_in_flight == 0
             && inner.decided.is_some()
             && inner.pending_since.is_none()
+            && inner.release_wait.is_none()
         {
             inner.lock.take()
         } else {
@@ -1325,28 +1453,42 @@ pub(crate) async fn run_arbitrated_route(
         let suffix_end =
             tokio::time::Instant::now() + Duration::from_millis(budgets::RELEASE_BUDGET_MS);
         let mut held = None;
+        // A release still running when its window ends. With a restore
+        // obligation, its restore is held back until it settles rather than
+        // given up on; see `restore_when_released`.
+        let mut unsettled_release = None;
         if let Some(release) = release {
-            let health = Arc::clone(&planes.health);
             let mut release_job = tokio::spawn(release);
             held = Some(
                 match tokio::time::timeout_at(suffix_end, &mut release_job).await {
                     Ok(Ok(held)) => held,
                     Ok(Err(_)) => HeldState::Unknown,
                     Err(_) => {
-                        let detached = health.enter_detached_worker();
-                        tokio::spawn(async move {
-                            let _detached = detached;
-                            let _ = release_job.await;
-                        });
+                        unsettled_release = Some(release_job);
                         HeldState::Unknown
                     }
                 },
             );
         }
         let decided = match &restore {
-            Some(cell) => Some(finish_restore(Arc::clone(cell), held, suffix_end, &planes).await),
+            Some(cell) => Some(match unsettled_release.take() {
+                Some(release_job) => match cell.forgo_until_released() {
+                    Some(decided) => {
+                        restore_when_released(Arc::clone(cell), release_job, &planes);
+                        decided
+                    }
+                    None => {
+                        detach_release(release_job, &planes);
+                        finish_restore(Arc::clone(cell), held, suffix_end, &planes).await
+                    }
+                },
+                None => finish_restore(Arc::clone(cell), held, suffix_end, &planes).await,
+            }),
             None => None,
         };
+        if let Some(release_job) = unsettled_release {
+            detach_release(release_job, &planes);
+        }
         terminal.start_late_fronting(restore.as_ref());
         if let Some(held) = held {
             chosen = rebuild_body(chosen, |body| {
@@ -1431,6 +1573,45 @@ pub(crate) async fn run_arbitrated_route(
                 },
                 _ = &mut job, if !finished => { finished = true; detached.take(); },
             }
+        }
+    });
+}
+
+/// Keep a release that outlived its window running detached until it ends.
+fn detach_release(release_job: tokio::task::JoinHandle<HeldState>, planes: &Planes) {
+    let detached = planes.health.enter_detached_worker();
+    tokio::spawn(async move {
+        let _detached = detached;
+        let _ = release_job.await;
+    });
+}
+
+/// The restore for a held-input release that had not settled when the reply
+/// was due ([`RestoreCell::forgo_until_released`] already reported it
+/// failed). It waits, detached, for the release: once every key is
+/// confirmed up, the previous application is put back if the target is
+/// still in front and nothing since the front shows the person using it;
+/// a release that settles unconfirmed requests nothing, since a key may
+/// still be down.
+///
+/// This is the one restore with no time bound: a release that never settles
+/// leaves the target in front and the fronting lock held, and the reply has
+/// already said `restore_failed`, never success. Putting the previous
+/// application back over a key that may still be down would deliver it to
+/// that application, which is worse than leaving the target in front.
+fn restore_when_released(
+    cell: Arc<RestoreCell>,
+    release_job: tokio::task::JoinHandle<HeldState>,
+    planes: &Planes,
+) {
+    let detached = planes.health.enter_detached_worker();
+    tokio::spawn(async move {
+        let _detached = detached;
+        match release_job.await {
+            Ok(HeldState::Released | HeldState::NoneHeld) => {
+                let _ = tokio::task::spawn_blocking(move || cell.restore_after_release()).await;
+            }
+            Ok(HeldState::Unknown) | Err(_) => cell.abandon_release_wait(),
         }
     });
 }
@@ -3026,7 +3207,10 @@ mod restore_slot_tests {
     async fn an_unconfirmed_release_requests_no_restore_and_replies_restore_failed() {
         let unknown: fn(SharedScreen) -> ReleaseJob = |_| Box::pin(async { HeldState::Unknown });
         let stalled: fn(SharedScreen) -> ReleaseJob = |_| Box::pin(std::future::pending());
-        for release in [unknown, stalled] {
+        // A release that settles unconfirmed gives up the restore and the
+        // lock. One that never settles keeps the lock: the restore it holds
+        // back still runs if the release is ever confirmed.
+        for (release, lock_releases) in [(unknown, 1), (stalled, 0)] {
             let shared = screen(true);
             let releases = Arc::new(AtomicUsize::new(0));
             let reply = cancelled_route(fronted_worker(
@@ -3046,7 +3230,7 @@ mod restore_slot_tests {
                 .as_str()
                 .unwrap()
                 .starts_with("Mail was left"));
-            assert_eq!(releases.load(SeqCst), 1);
+            assert_eq!(releases.load(SeqCst), lock_releases);
         }
     }
 

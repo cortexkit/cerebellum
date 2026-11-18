@@ -1380,7 +1380,10 @@ pub(crate) fn hooked_fronting(mode: AppUse, purpose: Purpose, end: &HookedEnd) -
 /// application would receive the held key; the bracket keeps reporting the
 /// target left in front, and terminal cleanup, finding the release
 /// unconfirmed, reports the restore failed without requesting one and
-/// releases the fronting lock.
+/// releases the fronting lock. A release that was still running when the
+/// reply was due is different: terminal cleanup reports the restore failed
+/// but keeps the lock, and restores once that release settles confirmed
+/// (see `terminal_arbiter::restore_when_released`).
 pub(crate) fn finish_after_release(
     hooks: &CellHooks,
     held: Option<crate::HeldState>,
