@@ -528,31 +528,25 @@ struct PreviewDraw {
 #[derive(Clone, Default)]
 pub struct Coordinator(Arc<State>);
 
-/// An initial launch and at most one restart, no sooner than a minute later.
-/// A second crash leaves the cosmetic helper off until the module restarts.
+/// Allow one cursor helper launch attempt per minute. A failed attempt also
+/// starts the cooldown, but the next request can retry once it expires.
 #[derive(Default)]
 #[cfg(any(target_os = "macos", test))]
 struct RestartLimit {
-    first: Option<Instant>,
-    restarted: bool,
+    last_attempt: Option<Instant>,
 }
 
 #[cfg(any(target_os = "macos", test))]
 impl RestartLimit {
     fn admit(&mut self, now: Instant) -> bool {
-        match self.first {
-            None => {
-                self.first = Some(now);
-                true
-            }
-            Some(first)
-                if !self.restarted && now.duration_since(first) >= Duration::from_secs(60) =>
-            {
-                self.restarted = true;
-                true
-            }
-            _ => false,
+        if self
+            .last_attempt
+            .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(60))
+        {
+            return false;
         }
+        self.last_attempt = Some(now);
+        true
     }
 }
 
@@ -3635,13 +3629,30 @@ mod tests {
     }
 
     #[test]
-    fn cursor_restart_limit_is_one_after_a_minute() {
+    fn cursor_restart_limit_measures_cooldown_from_the_last_attempt() {
+        let start = Instant::now();
+        let mut limit = RestartLimit::default();
+        assert!(limit.admit(start));
+        assert!(!limit.admit(start + Duration::from_secs(59)));
+        assert!(limit.admit(start + Duration::from_secs(70)));
+        assert!(!limit.admit(start + Duration::from_secs(120)));
+        assert!(limit.admit(start + Duration::from_secs(130)));
+    }
+
+    #[test]
+    fn cursor_restart_limit_recovers_after_each_cooldown() {
         let start = Instant::now();
         let mut limit = RestartLimit::default();
         assert!(limit.admit(start));
         assert!(!limit.admit(start + Duration::from_secs(59)));
         assert!(limit.admit(start + Duration::from_secs(60)));
-        assert!(!limit.admit(start + Duration::from_secs(120)));
+        assert!(!limit.admit(start + Duration::from_secs(119)));
+        assert!(
+            limit.admit(start + Duration::from_secs(120)),
+            "the second launch must not exhaust all future restarts"
+        );
+        assert!(!limit.admit(start + Duration::from_secs(179)));
+        assert!(limit.admit(start + Duration::from_secs(180)));
     }
 
     #[test]
