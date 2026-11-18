@@ -374,8 +374,23 @@ pub(crate) fn disposition_of<T>(
 /// process can be released this way; global input has no per-process route,
 /// so it stays unconfirmed.
 pub(crate) fn release_one<D: PlatformDriver>(press: &HeldPress, driver: &mut D) -> bool {
+    release_one_observed(press, driver, None)
+}
+
+pub(crate) fn release_one_observed<D: PlatformDriver>(
+    press: &HeldPress,
+    driver: &mut D,
+    cutoff: Option<&cerebellum_computer::dispatch::CutoffGate>,
+) -> bool {
     match press.route {
-        HeldRoute::Process { .. } => driver.release_held(&press.grant, &press.action).is_ok(),
+        HeldRoute::Process { .. } => {
+            let started = cutoff.map(|_| std::time::Instant::now());
+            let released = driver.release_held(&press.grant, &press.action).is_ok();
+            if let Some((cutoff, started)) = cutoff.zip(started) {
+                cutoff.native_call(started, std::time::Instant::now());
+            }
+            released
+        }
         HeldRoute::Global => false,
     }
 }

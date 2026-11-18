@@ -26,6 +26,24 @@ static EXPIRED_WRITES: AtomicU64 = AtomicU64::new(0);
 static EXPIRED_OS_DELAY: AtomicU64 = AtomicU64::new(0);
 static EXPIRED_INTERNAL: AtomicU64 = AtomicU64::new(0);
 static PREVIOUS_BIND_UNAVAILABLE: AtomicU64 = AtomicU64::new(0);
+static HELD_RELEASE_NATIVE_OVERRUN: AtomicU64 = AtomicU64::new(0);
+static HELD_RELEASE_NO_NATIVE_OVERRUN: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn held_release_counts() -> (u64, u64) {
+    (
+        HELD_RELEASE_NATIVE_OVERRUN.load(Ordering::Relaxed),
+        HELD_RELEASE_NO_NATIVE_OVERRUN.load(Ordering::Relaxed),
+    )
+}
+
+pub(super) fn record_held_release(native_overrun: bool) {
+    let count = if native_overrun {
+        &HELD_RELEASE_NATIVE_OVERRUN
+    } else {
+        &HELD_RELEASE_NO_NATIVE_OVERRUN
+    };
+    count.fetch_add(1, Ordering::Relaxed);
+}
 
 pub(crate) fn previous_bind_failed() {
     PREVIOUS_BIND_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);

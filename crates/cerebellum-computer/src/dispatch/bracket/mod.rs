@@ -62,10 +62,12 @@
 //!   restoring under a held key would hand that key to the previous
 //!   application. A release that settles before the deadline is followed at
 //!   once by the restore, under the deadline. One still unsettled at the
-//!   deadline keeps the fronting lock held (module health counts it as
-//!   `frontingLockHeldForUnsettledRelease`), and the restore follows the
+//!   deadline keeps the fronting lock held, and the restore follows the
 //!   confirmed release without a deadline; an unconfirmed release restores
-//!   nothing.
+//!   nothing. Health tracks locks still held after the reply in
+//!   `frontingLockHeldForUnsettledRelease`. For app-use fronts taking the
+//!   ordinary restore path without a deadline, `frontingRestoreAfterHeldRelease`
+//!   counts decisions with or without evidence of a native overrun.
 //!
 //! Neither exception assumes focus or input is safe merely because time has
 //! passed. Clock measurements cannot distinguish preemption inside our code

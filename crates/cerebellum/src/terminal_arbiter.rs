@@ -602,12 +602,17 @@ impl RestoreCell {
             return self.complete(self.inner(), self.failed());
         };
         let started = std::time::Instant::now();
-        let write_deadline = self.gate.deadline().filter(|_| timed).map(|deadline| {
+        let deadline = self.gate.deadline();
+        let native_overrun = self.gate.native_overrun_until();
+        if !timed && deadline.is_some() {
+            restore_preparation::record_held_release(native_overrun.is_some());
+        }
+        let write_deadline = deadline.filter(|_| timed).map(|deadline| {
             restore_preparation::WriteDeadline::new(
                 deadline,
                 self.gate.reserve_start(),
                 started,
-                self.gate.native_overrun_until(),
+                native_overrun,
             )
             .with_tail_from(entered)
         });
@@ -3232,6 +3237,48 @@ mod restore_slot_tests {
             after.contains("restore was handed off"),
             "the watch holds it now: {after}"
         );
+    }
+
+    #[test]
+    fn untimed_restores_after_held_release_count_with_and_without_a_native_overrun() {
+        for native_overrun in [false, true] {
+            let shared = screen(true);
+            let releases = Arc::new(AtomicUsize::new(0));
+            let terminal = TerminalArbiter::new(request());
+            let (cell, gate, _) = bounded_cell(
+                &terminal,
+                &shared,
+                &releases,
+                Duration::from_secs(60),
+                Duration::from_secs(120),
+            );
+            cell.front_confirmed();
+            assert!(gate.begin_post(true));
+            let released = std::time::Instant::now();
+            let deadline = released - Duration::from_millis(10);
+            gate.set_bound(deadline - Duration::from_millis(50), deadline);
+            if native_overrun {
+                gate.native_call(deadline - Duration::from_millis(1), released);
+            }
+
+            let count = || {
+                let (native, no_native) = restore_preparation::held_release_counts();
+                if native_overrun {
+                    native
+                } else {
+                    no_native
+                }
+            };
+            let before = count();
+            let decided = cell.decide_after_release(true, released, released);
+            assert_eq!(decided.restore, RestoreStatus::Restored);
+            assert!(
+                count() > before,
+                "missing count for native overrun = {native_overrun}"
+            );
+            assert_eq!(shared.lock().unwrap().requests, [PREVIOUS]);
+            assert_eq!(releases.load(SeqCst), 1);
+        }
     }
 
     #[test]

@@ -848,6 +848,10 @@ impl CellHooks {
         self.state().cell.clone()
     }
 
+    pub(crate) fn cutoff(&self) -> Option<Arc<cerebellum_computer::dispatch::CutoffGate>> {
+        self.state().cutoff.clone()
+    }
+
     /// Run `decide` on the cell under the restore's own budget, and keep
     /// what it decided.
     fn decide_using(&self) -> HookedRestore {

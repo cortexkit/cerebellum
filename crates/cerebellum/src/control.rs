@@ -601,6 +601,11 @@ pub(super) fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleCo
             "frontingLockHeldForUnsettledRelease".to_string(),
             json!({"count": count, "oldest_since_ms": oldest_since_ms}),
         );
+        let (native, other) = crate::terminal_arbiter::restore_preparation::held_release_counts();
+        metrics.insert(
+            "frontingRestoreAfterHeldRelease".to_string(),
+            json!({"count": native.saturating_add(other), "native_overrun": native, "no_native_overrun": other}),
+        );
         let (stalled, stalled_total) = crate::terminal_arbiter::stalled_picture_reads();
         metrics.insert(
             "pictureReadsPastLifetime".to_string(),
