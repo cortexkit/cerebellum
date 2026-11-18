@@ -632,6 +632,7 @@ impl RestoreCell {
                 gate: &self.gate,
                 ticket,
             },
+            cell: Some(self),
             #[cfg(all(feature = "desk-probe", target_os = "macos"))]
             probe_timing: &self.probe_timing,
         };
@@ -695,6 +696,7 @@ impl RestoreCell {
                 restore_preparation::WriteDeadline::new(deadline, started, Some(wake))
             }),
             owner: DecisionOwner::Timer,
+            cell: Some(self),
             #[cfg(all(feature = "desk-probe", target_os = "macos"))]
             probe_timing: &self.probe_timing,
         };
@@ -767,6 +769,13 @@ impl RestoreCell {
                 front_requested: true,
             },
         )
+    }
+
+    /// The first native restore request was refused at its deadline.
+    /// Published at once, before any fallback or confirmation wait, so a
+    /// terminal reply finalized meanwhile discloses the handoff.
+    fn publish_expired_write(&self) {
+        self.inner().expired_write_handed_off = true;
     }
 
     /// A decision that found nothing fronted.
@@ -855,6 +864,7 @@ impl RestoreCell {
                 _target: self.target_pid,
                 write_deadline: None,
                 owner: DecisionOwner::Unowned,
+                cell: None,
                 #[cfg(all(feature = "desk-probe", target_os = "macos"))]
                 probe_timing: &self.probe_timing,
             };
@@ -1091,6 +1101,8 @@ struct RestoreDecisionHost<'a> {
     _target: u32,
     write_deadline: Option<restore_preparation::WriteDeadline>,
     owner: DecisionOwner<'a>,
+    /// The cell a refused first write is published to at once.
+    cell: Option<&'a RestoreCell>,
     #[cfg(all(feature = "desk-probe", target_os = "macos"))]
     probe_timing: &'a probe_timing::ProbeTiming,
 }
@@ -1167,6 +1179,7 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
         let mut check = restore_preparation::NativeWriteCheck {
             owner: &self.owner,
             deadline: self.write_deadline.as_mut(),
+            cell: self.cell,
         };
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
         {
@@ -1185,6 +1198,7 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
         let mut check = restore_preparation::NativeWriteCheck {
             owner: &self.owner,
             deadline: self.write_deadline.as_mut(),
+            cell: self.cell,
         };
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
         {
@@ -4068,6 +4082,112 @@ mod restore_slot_tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(shared.lock().unwrap().requests, [PREVIOUS]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_refused_at_its_deadline_is_disclosed_as_handed_off_when_the_terminal_stops_waiting(
+    ) {
+        /// A host whose first pause, after the refused write, blocks its
+        /// thread until the test lets it go, or for a few real seconds.
+        struct PausedAfterRefusal {
+            inner: FakeHost,
+            refused: std::sync::mpsc::Sender<()>,
+            release: Option<std::sync::mpsc::Receiver<()>>,
+        }
+        impl RestoreHost for PausedAfterRefusal {
+            fn now_ms(&mut self) -> u64 {
+                self.inner.now_ms()
+            }
+            fn pause_ms(&mut self, milliseconds: u64) {
+                if let Some(release) = self.release.take() {
+                    let _ = self.refused.send(());
+                    let _ = release.recv_timeout(Duration::from_secs(5));
+                }
+                self.inner.pause_ms(milliseconds);
+            }
+            fn frontmost_pid(&mut self) -> Option<u32> {
+                self.inner.frontmost_pid()
+            }
+            fn request_front(&mut self, pid: u32) -> bool {
+                self.inner.request_front(pid)
+            }
+            fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
+                self.inner.hardware_input_snapshot()
+            }
+        }
+
+        let shared = screen(true);
+        let releases = Arc::new(AtomicUsize::new(0));
+        let (refused, write_refused) = std::sync::mpsc::channel();
+        let (let_go, release) = std::sync::mpsc::channel();
+        let mut planes = crate::tests::management_bound_planes(1, 1);
+        let input = Mutex::new(Some((
+            Arc::clone(&shared),
+            Arc::clone(&releases),
+            refused,
+            release,
+        )));
+        let (ready, worker_started) = tokio::sync::oneshot::channel::<()>();
+        let ready = Mutex::new(Some(ready));
+        planes.route_test_handler = Some(Arc::new(move || {
+            let (shared, releases, refused, release) = input.lock().unwrap().take().unwrap();
+            let ready = ready.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                let terminal = TerminalArbiter::current().unwrap();
+                terminal.set_step(CallStep::Dispatch);
+                assert!(terminal.gate.begin_mutation());
+                let mut obligation = obligation(&shared, &releases);
+                obligation.host = Box::new(PausedAfterRefusal {
+                    inner: FakeHost(shared),
+                    refused,
+                    release: Some(release),
+                });
+                let cell = terminal.register_restore(obligation).unwrap();
+                assert!(cell.begin_front_attempt(0));
+                cell.front_confirmed();
+                cell.front_attempt_returned();
+                // Already past: the first restore write is refused.
+                cell.set_restore_deadline(std::time::Instant::now() - Duration::from_millis(1));
+                let _ = ready.send(());
+                std::future::pending::<()>().await;
+            })
+        }));
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_frame(request(), &tx, &planes).await.unwrap();
+        worker_started.await.unwrap();
+        handle_frame(cancel(), &tx, &planes).await.unwrap();
+        let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+        while write_refused.try_recv().is_err() {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the write was never refused"
+            );
+            tokio::task::yield_now().await;
+        }
+        // The owner is still confirming its refused request when the
+        // terminal's budget runs out.
+        tokio::time::advance(Duration::from_millis(budgets::RELEASE_BUDGET_MS)).await;
+        let reply = rx.recv().await.unwrap();
+        let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(reply["outcome"], "restore_failed");
+        let remedy = reply["remedy"].as_str().unwrap();
+        assert!(
+            remedy.contains("restore was handed off"),
+            "a known miss is disclosed as a handoff, not as cleanup in progress: {remedy}"
+        );
+        assert!(!remedy.contains("still running"), "{remedy}");
+        assert!(
+            shared.lock().unwrap().requests.is_empty(),
+            "the refused write made no request"
+        );
+        let_go.send(()).unwrap();
+        while releases.load(SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the handed-off restore never ended"
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test(start_paused = true)]

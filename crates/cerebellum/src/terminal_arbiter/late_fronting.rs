@@ -250,6 +250,7 @@ pub(super) fn start(
             _target: target,
             write_deadline: None,
             owner: super::DecisionOwner::Unowned,
+            cell: None,
             #[cfg(all(feature = "desk-probe", target_os = "macos"))]
             probe_timing: &probe_timing,
         };

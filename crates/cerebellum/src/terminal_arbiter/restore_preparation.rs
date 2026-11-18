@@ -39,6 +39,8 @@ pub(crate) fn expired_internal() -> u64 {
 pub(super) struct NativeWriteCheck<'a> {
     pub(super) owner: &'a super::DecisionOwner<'a>,
     pub(super) deadline: Option<&'a mut WriteDeadline>,
+    /// Told at once when the deadline refuses the write.
+    pub(super) cell: Option<&'a super::RestoreCell>,
 }
 
 impl RestoreWriteCheck for NativeWriteCheck<'_> {
@@ -48,7 +50,16 @@ impl RestoreWriteCheck for NativeWriteCheck<'_> {
         if !self.owner.commit() {
             return false;
         }
-        self.deadline.as_mut().is_none_or(|guard| guard.permit())
+        let Some(guard) = self.deadline.as_mut() else {
+            return true;
+        };
+        let permitted = guard.permit();
+        if !permitted && guard.expired {
+            if let Some(cell) = self.cell {
+                cell.publish_expired_write();
+            }
+        }
+        permitted
     }
 
     fn identity_read(&mut self, started: Instant, finished: Instant) {
