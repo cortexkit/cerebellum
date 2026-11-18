@@ -368,8 +368,8 @@ pub(crate) fn dispatch_refusal_reply(
         {
             Some(
                 "the measured restore and send costs are unknown or cannot fit the fronting \
-                 allowance. Nothing was sent and nothing was brought forward; retrying is safe. \
-                 Use write_text on a settable element when possible",
+                 allowance. No keys or clicks were sent and nothing was brought forward; \
+                 retrying is safe. Use write_text on a settable element when possible",
             )
         }
         DispatchError::FrontingFailed => Some(
@@ -736,6 +736,22 @@ mod tests {
             remedy.contains("No keys or clicks were sent; retry the shortcut"),
             "{reply}"
         );
+    }
+
+    /// A shortcut refused before anything was brought forward may still
+    /// have followed the observer's liveness marker, so it says no keys or
+    /// clicks were sent, not that nothing was.
+    #[test]
+    fn a_refusal_before_any_front_says_no_keys_or_clicks_were_sent() {
+        let mut bracket = bracket_stopped_before_front(0, 0);
+        bracket.stop = Some(BracketStop::BoundExceeded);
+        let reply = dispatch_refusal_reply(&DispatchError::FrontingBoundExceeded, Some(&bracket));
+        let remedy = reply["remedy"].as_str().unwrap();
+        assert!(
+            remedy.contains("No keys or clicks were sent and nothing was brought forward"),
+            "{reply}"
+        );
+        assert!(!remedy.contains("Nothing was sent"), "{reply}");
     }
 
     /// A window list that could not be read before the first front answers
