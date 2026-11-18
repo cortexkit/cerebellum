@@ -25,7 +25,7 @@ impl Drop for Closed {
 }
 
 impl Transport for Fake {
-    fn open(&self) -> BoxFuture<'_, Result<Connection, String>> {
+    fn open(&self) -> BoxFuture<'_, Result<Connection, OpenFailure>> {
         Box::pin(async move {
             self.opened.fetch_add(1, Ordering::SeqCst);
             let gate = self.gate.lock().unwrap().clone();
@@ -37,8 +37,7 @@ impl Transport for Fake {
             let refresh = self.refresh_after.load(Ordering::SeqCst);
             Ok(Connection {
                 notices,
-                refresh_at: Instant::now()
-                    + Duration::from_secs(if refresh == 0 { 3600 } else { refresh }),
+                refresh_at: (refresh != 0).then(|| Instant::now() + Duration::from_secs(refresh)),
                 _guard: Box::new(Closed(self.closed.clone())),
             })
         })
