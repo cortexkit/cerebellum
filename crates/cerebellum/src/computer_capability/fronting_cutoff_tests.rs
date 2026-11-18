@@ -264,6 +264,61 @@ fn the_cutoff_requests_the_restore_at_once_while_the_activation_is_still_in_flig
 }
 
 #[test]
+fn an_already_frontmost_picture_runs_with_a_fence_and_a_bounded_hold() {
+    let screen = Screen::new(&mail_desk());
+    screen.desk.state().frontmost = Some(TARGET);
+    let (hooks, releases) = app_use_hooks();
+    let mut boxed = boxed_hooks(&hooks);
+    let mut read_ran = false;
+    let outcome = cerebellum_computer::platform::run_hooked_fronted(
+        &mut FakeBracket(screen.clone()),
+        &mut UserIdleEstimator::new(),
+        plan(),
+        &|| false,
+        boxed.as_mut(),
+        Some(&mut || {
+            read_ran = true;
+            assert!(
+                hooks.picture_may_acquire(),
+                "an in-time picture is admitted"
+            );
+            let cell = hooks.cell().expect("a no-switch read owns a cell");
+            let _hold = cell
+                .hold_lock_for_read(Duration::from_millis(2 * BOUND_MS))
+                .unwrap();
+            let give_up = Instant::now() + crate::test_support::HANG_GUARD;
+            while !hooks.cutoff_fired() && Instant::now() < give_up {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(hooks.cutoff_fired(), "the no-switch cutoff ran");
+            assert!(!hooks.picture_may_acquire(), "native acquisition is fenced");
+            assert_eq!(
+                lock_releases(&releases),
+                0,
+                "held while capture is still within its lifetime"
+            );
+            while lock_releases(&releases) == 0 && Instant::now() < give_up {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                lock_releases(&releases),
+                1,
+                "the watchdog lets another front proceed"
+            );
+        }),
+    );
+    assert!(read_ran);
+    assert_eq!(outcome.report.restore, RestoreStatus::NotNeeded);
+    assert!(!outcome.report.restore_started_by_cutoff);
+    assert!(
+        screen.log().is_empty(),
+        "neither a front nor a restore was requested"
+    );
+    assert_eq!(screen.frontmost(), Some(TARGET));
+    assert_eq!(lock_releases(&releases), 1);
+}
+
+#[test]
 fn a_picture_read_past_admission_when_the_cutoff_fires_keeps_the_lock_and_acquires_nothing() {
     let screen = Screen::new(&mail_desk());
     let (hooks, releases) = app_use_hooks();
@@ -275,7 +330,7 @@ fn a_picture_read_past_admission_when_the_cutoff_fires_keeps_the_lock_and_acquir
     // in the visibility inspection, then ask the fence right before the
     // pixels would be requested.
     let mut read = || {
-        let _hold = reader.hold_lock_for_read().unwrap().expect("bounded hold");
+        let _hold = reader.hold_lock_for_read().expect("bounded hold");
         let give_up = Instant::now() + crate::test_support::HANG_GUARD;
         while Instant::now() < give_up
             && !reader.cell().is_some_and(|cell| cell.decided().is_some())
@@ -316,7 +371,7 @@ fn a_picture_read_inside_the_bound_may_acquire() {
     let reader = hooks.clone();
     let mut acquired = false;
     let mut read = || {
-        let _hold = reader.hold_lock_for_read().unwrap().expect("bounded hold");
+        let _hold = reader.hold_lock_for_read().expect("bounded hold");
         acquired = reader.picture_may_acquire();
     };
     let outcome = cerebellum_computer::platform::run_hooked_fronted(

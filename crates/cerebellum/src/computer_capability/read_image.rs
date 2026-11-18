@@ -88,13 +88,20 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
                 || gate.is_some_and(|gate| gate.stopped())
         },
         &mut || {
-            // The fronting lock stays held until this read returns, even if
-            // the cutoff restores meanwhile, so no other front starts under
-            // a capture still in flight.
-            let Ok(_lock_hold) = hooks.hold_lock_for_read() else {
+            // Even without a focus switch, a read needs both an open fence
+            // and a watchdog-bounded hold on the fronting lock.
+            if !fence() {
+                captured = Err(ImageUnavailable::FrontingBoundExceeded);
+                return;
+            }
+            let Some(_lock_hold) = hooks.hold_lock_for_read() else {
                 captured = Err(ImageUnavailable::FrontingUnavailable);
                 return;
             };
+            if !fence() {
+                captured = Err(ImageUnavailable::FrontingBoundExceeded);
+                return;
+            }
             // Even a backend panic must return through the bracket's restore.
             captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 check_visibility(freshness, grant, evidence, None, false)?;

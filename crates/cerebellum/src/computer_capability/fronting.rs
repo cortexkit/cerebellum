@@ -698,10 +698,9 @@ pub(crate) fn decide_with_restore_budget(cell: &RestoreCell) -> RestoreDecided {
     with_restore_budget(cell, RestoreCell::decide)
 }
 
-fn with_restore_budget(
-    cell: &RestoreCell,
-    decide: fn(&RestoreCell) -> RestoreDecided,
-) -> RestoreDecided {
+type RestoreDecision = fn(&RestoreCell) -> RestoreDecided;
+
+fn with_restore_budget(cell: &RestoreCell, decide: RestoreDecision) -> RestoreDecided {
     std::thread::scope(|scope| {
         scope
             .spawn(|| with_restore_budget_here(cell, decide))
@@ -713,10 +712,7 @@ fn with_restore_budget(
 /// [`with_restore_budget`] on the calling thread, which must carry no outer
 /// accessibility deadline: the cutoff's own timer thread, already running,
 /// so the restore at the cutoff does not wait for a new thread to start.
-fn with_restore_budget_here(
-    cell: &RestoreCell,
-    decide: fn(&RestoreCell) -> RestoreDecided,
-) -> RestoreDecided {
+fn with_restore_budget_here(cell: &RestoreCell, decide: RestoreDecision) -> RestoreDecided {
     #[cfg(target_os = "macos")]
     let _ax = cerebellum_macos::ax_budget::bound_messages_until(
         Instant::now() + Duration::from_millis(RESTORE_AX_MS),
@@ -757,7 +753,9 @@ impl ObligationParts {
         // every front: takeover fronts have no second route
         // (`restore_fallback` stays false), but their one route checks it
         // too.
-        host.remember_previous(previous);
+        if previous != target {
+            host.remember_previous(previous);
+        }
         self.terminal
             .register_restore(RestoreObligation {
                 previous_pid: previous,
@@ -840,14 +838,14 @@ impl CellHooks {
 
     /// Run `decide` on the cell under the restore's own budget, and keep
     /// what it decided.
-    fn decide_using(&self, decide: fn(&RestoreCell) -> RestoreDecided) -> HookedRestore {
+    fn decide_using(&self, decide: RestoreDecision) -> HookedRestore {
         self.decide_with_budget(decide, with_restore_budget)
     }
 
     fn decide_with_budget(
         &self,
-        decide: fn(&RestoreCell) -> RestoreDecided,
-        budgeted: fn(&RestoreCell, fn(&RestoreCell) -> RestoreDecided) -> RestoreDecided,
+        decide: RestoreDecision,
+        budgeted: fn(&RestoreCell, RestoreDecision) -> RestoreDecided,
     ) -> HookedRestore {
         let Some(cell) = self.cell() else {
             return HookedRestore {
@@ -893,18 +891,10 @@ impl CellHooks {
 
     /// Keep the fronting lock for a picture read under way, until the hold
     /// is dropped; see [`RestoreCell::hold_lock_for_read`].
-    pub(crate) fn hold_lock_for_read(
-        &self,
-    ) -> Result<Option<crate::terminal_arbiter::ReadLockHold>, ()> {
-        match self.cell() {
-            Some(cell) => cell
-                .hold_lock_for_read(Duration::from_millis(
-                    crate::budgets::PICTURE_READ_LIFETIME_MS,
-                ))
-                .map(Some)
-                .ok_or(()),
-            None => Ok(None),
-        }
+    pub(crate) fn hold_lock_for_read(&self) -> Option<crate::terminal_arbiter::ReadLockHold> {
+        self.cell()?.hold_lock_for_read(Duration::from_millis(
+            crate::budgets::PICTURE_READ_LIFETIME_MS,
+        ))
     }
 
     /// What the hooks hold now, without releasing an unregistered lock as

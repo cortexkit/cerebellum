@@ -1923,6 +1923,7 @@ struct HookedHost<'a, H> {
     bound_ms: u64,
     cutoff: std::sync::Arc<crate::dispatch::CutoffGate>,
     timer: Option<crate::dispatch::CutoffTimer>,
+    picture: bool,
 }
 
 impl<H: crate::dispatch::FrontingBracketHost> HookedHost<'_, H> {
@@ -2043,6 +2044,30 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             self.decided = Some(self.hooks.decide_restore());
         }
         true
+    }
+    fn begin_without_switch(&mut self, pid: u32) -> bool {
+        if !self.picture {
+            return true;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(self.bound_ms);
+        if !self.hooks.register(pid, pid, self.inner.restore_host()) {
+            self.registration = Registration::Refused;
+            return false;
+        }
+        self.registration = Registration::Registered { prevented: false };
+        // No activation is recorded: the timer can end the lock obligation,
+        // but neither the timer nor terminal cleanup may change the focus.
+        let timer = self.hooks.cutoff_restore().and_then(|finish| {
+            crate::dispatch::CutoffTimer::arm(std::sync::Arc::clone(&self.cutoff), deadline, finish)
+        });
+        if let Some(timer) = timer {
+            self.timer = Some(timer);
+            self.hooks.cutoff_armed(std::sync::Arc::clone(&self.cutoff));
+            true
+        } else {
+            self.registration = Registration::Registered { prevented: true };
+            false
+        }
     }
     fn our_pid(&self) -> i64 {
         self.inner.our_pid()
@@ -2231,6 +2256,7 @@ pub(crate) fn run_hooked_fronted_with_predictor<
         bound_ms: plan.maximum_interval_ms,
         cutoff: std::sync::Arc::new(crate::dispatch::CutoffGate::new()),
         timer: None,
+        picture: read.is_some(),
     };
     let mut outcome = match read {
         None => crate::dispatch::run_fronting_bracket_with_predictor(
@@ -2257,7 +2283,8 @@ pub(crate) fn run_hooked_fronted_with_predictor<
     if let Some(timer) = hooked.timer.take() {
         timer.finish();
     }
-    outcome.report.restore_started_by_cutoff = hooked.cutoff.restore_started_by_cutoff();
+    outcome.report.restore_started_by_cutoff =
+        hooked.previous != Some(Some(hooked.target)) && hooked.cutoff.restore_started_by_cutoff();
     match hooked.registration {
         Registration::NotYet => {}
         Registration::Refused | Registration::Registered { prevented: true } => {

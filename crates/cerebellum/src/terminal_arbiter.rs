@@ -460,7 +460,13 @@ impl RestoreCell {
         lifetime: Duration,
         spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> bool,
     ) -> Option<ReadLockHold> {
-        self.inner().reads_in_flight += 1;
+        {
+            let mut inner = self.inner();
+            if inner.attempt.taken() || inner.lock.is_none() {
+                return None;
+            }
+            inner.reads_in_flight += 1;
+        }
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (returned, wait) = std::sync::mpsc::channel::<()>();
         let cell = Arc::clone(self);
@@ -506,8 +512,16 @@ impl RestoreCell {
         } else {
             None
         };
+        let late_start = if inner.reads_in_flight == 0 && inner.decided.is_some() {
+            inner.late_start.take()
+        } else {
+            None
+        };
         drop(inner);
         drop(lock);
+        if let Some(start) = late_start {
+            start();
+        }
     }
 
     /// Whether a late watch is owed for an activation this cell did not see
@@ -809,7 +823,11 @@ impl RestoreCell {
         decided: RestoreDecided,
     ) -> RestoreDecided {
         inner.decided = Some(decided);
-        let late_start = inner.late_start.take();
+        let late_start = if inner.reads_in_flight == 0 {
+            inner.late_start.take()
+        } else {
+            None
+        };
         let lock = if inner.pending_since.is_none()
             && inner.reads_in_flight == 0
             && inner.release_wait.is_none()
@@ -1199,7 +1217,7 @@ impl TerminalArbiter {
                 }
             };
             let mut inner = cell.inner();
-            if inner.decided.is_none() {
+            if inner.decided.is_none() || inner.reads_in_flight > 0 {
                 // Terminal cleanup can give up waiting before the restore
                 // owner hands the host and lock to the late activation watcher.
                 inner.late_start.get_or_insert_with(|| Box::new(start));

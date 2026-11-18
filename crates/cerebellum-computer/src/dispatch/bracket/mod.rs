@@ -127,6 +127,11 @@ pub trait FrontingBracketHost {
     fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
         permitted() && self.request_front(pid)
     }
+    /// Start a bounded interval without switching focus. Hooked picture
+    /// reads still need a deadline and a lock owner on this path.
+    fn begin_without_switch(&mut self, _pid: u32) -> bool {
+        true
+    }
     /// A second way to ask for `pid` to come to the front, used by a restore
     /// when [`Self::request_front`] was refused or has not taken effect within
     /// [`RESTORE_FALLBACK_AFTER_MS`]. `false` when the host has none or the
@@ -615,8 +620,11 @@ pub(crate) fn run_fronting_bracket_with_predictor<'a, H: FrontingBracketHost>(
         let calibrating = calibration.is_some();
         let fronted_at = host.borrow_mut().now_ms();
         report.chunks += 1;
-        let requested =
-            plan.target_pid == previous || host.borrow_mut().request_front(plan.target_pid);
+        let requested = if plan.target_pid == previous {
+            host.borrow_mut().begin_without_switch(previous)
+        } else {
+            host.borrow_mut().request_front(plan.target_pid)
+        };
         let mut front_ok = requested;
         while front_ok {
             let drained = host.borrow_mut().drain(&tap);
@@ -1015,6 +1023,9 @@ pub(crate) fn run_fronting_read_with_predictor<'a, H: FrontingBracketHost>(
         fn request_front(&mut self, pid: u32) -> bool {
             self.host.request_front(pid)
         }
+        fn begin_without_switch(&mut self, pid: u32) -> bool {
+            self.host.begin_without_switch(pid)
+        }
         fn request_front_fallback(&mut self, pid: u32) -> bool {
             self.host.request_front_fallback(pid)
         }
@@ -1077,7 +1088,7 @@ pub(crate) fn run_fronting_read_with_predictor<'a, H: FrontingBracketHost>(
             observation: ObservedUnit<'_, Self::Tap>,
         ) -> Result<UnitPosted, SequencePostFailure> {
             if (observation.cancelled)()
-                || observation.cutoff.is_some_and(CutoffGate::fired)
+                || observation.cutoff.is_some_and(CutoffGate::past_deadline)
                 || self.host.now_ms() >= observation.deadline_ms
             {
                 return Err(SequencePostFailure {
