@@ -311,8 +311,8 @@ fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
             restore_ms: None,
         };
     }
-    // Each read below is a native call: none starts once the request could
-    // no longer be made by its deadline.
+    // Check the deadline before reading focus; the platform also checks it
+    // at the final restore write, after verifying the process identity.
     if host.restore_deadline_missed() {
         return missed_deadline(host);
     }
@@ -608,8 +608,9 @@ pub(super) fn request_restore<H: FrontingBracketHost + ?Sized>(
     let previous = request.previous;
     let first_accepted = host.request_front(previous);
     if host.restore_deadline_missed() {
-        // Refused at its deadline: nothing more is written here, no second
-        // route and no wait, so the late watch can take over at once.
+        // Refused at its deadline: no second route and no confirmation wait.
+        // Terminal cleanup starts the late watch once the owner hands over
+        // the obligation.
         return RestoreStatus::Failed {
             left_in_front: None,
         };

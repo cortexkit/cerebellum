@@ -2,7 +2,9 @@
 //! native restore write: the reads and setup the restore makes once it
 //! stops waiting, which the restore reserve must cover so that a restore
 //! begun at the start of the reserve still makes its request by the
-//! deadline. Samples come only from the bracket owner's own restores.
+//! deadline. The reserve also covers the time the thread that fronted the
+//! target still spends finishing the action or releasing input after the
+//! reserve starts, plus the time to start the restore thread.
 //!
 //! Kept in memory like the restore samples: the largest of the last few
 //! measurements, never below `RESTORE_PREPARATION_RESERVE_MS` and never
@@ -19,9 +21,37 @@ use cerebellum_computer::platform::RestoreWriteCheck;
 const SAMPLES: usize = 8;
 
 static PREPARATIONS: Mutex<VecDeque<u64>> = Mutex::new(VecDeque::new());
+static RESERVE_TAILS: Mutex<VecDeque<u64>> = Mutex::new(VecDeque::new());
 static EXPIRED_WRITES: AtomicU64 = AtomicU64::new(0);
 static EXPIRED_OS_DELAY: AtomicU64 = AtomicU64::new(0);
 static EXPIRED_INTERNAL: AtomicU64 = AtomicU64::new(0);
+static PREVIOUS_BIND_UNAVAILABLE: AtomicU64 = AtomicU64::new(0);
+static HELD_RELEASE_NATIVE_OVERRUN: AtomicU64 = AtomicU64::new(0);
+static HELD_RELEASE_NO_NATIVE_OVERRUN: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn held_release_counts() -> (u64, u64) {
+    (
+        HELD_RELEASE_NATIVE_OVERRUN.load(Ordering::Relaxed),
+        HELD_RELEASE_NO_NATIVE_OVERRUN.load(Ordering::Relaxed),
+    )
+}
+
+pub(super) fn record_held_release(native_overrun: bool) {
+    let count = if native_overrun {
+        &HELD_RELEASE_NATIVE_OVERRUN
+    } else {
+        &HELD_RELEASE_NO_NATIVE_OVERRUN
+    };
+    count.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn previous_bind_failed() {
+    PREVIOUS_BIND_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn previous_bind_failures() -> u64 {
+    PREVIOUS_BIND_UNAVAILABLE.load(Ordering::Relaxed)
+}
 
 pub(crate) fn expired_writes() -> u64 {
     EXPIRED_WRITES.load(Ordering::Relaxed)
@@ -62,6 +92,7 @@ pub(super) struct WriteDeadline {
     reserve_start: Option<Instant>,
     /// When the owner began this decision's restore preparation.
     started: Instant,
+    reserve_tail: Duration,
     boundary_at: Option<Instant>,
     /// The first boundary was the native write itself, not a miss found
     /// before it.
@@ -87,6 +118,7 @@ impl WriteDeadline {
             deadline,
             reserve_start,
             started,
+            reserve_tail: Duration::ZERO,
             boundary_at: None,
             reached_write: false,
             os_reads: Duration::ZERO,
@@ -94,6 +126,17 @@ impl WriteDeadline {
             native_overrun_until,
             expired: false,
         }
+    }
+
+    pub(super) fn with_tail_from(mut self, entered: Instant) -> Self {
+        let thread_setup = self.started.saturating_duration_since(entered);
+        let late_entry = self.reserve_start.map_or(Duration::ZERO, |reserve| {
+            entered.saturating_duration_since(reserve)
+        });
+        // Include startup even for an early decision, without also charging
+        // it as part of the tail into the reserve.
+        self.reserve_tail = late_entry.saturating_add(thread_setup);
+        self
     }
 
     /// How long the decision may still wait before it must prepare its
@@ -180,32 +223,44 @@ impl WriteDeadline {
         if !self.reached_write {
             return None;
         }
-        let nanos = self
-            .boundary_at?
-            .saturating_duration_since(self.started)
-            .as_nanos();
-        Some(u64::try_from(nanos.div_ceil(1_000_000)).unwrap_or(u64::MAX))
+        Some(ceil_ms(
+            self.boundary_at?.saturating_duration_since(self.started),
+        ))
     }
 
     /// Keep this decision's preparation, when it reached a native write.
     pub(super) fn record_sample(&self) {
-        if let Some(ms) = self.sample_ms() {
+        let sample = self.sample_ms();
+        // A miss before the write cannot measure preparation through the
+        // request, but it can still measure time lost before preparation.
+        if sample.is_some() || self.expired {
+            record_in(&RESERVE_TAILS, ceil_ms(self.reserve_tail));
+        }
+        if let Some(ms) = sample {
             record(ms);
         }
     }
 }
 
+fn ceil_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
+}
+
 /// Keep one measured preparation, in milliseconds.
 fn record(milliseconds: u64) {
-    let mut samples = PREPARATIONS
+    record_in(&PREPARATIONS, milliseconds);
+    #[cfg(test)]
+    RECORDED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+}
+
+fn record_in(samples: &Mutex<VecDeque<u64>>, milliseconds: u64) {
+    let mut samples = samples
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     samples.push_back(milliseconds);
     while samples.len() > SAMPLES {
         samples.pop_front();
     }
-    #[cfg(test)]
-    RECORDED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
 }
 
 #[cfg(test)]
@@ -222,14 +277,8 @@ pub(crate) fn samples_recorded_on_this_thread() -> usize {
 
 /// How far before the deadline the restore reserve starts, in milliseconds.
 pub(crate) fn reserve_ms() -> u64 {
-    let slowest = PREPARATIONS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
-    slowest
+    slowest(&PREPARATIONS)
+        .saturating_add(slowest(&RESERVE_TAILS))
         .saturating_add(crate::budgets::RESTORE_PREPARATION_SLACK_MS)
         .clamp(
             crate::budgets::RESTORE_PREPARATION_RESERVE_MS,
@@ -237,9 +286,30 @@ pub(crate) fn reserve_ms() -> u64 {
         )
 }
 
+fn slowest(samples: &Mutex<VecDeque<u64>>) -> u64 {
+    samples
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_reserve_tail_counts_thread_setup_and_only_the_late_part_of_owner_work() {
+        let base = Instant::now();
+        let at = |ms| base + Duration::from_millis(ms);
+        for (entered, started, tail) in [(1, 4, 3), (6, 9, 3), (9, 12, 5)] {
+            let guard = WriteDeadline::new(at(30), Some(at(7)), at(started), None)
+                .with_tail_from(at(entered));
+            assert_eq!(guard.reserve_tail, Duration::from_millis(tail));
+        }
+    }
 
     #[test]
     fn a_sample_covers_the_preparation_but_not_the_wait_before_it() {

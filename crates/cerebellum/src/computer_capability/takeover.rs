@@ -1143,6 +1143,7 @@ where
                         ticket,
                         &Err::<(), _>(DispatchError::SyntheticUnavailable),
                         make_driver.as_ref(),
+                        None,
                     );
                     return if audit
                         .release_unused(&DispatchError::SyntheticUnavailable)
@@ -1161,7 +1162,7 @@ where
             work.publish_posting(&own_input, &posting);
             let dispatched = dispatcher.dispatch(&mut audit, identity, request);
             own_input.end_posting(posting);
-            let held = super::settle_held_input(ticket, &dispatched, make_driver.as_ref());
+            let held = super::settle_held_input(ticket, &dispatched, make_driver.as_ref(), None);
             let settled_at = std::time::Instant::now();
             if let Some(hooks) = &worker_hooks {
                 super::fronting::finish_after_release(hooks, held, settled_at, None);

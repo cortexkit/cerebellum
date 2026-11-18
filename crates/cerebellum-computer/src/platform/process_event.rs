@@ -403,6 +403,12 @@ fn post_paced_with_visibility<T: PerProcessEventTransport>(
 /// The checks a keystroke unit makes before each of its own posts while its
 /// target is temporarily in front.
 pub trait FrontedKeyGuard {
+    /// Whether the temporary front is closed to new posts, for example when
+    /// its restore reserve starts. Check before preparing the transport;
+    /// this does not commit a post.
+    fn closed(&self) -> bool {
+        false
+    }
     /// Runs before a press or self-contained post, never before a release
     /// or a recovery release. It runs after every preparation for the post
     /// (the window-server listing read and whatever the transport prepares, such as an authentication
@@ -455,6 +461,9 @@ pub fn post_event_sequence_fronted<T: PerProcessEventTransport>(
         };
         let role = roles[index];
         let routed = if !recovery && role != SyntheticStepRole::Release {
+            if guard.closed() {
+                return Err(ProcessEventRefusal::Cancelled);
+            }
             let press = role == SyntheticStepRole::Press;
             require_listed_generation(target, transport, visibility)
                 .and_then(|()| {

@@ -276,13 +276,17 @@ impl FrontingPressHost for PressDesk {
     fn dispatch_gate_open(&mut self) -> bool {
         true
     }
-    fn register_restore_obligation(&mut self, previous: u32, target: u32) -> bool {
+    fn register_restore_obligation(
+        &mut self,
+        previous: u32,
+        target: u32,
+    ) -> Result<(), FrontingStop> {
         assert_eq!((previous, target), (PREVIOUS, TARGET));
         self.log.push("register");
         if self.cleanup_takes_at_registration {
             assert!(self.attempt.stop_front(), "stopped before any front");
         }
-        true
+        Ok(())
     }
     fn begin_front_attempt(&mut self, front_instant_ms: u64) -> bool {
         self.attempt.begin_front_attempt(front_instant_ms)

@@ -2068,13 +2068,15 @@ where
             own_input.end_posting(posting);
             // Released first; only then may the previous application come
             // back, since a key still held would land on it.
-            let held = settle_held_input(ticket, &dispatched, make_driver.as_ref());
+            let cutoff = driver_hooks.as_ref().and_then(fronting::CellHooks::cutoff);
+            let held =
+                settle_held_input(ticket, &dispatched, make_driver.as_ref(), cutoff.as_deref());
             let settled_at = std::time::Instant::now();
-            effects.sample(input_source.as_ref(), &effect_grant);
             let mut bracket = dispatcher.last_bracket().cloned();
             let hooked = driver_hooks.as_ref().map(|hooks| {
                 fronting::finish_after_release(hooks, held, settled_at, bracket.as_mut())
             });
+            effects.sample(input_source.as_ref(), &effect_grant);
             (dispatched, bracket, hooked, effects)
         })
         .await
@@ -3339,10 +3341,11 @@ fn settle_held_input<T, D: PlatformDriver>(
     ticket: Option<held_input::SendTicket>,
     dispatched: &Result<T, DispatchError>,
     make_driver: &(dyn Fn() -> D + Send + Sync),
+    cutoff: Option<&cerebellum_computer::dispatch::CutoffGate>,
 ) -> Option<crate::HeldState> {
     ticket.map(|ticket| {
         ticket.settle(held_input::disposition_of(dispatched), |press| {
-            held_input::release_one(press, &mut make_driver())
+            held_input::release_one_observed(press, &mut make_driver(), cutoff)
         })
     })
 }

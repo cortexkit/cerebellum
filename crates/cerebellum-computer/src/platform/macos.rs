@@ -856,7 +856,7 @@ impl FrontingRestoreHost for MacRestoreHost {
         )
     }
 
-    fn remember_previous(&mut self, pid: u32) {
+    fn remember_previous(&mut self, pid: u32) -> bool {
         // Once: a later call never rebinds, so a pid that has since passed to
         // another process, or a failed first bind, is never replaced by a
         // fresh lookup.
@@ -866,6 +866,9 @@ impl FrontingRestoreHost for MacRestoreHost {
         {
             self.prepared = cerebellum_macos::prepare_frontmost(pid).ok();
         }
+        self.previous
+            .identity()
+            .is_some_and(|(previous, _)| previous == pid)
     }
 
     fn request_front_fallback(&mut self, pid: u32) -> bool {

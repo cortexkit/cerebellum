@@ -34,38 +34,44 @@
 //! - Every wait it controls (poll sleeps, the wait for a picture's capture
 //!   callback, accessibility messages to the target) ends at the start of
 //!   the restore reserve, the deadline minus the measured restore reserve.
-//! - A post, a capture or the target's front write starts only before the
-//!   reserve starts, so whatever was admitted leaves the restore its whole
-//!   reserve. From the start of the reserve the owner only releases held
-//!   input and restores.
-//! - The deadline is checked before each native call that precedes the
-//!   first restore request, and at that request itself.
+//! - A post, a capture or the target's front write may start only before the
+//!   reserve starts. No new press or self-contained post begins preparation
+//!   in the reserve; work already in flight can still finish there, as can
+//!   held-input releases. The reserve accounts for time between its start
+//!   and the owner's decision, restore-thread startup, and preparation for
+//!   the first restore request.
+//! - The decision checks the deadline before reading focus, and again at the
+//!   first native restore write, after the process identity check.
 //!
 //! # Named exceptions
 //!
 //! The bound holds except in these cases, each reported rather than hidden:
 //!
-//! - **A native call that cannot be capped stalls**: a WindowServer focus
-//!   read, `CGEventPostToPid`, `proc_pidinfo`, the restore's own
-//!   accessibility or AppKit write, a ScreenCaptureKit acquisition that
-//!   cannot be cancelled, or the OS preempting the owner. An owner that
-//!   returns past the deadline writes nothing new but the restore-or-handoff:
-//!   a restore request that can no longer be made by the deadline is
+//! - **Uncapped work stalls**: WindowServer connection setup and its focus,
+//!   listing and visibility reads; SkyLight authentication preparation and
+//!   `AXIsProcessTrusted`; event posts and `proc_pidinfo`; the restore's own
+//!   accessibility or AppKit write; ScreenCaptureKit acquisition or copying
+//!   pixels while holding `abandoned` (the flag the caller sets when it stops
+//!   waiting); thread creation; or OS preemption. An owner that never returns
+//!   cannot restore or hand off the obligation. If it returns after the
+//!   deadline before writing, a restore request that can no longer be made is
 //!   refused, the restore reports failed, the miss is counted
 //!   (`frontingRestoreExpiredAtWrite`, with known native stalls counted
-//!   apart from our own overruns), and the bounded late watch takes the
-//!   obligation over. The reply says the restore was handed off only once
-//!   the watch holds it. The watch puts the previous application back only
-//!   while the target is still in front and continuous input observation
-//!   shows no person input.
+//!   apart from our own overruns), and terminal cleanup starts the bounded
+//!   late watch when it has the obligation. The reply says the restore was
+//!   handed off only once the watch holds it. The watch puts the previous
+//!   application back only while the target is still in front and continuous
+//!   input observation shows no person input.
 //! - **A key release that has not settled**: the restore waits for it, since
 //!   restoring under a held key would hand that key to the previous
-//!   application. A release that settles before the deadline is followed at
-//!   once by the restore, under the deadline. One still unsettled at the
-//!   deadline keeps the fronting lock held (module health counts it as
-//!   `frontingLockHeldForUnsettledRelease`), and the restore follows the
+//!   application. A release that settles before the deadline is followed by
+//!   the restore under the deadline. One still unsettled at the
+//!   deadline keeps the fronting lock held, and the restore follows the
 //!   confirmed release without a deadline; an unconfirmed release restores
-//!   nothing.
+//!   nothing. Health tracks locks still held after the reply in
+//!   `frontingLockHeldForUnsettledRelease`. For app-use fronts taking the
+//!   ordinary restore path without a deadline, `frontingRestoreAfterHeldRelease`
+//!   counts decisions with or without evidence of a native overrun.
 //!
 //! Neither exception assumes focus or input is safe merely because time has
 //! passed. Clock measurements cannot distinguish preemption inside our code

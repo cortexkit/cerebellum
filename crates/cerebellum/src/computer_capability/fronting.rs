@@ -699,12 +699,14 @@ impl RestoreHost for PlatformRestoreHost {
 /// run on a fresh thread, which carries no outer deadline, so a call whose
 /// work deadline already passed still puts the previous application back.
 pub(crate) fn decide_with_restore_budget(cell: &RestoreCell) -> RestoreDecided {
-    with_restore_budget(cell, RestoreCell::decide)
+    with_restore_budget(cell, RestoreCell::decide_entered)
 }
 
-type RestoreDecision = fn(&RestoreCell) -> RestoreDecided;
-
-fn with_restore_budget(cell: &RestoreCell, decide: RestoreDecision) -> RestoreDecided {
+fn with_restore_budget(
+    cell: &RestoreCell,
+    decide: impl Fn(&RestoreCell, Instant) -> RestoreDecided + Sync,
+) -> RestoreDecided {
+    let entered = Instant::now();
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -716,10 +718,10 @@ fn with_restore_budget(cell: &RestoreCell, decide: RestoreDecision) -> RestoreDe
                 );
                 #[cfg(not(target_os = "macos"))]
                 let _ = RESTORE_AX_MS;
-                decide(cell)
+                decide(cell, entered)
             })
             .join()
-            .unwrap_or_else(|_| decide(cell))
+            .unwrap_or_else(|_| cell.forgo())
     })
 }
 
@@ -742,13 +744,14 @@ impl ObligationParts {
     /// `None` when the call's terminal reply is already chosen; the lock is
     /// then released and nothing may be fronted.
     /// `gate` is the bracket's, when the front runs in one.
+    /// The second result says whether the previous process could be bound.
     pub(crate) fn register(
         &mut self,
         previous: u32,
         target: u32,
         host: Box<dyn FrontingRestoreHost>,
         gate: Option<Arc<cerebellum_computer::dispatch::CutoffGate>>,
-    ) -> Option<Arc<RestoreCell>> {
+    ) -> Option<(Arc<RestoreCell>, bool)> {
         let lock = self.lock.take()?;
         let mut host = host;
         // Every restore route checks it is still putting back this process,
@@ -756,8 +759,12 @@ impl ObligationParts {
         // every front: takeover fronts have no second route
         // (`restore_fallback` stays false), but their one route checks it
         // too.
-        if previous != target {
-            host.remember_previous(previous);
+        let bound = previous == target || host.remember_previous(previous);
+        if !bound {
+            crate::terminal_arbiter::restore_preparation::previous_bind_failed();
+            if let Some(gate) = &gate {
+                gate.stop_front();
+            }
         }
         self.terminal
             .register_restore(RestoreObligation {
@@ -774,6 +781,7 @@ impl ObligationParts {
                 gate,
             })
             .ok()
+            .map(|cell| (cell, bound))
     }
 }
 
@@ -782,7 +790,7 @@ struct HooksState {
     report: Option<cerebellum_computer::dispatch::BracketReport>,
     parts: Option<ObligationParts>,
     cell: Option<Arc<RestoreCell>>,
-    refused: bool,
+    refusal: Option<FrontingStop>,
     decided: Option<RestoreDecided>,
     finished: Option<(Option<DeferredRestore>, bool)>,
     /// The bracket's gate for this front, once registered.
@@ -800,8 +808,8 @@ pub(crate) struct HookedEnd {
     pub(crate) report: Option<cerebellum_computer::dispatch::BracketReport>,
     /// The registered obligation, when one was registered.
     pub(crate) cell: Option<Arc<RestoreCell>>,
-    /// Registration was refused because the terminal was already chosen.
-    pub(crate) refused: bool,
+    /// Why registration could not admit a front.
+    pub(crate) refusal: Option<FrontingStop>,
     /// The decision, when one ran.
     pub(crate) decided: Option<RestoreDecided>,
     /// The bracket's outcome reached the hooks: what it deferred, and
@@ -830,7 +838,7 @@ impl CellHooks {
         HookedEnd {
             report: state.report.clone(),
             cell: state.cell.clone(),
-            refused: state.refused,
+            refusal: state.refusal,
             decided: state.decided,
             finished: state.finished,
         }
@@ -840,9 +848,13 @@ impl CellHooks {
         self.state().cell.clone()
     }
 
+    pub(crate) fn cutoff(&self) -> Option<Arc<cerebellum_computer::dispatch::CutoffGate>> {
+        self.state().cutoff.clone()
+    }
+
     /// Run `decide` on the cell under the restore's own budget, and keep
     /// what it decided.
-    fn decide_using(&self, decide: RestoreDecision) -> HookedRestore {
+    fn decide_using(&self) -> HookedRestore {
         let Some(cell) = self.cell() else {
             return HookedRestore {
                 restore: RestoreStatus::NotNeeded,
@@ -851,7 +863,7 @@ impl CellHooks {
                 restore_ms: None,
             };
         };
-        let decided = with_restore_budget(&cell, decide);
+        let decided = decide_with_restore_budget(&cell);
         self.state().decided = Some(decided);
         HookedRestore {
             restore: decided.restore,
@@ -912,7 +924,7 @@ impl CellHooks {
         HookedEnd {
             report: state.report.clone(),
             cell: state.cell.clone(),
-            refused: state.refused,
+            refusal: state.refusal,
             decided: state.decided,
             finished: state.finished,
         }
@@ -938,13 +950,16 @@ impl FrontedDispatchHooks for CellHooks {
             return false;
         };
         match parts.register(previous, target, host, Some(Arc::clone(gate))) {
-            Some(cell) => {
+            Some((cell, bound)) => {
                 state.cell = Some(cell);
                 state.cutoff = Some(Arc::clone(gate));
+                if !bound {
+                    state.refusal = Some(FrontingStop::PreviousUnknown);
+                }
                 true
             }
             None => {
-                state.refused = true;
+                state.refusal = Some(FrontingStop::TerminalAlreadyChosen);
                 false
             }
         }
@@ -972,7 +987,13 @@ impl FrontedDispatchHooks for CellHooks {
     }
 
     fn decide_restore(&mut self) -> HookedRestore {
-        self.decide_using(RestoreCell::decide)
+        self.decide_using()
+    }
+
+    fn forgo_restore(&mut self) {
+        if let Some(cell) = self.cell() {
+            self.state().decided = Some(cell.forgo());
+        }
     }
 
     fn finished(&mut self, outcome: &BracketOutcome) {
@@ -1410,8 +1431,8 @@ where
 /// The reply's `fronting` for a temporary front run through `hooks`, once
 /// it ended. `purpose` is what it was for.
 pub(crate) fn hooked_fronting(mode: AppUse, purpose: Purpose, end: &HookedEnd) -> Fronting {
-    if end.refused {
-        return Fronting::stopped(mode, purpose, FrontingStop::TerminalAlreadyChosen);
+    if let Some(stop) = end.refusal {
+        return Fronting::stopped(mode, purpose, stop);
     }
     match (&end.cell, end.decided) {
         (Some(cell), Some(decided)) if decided.front_requested => Fronting {
@@ -1455,17 +1476,8 @@ pub(crate) fn finish_after_release(
             held,
             None | Some(crate::HeldState::Released | crate::HeldState::NoneHeld)
         );
-        let decided = std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    #[cfg(target_os = "macos")]
-                    let _ax = cerebellum_macos::ax_budget::bound_messages_until(
-                        Instant::now() + Duration::from_millis(RESTORE_AX_MS),
-                    );
-                    cell.decide_after_release(released, settled_at)
-                })
-                .join()
-                .unwrap_or_else(|_| cell.decide_after_release(released, settled_at))
+        let decided = with_restore_budget(cell, |cell, entered| {
+            cell.decide_after_release(released, settled_at, entered)
         });
         hooks.state().decided = Some(decided);
         end.decided = Some(decided);

@@ -1716,8 +1716,11 @@ pub trait FrontingRestoreHost: Send {
     /// ([`PreviousBinding`]) and every restore request it makes, the first
     /// route and the second alike, refuses a pid that has since passed to
     /// another process. A host binds only once: a later call never replaces
-    /// the binding, and a bind that failed admits no restore write at all.
-    fn remember_previous(&mut self, _pid: u32) {}
+    /// the binding. `false` means the process could not be bound, so no
+    /// temporary front or restore write can be made.
+    fn remember_previous(&mut self, _pid: u32) -> bool {
+        true
+    }
     /// A second way to ask for `pid`, the remembered previous application,
     /// to come to the front, for when [`Self::request_front`] has not taken
     /// effect. `false` when the host has none, `pid` is not the remembered
@@ -1772,13 +1775,6 @@ impl PreviousBinding {
     pub fn identity(&self) -> Option<(u32, u64)> {
         self.start.map(|start| (self.pid, start))
     }
-
-    /// Whether a restore write to `pid`, whose start time reads `current`
-    /// right before the write, puts back the bound process: the same pid, a
-    /// start time read at the bind, and the same start time now.
-    pub fn admits(&self, pid: u32, current: Option<u64>) -> bool {
-        self.pid == pid && self.start.is_some() && self.start == current
-    }
 }
 
 /// Where a restore host keeps its [`PreviousBinding`]: empty until the one
@@ -1801,11 +1797,6 @@ impl PreviousSlot {
     /// failed one.
     pub fn identity(&self) -> Option<(u32, u64)> {
         self.0.and_then(|binding| binding.identity())
-    }
-
-    /// See [`PreviousBinding::admits`]; nothing is admitted before the bind.
-    pub fn admits(&self, pid: u32, current: Option<u64>) -> bool {
-        self.0.is_some_and(|binding| binding.admits(pid, current))
     }
 }
 
@@ -1954,6 +1945,9 @@ pub trait FrontedDispatchHooks: Send {
     /// owns the front, and nothing else performs its restore while the call
     /// runs.
     fn decide_restore(&mut self) -> HookedRestore;
+    /// End the obligation without writing focus when an unwind leaves input
+    /// possibly held or interrupts restoration itself.
+    fn forgo_restore(&mut self);
     /// How many milliseconds before the bracket's deadline the restore
     /// reserve starts, when this front's first restore request has an
     /// absolute deadline: the time the restore lately took to prepare, so
@@ -1974,7 +1968,7 @@ enum Registration {
     NotYet,
     /// The terminal was already chosen; nothing was fronted.
     Refused,
-    /// Registered; `prevented` when cleanup stopped it before the front.
+    /// Registered; `prevented` when the front cannot be requested.
     Registered {
         prevented: bool,
     },
@@ -2008,6 +2002,37 @@ impl<H: crate::dispatch::FrontingBracketHost> HookedHost<'_, H> {
         if self.dispatching {
             self.dispatching = false;
             self.hooks.front_attempt_returned();
+        }
+    }
+}
+
+impl<H> Drop for HookedHost<'_, H> {
+    fn drop(&mut self) {
+        if !std::thread::panicking()
+            || self.registration != (Registration::Registered { prevented: false })
+            || self.decided.is_some()
+        {
+            return;
+        }
+        // The bracket's own thread still owns this front during unwind.
+        // Close the gate and lift the target's cap before restore cleanup.
+        self.cutoff.end_front();
+        self.target_cap = None;
+        // A second panic during cleanup must not abort the process.
+        let recovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if self.dispatching {
+                self.hooks.front_attempt_returned();
+            }
+            if self.cutoff.input_held() {
+                self.hooks.forgo_restore();
+            } else {
+                self.hooks.decide_restore();
+            }
+        }));
+        if recovered.is_err() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.hooks.forgo_restore();
+            }));
         }
     }
 }
@@ -2070,8 +2095,8 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
                 self.registration = Registration::Refused;
                 return false;
             }
-            // A registration that outlasted the reserve leaves no time to
-            // front in: nothing new starts from its start.
+            // Registration can close the gate when there is no safe
+            // previous process to restore, or when it outlasts the reserve.
             if self.cutoff.closed() {
                 self.registration = Registration::Registered { prevented: true };
                 return false;
@@ -2992,6 +3017,9 @@ mod hooked_fronted_tests {
                 input_coverage_unavailable: false,
                 restore_ms: None,
             }
+        }
+        fn forgo_restore(&mut self) {
+            self.host = None;
         }
         fn finished(&mut self, _outcome: &crate::dispatch::BracketOutcome) {
             self.screen.lock().unwrap().hooks.push("finished");

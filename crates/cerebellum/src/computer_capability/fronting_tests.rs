@@ -501,6 +501,7 @@ struct ScreenState {
     /// A chord's post blocks the bracket's thread for this long in real
     /// time, logging `post-done` when it returns.
     post_blocks_ms: u64,
+    panic_during_post: bool,
     /// Whether the paired release of held keys returns.
     release_ok: bool,
     /// These elements of the desk read enabled while the target is
@@ -538,6 +539,7 @@ struct ScreenState {
     remembered_previous: Option<u32>,
     /// How many times a restore host was told which process to put back.
     remember_calls: usize,
+    previous_bind_fails: bool,
     /// The restore host refuses to ask for any process it was not told to
     /// put back, as the macOS host does, which checks that process's
     /// start time before asking.
@@ -583,6 +585,7 @@ impl Screen {
                 post_unknown: false,
                 post_cost_ms: 0,
                 post_blocks_ms: 0,
+                panic_during_post: false,
                 release_ok: true,
                 enable_on_front: Vec::new(),
                 hold_until_stopped: None,
@@ -597,6 +600,7 @@ impl Screen {
                 fallback_works: false,
                 remembered_previous: None,
                 remember_calls: 0,
+                previous_bind_fails: false,
                 restore_needs_remembered_previous: false,
                 landings_at: Vec::new(),
                 restore_focus_delay_ms: 0,
@@ -755,10 +759,14 @@ impl FrontingRestoreHost for FakeRestore {
         }
         self.0.front("restore", pid)
     }
-    fn remember_previous(&mut self, pid: u32) {
+    fn remember_previous(&mut self, pid: u32) -> bool {
         let mut state = self.0.state();
-        state.remembered_previous = Some(pid);
         state.remember_calls += 1;
+        if state.previous_bind_fails {
+            return false;
+        }
+        state.remembered_previous = Some(pid);
+        true
     }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
         if self.0.state().fallback_works {
@@ -921,6 +929,35 @@ impl FrontingBracketHost for FakeBracket {
     ) -> HeartbeatObservation {
         seen(probe)
     }
+    fn unit_checks_cutoff(&self) -> bool {
+        self.0.state().panic_during_post
+    }
+
+    fn post_observed_unit(
+        &mut self,
+        index: usize,
+        observation: cerebellum_computer::dispatch::ObservedUnit<'_, Self::Tap>,
+    ) -> Result<UnitPosted, SequencePostFailure> {
+        let (panic, hold, posting) = {
+            let mut state = self.0.state();
+            if state.panic_during_post {
+                (true, state.post_unknown, state.posting.take())
+            } else {
+                (false, false, None)
+            }
+        };
+        if panic {
+            if hold {
+                assert!(observation.cutoff.unwrap().begin_post(true));
+            }
+            if let Some(posting) = posting {
+                posting.notify_one();
+            }
+            panic!("injected panic in the fronted action");
+        }
+        self.post_unit(index)
+    }
+
     fn post_unit(&mut self, _index: usize) -> Result<UnitPosted, SequencePostFailure> {
         let (mut unknown, hold, posting, post_cost_ms, post_blocks_ms) = {
             let mut state = self.0.state();
@@ -1792,6 +1829,33 @@ async fn a_background_command_chord_fronts_posts_and_restores() {
 }
 
 #[tokio::test]
+async fn a_failed_previous_bind_refuses_a_background_chord_before_fronting() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    rig.read().await;
+    {
+        let mut state = rig.screen.state();
+        state.previous_bind_fails = true;
+        state.restore_needs_remembered_previous = true;
+    }
+    let terminal = under_terminal();
+    let reply = rig
+        .call_under(&terminal, "computer.keys", command_chord())
+        .await;
+    assert!(
+        rig.screen.log().is_empty(),
+        "{reply}: {:?}",
+        rig.screen.log()
+    );
+    assert_eq!(rig.screen.state().remember_calls, 1);
+    assert_eq!(reply["effect_status"], "not_dispatched", "{reply}");
+    assert_eq!(
+        reply["fronting"]["not_fronted_reason"], "previous_unknown",
+        "{reply}"
+    );
+    assert!(!rig.lock.held());
+}
+
+#[tokio::test]
 async fn a_needs_front_shortcut_accepts_a_150_ms_bracket_but_not_210_ms() {
     use cerebellum_computer::audit::{
         ActuationOutcome, FrontingRecordMode, FrontingRecordPurpose, FrontingRecordRestore,
@@ -2047,6 +2111,9 @@ impl FrontedDispatchHooks for CleanupFirst {
     fn decide_restore(&mut self) -> cerebellum_computer::platform::HookedRestore {
         self.0.decide_restore()
     }
+    fn forgo_restore(&mut self) {
+        self.0.forgo_restore();
+    }
     fn finished(&mut self, outcome: &cerebellum_computer::dispatch::BracketOutcome) {
         self.0.finished(outcome);
     }
@@ -2232,6 +2299,43 @@ impl Routed {
             self.rx.try_recv().is_err(),
             "the route sent a frame after its one reply"
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicking_front_owner_restores_unless_input_may_be_held() {
+    for held in [false, true] {
+        let rig = rig(AppUse::Background, mail_desk()).await;
+        rig.read().await;
+        let posting = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut state = rig.screen.state();
+            state.panic_during_post = true;
+            state.post_unknown = held;
+            state.posting = Some(Arc::clone(&posting));
+        }
+        let mut call = routed(
+            &rig,
+            "computer.keys",
+            command_chord(),
+            |_, _| {},
+            Some(posting),
+        )
+        .await;
+        call.worker_finished_silently().await;
+        let reply = &call.reply;
+        let expected = if held { "failed" } else { "restored" };
+        assert_eq!(reply["fronting"]["restore"], expected, "{reply}");
+        assert!(!reply.to_string().contains("still running"), "{reply}");
+        assert_eq!(
+            rig.screen.log(),
+            if held {
+                vec!["front:4242"]
+            } else {
+                vec!["front:4242", "restore:100"]
+            }
+        );
+        assert!(!rig.lock.held());
     }
 }
 
