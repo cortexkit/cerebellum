@@ -444,8 +444,9 @@ async fn send_principal_denied(
 /// - on macOS, the live turn-hint subscription's process-lifetime counts:
 ///   `turnHintSubscriptionsOpened`, `turnHintOpenFailures`,
 ///   `turnHintSubscriptionsClosed`, `turnHintNoticesReceived` and
-///   `turnHintBadgesEnded`, plus `turnHintActiveBadges` (badges keeping it
-///   open) and `turnHintSubscriptionOpen`;
+///   `turnHintBadgesEnded`, plus `turnHintActiveBadges` (visible cursor badges
+///   or previews), `turnHintSubscriptionOpen`, and `turnHintLastOpenFailureReason`
+///   (`timeout`, `unavailable`, or `null` before the first failure);
 /// - `userBrowserConnections` and `userBrowserDisconnects`, how many Chrome
 ///   extension native-host connections were accepted (after the host's hello
 ///   was verified) and how many of them ended; `userBrowserConnectedAtMs` and

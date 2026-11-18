@@ -3,8 +3,9 @@
 
 #[cfg(target_os = "macos")]
 mod live;
+#[cfg(all(target_os = "macos", test))]
+mod live_tests;
 mod notice;
-mod reply;
 #[cfg(test)]
 mod tests;
 
@@ -20,6 +21,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 const LINGER: Duration = Duration::from_secs(30);
 const RETRY: Duration = Duration::from_secs(1);
+const OPEN_WINDOW: Duration = Duration::from_secs(4);
 
 /// Process-lifetime counts for the live hint subscription, reported in health
 /// so a live check can tell whether hints arrived and whether the connection
@@ -28,6 +30,7 @@ const RETRY: Duration = Duration::from_secs(1);
 pub(crate) struct HintGauges {
     opened: std::sync::atomic::AtomicU64,
     open_failures: std::sync::atomic::AtomicU64,
+    last_open_failure: std::sync::atomic::AtomicU8,
     closed: std::sync::atomic::AtomicU64,
     received: std::sync::atomic::AtomicU64,
     matched: std::sync::atomic::AtomicU64,
@@ -38,6 +41,7 @@ pub(crate) struct HintGauges {
 pub(crate) static HINT_GAUGES: HintGauges = HintGauges {
     opened: std::sync::atomic::AtomicU64::new(0),
     open_failures: std::sync::atomic::AtomicU64::new(0),
+    last_open_failure: std::sync::atomic::AtomicU8::new(0),
     closed: std::sync::atomic::AtomicU64::new(0),
     received: std::sync::atomic::AtomicU64::new(0),
     matched: std::sync::atomic::AtomicU64::new(0),
@@ -52,10 +56,10 @@ impl HintGauges {
     }
 
     pub(crate) fn insert_into(&self, metrics: &mut serde_json::Map<String, serde_json::Value>) {
-        use std::sync::atomic::Ordering::Relaxed;
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
         for (name, value) in [
             ("turnHintSubscriptionsOpened", self.opened.load(Relaxed)),
-            ("turnHintOpenFailures", self.open_failures.load(Relaxed)),
+            ("turnHintOpenFailures", self.open_failures.load(Acquire)),
             ("turnHintSubscriptionsClosed", self.closed.load(Relaxed)),
             ("turnHintNoticesReceived", self.received.load(Relaxed)),
             ("turnHintBadgesEnded", self.matched.load(Relaxed)),
@@ -67,6 +71,21 @@ impl HintGauges {
             "turnHintSubscriptionOpen".into(),
             serde_json::json!(self.open_now.load(Relaxed)),
         );
+        let reason = match self.last_open_failure.load(Relaxed) {
+            1 => Some("unavailable"),
+            2 => Some("timeout"),
+            _ => None,
+        };
+        metrics.insert(
+            "turnHintLastOpenFailureReason".into(),
+            serde_json::json!(reason),
+        );
+    }
+
+    fn open_failed(&self, reason: OpenFailure) {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        self.last_open_failure.store(reason as u8, Relaxed);
+        self.open_failures.fetch_add(1, Release);
     }
 
     fn set_connection(&self, connection: &Option<Connection>, was_open: &mut bool) {
@@ -81,13 +100,20 @@ impl HintGauges {
     }
 }
 
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub(crate) enum OpenFailure {
+    Unavailable = 1,
+    Timeout,
+}
+
 pub(crate) trait Transport: Send + Sync {
-    fn open(&self) -> BoxFuture<'_, Result<Connection, String>>;
+    fn open(&self) -> BoxFuture<'_, Result<Connection, OpenFailure>>;
 }
 
 pub(crate) struct Connection {
     notices: mpsc::Receiver<Notice>,
-    refresh_at: Instant,
+    refresh_at: Option<Instant>,
     // Owns the reader and every NATS client clone; dropping a subscription alone
     // would leave the connection's authentication/reconnect work alive.
     _guard: Box<dyn Send>,
@@ -112,7 +138,7 @@ impl Listener {
         receive: impl Fn(Notice) + Send + Sync + 'static,
     ) -> Self {
         let (commands, receiver) = mpsc::unbounded_channel();
-        tokio::spawn(run(transport, receiver, receive));
+        tokio::spawn(run(transport, receiver, receive, &HINT_GAUGES));
         Self { commands, idle }
     }
 
@@ -132,7 +158,7 @@ impl Listener {
     }
 }
 
-struct Opening(JoinHandle<Result<Connection, String>>);
+struct Opening(JoinHandle<Result<Connection, OpenFailure>>);
 
 impl Drop for Opening {
     fn drop(&mut self) {
@@ -144,6 +170,7 @@ async fn run(
     transport: Arc<dyn Transport>,
     mut commands: mpsc::UnboundedReceiver<Activity>,
     receive: impl Fn(Notice),
+    gauges: &HintGauges,
 ) {
     let mut active = HashMap::<String, Instant>::new();
     let mut connection: Option<Connection> = None;
@@ -165,7 +192,11 @@ async fn run(
             linger = None;
             retry = None;
         }
-        if connection.as_ref().is_some_and(|bus| bus.refresh_at <= now) {
+        if connection
+            .as_ref()
+            .and_then(|bus| bus.refresh_at)
+            .is_some_and(|until| until <= now)
+        {
             connection = None;
         }
         if !active.is_empty()
@@ -174,18 +205,22 @@ async fn run(
             && retry.is_none_or(|until| until <= now)
         {
             let transport = transport.clone();
-            opening = Some(Opening(tokio::spawn(async move { transport.open().await })));
+            opening = Some(Opening(tokio::spawn(async move {
+                tokio::time::timeout(OPEN_WINDOW, transport.open())
+                    .await
+                    .unwrap_or(Err(OpenFailure::Timeout))
+            })));
             retry = None;
         }
-        HINT_GAUGES.set_connection(&connection, &mut was_open);
-        HINT_GAUGES
+        gauges.set_connection(&connection, &mut was_open);
+        gauges
             .active_badges
             .store(active.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let deadline = active
             .values()
             .copied()
             .chain(linger)
-            .chain(connection.as_ref().map(|bus| bus.refresh_at))
+            .chain(connection.as_ref().and_then(|bus| bus.refresh_at))
             .chain(retry.filter(|_| !active.is_empty()))
             .min();
         tokio::select! {
@@ -203,22 +238,20 @@ async fn run(
             },
             result = async {
                 match opening.as_mut() {
-                    Some(task) => Some((&mut task.0).await),
+                    Some(task) => (&mut task.0).await.unwrap_or(Err(OpenFailure::Unavailable)),
                     None => std::future::pending().await,
                 }
             } => {
                 opening = None;
                 match result {
-                    Some(Ok(Ok(bus))) => {
-                        HINT_GAUGES
+                    Ok(bus) => {
+                        gauges
                             .opened
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         connection = Some(bus);
                     }
-                    _ => {
-                        HINT_GAUGES
-                            .open_failures
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Err(reason) => {
+                        gauges.open_failed(reason);
                         retry = Some(Instant::now() + RETRY);
                     }
                 }
@@ -230,7 +263,7 @@ async fn run(
                 }
             } => {
                 if let Some(notice) = notice {
-                    HINT_GAUGES
+                    gauges
                         .received
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     receive(notice);
