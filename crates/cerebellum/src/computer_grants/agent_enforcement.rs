@@ -138,6 +138,7 @@ impl ComputerGrants {
     }
 }
 
+#[cfg(test)]
 impl ComputerGrants {
     /// Retain an already-held permission only when an action will use it.
     /// Unlike `require`, this never asks a question when authority is absent.

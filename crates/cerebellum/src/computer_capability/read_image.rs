@@ -1,4 +1,4 @@
-//! Image reads borrow the keys bracket only under an already-held takeover grant.
+//! Images that need the front use the same bounded bracket as app shortcuts.
 
 use cerebellum_computer::app_state::image::{
     ImageDecision, ImageFronting, ImageUnavailable, WindowImageCapture,
@@ -17,8 +17,6 @@ use super::image_freshness::{image_freshness_decision, ImageFreshnessSource};
 pub(super) struct ImageReadPlan {
     pub requested: bool,
     pub bring_to_front: bool,
-    pub takeover: bool,
-    pub bracket_admitted: bool,
     pub cancel: Option<crate::CancelHandle>,
     pub now_ms: u64,
     /// The call's dispatch gate. Fronting the target is a mutation, so it
@@ -46,23 +44,11 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     }
     let (_, _, decision) = freshness.inspect_decision(grant, None);
     evidence.borrow_mut().decision = Some(decision);
-    if !plan.takeover {
-        return Err(ImageUnavailable::ImageNeedsTakeover);
-    }
-    if !plan.bracket_admitted {
-        return Err(ImageUnavailable::FrontingUnavailable);
-    }
     let hooks = plan
         .hooks
         .as_ref()
         .ok_or(ImageUnavailable::FrontingUnavailable)?;
-    // The declared 300 ms read bound is provisional pending live measurement.
-    // Shortcut brackets have an independent bound.
-    let bound = cerebellum_computer::platform::vocabulary::frozen_row_bound_ms(
-        "computer.read_state",
-        "maximum_fronting_read_interval_ms",
-    )
-    .ok_or(ImageUnavailable::FrontingUnavailable)?;
+    let bound = crate::budgets::FRONTING_BRACKET_MS;
     if backend.screen_recording_liveness() != PermissionLiveness::Live {
         return Err(ImageUnavailable::ScreenRecordingNotLive);
     }
@@ -119,7 +105,7 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
             });
         evidence.borrow_mut().fronting_record = super::fronting::hooked_fronting(
             mode,
-            super::fronting::Purpose::BringToFront,
+            super::fronting::Purpose::NeedsFront,
             &hooks.peek(),
         )
         .row_record();

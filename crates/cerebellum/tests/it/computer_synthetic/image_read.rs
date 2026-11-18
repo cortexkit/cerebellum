@@ -141,10 +141,18 @@ impl CaptureBackend for TrackedCapture {
 }
 
 async fn read(
-    takeover: bool,
     script: FrontingScript,
     still_covered: bool,
     cover_during_capture: bool,
+) -> (Value, Value, Arc<Mutex<Shared>>, usize) {
+    read_with_app_grant(script, still_covered, cover_during_capture, false).await
+}
+
+async fn read_with_app_grant(
+    script: FrontingScript,
+    still_covered: bool,
+    cover_during_capture: bool,
+    allow_once: bool,
 ) -> (Value, Value, Arc<Mutex<Shared>>, usize) {
     let shared = Shared::handle();
     shared.lock().unwrap().fronted = script;
@@ -170,13 +178,24 @@ async fn read(
         still_covered,
         cover_during_capture,
     }));
-    let management = granted_management().await;
-    if takeover {
-        grant_takeover(&management).await;
-    }
-    let carrier = ScriptedCarrier::answering(&["computer_30m"]);
+    let (management, carrier) = if allow_once {
+        (
+            support::computer::management(),
+            ScriptedCarrier::answering(&["allow_once", "deny"]),
+        )
+    } else {
+        (
+            granted_management().await,
+            ScriptedCarrier::answering(&["computer_30m"]),
+        )
+    };
     let clock = FakeClock::new();
     let invoke = || async {
+        let mut consent = relayed(&carrier);
+        if allow_once {
+            // Without a grant holder, the app card can approve only this call.
+            consent.caller.holder = None;
+        }
         with_terminal(
             "computer.read_state",
             plane.serve(
@@ -187,7 +206,7 @@ async fn read(
                     grantee: GRANTEE,
                     identity: identity(),
                     management: &management,
-                    consent: relayed(&carrier),
+                    consent,
                     clock: &clock,
                     now_ms: 10,
                 },
@@ -202,26 +221,23 @@ async fn read(
         .await
         .expect("the fronted read passes the closed reply schema")
     };
-    let mut reply = invoke().await;
-    if !takeover {
-        assert_eq!(reply["outcome"], "consent_granted_not_executed", "{reply}");
-        assert!(reply["remedy"]
-            .as_str()
-            .unwrap()
-            .contains("Nothing was brought forward"));
-        assert!(shared.lock().unwrap().image_front_requests.is_empty());
-        assert_eq!(captures.load(Ordering::SeqCst), 0);
-        assert_eq!(carrier.questions().len(), 1);
-        reply = invoke().await;
-        assert_eq!(
-            carrier.questions().len(),
-            1,
-            "the re-issued read uses the held grant"
+    let reply = invoke().await;
+    if allow_once {
+        assert!(
+            reply.get("image").is_some(),
+            "the waiting call uses its own approval: {reply}"
         );
+        let second = invoke().await;
+        assert_eq!(second["outcome"], "consent_denied", "{second}");
+        let cards = carrier.questions();
+        assert_eq!(cards.len(), 2, "the later call has no grant");
+        for card in cards {
+            assert_eq!(card["params"]["scope"]["app"], TARGET_BUNDLE_ID);
+        }
     } else {
         assert!(
             carrier.questions().is_empty(),
-            "a held takeover never asks again"
+            "an app grant suffices: {reply}"
         );
     }
     assert!(plane.result_schema_findings().is_empty());
@@ -261,20 +277,8 @@ async fn read(
 }
 
 #[tokio::test]
-async fn approving_a_covered_read_never_fronts_but_a_reissued_read_uses_the_grant() {
-    let (reply, row, shared, captures) = read(false, FrontingScript::default(), false, false).await;
-    assert!(reply.get("image").is_some(), "{reply}");
-    assert_eq!(captures, 1);
-    assert_eq!(
-        shared.lock().unwrap().image_front_requests,
-        vec![grant().pid, OTHER_APPLICATION_PID]
-    );
-    assert_eq!(row["image_returned"], true);
-}
-
-#[tokio::test]
-async fn covered_takeover_fronts_captures_and_restores_previous_app() {
-    let (reply, row, shared, captures) = read(true, FrontingScript::default(), false, false).await;
+async fn covered_read_fronts_captures_and_restores_with_only_an_app_grant() {
+    let (reply, row, shared, captures) = read(FrontingScript::default(), false, false).await;
     assert!(reply.get("image").is_some(), "{reply}");
     assert_eq!(captures, 1);
     let shared = shared.lock().unwrap();
@@ -294,11 +298,21 @@ async fn covered_takeover_fronts_captures_and_restores_previous_app() {
 }
 
 #[tokio::test]
+async fn covered_read_spends_allow_once_on_the_waiting_call_not_a_retry() {
+    let (_, _, shared, captures) =
+        read_with_app_grant(FrontingScript::default(), false, false, true).await;
+    assert_eq!(captures, 1);
+    assert_eq!(
+        shared.lock().unwrap().image_front_requests,
+        [grant().pid, OTHER_APPLICATION_PID]
+    );
+}
+
+#[tokio::test]
 async fn fronting_overrun_discloses_bound_and_withholds_image() {
     let (reply, row, shared, captures) = read(
-        true,
         FrontingScript {
-            front_latency_ms: Some(151),
+            front_latency_ms: Some(101),
             ..Default::default()
         },
         false,
@@ -315,7 +329,7 @@ async fn fronting_overrun_discloses_bound_and_withholds_image() {
         row["image_fronting"]["longest_fronted_interval_ms"]
             .as_u64()
             .unwrap()
-            > 300
+            > 200
     );
     assert_eq!(
         shared
@@ -331,7 +345,7 @@ async fn fronting_overrun_discloses_bound_and_withholds_image() {
 
 #[tokio::test]
 async fn still_covered_after_fronting_never_captures() {
-    let (reply, row, shared, captures) = read(true, FrontingScript::default(), true, false).await;
+    let (reply, row, shared, captures) = read(FrontingScript::default(), true, false).await;
     assert_eq!(
         reply["image_unavailable"]["reason"],
         "window_covered_may_be_stale"
@@ -351,7 +365,7 @@ async fn still_covered_after_fronting_never_captures() {
 
 #[tokio::test]
 async fn cover_racing_capture_withholds_pixels_and_restores() {
-    let (reply, row, _, captures) = read(true, FrontingScript::default(), false, true).await;
+    let (reply, row, _, captures) = read(FrontingScript::default(), false, true).await;
     assert_eq!(captures, 1);
     assert!(reply.get("image").is_none());
     assert_eq!(
@@ -365,7 +379,6 @@ async fn cover_racing_capture_withholds_pixels_and_restores() {
 #[tokio::test]
 async fn failed_restore_is_disclosed_without_releasing_image() {
     let (reply, row, shared, captures) = read(
-        true,
         FrontingScript {
             refuse_restore: true,
             ..Default::default()
@@ -392,7 +405,7 @@ async fn failed_restore_is_disclosed_without_releasing_image() {
 
 #[tokio::test]
 async fn person_change_refuses_fronting_but_does_not_block_an_unfronted_read() {
-    for takeover in [false, true] {
+    for front_image in [false, true] {
         let shared = Shared::handle();
         let desk = background(focused_text_desk());
         desk.state().window = Some((1, Some("Before".into())));
@@ -413,18 +426,15 @@ async fn person_change_refuses_fronting_but_does_not_block_an_unfronted_read() {
         .await;
         assert_eq!(first["outcome"], "completed");
         desk.state().window = Some((1, Some("After".into())));
-        if takeover {
-            grant_takeover(&management).await;
-        }
         let reply = serve_asking(
             &plane,
             "computer.read_state",
-            json!({"target": TARGET_BUNDLE_ID, "include_image": true, "bring_to_front": takeover}),
+            json!({"target": TARGET_BUNDLE_ID, "include_image": true, "bring_to_front": front_image}),
             &management,
             no_relay(),
         )
         .await;
-        if takeover {
+        if front_image {
             assert_eq!(reply["outcome"], "state_changed_by_person");
             assert_eq!(reply["reason"], "window_changed");
         } else {
@@ -439,9 +449,8 @@ async fn person_change_refuses_fronting_but_does_not_block_an_unfronted_read() {
 }
 
 #[tokio::test]
-async fn image_reads_use_their_own_bound_and_encode_after_restore() {
+async fn image_reads_fit_the_needs_front_bound_and_encode_after_restore() {
     let (reply, row, shared, captures) = read(
-        true,
         FrontingScript {
             front_latency_ms: Some(100),
             ..Default::default()
@@ -452,7 +461,7 @@ async fn image_reads_use_their_own_bound_and_encode_after_restore() {
     .await;
     assert!(
         reply.get("image").is_some(),
-        "a 200 ms image bracket fits the read bound, not the keys bound: {reply}"
+        "a 200 ms image bracket fits the needs-front bound: {reply}"
     );
     assert_eq!(captures, 1);
     assert_eq!(row["longest_fronted_interval_ms"], 200);
