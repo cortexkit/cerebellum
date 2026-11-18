@@ -226,6 +226,9 @@ pub(super) fn start(
             },
         );
     }
+    // The watch now holds the host and the fronting lock: from here, and
+    // not before, a reply may say the restore was handed off to it.
+    cell.inner().watch_holds = true;
     let target = cell.target_pid;
     let previous = cell.previous_pid;
     #[cfg(all(feature = "desk-probe", target_os = "macos"))]

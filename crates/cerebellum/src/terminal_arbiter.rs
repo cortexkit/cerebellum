@@ -333,6 +333,9 @@ struct RestoreCellInner {
     /// The first restore request missed its deadline, so the late watch is
     /// owed the obligation.
     handoff_owed: bool,
+    /// The late watch took the host and the fronting lock. Only from here may
+    /// a reply say the restore was handed off.
+    watch_holds: bool,
     late_start: Option<Box<dyn FnOnce() + Send>>,
     /// The restore host, which carries the previous application's identity
     /// as it was bound before the front. It moves, never copied, from the
@@ -372,6 +375,7 @@ impl RestoreCell {
             purpose: obligation.purpose,
             inner: std::sync::Mutex::new(RestoreCellInner {
                 handoff_owed: false,
+                watch_holds: false,
                 late_start: None,
                 host: Some(obligation.host),
                 lock: Some(obligation.lock),
@@ -841,9 +845,10 @@ impl RestoreCell {
         }
     }
 
-    /// Record the decision, wake any waiter, then release the fronting lock
-    /// unless a picture read or the late watch still needs it. Only the
-    /// first decision counts.
+    /// Release the fronting lock unless a picture read or the late watch
+    /// still needs it, then record the decision and wake any waiter, so a
+    /// waiter that sees the decision never sees the lock still held. Only
+    /// the first decision counts.
     fn complete(
         &self,
         mut inner: std::sync::MutexGuard<'_, RestoreCellInner>,
@@ -852,7 +857,6 @@ impl RestoreCell {
         if let Some(first) = inner.decided {
             return first;
         }
-        inner.decided = Some(decided);
         if let Some(since_ms) = inner.release_wait.take() {
             unsettled_release_lock_ended(since_ms);
         }
@@ -861,14 +865,14 @@ impl RestoreCell {
         } else {
             None
         };
-        let lock = if inner.pending_since.is_none() && inner.reads_in_flight == 0 {
-            inner.lock.take()
-        } else {
-            None
-        };
+        if inner.pending_since.is_none() && inner.reads_in_flight == 0 {
+            // Dropping the guard only releases the lock; it calls nothing
+            // that takes this cell's mutex.
+            drop(inner.lock.take());
+        }
+        inner.decided = Some(decided);
         drop(inner);
         self.changed.notify_all();
-        drop(lock);
         if let Some(start) = late_start {
             start();
         }
@@ -931,14 +935,16 @@ impl RestoreCell {
                 None => remedy,
             };
             let inner = self.inner();
-            if inner.handoff_owed {
+            if inner.handoff_owed && inner.watch_holds {
                 remedy.push_str(". The first restore request missed its deadline; the restore was handed off to a short-lived watcher that can retry only while the target remains in front and continuous input observation shows no person input.");
-            } else if self.gate.deadline().is_some()
-                && inner.late_start.is_some()
-                && inner.decided.is_none()
+            } else if inner.handoff_owed
+                || (self.gate.deadline().is_some()
+                    && inner.late_start.is_some()
+                    && inner.decided.is_none())
             {
-                // The terminal stopped waiting before the restore owner
-                // could tell whether it reached the write in time.
+                // The owner has not decided, or has missed the deadline but
+                // the late watch does not hold the obligation yet: nothing
+                // may be said to be handed off until it does.
                 remedy.push_str(". Restore cleanup is still running; if its first request misses the deadline, a short-lived watcher can retry only while the target remains in front and continuous input observation shows no person input.");
             }
             object.insert("remedy".into(), json!(remedy));
@@ -3176,6 +3182,49 @@ mod restore_slot_tests {
             shared.lock().unwrap().requests,
             [PREVIOUS],
             "only the watch wrote"
+        );
+    }
+
+    #[test]
+    fn a_missed_deadline_is_disclosed_as_handed_off_only_once_the_watch_holds_it() {
+        let shared = screen(true);
+        let releases = Arc::new(AtomicUsize::new(0));
+        let terminal = TerminalArbiter::new(request());
+        let (cell, gate, _) = bounded_cell(
+            &terminal,
+            &shared,
+            &releases,
+            Duration::from_secs(60),
+            Duration::from_secs(120),
+        );
+        cell.front_confirmed();
+        // A picture read still holds the fronting lock, so the late watch
+        // cannot take the obligation yet.
+        let hold = cell
+            .hold_read_with_watchdog(Duration::from_secs(60), |_| true)
+            .expect("a bounded hold");
+        gate.set_bound(
+            std::time::Instant::now() - Duration::from_millis(1),
+            std::time::Instant::now() - Duration::from_millis(1),
+        );
+        let decided = cell.decide();
+        assert!(matches!(decided.restore, RestoreStatus::Failed { .. }));
+        terminal.start_late_fronting(Some(&cell));
+        let remedy = |cell: &RestoreCell| {
+            let mut reply = json!({"outcome": "completed"});
+            cell.disclose(&mut reply, decided);
+            reply["remedy"].as_str().unwrap().to_owned()
+        };
+        let before = remedy(&cell);
+        assert!(
+            !before.contains("handed off") && before.contains("still running"),
+            "a known miss the watch does not hold yet is not a handoff: {before}"
+        );
+        drop(hold);
+        let after = remedy(&cell);
+        assert!(
+            after.contains("restore was handed off"),
+            "the watch holds it now: {after}"
         );
     }
 
