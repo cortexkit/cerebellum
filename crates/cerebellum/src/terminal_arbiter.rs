@@ -318,6 +318,8 @@ pub struct RestoreCell {
 
 struct RestoreCellInner {
     restore_deadline: Option<std::time::Instant>,
+    /// Keep the handoff evidence after the watcher takes the host and lock.
+    expired_write_handed_off: bool,
     cutoff: Option<Arc<crate::computer::dispatch::CutoffGate>>,
     late_start: Option<Box<dyn FnOnce() + Send>>,
     attempt: crate::computer::dispatch::FrontAttempt,
@@ -356,6 +358,7 @@ impl RestoreCell {
             purpose: obligation.purpose,
             inner: std::sync::Mutex::new(RestoreCellInner {
                 restore_deadline: None,
+                expired_write_handed_off: false,
                 cutoff: None,
                 late_start: None,
                 attempt: crate::computer::dispatch::FrontAttempt::new(),
@@ -664,6 +667,7 @@ impl RestoreCell {
                 {
                     let mut inner = self.inner();
                     inner.pending_since = Some(front_instant_ms);
+                    inner.expired_write_handed_off = expired;
                     inner.pending_restored = matches!(
                         outcome.restore,
                         crate::computer::dispatch::RestoreStatus::Restored
@@ -906,10 +910,21 @@ impl RestoreCell {
                 .and_then(Value::as_str)
                 .and_then(crate::computer_capability::keystrokes::keys_sent_in)
                 .map(str::to_owned);
-            let remedy = match sent {
+            let mut remedy = match sent {
                 Some(sent) => format!("{sent} {remedy}"),
                 None => remedy,
             };
+            let inner = self.inner();
+            if inner.expired_write_handed_off {
+                remedy.push_str(". The first restore request missed its deadline; the restore was handed off to a short-lived watcher that can retry only while the target remains in front and continuous input observation shows no person input.");
+            } else if inner.restore_deadline.is_some()
+                && inner.late_start.is_some()
+                && inner.decided.is_none()
+            {
+                // The terminal stopped waiting before the restore owner
+                // could tell whether it reached the write in time.
+                remedy.push_str(". Restore cleanup is still running; if its first request misses the deadline, a short-lived watcher can retry only while the target remains in front and continuous input observation shows no person input.");
+            }
             object.insert("remedy".into(), json!(remedy));
         } else if let RestoreStatus::SkippedPerson { now_front } = decided.restore {
             let explanation = if decided.input_coverage_unavailable {
@@ -3103,6 +3118,18 @@ mod restore_slot_tests {
         );
         assert!(decided.restore_ms.is_none());
         assert!(restore_preparation::expired_writes() > expired);
+        let mut reply = json!({"outcome": "completed", "effect_status": "effect_indeterminate"});
+        cell.disclose(&mut reply, decided);
+        assert_eq!(reply["outcome"], "restore_failed");
+        assert_eq!(reply["fronting"]["restore"], "failed");
+        assert_eq!(reply["effect_status"], "effect_indeterminate");
+        assert!(
+            reply["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("restore was handed off"),
+            "{reply}"
+        );
         let end = std::time::Instant::now() + crate::test_support::HANG_GUARD;
         while releases.load(SeqCst) == 0 && std::time::Instant::now() < end {
             std::thread::sleep(Duration::from_millis(1));
