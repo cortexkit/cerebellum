@@ -21,7 +21,10 @@ use std::time::Duration;
 /// The per-post checks for a keystroke unit posted while its target is in
 /// front: the cutoff has not fired, the target is still the frontmost
 /// application, and the bracket's deadline has not passed. The unit's
-/// cancellation is checked separately by the sequence, before these.
+/// cancellation is checked separately by the sequence, just before these.
+/// The sequence runs them after the post's window-server listing read, the
+/// one step that can block, so nothing slow lies between these checks and
+/// the post call.
 ///
 /// A post refused here was never made, so the refusal is
 /// [`ProcessEventRefusal::Cancelled`], which a reply reads as no post call
@@ -51,8 +54,9 @@ where
         if (self.now_ms)() >= self.deadline_ms {
             return Err(ProcessEventRefusal::Cancelled);
         }
-        // Last, because a press marks the cutoff held from here until its
-        // release: the timer must not restore while this post is in flight.
+        // Last, because this commits the post: the cutoff stays held from
+        // here until the post returns, and after a press until its release,
+        // so the timer never restores while the post is in flight.
         if self.cutoff.is_some_and(|cutoff| !cutoff.begin_post(press)) {
             return Err(ProcessEventRefusal::Cancelled);
         }
@@ -76,7 +80,7 @@ struct GateState {
     fired: bool,
     /// The bracket began its own restore, so the timer has nothing to start.
     disarmed: bool,
-    /// A press may be down, or a post that may press is in flight.
+    /// A post is in flight, or a press may be down.
     held: bool,
     /// The timer started the restore.
     restore_started_by_cutoff: bool,
@@ -92,18 +96,20 @@ impl CutoffGate {
     }
 
     /// A post is about to start. `false` once the cutoff fired: the post
-    /// must not be made. A `press` keeps the gate held until
-    /// [`Self::all_released`], so the timer will not restore meanwhile.
-    pub fn begin_post(&self, press: bool) -> bool {
+    /// must not be made. Otherwise the post is committed under the gate's
+    /// lock: the gate is held until [`Self::all_released`], so the timer will
+    /// not restore while the post is in flight. A self-contained post is
+    /// released once it returns; a `press` only once its release has.
+    pub fn begin_post(&self, _press: bool) -> bool {
         let mut state = self.state();
         if state.fired {
             return false;
         }
-        state.held |= press;
+        state.held = true;
         true
     }
 
-    /// Nothing the unit pressed is still down.
+    /// No post is in flight and nothing the unit pressed is still down.
     pub fn all_released(&self) {
         self.state().held = false;
     }
