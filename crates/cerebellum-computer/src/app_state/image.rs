@@ -371,6 +371,7 @@ mod tests {
             stop: None,
             waiting_out_slow_post: false,
             waiting_out_slow_restore: false,
+            restore_calibrated: false,
         }
     }
 

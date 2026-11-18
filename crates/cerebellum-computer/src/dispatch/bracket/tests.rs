@@ -6,6 +6,7 @@ use super::*;
 use crate::dispatch::seize::{HeartbeatMarker, IdleGateRefusal, OBSERVED_DISPATCH_IDLE_MS};
 use crate::platform::{HeldStateDisposition, ProcessEventRefusal};
 
+mod calibration;
 mod listing;
 mod restore_fallback;
 mod restore_reserve;

@@ -1723,6 +1723,12 @@ pub trait FrontingRestoreHost: Send {
 /// clock.
 pub trait RestoreHostSource {
     fn restore_host(&self) -> Box<dyn FrontingRestoreHost>;
+
+    /// Whether this host measures the real desktop on the process clock.
+    /// Synthetic hosts keep their own timing, not the module's predictor.
+    fn supports_needs_front_restore_predictor(&self) -> bool {
+        false
+    }
 }
 
 /// One fronting outside the keystroke bracket, as the platform provides it:
@@ -1820,6 +1826,11 @@ pub struct HookedRestore {
 /// the front attempt's start and return, and the one restore decision, which
 /// the caller shares with its terminal cleanup so it runs exactly once.
 pub trait FrontedDispatchHooks: Send {
+    /// Opt in only for a needs-front bracket admitted under app-use authority.
+    /// Takeover brackets keep their existing, process-only reserve.
+    fn uses_needs_front_restore_predictor(&self) -> bool {
+        false
+    }
     /// Register the restore obligation for a front of `target` over
     /// `previous`, read with the fronting lock held. `host` is on the
     /// bracket's clock. `false` when the call's terminal reply is already
@@ -2074,6 +2085,9 @@ pub fn run_hooked_fronted<H: crate::dispatch::FrontingBracketHost + RestoreHostS
     read: Option<&mut dyn FnMut()>,
 ) -> crate::dispatch::BracketOutcome {
     use crate::dispatch::{BracketStop, FrontingAdmission, RestoreStatus};
+    let predictor = (host.supports_needs_front_restore_predictor()
+        && hooks.uses_needs_front_restore_predictor())
+    .then(crate::dispatch::needs_front_restore_predictor);
     let admission = FrontingAdmission {
         app_use_fronting_admitted: true,
     };
@@ -2087,20 +2101,22 @@ pub fn run_hooked_fronted<H: crate::dispatch::FrontingBracketHost + RestoreHostS
         decided: None,
     };
     let mut outcome = match read {
-        None => crate::dispatch::run_fronting_bracket_with(
+        None => crate::dispatch::run_fronting_bracket_with_predictor(
             &mut hooked,
             estimator,
             plan,
             admission,
             cancelled,
+            predictor,
         ),
-        Some(read) => crate::dispatch::run_fronting_read_with(
+        Some(read) => crate::dispatch::run_fronting_read_with_predictor(
             &mut hooked,
             estimator,
             plan,
             admission,
             cancelled,
             read,
+            predictor,
         ),
     };
     hooked.returned();

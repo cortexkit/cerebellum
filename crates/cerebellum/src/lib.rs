@@ -1963,6 +1963,9 @@ pub async fn run_entry() -> Result<(), ModuleError> {
     let config = ModuleConfig::from_env()?;
     record_private_state_tightening();
     record_engram_catalog_write();
+    cerebellum_computer::dispatch::load_needs_front_restore_predictor(
+        cerebellum_core::platform_dirs::data_home().as_deref(),
+    );
     let ending = run(
         config,
         read_live_settings_from_config_file,

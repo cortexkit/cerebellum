@@ -828,6 +828,12 @@ impl CellHooks {
 }
 
 impl FrontedDispatchHooks for CellHooks {
+    fn uses_needs_front_restore_predictor(&self) -> bool {
+        self.state().parts.as_ref().is_some_and(|parts| {
+            parts.restore_fallback && parts.purpose == FrontingPurpose::NeedsFront
+        })
+    }
+
     fn register(&mut self, previous: u32, target: u32, host: Box<dyn FrontingRestoreHost>) -> bool {
         let mut state = self.state();
         let Some(parts) = state.parts.as_mut() else {

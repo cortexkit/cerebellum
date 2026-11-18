@@ -1119,6 +1119,7 @@ fn a_fronted_dispatch_compares_against_its_plan_and_other_dispatches_keep_the_ro
                 stop: None,
                 waiting_out_slow_post: false,
                 waiting_out_slow_restore: false,
+                restore_calibrated: false,
             }),
             ..RecordingDriver::default()
         };

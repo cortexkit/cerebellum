@@ -4,13 +4,12 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const RESTORE_SAMPLES: usize = 8;
+pub(super) const RESTORE_SAMPLES: usize = 8;
 
 /// Shared across target applications for this cerebellum process. A restore
 /// returns to the person's application, not the action's target, so a PID-only
-/// target cache would miss that cost and could confuse reused PIDs. Keeping
-/// only eight samples lets a transient stall age out through later restores,
-/// including restores after a pre-post refusal.
+/// target cache would miss that cost and could confuse reused PIDs. App-use
+/// needs-front brackets keep their own real-restore history.
 static RESTORE_LATENCIES: Mutex<RestoreLatencies> = Mutex::new(RestoreLatencies::new());
 
 pub(super) struct RestoreLatencies {
@@ -36,6 +35,15 @@ impl RestoreLatencies {
 
     pub(super) fn maximum(&self) -> Option<u64> {
         self.samples[..self.len].iter().copied().max()
+    }
+
+    pub(super) fn oldest_first(&self) -> impl Iterator<Item = u64> + '_ {
+        let oldest = if self.len == RESTORE_SAMPLES {
+            self.next
+        } else {
+            0
+        };
+        (0..self.len).map(move |offset| self.samples[(oldest + offset) % RESTORE_SAMPLES])
     }
 }
 
