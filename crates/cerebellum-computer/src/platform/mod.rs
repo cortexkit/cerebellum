@@ -1863,6 +1863,12 @@ pub trait FrontedDispatchHooks: Send {
     /// before acquiring them, since the timer may fire while its read is
     /// already under way. The default keeps nothing.
     fn cutoff_armed(&mut self, _gate: std::sync::Arc<crate::dispatch::CutoffGate>) {}
+    /// How many milliseconds before the bracket's deadline the cutoff fires:
+    /// the time its restore takes to prepare, so that the restore request
+    /// itself is made by the deadline. The default is none.
+    fn cutoff_lead_ms(&self) -> u64 {
+        0
+    }
     /// The bracket ended with `outcome`, whose restore is already the hooked
     /// decision. A `deferred_restore` in it is still owed: the caller settles
     /// the held input first.
@@ -1938,8 +1944,15 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             // the start of the bounded interval just before this request:
             // registration and arming can take time, and none of it may move
             // the cutoff later than the bound.
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(self.bound_ms);
+            let stamped = std::time::Instant::now();
+            let deadline = stamped + std::time::Duration::from_millis(self.bound_ms);
+            // The cutoff fires early by the time its restore takes to prepare,
+            // so the restore request itself is made by the deadline.
+            let cutoff_at = deadline
+                .checked_sub(std::time::Duration::from_millis(
+                    self.hooks.cutoff_lead_ms(),
+                ))
+                .map_or(stamped, |at| at.max(stamped));
             if self.registration != Registration::NotYet {
                 // One temporary front per call: a later chunk is not
                 // fronted again under the same obligation.
@@ -1962,7 +1975,7 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             if let Some(restore) = self.hooks.cutoff_restore() {
                 match crate::dispatch::CutoffTimer::arm(
                     std::sync::Arc::clone(&self.cutoff),
-                    deadline,
+                    cutoff_at,
                     restore,
                 ) {
                     Some(timer) => {
@@ -1977,7 +1990,7 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             }
             // A registration that outlasted the bound leaves no time to
             // front in; the timer, firing at once, is already deciding.
-            if std::time::Instant::now() >= deadline {
+            if std::time::Instant::now() >= cutoff_at {
                 self.registration = Registration::Registered { prevented: true };
                 return false;
             }

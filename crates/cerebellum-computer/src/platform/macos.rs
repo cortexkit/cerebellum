@@ -792,6 +792,10 @@ struct MacRestoreHost {
     /// the obligation names it; the second route to the front refuses any
     /// other process.
     previous: Option<(u32, u64)>,
+    /// The previous application's accessibility element, resolved when the
+    /// obligation named it, so a restore at the cutoff makes no lookup
+    /// before its request.
+    prepared: Option<cerebellum_macos::PreparedFrontmost>,
 }
 
 impl MacRestoreHost {
@@ -799,6 +803,7 @@ impl MacRestoreHost {
         Self {
             started,
             previous: None,
+            prepared: None,
         }
     }
 }
@@ -824,12 +829,18 @@ impl FrontingRestoreHost for MacRestoreHost {
             self.previous,
             pid,
             cerebellum_macos::process_start_time_micros,
-            |still_ours| cerebellum_macos::request_frontmost_while(pid, still_ours).is_ok(),
+            |still_ours| match &self.prepared {
+                Some(prepared) if prepared.pid() == pid => {
+                    prepared.request_while(still_ours).is_ok()
+                }
+                _ => cerebellum_macos::request_frontmost_while(pid, still_ours).is_ok(),
+            },
         )
     }
 
     fn remember_previous(&mut self, pid: u32) {
         self.previous = cerebellum_macos::process_start_time_micros(pid).map(|start| (pid, start));
+        self.prepared = cerebellum_macos::prepare_frontmost(pid).ok();
     }
 
     fn request_front_fallback(&mut self, pid: u32) -> bool {

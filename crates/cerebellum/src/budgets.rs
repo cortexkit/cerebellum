@@ -45,6 +45,23 @@ pub const FRONTING_READ_MS: u64 = 300;
 /// describes the takeover bracket; app-grant needs-front shortcuts use this
 /// budget instead.
 pub const FRONTING_BRACKET_MS: u64 = 200;
+/// How far before `FRONTING_BRACKET_MS` an app-use front's cutoff fires, so
+/// that the restore request itself, not merely the start of the work leading
+/// to it, is made by the deadline. The work between the cutoff firing and the
+/// native restore request is two frontmost readings (each a window-server
+/// window list), two reads of the hardware observer's timestamps, the
+/// previous application's start-time check and the accessibility write on an
+/// element resolved when the front was registered. Measured on a desk
+/// (two window-list reads and a start-time read, 40 runs): median about
+/// 1 ms, 90th percentile about 5 ms, slowest 33 ms. This floor covers the
+/// slowest with room for scheduling; a preparation measured slower raises
+/// the reserve, up to `RESTORE_PREPARATION_RESERVE_MAX_MS`.
+pub const RESTORE_PREPARATION_RESERVE_MS: u64 = 50;
+/// The most the cutoff fires early, however slow preparation was measured:
+/// half the bracket, so a front always leaves time to act. A preparation
+/// slower than this makes the restore request late, and the late request is
+/// measured and reported like any other.
+pub const RESTORE_PREPARATION_RESERVE_MAX_MS: u64 = 100;
 /// How long a fronted picture read may keep the fronting lock from its
 /// start. Its pixels are refused past `FRONTING_BRACKET_MS` anyway; this
 /// bounds only how long a read whose synchronous step never returns can

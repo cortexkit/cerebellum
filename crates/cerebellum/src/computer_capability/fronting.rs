@@ -694,18 +694,26 @@ fn with_restore_budget(
 ) -> RestoreDecided {
     std::thread::scope(|scope| {
         scope
-            .spawn(|| {
-                #[cfg(target_os = "macos")]
-                let _ax = cerebellum_macos::ax_budget::bound_messages_until(
-                    Instant::now() + Duration::from_millis(RESTORE_AX_MS),
-                );
-                #[cfg(not(target_os = "macos"))]
-                let _ = RESTORE_AX_MS;
-                decide(cell)
-            })
+            .spawn(|| with_restore_budget_here(cell, decide))
             .join()
             .unwrap_or_else(|_| decide(cell))
     })
+}
+
+/// [`with_restore_budget`] on the calling thread, which must carry no outer
+/// accessibility deadline: the cutoff's own timer thread, already running,
+/// so the restore at the cutoff does not wait for a new thread to start.
+fn with_restore_budget_here(
+    cell: &RestoreCell,
+    decide: fn(&RestoreCell) -> RestoreDecided,
+) -> RestoreDecided {
+    #[cfg(target_os = "macos")]
+    let _ax = cerebellum_macos::ax_budget::bound_messages_until(
+        Instant::now() + Duration::from_millis(RESTORE_AX_MS),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let _ = RESTORE_AX_MS;
+    decide(cell)
 }
 
 /// What a temporary front's obligation carries before it is registered.
@@ -823,6 +831,14 @@ impl CellHooks {
     /// Run `decide` on the cell under the restore's own budget, and keep
     /// what it decided.
     fn decide_using(&self, decide: fn(&RestoreCell) -> RestoreDecided) -> HookedRestore {
+        self.decide_with_budget(decide, with_restore_budget)
+    }
+
+    fn decide_with_budget(
+        &self,
+        decide: fn(&RestoreCell) -> RestoreDecided,
+        budgeted: fn(&RestoreCell, fn(&RestoreCell) -> RestoreDecided) -> RestoreDecided,
+    ) -> HookedRestore {
         let Some(cell) = self.cell() else {
             return HookedRestore {
                 restore: RestoreStatus::NotNeeded,
@@ -831,7 +847,7 @@ impl CellHooks {
                 restore_ms: None,
             };
         };
-        let decided = with_restore_budget(&cell, decide);
+        let decided = budgeted(&cell, decide);
         self.state().decided = Some(decided);
         HookedRestore {
             restore: decided.restore,
@@ -957,9 +973,26 @@ impl FrontedDispatchHooks for CellHooks {
         let hooks = self.clone();
         app_use.then(|| {
             Box::new(move || {
-                hooks.decide_using(RestoreCell::decide_at_cutoff);
+                // On the timer's own thread, already running: no thread is
+                // started between the cutoff firing and the restore request.
+                hooks.decide_with_budget(RestoreCell::decide_at_cutoff, with_restore_budget_here);
             }) as Box<dyn FnOnce() + Send>
         })
+    }
+
+    /// App-use fronts' cutoffs fire early by the restore's measured
+    /// preparation time ([`crate::terminal_arbiter::restore_preparation`]).
+    fn cutoff_lead_ms(&self) -> u64 {
+        let app_use = self
+            .state()
+            .parts
+            .as_ref()
+            .is_some_and(|parts| parts.restore_fallback);
+        if app_use {
+            crate::terminal_arbiter::restore_preparation::reserve_ms()
+        } else {
+            0
+        }
     }
 
     fn cutoff_armed(&mut self, gate: Arc<cerebellum_computer::dispatch::CutoffGate>) {

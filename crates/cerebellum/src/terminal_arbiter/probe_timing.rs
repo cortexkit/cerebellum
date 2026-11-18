@@ -794,6 +794,7 @@ mod tests {
             &mut RestoreDecisionHost {
                 host: &mut host,
                 _target: 42,
+                requested_at: None,
                 probe_timing: &probe,
             },
             7,

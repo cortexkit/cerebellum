@@ -248,6 +248,7 @@ pub(super) fn start(
         let mut adapter = RestoreDecisionHost {
             host: host.as_mut(),
             _target: target,
+            requested_at: None,
             #[cfg(all(feature = "desk-probe", target_os = "macos"))]
             probe_timing: &probe_timing,
         };

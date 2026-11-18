@@ -498,6 +498,7 @@ impl RestoreCell {
 
     fn decide_with(&self, at_cutoff: bool) -> RestoreDecided {
         use crate::computer::dispatch::{CleanupTake, FrontAttemptState};
+        let started = std::time::Instant::now();
         let mut inner = self.inner();
         let front_instant_ms = match inner.attempt.take() {
             CleanupTake::AlreadyTaken => return self.await_decision(inner),
@@ -551,6 +552,7 @@ impl RestoreCell {
                 let mut adapter = RestoreDecisionHost {
                     host: host.as_mut(),
                     _target: self.target_pid,
+                    requested_at: None,
                     #[cfg(all(feature = "desk-probe", target_os = "macos"))]
                     probe_timing: &self.probe_timing,
                 };
@@ -572,6 +574,14 @@ impl RestoreCell {
                         confirmed,
                     )
                 };
+                // How long the cutoff took to reach its restore request: the
+                // cutoff fires that much early next time.
+                if let (true, Some(requested_at)) = (at_cutoff, adapter.requested_at) {
+                    restore_preparation::record(
+                        u64::try_from(requested_at.saturating_duration_since(started).as_millis())
+                            .unwrap_or(u64::MAX),
+                    );
+                }
                 // An activation the action never confirmed is always left to
                 // the late watch, even one restored here: the same activation
                 // can land again after this decision.
@@ -683,6 +693,7 @@ impl RestoreCell {
             let mut adapter = RestoreDecisionHost {
                 host: host.as_mut(),
                 _target: self.target_pid,
+                requested_at: None,
                 #[cfg(all(feature = "desk-probe", target_os = "macos"))]
                 probe_timing: &self.probe_timing,
             };
@@ -894,6 +905,8 @@ pub(crate) fn stalled_picture_reads() -> (usize, u64) {
 struct RestoreDecisionHost<'a> {
     host: &'a mut dyn RestoreHost,
     _target: u32,
+    /// When the decision first asked for an application to come forward.
+    requested_at: Option<std::time::Instant>,
     #[cfg(all(feature = "desk-probe", target_os = "macos"))]
     probe_timing: &'a probe_timing::ProbeTiming,
 }
@@ -918,6 +931,8 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
         self.host.frontmost_pid()
     }
     fn request_front(&mut self, pid: u32) -> bool {
+        self.requested_at
+            .get_or_insert_with(std::time::Instant::now);
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
         {
             probe_timing::request_restore(
@@ -1012,6 +1027,7 @@ type TerminalHook = Box<dyn FnOnce() + Send>;
 mod late_fronting;
 #[cfg(all(feature = "desk-probe", target_os = "macos"))]
 pub(crate) mod probe_timing;
+pub(crate) mod restore_preparation;
 #[cfg(test)]
 pub(crate) use late_fronting::hold_watch_for_test;
 #[cfg(all(feature = "desk-probe", target_os = "macos"))]
