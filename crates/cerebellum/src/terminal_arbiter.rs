@@ -243,6 +243,7 @@ pub struct RestoreDecided {
     pub restore: crate::computer::dispatch::RestoreStatus,
     /// Hardware input arrived after the front.
     pub person_input_during_fronting: bool,
+    pub input_coverage_unavailable: bool,
     /// A front request was made. `false` when cleanup took the obligation
     /// before the worker fronted, so the worker never did.
     pub front_requested: bool,
@@ -383,6 +384,7 @@ impl RestoreCell {
                     RestoreDecided {
                         restore: crate::computer::dispatch::RestoreStatus::NotNeeded,
                         person_input_during_fronting: false,
+                        input_coverage_unavailable: false,
                         front_requested: false,
                     },
                 );
@@ -448,6 +450,7 @@ impl RestoreCell {
                 RestoreDecided {
                     restore: outcome.restore,
                     person_input_during_fronting: outcome.person_input_during_fronting,
+                    input_coverage_unavailable: outcome.input_coverage_unavailable,
                     front_requested: true,
                 }
             }
@@ -470,6 +473,7 @@ impl RestoreCell {
             CleanupTake::PreventedFront => RestoreDecided {
                 restore: crate::computer::dispatch::RestoreStatus::NotNeeded,
                 person_input_during_fronting: false,
+                input_coverage_unavailable: false,
                 front_requested: false,
             },
             CleanupTake::AwaitFrontAttempt | CleanupTake::Decide { .. } => self.failed(),
@@ -485,6 +489,7 @@ impl RestoreCell {
                 left_in_front: Some(self.target_pid),
             },
             person_input_during_fronting: false,
+            input_coverage_unavailable: false,
             front_requested: true,
         }
     }
@@ -563,6 +568,29 @@ impl RestoreCell {
                 "the application that was in front before could not be put back; switch back to the application you were using".to_owned()
             };
             object.insert("remedy".into(), json!(remedy));
+        } else if let RestoreStatus::SkippedPerson { now_front } = decided.restore {
+            let explanation = if decided.input_coverage_unavailable {
+                Some(format!(
+                    "Cerebellum couldn't watch for person input throughout the attempt to bring {} forward, so it left focus alone. Check hardwareInputObserver in module health before bringing an app forward again.",
+                    self.target_name
+                ))
+            } else if decided.person_input_during_fronting {
+                let focus = if now_front == Some(self.target_pid) {
+                    format!("{} was left in front", self.target_name)
+                } else {
+                    "focus was left alone".to_owned()
+                };
+                Some(format!("The person used the mouse or keyboard during fronting, so {focus}. Don't bring apps forward again until the person is idle."))
+            } else {
+                None
+            };
+            if let Some(mut explanation) = explanation {
+                if let Some(prior) = object.get("remedy").and_then(Value::as_str) {
+                    explanation.push(' ');
+                    explanation.push_str(prior);
+                }
+                object.insert("remedy".into(), json!(explanation));
+            }
         }
     }
 }
@@ -2755,6 +2783,39 @@ mod restore_slot_tests {
         assert_eq!(body["outcome"], "completed", "skipped_person is no failure");
         assert_eq!(body["fronting"]["restore"], "skipped_person");
         assert_eq!(body["fronting"]["person_input_during_fronting"], true);
+        assert!(body["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("Don't bring apps forward again"));
+    }
+
+    #[test]
+    fn a_restore_with_no_hardware_coverage_explains_why_it_left_focus_alone() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let shared = screen(true);
+        shared.lock().unwrap().snapshot = None;
+        let terminal = TerminalArbiter::new(request());
+        let cell = terminal
+            .register_restore(obligation(&shared, &releases))
+            .unwrap();
+        assert!(cell.begin_front_attempt(1));
+        cell.front_confirmed();
+        cell.front_attempt_returned();
+        let decided = cell.decide();
+        assert!(!decided.person_input_during_fronting);
+        assert!(shared.lock().unwrap().requests.is_empty());
+        let mut body = json!({"outcome":"completed"});
+        cell.disclose(&mut body, decided);
+        assert!(body["fronting"]
+            .get("person_input_during_fronting")
+            .is_none());
+        assert!(
+            body["remedy"]
+                .as_str()
+                .is_some_and(|remedy| remedy.contains("couldn't watch for person input")
+                    && remedy.contains("left focus alone")),
+            "{body}"
+        );
     }
 
     #[test]
@@ -2772,6 +2833,7 @@ mod restore_slot_tests {
                 left_in_front: Some(TARGET),
             },
             person_input_during_fronting: false,
+            input_coverage_unavailable: false,
             front_requested: true,
         };
         for outcome in [

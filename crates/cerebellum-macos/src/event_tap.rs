@@ -94,9 +94,56 @@ const OBSERVER_RUNNING: u8 = 1;
 const OBSERVER_NO_PERMISSION: u8 = 2;
 const OBSERVER_UNAVAILABLE: u8 = 3;
 
+/// Aggregate observer health. No event content or source identity is exposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardwareObserverHealth {
+    pub state: &'static str,
+    pub disabled_reenabled_count: u64,
+    pub install_failure_count: u64,
+    pub coverage_gap_count: u64,
+    pub last_problem: Option<&'static str>,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum ObserverProblem {
+    NoInputMonitoring = 1,
+    InstallThread,
+    TapCreate,
+    RunLoopSource,
+    RunLoop,
+    InitiallyDisabled,
+    DisabledByTimeout,
+    DisabledByUserInput,
+    DisabledWithoutNotice,
+    RunLoopStopped,
+    Disconnected,
+    EventTimeUnavailable,
+}
+
+impl ObserverProblem {
+    const NAMES: [&'static str; 12] = [
+        "input_monitoring_unavailable",
+        "observer_thread_start_failed",
+        "tap_create_failed",
+        "run_loop_source_failed",
+        "run_loop_unavailable",
+        "tap_initially_disabled",
+        "tap_disabled_by_timeout",
+        "tap_disabled_by_user_input",
+        "tap_disabled_without_notice",
+        "tap_run_loop_stopped",
+        "tap_disconnected",
+        "event_time_unavailable",
+    ];
+}
+
 struct ObserverHealth {
     state: std::sync::atomic::AtomicU8,
     disabled_reenabled_count: std::sync::atomic::AtomicU64,
+    install_failure_count: std::sync::atomic::AtomicU64,
+    coverage_gap_count: std::sync::atomic::AtomicU64,
+    last_problem: std::sync::atomic::AtomicU8,
 }
 
 impl ObserverHealth {
@@ -104,6 +151,9 @@ impl ObserverHealth {
         Self {
             state: std::sync::atomic::AtomicU8::new(OBSERVER_NOT_STARTED),
             disabled_reenabled_count: std::sync::atomic::AtomicU64::new(0),
+            install_failure_count: std::sync::atomic::AtomicU64::new(0),
+            coverage_gap_count: std::sync::atomic::AtomicU64::new(0),
+            last_problem: std::sync::atomic::AtomicU8::new(0),
         }
     }
 
@@ -112,18 +162,46 @@ impl ObserverHealth {
             .store(state, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn snapshot(&self) -> (&'static str, u64) {
-        let state = match self.state.load(std::sync::atomic::Ordering::Relaxed) {
+    fn problem(&self, reason: ObserverProblem) {
+        self.last_problem
+            .store(reason as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn install_failed(&self, reason: ObserverProblem) {
+        self.problem(reason);
+        self.install_failure_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.set_state(OBSERVER_UNAVAILABLE);
+    }
+
+    fn gap(&self, reason: ObserverProblem, new_gap: bool) {
+        self.problem(reason);
+        if new_gap {
+            self.coverage_gap_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.set_state(OBSERVER_UNAVAILABLE);
+    }
+
+    fn snapshot(&self) -> HardwareObserverHealth {
+        use std::sync::atomic::Ordering::Relaxed;
+        let state = match self.state.load(Relaxed) {
             OBSERVER_NOT_STARTED => "not_started",
             OBSERVER_RUNNING => "running",
             OBSERVER_NO_PERMISSION => "unavailable_no_permission",
             _ => "unavailable",
         };
-        (
+        HardwareObserverHealth {
             state,
-            self.disabled_reenabled_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+            disabled_reenabled_count: self.disabled_reenabled_count.load(Relaxed),
+            install_failure_count: self.install_failure_count.load(Relaxed),
+            coverage_gap_count: self.coverage_gap_count.load(Relaxed),
+            last_problem: self
+                .last_problem
+                .load(Relaxed)
+                .checked_sub(1)
+                .and_then(|index| ObserverProblem::NAMES.get(usize::from(index)).copied()),
+        }
     }
 }
 
@@ -132,14 +210,17 @@ fn note_hardware_disable(
     history: &std::sync::Mutex<HardwareHistory>,
     health: &ObserverHealth,
 ) -> bool {
-    if !matches!(event_type, u32::MAX | 0xFFFF_FFFE) {
-        return false;
-    }
-    history
+    let reason = match event_type {
+        0xFFFF_FFFE => ObserverProblem::DisabledByTimeout,
+        u32::MAX => ObserverProblem::DisabledByUserInput,
+        _ => return false,
+    };
+    let mut state = history
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .invalidate();
-    health.set_state(OBSERVER_UNAVAILABLE);
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let had_coverage = state.since.is_some();
+    state.invalidate();
+    health.gap(reason, had_coverage);
     true
 }
 
@@ -162,10 +243,13 @@ fn recover_hardware_observer(
         let mut state = history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if tap.is_enabled() && state.since.is_some() {
-            return;
+        if state.since.is_some() {
+            if tap.is_enabled() {
+                return;
+            }
+            state.invalidate();
+            health.gap(ObserverProblem::DisabledWithoutNotice, true);
         }
-        state.invalidate();
         health.set_state(OBSERVER_UNAVAILABLE);
     }
     tap.enable();
@@ -230,6 +314,8 @@ pub enum SessionEventTapError {
     RunLoopSourceUnavailable,
     /// The tap thread has no run loop to attach the source to.
     RunLoopUnavailable,
+    /// The process could not spawn the tap's run-loop thread.
+    RunLoopThreadUnavailable,
 }
 
 impl fmt::Display for SessionEventTapError {
@@ -246,6 +332,7 @@ impl fmt::Display for SessionEventTapError {
                 )
             }
             Self::RunLoopUnavailable => write!(f, "the tap thread has no run loop"),
+            Self::RunLoopThreadUnavailable => write!(f, "the tap run-loop thread could not start"),
         }
     }
 }
@@ -286,9 +373,9 @@ mod framework {
 
     use super::{
         note_hardware_disable, recover_hardware_observer, session_event_channel,
-        tap_create_failure, HardwareHistory, HardwareObservation, HardwareTapControl,
-        ObserverHealth, SessionEvent, SessionEventTapError, OBSERVER_NO_PERMISSION,
-        OBSERVER_RUNNING, OBSERVER_UNAVAILABLE,
+        tap_create_failure, HardwareHistory, HardwareObservation, HardwareObserverHealth,
+        HardwareTapControl, ObserverHealth, ObserverProblem, SessionEvent, SessionEventTapError,
+        OBSERVER_NO_PERMISSION, OBSERVER_RUNNING, OBSERVER_UNAVAILABLE,
     };
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
@@ -373,6 +460,7 @@ mod framework {
         pub fn hardware_input_snapshot() -> Option<(Instant, Option<Instant>)> {
             HARDWARE_STARTED.get_or_init(|| {
                 if input_monitoring_access() != crate::input::InputMonitoringAccess::Granted {
+                    HARDWARE_HEALTH.problem(ObserverProblem::NoInputMonitoring);
                     HARDWARE_HEALTH.set_state(OBSERVER_NO_PERMISSION);
                     return;
                 }
@@ -381,9 +469,27 @@ mod framework {
                 let spawned = thread::Builder::new()
                     .name("hardware-input-observer".into())
                     .spawn(move || {
-                        let Ok(tap) = Self::listen_impl(1, true) else {
-                            let _ = ready_tx.send(());
-                            return;
+                        let tap = match Self::listen_impl(1, true) {
+                            Ok(tap) => tap,
+                            Err(error) => {
+                                let reason = match error {
+                                    SessionEventTapError::NotCreated { .. } => {
+                                        ObserverProblem::TapCreate
+                                    }
+                                    SessionEventTapError::RunLoopSourceUnavailable => {
+                                        ObserverProblem::RunLoopSource
+                                    }
+                                    SessionEventTapError::RunLoopUnavailable => {
+                                        ObserverProblem::RunLoop
+                                    }
+                                    SessionEventTapError::RunLoopThreadUnavailable => {
+                                        ObserverProblem::InstallThread
+                                    }
+                                };
+                                HARDWARE_HEALTH.install_failed(reason);
+                                let _ = ready_tx.send(());
+                                return;
+                            }
                         };
                         {
                             let mut state = HARDWARE
@@ -392,10 +498,16 @@ mod framework {
                             state.since = tap.is_enabled().then(Instant::now);
                             if state.since.is_some() {
                                 HARDWARE_HEALTH.set_state(OBSERVER_RUNNING);
+                            } else {
+                                HARDWARE_HEALTH.gap(ObserverProblem::InitiallyDisabled, true);
                             }
                         }
                         let _ = ready_tx.send(());
                         loop {
+                            if tap.thread.as_ref().is_some_and(JoinHandle::is_finished) {
+                                lose_hardware_coverage(ObserverProblem::RunLoopStopped);
+                                break;
+                            }
                             recover_hardware_observer(
                                 &tap,
                                 &HARDWARE,
@@ -405,11 +517,7 @@ mod framework {
                             match tap.events().recv_timeout(Duration::from_millis(10)) {
                                 Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                    HARDWARE
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .invalidate();
-                                    HARDWARE_HEALTH.set_state(OBSERVER_UNAVAILABLE);
+                                    lose_hardware_coverage(ObserverProblem::Disconnected);
                                     break;
                                 }
                             }
@@ -417,6 +525,8 @@ mod framework {
                     });
                 if spawned.is_ok() {
                     let _ = ready_rx.recv();
+                } else {
+                    HARDWARE_HEALTH.install_failed(ObserverProblem::InstallThread);
                 }
             });
             let state = HARDWARE
@@ -427,7 +537,7 @@ mod framework {
 
         /// Read-only health facts; this neither starts the observer nor asks
         /// for permission, and uses atomics to keep the health lane insulated.
-        pub fn hardware_observer_health() -> (&'static str, u64) {
+        pub fn hardware_observer_health() -> HardwareObserverHealth {
             HARDWARE_HEALTH.snapshot()
         }
 
@@ -475,10 +585,17 @@ mod framework {
 
             let port_for_loop = SendMachPort(port.clone());
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            let thread = thread::Builder::new()
+            let Ok(thread) = thread::Builder::new()
                 .name("session-event-tap".into())
                 .spawn(move || run_tap_loop(port_for_loop, ready_tx))
-                .expect("the process can spawn a thread");
+            else {
+                port.invalidate();
+                // SAFETY: no run-loop thread started, so there is no callback.
+                unsafe {
+                    drop(Box::from_raw(user_info));
+                }
+                return Err(SessionEventTapError::RunLoopThreadUnavailable);
+            };
 
             match ready_rx.recv() {
                 Ok(Ok(SendRunLoop(run_loop))) => Ok(Self {
@@ -644,11 +761,7 @@ mod framework {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .record(source_unix_process_id, source_state, observation, scroll);
                 } else {
-                    HARDWARE
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .invalidate();
-                    HARDWARE_HEALTH.set_state(OBSERVER_UNAVAILABLE);
+                    lose_hardware_coverage(ObserverProblem::EventTimeUnavailable);
                 }
             }
             return event.as_ptr();
@@ -667,6 +780,15 @@ mod framework {
             observed_at_ns,
         });
         event.as_ptr()
+    }
+
+    fn lose_hardware_coverage(reason: ObserverProblem) {
+        let mut state = HARDWARE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let had_coverage = state.since.is_some();
+        state.invalidate();
+        HARDWARE_HEALTH.gap(reason, had_coverage);
     }
 }
 
@@ -866,7 +988,10 @@ mod hardware_tests {
 
     #[test]
     fn disabled_hardware_observer_reenables_and_restarts_coverage() {
-        for disabled_kind in [u32::MAX, u32::MAX - 1] {
+        for (disabled_kind, reason) in [
+            (u32::MAX, "tap_disabled_by_user_input"),
+            (u32::MAX - 1, "tap_disabled_by_timeout"),
+        ] {
             let before = Instant::now();
             let after = before + Duration::from_secs(1);
             let history = Mutex::new(HardwareHistory {
@@ -882,13 +1007,20 @@ mod hardware_tests {
             };
             assert!(note_hardware_disable(disabled_kind, &history, &health));
             assert!(history.lock().unwrap().since.is_none());
-            assert_eq!(health.snapshot(), ("unavailable", 0));
+            assert_eq!(health.snapshot().state, "unavailable");
+            assert_eq!(health.snapshot().disabled_reenabled_count, 0);
+            assert_eq!(health.snapshot().coverage_gap_count, 1);
+            assert_eq!(health.snapshot().last_problem, Some(reason));
+            assert!(note_hardware_disable(disabled_kind, &history, &health));
+            assert_eq!(health.snapshot().coverage_gap_count, 1);
             recover_hardware_observer(&tap, &history, &health, || after);
             assert_eq!(tap.enable_calls.get(), 1);
             assert!(tap.enabled.get());
             assert_eq!(history.lock().unwrap().since, Some(after));
             assert_eq!(history.lock().unwrap().latest, [None; 5]);
-            assert_eq!(health.snapshot(), ("running", 1));
+            assert_eq!(health.snapshot().state, "running");
+            assert_eq!(health.snapshot().disabled_reenabled_count, 1);
+            assert_eq!(health.snapshot().last_problem, Some(reason));
             // Normal polling must not keep moving the coverage boundary.
             recover_hardware_observer(&tap, &history, &health, Instant::now);
             assert_eq!(tap.enable_calls.get(), 1);
@@ -913,16 +1045,29 @@ mod hardware_tests {
         recover_hardware_observer(&tap, &history, &health, Instant::now);
         assert_eq!(tap.enable_calls.get(), 1);
         assert!(history.lock().unwrap().since.is_none());
-        assert_eq!(health.snapshot(), ("unavailable", 0));
+        assert_eq!(health.snapshot().state, "unavailable");
+        assert_eq!(health.snapshot().disabled_reenabled_count, 0);
     }
 
     #[test]
     fn hardware_observer_health_distinguishes_not_started_permission_and_running() {
         let health = ObserverHealth::new();
-        assert_eq!(health.snapshot(), ("not_started", 0));
+        assert_eq!(health.snapshot().state, "not_started");
         health.set_state(OBSERVER_NO_PERMISSION);
-        assert_eq!(health.snapshot(), ("unavailable_no_permission", 0));
+        assert_eq!(health.snapshot().state, "unavailable_no_permission");
         health.set_state(OBSERVER_RUNNING);
-        assert_eq!(health.snapshot(), ("running", 0));
+        assert_eq!(health.snapshot().state, "running");
+        assert_eq!(health.snapshot().disabled_reenabled_count, 0);
+    }
+
+    #[test]
+    fn a_tap_install_failure_has_a_reason_but_is_not_a_coverage_gap() {
+        let health = ObserverHealth::new();
+        health.install_failed(ObserverProblem::TapCreate);
+        let report = health.snapshot();
+        assert_eq!(report.state, "unavailable");
+        assert_eq!(report.install_failure_count, 1);
+        assert_eq!(report.coverage_gap_count, 0);
+        assert_eq!(report.last_problem, Some("tap_create_failed"));
     }
 }

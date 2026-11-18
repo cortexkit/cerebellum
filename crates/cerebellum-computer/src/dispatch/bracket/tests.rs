@@ -1501,7 +1501,10 @@ fn late_activation_watch_leaves_person_input_and_unknown_coverage_alone() {
                 false
             });
         assert!(matches!(restore, RestoreStatus::SkippedPerson { .. }));
-        assert!(input);
+        assert_eq!(
+            input, !unknown,
+            "a coverage gap is not an observed input event"
+        );
         assert_eq!(desk.front_requests, [TARGET]);
         assert_eq!(desk.frontmost, Some(TARGET));
         assert!(desk.posted.is_empty());

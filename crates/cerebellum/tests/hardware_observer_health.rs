@@ -40,6 +40,7 @@ async fn health_reports_hardware_observer_without_starting_it() {
     };
     assert_eq!(
         metrics["hardwareInputObserver"],
-        json!({"state": state, "disabled_reenabled_count": 0})
+        json!({"state": state, "disabled_reenabled_count": 0,
+            "install_failure_count": 0, "coverage_gap_count": 0, "last_problem": null})
     );
 }

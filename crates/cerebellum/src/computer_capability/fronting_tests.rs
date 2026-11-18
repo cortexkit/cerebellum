@@ -3569,7 +3569,7 @@ async fn a_pending_chord_landing_after_its_reply_only_restores_and_never_posts()
             assert_eq!(rig.screen.log(), ["front:4242", "restore:100"]);
         } else {
             assert_eq!(record["restore"], "skipped_person");
-            assert_eq!(record["person_input_during_fronting"], true);
+            assert_eq!(record["person_input_during_fronting"], evidence == "input");
             assert_eq!(rig.screen.log(), ["front:4242"]);
         }
         assert!(!rig.screen.log().iter().any(|event| event == "post"));
