@@ -3,6 +3,7 @@ fn bus_names_used_by_cerebellum_are_pinned() {
     use cortexkit_bus_naming::{AccountNames, EVENT_CONSUMERS, MODULE_BUCKETS};
 
     let names = AccountNames::derive("test").unwrap();
+    assert_eq!(names.streams().event, "CK_TEST_EVENT");
     assert_eq!(
         names
             .live_subject("thalamus-harness", "turn_started", 1)
@@ -28,16 +29,35 @@ fn bus_names_used_by_cerebellum_are_pinned() {
             "event.thalamus-harness.turn_ended.v1",
         ]
     );
-    assert_eq!(
-        names
-            .event_subject_with_reader("cerebellum", "late_result_ready", 1, "prefrontal-core")
+    for (reader, subject) in [
+        (
+            "broca",
+            "ck.test.event.cerebellum.late_result_ready.v1.broca",
+        ),
+        (
+            "prefrontal-core",
+            "ck.test.event.cerebellum.late_result_ready.v1.prefrontal-core",
+        ),
+        (
+            "prefrontal",
+            "ck.test.event.cerebellum.late_result_ready.v1.prefrontal",
+        ),
+        (
+            "thalamus-harness",
+            "ck.test.event.cerebellum.late_result_ready.v1.thalamus-harness",
+        ),
+    ] {
+        assert_eq!(
+            super::Kind::LateResultReady {
+                custodian_module: Some(reader.to_owned()),
+            }
+            .subject("test")
             .unwrap(),
-        "ck.test.event.cerebellum.late_result_ready.v1.prefrontal-core"
-    );
+            subject
+        );
+    }
     assert_eq!(
-        names
-            .event_subject("cerebellum", "display_record_ready", 1)
-            .unwrap(),
+        super::Kind::DisplayRecordReady.subject("test").unwrap(),
         "ck.test.event.cerebellum.display_record_ready.v1"
     );
     let buckets: Vec<_> = MODULE_BUCKETS
