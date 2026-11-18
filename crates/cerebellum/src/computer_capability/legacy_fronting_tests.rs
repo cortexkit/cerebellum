@@ -1,6 +1,9 @@
 //! A build configured to front apps temporarily can restore focus even if it
 //! cannot leave them in front. These chords require mouse-and-keyboard
-//! permission; a picture requires only permission for its app.
+//! permission. Such a build carries no app-use fronting review, so it never
+//! fronts an app for a picture: pictures are fronted under the app's own
+//! grant only where that review is bound (see
+//! `without_the_app_use_review_a_bring_to_front_read_requests_no_front`).
 
 #![cfg(target_os = "macos")]
 
@@ -9,12 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy, Debug)]
 enum Caller {
-    Image,
     Chord,
     SystemChord,
 }
 
-const CALLERS: [Caller; 3] = [Caller::Image, Caller::Chord, Caller::SystemChord];
+const CALLERS: [Caller; 2] = [Caller::Chord, Caller::SystemChord];
 
 fn namespace(terminal: &Arc<crate::TerminalArbiter>) -> usize {
     Arc::as_ptr(terminal) as usize
@@ -29,7 +31,6 @@ fn under_terminal() -> Arc<crate::TerminalArbiter> {
 impl Caller {
     fn request(self) -> (&'static str, Value) {
         match self {
-            Self::Image => ("computer.read_state", bring_to_front_read()),
             Self::Chord => ("computer.keys", command_chord()),
             Self::SystemChord => (
                 "computer.keys",
@@ -40,7 +41,6 @@ impl Caller {
 
     fn in_call_end(self) -> u64 {
         match self {
-            Self::Image => 500,
             Self::Chord | Self::SystemChord => 400,
         }
     }
@@ -60,17 +60,8 @@ impl Caller {
     }
 
     fn assert_failed(self, reply: &Value) {
-        if matches!(self, Self::Image) {
-            assert_eq!(reply["outcome"], "completed", "{reply}");
-            assert!(reply.get("image").is_none(), "{reply}");
-            assert_eq!(
-                reply["image_unavailable"]["reason"], "restore_failed",
-                "{reply}"
-            );
-        } else {
-            assert_eq!(reply["outcome"], "restore_failed", "{reply}");
-            assert_eq!(reply["effect_status"], "not_dispatched", "{reply}");
-        }
+        assert_eq!(reply["outcome"], "restore_failed", "{self:?}: {reply}");
+        assert_eq!(reply["effect_status"], "not_dispatched", "{reply}");
         if reply.get("fronting").is_some() {
             assert_eq!(reply["fronting"]["fronted"], false, "{reply}");
             assert_eq!(reply["fronting"]["restore"], "failed", "{reply}");
@@ -161,11 +152,6 @@ async fn landing_after_reply(caller: Caller) {
 }
 
 #[tokio::test]
-async fn legacy_takeover_image_landing_after_reply_restores_without_capturing() {
-    landing_after_reply(Caller::Image).await;
-}
-
-#[tokio::test]
 async fn legacy_takeover_chord_landing_after_reply_restores_without_posting() {
     landing_after_reply(Caller::Chord).await;
     landing_after_reply(Caller::SystemChord).await;
@@ -197,12 +183,7 @@ async fn legacy_fronting_waits_for_focus_ownership_before_snapshot_or_request() 
             "{caller:?}: {reply}"
         );
         assert_eq!(rig.screen.frontmost(), Some(200));
-        let action = if matches!(caller, Caller::Image) {
-            "read"
-        } else {
-            "post"
-        };
-        assert_eq!(rig.screen.log(), ["front:4242", action, "restore:200"]);
+        assert_eq!(rig.screen.log(), ["front:4242", "post", "restore:200"]);
         assert!(!rig.lock.held());
     }
 }
@@ -214,14 +195,9 @@ async fn legacy_takeover_keeps_its_admission_without_a_prior_read() {
         grant_takeover(&rig).await;
         assert!(!rig.seen_marks_recorded());
         let reply = caller.call(&rig, &under_terminal()).await;
-        let action = if matches!(caller, Caller::Image) {
-            "read"
-        } else {
-            "post"
-        };
         assert_eq!(
             rig.screen.log(),
-            ["front:4242", action, "restore:100"],
+            ["front:4242", "post", "restore:100"],
             "{caller:?}: {reply}"
         );
         assert_eq!(reply["fronting"]["restore"], "restored");
@@ -340,16 +316,6 @@ async fn legacy_admission_is_rechecked_after_waiting_for_the_lock() {
             }
             drop(held);
             let reply = task.await.unwrap();
-            if matches!(caller, Caller::Image) && lost == "takeover" {
-                assert_eq!(
-                    rig.screen.log(),
-                    ["front:4242", "read", "restore:100"],
-                    "{reply}"
-                );
-                assert_eq!(reply["fronting"]["restore"], "restored");
-                assert!(!rig.lock.held());
-                continue;
-            }
             assert!(rig.screen.log().is_empty(), "{caller:?}/{lost}: {reply}");
             assert!(reply.get("image").is_none());
             assert!(!rig.lock.held());
@@ -380,10 +346,8 @@ async fn legacy_cleanup_cannot_race_a_new_front_on_another_target() {
     let other = rig
         .call_under(
             &under_terminal(),
-            "computer.read_state",
-            json!({
-                "target": other_app().bundle_identity, "include_image": true, "bring_to_front": true
-            }),
+            "computer.keys",
+            json!({"target": other_app().bundle_identity, "keys": ["command", "space"]}),
         )
         .await;
     assert_eq!(
@@ -689,11 +653,7 @@ async fn legacy_late_cleanup_round_trips_through_the_existing_journal_reader() {
                 serde_json::from_slice(&obligation.descriptor_bytes).unwrap();
             assert_eq!(
                 descriptor.capability,
-                if matches!(caller, Caller::Image) {
-                    cerebellum_computer::audit::ComputerCapability::ReadState
-                } else {
-                    cerebellum_computer::audit::ComputerCapability::Keys
-                }
+                cerebellum_computer::audit::ComputerCapability::Keys
             );
             let sequence = row["sequence"].as_u64().unwrap().to_string();
             assert_eq!(durable["entries"][&sequence]["kind"], "finalized_committed");
