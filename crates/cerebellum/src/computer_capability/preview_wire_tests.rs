@@ -7,7 +7,7 @@
 //! when an action reached the application is exact.
 
 use super::cursor::{Coordinator, SessionScope, TurnOutcome, ACTING_AGENT, ACTING_SESSION};
-use super::preview::{CaptureJob, PreviewCapturer, PreviewJpeg, PreviewPlane, PreviewRefused};
+use super::preview::{CaptureJob, NoFrameReason, PreviewCapturer, PreviewJpeg, PreviewPlane};
 use super::*;
 use cerebellum_computer::app_state::source::{ElementFacts, RawElement};
 use cerebellum_computer::capture::InMemoryCaptureBackend;
@@ -124,7 +124,7 @@ fn two_window_desk() -> support::Desk {
 struct CountingCapture(AtomicUsize);
 
 impl PreviewCapturer for CountingCapture {
-    fn capture(&self, _job: &CaptureJob) -> Result<PreviewJpeg, PreviewRefused> {
+    fn capture(&self, _job: &CaptureJob) -> Result<PreviewJpeg, NoFrameReason> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(PreviewJpeg {
             size: [4, 3],

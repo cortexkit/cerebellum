@@ -40,18 +40,22 @@
 //! model-visible, never retained and never journaled.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use cerebellum_computer::app_state::source::{AppStateSource, ElementHandle};
 #[cfg(any(test, target_os = "macos", target_os = "windows"))]
-use cerebellum_computer::capture::{CaptureBackend, ScopedCaptureController};
+use cerebellum_computer::capture::{
+    CaptureBackend, PreviewWindowCaptureError, ScopedCaptureController,
+};
 use cerebellum_computer::cursor::{
     CursorFrame, CursorPreview, PreviewFallback, IDLE_FADE_AFTER_MS, IDLE_FADE_MS, PREVIEW_SLOTS,
 };
 use cerebellum_computer::platform::ProcessGrant;
 use cerebellum_computer::preview_layout::{thumbnail_size, PREVIEW_WIDTH};
+
+mod diagnostics;
+pub(crate) use diagnostics::{NoFrameReason, PreviewGauges, PREVIEW_GAUGES};
 
 /// How long the worker waits for a native capture request to answer. A
 /// request still unanswered after this stays outstanding: no other request
@@ -63,49 +67,6 @@ pub(crate) const IN_FLIGHT_REFRESH_MS: u64 = 500;
 /// How long after its agent's last action a preview is gone: the helper
 /// fades the badge, and the preview with it, after this long.
 const PREVIEW_IDLE: Duration = Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS);
-
-/// How much work the preview has done since the process started, for the
-/// module's health reply: capture requests made and frame lines written to
-/// the helper. Counts only, naming no agent, window or application, so a
-/// desk probe can tell an idle preview costs nothing. Plain atomics: reading
-/// them takes no lock the preview holds.
-#[derive(Debug, Default)]
-pub(crate) struct PreviewGauges {
-    capture_requests: AtomicU64,
-    frames_written: AtomicU64,
-}
-
-impl PreviewGauges {
-    pub(crate) const fn new() -> Self {
-        Self {
-            capture_requests: AtomicU64::new(0),
-            frames_written: AtomicU64::new(0),
-        }
-    }
-
-    /// Capture requests handed to the capture backend.
-    pub(crate) fn capture_requests(&self) -> u64 {
-        self.capture_requests.load(Ordering::Relaxed)
-    }
-
-    /// Frame lines written to the helper's pipe.
-    pub(crate) fn frames_written(&self) -> u64 {
-        self.frames_written.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn frame_written(&self) {
-        self.frames_written.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn capture_requested(&self) {
-        self.capture_requests.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// The process's preview gauges, reported as `previewCaptureRequests` and
-/// `previewFramesWritten`. Tests that count exactly give their worker and
-/// cursor gauges of their own, since other tests capture in parallel.
-pub(crate) static PREVIEW_GAUGES: PreviewGauges = PreviewGauges::new();
 
 /// Which preview slot each agent holds, top-down from 0.
 ///
@@ -345,15 +306,10 @@ pub(crate) struct PreviewJpeg {
     pub(crate) jpeg: Vec<u8>,
 }
 
-/// A capture produced no frame: permission not live, an owner check that
-/// failed, a window that is gone, or any other refusal. There is nothing
-/// to say about it beyond the icon the preview then shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PreviewRefused;
-
 /// What the worker does next.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Step {
+    capture_wait_elapsed: bool,
     /// Preview lines to send now: previews switching to their icon.
     pub(crate) lines: Vec<CursorPreview>,
     /// A capture to request now.
@@ -368,6 +324,7 @@ pub(crate) struct Step {
 pub(crate) struct Answer {
     pub(crate) frame: Option<CursorFrame>,
     pub(crate) lines: Vec<CursorPreview>,
+    no_frame: Option<NoFrameReason>,
 }
 
 struct Shown {
@@ -429,6 +386,7 @@ struct Outstanding {
     /// Its wait has ended without an answer. It still counts as outstanding
     /// until it answers.
     timed_out: bool,
+    started: bool,
 }
 
 /// The previews and their capture timing, with time passed in: every rule
@@ -634,6 +592,7 @@ impl Schedule {
                     return step;
                 }
                 outstanding.timed_out = true;
+                step.capture_wait_elapsed = outstanding.started;
                 for shown in self.shown.values_mut() {
                     if shown.icon.is_none() {
                         shown.icon = Some(IconCause::Stalled);
@@ -669,6 +628,7 @@ impl Schedule {
                     job: self.jobs,
                     submitted: now,
                     timed_out: false,
+                    started: false,
                 });
                 step.submit = Some(CaptureJob {
                     id: self.jobs,
@@ -697,7 +657,7 @@ impl Schedule {
     pub(crate) fn answered(
         &mut self,
         job: &CaptureJob,
-        result: Result<PreviewJpeg, PreviewRefused>,
+        result: Result<PreviewJpeg, NoFrameReason>,
     ) -> Answer {
         let mut answer = Answer::default();
         if self
@@ -724,30 +684,34 @@ impl Schedule {
             .get_mut(&job.agent)
             .filter(|shown| shown.generation() == job.generation && shown.window() == job.window)
         else {
+            answer.no_frame = Some(NoFrameReason::Stale);
             return answer;
         };
         if shown.icon == Some(IconCause::Minimized) {
             // Asked for before the window was minimized: nothing to show.
+            answer.no_frame = Some(NoFrameReason::Minimized);
             return answer;
         }
-        let frame = result
-            .ok()
-            .map(|jpeg| {
-                CursorFrame::new(
-                    job.agent.clone(),
-                    job.generation,
-                    job.window,
-                    jpeg.size,
-                    &jpeg.jpeg,
-                )
-            })
-            .filter(CursorFrame::valid);
+        let frame = result.and_then(|jpeg| {
+            let frame = CursorFrame::new(
+                job.agent.clone(),
+                job.generation,
+                job.window,
+                jpeg.size,
+                &jpeg.jpeg,
+            );
+            frame
+                .valid()
+                .then_some(frame)
+                .ok_or(NoFrameReason::InvalidFrame)
+        });
         match frame {
-            Some(frame) => {
+            Ok(frame) => {
                 shown.icon = None;
                 answer.frame = Some(frame);
             }
-            None => {
+            Err(reason) => {
+                answer.no_frame = Some(reason);
                 let had_icon = shown.icon.is_some();
                 shown.icon = Some(IconCause::Refused);
                 if !had_icon {
@@ -764,7 +728,7 @@ pub(crate) trait PreviewOutput: Send + Sync {
     /// Send a preview line. It may start the helper.
     fn preview(&self, line: CursorPreview) -> bool;
     /// Queue a frame. It never starts the helper.
-    fn frame(&self, frame: CursorFrame) -> bool;
+    fn frame(&self, frame: CursorFrame) -> Result<(), NoFrameReason>;
 }
 
 impl PreviewOutput for super::cursor::Coordinator {
@@ -772,14 +736,14 @@ impl PreviewOutput for super::cursor::Coordinator {
         self.send_preview(line)
     }
 
-    fn frame(&self, frame: CursorFrame) -> bool {
-        self.send_frame(frame)
+    fn frame(&self, frame: CursorFrame) -> Result<(), NoFrameReason> {
+        self.queue_frame(frame)
     }
 }
 
 /// Takes one preview frame, blocking until the capture answers.
 pub(crate) trait PreviewCapturer: Send + Sync {
-    fn capture(&self, job: &CaptureJob) -> Result<PreviewJpeg, PreviewRefused>;
+    fn capture(&self, job: &CaptureJob) -> Result<PreviewJpeg, NoFrameReason>;
 }
 
 /// Captures through a fresh capture backend and controller for each
@@ -808,14 +772,23 @@ where
     F: Fn() -> B + Send + Sync,
     B: CaptureBackend,
 {
-    fn capture(&self, job: &CaptureJob) -> Result<PreviewJpeg, PreviewRefused> {
+    fn capture(&self, job: &CaptureJob) -> Result<PreviewJpeg, NoFrameReason> {
         let mut controller =
             ScopedCaptureController::with_v1_bounds((self.backend)(), job.target.clone())
-                .map_err(|_| PreviewRefused)?;
+                .map_err(|_| NoFrameReason::Controller)?;
         let now_ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
         let frame = controller
             .capture_window_for_preview(now_ms, &job.window.to_string(), job.max_px)
-            .map_err(|_| PreviewRefused)?;
+            .map_err(|error| match error {
+                PreviewWindowCaptureError::Permission(_) => NoFrameReason::Permission,
+                PreviewWindowCaptureError::Enumeration => NoFrameReason::Enumeration,
+                PreviewWindowCaptureError::NoWindow => NoFrameReason::WindowNotVerified,
+                PreviewWindowCaptureError::Capture => NoFrameReason::Capture,
+                PreviewWindowCaptureError::Owner => NoFrameReason::Owner,
+                PreviewWindowCaptureError::InvalidSize => NoFrameReason::CaptureSize,
+                PreviewWindowCaptureError::Encode => NoFrameReason::Encode,
+                PreviewWindowCaptureError::FrameSize => NoFrameReason::EncodedSize,
+            })?;
         Ok(PreviewJpeg {
             size: [frame.width_px, frame.height_px],
             jpeg: frame.jpeg,
@@ -828,8 +801,8 @@ where
 pub(crate) struct NoPreviewCapture;
 
 impl PreviewCapturer for NoPreviewCapture {
-    fn capture(&self, _job: &CaptureJob) -> Result<PreviewJpeg, PreviewRefused> {
-        Err(PreviewRefused)
+    fn capture(&self, _job: &CaptureJob) -> Result<PreviewJpeg, NoFrameReason> {
+        Err(NoFrameReason::Unsupported)
     }
 }
 
@@ -1060,8 +1033,8 @@ impl PreviewWorker {
     pub(crate) fn show(&self, request: PreviewRequest) -> ShowOutcome {
         let mut locked = self.shared.lock();
         let (outcome, line) = locked.schedule.show(request, Instant::now());
-        if let Some(line) = line {
-            self.shared.output.preview(line);
+        if line.is_some_and(|line| !self.shared.output.preview(line)) {
+            self.shared.gauges.show_enqueue_dropped();
         }
         drop(locked);
         self.shared.changed.notify_all();
@@ -1151,7 +1124,7 @@ fn capture_requests(
             // The preview this job was for is hidden, shown anew, faded out, or
             // the worker has stopped: retire the job with no native read, and
             // discard its answer unsent.
-            let _ = locked.schedule.answered(&job, Err(PreviewRefused));
+            let _ = locked.schedule.answered(&job, Err(NoFrameReason::Stale));
             drop(locked);
             shared.changed.notify_all();
             continue;
@@ -1159,8 +1132,14 @@ fn capture_requests(
         // This check shares hide's lock, but the native capture must not: a
         // hide never waits for a capture. A hide after this check can still
         // race the start of capture; its answer is dropped by generation.
-        drop(locked);
         shared.gauges.capture_requested();
+        if let Some(outstanding) = &mut locked.schedule.outstanding {
+            outstanding.started = true;
+            if outstanding.timed_out {
+                shared.gauges.capture_wait_elapsed();
+            }
+        }
+        drop(locked);
         let result = capturer.capture(&job);
         let mut locked = shared.lock();
         let answer = locked.schedule.answered(&job, result);
@@ -1170,8 +1149,12 @@ fn capture_requests(
         for line in answer.lines {
             shared.output.preview(line);
         }
-        if let Some(frame) = answer.frame {
-            shared.output.frame(frame);
+        if let Some(reason) = answer.no_frame.or_else(|| {
+            answer
+                .frame
+                .and_then(|frame| shared.output.frame(frame).err())
+        }) {
+            shared.gauges.no_frame(reason);
         }
         drop(locked);
         shared.changed.notify_all();
@@ -1187,6 +1170,9 @@ fn run(shared: &Shared, jobs: &std::sync::mpsc::Sender<CaptureJob>) {
             return;
         }
         let step = locked.schedule.next(Instant::now());
+        if step.capture_wait_elapsed {
+            shared.gauges.capture_wait_elapsed();
+        }
         for line in step.lines {
             shared.output.preview(line);
         }
@@ -1509,7 +1495,9 @@ mod tests {
 
         assert!(schedule.hide("a"));
         let late = schedule.answered(&first, Ok(jpeg()));
-        assert_eq!(late, Answer::default(), "a hidden preview got its frame");
+        assert!(late.frame.is_none(), "a hidden preview got its frame");
+        assert!(late.lines.is_empty());
+        assert_eq!(late.no_frame, Some(NoFrameReason::Stale));
         let mut captured = Vec::new();
         let mut at = now + Duration::from_millis(600_001);
         while let Some(job) = schedule.next(at).submit {
@@ -1553,7 +1541,9 @@ mod tests {
             panic!("not shown");
         };
         assert!(generation > first_generation);
-        assert_eq!(schedule.answered(&old, Ok(jpeg())), Answer::default());
+        let answer = schedule.answered(&old, Ok(jpeg()));
+        assert!(answer.frame.is_none() && answer.lines.is_empty());
+        assert_eq!(answer.no_frame, Some(NoFrameReason::Stale));
 
         let current = schedule.next(now).submit.unwrap();
         assert_eq!((current.window, current.generation), (11, generation));
@@ -1580,10 +1570,9 @@ mod tests {
             panic!("not shown");
         };
         assert!(again > generation);
-        assert_eq!(
-            schedule.answered(&before_hide, Ok(jpeg())),
-            Answer::default()
-        );
+        let answer = schedule.answered(&before_hide, Ok(jpeg()));
+        assert!(answer.frame.is_none() && answer.lines.is_empty());
+        assert_eq!(answer.no_frame, Some(NoFrameReason::Stale));
     }
 
     #[test]
@@ -1593,16 +1582,15 @@ mod tests {
         let (_, line) = schedule.show(request("a", 10), Instant::now());
         assert!(!icon(&line.unwrap()));
         let job = schedule.next(now).submit.unwrap();
-        let answer = schedule.answered(&job, Err(PreviewRefused));
+        let answer = schedule.answered(&job, Err(NoFrameReason::Capture));
         assert_eq!(answer.frame, None);
         assert_eq!(answer.lines.len(), 1);
         assert!(icon(&answer.lines[0]));
         schedule.action_settled("a", Instant::now());
         let job = schedule.next(now).submit.unwrap();
-        assert_eq!(
-            schedule.answered(&job, Err(PreviewRefused)),
-            Answer::default()
-        );
+        let answer = schedule.answered(&job, Err(NoFrameReason::Capture));
+        assert!(answer.frame.is_none() && answer.lines.is_empty());
+        assert_eq!(answer.no_frame, Some(NoFrameReason::Capture));
         // A frame that would not fit its line is a failed capture too.
         schedule.action_settled("a", Instant::now());
         let job = schedule.next(now).submit.unwrap();
@@ -1830,12 +1818,18 @@ mod tests {
             backend.set_permission_liveness(PermissionLiveness::Unavailable);
             backend
         });
-        for capture in [&reused as &dyn PreviewCapturer, &not_live] {
+        for (capture, reason) in [
+            (
+                &reused as &dyn PreviewCapturer,
+                NoFrameReason::WindowNotVerified,
+            ),
+            (&not_live, NoFrameReason::Permission),
+        ] {
             let mut schedule = admitted();
             schedule.show(request("a", 11), Instant::now());
             let job = schedule.next(Instant::now()).submit.unwrap();
             let result = capture.capture(&job);
-            assert_eq!(result, Err(PreviewRefused));
+            assert_eq!(result, Err(reason));
             let answer = schedule.answered(&job, result);
             assert_eq!(answer.frame, None);
             assert_eq!(answer.lines.len(), 1);
@@ -1878,9 +1872,9 @@ mod tests {
             true
         }
 
-        fn frame(&self, frame: CursorFrame) -> bool {
+        fn frame(&self, frame: CursorFrame) -> Result<(), NoFrameReason> {
             self.sent().push(Sent::Frame(frame));
-            true
+            Ok(())
         }
     }
 
@@ -1905,7 +1899,7 @@ mod tests {
     }
 
     impl PreviewCapturer for Held {
-        fn capture(&self, _job: &CaptureJob) -> Result<PreviewJpeg, PreviewRefused> {
+        fn capture(&self, _job: &CaptureJob) -> Result<PreviewJpeg, NoFrameReason> {
             *self.calls.lock().unwrap() += 1;
             let mut open = self.open.lock().unwrap();
             while !*open {
@@ -2065,15 +2059,11 @@ mod tests {
     /// then the late answer: one native request in all, and no frame.
     #[test]
     fn an_unanswered_capture_then_hide_then_late_answer_sends_no_frame() {
+        static GAUGES: PreviewGauges = PreviewGauges::new();
         let output = Arc::new(Recorder::default());
         let held = Arc::new(Held::default());
-        let worker = PreviewWorker::spawn_with(
-            output.clone(),
-            held.clone(),
-            true,
-            SHORT_WAIT,
-            &PREVIEW_GAUGES,
-        );
+        let worker =
+            PreviewWorker::spawn_with(output.clone(), held.clone(), true, SHORT_WAIT, &GAUGES);
         worker.show(request("a", 10));
         wait_for("the first request", || held.calls() == 1);
         for _ in 0..5 {
@@ -2081,12 +2071,42 @@ mod tests {
             worker.action_settled("a");
         }
         wait_for("the icon after the wait ended", || output.icon_shown("a"));
+        assert_eq!(GAUGES.report()["previewCaptureWaitTimeouts"], 1);
         assert!(worker.outstanding());
         worker.hide("a");
         held.open();
         wait_for("the late answer", || !worker.outstanding());
         assert_eq!(held.calls(), 1);
         assert_eq!(output.frames("a"), 0);
+        assert_eq!(GAUGES.capture_requests(), 1);
+        assert_eq!(GAUGES.report()["previewNoFrameReasons"]["stale"], 1);
+    }
+
+    #[test]
+    fn a_rejected_show_does_not_prevent_capture_and_a_queue_loss_is_counted() {
+        struct ClosedWriter;
+        impl PreviewOutput for ClosedWriter {
+            fn preview(&self, _: CursorPreview) -> bool {
+                false
+            }
+            fn frame(&self, _: CursorFrame) -> Result<(), NoFrameReason> {
+                Err(NoFrameReason::NoWriter)
+            }
+        }
+        static GAUGES: PreviewGauges = PreviewGauges::new();
+        let capture = Arc::new(Held::default());
+        capture.open();
+        let worker = PreviewWorker::spawn_counting(Arc::new(ClosedWriter), capture, true, &GAUGES);
+        assert!(matches!(
+            worker.show(request("a", 10)),
+            ShowOutcome::Shown { .. }
+        ));
+        wait_for("a recorded queue loss", || {
+            GAUGES.report()["previewNoFrameReasons"]["no_writer"] == 1
+        });
+        assert_eq!(GAUGES.report()["previewShowEnqueueDrops"], 1);
+        assert_eq!(GAUGES.capture_requests(), 1);
+        assert_eq!(GAUGES.frames_written(), 0);
     }
 
     /// Agent A's request is outstanding when agent B acts: B's calls return

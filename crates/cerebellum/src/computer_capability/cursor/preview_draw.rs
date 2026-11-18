@@ -11,12 +11,15 @@ impl Coordinator {
     /// the helper, and it is not an action: the badge's idle clock is not
     /// restarted by it. At most one frame per agent waits for the pipe; a
     /// newer one replaces it. A frame over `MAX_FRAME_BYTES` is dropped.
-    pub(crate) fn send_frame(&self, frame: CursorFrame) -> bool {
-        if self.0.stopped.load(std::sync::atomic::Ordering::Acquire) || !frame.valid() {
-            return false;
+    pub(crate) fn queue_frame(&self, frame: CursorFrame) -> Result<(), NoFrameReason> {
+        if self.0.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(NoFrameReason::Stopped);
+        }
+        if !frame.valid() {
+            return Err(NoFrameReason::InvalidFrame);
         }
         let Some(sender) = self.0.sender.get() else {
-            return false;
+            return Err(NoFrameReason::NoWriter);
         };
         if !self
             .0
@@ -25,19 +28,31 @@ impl Coordinator {
         {
             // Without a confirmed pipe writer, send the frame directly to
             // the channel reader instead of storing it for a later write.
-            return sender.try_send(CursorLine::Frame(frame)).is_ok();
+            return sender
+                .try_send(CursorLine::Frame(frame))
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => NoFrameReason::QueueFull,
+                    mpsc::error::TrySendError::Closed(_) => NoFrameReason::NoWriter,
+                });
         }
         let mut frames = self.frames();
+        if self.0.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(NoFrameReason::Stopped);
+        }
+        if sender.is_closed() {
+            return Err(NoFrameReason::NoWriter);
+        }
         if let Some(waiting) = frames
             .iter_mut()
             .find(|waiting| waiting.frame_agent == frame.frame_agent)
         {
             // Latest wins; the writer was already woken for the older one.
             *waiting = frame;
-            return true;
+            self.0.preview_gauges().no_frame(NoFrameReason::Superseded);
+            return Ok(());
         }
         if frames.len() >= PENDING_FRAME_CAP {
-            return false;
+            return Err(NoFrameReason::QueueFull);
         }
         // Only a wake: the writer takes frames from the record, never from
         // the channel. If the channel is full the writer is busy and finds
@@ -52,7 +67,12 @@ impl Coordinator {
         };
         frames.push_back(frame);
         let _ = sender.try_send(CursorLine::Frame(wake));
-        true
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send_frame(&self, frame: CursorFrame) -> bool {
+        self.queue_frame(frame).is_ok()
     }
 
     /// Move an agent's badge inside its preview of `motion.pmotion_window`,
