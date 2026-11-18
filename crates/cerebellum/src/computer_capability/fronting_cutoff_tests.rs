@@ -272,9 +272,9 @@ fn a_picture_read_past_admission_when_the_cutoff_fires_keeps_the_lock_and_acquir
     let reader = hooks.clone();
     let mut released_during_read = None;
     let mut acquired = false;
-    // The read as a fronted picture runs it: hold the lock, pass admission,
-    // block in the visibility inspection, then ask the fence right before
-    // the pixels would be requested.
+    // As a fronted picture read does: hold the lock, pass admission, block
+    // in the visibility inspection, then ask the fence right before the
+    // pixels would be requested.
     let mut read = || {
         let _hold = reader.hold_lock_for_read();
         let give_up = Instant::now() + crate::test_support::HANG_GUARD;

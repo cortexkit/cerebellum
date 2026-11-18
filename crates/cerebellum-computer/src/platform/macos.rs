@@ -817,9 +817,9 @@ impl FrontingRestoreHost for MacRestoreHost {
     }
 
     fn request_front(&mut self, pid: u32) -> bool {
-        // Only the process the obligation named as the one to put back, and
-        // only while it still holds the pid, checked again right before
-        // the activation is written.
+        // Only the process recorded as the previous application, and only
+        // while it still holds the pid, checked again right before the
+        // activation is written.
         pointer::request_previous_front(
             self.previous,
             pid,

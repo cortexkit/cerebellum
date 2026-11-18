@@ -480,7 +480,7 @@ struct ScreenState {
     /// When each request to bring the previous application back was made,
     /// in real time, for the cutoff's real-time bound.
     restore_requested_at: Vec<std::time::Instant>,
-    /// Handing the restore host to the obligation blocks the bracket's
+    /// Handing the restore host over at registration blocks the bracket's
     /// thread for this long in real time, as a slow registration would.
     register_blocks_ms: u64,
     /// The request to front the target blocks the bracket's thread for this

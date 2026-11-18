@@ -223,7 +223,7 @@ impl FrontingBracketHost for ShortcutHost {
 }
 
 /// Hooks whose one restore decision the cutoff's timer and the bracket
-/// share, as the call's restore cell does.
+/// share, as a call's `RestoreCell` does in the module.
 #[derive(Default)]
 struct Decision {
     host: Option<Box<dyn FrontingRestoreHost>>,
