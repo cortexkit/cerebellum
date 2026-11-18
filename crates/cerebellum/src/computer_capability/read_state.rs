@@ -51,35 +51,6 @@ where
         if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
             return locked;
         }
-        if parsed.include_image && parsed.bring_to_front && !consent.unattended {
-            match management
-                .computer_grants()
-                .require(
-                    &crate::computer_grants::GrantNeed::Takeover,
-                    &consent,
-                    &cancel,
-                )
-                .await
-            {
-                Ok(takeover) if takeover.waited => {
-                    // Approval can arrive long after the read was requested.
-                    // Store the grant, but never cover the person's work late.
-                    let mut reply = json!({
-                        "outcome":"consent_granted_not_executed",
-                        "remedy":"Allowed. Nothing was brought forward; read again with include_image and bring_to_front to get the picture."
-                    });
-                    takeover.decorate(&mut reply);
-                    admission.decorate(&mut reply);
-                    return reply;
-                }
-                Ok(_) => {}
-                Err(refusal) => {
-                    let mut reply = refusal.reply(None);
-                    admission.decorate(&mut reply);
-                    return reply;
-                }
-            }
-        }
         let work = quarantine::CallWork::current();
         if let Some(mut busy) = work.bind(&self.serializer.quarantine, &grant).await {
             admission.decorate(&mut busy);
@@ -113,20 +84,11 @@ where
                 return reply;
             }
         }
-        let takeover_held = !consent.unattended
-            && parsed.include_image
+        let fronting_admission = self.fronting_admission(&consent, false);
+        let bring_to_front = parsed.include_image
             && parsed.bring_to_front
-            && management.computer_grants().retain_held(
-                &consent.caller,
-                &crate::computer_grants::GrantNeed::Takeover,
-            );
-        let fronting_admission = self.fronting_admission(&consent, takeover_held);
-        let (bring_to_front, takeover) = fronting::image_fronting(
-            fronting_admission,
-            parsed.bring_to_front,
-            foreground.is_some_and(|front| front.fronting.fronted),
-        );
-        if parsed.include_image && bring_to_front && takeover {
+            && fronting_admission.mode == cerebellum_core::config::AppUse::Background;
+        if bring_to_front && fronting_admission.may_front_image().is_ok() {
             if let Some(mut refusal) = self
                 .refuse_if_person_changed(management, &identity.conversation_key, &grant)
                 .await
@@ -504,18 +466,11 @@ where
             .permissions
             .state(cerebellum_computer::platform::PermissionService::ScreenRecording)
             == PermissionLiveness::Live;
-        // A `bring_to_front` read under held takeover may front the application
-        // even in foreground app-use: the person can switch away after the
-        // foreground check and before capture. Takeover has separate admission from
-        // app-use fronting, but shares focus ownership and restore cleanup.
+        // Foreground mode uses its ordinary one-way front. Only background
+        // mode temporarily brings an app forward for its picture and restores.
         let mut image_hooks = None;
         let mut image_fronting = None;
-        let bring_to_front_now = parsed.include_image
-            && bring_to_front
-            && takeover
-            && image_permission_live
-            && self.fronting_bracket_admitted;
-        if bring_to_front_now {
+        if bring_to_front && image_permission_live && fronting_admission.may_front_image().is_ok() {
             let call = fronting::FrontCall {
                 grant: &grant,
                 consent: &consent,
@@ -524,14 +479,7 @@ where
                 conversation_key: &conversation_key,
                 input_follows: false,
             };
-            match self
-                .prepare_takeover_front(
-                    call,
-                    crate::terminal_arbiter::FrontingPurpose::BringToFront,
-                    &admission,
-                )
-                .await
-            {
+            match self.prepare_image_front(call, &admission).await {
                 Ok(parts) => image_hooks = Some(fronting::CellHooks::new(parts)),
                 Err(prepared) => {
                     if let Some(change) = prepared.change {
@@ -542,7 +490,7 @@ where
                     }
                     image_fronting = Some(fronting::Fronting::stopped(
                         fronting_admission.mode,
-                        fronting::Purpose::BringToFront,
+                        fronting::Purpose::NeedsFront,
                         prepared.stop,
                     ));
                 }
@@ -553,7 +501,7 @@ where
         // replaces it with its own outcome once the bracket returns.
         let planned_fronting = match (&image_hooks, image_fronting) {
             (Some(_), _) => fronting::Fronting {
-                purpose: fronting::Purpose::BringToFront,
+                purpose: fronting::Purpose::NeedsFront,
                 ..fronting::Fronting::untouched(fronting_admission.mode)
             },
             (None, Some(stopped)) => stopped,
@@ -572,8 +520,6 @@ where
                 ImageReadPlan {
                     requested: parsed.include_image,
                     bring_to_front,
-                    takeover,
-                    bracket_admitted: self.fronting_bracket_admitted && image_hooks.is_some(),
                     cancel: Some(cancel),
                     now_ms,
                     gate: None,
@@ -616,12 +562,6 @@ where
             }
             Ok((None, Some(reason), fronting)) => {
                 reply["image_unavailable"] = json!({"reason": reason.as_str()});
-                if reason == ImageUnavailable::ImageNeedsTakeover {
-                    reply["image_unavailable"]["detail"] = json!({
-                        "grant": "takeover", "grant_label": "control of your mouse and keyboard",
-                        "scope": {"takeover": "machine"},
-                    });
-                }
                 if let Some(fronting) = fronting {
                     reply["image_fronting"] = json!(fronting);
                 }
@@ -646,7 +586,7 @@ where
             let end = hooks.end();
             let fronted = fronting::hooked_fronting(
                 fronting_admission.mode,
-                fronting::Purpose::BringToFront,
+                fronting::Purpose::NeedsFront,
                 &end,
             );
             if fronted.fronted {
@@ -733,15 +673,12 @@ where
                 custody
                     .finalize_read(reservation, false)
                     .map_err(|_| ImageUnavailable::AuditUnavailable)?;
-                let reason =
-                    (image_plan.requested && image_plan.bring_to_front && !image_plan.takeover)
-                        .then_some(ImageUnavailable::ImageNeedsTakeover);
-                return Ok((None, reason, None));
+                return Ok((None, None, None));
             };
             let image = release_through_custody(&mut custody, || {
                 // The observed bracket posts a heartbeat, just as keys does;
                 // do not mistake that input for the person's next action.
-                let mut posting = (image_plan.bring_to_front && image_plan.takeover).then(|| {
+                let mut posting = image_plan.hooks.as_ref().map(|_| {
                     let posting =
                         own_input.begin_posting(person::last_input_instant(input_source.as_ref()));
                     work.publish_posting(&own_input, &posting);

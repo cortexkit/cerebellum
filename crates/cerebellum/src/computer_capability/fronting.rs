@@ -119,7 +119,6 @@ pub(crate) fn held_input_confirmed(held: &super::held_input::HeldInput) -> bool 
 pub(crate) enum Purpose {
     ForegroundMode,
     NeedsFront,
-    BringToFront,
     None,
 }
 
@@ -128,7 +127,6 @@ impl Purpose {
         match self {
             Self::ForegroundMode => "foreground_mode",
             Self::NeedsFront => "needs_front",
-            Self::BringToFront => "bring_to_front",
             Self::None => "none",
         }
     }
@@ -289,7 +287,6 @@ impl Fronting {
             purpose: match self.purpose {
                 Purpose::ForegroundMode => FrontingRecordPurpose::ForegroundMode,
                 Purpose::NeedsFront => FrontingRecordPurpose::NeedsFront,
-                Purpose::BringToFront => FrontingRecordPurpose::BringToFront,
                 Purpose::None => FrontingRecordPurpose::None,
             },
             restore: match self.restore {
@@ -511,22 +508,18 @@ fn takeover_route(admission: Admission) -> ChordRoute {
     }
 }
 
-/// The image read's `(bring_to_front, takeover)` once the mode is applied.
-/// A foreground read whose one-way front succeeded ignores `bring_to_front`.
-/// Otherwise either mode needs held takeover in an attended session to run
-/// the temporary bracket, including when the target was already frontmost
-/// at the foreground check but the person switched away before capture.
-pub(crate) fn image_fronting(
-    admission: Admission,
-    bring_to_front: bool,
-    fronted_one_way: bool,
-) -> (bool, bool) {
-    let bring_to_front =
-        bring_to_front && !(admission.mode == AppUse::Foreground && fronted_one_way);
-    (
-        bring_to_front,
-        bring_to_front && admission.attended && admission.takeover_held,
-    )
+impl Admission {
+    /// An image needs the bracket review, not the review for sending app
+    /// input or leaving the app in front.
+    pub(super) fn may_front_image(self) -> Result<(), FrontingStop> {
+        if !self.attended {
+            Err(FrontingStop::Unattended)
+        } else if !self.bracket_admitted {
+            Err(FrontingStop::FrontingNotAdmitted)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// A one-way front that went through.
@@ -873,6 +866,7 @@ impl FrontedDispatchHooks for CellHooks {
             return HookedRestore {
                 restore: RestoreStatus::NotNeeded,
                 person_input_during_fronting: false,
+                input_coverage_unavailable: false,
             };
         };
         let decided = decide_with_restore_budget(&cell);
@@ -880,6 +874,7 @@ impl FrontedDispatchHooks for CellHooks {
         HookedRestore {
             restore: decided.restore,
             person_input_during_fronting: decided.person_input_during_fronting,
+            input_coverage_unavailable: decided.input_coverage_unavailable,
         }
     }
 
@@ -1097,6 +1092,7 @@ pub(crate) struct PrepareStop {
 /// waiting for focus ownership.
 enum TemporaryFrontAuthority<'a> {
     AppUse,
+    AppRead(&'a crate::computer_grants::GrantAdmission),
     Takeover(&'a crate::computer_grants::GrantAdmission),
 }
 
@@ -1178,8 +1174,23 @@ where
         .await
     }
 
-    /// Prepare only a takeover-authorized image or chord bracket. In particular,
-    /// obtaining the shared hooks does not enable app-grant-only fronting.
+    /// Prepare a picture-only bracket with this call's app admission.
+    pub(super) async fn prepare_image_front(
+        &self,
+        call: FrontCall<'_>,
+        admission: &crate::computer_grants::GrantAdmission,
+    ) -> Result<ObligationParts, PrepareStop> {
+        Box::pin(self.prepare_front_with_authority(
+            call,
+            FrontingPurpose::NeedsFront,
+            true,
+            TemporaryFrontAuthority::AppRead(admission),
+        ))
+        .await
+    }
+
+    /// Prepare a takeover-authorized chord bracket. Obtaining the shared
+    /// hooks does not enable app-grant-only fronting for these chords.
     pub(crate) async fn prepare_takeover_front(
         &self,
         call: FrontCall<'_>,
@@ -1213,10 +1224,17 @@ where
         // not. Both routes still compare any baseline the conversation has.
         let require_seen =
             matches!(&authority, TemporaryFrontAuthority::AppUse) && call.input_follows;
-        let restore_fallback = matches!(&authority, TemporaryFrontAuthority::AppUse);
+        let restore_fallback = !matches!(&authority, TemporaryFrontAuthority::Takeover(_));
         match authority {
             TemporaryFrontAuthority::AppUse => {
                 self.fronting_admission(call.consent, false).may_front()?;
+            }
+            TemporaryFrontAuthority::AppRead(admission) => {
+                self.fronting_admission(call.consent, false)
+                    .may_front_image()?;
+                if !admission.commit() {
+                    return Err(FrontingStop::DispatchGateClosed.into());
+                }
             }
             TemporaryFrontAuthority::Takeover(admission) => {
                 if call.consent.unattended {

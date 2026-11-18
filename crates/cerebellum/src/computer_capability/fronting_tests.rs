@@ -30,11 +30,7 @@ fn admission(mode: AppUse, attended: bool, admitted: bool, takeover_held: bool) 
     }
 }
 
-/// Every combination of mode, attendance and admission, for the three
-/// things the setting decides: whether a background `bring_to_front` image
-/// read answers `image_needs_takeover`, whether a Command chord to a
-/// background application answers `modifier_chord_needs_foreground`, and
-/// whether anything fronts.
+/// How mode, attendance and reviews admit one-way fronts, chords and pictures.
 #[test]
 fn mode_attendance_and_admission_decide_takeover_chords_and_fronting() {
     for mode in [AppUse::Foreground, AppUse::Background] {
@@ -78,21 +74,19 @@ fn mode_attendance_and_admission_decide_takeover_chords_and_fronting() {
                     ChordRoute::PerProcess
                 );
 
-                // The image read: without takeover a background
-                // bring_to_front still needs takeover in every case; in
-                // foreground mode a successful front removes the need.
-                let (bring, takeover) = image_fronting(without_takeover, true, false);
-                assert!(bring && !takeover, "{case}: image_needs_takeover");
-                let (bring, takeover) = image_fronting(without_takeover, true, true);
-                match mode {
-                    AppUse::Foreground => assert!(!bring && !takeover, "{case}"),
-                    AppUse::Background => assert!(bring && !takeover, "{case}"),
-                }
-                // With takeover held, either mode can run the temporary
-                // bracket when no one-way front occurred, but only attended.
-                let with_takeover = admission(mode, attended, admitted, true);
-                let (_, takeover) = image_fronting(with_takeover, true, false);
-                assert_eq!(takeover, attended, "{case} with takeover");
+                assert_eq!(
+                    without_takeover.may_front_image().is_ok(),
+                    attended,
+                    "{case}"
+                );
+                let no_bracket = Admission {
+                    bracket_admitted: false,
+                    ..without_takeover
+                };
+                assert!(
+                    no_bracket.may_front_image().is_err(),
+                    "{case} without bracket review"
+                );
             }
         }
     }
@@ -208,12 +202,12 @@ fn every_restore_value_and_reason_reaches_the_reply() {
         (
             Fronting::temporary(
                 AppUse::Background,
-                Purpose::BringToFront,
+                Purpose::NeedsFront,
                 RestoreStatus::SkippedPerson { now_front: Some(3) },
                 true,
             ),
             "skipped_person",
-            "bring_to_front",
+            "needs_front",
         ),
         (
             Fronting::temporary(
@@ -2300,32 +2294,12 @@ async fn open_app_fronts_a_running_or_launched_app_only_in_foreground_mode() {
 }
 
 // ---------------------------------------------------------------------------
-// bring_to_front under takeover, through the call's restore obligation
+// bring_to_front through the call's restore obligation
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_foreground_takeover_image_read_owns_and_restores_a_late_activation() {
-    let rig = rig(AppUse::Foreground, mail_desk()).await;
-    let carrier = support::ScriptedCarrier::answering(&["computer_30m"]);
-    rig.management
-        .computer_grants()
-        .require(
-            &crate::computer_grants::GrantNeed::Takeover,
-            &support::relayed(&carrier),
-            &crate::CancelHandle::pending(),
-        )
-        .await
-        .unwrap();
-    let desk = rig.desk.clone();
-    {
-        let mut state = rig.desk.state();
-        state.frontmost = Some(TARGET);
-        // Foreground admission observes the target, then the person switches
-        // away before image capture. That earlier observation owns no bracket.
-        state.on_frontmost_read = Some(support::DeskHook(Arc::new(move || {
-            desk.state().frontmost = Some(PREVIOUS);
-        })));
-    }
+async fn a_background_app_grant_image_read_owns_and_restores_a_late_activation() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
     let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let mut state = rig.screen.state();
@@ -2346,8 +2320,8 @@ async fn a_foreground_takeover_image_read_owns_and_restores_a_late_activation() 
         reply["image_unavailable"]["reason"], "restore_failed",
         "{reply}"
     );
-    assert_eq!(reply["fronting"]["mode"], "foreground");
-    assert_eq!(reply["fronting"]["purpose"], "bring_to_front");
+    assert_eq!(reply["fronting"]["mode"], "background");
+    assert_eq!(reply["fronting"]["purpose"], "needs_front");
     assert_eq!(rig.screen.log(), ["front:4242"], "no late capture");
     assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
     assert!(rig.lock.held(), "the pending restore still owns the lock");
@@ -2371,22 +2345,30 @@ async fn a_foreground_takeover_image_read_owns_and_restores_a_late_activation() 
     assert!(rx.try_recv().is_err(), "one cleanup per activation");
 }
 
-/// Background mode: a `bring_to_front` image read under held takeover fronts
+#[tokio::test]
+async fn an_explicit_picture_in_foreground_mode_keeps_the_one_way_front() {
+    let rig = rig(AppUse::Foreground, mail_desk()).await;
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.read_state",
+            json!({"target": support::TARGET_BUNDLE_ID, "include_image": true,
+                "bring_to_front": true}),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["fronting"]["purpose"], "foreground_mode", "{reply}");
+    assert_eq!(reply["fronting"]["restore"], "left_in_front", "{reply}");
+    assert_eq!(rig.screen.log(), ["front:4242"]);
+    assert_eq!(rig.screen.frontmost(), Some(TARGET));
+}
+
+/// Background mode: a `bring_to_front` image read under the app grant fronts
 /// the application, reads it while in front, and puts the previous
 /// application back through the call's one restore decision.
 #[tokio::test]
 async fn a_bring_to_front_read_fronts_reads_and_restores_once() {
     let rig = rig(AppUse::Background, mail_desk()).await;
-    let carrier = support::ScriptedCarrier::answering(&["computer_30m"]);
-    rig.management
-        .computer_grants()
-        .require(
-            &crate::computer_grants::GrantNeed::Takeover,
-            &support::relayed(&carrier),
-            &crate::CancelHandle::pending(),
-        )
-        .await
-        .unwrap();
     let reply = rig
         .call_under(
             &under_terminal(),
@@ -2403,7 +2385,7 @@ async fn a_bring_to_front_read_fronts_reads_and_restores_once() {
     );
     assert_eq!(
         reply["fronting"],
-        json!({"mode":"background","fronted":true,"purpose":"bring_to_front",
+        json!({"mode":"background","fronted":true,"purpose":"needs_front",
             "restore":"restored"}),
         "{reply}"
     );
@@ -3607,7 +3589,7 @@ async fn a_pending_chord_landing_after_its_reply_only_restores_and_never_posts()
             assert_eq!(rig.screen.log(), ["front:4242", "restore:100"]);
         } else {
             assert_eq!(record["restore"], "skipped_person");
-            assert_eq!(record["person_input_during_fronting"], true);
+            assert_eq!(record["person_input_during_fronting"], evidence == "input");
             assert_eq!(rig.screen.log(), ["front:4242"]);
         }
         assert!(!rig.screen.log().iter().any(|event| event == "post"));

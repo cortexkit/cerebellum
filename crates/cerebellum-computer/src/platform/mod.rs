@@ -1819,6 +1819,7 @@ impl crate::dispatch::FrontingBracketHost for Box<dyn FrontingSession> {
 pub struct HookedRestore {
     pub restore: crate::dispatch::RestoreStatus,
     pub person_input_during_fronting: bool,
+    pub input_coverage_unavailable: bool,
 }
 
 /// What the caller of an admitted fronted dispatch owns around it: the
@@ -1988,6 +1989,7 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             return crate::dispatch::RestoreOutcome {
                 restore: crate::dispatch::RestoreStatus::NotNeeded,
                 person_input_during_fronting: false,
+                input_coverage_unavailable: false,
                 finished_at_ms: self.inner.now_ms(),
             };
         }
@@ -2002,6 +2004,7 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
         crate::dispatch::RestoreOutcome {
             restore: decided.restore,
             person_input_during_fronting: decided.person_input_during_fronting,
+            input_coverage_unavailable: decided.input_coverage_unavailable,
             finished_at_ms: self.inner.now_ms(),
         }
     }
@@ -2736,6 +2739,7 @@ mod hooked_fronted_tests {
                 return HookedRestore {
                     restore: RestoreStatus::NotNeeded,
                     person_input_during_fronting: false,
+                    input_coverage_unavailable: false,
                 };
             }
             let host = self.host.as_mut().unwrap();
@@ -2743,6 +2747,7 @@ mod hooked_fronted_tests {
             HookedRestore {
                 restore: RestoreStatus::Restored,
                 person_input_during_fronting: false,
+                input_coverage_unavailable: false,
             }
         }
         fn finished(&mut self, _outcome: &crate::dispatch::BracketOutcome) {

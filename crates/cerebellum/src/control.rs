@@ -458,7 +458,7 @@ async fn send_principal_denied(
 ///   in force, or withheld because their store could not be read;
 /// - `openAppLaunchHistory`, whether optional timing history is available or
 ///   launches are using default waits after a read or write failure;
-/// - `hardwareInputObserver: {state, disabled_reenabled_count}`, whether the
+/// - `hardwareInputObserver`, whether the
 ///   timestamp-only hardware observer is running and how often it recovered
 ///   from a disabled tap. Reading health never starts the observer.
 ///
@@ -562,14 +562,25 @@ pub(super) fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleCo
             serde_json::Value::from(open_app_history::durable_history_health()),
         );
         #[cfg(target_os = "macos")]
-        let (observer_state, reenabled_count) =
-            cerebellum_macos::SessionEventTap::hardware_observer_health();
+        let observer = {
+            let health = cerebellum_macos::SessionEventTap::hardware_observer_health();
+            json!({
+                "state": health.state,
+                "disabled_reenabled_count": health.disabled_reenabled_count,
+                "install_failure_count": health.install_failure_count,
+                "coverage_gap_count": health.coverage_gap_count,
+                "last_problem": health.last_problem,
+            })
+        };
         #[cfg(not(target_os = "macos"))]
-        let (observer_state, reenabled_count) = ("platform_unsupported", 0_u64);
-        metrics.insert(
-            "hardwareInputObserver".to_string(),
-            serde_json::json!({"state": observer_state, "disabled_reenabled_count": reenabled_count}),
-        );
+        let observer = json!({
+            "state": "platform_unsupported",
+            "disabled_reenabled_count": 0,
+            "install_failure_count": 0,
+            "coverage_gap_count": 0,
+            "last_problem": Value::Null,
+        });
+        metrics.insert("hardwareInputObserver".to_string(), observer);
     }
     report
 }

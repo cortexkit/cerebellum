@@ -84,6 +84,16 @@ pub fn hardware_input_since(
     }
 }
 
+fn observed_input_since(snapshot: Option<HardwareInputSnapshot>, since_ms: u64) -> bool {
+    snapshot
+        .and_then(|snapshot| snapshot.last_input_ms)
+        .is_some_and(|last| last >= since_ms)
+}
+
+fn covers(snapshot: Option<HardwareInputSnapshot>, since_ms: u64) -> bool {
+    snapshot.is_some_and(|snapshot| snapshot.coverage_start_ms <= since_ms)
+}
+
 /// What to do about the previous application once a temporary front ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreDecision {
@@ -125,6 +135,8 @@ pub struct RestoreOutcome {
     /// Hardware input arrived after the front, whether or not it led to a
     /// skipped restore.
     pub person_input_during_fronting: bool,
+    /// The decision could not establish continuous observation from the front.
+    pub input_coverage_unavailable: bool,
     /// When the previous application was seen back in front, or the decision
     /// otherwise finished, on the host's clock.
     pub finished_at_ms: u64,
@@ -184,9 +196,8 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
         loop {
             let frontmost = host.frontmost_pid();
             let snapshot = host.hardware_input_snapshot();
-            let input = snapshot
-                .and_then(|snapshot| snapshot.last_input_ms)
-                .is_some_and(|last| last >= front_instant_ms);
+            let input = observed_input_since(snapshot, front_instant_ms);
+            let input_coverage_unavailable = !covers(snapshot, front_instant_ms);
             if frontmost == Some(target) {
                 let latency = host.now_ms().saturating_sub(front_instant_ms);
                 host.late_activation_observed(latency);
@@ -197,20 +208,20 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
                         now_front: frontmost,
                     },
                     person_input_during_fronting: true,
+                    input_coverage_unavailable,
                     finished_at_ms: host.now_ms(),
                 };
             }
             if frontmost == Some(target) {
                 break;
             }
-            if !snapshot.is_some_and(|snapshot| snapshot.coverage_start_ms <= front_instant_ms)
-                || !matches!(frontmost, Some(pid) if pid == previous)
-            {
+            if input_coverage_unavailable || frontmost != Some(previous) {
                 return RestoreOutcome {
                     restore: RestoreStatus::SkippedPerson {
                         now_front: frontmost,
                     },
                     person_input_during_fronting: input,
+                    input_coverage_unavailable,
                     finished_at_ms: host.now_ms(),
                 };
             }
@@ -220,6 +231,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
                         left_in_front: frontmost,
                     },
                     person_input_during_fronting: input,
+                    input_coverage_unavailable: false,
                     finished_at_ms: host.now_ms(),
                 };
             }
@@ -231,6 +243,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
         return RestoreOutcome {
             restore: RestoreStatus::NotNeeded,
             person_input_during_fronting: false,
+            input_coverage_unavailable: false,
             finished_at_ms: host.now_ms(),
         };
     }
@@ -243,14 +256,10 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
     let frontmost = host.frontmost_pid();
     // Disclose only observed input. Unknown coverage independently skips the
     // restore below; it must not be reported as a person event that was seen.
-    let input = snapshot
-        .and_then(|snapshot| snapshot.last_input_ms)
-        .is_some_and(|last| last >= front_instant_ms);
-    let covered = |snapshot: Option<HardwareInputSnapshot>| {
-        snapshot.is_some_and(|snapshot| snapshot.coverage_start_ms <= front_instant_ms)
-    };
-    if !covered(first_snapshot)
-        || !covered(snapshot)
+    let input = observed_input_since(snapshot, front_instant_ms);
+    let input_coverage_unavailable =
+        !covers(first_snapshot, front_instant_ms) || !covers(snapshot, front_instant_ms);
+    if input_coverage_unavailable
         || (require_quiet && input)
         || first_front != frontmost
         || first_snapshot != snapshot
@@ -260,6 +269,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
                 now_front: frontmost,
             },
             person_input_during_fronting: input,
+            input_coverage_unavailable,
             finished_at_ms: host.now_ms(),
         };
     }
@@ -267,6 +277,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
         RestoreDecision::SkipPerson { now_front } => RestoreOutcome {
             restore: RestoreStatus::SkippedPerson { now_front },
             person_input_during_fronting: input,
+            input_coverage_unavailable: false,
             finished_at_ms: host.now_ms(),
         },
         RestoreDecision::Restore {
@@ -286,6 +297,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
             RestoreOutcome {
                 restore,
                 person_input_during_fronting,
+                input_coverage_unavailable: false,
                 finished_at_ms: host.now_ms(),
             }
         }
@@ -307,10 +319,10 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
 /// in front, so a caller that must end quickly is held for one restore wait
 /// at most.
 ///
-/// It stops at the first person input, and an unavailable input observer or
-/// a gap in its coverage counts as input: focus is then left alone, unless
-/// the previous application was already back, where the input is the
-/// person's own work in it. It also stops when a third application comes to
+/// It stops at the first person input or gap in observer coverage. Both
+/// leave focus alone, but a gap is not an observed person event. If the
+/// previous application was already back, input there does not change the
+/// restore result. The watch also stops when a third application comes to
 /// the front or the front cannot be read, on `stop`, and at the window's end.
 ///
 /// Returns the restore status as the watch ended, the latency of the first
@@ -337,7 +349,8 @@ pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
     let first_attempt_only = watch == LateWatch::FirstAttempt;
     loop {
         let front = host.frontmost_pid();
-        let input = hardware_input_since(host.hardware_input_snapshot(), requested_at);
+        let snapshot = host.hardware_input_snapshot();
+        let input = observed_input_since(snapshot, requested_at);
         let now = host.now_ms();
         let target_front = front == Some(target);
         if target_front {
@@ -350,14 +363,14 @@ pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
             }
         }
         target_was_front = target_front;
-        if input {
+        if input || !covers(snapshot, requested_at) {
             if restored {
                 return (RestoreStatus::Restored, first_landing, false);
             }
             return (
                 RestoreStatus::SkippedPerson { now_front: front },
                 first_landing,
-                true,
+                input,
             );
         }
         let settled = || {

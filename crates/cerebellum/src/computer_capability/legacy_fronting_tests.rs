@@ -1,5 +1,6 @@
-//! Callers authorized by held takeover and the takeover-dispatch review use
-//! shared cleanup without app-use admission.
+//! A build configured to front apps temporarily can restore focus even if it
+//! cannot leave them in front. These chords require mouse-and-keyboard
+//! permission; a picture requires only permission for its app.
 
 #![cfg(target_os = "macos")]
 
@@ -39,7 +40,7 @@ impl Caller {
 
     fn in_call_end(self) -> u64 {
         match self {
-            Self::Image => 600,
+            Self::Image => 500,
             Self::Chord | Self::SystemChord => 400,
         }
     }
@@ -339,6 +340,16 @@ async fn legacy_admission_is_rechecked_after_waiting_for_the_lock() {
             }
             drop(held);
             let reply = task.await.unwrap();
+            if matches!(caller, Caller::Image) && lost == "takeover" {
+                assert_eq!(
+                    rig.screen.log(),
+                    ["front:4242", "read", "restore:100"],
+                    "{reply}"
+                );
+                assert_eq!(reply["fronting"]["restore"], "restored");
+                assert!(!rig.lock.held());
+                continue;
+            }
             assert!(rig.screen.log().is_empty(), "{caller:?}/{lost}: {reply}");
             assert!(reply.get("image").is_none());
             assert!(!rig.lock.held());

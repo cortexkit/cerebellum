@@ -921,6 +921,63 @@ async fn takeover_holders_elect_one_and_the_drain_winner_makes_holds_true() {
 }
 
 #[tokio::test]
+async fn an_allow_once_app_card_never_promises_a_held_grant_to_a_duplicate() {
+    let service = CardService::new();
+    let carrier = TestCarrier::new(&service);
+    let grants = Arc::new(ComputerGrants::in_memory());
+    let mut consent = context(carrier.clone());
+    consent.caller.holder = None;
+    let need = GrantNeed::App {
+        bundle_identity: "com.example.Editor".into(),
+        display_name: "Editor".into(),
+        code: Arc::new(SignedByFixtureTeam),
+    };
+    let call = || {
+        let (grants, need) = (grants.clone(), need.clone());
+        let mut consent = context(carrier.clone());
+        consent.caller.holder = None;
+        tokio::spawn(async move {
+            grants
+                .require(&need, &consent, &CancelHandle::pending())
+                .await
+        })
+    };
+    let first = call();
+    let card = service.card(1, 1).await;
+    let second = call();
+    until(|| {
+        service
+            .calls()
+            .iter()
+            .filter(|(method, _)| method == wire::CONSENT_AWAIT)
+            .count()
+            == 2
+    })
+    .await;
+    assert!(service.answer(
+        card.header.corr,
+        ScriptedAnswer::Answered(json!({"decision":"allow_once"}))
+    ));
+
+    let results = [first.await.unwrap(), second.await.unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let refusal = results
+        .into_iter()
+        .find_map(Result::err)
+        .unwrap()
+        .reply(None);
+    assert_eq!(refusal["outcome"], "consent_granted_not_executed");
+    assert!(
+        refusal["remedy"]
+            .as_str()
+            .unwrap()
+            .contains("no grant was saved"),
+        "{refusal}"
+    );
+    assert!(!grants.holds(&consent.caller, &need));
+}
+
+#[tokio::test]
 async fn late_takeover_allow_once_records_no_grant_and_reports_approved_not_executed() {
     let service = CardService::new();
     let carrier = TestCarrier::new(&service);
