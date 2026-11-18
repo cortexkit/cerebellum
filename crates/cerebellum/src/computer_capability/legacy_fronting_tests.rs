@@ -1,8 +1,9 @@
 //! A build configured to front apps temporarily can restore focus even if it
 //! cannot leave them in front. These chords require mouse-and-keyboard
-//! permission. Such a build carries no app-use fronting review, so it never
-//! fronts an app for a picture: pictures are fronted under the app's own
-//! grant only where that review is bound (see
+//! permission. Such a build carries no app-use fronting review (the release
+//! review that admits bringing an app forward under the app's own grant), so
+//! it never fronts an app for a picture: pictures are fronted under the app's
+//! own grant only in builds that carry that review (see
 //! `without_the_app_use_review_a_bring_to_front_read_requests_no_front`).
 
 #![cfg(target_os = "macos")]

@@ -892,7 +892,8 @@ impl FrontedDispatchHooks for CellHooks {
     }
 
     /// App-use fronts (shortcuts and pictures under the app's own grant)
-    /// get a cutoff timer; takeover fronts keep their existing bounds. The
+    /// get a cutoff timer; fronts made under the takeover (mouse-and-keyboard)
+    /// grant keep their existing bounds. The
     /// timer runs this same hooks' decision, which goes through the one
     /// restore cell, so the restore still runs exactly once.
     fn cutoff_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {

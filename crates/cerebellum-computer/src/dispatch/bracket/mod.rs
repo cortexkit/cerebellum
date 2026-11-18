@@ -547,8 +547,9 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
         if cold || restore_reserve.saturating_add(unit_reserve) > bound {
             let restore_blocks =
                 previous != plan.target_pid && restore_reserve > bound && unit_reserve <= bound;
-            // Only app-use needs-front may measure without posting any keys
-            // or clicks. A cold
+            // Only a bracket with a restore predictor (one fronting the target
+            // under the app's own grant because it needs it in front) may
+            // measure without posting any keys or clicks. A cold
             // predictor, or one whose slow restore prevents any newer sample,
             // can otherwise keep every later call from even requesting a front.
             if (cold || restore_blocks) && next_unit == 0 {
