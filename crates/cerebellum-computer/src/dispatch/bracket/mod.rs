@@ -28,12 +28,14 @@
 //! application back under a held modifier. Without admission a bracket
 //! behaves as it always has.
 
+mod cutoff;
 mod latency;
 mod press;
 mod reason;
 mod restore;
 mod restore_predictor;
 
+pub use cutoff::*;
 pub use latency::UNIT_POST_COST_MAX_AGE;
 // Only the macOS keystroke host keeps unit post costs process-wide.
 #[cfg(target_os = "macos")]

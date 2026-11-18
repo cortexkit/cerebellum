@@ -610,25 +610,17 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
         heartbeat_observation(tap, watcher, probe, self.started)
     }
 
+    // Keystroke units are posted only through `post_observed_unit`, which
+    // checks focus, cancellation and the deadline before each key post. A
+    // keystroke post without those checks is refused before anything is sent.
     fn post_unit(
         &mut self,
-        index: usize,
+        _index: usize,
     ) -> Result<crate::dispatch::UnitPosted, SequencePostFailure> {
-        let steps = self
-            .units
-            .get_mut(index)
-            .and_then(Option::take)
-            .unwrap_or_default();
-        let report = post_event_sequence_with_visibility(
-            self.target,
-            steps,
-            &mut self.transport,
-            &mut self.visibility,
-            &|| false,
-        )?;
-        Ok(crate::dispatch::UnitPosted {
-            posts_returned: report.posts_returned,
-            generation_verifications: report.generation_verifications,
+        Err(SequencePostFailure {
+            posts_returned: 0,
+            refusal: super::process_event::ProcessEventRefusal::Cancelled,
+            held_state: HeldStateDisposition::NoneHeld,
         })
     }
 
@@ -638,7 +630,32 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
         observation: crate::dispatch::ObservedUnit<'_, Self::Tap>,
     ) -> Result<crate::dispatch::UnitPosted, SequencePostFailure> {
         let Some(pointer) = self.pointer.as_mut() else {
-            return self.post_unit(index);
+            let steps = self
+                .units
+                .get_mut(index)
+                .and_then(Option::take)
+                .unwrap_or_default();
+            let started = self.started;
+            let mut checks = crate::dispatch::FrontedKeyChecks {
+                target_pid: self.target.pid,
+                deadline_ms: observation.deadline_ms,
+                now_ms: || elapsed_millis(started),
+                frontmost_pid: || {
+                    cerebellum_macos::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok())
+                },
+            };
+            let report = super::process_event::post_event_sequence_fronted(
+                self.target,
+                steps,
+                &mut self.transport,
+                &mut self.visibility,
+                observation.cancelled,
+                &mut checks,
+            )?;
+            return Ok(crate::dispatch::UnitPosted {
+                posts_returned: report.posts_returned,
+                generation_verifications: report.generation_verifications,
+            });
         };
         let steps = self
             .units
