@@ -1,4 +1,6 @@
-//! Images that need the front use the same bounded bracket as app shortcuts.
+//! A picture of a covered window brings the app forward the same way an app
+//! shortcut does: the app is in front for at most the needs-front time limit,
+//! nothing is typed or clicked, and the person's app is put back afterwards.
 
 use cerebellum_computer::app_state::image::{
     ImageDecision, ImageFronting, ImageUnavailable, WindowImageCapture,
