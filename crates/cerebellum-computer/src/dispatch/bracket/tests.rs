@@ -50,6 +50,7 @@ struct FakeDesk {
     frontmost_at_post: Vec<Option<u32>>,
     /// Every fronting request, in order.
     front_requests: Vec<u32>,
+    restore_observation_until_ms: Option<u64>,
     /// The desk-clock instant of each entry in `front_requests`.
     front_request_times: Vec<u64>,
     /// The newest hardware input the process-wide observer saw.
@@ -117,6 +118,7 @@ impl FakeDesk {
             fronted_intervals: Vec::new(),
             frontmost_at_post: Vec::new(),
             front_requests: Vec::new(),
+            restore_observation_until_ms: None,
             front_request_times: Vec::new(),
             hardware_input_ms: None,
             switch_after_unit: None,
@@ -177,6 +179,10 @@ impl FakeDesk {
 }
 
 impl FrontingBracketHost for FakeDesk {
+    fn restore_observation_open(&self) -> bool {
+        self.restore_observation_until_ms
+            .is_none_or(|cutoff| self.now < cutoff)
+    }
     type Tap = ();
 
     fn now_ms(&mut self) -> u64 {
@@ -1464,6 +1470,29 @@ fn restore_new_activity_during_final_sampling_leaves_focus_alone() {
         }
     );
     assert_eq!(desk.front_requests, [TARGET]);
+}
+
+#[test]
+fn an_unconfirmed_activation_stops_observation_at_the_restore_reserve_without_claiming_success() {
+    let mut desk = FakeDesk::new();
+    desk.front_latency_ms = 800;
+    desk.restore_observation_until_ms = Some(150);
+    desk.request_front(TARGET);
+    desk.advance(100);
+
+    let reply = restore_after_front_attempt(&mut desk, PREVIOUS, TARGET, 0, 300, false);
+    assert_eq!(
+        desk.now, 150,
+        "the request does not wait out the restore reserve"
+    );
+    assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
+    assert_eq!(
+        reply.restore,
+        RestoreStatus::Failed {
+            left_in_front: Some(PREVIOUS)
+        }
+    );
+    assert!(desk.posted.is_empty());
 }
 
 #[test]
