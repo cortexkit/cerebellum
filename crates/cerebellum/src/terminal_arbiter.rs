@@ -561,8 +561,9 @@ impl RestoreCell {
         let started = std::time::Instant::now();
         let at_cutoff = wake.is_some();
         let mut inner = self.inner();
-        // A timed restore cannot wait out the native front request. The
-        // worker or terminal can still observe a landing before cutoff.
+        // A timed restore cannot wait out the native front request. A landing
+        // that happens before the cutoff is still seen by the dispatch thread's
+        // confirmation wait or by the reply's terminal handling.
         let timed = inner.restore_deadline.is_some();
         let front_instant_ms = match inner.attempt.take() {
             CleanupTake::AlreadyTaken => return self.await_decision(inner),

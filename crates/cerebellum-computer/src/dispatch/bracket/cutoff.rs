@@ -137,7 +137,8 @@ impl CutoffGate {
         state.held = false;
     }
 
-    /// A committed post or its paired release occupied the restore window.
+    /// A committed post or its paired key release was still in progress when
+    /// the deadline passed, so the restore had to wait for it to finish.
     pub fn restore_deferred_for_post(&self) -> bool {
         self.state().deferred_for_post
     }
