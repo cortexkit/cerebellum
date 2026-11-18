@@ -1,18 +1,22 @@
+use super::notice::ThalamusNotice;
 use super::*;
 use crate::computer_capability::cursor::{Coordinator, Identity, SessionScope, TurnOutcome};
 use cerebellum_computer::cursor::{CursorEvent, CursorKind, CursorLine, PictureMotion};
+use cortexkit_bus_naming::AccountNames;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Mutex,
 };
 
 const SESSION: &str = "0123456789abcdef0123456789abcdef";
+const BROCA_SESSION: &str = "broca-route-session";
+const BROCA_EPOCH: &str = "9ff791461dcb486a0d391edf3c54fbde";
 
 #[derive(Default)]
 struct Fake {
     opened: AtomicUsize,
     closed: Arc<AtomicUsize>,
-    senders: Mutex<Vec<mpsc::Sender<Notice>>>,
+    senders: Mutex<Vec<mpsc::Sender<Delivery>>>,
     gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     refresh_after: AtomicU64,
 }
@@ -46,19 +50,35 @@ impl Transport for Fake {
 
 impl Fake {
     async fn emit(&self, agent: &str, kind: Kind, seq: u64) {
+        self.deliver(Delivery::Notice(Notice::Thalamus(ThalamusNotice {
+            module: "thalamus-harness",
+            agent: agent.into(),
+            session: SESSION.into(),
+            seq,
+            kind,
+        })))
+        .await;
+    }
+
+    async fn deliver(&self, delivery: Delivery) {
         let sender = self.senders.lock().unwrap().last().unwrap().clone();
-        sender
-            .send(Notice {
-                module: "thalamus-harness",
-                agent: agent.into(),
-                session: SESSION.into(),
-                seq,
-                kind,
-            })
-            .await
-            .unwrap();
+        sender.send(delivery).await.unwrap();
         settle().await;
     }
+}
+
+fn broca_event(event: &str, session: Option<&str>, seq: &str, epoch: &str) -> Delivery {
+    let names = AccountNames::derive("test").unwrap();
+    let subject = names.event_subject("broca", event, 1).unwrap();
+    Delivery::parse(&names, &subject, |header| match header {
+        "session" => session,
+        "seq" => Some(seq),
+        "epoch" => Some(epoch),
+        "session_ref" => Some("32db1a5342168526c10b5dedf01c1760"),
+        "Nats-Msg-Id" => Some("41d2d2353f40eef36aad76e5af8be4526af4e05bd36bcbbb5958f7ef30ea3e82"),
+        _ => None,
+    })
+    .unwrap()
 }
 
 async fn settle() {
@@ -74,15 +94,20 @@ fn setup() -> (Coordinator, mpsc::Receiver<CursorLine>, Arc<Fake>) {
     (cursor, lines, transport)
 }
 
-fn draw(cursor: &Coordinator) {
-    cursor.draw_for_test(&Identity::for_test(
+fn identity() -> Identity {
+    Identity::for_test(
         "agent-a",
         None,
         Some(SessionScope {
             scope_ref: "head-a".into(),
             epoch: 1,
         }),
-    ));
+    )
+    .with_route_session_for_test(BROCA_SESSION)
+}
+
+fn draw(cursor: &Coordinator) {
+    cursor.draw_for_test(&identity());
     cursor.send_scheduled_for_test(CursorEvent {
         agent: "agent-a".into(),
         initial: 'A',
@@ -117,6 +142,123 @@ async fn matching_turn_ended_hint_ends_the_badge() {
     settle().await;
     transport.emit("agent-a", Kind::Ended, 2).await;
     assert_eq!(hides(&mut lines), ["agent-a"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn matching_broca_run_ended_hides_the_badge() {
+    let (cursor, mut lines, transport) = setup();
+    draw(&cursor);
+    settle().await;
+    transport
+        .deliver(broca_event(
+            "run.ended",
+            Some(BROCA_SESSION),
+            "17",
+            BROCA_EPOCH,
+        ))
+        .await;
+    assert_eq!(hides(&mut lines), ["agent-a"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn broca_run_ended_hides_a_preview_without_badge_motion() {
+    let (cursor, mut lines, transport) = setup();
+    let showing = cursor.show_preview_for_test(&identity());
+    let line = lines.try_recv().unwrap();
+    assert!(matches!(line, CursorLine::Preview(_)));
+    cursor.confirm_write_for_test(&line);
+    settle().await;
+    assert!(showing());
+    transport
+        .deliver(broca_event(
+            "run.ended",
+            Some(BROCA_SESSION),
+            "17",
+            BROCA_EPOCH,
+        ))
+        .await;
+    assert_eq!(hides(&mut lines), ["agent-a"]);
+    assert!(!showing());
+}
+
+#[tokio::test(start_paused = true)]
+async fn broca_run_ended_requires_the_matching_plain_route_session() {
+    let (cursor, mut lines, transport) = setup();
+    draw(&cursor);
+    settle().await;
+    for session in [None, Some(""), Some("another-route"), Some("head-a")] {
+        transport
+            .deliver(broca_event("run.ended", session, "17", BROCA_EPOCH))
+            .await;
+        assert!(hides(&mut lines).is_empty(), "session {session:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn broca_start_and_pause_leave_the_badge_and_fence_older_ends() {
+    for event in ["run.started", "run.paused"] {
+        let (cursor, mut lines, transport) = setup();
+        draw(&cursor);
+        settle().await;
+        transport
+            .deliver(broca_event(event, Some(BROCA_SESSION), "20", BROCA_EPOCH))
+            .await;
+        assert!(hides(&mut lines).is_empty(), "{event} must not hide");
+        draw(&cursor);
+        transport
+            .deliver(broca_event(
+                "run.ended",
+                Some(BROCA_SESSION),
+                "19",
+                BROCA_EPOCH,
+            ))
+            .await;
+        assert!(
+            hides(&mut lines).is_empty(),
+            "{event} must fence older ends"
+        );
+        transport
+            .deliver(broca_event(
+                "run.ended",
+                Some(BROCA_SESSION),
+                "2",
+                "1624d0ef0d1e218eb93aed2001791fd7",
+            ))
+            .await;
+        assert_eq!(
+            hides(&mut lines),
+            ["agent-a"],
+            "a new epoch resets the sequence"
+        );
+    }
+}
+
+#[test]
+fn broca_health_distinguishes_received_missing_session_and_matched() {
+    let gauges = HintGauges::default();
+    let mut sequences = BrocaSequences::default();
+    for (session, seq) in [
+        (None, "17"),
+        (Some("another-route"), "17"),
+        (Some(BROCA_SESSION), "17"),
+        (Some(BROCA_SESSION), "17"),
+    ] {
+        dispatch(
+            broca_event("run.ended", session, seq, BROCA_EPOCH),
+            &mut sequences,
+            &|notice| match notice {
+                Notice::Broca(hint) if hint.session == BROCA_SESSION => 2,
+                _ => 0,
+            },
+            &gauges,
+        );
+    }
+    let mut health = serde_json::Map::new();
+    gauges.insert_into(&mut health);
+    assert_eq!(health["turnHintBrocaEventsReceived"], 4);
+    assert_eq!(health["turnHintBrocaMissingSession"], 1);
+    assert_eq!(health["turnHintBrocaEventsMatched"], 1);
+    assert_eq!(health["turnHintBadgesEnded"], 2);
 }
 
 #[tokio::test(start_paused = true)]

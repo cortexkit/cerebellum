@@ -655,7 +655,7 @@ mod tests {
                 badge: "agent-a".into(),
                 avatar_agent: Some("agent-a".into()),
                 call: None,
-                session: None,
+                session: Default::default(),
             },
             cerebellum_computer::cursor::CursorKind::Reading,
             cerebellum_computer::platform::ProcessGrant {

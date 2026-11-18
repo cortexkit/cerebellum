@@ -5,7 +5,7 @@ use cortexkit_bus_naming::AccountNames;
 use futures_util::{future::BoxFuture, StreamExt};
 use subc_client_rs::{consumer::ConsumerOptions, SubcConsumer};
 
-use super::{notice, Connection, Notice, OpenFailure, Transport};
+use super::{notice, Connection, Delivery, OpenFailure, Transport};
 
 pub(crate) struct LiveTransport {
     connection_file: PathBuf,
@@ -48,7 +48,9 @@ impl Transport for LiveTransport {
             let mut changes = client.connection_changes();
             let connection = client.connection();
             let mut subscribers = Vec::new();
-            for subject in notice::subjects(&names).map_err(|_| OpenFailure::Unavailable)? {
+            for subject in
+                notice::subjects(&names, &self.module).map_err(|_| OpenFailure::Unavailable)?
+            {
                 subscribers.push(
                     connection
                         .subscribe(&subject)
@@ -69,17 +71,15 @@ impl Transport for LiveTransport {
                         message = messages.next() => message,
                     };
                     let Some(message) = message else { break };
-                    let Some(headers) = message.headers.as_ref() else {
-                        continue;
+                    let header = |name: &str| {
+                        message
+                            .headers
+                            .as_ref()?
+                            .get_last(name)
+                            .map(|value| value.as_str())
                     };
-                    let header = |name: &str| headers.get_last(name).map(|value| value.as_str());
-                    if let Some(notice) = Notice::parse(
-                        &names,
-                        message.subject.as_str(),
-                        header(notice::KEY_HEADER),
-                        header("agent"),
-                        header("session_ref"),
-                    ) {
+                    if let Some(notice) = Delivery::parse(&names, message.subject.as_str(), header)
+                    {
                         if sender.send(notice).await.is_err() {
                             break;
                         }

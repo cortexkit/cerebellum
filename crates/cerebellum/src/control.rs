@@ -447,6 +447,9 @@ async fn send_principal_denied(
 ///   `turnHintBadgesEnded`, plus `turnHintActiveBadges` (visible cursor badges
 ///   or previews), `turnHintSubscriptionOpen`, and `turnHintLastOpenFailureReason`
 ///   (`timeout`, `unavailable`, or `null` before the first failure);
+///   `turnHintBrocaEventsReceived`, `turnHintBrocaMissingSession`, and
+///   `turnHintBrocaEventsMatched` count Broca run events, events without a plain
+///   session header, and end events that hid at least one badge or preview;
 /// - `userBrowserConnections` and `userBrowserDisconnects`, how many Chrome
 ///   extension native-host connections were accepted (after the host's hello
 ///   was verified) and how many of them ended; `userBrowserConnectedAtMs` and
