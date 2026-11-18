@@ -526,6 +526,12 @@ struct ScreenState {
     restores_ignored: usize,
     /// Whether the restore host's second route to the front works.
     fallback_works: bool,
+    /// The process a registration told the restore host it will put back.
+    remembered_previous: Option<u32>,
+    /// The restore host refuses to ask for any process it was not told to
+    /// put back, as the macOS host does, which checks that process's
+    /// start time before asking.
+    restore_needs_remembered_previous: bool,
     /// The target comes to the front again at each of these instants, as an
     /// activation delivered more than once does.
     landings_at: Vec<u64>,
@@ -576,6 +582,8 @@ impl Screen {
                 person_key_pending: false,
                 restores_ignored: 0,
                 fallback_works: false,
+                remembered_previous: None,
+                restore_needs_remembered_previous: false,
                 landings_at: Vec::new(),
             })),
             desk: desk.clone(),
@@ -715,6 +723,13 @@ impl FrontingRestoreHost for FakeRestore {
             if pid != TARGET {
                 state.restore_requested_at.push(std::time::Instant::now());
             }
+            if pid != TARGET
+                && state.restore_needs_remembered_previous
+                && state.remembered_previous != Some(pid)
+            {
+                state.log.push(format!("restore-refused:{pid}"));
+                return false;
+            }
             if pid != TARGET && state.restores_ignored > 0 {
                 state.restores_ignored -= 1;
                 state.log.push(format!("restore:{pid}"));
@@ -722,6 +737,9 @@ impl FrontingRestoreHost for FakeRestore {
             }
         }
         self.0.front("restore", pid)
+    }
+    fn remember_previous(&mut self, pid: u32) {
+        self.0.state().remembered_previous = Some(pid);
     }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
         if self.0.state().fallback_works {

@@ -727,12 +727,12 @@ impl ObligationParts {
     ) -> Option<Arc<RestoreCell>> {
         let lock = self.lock.take()?;
         let mut host = host;
-        if self.restore_fallback {
-            // The restore host's second route to the front only ever
-            // activates this process, so a pid reused meanwhile is never
-            // brought forward.
-            host.remember_previous(previous);
-        }
+        // Every restore route checks it is still putting back this process,
+        // so a pid reused meanwhile is never brought forward. Remembered for
+        // every front: takeover fronts have no second route
+        // (`restore_fallback` stays false), but their one route checks it
+        // too.
+        host.remember_previous(previous);
         self.terminal
             .register_restore(RestoreObligation {
                 previous_pid: previous,
