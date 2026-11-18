@@ -486,11 +486,11 @@ mod tests {
         now: Instant,
         wait_status: Option<i32>,
         write_error: Option<std::io::ErrorKind>,
+        screen_locked: Option<bool>,
+        launch_fails: bool,
     }
     struct FakeLauncher {
         stats: Arc<Mutex<Stats>>,
-        screen: Option<bool>,
-        fail: bool,
     }
     struct FakeHelper(Arc<Mutex<Stats>>);
     impl Helper for FakeHelper {
@@ -523,7 +523,7 @@ mod tests {
     impl Launcher for FakeLauncher {
         type Helper = FakeHelper;
         fn screen_unlocked(&self) -> bool {
-            self.screen == Some(false)
+            self.stats.lock().unwrap().screen_locked == Some(false)
         }
         fn now(&self) -> Instant {
             self.stats.lock().unwrap().now
@@ -531,7 +531,7 @@ mod tests {
         fn launch(&mut self, _: Option<Instant>) -> Result<FakeHelper, &'static str> {
             let mut stats = self.stats.lock().unwrap();
             stats.launches += 1;
-            if self.fail {
+            if stats.launch_fails {
                 return Err("mouse-down recipient helper pinned executable unavailable");
             }
             stats.alive = true;
@@ -556,13 +556,13 @@ mod tests {
             now: Instant::now(),
             wait_status: None,
             write_error: None,
+            screen_locked: screen,
+            launch_fails: fail,
         }));
         (
             Service::start(
                 FakeLauncher {
                     stats: stats.clone(),
-                    screen,
-                    fail,
                 },
                 gauges,
             ),
@@ -687,6 +687,52 @@ mod tests {
     }
 
     #[test]
+    fn next_preview_retries_after_unlock_without_spending_a_launch_attempt_while_locked() {
+        let (service, stats) = fixture(Some(true), false);
+        let owner = Arc::new(State::default());
+        let line = CursorLine::Preview(CursorPreview {
+            preview_agent: "agent".into(),
+            preview_generation: 1,
+            preview_slot: 0,
+            preview_window: 12,
+            preview_app: "TextEdit".into(),
+            preview_aspect: [100.0, 100.0],
+            preview_label: None,
+            preview_fallback: None,
+            preview_icon_path: None,
+        });
+        let locked = service.write(&owner, &line);
+        assert!(!locked.written);
+        assert_eq!(locked.failure, NoFrameReason::ScreenLockedOrUnreadable);
+        assert_eq!(stats.lock().unwrap().launches, 0);
+        stats.lock().unwrap().screen_locked = Some(false);
+        assert!(service.write(&owner, &line).written);
+        assert_eq!(stats.lock().unwrap().launches, 1);
+        service.stop();
+    }
+
+    #[test]
+    fn repeated_failed_launches_retry_on_demand_after_the_cause_is_gone() {
+        let (service, stats) = fixture(Some(false), true);
+        for _ in 0..2 {
+            assert_eq!(
+                service.prewarm(deadline()),
+                Err("mouse-down recipient helper pinned executable unavailable")
+            );
+            assert_eq!(
+                service.prewarm(deadline()),
+                Err("mouse-down recipient helper restart limit reached")
+            );
+            stats.lock().unwrap().now += Duration::from_secs(60);
+        }
+        assert_eq!(stats.lock().unwrap().launches, 2);
+        stats.lock().unwrap().launch_fails = false;
+        assert_eq!(service.prewarm(deadline()), Ok(()));
+        assert_eq!(stats.lock().unwrap().launches, 3);
+        service.stop();
+    }
+
+    #[test]
     fn queries_and_visuals_share_the_same_child_and_restart_limit() {
         let (service, stats) = fixture(Some(false), false);
         assert!(
@@ -723,13 +769,15 @@ mod tests {
             let mut stats = stats.lock().unwrap();
             assert_eq!(stats.launches, 2);
             stats.alive = false;
-            stats.now += Duration::from_secs(61);
         }
         assert_eq!(
             service.query([10.0, 20.0], deadline()),
             Err("mouse-down recipient helper restart limit reached")
         );
         assert_eq!(stats.lock().unwrap().launches, 2);
+        stats.lock().unwrap().now += Duration::from_secs(60);
+        assert_eq!(service.query([10.0, 20.0], deadline()), Ok(Some(77)));
+        assert_eq!(stats.lock().unwrap().launches, 3);
         service.stop();
     }
 

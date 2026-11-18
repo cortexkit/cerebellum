@@ -7,6 +7,14 @@ impl Coordinator {
         self.send_line(CursorLine::Preview(preview))
     }
 
+    pub(crate) fn hide_idle_preview(&self, agent: &str) {
+        self.send_line(CursorLine::Hide(CursorHide::new(agent)));
+        #[cfg(any(target_os = "macos", test))]
+        if let Some(listener) = self.0.turn_hints.get() {
+            listener.ended(agent);
+        }
+    }
+
     /// Queue a frame for an agent's preview. It never waits and never starts
     /// the helper, and it is not an action: the badge's idle clock is not
     /// restarted by it. At most one frame per agent waits for the pipe; a

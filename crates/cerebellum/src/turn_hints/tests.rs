@@ -121,6 +121,56 @@ async fn matching_turn_ended_hint_ends_the_badge() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_preview_without_motion_opens_hints_and_hides_on_either_turn_end() {
+    for direct in [false, true] {
+        let (cursor, mut lines, transport) = setup();
+        let showing = cursor.show_preview_for_test(&Identity::for_test(
+            "agent-a",
+            None,
+            Some(SessionScope {
+                scope_ref: "head-a".into(),
+                epoch: 1,
+            }),
+        ));
+        let line = lines.try_recv().unwrap();
+        assert!(matches!(line, CursorLine::Preview(_)));
+        settle().await;
+        assert_eq!(
+            transport.opened.load(Ordering::SeqCst),
+            0,
+            "enqueue is not a confirmed write"
+        );
+        cursor.confirm_write_for_test(&line);
+        settle().await;
+        assert_eq!(
+            transport.opened.load(Ordering::SeqCst),
+            1,
+            "a written preview counts as drawn without motion"
+        );
+        assert!(showing());
+        if direct {
+            assert!(cursor.turn_ended(SESSION, Some("head-a"), TurnOutcome::Completed));
+        } else {
+            transport.emit("agent-a", Kind::Ended, 2).await;
+        }
+        assert_eq!(hides(&mut lines), ["agent-a"]);
+        assert!(!showing());
+        cursor.confirm_write_for_test(&line);
+        settle().await;
+        tokio::time::advance(LINGER - Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(transport.closed.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(
+            transport.closed.load(Ordering::SeqCst),
+            1,
+            "an obsolete write must not keep hints subscribed"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn another_agents_turn_ended_hint_ends_nothing() {
     let (cursor, mut lines, transport) = setup();
     draw(&cursor);
