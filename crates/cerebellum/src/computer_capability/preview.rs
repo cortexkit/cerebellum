@@ -24,10 +24,9 @@
 //!   latest window, and every preview shows the application's icon. A frame
 //!   that answers late is sent only if its preview still shows that window
 //!   in the same generation. A hidden preview has no capture and no timer.
-//! - A preview whose agent has not acted for the badge's idle timeout is
-//!   taken for hidden, as the helper hides it then: its slot is free for the
-//!   next agent, and it is never refreshed again. Nothing times this; it is
-//!   noticed the next time an agent asks for a slot.
+//! - Once the badge's idle timeout expires, the worker hides the preview
+//!   and frees its slot even if the helper did not run its own fade. No idle
+//!   timer remains after the last preview is hidden.
 //! - A minimized window shows the application's icon with `minimized`, and
 //!   nothing is captured of it.
 //! - Without `preview_capture_admitted` (set only when this build carries
@@ -310,6 +309,7 @@ pub(crate) struct PreviewJpeg {
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Step {
     capture_wait_elapsed: bool,
+    hides: Vec<String>,
     /// Preview lines to send now: previews switching to their icon.
     pub(crate) lines: Vec<CursorPreview>,
     /// A capture to request now.
@@ -376,7 +376,11 @@ impl Shown {
     /// Whether the helper has faded it out by `now`: no action in flight and
     /// none for `PREVIEW_IDLE`.
     fn idle(&self, now: Instant) -> bool {
-        !self.in_flight && now.saturating_duration_since(self.last_active) >= PREVIEW_IDLE
+        self.idle_at().is_some_and(|at| now >= at)
+    }
+
+    fn idle_at(&self) -> Option<Instant> {
+        (!self.in_flight).then(|| self.last_active + PREVIEW_IDLE)
     }
 }
 
@@ -420,10 +424,8 @@ impl Schedule {
 
     /// Hold a slot for the agent before its window is read, so whether it
     /// gets a preview is known at once: `None` when every slot is held by
-    /// another agent (`not_shown_capacity`). A preview gone idle by `now`
-    /// counts as hidden and frees its slot first.
-    pub(crate) fn reserve(&mut self, agent: &str, now: Instant) -> Option<u8> {
-        self.expire_idle(now);
+    /// another agent (`not_shown_capacity`).
+    fn reserve(&mut self, agent: &str) -> Option<u8> {
         self.slots.assign(agent)
     }
 
@@ -437,22 +439,24 @@ impl Schedule {
     }
 
     /// Whether the agent's preview is showing at `now`.
+    #[cfg(test)]
     pub(crate) fn is_shown(&self, agent: &str, now: Instant) -> bool {
         self.shown.get(agent).is_some_and(|shown| !shown.idle(now))
     }
 
-    /// Forget every preview the helper has faded out by `now`, freeing its
-    /// slot. A later action shows it anew, in a new generation.
-    fn expire_idle(&mut self, now: Instant) {
+    /// Free every idle preview's slot and tell the helper to remove its panel.
+    /// A later action shows it anew, in a new generation.
+    fn expire_idle(&mut self, now: Instant) -> Vec<String> {
         let idle: Vec<String> = self
             .shown
             .iter()
             .filter(|(_, shown)| shown.idle(now))
             .map(|(agent, _)| agent.clone())
             .collect();
-        for agent in idle {
-            self.hide(&agent);
+        for agent in &idle {
+            self.hide(agent);
         }
+        idle
     }
 
     /// Show the agent's preview of `request.window`, or keep showing it with
@@ -465,7 +469,6 @@ impl Schedule {
         request: PreviewRequest,
         now: Instant,
     ) -> (ShowOutcome, Option<CursorPreview>) {
-        self.expire_idle(now);
         let Some(slot) = self.slots.assign(&request.agent) else {
             return (ShowOutcome::NotShownCapacity, None);
         };
@@ -583,12 +586,16 @@ impl Schedule {
 
     /// What to do at `now`.
     pub(crate) fn next(&mut self, now: Instant) -> Step {
-        let mut step = Step::default();
+        let mut step = Step {
+            hides: self.expire_idle(now),
+            wake_at: self.shown.values().filter_map(Shown::idle_at).min(),
+            ..Step::default()
+        };
         if let Some(outstanding) = &mut self.outstanding {
             if !outstanding.timed_out {
                 let deadline = outstanding.submitted + self.capture_timeout;
                 if now < deadline {
-                    step.wake_at = Some(deadline);
+                    step.wake_by(deadline);
                     return step;
                 }
                 outstanding.timed_out = true;
@@ -638,16 +645,19 @@ impl Schedule {
                     target: shown.target.clone(),
                     max_px: shown.max_px,
                 });
-                step.wake_at = Some(now + self.capture_timeout);
+                step.wake_by(now + self.capture_timeout);
                 return step;
             }
         }
-        step.wake_at = self
+        if let Some(refresh_at) = self
             .shown
             .values()
             .filter(|shown| shown.in_flight && shown.icon != Some(IconCause::Minimized))
             .filter_map(|shown| shown.last_submit.map(|at| at + refresh))
-            .min();
+            .min()
+        {
+            step.wake_by(refresh_at);
+        }
         step
     }
 
@@ -723,10 +733,18 @@ impl Schedule {
     }
 }
 
+impl Step {
+    fn wake_by(&mut self, at: Instant) {
+        self.wake_at = Some(self.wake_at.map_or(at, |wake| wake.min(at)));
+    }
+}
+
 /// Where preview lines go: the agent-cursor helper's pipe.
 pub(crate) trait PreviewOutput: Send + Sync {
     /// Send a preview line. It may start the helper.
     fn preview(&self, line: CursorPreview) -> bool;
+    /// Remove an idle preview without waiting for the helper's fade.
+    fn hide_idle(&self, agent: &str);
     /// Queue a frame. It never starts the helper.
     fn frame(&self, frame: CursorFrame) -> Result<(), NoFrameReason>;
 }
@@ -734,6 +752,10 @@ pub(crate) trait PreviewOutput: Send + Sync {
 impl PreviewOutput for super::cursor::Coordinator {
     fn preview(&self, line: CursorPreview) -> bool {
         self.send_preview(line)
+    }
+
+    fn hide_idle(&self, agent: &str) {
+        self.hide_idle_preview(agent);
     }
 
     fn frame(&self, frame: CursorFrame) -> Result<(), NoFrameReason> {
@@ -1016,7 +1038,11 @@ impl PreviewWorker {
 
     /// Hold a slot for the agent, as `Schedule::reserve` decides.
     pub(crate) fn reserve(&self, agent: &str) -> Option<u8> {
-        self.shared.lock().schedule.reserve(agent, Instant::now())
+        let mut locked = self.shared.lock();
+        for idle in locked.schedule.expire_idle(Instant::now()) {
+            self.shared.output.hide_idle(&idle);
+        }
+        locked.schedule.reserve(agent)
     }
 
     /// Give back a slot held for a preview that was not shown.
@@ -1024,7 +1050,13 @@ impl PreviewWorker {
         self.shared.lock().schedule.release_unshown(agent);
     }
 
+    /// Whether a hide may still need to be queued before drawing on screen.
+    pub(crate) fn has_preview(&self, agent: &str) -> bool {
+        self.shared.lock().schedule.shown.contains_key(agent)
+    }
+
     /// Whether the agent's preview is showing.
+    #[cfg(test)]
     pub(crate) fn is_shown(&self, agent: &str) -> bool {
         self.shared.lock().schedule.is_shown(agent, Instant::now())
     }
@@ -1032,13 +1064,33 @@ impl PreviewWorker {
     /// Show or retarget the agent's preview, as `Schedule::show` decides.
     pub(crate) fn show(&self, request: PreviewRequest) -> ShowOutcome {
         let mut locked = self.shared.lock();
-        let (outcome, line) = locked.schedule.show(request, Instant::now());
+        let now = Instant::now();
+        for idle in locked.schedule.expire_idle(now) {
+            self.shared.output.hide_idle(&idle);
+        }
+        let (outcome, line) = locked.schedule.show(request, now);
         if line.is_some_and(|line| !self.shared.output.preview(line)) {
             self.shared.gauges.show_enqueue_dropped();
         }
         drop(locked);
         self.shared.changed.notify_all();
         outcome
+    }
+
+    #[cfg(any(test, target_os = "macos"))]
+    pub(crate) fn if_current(&self, line: &CursorPreview, activity: impl FnOnce()) {
+        let locked = self.shared.lock();
+        if !locked.stopped
+            && locked
+                .schedule
+                .shown
+                .get(&line.preview_agent)
+                .is_some_and(|shown| {
+                    shown.generation() == line.preview_generation && !shown.idle(Instant::now())
+                })
+        {
+            activity();
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1170,6 +1222,9 @@ fn run(shared: &Shared, jobs: &std::sync::mpsc::Sender<CaptureJob>) {
             return;
         }
         let step = locked.schedule.next(Instant::now());
+        for agent in step.hides {
+            shared.output.hide_idle(&agent);
+        }
         if step.capture_wait_elapsed {
             shared.gauges.capture_wait_elapsed();
         }
@@ -1373,11 +1428,22 @@ mod tests {
         }
     }
 
-    /// The helper fades an agent's preview out once the agent has not
-    /// acted for the badge's idle timeout. The module then takes it for
-    /// hidden: its slot goes to the next new agent, nothing is captured or
-    /// timed for it, and its agent's next action shows it in a new
-    /// generation. No timer runs while waiting for that.
+    #[test]
+    fn a_resting_preview_wakes_at_the_badge_idle_deadline() {
+        let now = Instant::now();
+        // This preview has no motion or capture; only its idle hide needs a timer.
+        let mut schedule = Schedule::new(false, Duration::from_secs(2));
+        schedule.show(request("a", 10), now);
+        assert_eq!(schedule.next(now).wake_at, Some(now + PREVIEW_IDLE));
+        let step = schedule.next(now + PREVIEW_IDLE);
+        assert_eq!(step.hides, ["a"]);
+        assert_eq!(step.submit, None);
+        assert_eq!(step.wake_at, None);
+        assert!(schedule.next(now + PREVIEW_IDLE).hides.is_empty());
+    }
+
+    /// After the badge's idle deadline, every expired preview is hidden and
+    /// its slot can be reused. No idle timer stays armed for a hidden preview.
     #[test]
     fn an_idle_preview_frees_its_slot_and_is_never_refreshed() {
         let mut schedule = admitted();
@@ -1397,20 +1463,22 @@ mod tests {
             schedule.answered(&job, Ok(jpeg()));
         }
         let step = schedule.next(now);
-        assert_eq!(step.wake_at, None, "a timer runs while waiting to idle");
+        assert_eq!(step.wake_at, Some(now + PREVIEW_IDLE));
         // Just before the timeout every slot is still held.
         let almost = now + PREVIEW_IDLE - Duration::from_millis(1);
-        assert_eq!(schedule.reserve("d", almost), None);
+        assert_eq!(schedule.reserve("d"), None);
         assert!(schedule.is_shown("a", almost));
         // At it, every idle preview is gone: a new agent takes the top
         // slot, and nothing more is captured for the idle ones.
         let idle = now + PREVIEW_IDLE;
         assert!(!schedule.is_shown("a", idle));
-        assert_eq!(schedule.reserve("d", idle), Some(0));
         let step = schedule.next(idle);
+        assert_eq!(step.hides, ["a", "b", "c"]);
+        assert_eq!(schedule.reserve("d"), Some(0));
         assert_eq!(step.submit, None, "an idle preview was captured");
         assert_eq!(step.wake_at, None, "an idle preview has a timer");
         // The idle agent's next action shows its preview anew.
+        schedule.release_unshown("d");
         let (ShowOutcome::Shown { generation, .. }, _) = schedule.show(request("a", 10), idle)
         else {
             panic!("not shown");
@@ -1434,13 +1502,13 @@ mod tests {
         }
         assert_eq!(submitted, [0, 500, 1_000]);
         // Settling asks for one more at once.
-        schedule.action_settled("a", Instant::now());
         let at = now + Duration::from_millis(1_420);
+        schedule.action_settled("a", at);
         let job = schedule.next(at).submit.expect("a refresh after settling");
         schedule.answered(&job, Ok(jpeg()));
         let step = schedule.next(at + Duration::from_millis(1));
         assert_eq!(step.submit, None);
-        assert_eq!(step.wake_at, None, "a timer runs with no action in flight");
+        assert_eq!(step.wake_at, Some(at + PREVIEW_IDLE));
     }
 
     /// An unanswered request blocks every other one, for every agent, until
@@ -1478,14 +1546,11 @@ mod tests {
             .map(|line| line.preview_agent.as_str())
             .collect();
         assert_eq!(icons, ["a", "b"]);
-        assert_eq!(
-            step.wake_at, None,
-            "a timer runs while waiting for the answer"
-        );
+        assert!(step.wake_at.is_some_and(|at| at >= now + PREVIEW_IDLE));
         // A preview shown while the request is stuck shows its icon at once.
         let (_, line) = schedule.show(request("c", 30), Instant::now());
         assert!(icon(&line.unwrap()));
-        for later in [2_500, 10_000, 600_000] {
+        for later in [2_500, 10_000] {
             assert_eq!(
                 schedule.next(now + Duration::from_millis(later)).submit,
                 None,
@@ -1499,7 +1564,8 @@ mod tests {
         assert!(late.lines.is_empty());
         assert_eq!(late.no_frame, Some(NoFrameReason::Stale));
         let mut captured = Vec::new();
-        let mut at = now + Duration::from_millis(600_001);
+        // Let the outstanding capture answer before the other previews idle.
+        let mut at = now + Duration::from_millis(10_001);
         while let Some(job) = schedule.next(at).submit {
             captured.push((job.agent.clone(), job.window));
             schedule.answered(&job, Ok(jpeg()));
@@ -1841,6 +1907,7 @@ mod tests {
     enum Sent {
         Preview(CursorPreview),
         Frame(CursorFrame),
+        Hide(String),
     }
 
     #[derive(Default)]
@@ -1870,6 +1937,10 @@ mod tests {
         fn preview(&self, line: CursorPreview) -> bool {
             self.sent().push(Sent::Preview(line));
             true
+        }
+
+        fn hide_idle(&self, agent: &str) {
+            self.sent().push(Sent::Hide(agent.to_owned()));
         }
 
         fn frame(&self, frame: CursorFrame) -> Result<(), NoFrameReason> {
@@ -1924,6 +1995,34 @@ mod tests {
     /// timing out is reached quickly; nothing is asserted about how long
     /// anything takes.
     const SHORT_WAIT: Duration = Duration::from_millis(20);
+
+    #[test]
+    fn the_worker_sends_an_idle_hide_without_another_action() {
+        let output = Arc::new(Recorder::default());
+        let worker = PreviewWorker::spawn(output.clone(), Arc::new(NoPreviewCapture), false);
+        worker.show(request("a", 10));
+        let expired = Instant::now().checked_sub(PREVIEW_IDLE).unwrap();
+        worker
+            .shared
+            .lock()
+            .schedule
+            .shown
+            .get_mut("a")
+            .unwrap()
+            .last_active = expired;
+        worker.shared.changed.notify_all();
+        wait_for("the idle hide", || {
+            output
+                .sent()
+                .iter()
+                .any(|sent| matches!(sent, Sent::Hide(agent) if agent == "a"))
+        });
+        assert!(!worker.has_preview("a"));
+        assert_eq!(
+            worker.shared.lock().schedule.next(Instant::now()).wake_at,
+            None
+        );
+    }
 
     #[test]
     fn a_queued_capture_is_dropped_if_the_preview_was_hidden_before_pickup() {
@@ -2092,6 +2191,7 @@ mod tests {
             fn frame(&self, _: CursorFrame) -> Result<(), NoFrameReason> {
                 Err(NoFrameReason::NoWriter)
             }
+            fn hide_idle(&self, _: &str) {}
         }
         static GAUGES: PreviewGauges = PreviewGauges::new();
         let capture = Arc::new(Held::default());

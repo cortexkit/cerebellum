@@ -166,7 +166,7 @@ impl Badges {
             let preview_is_shown = self
                 .preview
                 .running()
-                .is_some_and(|worker| worker.is_shown(identity.badge()));
+                .is_some_and(|worker| worker.has_preview(identity.badge()));
             if preview_is_shown {
                 self.cursor.end(identity.badge());
             }
