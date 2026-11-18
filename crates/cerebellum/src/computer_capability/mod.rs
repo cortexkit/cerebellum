@@ -148,6 +148,11 @@ pub(crate) fn preview_capture_requests() -> u64 {
 pub(crate) fn preview_frames_written() -> u64 {
     preview::PREVIEW_GAUGES.frames_written()
 }
+
+#[cfg(target_os = "macos")]
+pub(crate) fn preview_diagnostics() -> serde_json::Value {
+    preview::PREVIEW_GAUGES.report()
+}
 #[cfg(test)]
 mod preview_wire_tests;
 mod quarantine;

@@ -59,7 +59,6 @@ const SIG_BLOCK: c_int = 1;
 const SIG_IGN: usize = 1;
 #[cfg(test)]
 const SIG_ERR: usize = usize::MAX;
-#[cfg(test)]
 const WNOHANG: c_int = 1;
 #[cfg(test)]
 const O_ACCMODE: c_int = 3;
@@ -450,6 +449,23 @@ pub struct ReleasedChild {
 impl ReleasedChild {
     pub fn generation(&self) -> ProcessGeneration {
         self.generation
+    }
+
+    /// Reap an exited child without waiting; the returned value is its raw
+    /// `waitpid` status. The handle still owns a running child.
+    pub fn try_wait_status(&mut self) -> Option<i32> {
+        if self.reaped {
+            return None;
+        }
+        let pid = self.generation.pid as c_int;
+        let mut status = 0;
+        // SAFETY: waitpid only observes/reaps our child and writes a c_int.
+        if unsafe { waitpid(pid, &mut status, WNOHANG) } == pid {
+            self.reaped = true;
+            Some(status)
+        } else {
+            None
+        }
     }
 
     /// Wait until the target exits and reap it in the launcher.

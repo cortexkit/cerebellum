@@ -1,5 +1,5 @@
 use super::super::preview::{
-    CaptureJob, PreviewCapturer, PreviewJpeg, PreviewPlane, PreviewRefused,
+    CaptureJob, NoFrameReason, PreviewCapturer, PreviewJpeg, PreviewPlane,
 };
 use super::*;
 use cerebellum_computer::app_state::source::{
@@ -73,7 +73,7 @@ impl AppStateSource for Geometry {
 struct Capture;
 
 impl PreviewCapturer for Capture {
-    fn capture(&self, _: &CaptureJob) -> Result<PreviewJpeg, PreviewRefused> {
+    fn capture(&self, _: &CaptureJob) -> Result<PreviewJpeg, NoFrameReason> {
         Ok(PreviewJpeg {
             size: [4, 3],
             jpeg: vec![0xff, 0xd8, 0xff, 0xd9],

@@ -430,6 +430,14 @@ async fn send_principal_denied(
 ///   started, so an idle preview can be seen to cost nothing;
 /// - on macOS, `cursorHelperBinaryUnavailable`, whether the helper's executable
 ///   could not be captured or verified against the module's startup executable;
+/// - on macOS, `previewNoFrameReasons` counts terminal capture or delivery
+///   losses by stage; `previewCaptureWaitTimeouts` counts expired waits even
+///   if a frame arrives late, and `previewShowEnqueueDrops` counts show or
+///   retarget messages that could not be queued for the helper;
+/// - on macOS, `cursorHelperStartOutcomes`, `cursorHelperLastStartFailure`,
+///   `cursorHelperExitReasons`, `cursorHelperLastWaitStatus`,
+///   `cursorHelperReplyReaderDisconnects`, and `cursorHelperPid` distinguish
+///   an unavailable helper from a refused capture or failed frame write;
 /// - `turnEndedReceived`, `turnEndedRefused`, and `turnEndedMatchedBadge`, the
 ///   process-lifetime counts for the quiet `session.turn_ended` adapter, plus
 ///   `turnEndedLastAtMs`, its last admitted event timestamp or `null`;
@@ -454,8 +462,9 @@ async fn send_principal_denied(
 ///   timestamp-only hardware observer is running and how often it recovered
 ///   from a disabled tap. Reading health never starts the observer.
 ///
-/// All are atomics, so reading them keeps the health lane insulated, and
-/// none changes the status.
+/// Counters are atomic and none changes the status. The helper PID, when
+/// present, is checked against the OS process-start time without waiting on
+/// its transport.
 pub(super) fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlResponse {
     if let ModuleControlResponse::HealthCheck {
         metrics: Some(serde_json::Value::Object(metrics)),
@@ -493,6 +502,14 @@ pub(super) fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleCo
                 "previewFramesWritten".into(),
                 json!(computer_capability::preview_frames_written()),
             );
+            for report in [
+                computer_capability::preview_diagnostics(),
+                computer_capability::cursor::helper_health(),
+            ] {
+                if let serde_json::Value::Object(fields) = report {
+                    metrics.extend(fields);
+                }
+            }
         }
         metrics.insert(
             "privateStateTightenFailures".to_string(),

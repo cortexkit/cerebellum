@@ -354,6 +354,19 @@ pub enum SingleWindowCaptureError {
     Capture(CaptureError),
 }
 
+/// The stage that refused a preview frame, without any window or backend text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewWindowCaptureError {
+    Permission(CaptureError),
+    Enumeration,
+    NoWindow,
+    Capture,
+    Owner,
+    InvalidSize,
+    Encode,
+    FrameSize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WindowChangeKind {
@@ -833,14 +846,18 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         now_ms: u64,
         window_id: &str,
         max_px: [u32; 2],
-    ) -> Result<PreviewWindowFrame, SingleWindowCaptureError> {
-        self.ready_for_single_window(now_ms)?;
+    ) -> Result<PreviewWindowFrame, PreviewWindowCaptureError> {
+        use PreviewWindowCaptureError as Refused;
+        self.check_single_window_permission(now_ms)
+            .map_err(Refused::Permission)?;
+        self.refresh_if_needed(now_ms)
+            .map_err(|_| Refused::Enumeration)?;
         let window = self
             .windows
             .iter()
             .find(|window| window.window_id == window_id)
             .cloned()
-            .ok_or(SingleWindowCaptureError::NoWindow)?;
+            .ok_or(Refused::NoWindow)?;
         let request = WindowCaptureRequest {
             target: self.target.clone(),
             filter: DesktopIndependentWindowFilter::new(window.window_id.clone()),
@@ -850,16 +867,15 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         let pending = self
             .backend
             .capture_window_unencoded_for_vision(&request)
-            .map_err(|error| SingleWindowCaptureError::Capture(error.into()))?;
-        self.verify_vision_owner(&pending.frame)?;
+            .map_err(|_| Refused::Capture)?;
+        self.verify_vision_owner(&pending.frame)
+            .map_err(|_| Refused::Owner)?;
         let (mut width_px, mut height_px) = preview_scaled_size(
             pending.frame.captured_width_px,
             pending.frame.captured_height_px,
             max_px,
         )
-        .ok_or(SingleWindowCaptureError::Capture(
-            CaptureError::CaptureScopeUnavailable,
-        ))?;
+        .ok_or(Refused::InvalidSize)?;
         let mut jpeg = Vec::new();
         for attempt in 0..2 {
             if attempt > 0 {
@@ -869,15 +885,13 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
             jpeg = self
                 .backend
                 .encode_window_for_preview(&pending, width_px, height_px)
-                .map_err(|error| SingleWindowCaptureError::Capture(error.into()))?;
+                .map_err(|_| Refused::Encode)?;
             if jpeg.len() <= crate::cursor::MAX_FRAME_BYTES {
                 break;
             }
         }
         if jpeg.is_empty() || jpeg.len() > crate::cursor::MAX_FRAME_BYTES {
-            return Err(SingleWindowCaptureError::Capture(CaptureError::Backend(
-                "the preview frame does not fit a frame line".into(),
-            )));
+            return Err(Refused::FrameSize);
         }
         self.state = CaptureSessionState::Active;
         Ok(PreviewWindowFrame {
@@ -891,20 +905,23 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
     /// Live permission, no revocation under way, and a current window list:
     /// what any capture of one window needs before it picks the window.
     fn ready_for_single_window(&mut self, now_ms: u64) -> Result<(), SingleWindowCaptureError> {
-        self.ensure_capture_permission(now_ms)
+        self.check_single_window_permission(now_ms)
             .map_err(SingleWindowCaptureError::Capture)?;
+        self.refresh_if_needed(now_ms)
+            .map_err(SingleWindowCaptureError::Capture)?;
+        Ok(())
+    }
+
+    fn check_single_window_permission(&mut self, now_ms: u64) -> Result<(), CaptureError> {
+        self.ensure_capture_permission(now_ms)?;
         if matches!(
             self.state,
             CaptureSessionState::RevokedTeardownPending
                 | CaptureSessionState::RevokedTeardownComplete
                 | CaptureSessionState::RevokedTeardownDetached
         ) {
-            return Err(SingleWindowCaptureError::Capture(
-                CaptureError::PermissionUnavailable,
-            ));
+            return Err(CaptureError::PermissionUnavailable);
         }
-        self.refresh_if_needed(now_ms)
-            .map_err(SingleWindowCaptureError::Capture)?;
         Ok(())
     }
 
@@ -1556,7 +1573,7 @@ mod tests {
         let mut controller = ScopedCaptureController::with_v1_bounds(backend, owner).unwrap();
         assert_eq!(
             controller.capture_window_for_preview(1, "11", [560, 720]),
-            Err(SingleWindowCaptureError::Capture(
+            Err(PreviewWindowCaptureError::Permission(
                 CaptureError::PermissionUnavailable
             ))
         );
@@ -1567,7 +1584,7 @@ mod tests {
             .set_permission_liveness(PermissionLiveness::Live);
         assert_eq!(
             controller.capture_window_for_preview(2, "12", [560, 720]),
-            Err(SingleWindowCaptureError::NoWindow),
+            Err(PreviewWindowCaptureError::NoWindow),
             "a window whose owner did not verify was captured"
         );
         assert!(controller.backend().window_requests().is_empty());
@@ -1581,9 +1598,7 @@ mod tests {
             .set_windows(vec![window("11", &stranger, true)]);
         assert_eq!(
             controller.capture_window_for_preview(4, "11", [560, 720]),
-            Err(SingleWindowCaptureError::Capture(
-                CaptureError::CaptureScopeUnavailable
-            ))
+            Err(PreviewWindowCaptureError::Owner)
         );
     }
 
@@ -1597,10 +1612,10 @@ mod tests {
         backend.set_vision_frame("11", 800, 600, vec![1; crate::cursor::MAX_FRAME_BYTES + 1]);
         backend.set_vision_frame("12", 800, 600, vec![1; crate::cursor::MAX_FRAME_BYTES]);
         let mut controller = ScopedCaptureController::with_v1_bounds(backend, owner).unwrap();
-        assert!(matches!(
+        assert_eq!(
             controller.capture_window_for_preview(1, "11", [560, 720]),
-            Err(SingleWindowCaptureError::Capture(CaptureError::Backend(_)))
-        ));
+            Err(PreviewWindowCaptureError::FrameSize)
+        );
         assert!(controller
             .capture_window_for_preview(2, "12", [560, 720])
             .is_ok());
