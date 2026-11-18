@@ -912,6 +912,32 @@ fn is_blocked_menu_item(facts: &ElementFacts) -> bool {
         && facts.title.as_deref().is_some_and(is_session_ending_title)
 }
 
+fn is_menu_bar_command(
+    source: &dyn AppStateSource,
+    facts: &ElementFacts,
+    handle: &ElementHandle,
+) -> bool {
+    if facts.role.as_deref() != Some("AXMenuItem") {
+        return false;
+    }
+    let mut current = handle.clone();
+    for role in ["AXMenu", "AXMenuBarItem", "AXMenuBar"] {
+        let Ok(Some(parent)) = source.element_parent(&current) else {
+            return false;
+        };
+        let Ok(parent_facts) = source.element_facts(&parent) else {
+            return false;
+        };
+        if parent_facts.role.as_deref() != Some(role)
+            || matches!((facts.pid, parent_facts.pid), (Some(item), Some(owner)) if item != owner)
+        {
+            return false;
+        }
+        current = parent;
+    }
+    true
+}
+
 fn press_available(
     source: &dyn AppStateSource,
     facts: &ElementFacts,
@@ -946,6 +972,8 @@ fn press_available(
     if capability == ComputerCapability::PressElement
         && source.reports_screen_geometry()
         && !super::action_effects::has_screen_position(source, handle)
+        // Closed menu bar commands have no position but still accept AXPress.
+        && !is_menu_bar_command(source, facts, handle)
     {
         return Err(json!({
             "outcome": "no_press_action",
