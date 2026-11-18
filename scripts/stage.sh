@@ -125,7 +125,10 @@ if [ "$debug_entries" != 0 ]; then
 fi
 # What this build reads, beside the binary, so the placer can check it against
 # the floor on the machine it places onto rather than trusting this host's.
+# SUBC's placement tool reads `<staged binary>.format-versions.json`, so the
+# map is written under that name too.
 cp "$FORMAT_VERSIONS" "$STAGE/format-versions.json"
+cp "$FORMAT_VERSIONS" "$STAGE/ck-cerebellum.format-versions.json"
 
 # The backup catalog travels with the binary as a reviewable copy. It lives in
 # the repo because it is a declaration rather than generated state. The module
