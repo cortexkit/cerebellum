@@ -275,7 +275,7 @@ fn a_picture_read_past_admission_when_the_cutoff_fires_keeps_the_lock_and_acquir
     // in the visibility inspection, then ask the fence right before the
     // pixels would be requested.
     let mut read = || {
-        let _hold = reader.hold_lock_for_read();
+        let _hold = reader.hold_lock_for_read().unwrap().expect("bounded hold");
         let give_up = Instant::now() + crate::test_support::HANG_GUARD;
         while Instant::now() < give_up
             && !reader.cell().is_some_and(|cell| cell.decided().is_some())
@@ -316,7 +316,7 @@ fn a_picture_read_inside_the_bound_may_acquire() {
     let reader = hooks.clone();
     let mut acquired = false;
     let mut read = || {
-        let _hold = reader.hold_lock_for_read();
+        let _hold = reader.hold_lock_for_read().unwrap().expect("bounded hold");
         acquired = reader.picture_may_acquire();
     };
     let outcome = cerebellum_computer::platform::run_hooked_fronted(

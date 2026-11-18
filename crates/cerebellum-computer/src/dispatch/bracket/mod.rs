@@ -6,7 +6,7 @@
 //! them means making them frontmost. Fronting an application can take the
 //! person's own keystrokes, so the bracket runs under the same guards the
 //! observed pointer sequence does, through the same functions: the idle gate
-//! and heartbeat in [`begin_observed_sequence`], and the per-post heartbeat,
+//! and heartbeat in [`super::seize::begin_observed_sequence`], and the per-post heartbeat,
 //! focus and seize checks in [`dispatch_observed_post_in_order`]. Any input
 //! that is not ours stops it.
 //!
@@ -73,9 +73,9 @@ use serde::{Deserialize, Serialize};
 
 use super::seize::SourcedInputKind;
 use super::seize::{
-    begin_observed_sequence, dispatch_observed_post_in_order, observe_drained_events,
-    AbortDecision, AbortReason, HeartbeatObservation, HeartbeatProbe, ObservedPostRefusal,
-    ObservedSequenceHooks, SeizeWatcher, SourcedInputEvent, UserIdleEstimator,
+    dispatch_observed_post_in_order, observe_drained_events, AbortDecision, AbortReason,
+    HeartbeatObservation, HeartbeatProbe, ObservedPostRefusal, ObservedSequenceHooks, SeizeWatcher,
+    SourcedInputEvent, UserIdleEstimator,
 };
 use crate::platform::{HeldStateDisposition, IdleReading, SequencePostFailure};
 
@@ -443,14 +443,40 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
     run_fronting_bracket_with_predictor(host, estimator, plan, admission, cancelled, None)
 }
 
-pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
+/// A bracket can update idle history without owning its mutex across native work.
+pub(crate) enum BracketIdle<'a> {
+    Local(&'a mut UserIdleEstimator),
+    #[cfg(any(target_os = "macos", test))]
+    Shared(&'a std::sync::Mutex<UserIdleEstimator>),
+}
+
+impl<'a> From<&'a mut UserIdleEstimator> for BracketIdle<'a> {
+    fn from(estimator: &'a mut UserIdleEstimator) -> Self {
+        Self::Local(estimator)
+    }
+}
+
+impl BracketIdle<'_> {
+    fn with<T>(&mut self, use_idle: impl FnOnce(&mut UserIdleEstimator) -> T) -> T {
+        match self {
+            Self::Local(estimator) => use_idle(estimator),
+            #[cfg(any(target_os = "macos", test))]
+            Self::Shared(estimator) => {
+                use_idle(&mut estimator.lock().unwrap_or_else(|p| p.into_inner()))
+            }
+        }
+    }
+}
+
+pub(crate) fn run_fronting_bracket_with_predictor<'a, H: FrontingBracketHost>(
     host: &mut H,
-    estimator: &mut UserIdleEstimator,
+    estimator: impl Into<BracketIdle<'a>>,
     plan: BracketPlan,
     admission: FrontingAdmission,
     cancelled: &dyn Fn() -> bool,
     predictor: Option<&RestorePredictor>,
 ) -> BracketOutcome {
+    let mut estimator = estimator.into();
     let unfronted = |report| BracketOutcome {
         report,
         person_input_during_fronting: false,
@@ -487,11 +513,10 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
         watcher.queue_post();
     }
     let idle_read_at = Instant::now();
-    let begun = begin_observed_sequence(
-        estimator,
+    let begun = super::seize::begin_observed_sequence_using(
+        |hid_idle| estimator.with(|estimator| estimator.user_idle(hid_idle, idle_read_at)),
         &mut watcher,
         our_pid,
-        idle_read_at,
         ObservedSequenceHooks {
             create_tap: || host.borrow_mut().create_tap(),
             read_idle: || host.borrow_mut().read_idle(),
@@ -513,7 +538,7 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
                 refusal,
                 ObservedPostRefusal::AlreadyAborted(AbortReason::UserSeizedControl)
             ) {
-                estimator.clear_carry();
+                estimator.with(UserIdleEstimator::clear_carry);
             }
             report.stop = Some(match watcher.abort_decision() {
                 Some(abort) => BracketStop::Aborted(abort),
@@ -529,7 +554,7 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
     // event happened to give the watcher a separate abort reason.
     watcher.observe_heartbeat(super::seize::heartbeat_liveness(probe, heartbeat), 0);
     if let Some(abort) = watcher.abort_decision() {
-        estimator.clear_carry();
+        estimator.with(UserIdleEstimator::clear_carry);
         report.stop = Some(BracketStop::Aborted(abort));
         return unfronted(report);
     }
@@ -862,12 +887,14 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
         Some(BracketStop::Aborted(abort))
             if matches!(abort.reason, AbortReason::UserSeizedControl) =>
         {
-            estimator.clear_carry();
+            estimator.with(UserIdleEstimator::clear_carry);
         }
         _ => {}
     }
-    host.borrow_mut()
-        .finish_observation(&tap, estimator, user_idle, idle_read_at);
+    estimator.with(|estimator| {
+        host.borrow_mut()
+            .finish_observation(&tap, estimator, user_idle, idle_read_at);
+    });
     BracketOutcome {
         report,
         person_input_during_fronting: person_input,
@@ -961,9 +988,9 @@ pub fn run_fronting_read_with<H: FrontingBracketHost>(
     run_fronting_read_with_predictor(host, estimator, plan, admission, cancelled, read, None)
 }
 
-pub(crate) fn run_fronting_read_with_predictor<H: FrontingBracketHost>(
+pub(crate) fn run_fronting_read_with_predictor<'a, H: FrontingBracketHost>(
     host: &mut H,
-    estimator: &mut UserIdleEstimator,
+    estimator: impl Into<BracketIdle<'a>>,
     mut plan: BracketPlan,
     admission: FrontingAdmission,
     cancelled: &dyn Fn() -> bool,

@@ -2185,6 +2185,17 @@ pub fn run_hooked_fronted<H: crate::dispatch::FrontingBracketHost + RestoreHostS
     hooks: &mut dyn FrontedDispatchHooks,
     read: Option<&mut dyn FnMut()>,
 ) -> crate::dispatch::BracketOutcome {
+    run_hooked_fronted_with_idle(host, estimator.into(), plan, cancelled, hooks, read)
+}
+
+fn run_hooked_fronted_with_idle<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>(
+    host: &mut H,
+    estimator: crate::dispatch::BracketIdle<'_>,
+    plan: crate::dispatch::BracketPlan,
+    cancelled: &dyn Fn() -> bool,
+    hooks: &mut dyn FrontedDispatchHooks,
+    read: Option<&mut dyn FnMut()>,
+) -> crate::dispatch::BracketOutcome {
     let predictor = (host.supports_needs_front_restore_predictor()
         && hooks.uses_needs_front_restore_predictor())
     .then(crate::dispatch::needs_front_restore_predictor);
@@ -2194,10 +2205,11 @@ pub fn run_hooked_fronted<H: crate::dispatch::FrontingBracketHost + RestoreHostS
 /// [`run_hooked_fronted`] with the restore predictor named rather than
 /// chosen, so a test can hand it one loaded from its own history file.
 pub(crate) fn run_hooked_fronted_with_predictor<
+    'a,
     H: crate::dispatch::FrontingBracketHost + RestoreHostSource,
 >(
     host: &mut H,
-    estimator: &mut crate::dispatch::UserIdleEstimator,
+    estimator: impl Into<crate::dispatch::BracketIdle<'a>>,
     plan: crate::dispatch::BracketPlan,
     cancelled: &dyn Fn() -> bool,
     hooks: &mut dyn FrontedDispatchHooks,

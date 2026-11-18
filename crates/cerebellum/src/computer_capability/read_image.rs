@@ -91,7 +91,10 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
             // The fronting lock stays held until this read returns, even if
             // the cutoff restores meanwhile, so no other front starts under
             // a capture still in flight.
-            let _lock_hold = hooks.hold_lock_for_read();
+            let Ok(_lock_hold) = hooks.hold_lock_for_read() else {
+                captured = Err(ImageUnavailable::FrontingUnavailable);
+                return;
+            };
             // Even a backend panic must return through the bracket's restore.
             captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 check_visibility(freshness, grant, evidence, None, false)?;

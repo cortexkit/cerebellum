@@ -2289,7 +2289,6 @@ impl PlatformDriver for MacOs26PlatformDriver {
             visibility: VisibilityMemo::new(VISIBLE_READING_MAX_AGE),
             pointer: None,
         };
-        let mut user_idle = self.user_idle.lock().unwrap_or_else(|p| p.into_inner());
         let plan = crate::dispatch::BracketPlan {
             target_pid: target.pid,
             units: 1,
@@ -2302,9 +2301,9 @@ impl PlatformDriver for MacOs26PlatformDriver {
                 read();
             }
         };
-        Ok(crate::platform::run_hooked_fronted(
+        Ok(crate::platform::run_hooked_fronted_with_idle(
             &mut host,
-            &mut user_idle,
+            crate::dispatch::BracketIdle::Shared(&self.user_idle),
             plan,
             cancelled,
             hooks.as_mut(),

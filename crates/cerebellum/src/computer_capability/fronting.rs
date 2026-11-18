@@ -893,12 +893,18 @@ impl CellHooks {
 
     /// Keep the fronting lock for a picture read under way, until the hold
     /// is dropped; see [`RestoreCell::hold_lock_for_read`].
-    pub(crate) fn hold_lock_for_read(&self) -> Option<crate::terminal_arbiter::ReadLockHold> {
-        self.cell().map(|cell| {
-            cell.hold_lock_for_read(Duration::from_millis(
-                crate::budgets::PICTURE_READ_LIFETIME_MS,
-            ))
-        })
+    pub(crate) fn hold_lock_for_read(
+        &self,
+    ) -> Result<Option<crate::terminal_arbiter::ReadLockHold>, ()> {
+        match self.cell() {
+            Some(cell) => cell
+                .hold_lock_for_read(Duration::from_millis(
+                    crate::budgets::PICTURE_READ_LIFETIME_MS,
+                ))
+                .map(Some)
+                .ok_or(()),
+            None => Ok(None),
+        }
     }
 
     /// What the hooks hold now, without releasing an unregistered lock as

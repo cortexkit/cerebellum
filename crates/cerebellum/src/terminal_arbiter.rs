@@ -446,35 +446,50 @@ impl RestoreCell {
     /// and module health reports it (`pictureReadsPastLifetime`). Whatever
     /// that read later acquires is refused by its fence, whose deadline has
     /// long passed.
-    pub fn hold_lock_for_read(self: &Arc<Self>, lifetime: Duration) -> ReadLockHold {
+    pub fn hold_lock_for_read(self: &Arc<Self>, lifetime: Duration) -> Option<ReadLockHold> {
+        self.hold_read_with_watchdog(lifetime, |watch| {
+            std::thread::Builder::new()
+                .name("picture-read-lifetime".into())
+                .spawn(watch)
+                .is_ok()
+        })
+    }
+
+    fn hold_read_with_watchdog(
+        self: &Arc<Self>,
+        lifetime: Duration,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> bool,
+    ) -> Option<ReadLockHold> {
         self.inner().reads_in_flight += 1;
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (returned, wait) = std::sync::mpsc::channel::<()>();
         let cell = Arc::clone(self);
         let expiry_ended = Arc::clone(&ended);
-        // Without a watchdog the hold is only as bounded as the read itself.
-        let _ = std::thread::Builder::new()
-            .name("picture-read-lifetime".into())
-            .spawn(move || {
-                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(lifetime)
-                {
-                    // Counted as stalled before claiming the read, so a hold
-                    // dropped at this moment never takes the count below zero.
-                    STALLED_PICTURE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if expiry_ended.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                        STALLED_PICTURE_READS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    } else {
-                        STALLED_PICTURE_READS_TOTAL
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        cell.read_ended();
-                    }
+        let expires_at = std::time::Instant::now() + lifetime;
+        if !spawn(Box::new(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                wait.recv_timeout(expires_at.saturating_duration_since(std::time::Instant::now()))
+            {
+                // Counted as stalled before claiming the read, so a hold
+                // dropped at this moment never takes the count below zero.
+                STALLED_PICTURE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if expiry_ended.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    STALLED_PICTURE_READS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    STALLED_PICTURE_READS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    cell.read_ended();
                 }
-            });
-        ReadLockHold {
+            }
+        })) {
+            // Refuse before entering native capture if we cannot bound its hold.
+            self.read_ended();
+            return None;
+        }
+        Some(ReadLockHold {
             cell: Arc::clone(self),
             ended,
             _returned: returned,
-        }
+        })
     }
 
     /// One picture read no longer holds the fronting lock: release it when
@@ -3071,6 +3086,20 @@ mod restore_slot_tests {
     }
 
     #[test]
+    fn a_picture_read_without_a_watchdog_is_not_admitted() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let terminal = TerminalArbiter::new(request());
+        let cell = terminal
+            .register_restore(obligation(&screen(true), &releases))
+            .unwrap();
+        assert!(cell
+            .hold_read_with_watchdog(Duration::from_secs(10), |_| false)
+            .is_none());
+        cell.decide();
+        assert_eq!(releases.load(SeqCst), 1, "a refused read keeps no hold");
+    }
+
+    #[test]
     fn a_picture_read_that_never_returns_releases_the_lock_at_its_lifetime() {
         let releases = Arc::new(AtomicUsize::new(0));
         let terminal = TerminalArbiter::new(request());
@@ -3080,7 +3109,7 @@ mod restore_slot_tests {
         let (_, total_before) = stalled_picture_reads();
         // The read's synchronous step never returns: its hold is never
         // dropped during the test's wait.
-        let hold = cell.hold_lock_for_read(Duration::from_millis(50));
+        let hold = cell.hold_lock_for_read(Duration::from_millis(50)).unwrap();
         cell.decide();
         assert_eq!(releases.load(SeqCst), 0, "kept while the read runs");
         let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
