@@ -721,7 +721,7 @@ fn with_restore_budget(
                 decide(cell, entered)
             })
             .join()
-            .unwrap_or_else(|_| decide(cell, entered))
+            .unwrap_or_else(|_| cell.forgo())
     })
 }
 
