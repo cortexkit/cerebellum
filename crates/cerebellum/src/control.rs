@@ -471,6 +471,11 @@ async fn send_principal_denied(
 ///   wall-clock milliseconds, or `null`). Such a lock has no time bound: it
 ///   is released only when that release settles, so a nonzero count that
 ///   stays is a stuck release, and no app is brought forward meanwhile.
+/// - `pictureReadsPastLifetime`, fronted picture reads that outlived their
+///   lifetime (`PICTURE_READ_LIFETIME_MS`) and had their fronting lock
+///   released as for a timed-out read: how many have still not returned
+///   (`still_running`) and how many there have been since the module
+///   started (`total`).
 ///
 /// Counters are atomic and none changes the status. The helper PID, when
 /// present, is checked against the OS process-start time without waiting on
@@ -595,6 +600,11 @@ pub(super) fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleCo
         metrics.insert(
             "frontingLockHeldForUnsettledRelease".to_string(),
             json!({"count": count, "oldest_since_ms": oldest_since_ms}),
+        );
+        let (stalled, stalled_total) = crate::terminal_arbiter::stalled_picture_reads();
+        metrics.insert(
+            "pictureReadsPastLifetime".to_string(),
+            json!({"still_running": stalled, "total": stalled_total}),
         );
     }
     report

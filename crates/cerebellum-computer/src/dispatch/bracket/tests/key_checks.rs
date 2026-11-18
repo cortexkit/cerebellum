@@ -38,6 +38,16 @@ struct Keyboard {
     /// would have started the restore, one entry per post.
     restore_during_post: RefCell<Vec<bool>>,
     fire_during_post: bool,
+    /// The transport's own preparation for each post (an authentication
+    /// object, say) takes this long on the fake clock.
+    preparation_ms: u64,
+    /// The process-generation reading with this number (from 1) takes past
+    /// any deadline on the fake clock.
+    slow_generation_read: Option<usize>,
+    generation_reads: Cell<usize>,
+    /// The unit is stopped while focus is being read.
+    stop_during_focus_read: bool,
+    stopped: Cell<bool>,
 }
 
 impl Keyboard {
@@ -51,6 +61,11 @@ impl Keyboard {
             gate: CutoffGate::new(),
             restore_during_post: RefCell::new(Vec::new()),
             fire_during_post: false,
+            preparation_ms: 0,
+            slow_generation_read: None,
+            generation_reads: Cell::new(0),
+            stop_during_focus_read: false,
+            stopped: Cell::new(false),
         }
     }
 }
@@ -61,6 +76,12 @@ impl PerProcessEventTransport for Transport<'_> {
     type Event = &'static str;
 
     fn process_generation(&mut self, _pid: u32) -> ProcessGenerationReading {
+        let keyboard = self.0;
+        let reads = keyboard.generation_reads.get() + 1;
+        keyboard.generation_reads.set(reads);
+        if keyboard.slow_generation_read == Some(reads) {
+            keyboard.now.set(keyboard.now.get() + 1_000);
+        }
         ProcessGenerationReading::Started(GENERATION)
     }
     fn window_server_visibility(&mut self, _pid: u32) -> WindowServerVisibility {
@@ -93,6 +114,20 @@ impl PerProcessEventTransport for Transport<'_> {
             keyboard.frontmost.set(Some(THIRD));
         }
         Ok(PostCallMade::public_core_graphics())
+    }
+    fn post_to_pid_after(
+        &mut self,
+        pid: u32,
+        event: &'static str,
+        last_check: &mut dyn FnMut() -> Result<(), ProcessEventRefusal>,
+    ) -> Result<PostCallMade, ProcessEventRefusal> {
+        let keyboard = self.0;
+        keyboard
+            .now
+            .set(keyboard.now.get() + keyboard.preparation_ms);
+        last_check()?;
+        self.post_to_pid(pid, event)
+            .map_err(ProcessEventRefusal::PostCallFailed)
     }
 }
 
@@ -158,7 +193,12 @@ fn post_with(
         target_pid: TARGET,
         deadline_ms,
         now_ms: || keyboard.now.get(),
-        frontmost_pid: || keyboard.frontmost.get(),
+        frontmost_pid: || {
+            if keyboard.stop_during_focus_read {
+                keyboard.stopped.set(true);
+            }
+            keyboard.frontmost.get()
+        },
         cutoff,
     };
     post_event_sequence_fronted(
@@ -344,4 +384,52 @@ fn a_unit_that_stays_in_front_and_inside_the_deadline_posts_every_key() {
         *keyboard.posted.borrow(),
         ["cmd down", "v down", "v up", "cmd up"]
     );
+}
+
+/// Post one key, pressed and released, with the cutoff gate, and expect the
+/// press to be refused with nothing posted.
+fn refused_before_any_post(keyboard: &Keyboard) {
+    let failure = post_with(
+        keyboard,
+        vec![press("a down"), release("a up")],
+        500,
+        &|| keyboard.stopped.get(),
+        &mut VisibilityMemo::uncached(),
+        Some(&keyboard.gate),
+    )
+    .unwrap_err();
+    assert_eq!(failure.refusal, ProcessEventRefusal::Cancelled);
+    assert_eq!(failure.posts_returned, 0);
+    assert!(keyboard.posted.borrow().is_empty());
+}
+
+#[test]
+fn the_deadline_passing_during_the_transports_preparation_refuses_the_post() {
+    let mut keyboard = Keyboard::new();
+    keyboard.preparation_ms = 1_000;
+    refused_before_any_post(&keyboard);
+}
+
+#[test]
+fn the_deadline_passing_during_the_final_generation_lookup_refuses_the_post() {
+    let mut keyboard = Keyboard::new();
+    // The first reading comes with the listing read; the second is the
+    // final lookup just before the post.
+    keyboard.slow_generation_read = Some(2);
+    refused_before_any_post(&keyboard);
+}
+
+#[test]
+fn a_stop_during_the_focus_read_refuses_the_post() {
+    let mut keyboard = Keyboard::new();
+    keyboard.stop_during_focus_read = true;
+    refused_before_any_post(&keyboard);
+}
+
+#[test]
+fn the_absolute_deadline_refuses_the_post_even_when_the_timer_has_not_run() {
+    let keyboard = Keyboard::new();
+    keyboard.now.set(600);
+    assert!(!keyboard.gate.fired(), "a late timer has not fired yet");
+    refused_before_any_post(&keyboard);
 }

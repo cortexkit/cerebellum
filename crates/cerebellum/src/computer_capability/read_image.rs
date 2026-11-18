@@ -66,6 +66,20 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     if !driver.accept_fronted_dispatch_hooks(super::fronting::boxed_hooks(hooks)) {
         return Err(ImageUnavailable::FrontingUnavailable);
     }
+    // Whether this read may still acquire pixels: the cutoff has not fired
+    // and its absolute deadline has not passed, no cleanup has taken over
+    // restoring the person's application, and the call has not been stopped. Shared with the
+    // platform's capture completion, which may run after the request.
+    let fence: cerebellum_computer::capture::AcquisitionFence = {
+        let hooks = hooks.clone();
+        let cancel = plan.cancel.clone();
+        let gate = plan.gate.clone();
+        std::sync::Arc::new(move || {
+            hooks.picture_may_acquire()
+                && !cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled())
+                && !gate.as_ref().is_some_and(|gate| gate.stopped())
+        })
+    };
     let bracket = driver.read_fronted(
         grant,
         bound,
@@ -82,18 +96,18 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
             captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 check_visibility(freshness, grant, evidence, None, false)?;
                 // The visibility check and the window lookup can block. The
-                // bound is asked again immediately before the pixels are
-                // requested: once it has passed, none are acquired.
-                let pending = controller
-                    .capture_frontmost_window_unencoded_for_vision_fenced(now_ms, &|| {
-                        hooks.picture_may_acquire()
-                    });
-                if !hooks.picture_may_acquire() {
-                    // Refused at the fence, or acquired as the bound passed:
-                    // either way nothing from this read is returned.
-                    return Err(ImageUnavailable::FrontingBoundExceeded);
-                }
-                let pending = pending.map_err(image_capture_error)?;
+                // fence is asked again immediately before the pixels are
+                // requested, and by the completion before any are copied:
+                // once it has closed, no pixels are requested, and none are
+                // copied or returned even if ScreenCaptureKit completes a
+                // request already made.
+                let pending =
+                    controller.capture_frontmost_window_unencoded_for_vision_fenced(now_ms, &fence);
+                let pending = match pending {
+                    Ok(pending) => pending,
+                    Err(_) if !fence() => return Err(ImageUnavailable::FrontingBoundExceeded),
+                    Err(error) => return Err(image_capture_error(error)),
+                };
                 check_visibility(
                     freshness,
                     grant,
@@ -101,6 +115,11 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
                     Some(&pending.window.window_id),
                     false,
                 )?;
+                // Last, after the second visibility check: pixels acquired as
+                // the fence closed are not returned.
+                if !fence() {
+                    return Err(ImageUnavailable::FrontingBoundExceeded);
+                }
                 Ok(pending)
             }))
             .unwrap_or(Err(ImageUnavailable::CaptureFailed));
@@ -129,7 +148,12 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     if matches!(report.restore, RestoreStatus::Failed { .. }) {
         return Err(ImageUnavailable::RestoreFailed);
     }
-    if report.longest_fronted_interval_ms > bound || report.stop == Some(BracketStop::BoundExceeded)
+    // An explicit veto: a picture whose front the cutoff ended is never
+    // returned, whatever the measured interval says.
+    if hooks.cutoff_fired()
+        || report.restore_started_by_cutoff
+        || report.longest_fronted_interval_ms > bound
+        || report.stop == Some(BracketStop::BoundExceeded)
     {
         return Err(ImageUnavailable::FrontingBoundExceeded);
     }

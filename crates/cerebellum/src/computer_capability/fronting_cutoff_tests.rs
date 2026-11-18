@@ -218,12 +218,10 @@ fn a_registration_that_outlasts_the_bound_fronts_nothing() {
 }
 
 #[test]
-fn the_cutoff_firing_during_a_blocked_activation_restores_once_it_returns() {
+fn the_cutoff_requests_the_restore_at_once_while_the_activation_is_still_in_flight() {
     let screen = Screen::new(&mail_desk());
-    // The activation request blocks past the bound, but returns within the
-    // wait the restore decision allows an activation in flight.
+    // The activation request blocks well past the bound.
     let front_blocks_ms = 2 * BOUND_MS;
-    assert!(front_blocks_ms < crate::budgets::FRONT_WAIT_MS);
     screen.state().front_blocks_ms = front_blocks_ms;
     let (hooks, releases) = app_use_hooks();
     let mut boxed = boxed_hooks(&hooks);
@@ -241,27 +239,24 @@ fn the_cutoff_firing_during_a_blocked_activation_restores_once_it_returns() {
         log,
         [
             format!("front:{TARGET}"),
-            "front-returned".to_owned(),
             format!("restore:{PREVIOUS}"),
+            "front-returned".to_owned(),
         ],
-        "never restored under the pending activation, and nothing posted"
+        "the restore is requested at the cutoff, not after the activation returns"
     );
-    // The hard bound on the restore request: the cutoff plus, at most, the
-    // wait for an activation still in flight.
+    // The hard bound on the restore request: the cutoff, plus scheduling.
     let restored_after = first_restore_after(&screen, started);
     assert!(
-        restored_after >= Duration::from_millis(front_blocks_ms),
-        "{restored_after:?}"
-    );
-    assert!(
-        restored_after
-            < Duration::from_millis(BOUND_MS + crate::budgets::FRONT_WAIT_MS + BOUND_MS / 2),
-        "{restored_after:?}"
+        restored_after < Duration::from_millis(BOUND_MS + BOUND_MS / 2),
+        "restore requested {restored_after:?} after the bracket began"
     );
     assert!(outcome.report.restore_started_by_cutoff);
     assert_eq!(outcome.report.units_posted, 0);
-    assert_eq!(outcome.report.restore, RestoreStatus::Restored);
-    assert_eq!(lock_releases(&releases), 1);
+    // The activation landed after the restore request: the late watch is
+    // owed it, and keeps the fronting lock until it has run.
+    let cell = hooks.cell().expect("registered");
+    assert!(cell.late_watch_pending(), "{log:?}");
+    assert_eq!(lock_releases(&releases), 0);
 }
 
 #[test]
@@ -370,4 +365,18 @@ fn a_restore_the_cutoff_ran_is_sampled_at_its_own_cost_not_the_readers_wait() {
         sampled >= Some(cerebellum_computer::dispatch::RESTORE_FALLBACK_AFTER_MS),
         "the restore took at least the fallback delay, but was sampled at {sampled:?}"
     );
+}
+
+#[test]
+fn a_picture_may_not_acquire_past_the_deadline_even_before_the_timer_runs() {
+    let (hooks, _releases) = app_use_hooks();
+    let mut boxed = boxed_hooks(&hooks);
+    let gate = Arc::new(cerebellum_computer::dispatch::CutoffGate::new());
+    gate.set_deadline(Instant::now() + Duration::from_secs(3600));
+    boxed.cutoff_armed(Arc::clone(&gate));
+    assert!(hooks.picture_may_acquire(), "inside the bound");
+    // A late-scheduled timer has not fired, but the deadline is behind.
+    gate.set_deadline(Instant::now() - Duration::from_millis(1));
+    assert!(!gate.fired());
+    assert!(!hooks.picture_may_acquire());
 }

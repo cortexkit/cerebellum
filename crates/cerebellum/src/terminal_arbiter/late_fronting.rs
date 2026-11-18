@@ -260,13 +260,9 @@ pub(super) fn start(
             crate::computer::dispatch::LateWatch::WholeWindow { already_restored },
             &|| stop.load(Ordering::Acquire) != 0,
         );
-        // A watch that left focus alone because the input observer lost
-        // coverage (`ended.coverage_lost`) is recorded as `skipped_person`,
-        // as any other left-alone focus is: the record's shape is fixed. The
-        // gap itself is counted in module health, under
-        // `hardwareInputObserver.coverage_gap_count`.
         let (mut restore, latency, input) =
             (ended.restore, ended.first_landing_ms, ended.person_input);
+        let mut coverage_lost = ended.coverage_lost;
         // Route close ends the task too, but first puts back a target that
         // has already landed if observation still proves no person input.
         if stop.load(Ordering::Acquire) == 2
@@ -276,7 +272,7 @@ pub(super) fn start(
                 since,
             )
         {
-            let (final_restore, _, _) = crate::computer::dispatch::watch_late_activation(
+            let last = crate::computer::dispatch::watch_late_activation_ending(
                 &mut adapter,
                 previous,
                 target,
@@ -285,7 +281,8 @@ pub(super) fn start(
                 crate::computer::dispatch::LateWatch::FirstAttempt,
                 &|| false,
             );
-            restore = final_restore;
+            restore = last.restore;
+            coverage_lost = last.coverage_lost;
         }
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
         probe_timing.watch_finished(restore);
@@ -294,17 +291,33 @@ pub(super) fn start(
         drop(_lock);
         drop(registered);
         if let Some(record) = recorder {
-            let status = match restore {
-                crate::computer::dispatch::RestoreStatus::Restored => "restored",
-                crate::computer::dispatch::RestoreStatus::SkippedPerson { .. } => "skipped_person",
-                _ => "failed",
-            };
+            let status = recorded_restore(restore, coverage_lost);
             record(json!({"cleanup": "restore", "target_pid": target,
                 "previous_pid": previous, "restore": status,
                 "person_input_during_fronting": input,
                 "activation_latency_ms": latency}));
         }
     });
+}
+
+/// The late watch record's `restore` word. A watch that left focus alone
+/// because the input observer lost coverage records `skipped_coverage`,
+/// distinct from `skipped_person` (person input, or a third application in
+/// front). The record is open completion JSON in the journal, read as
+/// opaque bytes, so a new word needs no journal format change and an older
+/// reader reads it like any other.
+fn recorded_restore(
+    restore: crate::computer::dispatch::RestoreStatus,
+    coverage_lost: bool,
+) -> &'static str {
+    match restore {
+        crate::computer::dispatch::RestoreStatus::Restored => "restored",
+        crate::computer::dispatch::RestoreStatus::SkippedPerson { .. } if coverage_lost => {
+            "skipped_coverage"
+        }
+        crate::computer::dispatch::RestoreStatus::SkippedPerson { .. } => "skipped_person",
+        _ => "failed",
+    }
 }
 
 #[cfg(test)]
@@ -386,5 +399,28 @@ mod tests {
         assert_eq!(pending.stop.load(Ordering::Acquire), 1);
         drop(pending);
         assert!(!PENDING.lock().unwrap().contains_key(&key));
+    }
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+    use crate::computer::dispatch::RestoreStatus;
+
+    #[test]
+    fn a_watch_stopped_by_lost_coverage_is_recorded_apart_from_a_person() {
+        let skipped = RestoreStatus::SkippedPerson { now_front: None };
+        assert_eq!(recorded_restore(skipped, true), "skipped_coverage");
+        assert_eq!(recorded_restore(skipped, false), "skipped_person");
+        assert_eq!(recorded_restore(RestoreStatus::Restored, true), "restored");
+        assert_eq!(
+            recorded_restore(
+                RestoreStatus::Failed {
+                    left_in_front: None
+                },
+                false
+            ),
+            "failed"
+        );
     }
 }

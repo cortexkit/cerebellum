@@ -10,7 +10,11 @@
 //! focus and seize checks in [`dispatch_observed_post_in_order`]. Any input
 //! that is not ours stops it.
 //!
-//! The time the target spends in front is bounded. Text that cannot be posted
+//! The time the target spends in front is bounded: after each chunk's
+//! deadline nothing new is posted or captured, and by it the restore of the
+//! previous application has been requested (see [`CutoffGate`] for an
+//! admitted app-use front). The restore's confirmation is measured and
+//! reported, not promised within the bound. Text that cannot be posted
 //! inside one bounded interval is split into chunks, and the previous
 //! application is restored between chunks. How much fits is measured while
 //! posting rather than assumed: each unit's post time and each restore's

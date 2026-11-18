@@ -1706,9 +1706,11 @@ pub trait FrontingRestoreHost: Send {
     fn request_front(&mut self, pid: u32) -> bool;
     /// `None` when unavailable, which the decision reads as no input seen.
     fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot>;
-    /// The application `pid` runs is the one a restore will put back. A host
-    /// with a second route to the front records which process that is, so
-    /// the route can refuse a pid that has since passed to another process.
+    /// The application `pid` runs is the one a restore will put back. Called
+    /// at every registration, whether or not the second route is allowed: a
+    /// host records which process that is, so its restore requests (the
+    /// first route and the second alike) can refuse a pid that has since
+    /// passed to another process.
     fn remember_previous(&mut self, _pid: u32) {}
     /// A second way to ask for `pid`, the remembered previous application,
     /// to come to the front, for when [`Self::request_front`] has not taken

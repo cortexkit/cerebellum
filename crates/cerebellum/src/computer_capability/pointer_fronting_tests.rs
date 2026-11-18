@@ -355,6 +355,32 @@ async fn fixture_with_grants(takeover: bool, app: bool) -> (Rig, String) {
     (rig, image_id)
 }
 
+/// A takeover front has no second route back, but its one restore route
+/// checks it puts back the process the registration named, as the macOS
+/// host does. The registration must therefore name that process even though
+/// the second route stays off, or the restore of an unchanged previous
+/// application is refused.
+#[tokio::test]
+async fn a_takeover_front_restores_the_unchanged_previous_application_through_its_one_route() {
+    let (rig, image_id) = fixture().await;
+    rig.screen.state().restore_needs_remembered_previous = true;
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.takeover_click",
+            json!({"image_id":image_id,"x":10,"y":20}),
+        )
+        .await;
+    assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
+    assert_eq!(
+        rig.screen.log(),
+        ["front:4242", "down", "up", "restore:100"],
+        "restored through the one route, never the second"
+    );
+    assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
+    assert!(!rig.lock.held());
+}
+
 #[tokio::test]
 async fn a_covered_granted_image_click_fronts_posts_down_up_and_restores() {
     let (rig, image_id) = fixture().await;

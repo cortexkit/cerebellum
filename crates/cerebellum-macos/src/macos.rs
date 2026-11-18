@@ -1226,6 +1226,32 @@ pub fn capture_window_owned_by(
     source_rect: Option<CaptureSourceRect>,
     accept_owner: &mut dyn FnMut(u32) -> bool,
 ) -> Result<RawCapture, CaptureError> {
+    capture_window_fenced(
+        window_id,
+        timeout,
+        source_rect,
+        accept_owner,
+        Arc::new(|| true),
+    )
+}
+
+/// [`capture_window_owned_by`] for a capture whose time is limited from
+/// outside. `may_acquire` is asked after the filter, the configuration and
+/// the completion are built, immediately before ScreenCaptureKit is asked
+/// for the pixels: once it answers `false` nothing is requested. It is asked
+/// again in the completion before any pixel is copied, and a completion
+/// arriving after it closed, or after this call stopped waiting, drops the
+/// image without copying it.
+///
+/// A request already made cannot be withdrawn: ScreenCaptureKit may still
+/// capture the window after the fence closes; only the copy is refused.
+pub fn capture_window_fenced(
+    window_id: u32,
+    timeout: Duration,
+    source_rect: Option<CaptureSourceRect>,
+    accept_owner: &mut dyn FnMut(u32) -> bool,
+    may_acquire: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<RawCapture, CaptureError> {
     // Before any filter is created. Without a window-server connection the
     // filter constructor does not fail -- it aborts the process, which for a
     // module means the whole module dies rather than refusing one capture.
@@ -1289,7 +1315,23 @@ pub fn capture_window_owned_by(
 
     let delivery: Arc<Delivery<Result<RawCapture, String>>> = Delivery::new();
     let sink = delivery.clone();
+    // Whether this call stopped waiting. Held by the completion while it
+    // copies, so the copy and the waiter's giving up never interleave.
+    let abandoned = Arc::new(Mutex::new(false));
+    let completion_abandoned = Arc::clone(&abandoned);
+    let completion_fence = Arc::clone(&may_acquire);
     let handler = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
+        let abandoned = completion_abandoned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *abandoned || !completion_fence() {
+            // Too late: the caller no longer waits, or its time in front
+            // ended. The image is dropped without a pixel being copied.
+            sink.deliver(Err(
+                "the capture arrived too late; its pixels were dropped".to_string()
+            ));
+            return;
+        }
         // SAFETY: the system passes either an image or an error, both valid for
         // this callback. Pixel bytes are copied out before it returns.
         let outcome = unsafe {
@@ -1302,8 +1344,17 @@ pub fn capture_window_owned_by(
             }
         };
         sink.deliver(outcome);
+        drop(abandoned);
     });
 
+    // The last check before the pixels are requested, after everything the
+    // request needs has been built.
+    if !may_acquire() {
+        return Err(CaptureError::Capture(format!(
+            "window {window_id}: the capture's time ended before it was requested; no pixels \
+             were requested"
+        )));
+    }
     // SAFETY: filter and configuration are owned by this frame and outlive the
     // call; the handler outlives it through the block's own retain.
     unsafe {
@@ -1314,9 +1365,12 @@ pub fn capture_window_owned_by(
         )
     };
 
-    let outcome = delivery
-        .wait(timeout)
-        .unwrap_or_else(|| Err(format!("the capture did not arrive within {timeout:?}")));
+    let outcome = delivery.wait(timeout).unwrap_or_else(|| {
+        *abandoned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        Err(format!("the capture did not arrive within {timeout:?}"))
+    });
 
     outcome.map_err(|reason| explain_capture_failure(reason, screen_is_locked()))
 }

@@ -163,6 +163,9 @@ mod imp {
         AuthFailed,
         /// The event pair could not be constructed, so nothing was posted.
         EventBuildFailed,
+        /// Every preparation was made, but the caller's last check refused
+        /// the post just before the OS call. Nothing was posted.
+        Withheld,
     }
 
     fn flags_for(modifiers: KeyModifiers) -> CGEventFlags {
@@ -323,6 +326,20 @@ mod imp {
         event: &crate::OwnedCgEvent,
         attach_auth: bool,
     ) -> PostResult {
+        post_single_key_to_pid_after(pid, event, attach_auth, &mut || true)
+    }
+
+    /// [`post_single_key_to_pid`], with every preparation made first (the
+    /// authentication object built and attached) and `last_check` asked
+    /// immediately before the OS post call, with nothing between its answer
+    /// and that call. When it answers `false`, nothing is posted and the
+    /// result is [`PostResult::Withheld`].
+    pub fn post_single_key_to_pid_after(
+        pid: i32,
+        event: &crate::OwnedCgEvent,
+        attach_auth: bool,
+        last_check: &mut dyn FnMut() -> bool,
+    ) -> PostResult {
         let symbols = symbols();
         let Some(post_address) = symbols.post_to_pid else {
             return PostResult::SpiUnavailable;
@@ -349,6 +366,9 @@ mod imp {
                 set_auth(raw, message);
             }
             let post: unsafe extern "C" fn(i32, *mut c_void) = std::mem::transmute(post_address);
+            if !last_check() {
+                return PostResult::Withheld;
+            }
             #[cfg(feature = "desk-probe")]
             crate::macos::note_post_for_probe(pid);
             post(pid, raw);
@@ -361,8 +381,8 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 pub use imp::{
-    keyboard_auth_available, post_key_to_pid, post_single_key_to_pid, skylight_available,
-    OwnedKeyEvent, PostResult,
+    keyboard_auth_available, post_key_to_pid, post_single_key_to_pid, post_single_key_to_pid_after,
+    skylight_available, OwnedKeyEvent, PostResult,
 };
 
 #[cfg(test)]

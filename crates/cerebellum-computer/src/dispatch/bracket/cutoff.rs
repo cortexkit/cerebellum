@@ -3,14 +3,20 @@
 //! timer that starts the restore when the bound passes while the bracket's
 //! own thread is still busy in a unit.
 //!
+//! What the bound means: after the deadline nothing new is posted or
+//! captured, and by the deadline the restore of the previous application
+//! has been requested. The restore's confirmation is reported, not promised
+//! within the bound: the person's application may come back late.
+//!
 //! The timer is armed when the front is requested and fires at the bound,
 //! whatever any timing history predicted. Firing stops new posts at once,
-//! and starts the restore itself unless a key or button may be held: a
-//! restore under a held key would hand that key to the previous
-//! application, so then the unit's own paired releases run first and the
-//! bracket restores after them, as on any other stop. The timer and the
-//! bracket reach the restore through the same once-only decision, so the
-//! restore runs once whichever gets there first.
+//! and requests the restore itself at once, even while the front request is
+//! still in flight, unless a key or button may be held: a restore under a
+//! held key would hand that key to the previous application, so then the
+//! unit's own paired releases run first and the bracket restores after
+//! them, as on any other stop. The timer and the bracket reach the restore
+//! through the same once-only decision, so the restore runs once whichever
+//! gets there first.
 
 use crate::platform::{FrontedKeyGuard, ProcessEventRefusal};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -19,12 +25,12 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 /// The per-post checks for a keystroke unit posted while its target is in
-/// front: the cutoff has not fired, the target is still the frontmost
-/// application, and the bracket's deadline has not passed. The unit's
-/// cancellation is checked separately by the sequence, just before these.
-/// The sequence runs them after the post's window-server listing read, the
-/// one step that can block, so nothing slow lies between these checks and
-/// the post call.
+/// front: the target is still the frontmost application, the unit has not
+/// been stopped, and the bracket's absolute deadline has not passed; then
+/// the post is committed on the cutoff gate. The sequence runs them after
+/// every preparation for the post (the listing read, the final generation
+/// lookup, any authentication the transport attaches), immediately before
+/// the OS post call.
 ///
 /// A post refused here was never made, so the refusal is
 /// [`ProcessEventRefusal::Cancelled`], which a reply reads as no post call
@@ -45,12 +51,21 @@ where
     N: FnMut() -> u64,
     F: FnMut() -> Option<u32>,
 {
-    fn before_post(&mut self, press: bool) -> Result<(), ProcessEventRefusal> {
-        // The focus read can take a moment; the deadline is read after it so
-        // nothing that can block separates the deadline check from the post.
+    fn before_post(
+        &mut self,
+        press: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), ProcessEventRefusal> {
+        // The focus read can take a moment, so the stop and the deadline are
+        // read after it: nothing that can block separates them from the post.
         if (self.frontmost_pid)() != Some(self.target_pid) {
             return Err(ProcessEventRefusal::Cancelled);
         }
+        if cancelled() {
+            return Err(ProcessEventRefusal::Cancelled);
+        }
+        // The absolute deadline itself, not only whether the timer has run:
+        // a late-scheduled timer must not leave a post open past it.
         if (self.now_ms)() >= self.deadline_ms {
             return Err(ProcessEventRefusal::Cancelled);
         }
@@ -84,6 +99,8 @@ struct GateState {
     held: bool,
     /// The timer started the restore.
     restore_started_by_cutoff: bool,
+    /// The absolute deadline the timer was armed for.
+    deadline: Option<Instant>,
 }
 
 impl CutoffGate {
@@ -117,6 +134,22 @@ impl CutoffGate {
     /// Whether the bound passed.
     pub fn fired(&self) -> bool {
         self.state().fired
+    }
+
+    /// Record the absolute deadline the timer is armed for, so a check need
+    /// not wait for the timer's thread to have run.
+    pub fn set_deadline(&self, deadline: Instant) {
+        self.state().deadline = Some(deadline);
+    }
+
+    /// Whether the bound passed: the timer fired, or the absolute deadline
+    /// is behind the clock even if the timer has not run yet.
+    pub fn past_deadline(&self) -> bool {
+        let state = self.state();
+        state.fired
+            || state
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     /// The bracket is starting its own restore; a timer firing after this
@@ -169,6 +202,7 @@ impl CutoffTimer {
         deadline: Instant,
         restore: Box<dyn FnOnce() + Send>,
     ) -> Option<Self> {
+        gate.set_deadline(deadline);
         let (stop, stopped) = mpsc::channel::<()>();
         let thread = std::thread::Builder::new()
             .name("fronting-cutoff".into())

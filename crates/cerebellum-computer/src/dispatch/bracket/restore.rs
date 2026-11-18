@@ -188,6 +188,32 @@ pub fn restore_after_front_attempt<H: FrontingBracketHost + ?Sized>(
     )
 }
 
+/// Request the previous application back at once, for a cutoff at the
+/// bracket's deadline: unlike [`restore_after_front_attempt`] with an
+/// unconfirmed activation, it does not first watch for that activation to
+/// land. It still leaves focus alone when person input has occurred since
+/// the front, or the hardware input observer could not watch throughout
+/// since then, or a third application is in front. An
+/// activation that lands after this request is the late watch's to put
+/// back.
+pub fn restore_without_awaiting_activation<H: FrontingBracketHost + ?Sized>(
+    host: &mut H,
+    previous: u32,
+    target: u32,
+    front_instant_ms: u64,
+    wait_ms: u64,
+) -> RestoreOutcome {
+    restore_attempt(
+        host,
+        previous,
+        target,
+        front_instant_ms,
+        wait_ms,
+        true,
+        true,
+    )
+}
+
 fn restore_attempt<H: FrontingBracketHost + ?Sized>(
     host: &mut H,
     previous: u32,

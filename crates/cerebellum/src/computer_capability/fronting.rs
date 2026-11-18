@@ -685,6 +685,13 @@ impl RestoreHost for PlatformRestoreHost {
 /// run on a fresh thread, which carries no outer deadline, so a call whose
 /// work deadline already passed still puts the previous application back.
 pub(crate) fn decide_with_restore_budget(cell: &RestoreCell) -> RestoreDecided {
+    with_restore_budget(cell, RestoreCell::decide)
+}
+
+fn with_restore_budget(
+    cell: &RestoreCell,
+    decide: fn(&RestoreCell) -> RestoreDecided,
+) -> RestoreDecided {
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -694,10 +701,10 @@ pub(crate) fn decide_with_restore_budget(cell: &RestoreCell) -> RestoreDecided {
                 );
                 #[cfg(not(target_os = "macos"))]
                 let _ = RESTORE_AX_MS;
-                cell.decide()
+                decide(cell)
             })
             .join()
-            .unwrap_or_else(|_| cell.decide())
+            .unwrap_or_else(|_| decide(cell))
     })
 }
 
@@ -727,12 +734,12 @@ impl ObligationParts {
     ) -> Option<Arc<RestoreCell>> {
         let lock = self.lock.take()?;
         let mut host = host;
-        if self.restore_fallback {
-            // The restore host's second route to the front only ever
-            // activates this process, so a pid reused meanwhile is never
-            // brought forward.
-            host.remember_previous(previous);
-        }
+        // Every restore route checks it is still putting back this process,
+        // so a pid reused meanwhile is never brought forward. Remembered for
+        // every front: takeover fronts have no second route
+        // (`restore_fallback` stays false), but their one route checks it
+        // too.
+        host.remember_previous(previous);
         self.terminal
             .register_restore(RestoreObligation {
                 previous_pid: previous,
@@ -813,24 +820,59 @@ impl CellHooks {
         self.state().cell.clone()
     }
 
+    /// Run `decide` on the cell under the restore's own budget, and keep
+    /// what it decided.
+    fn decide_using(&self, decide: fn(&RestoreCell) -> RestoreDecided) -> HookedRestore {
+        let Some(cell) = self.cell() else {
+            return HookedRestore {
+                restore: RestoreStatus::NotNeeded,
+                person_input_during_fronting: false,
+                input_coverage_unavailable: false,
+                restore_ms: None,
+            };
+        };
+        let decided = with_restore_budget(&cell, decide);
+        self.state().decided = Some(decided);
+        HookedRestore {
+            restore: decided.restore,
+            person_input_during_fronting: decided.person_input_during_fronting,
+            input_coverage_unavailable: decided.input_coverage_unavailable,
+            restore_ms: decided.restore_ms,
+        }
+    }
+
     /// Whether a picture read may still acquire pixels: the cutoff has not
-    /// fired and no cleanup has taken the obligation. Asked immediately
-    /// before the pixels are requested, and again once they arrived, so a
-    /// read that was already under way when the bound passed acquires
-    /// nothing, or has what it acquired withheld.
+    /// fired, its absolute deadline has not passed (whether or not the timer
+    /// has run yet), and no cleanup has taken over restoring the person's
+    /// application. Asked immediately before the pixels are requested, by
+    /// the completion before any are copied, and again once they arrived, so
+    /// a read that was already under way when the bound passed requests no
+    /// pixels, copies none, or has what it copied withheld.
     pub(crate) fn picture_may_acquire(&self) -> bool {
         let (cutoff, cell) = {
             let state = self.state();
             (state.cutoff.clone(), state.cell.clone())
         };
-        !cutoff.is_some_and(|cutoff| cutoff.fired())
+        !cutoff.is_some_and(|cutoff| cutoff.past_deadline())
             && !cell.is_some_and(|cell| cell.cleanup_taken())
+    }
+
+    /// Whether the cutoff timer fired for this front.
+    pub(crate) fn cutoff_fired(&self) -> bool {
+        self.state()
+            .cutoff
+            .as_ref()
+            .is_some_and(|cutoff| cutoff.fired())
     }
 
     /// Keep the fronting lock for a picture read under way, until the hold
     /// is dropped; see [`RestoreCell::hold_lock_for_read`].
     pub(crate) fn hold_lock_for_read(&self) -> Option<crate::terminal_arbiter::ReadLockHold> {
-        self.cell().map(|cell| cell.hold_lock_for_read())
+        self.cell().map(|cell| {
+            cell.hold_lock_for_read(Duration::from_millis(
+                crate::budgets::PICTURE_READ_LIFETIME_MS,
+            ))
+        })
     }
 
     /// What the hooks hold now, without releasing an unregistered lock as
@@ -889,22 +931,7 @@ impl FrontedDispatchHooks for CellHooks {
     }
 
     fn decide_restore(&mut self) -> HookedRestore {
-        let Some(cell) = self.cell() else {
-            return HookedRestore {
-                restore: RestoreStatus::NotNeeded,
-                person_input_during_fronting: false,
-                input_coverage_unavailable: false,
-                restore_ms: None,
-            };
-        };
-        let decided = decide_with_restore_budget(&cell);
-        self.state().decided = Some(decided);
-        HookedRestore {
-            restore: decided.restore,
-            person_input_during_fronting: decided.person_input_during_fronting,
-            input_coverage_unavailable: decided.input_coverage_unavailable,
-            restore_ms: decided.restore_ms,
-        }
+        self.decide_using(RestoreCell::decide)
     }
 
     fn finished(&mut self, outcome: &BracketOutcome) {
@@ -917,19 +944,20 @@ impl FrontedDispatchHooks for CellHooks {
 
     /// App-use fronts (shortcuts and pictures under the app's own grant)
     /// get a cutoff timer; fronts made under the takeover (mouse-and-keyboard)
-    /// grant keep their existing bounds. The
-    /// timer runs this same hooks' decision, which goes through the one
-    /// restore cell, so the restore still runs exactly once.
+    /// grant keep their existing bounds. The timer runs this same hooks'
+    /// decision, which goes through the one restore cell, so the restore
+    /// still runs exactly once; at the cutoff it is requested at once
+    /// ([`RestoreCell::decide_at_cutoff`]).
     fn cutoff_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
         let app_use = self
             .state()
             .parts
             .as_ref()
             .is_some_and(|parts| parts.restore_fallback);
-        let mut hooks = self.clone();
+        let hooks = self.clone();
         app_use.then(|| {
             Box::new(move || {
-                hooks.decide_restore();
+                hooks.decide_using(RestoreCell::decide_at_cutoff);
             }) as Box<dyn FnOnce() + Send>
         })
     }
