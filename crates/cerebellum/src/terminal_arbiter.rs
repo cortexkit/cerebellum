@@ -561,8 +561,8 @@ impl RestoreCell {
         let started = std::time::Instant::now();
         let at_cutoff = wake.is_some();
         let mut inner = self.inner();
-        // A timed restore must not spend its preparation window waiting on
-        // an activation, even when the terminal or bracket owns it first.
+        // A timed restore cannot wait out the native front request. The
+        // worker or terminal can still observe a landing before cutoff.
         let timed = inner.restore_deadline.is_some();
         let front_instant_ms = match inner.attempt.take() {
             CleanupTake::AlreadyTaken => return self.await_decision(inner),
@@ -627,10 +627,11 @@ impl RestoreCell {
                     write_deadline: deadline.map(|deadline| {
                         restore_preparation::WriteDeadline::new(deadline, started, wake)
                     }),
+                    observation_cutoff: deadline.and(cutoff.as_deref()),
                     #[cfg(all(feature = "desk-probe", target_os = "macos"))]
                     probe_timing: &self.probe_timing,
                 };
-                let mut outcome = if (at_cutoff || deadline.is_some()) && !confirmed {
+                let mut outcome = if at_cutoff && !confirmed {
                     crate::computer::dispatch::restore_without_awaiting_activation(
                         &mut adapter,
                         self.previous_pid,
@@ -769,6 +770,7 @@ impl RestoreCell {
                 host: host.as_mut(),
                 _target: self.target_pid,
                 write_deadline: None,
+                observation_cutoff: None,
                 #[cfg(all(feature = "desk-probe", target_os = "macos"))]
                 probe_timing: &self.probe_timing,
             };
@@ -1000,12 +1002,18 @@ struct RestoreDecisionHost<'a> {
     host: &'a mut dyn RestoreHost,
     _target: u32,
     write_deadline: Option<restore_preparation::WriteDeadline>,
+    observation_cutoff: Option<&'a crate::computer::dispatch::CutoffGate>,
     #[cfg(all(feature = "desk-probe", target_os = "macos"))]
     probe_timing: &'a probe_timing::ProbeTiming,
 }
 
 impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> {
     type Tap = ();
+
+    fn restore_observation_open(&self) -> bool {
+        self.observation_cutoff
+            .is_none_or(|cutoff| !cutoff.past_deadline())
+    }
 
     fn now_ms(&mut self) -> u64 {
         self.host.now_ms()

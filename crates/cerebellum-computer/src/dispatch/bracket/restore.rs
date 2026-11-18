@@ -168,7 +168,9 @@ pub fn restore_after_front<H: FrontingBracketHost + ?Sized>(
 /// An elapsed fronting wait does not cancel the operating system's request.
 /// Until the target has actually been observed, seeing the previous app is
 /// not evidence that the target cannot still arrive. The watch never posts
-/// input, and consumes the same allowance as the subsequent restore.
+/// input, and consumes the same allowance as the subsequent restore. An
+/// absolute cutoff takes priority: reserve time for the native request
+/// rather than continuing to wait for the target.
 pub fn restore_after_front_attempt<H: FrontingBracketHost + ?Sized>(
     host: &mut H,
     previous: u32,
@@ -183,8 +185,11 @@ pub fn restore_after_front_attempt<H: FrontingBracketHost + ?Sized>(
         target,
         front_instant_ms,
         wait_ms,
-        activation_observed,
-        !activation_observed,
+        if activation_observed {
+            Activation::ConfirmedByAction
+        } else {
+            Activation::ObserveIfTime
+        },
     )
 }
 
@@ -209,9 +214,16 @@ pub fn restore_without_awaiting_activation<H: FrontingBracketHost + ?Sized>(
         target,
         front_instant_ms,
         wait_ms,
-        true,
-        true,
+        Activation::PendingAtCutoff,
     )
+}
+
+#[derive(Clone, Copy)]
+enum Activation {
+    ConfirmedByAction,
+    ObservedByWatcher,
+    ObserveIfTime,
+    PendingAtCutoff,
 }
 
 fn restore_attempt<H: FrontingBracketHost + ?Sized>(
@@ -220,8 +232,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
     target: u32,
     front_instant_ms: u64,
     wait_ms: u64,
-    activation_observed: bool,
-    require_quiet: bool,
+    activation: Activation,
 ) -> RestoreOutcome {
     let started = host.now_ms();
     let mut outcome = untimed_restore_attempt(
@@ -230,8 +241,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
         target,
         front_instant_ms,
         wait_ms,
-        activation_observed,
-        require_quiet,
+        activation,
     );
     outcome.restore_ms = Some(outcome.finished_at_ms.saturating_sub(started));
     outcome
@@ -243,12 +253,18 @@ fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
     target: u32,
     front_instant_ms: u64,
     wait_ms: u64,
-    activation_observed: bool,
-    require_quiet: bool,
+    activation: Activation,
 ) -> RestoreOutcome {
     let started = host.now_ms();
-    if previous != target && !activation_observed {
-        loop {
+    let require_quiet = !matches!(activation, Activation::ConfirmedByAction);
+    let mut landing_seen = matches!(
+        activation,
+        Activation::ConfirmedByAction | Activation::ObservedByWatcher
+    );
+    if previous != target && matches!(activation, Activation::ObserveIfTime) {
+        // Keep the reserve for the final safety reads and native write. Do
+        // not start another observation read after the cutoff.
+        while host.restore_observation_open() {
             let frontmost = host.frontmost_pid();
             let snapshot = host.hardware_input_snapshot();
             let input = observed_input_since(snapshot, front_instant_ms);
@@ -269,6 +285,7 @@ fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
                 };
             }
             if frontmost == Some(target) {
+                landing_seen = true;
                 break;
             }
             if input_coverage_unavailable || frontmost != Some(previous) {
@@ -293,7 +310,9 @@ fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
                     restore_ms: None,
                 };
             }
-            host.pause_ms(FRONTING_POLL_MS);
+            if host.restore_observation_open() {
+                host.pause_ms(FRONTING_POLL_MS);
+            }
         }
     }
     let wait_ms = wait_ms.saturating_sub(host.now_ms().saturating_sub(started));
@@ -344,7 +363,7 @@ fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
         RestoreDecision::Restore {
             person_input_during_fronting,
         } => {
-            let restore = request_restore(
+            let mut restore = request_restore(
                 host,
                 RestoreRequest {
                     previous,
@@ -355,6 +374,14 @@ fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
                 requested_at,
                 wait_ms,
             );
+            if !landing_seen && frontmost == Some(previous) && restore == RestoreStatus::Restored {
+                // A request was made before the deadline, but the target
+                // hadn't landed. Only the late watcher can attempt recovery
+                // if the outstanding activation subsequently takes effect.
+                restore = RestoreStatus::Failed {
+                    left_in_front: frontmost,
+                };
+            }
             RestoreOutcome {
                 restore,
                 person_input_during_fronting,
@@ -493,8 +520,7 @@ pub fn watch_late_activation_ending<H: FrontingBracketHost + ?Sized>(
                 target,
                 requested_at,
                 RESTORE_WAIT_MS.min(end.saturating_sub(now)),
-                true,
-                true,
+                Activation::ObservedByWatcher,
             );
             if first_attempt_only {
                 let coverage_lost = result.input_coverage_unavailable

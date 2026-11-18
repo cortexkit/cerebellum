@@ -148,6 +148,11 @@ pub trait FrontingBracketHost {
     }
     /// Optional diagnostic observation; it never authorizes more action input.
     fn late_activation_observed(&mut self, _latency_ms: u64) {}
+    /// A restore owner may observe a pending activation only before it must
+    /// start the safety reads and prepare the restore request.
+    fn restore_observation_open(&self) -> bool {
+        true
+    }
     /// The action's confirmation wait ended. Later observations belong only
     /// to cleanup and must not turn the refused action into a confirmed front.
     fn front_attempt_finished(&mut self) {}
