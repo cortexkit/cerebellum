@@ -1853,6 +1853,11 @@ pub trait FrontedDispatchHooks: Send {
     fn cutoff_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
         None
     }
+    /// The cutoff timer for this front was armed on `gate`. A caller that
+    /// reads pixels while the target is in front asks the gate immediately
+    /// before acquiring them, since the timer may fire while its read is
+    /// already under way. The default keeps nothing.
+    fn cutoff_armed(&mut self, _gate: std::sync::Arc<crate::dispatch::CutoffGate>) {}
     /// The bracket ended with `outcome`, whose restore is already the hooked
     /// decision. A `deferred_restore` in it is still owed: the caller settles
     /// the held input first.
@@ -1955,7 +1960,10 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
                     deadline,
                     restore,
                 ) {
-                    Some(timer) => self.timer = Some(timer),
+                    Some(timer) => {
+                        self.timer = Some(timer);
+                        self.hooks.cutoff_armed(std::sync::Arc::clone(&self.cutoff));
+                    }
                     None => {
                         self.registration = Registration::Registered { prevented: true };
                         return false;

@@ -1016,8 +1016,11 @@ pub(crate) fn run_fronting_read_with_predictor<H: FrontingBracketHost>(
             Ok(UnitPosted::default())
         }
         // A picture unit posts no keys or clicks and holds nothing down, so
-        // the cutoff may restore while the read is still running. The read itself starts
-        // only inside the bound, before the cutoff and before cancellation.
+        // the cutoff may start the restore while the read is still running.
+        // The read starts only inside the bound, before the cutoff and
+        // before cancellation; a hooked caller asks the cutoff again
+        // immediately before acquiring pixels, withholds any acquired as it
+        // fired, and keeps its fronting lock until the read returns.
         fn post_observed_unit(
             &mut self,
             index: usize,

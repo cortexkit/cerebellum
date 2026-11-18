@@ -263,3 +263,73 @@ fn the_cutoff_firing_during_a_blocked_activation_restores_once_it_returns() {
     assert_eq!(outcome.report.restore, RestoreStatus::Restored);
     assert_eq!(lock_releases(&releases), 1);
 }
+
+#[test]
+fn a_picture_read_past_admission_when_the_cutoff_fires_keeps_the_lock_and_acquires_nothing() {
+    let screen = Screen::new(&mail_desk());
+    let (hooks, releases) = app_use_hooks();
+    let mut boxed = boxed_hooks(&hooks);
+    let reader = hooks.clone();
+    let mut released_during_read = None;
+    let mut acquired = false;
+    // The read as a fronted picture runs it: hold the lock, pass admission,
+    // block in the visibility inspection, then ask the fence right before
+    // the pixels would be requested.
+    let mut read = || {
+        let _hold = reader.hold_lock_for_read();
+        let give_up = Instant::now() + crate::test_support::HANG_GUARD;
+        while Instant::now() < give_up
+            && !reader.cell().is_some_and(|cell| cell.decided().is_some())
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        released_during_read = Some(lock_releases(&releases));
+        acquired = reader.picture_may_acquire();
+    };
+    let outcome = cerebellum_computer::platform::run_hooked_fronted(
+        &mut FakeBracket(screen.clone()),
+        &mut UserIdleEstimator::new(),
+        plan(),
+        &|| false,
+        boxed.as_mut(),
+        Some(&mut read),
+    );
+    assert!(outcome.report.restore_started_by_cutoff);
+    assert_eq!(restores(&screen), 1, "{:?}", screen.log());
+    assert_eq!(
+        released_during_read,
+        Some(0),
+        "the cutoff's restore must not release the fronting lock under a read in flight"
+    );
+    assert!(!acquired, "no pixels are acquired once the cutoff fired");
+    assert_eq!(
+        lock_releases(&releases),
+        1,
+        "released once the read returned"
+    );
+}
+
+#[test]
+fn a_picture_read_inside_the_bound_may_acquire() {
+    let screen = Screen::new(&mail_desk());
+    let (hooks, releases) = app_use_hooks();
+    let mut boxed = boxed_hooks(&hooks);
+    let reader = hooks.clone();
+    let mut acquired = false;
+    let mut read = || {
+        let _hold = reader.hold_lock_for_read();
+        acquired = reader.picture_may_acquire();
+    };
+    let outcome = cerebellum_computer::platform::run_hooked_fronted(
+        &mut FakeBracket(screen.clone()),
+        &mut UserIdleEstimator::new(),
+        plan(),
+        &|| false,
+        boxed.as_mut(),
+        Some(&mut read),
+    );
+    assert!(acquired);
+    assert!(!outcome.report.restore_started_by_cutoff);
+    assert_eq!(outcome.report.restore, RestoreStatus::Restored);
+    assert_eq!(lock_releases(&releases), 1);
+}

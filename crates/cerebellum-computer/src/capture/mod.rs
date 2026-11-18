@@ -531,6 +531,11 @@ pub enum BackendTeardownProgress {
     Pending,
 }
 
+/// Why a fenced capture acquired no pixels: the read's time in front ran out
+/// before the pixels were requested.
+pub const FENCE_CLOSED: &str =
+    "the bounded time in front ended before the capture; no pixels were requested";
+
 /// The native ScreenCaptureKit implementation is expected to make these calls
 /// non-blocking.  In particular, teardown is split into begin/poll so a revoked
 /// stream cannot wedge the health lane while the window-server releases it.
@@ -584,6 +589,22 @@ pub trait CaptureBackend {
         _request: &WindowCaptureRequest,
     ) -> Result<PendingVisionWindowFrame, BackendError> {
         Err(BackendError::UnsupportedOnPlatform)
+    }
+    /// [`Self::capture_window_unencoded_for_vision`], asking `may_acquire`
+    /// as late as the backend can before any pixels are requested; when it
+    /// answers `false`, no pixels are acquired. The default asks just before
+    /// the unfenced capture. A backend whose capture has slow steps of its
+    /// own before the pixels are requested (finding the window, checking its
+    /// owner) asks after those instead.
+    fn capture_window_unencoded_for_vision_fenced(
+        &mut self,
+        request: &WindowCaptureRequest,
+        may_acquire: &dyn Fn() -> bool,
+    ) -> Result<PendingVisionWindowFrame, BackendError> {
+        if !may_acquire() {
+            return Err(BackendError::Capture(FENCE_CLOSED.into()));
+        }
+        self.capture_window_unencoded_for_vision(request)
     }
     /// Finish a captured frame without taking another picture. Native backends
     /// encode raw BGRA; the default only completes a prepared synthetic fixture.
@@ -790,10 +811,23 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         &mut self,
         now_ms: u64,
     ) -> Result<PendingSingleWindowCapture, SingleWindowCaptureError> {
+        self.capture_frontmost_window_unencoded_for_vision_fenced(now_ms, &|| true)
+    }
+
+    /// [`Self::capture_frontmost_window_unencoded_for_vision`] for a read
+    /// whose time in front is bounded: `may_acquire` is asked immediately
+    /// before the backend requests pixels, after choosing the window and any
+    /// other step that can block, and no pixels are acquired once it answers
+    /// `false`.
+    pub fn capture_frontmost_window_unencoded_for_vision_fenced(
+        &mut self,
+        now_ms: u64,
+        may_acquire: &dyn Fn() -> bool,
+    ) -> Result<PendingSingleWindowCapture, SingleWindowCaptureError> {
         let (window, request) = self.select_vision_window(now_ms)?;
         let frame = self
             .backend
-            .capture_window_unencoded_for_vision(&request)
+            .capture_window_unencoded_for_vision_fenced(&request, may_acquire)
             .map_err(|error| SingleWindowCaptureError::Capture(error.into()))?;
         self.verify_vision_owner(&frame.frame)?;
         self.state = CaptureSessionState::Active;
@@ -1476,6 +1510,27 @@ mod tests {
             },
             accessibility_root: Some(format!("root-{id}")),
         }
+    }
+
+    /// A fenced capture asks the fence after choosing the window and before
+    /// the backend is asked for pixels; a closed fence acquires nothing.
+    #[test]
+    fn a_closed_fence_acquires_no_pixels() {
+        let owner = target();
+        let mut backend = InMemoryCaptureBackend::default();
+        backend.set_windows(vec![window("11", &owner, true)]);
+        backend.set_vision_frame("11", 800, 600, vec![0xFF, 0xD8]);
+        backend.set_frontmost_window(Some("11".into()));
+        let mut controller =
+            ScopedCaptureController::with_v1_bounds(backend, owner.clone()).unwrap();
+        assert!(controller
+            .capture_frontmost_window_unencoded_for_vision_fenced(5, &|| false)
+            .is_err());
+        assert!(controller.backend().window_requests().is_empty());
+        controller
+            .capture_frontmost_window_unencoded_for_vision_fenced(6, &|| true)
+            .unwrap();
+        assert_eq!(controller.backend().window_requests().len(), 1);
     }
 
     /// Map a backend screen-locked failure to the distinct capture error so callers can

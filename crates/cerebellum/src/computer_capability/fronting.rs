@@ -758,6 +758,8 @@ struct HooksState {
     refused: bool,
     decided: Option<RestoreDecided>,
     finished: Option<(Option<DeferredRestore>, bool)>,
+    /// The cutoff armed for this front, when one was.
+    cutoff: Option<Arc<cerebellum_computer::dispatch::CutoffGate>>,
 }
 
 /// The hooks a fronted dispatch or read runs its obligation through, shared
@@ -809,6 +811,26 @@ impl CellHooks {
 
     pub(crate) fn cell(&self) -> Option<Arc<RestoreCell>> {
         self.state().cell.clone()
+    }
+
+    /// Whether a picture read may still acquire pixels: the cutoff has not
+    /// fired and no cleanup has taken the obligation. Asked immediately
+    /// before the pixels are requested, and again once they arrived, so a
+    /// read that was already under way when the bound passed acquires
+    /// nothing, or has what it acquired withheld.
+    pub(crate) fn picture_may_acquire(&self) -> bool {
+        let (cutoff, cell) = {
+            let state = self.state();
+            (state.cutoff.clone(), state.cell.clone())
+        };
+        !cutoff.is_some_and(|cutoff| cutoff.fired())
+            && !cell.is_some_and(|cell| cell.cleanup_taken())
+    }
+
+    /// Keep the fronting lock for a picture read under way, until the hold
+    /// is dropped; see [`RestoreCell::hold_lock_for_read`].
+    pub(crate) fn hold_lock_for_read(&self) -> Option<crate::terminal_arbiter::ReadLockHold> {
+        self.cell().map(|cell| cell.hold_lock_for_read())
     }
 
     /// What the hooks hold now, without releasing an unregistered lock as
@@ -908,6 +930,10 @@ impl FrontedDispatchHooks for CellHooks {
                 hooks.decide_restore();
             }) as Box<dyn FnOnce() + Send>
         })
+    }
+
+    fn cutoff_armed(&mut self, gate: Arc<cerebellum_computer::dispatch::CutoffGate>) {
+        self.state().cutoff = Some(gate);
     }
 }
 

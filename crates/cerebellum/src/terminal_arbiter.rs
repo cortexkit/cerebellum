@@ -286,6 +286,10 @@ struct RestoreCellInner {
     /// watched for, so the late watch starts with the previous application
     /// restored and only a further landing needs it.
     pending_restored: bool,
+    /// Picture reads still running while the target may be in front. The
+    /// fronting lock is kept until the last one returns, even when the
+    /// decision completed first, so no other front starts under a capture.
+    reads_in_flight: usize,
 }
 
 impl RestoreCell {
@@ -309,6 +313,7 @@ impl RestoreCell {
                 front_confirmed: false,
                 pending_since: None,
                 pending_restored: false,
+                reads_in_flight: 0,
             }),
             changed: std::sync::Condvar::new(),
             pending_watch: late_fronting::register_pending(
@@ -368,6 +373,20 @@ impl RestoreCell {
     /// The decision, once it has completed.
     pub fn decided(&self) -> Option<RestoreDecided> {
         self.inner().decided
+    }
+
+    /// Whether cleanup, the worker's own or the call's terminal, or the
+    /// cutoff has taken the obligation: the front is ending.
+    pub fn cleanup_taken(&self) -> bool {
+        self.inner().attempt.taken()
+    }
+
+    /// A picture read is starting while the target may be in front. The
+    /// fronting lock is kept until the returned hold is dropped, whenever
+    /// the decision completes.
+    pub fn hold_lock_for_read(self: &Arc<Self>) -> ReadLockHold {
+        self.inner().reads_in_flight += 1;
+        ReadLockHold(Arc::clone(self))
     }
 
     /// Run the restore decision, or wait for the side that took the
@@ -511,7 +530,7 @@ impl RestoreCell {
         decided: RestoreDecided,
     ) -> RestoreDecided {
         inner.decided = Some(decided);
-        let lock = if inner.pending_since.is_none() {
+        let lock = if inner.pending_since.is_none() && inner.reads_in_flight == 0 {
             inner.lock.take()
         } else {
             None
@@ -592,6 +611,28 @@ impl RestoreCell {
                 object.insert("remedy".into(), json!(explanation));
             }
         }
+    }
+}
+
+/// Keeps the fronting lock while a picture read runs; see
+/// [`RestoreCell::hold_lock_for_read`]. Dropping it releases the lock when
+/// the decision has completed and no late watch has taken it over.
+pub struct ReadLockHold(Arc<RestoreCell>);
+
+impl Drop for ReadLockHold {
+    fn drop(&mut self) {
+        let mut inner = self.0.inner();
+        inner.reads_in_flight = inner.reads_in_flight.saturating_sub(1);
+        let lock = if inner.reads_in_flight == 0
+            && inner.decided.is_some()
+            && inner.pending_since.is_none()
+        {
+            inner.lock.take()
+        } else {
+            None
+        };
+        drop(inner);
+        drop(lock);
     }
 }
 
