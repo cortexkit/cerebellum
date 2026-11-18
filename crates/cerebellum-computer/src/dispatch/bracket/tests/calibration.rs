@@ -103,6 +103,32 @@ fn a_slow_predictor_can_calibrate_again_after_sixty_seconds() {
 }
 
 #[test]
+fn a_failed_cold_calibration_prevents_another_front_for_sixty_seconds() {
+    let predictor = RestorePredictor::open(None);
+    let mut desk = FakeDesk::new();
+    desk.refuse_front_of = Some(PREVIOUS);
+    let failed = shortcut(&mut desk, &predictor).report;
+    assert_eq!(failed.stop, Some(BracketStop::RestoreFailed));
+    assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
+    assert_eq!(predictor.maximum(), None);
+
+    // The person put their previous app back; another shortcut would need
+    // to front again, but must not while the calibration cooldown is active.
+    desk.set_frontmost(PREVIOUS);
+    desk.front_requests.clear();
+    let retry = shortcut(&mut desk, &predictor).report;
+    assert!(
+        desk.front_requests.is_empty(),
+        "unexpected front: {retry:?}"
+    );
+    assert_eq!(retry.stop, Some(BracketStop::BoundExceeded));
+    assert_eq!(retry.posts_returned, 0);
+    assert!(predictor
+        .try_calibrate(None, Instant::now() + Duration::from_secs(60))
+        .is_some());
+}
+
+#[test]
 fn calibration_will_not_front_over_an_active_person_or_restore_over_their_switch() {
     let predictor = RestorePredictor::open(None);
     let mut desk = FakeDesk::new();
@@ -137,6 +163,7 @@ fn an_over_budget_calibration_finishes_cleanup_and_only_remembers_real_restores(
     assert!(failed.longest_fronted_interval_ms > BOUND);
     assert_eq!(predictor.maximum(), None, "a timeout is not a sample");
 
+    let predictor = RestorePredictor::open(None);
     let mut desk = FakeDesk::new();
     desk.restore_wait_ms = Some(RESTORE_WAIT_MS);
     desk.restore_latency_ms = Some(250);

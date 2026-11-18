@@ -93,10 +93,9 @@ impl RestorePredictor {
         let mut state = self.state();
         if state.calibrating
             || state.samples.maximum() != measured
-            || (measured.is_some()
-                && state.last_calibration.is_some_and(|last| {
-                    now.saturating_duration_since(last) < RECALIBRATION_INTERVAL
-                }))
+            || state
+                .last_calibration
+                .is_some_and(|last| now.saturating_duration_since(last) < RECALIBRATION_INTERVAL)
         {
             return None;
         }
