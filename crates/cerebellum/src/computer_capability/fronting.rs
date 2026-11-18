@@ -707,23 +707,20 @@ type RestoreDecision = fn(&RestoreCell) -> RestoreDecided;
 fn with_restore_budget(cell: &RestoreCell, decide: RestoreDecision) -> RestoreDecided {
     std::thread::scope(|scope| {
         scope
-            .spawn(|| with_restore_budget_here(|| decide(cell)))
+            .spawn(|| {
+                // A fresh thread carries no outer deadline: only the
+                // restore's own budget caps its accessibility messages.
+                #[cfg(target_os = "macos")]
+                let _ax = cerebellum_macos::ax_budget::bound_messages_until(
+                    Instant::now() + Duration::from_millis(RESTORE_AX_MS),
+                );
+                #[cfg(not(target_os = "macos"))]
+                let _ = RESTORE_AX_MS;
+                decide(cell)
+            })
             .join()
             .unwrap_or_else(|_| decide(cell))
     })
-}
-
-/// [`with_restore_budget`] on the calling thread, which must carry no outer
-/// accessibility deadline: the cutoff's own timer thread, already running,
-/// so the restore at the cutoff does not wait for a new thread to start.
-fn with_restore_budget_here(decide: impl FnOnce() -> RestoreDecided) -> RestoreDecided {
-    #[cfg(target_os = "macos")]
-    let _ax = cerebellum_macos::ax_budget::bound_messages_until(
-        Instant::now() + Duration::from_millis(RESTORE_AX_MS),
-    );
-    #[cfg(not(target_os = "macos"))]
-    let _ = RESTORE_AX_MS;
-    decide()
 }
 
 /// What a temporary front's obligation carries before it is registered.
@@ -788,7 +785,7 @@ struct HooksState {
     refused: bool,
     decided: Option<RestoreDecided>,
     finished: Option<(Option<DeferredRestore>, bool)>,
-    /// The cutoff armed for this front, when one was.
+    /// The bracket's gate for this front, once registered.
     cutoff: Option<Arc<cerebellum_computer::dispatch::CutoffGate>>,
 }
 
@@ -864,28 +861,40 @@ impl CellHooks {
         }
     }
 
-    /// Whether a picture read may still acquire pixels: the cutoff has not
-    /// fired, its absolute deadline has not passed (whether or not the timer
-    /// has run yet), and no cleanup has taken over restoring the person's
-    /// application. Asked immediately before the pixels are requested, by
-    /// the completion before any are copied, and again once they arrived, so
-    /// a read that was already under way when the bound passed requests no
-    /// pixels, copies none, or has what it copied withheld.
+    /// Whether a picture read may still acquire pixels: the restore reserve
+    /// has not started (whatever this thread is doing), the owner has not
+    /// begun its restore and cleanup has not stopped the front. Asked
+    /// immediately before the pixels are requested, by the completion before
+    /// any are copied, and again once they arrived, so a read that was
+    /// already under way when the bound passed requests no pixels, copies
+    /// none, or has what it copied withheld.
     pub(crate) fn picture_may_acquire(&self) -> bool {
         let (cutoff, cell) = {
             let state = self.state();
             (state.cutoff.clone(), state.cell.clone())
         };
-        !cutoff.is_some_and(|cutoff| cutoff.past_deadline())
+        !cutoff.is_some_and(|cutoff| cutoff.closed())
             && !cell.is_some_and(|cell| cell.cleanup_taken())
     }
 
-    /// Whether the cutoff timer fired for this front.
+    /// When a picture read's waits for the system must end: the start of the
+    /// restore reserve, when the front has one. The bracket's own cap on its
+    /// waits on the target ends them there in production.
+    #[cfg(test)]
+    pub(crate) fn picture_wait_until(&self) -> Option<Instant> {
+        self.state()
+            .cutoff
+            .as_ref()
+            .and_then(|cutoff| cutoff.reserve_start())
+    }
+
+    /// Whether the front reached its cutoff, the start of the restore
+    /// reserve, before the bracket ended it.
     pub(crate) fn cutoff_fired(&self) -> bool {
         self.state()
             .cutoff
             .as_ref()
-            .is_some_and(|cutoff| cutoff.fired())
+            .is_some_and(|cutoff| cutoff.ended_past_cutoff())
     }
 
     /// Keep the fronting lock for a picture read under way, until the hold
@@ -931,6 +940,7 @@ impl FrontedDispatchHooks for CellHooks {
         match parts.register(previous, target, host, Some(Arc::clone(gate))) {
             Some(cell) => {
                 state.cell = Some(cell);
+                state.cutoff = Some(Arc::clone(gate));
                 true
             }
             None => {
@@ -974,66 +984,16 @@ impl FrontedDispatchHooks for CellHooks {
     }
 
     /// App-use fronts (shortcuts and pictures under the app's own grant)
-    /// get a cutoff timer; fronts made under the takeover (mouse-and-keyboard)
-    /// grant keep their existing bounds. The timer decides through the same
-    /// restore cell, which the cell's gate hands it at the start of the
-    /// restore reserve, so the restore still runs exactly once; it is then
-    /// requested at once ([`RestoreCell::decide_at_cutoff`]) on `host`, the
-    /// timer's own restore host.
-    fn cutoff_restore(
-        &mut self,
-        host: Box<dyn FrontingRestoreHost>,
-    ) -> Option<Box<dyn FnOnce(cerebellum_computer::dispatch::CutoffWake) + Send>> {
-        let state = self.state();
-        let fallback = state
+    /// get an absolute restore deadline, with the restore reserve starting
+    /// early by the restore's measured preparation time
+    /// ([`crate::terminal_arbiter::restore_preparation`]). Fronts made under
+    /// the takeover (mouse-and-keyboard) grant keep their existing bounds.
+    fn restore_reserve_ms(&self) -> Option<u64> {
+        self.state()
             .parts
             .as_ref()
-            .is_some_and(|parts| parts.restore_fallback);
-        if !fallback {
-            return None;
-        }
-        // Resolve the cell before arming. At cutoff the ready thread can
-        // claim it directly without taking the hooks' separate mutex.
-        let cell = state.cell.clone()?;
-        drop(state);
-        let mut host = host;
-        // Prepared now, as the obligation's host was at registration, so the
-        // timer's restore makes no lookup before its request either.
-        if cell.previous_pid() != cell.target_pid() {
-            host.remember_previous(cell.previous_pid());
-        }
-        let host: Box<dyn crate::terminal_arbiter::RestoreHost> =
-            Box::new(PlatformRestoreHost { host, fallback });
-        let hooks = self.clone();
-        Some(Box::new(move |wake| {
-            let decided = with_restore_budget_here(|| cell.decide_at_cutoff(wake, host));
-            hooks.state().decided = Some(decided);
-        }))
-    }
-
-    /// App-use fronts' cutoffs fire early by the restore's measured
-    /// preparation time ([`crate::terminal_arbiter::restore_preparation`]).
-    fn cutoff_lead_ms(&self) -> u64 {
-        let app_use = self
-            .state()
-            .parts
-            .as_ref()
-            .is_some_and(|parts| parts.restore_fallback);
-        if app_use {
-            crate::terminal_arbiter::restore_preparation::reserve_ms()
-        } else {
-            0
-        }
-    }
-
-    fn cutoff_armed(&mut self, gate: Arc<cerebellum_computer::dispatch::CutoffGate>) {
-        self.state().cutoff = Some(gate);
-    }
-
-    fn restore_deadline(&mut self, deadline: Instant) {
-        if let Some(cell) = self.cell() {
-            cell.set_restore_deadline(deadline);
-        }
+            .is_some_and(|parts| parts.restore_fallback)
+            .then(crate::terminal_arbiter::restore_preparation::reserve_ms)
     }
 }
 
@@ -1472,21 +1432,20 @@ pub(crate) fn hooked_fronting(mode: AppUse, purpose: Purpose, end: &HookedEnd) -
     }
 }
 
-/// End a hooked synthetic bracket once the held input is settled. A bracket
-/// whose post failed with a key possibly held deferred its restore: when
-/// settling `held` confirmed the release (or nothing was held), the one
-/// restore decision runs now and `bracket` reports it. When the release is
-/// not confirmed, no restore is requested at all, since the previous
-/// application would receive the held key; the bracket keeps reporting the
-/// target left in front, and terminal cleanup, finding the release
-/// unconfirmed, reports the restore failed without requesting one and
-/// releases the fronting lock. A release that was still running when the
-/// reply was due is different: terminal cleanup reports the restore failed
-/// but keeps the lock, and restores once that release settles confirmed
-/// (see `terminal_arbiter::restore_when_released`).
+/// End a hooked synthetic bracket once the held input is settled; `held`
+/// is how settling it ended, at `settled_at`. A bracket whose post failed
+/// with a key possibly held deferred its restore, and its owner decides it
+/// now ([`RestoreCell::decide_after_release`]): a release confirmed (or
+/// nothing held) before the deadline restores at once under that deadline;
+/// one confirmed after it restores without one; an unconfirmed release
+/// requests no restore at all, since the previous application would receive
+/// the held key, and reports the target left in front. A release still
+/// running when the reply was due was already reported failed by terminal
+/// cleanup, which kept the fronting lock for this decision.
 pub(crate) fn finish_after_release(
     hooks: &CellHooks,
     held: Option<crate::HeldState>,
+    settled_at: Instant,
     bracket: Option<&mut cerebellum_computer::dispatch::BracketReport>,
 ) -> HookedEnd {
     let mut end = hooks.end();
@@ -1496,13 +1455,24 @@ pub(crate) fn finish_after_release(
             held,
             None | Some(crate::HeldState::Released | crate::HeldState::NoneHeld)
         );
-        if released {
-            let decided = decide_with_restore_budget(cell);
-            hooks.state().decided = Some(decided);
-            end.decided = Some(decided);
-            if let Some(bracket) = bracket {
-                bracket.restore = decided.restore;
-            }
+        let decided = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    #[cfg(target_os = "macos")]
+                    let _ax = cerebellum_macos::ax_budget::bound_messages_until(
+                        Instant::now() + Duration::from_millis(RESTORE_AX_MS),
+                    );
+                    cell.decide_after_release(released, settled_at)
+                })
+                .join()
+                .unwrap_or_else(|_| cell.decide_after_release(released, settled_at))
+        });
+        hooks.state().decided = Some(decided);
+        end.decided = Some(decided);
+        // An unconfirmed release leaves the bracket's own report of what it
+        // left in front.
+        if let (Some(bracket), true) = (bracket, released) {
+            bracket.restore = decided.restore;
         }
     }
     end

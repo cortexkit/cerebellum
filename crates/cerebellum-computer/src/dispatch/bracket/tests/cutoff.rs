@@ -1,363 +1,130 @@
-//! The cutoff gate and timer on their own: the timer stops new posts and
-//! starts the restore at the bound, except while a key may be held, and no
-//! timer outlives the bracket that armed it.
+//! The cutoff gate on its own: it closes to new posts, fronts and captures
+//! at the start of the restore reserve, whatever any thread is doing, and
+//! records what a missed restore deadline can be attributed to. It performs
+//! nothing: the bracket's owner reads it.
 
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use crate::platform::FrontedKeyGuard;
 use std::time::{Duration, Instant};
 
-fn counting_restore(count: &Arc<AtomicUsize>) -> Box<dyn FnOnce() + Send> {
-    let count = Arc::clone(count);
-    Box::new(move || {
-        count.fetch_add(1, Ordering::SeqCst);
-    })
-}
-
-/// Wait for `condition`, failing the test after a generous guard.
-fn eventually(condition: impl Fn() -> bool) {
-    let give_up = Instant::now() + Duration::from_secs(10);
-    while !condition() {
-        assert!(Instant::now() < give_up, "timed out");
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
-#[test]
-fn at_the_bound_the_cutoff_stops_new_posts_and_starts_the_restore() {
-    let gate = Arc::new(CutoffGate::new());
-    let restores = Arc::new(AtomicUsize::new(0));
-    let timer = CutoffTimer::arm(
-        Arc::clone(&gate),
-        Instant::now() + Duration::from_millis(20),
-        counting_restore(&restores),
-    )
-    .unwrap();
-    eventually(|| restores.load(Ordering::SeqCst) == 1);
-    assert!(gate.fired());
-    assert!(!gate.begin_post(false), "no post starts after the cutoff");
-    assert!(!gate.begin_post(true));
-    timer.finish();
-    assert!(gate.restore_started_by_cutoff());
-    assert_eq!(restores.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn the_cutoff_fires_at_its_stamped_deadline_however_late_it_is_armed() {
-    let gate = Arc::new(CutoffGate::new());
-    let restores = Arc::new(AtomicUsize::new(0));
-    let stamped = Instant::now();
-    let deadline = stamped + Duration::from_millis(100);
-    // Registration took longer than the whole bound before the timer was
-    // armed; the cutoff must not then wait a further bound.
-    std::thread::sleep(Duration::from_millis(200));
-    let armed = Instant::now();
-    let timer = CutoffTimer::arm(Arc::clone(&gate), deadline, counting_restore(&restores)).unwrap();
-    eventually(|| restores.load(Ordering::SeqCst) == 1);
-    assert!(
-        armed.elapsed() < Duration::from_millis(80),
-        "a deadline already past fires at once, not a bound after arming"
-    );
-    timer.finish();
-}
-
-#[test]
-fn the_cutoff_never_restores_while_a_key_may_be_held() {
-    let gate = Arc::new(CutoffGate::new());
-    let restores = Arc::new(AtomicUsize::new(0));
-    assert!(gate.begin_post(true), "a press before the bound");
-    let timer = CutoffTimer::arm(
-        Arc::clone(&gate),
-        Instant::now() + Duration::from_millis(5),
-        counting_restore(&restores),
-    )
-    .unwrap();
-    eventually(|| gate.fired());
-    // The unit sees the cutoff at its next post and releases what it holds;
-    // the bracket restores after that, not the timer.
-    assert!(!gate.begin_post(true));
-    gate.all_released();
-    timer.finish();
-    assert_eq!(restores.load(Ordering::SeqCst), 0);
-    assert!(!gate.restore_started_by_cutoff());
-}
-
-#[test]
-fn a_bracket_that_restores_first_leaves_the_timer_nothing_to_do() {
-    let gate = Arc::new(CutoffGate::new());
-    let restores = Arc::new(AtomicUsize::new(0));
-    assert!(gate.begin_front_attempt(0));
-    gate.front_attempt_returned();
-    let timer = CutoffTimer::arm(
-        Arc::clone(&gate),
-        Instant::now() + Duration::from_millis(100),
-        counting_restore(&restores),
-    )
-    .unwrap();
-    let OrdinaryClaim::Decide { ticket, .. } = gate.claim_ordinary() else {
-        panic!("phase A is open to the bracket's own restore");
-    };
-    assert!(gate.settle_ordinary(&ticket), "decided inside phase A");
-    std::thread::sleep(Duration::from_millis(150));
-    timer.finish();
-    assert_eq!(restores.load(Ordering::SeqCst), 0);
-    assert!(!gate.fired());
-}
-
-#[test]
-fn finishing_before_the_bound_stops_the_timer_without_waiting_for_it() {
-    let gate = Arc::new(CutoffGate::new());
-    let restores = Arc::new(AtomicUsize::new(0));
-    let timer = CutoffTimer::arm(
-        Arc::clone(&gate),
-        Instant::now() + Duration::from_secs(3600),
-        counting_restore(&restores),
-    )
-    .unwrap();
-    let finishing = Instant::now();
-    timer.finish();
-    assert!(finishing.elapsed() < Duration::from_secs(5));
-    assert_eq!(restores.load(Ordering::SeqCst), 0);
-    assert!(!gate.fired());
-    assert!(gate.begin_post(true), "an unfired gate admits posts");
-}
-
-#[test]
-fn key_checks_refuse_a_press_once_the_cutoff_fired_and_mark_a_press_held() {
-    let gate = CutoffGate::new();
-    let mut checks = FrontedKeyChecks {
+fn checks(
+    gate: &CutoffGate,
+) -> FrontedKeyChecks<'_, impl FnMut() -> u64, impl FnMut() -> Option<u32>> {
+    FrontedKeyChecks {
         target_pid: TARGET,
         deadline_ms: 1_000,
         now_ms: || 0,
         frontmost_pid: || Some(TARGET),
-        cutoff: Some(&gate),
-    };
-    use crate::platform::FrontedKeyGuard;
-    assert!(checks.before_post(true, &|| false, &mut || Ok(())).is_ok());
-    assert!(!gate.fire(), "held: the timer must not restore");
-    assert!(
-        checks
-            .before_post(false, &|| false, &mut || Ok(()))
-            .is_err(),
-        "no post after the cutoff"
-    );
-    checks.all_released();
+        cutoff: Some(gate),
+    }
 }
 
 #[test]
-fn a_passed_deadline_counts_before_the_timer_has_run() {
+fn a_post_is_refused_once_the_restore_reserve_starts() {
     let gate = CutoffGate::new();
-    assert!(!gate.past_deadline(), "no deadline yet");
-    gate.set_deadline(Instant::now() + Duration::from_secs(3600));
-    assert!(!gate.past_deadline());
-    gate.set_deadline(Instant::now() - Duration::from_millis(1));
-    assert!(!gate.fired(), "the timer has not run");
-    assert!(gate.past_deadline(), "the clock alone closes it");
+    let deadline = Instant::now() + Duration::from_secs(3600);
+    gate.set_bound(Instant::now() + Duration::from_secs(1800), deadline);
     assert!(
-        !gate.begin_post(true),
-        "an expired gate cannot commit a post"
+        checks(&gate)
+            .before_post(false, &|| false, &mut || Ok(()))
+            .is_ok(),
+        "inside the bound, before the reserve"
     );
-    assert!(gate.fire(), "a refused post does not block restore");
-}
-
-#[test]
-fn a_hold_that_clears_before_the_deadline_lets_the_timer_restore_at_once() {
-    let gate = Arc::new(CutoffGate::new());
-    let wakes = Arc::new(std::sync::Mutex::new(Vec::new()));
-    assert!(gate.begin_post(true), "a press inside phase A");
-    let armed = Instant::now();
-    let deadline = armed + Duration::from_millis(200);
-    let recorded = Arc::clone(&wakes);
-    let timer = CutoffTimer::arm_with_wake(
-        Arc::clone(&gate),
-        armed + Duration::from_millis(20),
-        deadline,
-        Box::new(move |wake| recorded.lock().unwrap().push((wake, Instant::now()))),
-    )
-    .unwrap();
-    eventually(|| {
-        gate.phase()
-            == RestorePhase::Timer {
-                awaiting_release: true,
-            }
-    });
-    std::thread::sleep(Duration::from_millis(130).saturating_sub(armed.elapsed()));
-    let released = Instant::now();
     gate.all_released();
-    eventually(|| !wakes.lock().unwrap().is_empty());
-    timer.finish();
-    let (wake, ran_at) = wakes.lock().unwrap()[0];
-    assert!(
-        ran_at < deadline,
-        "the timer restores as soon as the release settles, inside the deadline"
-    );
-    assert!(
-        wake.scheduled_at >= released,
-        "preparation is timed from the release"
-    );
-    assert!(gate.restore_started_by_cutoff());
-}
-
-#[test]
-fn a_hold_through_the_deadline_passes_the_decision_to_the_release_without_a_deadline() {
-    let gate = Arc::new(CutoffGate::new());
-    let restores = Arc::new(AtomicUsize::new(0));
-    assert!(gate.begin_front_attempt(0));
-    gate.front_attempt_returned();
-    assert!(gate.begin_post(true));
-    let timer = CutoffTimer::arm(
-        Arc::clone(&gate),
-        Instant::now() + Duration::from_millis(5),
-        counting_restore(&restores),
-    )
-    .unwrap();
-    eventually(|| gate.phase() == RestorePhase::AfterRelease { claimed: false });
-    gate.all_released();
-    timer.finish();
-    assert_eq!(restores.load(Ordering::SeqCst), 0);
-    assert!(matches!(
-        gate.claim_ordinary(),
-        OrdinaryClaim::Decide {
-            write_deadline: false,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn an_ordinary_owner_loses_the_decision_when_the_reserve_starts() {
-    let gate = Arc::new(CutoffGate::new());
-    let restores = Arc::new(AtomicUsize::new(0));
-    assert!(gate.begin_front_attempt(0));
-    gate.front_attempt_returned();
-    let closes_at = Instant::now() + Duration::from_millis(60);
-    let timer = CutoffTimer::arm_with_wake(
-        Arc::clone(&gate),
-        closes_at,
-        closes_at + Duration::from_millis(100),
-        Box::new({
-            let restores = Arc::clone(&restores);
-            move |_| {
-                restores.fetch_add(1, Ordering::SeqCst);
-            }
-        }),
-    )
-    .unwrap();
-    let OrdinaryClaim::Decide { ticket, .. } = gate.claim_ordinary() else {
-        panic!("phase A is open to an ordinary owner");
-    };
-    assert!(gate.ordinary_holds(&ticket));
-    assert!(gate
-        .ordinary_time_left(&ticket)
-        .is_some_and(|left| left <= Duration::from_millis(60)));
-    assert_eq!(gate.claim_ordinary(), OrdinaryClaim::Await, "one owner");
-    // The owner is busy (a read it cannot cut short) across the reserve.
-    std::thread::sleep(closes_at.saturating_duration_since(Instant::now()));
-    assert!(
-        !gate.ordinary_holds(&ticket),
-        "the clock alone ends phase A, before the timer thread runs"
-    );
-    assert!(
-        !gate.settle_ordinary(&ticket),
-        "a lost owner cannot settle: it writes nothing"
-    );
-    eventually(|| restores.load(Ordering::SeqCst) == 1);
-    timer.finish();
-    assert!(gate.restore_started_by_cutoff());
-}
-
-#[test]
-fn finishing_while_an_ordinary_owner_decides_keeps_the_timer_for_its_turn() {
-    let gate = Arc::new(CutoffGate::new());
-    let restores = Arc::new(AtomicUsize::new(0));
-    assert!(gate.begin_front_attempt(0));
-    gate.front_attempt_returned();
-    let timer = CutoffTimer::arm(
-        Arc::clone(&gate),
-        Instant::now() + Duration::from_millis(40),
-        counting_restore(&restores),
-    )
-    .unwrap();
-    let OrdinaryClaim::Decide { .. } = gate.claim_ordinary() else {
-        panic!("phase A is open to an ordinary owner");
-    };
-    // The owner stalls; the bracket finishing must not take its backstop.
-    timer.finish();
-    assert_eq!(restores.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn a_bracket_ending_under_a_hold_returns_the_decision_with_its_deadline() {
-    let gate = Arc::new(CutoffGate::new());
-    let restores = Arc::new(AtomicUsize::new(0));
-    assert!(gate.begin_front_attempt(0));
-    gate.front_attempt_returned();
-    assert!(gate.begin_post(true), "a press whose release failed");
-    let timer = CutoffTimer::arm_with_wake(
-        Arc::clone(&gate),
-        Instant::now() + Duration::from_millis(5),
-        Instant::now() + Duration::from_secs(3600),
-        Box::new({
-            let restores = Arc::clone(&restores);
-            move |_| {
-                restores.fetch_add(1, Ordering::SeqCst);
-            }
-        }),
-    )
-    .unwrap();
-    eventually(|| {
-        gate.phase()
-            == RestorePhase::Timer {
-                awaiting_release: true,
-            }
-    });
-    let finishing = Instant::now();
-    timer.finish();
-    assert!(
-        finishing.elapsed() < Duration::from_secs(5),
-        "the caller settles the release only after the bracket returns"
-    );
-    assert_eq!(restores.load(Ordering::SeqCst), 0);
-    assert!(matches!(
-        gate.claim_ordinary(),
-        OrdinaryClaim::Decide {
-            write_deadline: true,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn a_cleanup_that_knows_input_is_held_ends_a_timer_waiting_for_the_release() {
-    let gate = Arc::new(CutoffGate::new());
-    let restores = Arc::new(AtomicUsize::new(0));
-    assert!(gate.begin_front_attempt(3));
-    assert!(gate.begin_post(true));
-    let timer = CutoffTimer::arm_with_wake(
-        Arc::clone(&gate),
-        Instant::now() + Duration::from_millis(5),
-        Instant::now() + Duration::from_secs(3600),
-        Box::new({
-            let restores = Arc::clone(&restores);
-            move |_| {
-                restores.fetch_add(1, Ordering::SeqCst);
-            }
-        }),
-    )
-    .unwrap();
-    eventually(|| {
-        gate.phase()
-            == RestorePhase::Timer {
-                awaiting_release: true,
-            }
-    });
+    // The reserve has started; the deadline itself is still far off.
+    gate.set_bound(Instant::now() - Duration::from_millis(1), deadline);
     assert_eq!(
-        gate.claim_forgo(),
-        ForgoClaim::Taken {
-            front_instant_ms: 3
+        checks(&gate).before_post(true, &|| false, &mut || Ok(())),
+        Err(crate::platform::ProcessEventRefusal::Cancelled),
+        "now >= reserve start: the post is not begun, though the deadline is still ahead"
+    );
+    assert!(!gate.begin_post(false));
+    assert!(!gate.input_held(), "a refused post holds nothing");
+    assert!(!gate.begin_front_attempt(0), "nor is a front begun");
+}
+
+#[test]
+fn a_committed_press_counts_as_held_until_its_release() {
+    let gate = CutoffGate::new();
+    let mut keys = checks(&gate);
+    assert!(keys.before_post(true, &|| false, &mut || Ok(())).is_ok());
+    assert!(gate.input_held(), "the press is committed and may be down");
+    keys.all_released();
+    assert!(!gate.input_held());
+}
+
+#[test]
+fn the_reserve_never_starts_after_the_deadline() {
+    let gate = CutoffGate::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    gate.set_bound(deadline + Duration::from_secs(60), deadline);
+    assert_eq!(gate.reserve_start(), Some(deadline));
+    assert!(gate.time_to_reserve_start().unwrap() <= Duration::from_secs(60));
+    assert!(
+        CutoffGate::new().time_to_reserve_start().is_none(),
+        "no bound"
+    );
+}
+
+#[test]
+fn cleanup_stops_a_front_not_yet_requested_and_only_closes_one_already_requested() {
+    let unfronted = CutoffGate::new();
+    assert!(unfronted.stop_front(), "nothing was fronted");
+    assert!(!unfronted.begin_front_attempt(0), "and nothing will be");
+    assert!(unfronted.closed());
+
+    let fronted = CutoffGate::new();
+    assert!(fronted.begin_front_attempt(7));
+    assert!(
+        !fronted.stop_front(),
+        "a requested front still needs its restore"
+    );
+    assert!(fronted.closed(), "but nothing new starts");
+    assert!(!fronted.begin_post(true));
+    assert_eq!(
+        fronted.attempt_state(),
+        FrontAttemptState::Dispatching {
+            front_instant_ms: 7
         }
     );
-    timer.finish();
-    assert_eq!(restores.load(Ordering::SeqCst), 0);
-    assert_eq!(gate.phase(), RestorePhase::Done { by_timer: false });
+}
+
+#[test]
+fn ending_the_front_closes_it_and_says_whether_the_cutoff_had_passed() {
+    let early = CutoffGate::new();
+    early.set_bound(
+        Instant::now() + Duration::from_secs(60),
+        Instant::now() + Duration::from_secs(120),
+    );
+    early.end_front();
+    assert!(early.closed());
+    assert!(!early.ended_past_cutoff());
+
+    let late = CutoffGate::new();
+    late.set_bound(Instant::now(), Instant::now() + Duration::from_secs(120));
+    std::thread::sleep(Duration::from_millis(2));
+    late.end_front();
+    assert!(late.ended_past_cutoff());
+}
+
+#[test]
+fn only_a_native_call_still_running_at_the_deadline_is_kept() {
+    let gate = CutoffGate::new();
+    let start = Instant::now();
+    let plus = |ms| start + Duration::from_millis(ms);
+    gate.set_bound(plus(30), plus(50));
+    gate.native_call(plus(1), plus(40));
+    assert_eq!(
+        gate.native_overrun_until(),
+        None,
+        "returned before the deadline"
+    );
+    gate.native_call(plus(45), plus(70));
+    assert_eq!(gate.native_overrun_until(), Some(plus(70)));
+    gate.native_call(plus(71), plus(90));
+    assert_eq!(
+        gate.native_overrun_until(),
+        Some(plus(70)),
+        "a later call that began after the deadline is our own lateness"
+    );
 }

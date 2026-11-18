@@ -778,13 +778,15 @@ impl<T> Delivery<T> {
         self.ready.notify_all();
     }
 
-    /// Waits for a value, or gives up at the deadline.
+    /// Waits for a value, or gives up at the deadline: `timeout` from now, or
+    /// sooner when this thread's callback cap
+    /// ([`crate::ax_budget::bound_callback_waits_until`]) ends first.
     ///
     /// The bound exists because the callback is invoked by the system: if the
     /// window server never answers, an unbounded wait holds this thread
     /// forever, and the caller cannot distinguish that from slow work.
     fn wait(&self, timeout: Duration) -> Option<T> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + crate::ax_budget::callback_wait(timeout);
         let mut slot = self.slot.lock().unwrap();
         while slot.is_none() {
             let remaining = deadline.saturating_duration_since(Instant::now());

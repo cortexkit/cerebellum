@@ -408,8 +408,9 @@ pub trait FrontedKeyGuard {
     /// (the window-server listing read and whatever the transport prepares, such as an authentication
     /// object attached to the event), immediately before the OS post call:
     /// nothing runs between its answer and that call. It reads focus, calls
-    /// `revalidate` to verify process generation, reads focus again, reads
-    /// `cancelled`, then the absolute deadline, and last commits the post. `press` says the
+    /// `revalidate` to verify the focused pid's process generation, reads
+    /// `cancelled`, then the absolute deadline, and last commits the post,
+    /// with no further focus or process-generation read after `revalidate`. `press` says the
     /// post may leave a key held until its paired release. An error stops
     /// the unit before this post, and the presses already posted are
     /// released as on any other stop.

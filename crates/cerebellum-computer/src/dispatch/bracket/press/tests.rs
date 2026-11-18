@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::dispatch::bracket::{
-    not_fronted_reason, CutoffGate, HardwareInputSnapshot, NotFrontedReason, OrdinaryClaim,
+    not_fronted_reason, CutoffGate, FrontAttemptState, HardwareInputSnapshot, NotFrontedReason,
     UnitPosted,
 };
 use crate::dispatch::seize::{
@@ -280,7 +280,7 @@ impl FrontingPressHost for PressDesk {
         assert_eq!((previous, target), (PREVIOUS, TARGET));
         self.log.push("register");
         if self.cleanup_takes_at_registration {
-            assert_eq!(self.attempt.claim_ordinary(), OrdinaryClaim::PreventedFront);
+            assert!(self.attempt.stop_front(), "stopped before any front");
         }
         true
     }
@@ -353,7 +353,7 @@ impl FrontingPressHost for PressDesk {
     }
     fn claim_restore(&mut self) -> RestoreClaim {
         self.log.push("claim");
-        if self.attempt.restore_taken() {
+        if self.attempt.attempt_state() == FrontAttemptState::NotStarted && self.attempt.closed() {
             return RestoreClaim::TakenByCleanup(RestoreStatus::NotNeeded);
         }
         RestoreClaim::Run

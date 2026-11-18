@@ -915,6 +915,9 @@ fn write_frontmost<E: std::borrow::Borrow<AxRetainedElement>>(
     // SAFETY: element, attribute name and the static Boolean are live for the
     // call.
     write_if_still_ours(resolve, still_ours, |application| unsafe {
+        // Refreshed from this thread's budget just before the write: the
+        // identity check that came after the lookup has used some of it.
+        bound_messages(application.borrow().as_ptr());
         AXUIElementSetAttributeValue(
             application.borrow().as_ptr(),
             CFRetained::as_ptr(&name).as_ptr().cast(),

@@ -626,6 +626,10 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
         ))
     }
 
+    fn cap_target_waits_until(&mut self, until: Instant) -> Option<crate::dispatch::TargetWaitCap> {
+        Some(cap_target_waits_until(until))
+    }
+
     // Keystroke units check the cutoff before each key post and mark the
     // keys they hold. A pointer gesture does not, so the bracket holds the
     // cutoff for the whole gesture: a restore under a held button would
@@ -789,17 +793,18 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
 /// The restore half of a front on this Mac, on the clock of the bracket or
 /// session it came from: the window list's frontmost application, fronting
 /// through accessibility, and the process-wide session observer's hardware
-/// input timestamps. It holds nothing but that clock's origin, so it is
-/// `Send` and can run on a cleanup thread.
+/// input timestamps. It holds that clock's origin and the previous
+/// application's binding, so it is `Send` and moves, binding and all, from
+/// the owner's restore to the late watch.
 struct MacRestoreHost {
     started: Instant,
-    /// The application a restore puts back, as `(pid, start time)`, once
-    /// the obligation names it; the second route to the front refuses any
-    /// other process.
-    previous: Option<(u32, u64)>,
+    /// The application a restore puts back, bound once as `(pid, start
+    /// time)` when the obligation names it, before the front. Both routes to
+    /// the front refuse any other process, and every process when the bind
+    /// failed.
+    previous: super::PreviousSlot,
     /// The previous application's accessibility element, resolved when the
-    /// obligation named it, so a restore at the cutoff makes no lookup
-    /// before its request.
+    /// obligation named it, so a restore makes no lookup before its request.
     prepared: Option<cerebellum_macos::PreparedFrontmost>,
 }
 
@@ -807,7 +812,7 @@ impl MacRestoreHost {
     fn new(started: Instant) -> Self {
         Self {
             started,
-            previous: None,
+            previous: super::PreviousSlot::default(),
             prepared: None,
         }
     }
@@ -836,7 +841,7 @@ impl FrontingRestoreHost for MacRestoreHost {
         // activation is written.
         let check = std::cell::RefCell::new(check);
         pointer::request_previous_front(
-            self.previous,
+            self.previous.identity(),
             pid,
             |pid| restore_start_time(pid, &mut **check.borrow_mut()),
             |still_ours| {
@@ -852,8 +857,15 @@ impl FrontingRestoreHost for MacRestoreHost {
     }
 
     fn remember_previous(&mut self, pid: u32) {
-        self.previous = cerebellum_macos::process_start_time_micros(pid).map(|start| (pid, start));
-        self.prepared = cerebellum_macos::prepare_frontmost(pid).ok();
+        // Once: a later call never rebinds, so a pid that has since passed to
+        // another process, or a failed first bind, is never replaced by a
+        // fresh lookup.
+        if self
+            .previous
+            .bind_once(pid, cerebellum_macos::process_start_time_micros)
+        {
+            self.prepared = cerebellum_macos::prepare_frontmost(pid).ok();
+        }
     }
 
     fn request_front_fallback(&mut self, pid: u32) -> bool {
@@ -865,7 +877,7 @@ impl FrontingRestoreHost for MacRestoreHost {
         pid: u32,
         check: &mut dyn super::RestoreWriteCheck,
     ) -> bool {
-        match self.previous {
+        match self.previous.identity() {
             Some((previous, start)) if previous == pid => {
                 let check = std::cell::RefCell::new(check);
                 cerebellum_macos::activate_application_while(
@@ -888,6 +900,17 @@ impl FrontingRestoreHost for MacRestoreHost {
             last_input,
         ))
     }
+}
+
+/// Cap this thread's accessibility messages and system-callback waits at
+/// `until` while the returned value is held: the target's application
+/// element and every element messaged while it is in front get a messaging
+/// timeout no longer than the time left, set again before each call.
+fn cap_target_waits_until(until: Instant) -> crate::dispatch::TargetWaitCap {
+    Box::new((
+        cerebellum_macos::ax_budget::bound_messages_until(until),
+        cerebellum_macos::ax_budget::bound_callback_waits_until(until),
+    ))
 }
 
 fn restore_start_time(pid: u32, check: &mut dyn super::RestoreWriteCheck) -> Option<u64> {
@@ -2514,6 +2537,24 @@ impl PlatformDriver for MacOs26PlatformDriver {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    /// While the target is in front, the bracket thread's accessibility
+    /// messages and callback waits end at the start of the restore reserve,
+    /// and the cap is lifted once the restore begins.
+    #[test]
+    fn the_target_wait_cap_ends_messages_and_callback_waits_at_the_reserve_start() {
+        use cerebellum_macos::ax_budget;
+        let until = Instant::now() + Duration::from_millis(80);
+        let cap = cap_target_waits_until(until);
+        assert!(ax_budget::messaging_timeout(Duration::from_secs(6)) <= Duration::from_millis(80));
+        assert!(ax_budget::callback_wait(Duration::from_secs(5)) <= Duration::from_millis(80));
+        drop(cap);
+        assert_eq!(ax_budget::remaining(), None);
+        assert_eq!(
+            ax_budget::callback_wait(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
 
     /// A picture bracket fronts only the admitted process generation: once
     /// another process holds the pid, no front is requested at all.

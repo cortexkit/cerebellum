@@ -20,24 +20,58 @@
 //! posting rather than assumed: each unit's post time and each restore's
 //! latency are timed, and a chunk ends when the next unit and a restore would
 //! no longer fit.
-//! Who decides the restore is set by time (see [`CutoffGate`]): before the
-//! restore reserve starts, the action's own cleanup or the call's terminal
-//! cleanup may decide; from its start the cutoff timer owns the decision
-//! outright and decides on its own restore host, so no blocking step of
-//! another owner can delay it. Input still held at the deadline defers the
-//! restore until its release; if OS focus reads stall past the deadline,
-//! the first native restore write is refused instead and the restore
-//! reports failure. A short-lived watcher can retry only while the target
-//! is still frontmost and observation shows the person has not intervened.
+//!
+//! # One owner
+//!
+//! The thread running the bracket owns the whole front and performs it in
+//! sequence: front the target, act, release any held input, restore the
+//! previous application. Nothing else performs the restore while the call
+//! runs: there is no timer thread, and the call's terminal cleanup only
+//! stops a front not yet requested or waits, bounded, for the owner's
+//! decision. The owner keeps an app-use front's bound itself, from two
+//! instants stamped before the front ([`CutoffGate`]):
+//!
+//! - Every wait it controls (poll sleeps, the wait for a picture's capture
+//!   callback, accessibility messages to the target) ends at the start of
+//!   the restore reserve, the deadline minus the measured restore reserve.
+//! - A post, a capture or the target's front write starts only before the
+//!   reserve starts, so whatever was admitted leaves the restore its whole
+//!   reserve. From the start of the reserve the owner only releases held
+//!   input and restores.
+//! - The deadline is checked before each native call that precedes the
+//!   first restore request, and at that request itself.
+//!
+//! # Named exceptions
+//!
+//! The bound holds except in these cases, each reported rather than hidden:
+//!
+//! - **A native call that cannot be capped stalls**: a WindowServer focus
+//!   read, `CGEventPostToPid`, `proc_pidinfo`, the restore's own
+//!   accessibility or AppKit write, a ScreenCaptureKit acquisition that
+//!   cannot be cancelled, or the OS preempting the owner. An owner that
+//!   returns past the deadline writes nothing new but the restore-or-handoff:
+//!   a restore request that can no longer be made by the deadline is
+//!   refused, the restore reports failed, the miss is counted
+//!   (`frontingRestoreExpiredAtWrite`, with known native stalls counted
+//!   apart from our own overruns), and the bounded late watch takes the
+//!   obligation over. The reply says the restore was handed off only once
+//!   the watch holds it. The watch puts the previous application back only
+//!   while the target is still in front and continuous input observation
+//!   shows no person input.
+//! - **A key release that has not settled**: the restore waits for it, since
+//!   restoring under a held key would hand that key to the previous
+//!   application. A release that settles before the deadline is followed at
+//!   once by the restore, under the deadline. One still unsettled at the
+//!   deadline keeps the fronting lock held (module health counts it as
+//!   `frontingLockHeldForUnsettledRelease`), and the restore follows the
+//!   confirmed release without a deadline; an unconfirmed release restores
+//!   nothing.
+//!
 //! Neither exception assumes focus or input is safe merely because time has
-//! passed.
-//! macOS is not a real-time scheduler: it can preempt even the ready cutoff
-//! thread. The reserve includes time from its planned wake through the last
-//! check, and the write is refused if that check is late. A timeout wake
-//! after the deadline or a stalled OS focus/identity read can explain the
-//! expiry; overruns in our own preparation are reported separately. Clock
-//! measurements cannot distinguish preemption inside our code from its own
-//! work, so those overruns are not attributed to an OS read.
+//! passed. Clock measurements cannot distinguish preemption inside our code
+//! from its own work, so an overrun is attributed to a native stall only
+//! when a native call was still running at the deadline and our own work
+//! since stayed within its allowance.
 //!
 //! Everything platform-specific is behind [`FrontingBracketHost`], so the
 //! ordering, the chunking and the bound are driven by a fake clock in tests.
@@ -96,6 +130,10 @@ use crate::platform::{HeldStateDisposition, IdleReading, SequencePostFailure};
 /// itself does not use up the interval.
 pub const FRONTING_POLL_MS: u64 = 2;
 
+/// What [`FrontingBracketHost::cap_target_waits_until`] keeps: the cap lasts
+/// while it is held and is lifted when it is dropped, on the same thread.
+pub type TargetWaitCap = Box<dyn std::any::Any>;
+
 /// What one unit's posting did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UnitPosted {
@@ -112,9 +150,9 @@ pub struct ObservedUnit<'a, T> {
     pub heartbeat: HeartbeatObservation,
     pub cancelled: &'a dyn Fn() -> bool,
     pub deadline_ms: u64,
-    /// The bracket's cutoff, when its host armed a timer for it. A unit
-    /// that checks it itself ([`FrontingBracketHost::unit_checks_cutoff`])
-    /// must call [`CutoffGate::begin_post`] before each post.
+    /// The bracket's cutoff gate, when its host keeps one. A unit that
+    /// checks it itself ([`FrontingBracketHost::unit_checks_cutoff`]) must
+    /// call [`CutoffGate::begin_post`] before each post.
     pub cutoff: Option<&'a CutoffGate>,
 }
 
@@ -153,14 +191,25 @@ pub trait FrontingBracketHost {
     }
     /// Optional diagnostic observation; it never authorizes more action input.
     fn late_activation_observed(&mut self, _latency_ms: u64) {}
-    /// Whether the side running this restore decision still owns it. An
-    /// ordinary owner (the action's cleanup or the terminal's) owns it only
-    /// until the restore reserve starts, when the timer takes it over; the
-    /// decision checks between its steps and stops, writing nothing, once
-    /// this is `false`. Hosts without a timer always own their decision.
-    fn restore_decision_held(&self) -> bool {
-        true
+    /// How many milliseconds the restore decision may still wait (for an
+    /// unconfirmed activation to land) before it must request the restore:
+    /// the time left before the restore reserve starts, zero once it has.
+    /// `None` when no absolute restore deadline applies.
+    fn restore_wait_left_ms(&mut self) -> Option<u64> {
+        None
     }
+    /// Whether the first restore request can no longer be made by its
+    /// deadline. Asked before each native call that precedes that request,
+    /// and after it; once `true` the decision writes nothing more and the
+    /// host hands the obligation to the late watch. Hosts without an
+    /// absolute restore deadline never miss it.
+    fn restore_deadline_missed(&mut self) -> bool {
+        false
+    }
+    /// The decision stopped waiting and began preparing its restore
+    /// request: the reads and the request that follow are the restore's own
+    /// cost, which is what the restore reserve must cover.
+    fn restore_preparation_started(&mut self) {}
     /// The action's confirmation wait ended. Later observations belong only
     /// to cleanup and must not turn the refused action into a confirmed front.
     fn front_attempt_finished(&mut self) {}
@@ -248,15 +297,24 @@ pub trait FrontingBracketHost {
     fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
         None
     }
-    /// The cutoff shared with a timer that starts the restore once a front
-    /// outlasts the bound, when this host arms one. The default arms none.
+    /// The front's bound, shared with its restore cell and the call's
+    /// terminal cleanup, when this host keeps one. The default keeps none.
     fn cutoff_gate(&mut self) -> Option<std::sync::Arc<CutoffGate>> {
+        None
+    }
+    /// Cap, until the returned value is dropped, how long anything this
+    /// thread asks of the target can block: every accessibility message (its
+    /// messaging timeout, refreshed before each call) and every wait for a
+    /// system callback ends by `until`, the start of the restore reserve. A
+    /// hung target then costs at most the time left before it. The default
+    /// caps nothing.
+    fn cap_target_waits_until(&mut self, _until: Instant) -> Option<TargetWaitCap> {
         None
     }
     /// Whether [`Self::post_observed_unit`] checks the cutoff before each of
     /// its own posts and marks the presses it holds. When it does not, the
-    /// bracket holds the cutoff for the whole unit, so the timer never
-    /// restores while such a unit may hold a key or button down.
+    /// bracket checks it once before the unit and counts the whole unit as
+    /// holding input until it returns.
     fn unit_checks_cutoff(&self) -> bool {
         false
     }
@@ -338,8 +396,9 @@ pub struct BracketReport {
     /// keys or clicks; like every bracket it posts the observer's liveness
     /// marker (a pointer move to where the pointer already is) first.
     pub restore_calibrated: bool,
-    /// The cutoff timer, not the bracket, started the restore: the front
-    /// reached its bound while the bracket was still busy in a unit.
+    /// The front was ended only once its cutoff, the start of the restore
+    /// reserve, had passed: it reached its bound while the bracket was still
+    /// busy in a unit.
     pub restore_started_by_cutoff: bool,
 }
 
@@ -419,6 +478,16 @@ fn await_front<H: FrontingBracketHost>(
         }
         host.borrow_mut().pause_ms(FRONTING_POLL_MS);
     }
+}
+
+/// The poll sleep a bracket with `cutoff` may take now: never past the start
+/// of the restore reserve, and zero once it has started.
+fn poll_pause_ms(cutoff: Option<&CutoffGate>) -> u64 {
+    cutoff
+        .and_then(CutoffGate::time_to_reserve_start)
+        .map_or(FRONTING_POLL_MS, |left| {
+            FRONTING_POLL_MS.min(u64::try_from(left.as_millis()).unwrap_or(u64::MAX))
+        })
 }
 
 /// Run the bracket.
@@ -649,8 +718,8 @@ pub(crate) fn run_fronting_bracket_with_predictor<'a, H: FrontingBracketHost>(
         while front_ok {
             let drained = host.borrow_mut().drain(&tap);
             observe_drained_events(&mut watcher, drained, our_pid, next_unit);
-            let cutoff_fired = cutoff.as_deref().is_some_and(CutoffGate::fired);
-            if cancelled() || watcher.abort_decision().is_some() || cutoff_fired {
+            let cutoff_closed = cutoff.as_deref().is_some_and(CutoffGate::closed);
+            if cancelled() || watcher.abort_decision().is_some() || cutoff_closed {
                 front_ok = false;
                 break;
             }
@@ -661,7 +730,10 @@ pub(crate) fn run_fronting_bracket_with_predictor<'a, H: FrontingBracketHost>(
                 front_ok = false;
                 break;
             }
-            host.borrow_mut().pause_ms(FRONTING_POLL_MS);
+            let pause = poll_pause_ms(cutoff.as_deref());
+            if pause > 0 {
+                host.borrow_mut().pause_ms(pause);
+            }
         }
         host.borrow_mut().front_attempt_finished();
         if !front_ok {
@@ -743,11 +815,12 @@ pub(crate) fn run_fronting_bracket_with_predictor<'a, H: FrontingBracketHost>(
                 }
                 break;
             }
-            // No unit starts once the cutoff fired. A unit that cannot check
-            // the cutoff at each of its posts holds it for its whole length.
+            // No unit starts once the cutoff closed. A unit that cannot check
+            // the cutoff at each of its posts is checked once here and counts
+            // as holding input for its whole length.
             if let Some(gate) = cutoff.as_deref() {
                 let may_start = if unit_checks_cutoff {
-                    !gate.fired()
+                    !gate.closed()
                 } else {
                     gate.begin_post(true)
                 };
@@ -766,7 +839,8 @@ pub(crate) fn run_fronting_bracket_with_predictor<'a, H: FrontingBracketHost>(
                 || (),
             );
             let posted = posted.map(|_| {
-                host.borrow_mut().post_observed_unit(
+                let started = Instant::now();
+                let posted = host.borrow_mut().post_observed_unit(
                     index,
                     ObservedUnit {
                         tap: &tap,
@@ -777,10 +851,16 @@ pub(crate) fn run_fronting_bracket_with_predictor<'a, H: FrontingBracketHost>(
                         deadline_ms: fronted_at.saturating_add(bound),
                         cutoff: cutoff.as_deref(),
                     },
-                )
+                );
+                // A unit is a run of posts, identity and focus reads, or a
+                // capture: a stall in it is a native one.
+                if let Some(gate) = cutoff.as_deref() {
+                    gate.native_call(started, Instant::now());
+                }
+                posted
             });
-            // A key that may still be down keeps the cutoff held, so the
-            // timer never restores over it; the caller settles it first.
+            // A key that may still be down stays held: the restore waits until
+            // the caller has settled its release.
             if let Some(gate) = cutoff.as_deref() {
                 if !matches!(
                     &posted,
@@ -1096,19 +1176,19 @@ pub(crate) fn run_fronting_read_with_predictor<'a, H: FrontingBracketHost>(
             (self.read)();
             Ok(UnitPosted::default())
         }
-        // A picture unit posts no keys or clicks and holds nothing down, so
-        // the cutoff may start the restore while the read is still running.
-        // The read starts only inside the bound, before the cutoff and
-        // before cancellation; a hooked caller asks the cutoff again
-        // immediately before acquiring pixels, withholds any acquired as it
-        // fired, and keeps its fronting lock until the read returns.
+        // A picture unit posts no keys or clicks and holds nothing down. The
+        // read starts only inside the bound, before the cutoff and before
+        // cancellation; a hooked caller asks the cutoff again immediately
+        // before acquiring pixels, ends its wait for them at the cutoff,
+        // withholds any acquired after it, and keeps its fronting lock until
+        // the read returns.
         fn post_observed_unit(
             &mut self,
             index: usize,
             observation: ObservedUnit<'_, Self::Tap>,
         ) -> Result<UnitPosted, SequencePostFailure> {
             if (observation.cancelled)()
-                || observation.cutoff.is_some_and(CutoffGate::past_deadline)
+                || observation.cutoff.is_some_and(CutoffGate::closed)
                 || self.host.now_ms() >= observation.deadline_ms
             {
                 return Err(SequencePostFailure {
@@ -1198,10 +1278,7 @@ fn restore<H: FrontingBracketHost>(
         }
         let interval = outcome.finished_at_ms.saturating_sub(fronted_at);
         // The sample is the restore's own cost as the side that ran it timed
-        // it. The time this thread spent reaching the decision says nothing
-        // about that cost: when the cutoff's timer ran the restore while a
-        // picture blocked this thread, reading the decision afterwards would
-        // otherwise record a near-zero restore.
+        // it, not the time this thread spent reaching the decision.
         let sample = outcome.restore_ms;
         if let Some(predictor) = predictor {
             match outcome.restore {

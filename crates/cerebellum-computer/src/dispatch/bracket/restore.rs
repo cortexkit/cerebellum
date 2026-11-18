@@ -169,8 +169,11 @@ pub fn restore_after_front<H: FrontingBracketHost + ?Sized>(
 /// Until the target has actually been observed, seeing the previous app is
 /// not evidence that the target cannot still arrive. The watch never posts
 /// input, and consumes the same allowance as the subsequent restore. An
-/// absolute cutoff takes priority: reserve time for the native request
-/// rather than continuing to wait for the target.
+/// absolute deadline takes priority: the watch ends when the restore
+/// reserve starts ([`FrontingBracketHost::restore_wait_left_ms`]), and the
+/// restore is requested at once without the landing having been seen. An
+/// activation that lands after that request is the late watch's to put
+/// back.
 pub fn restore_after_front_attempt<H: FrontingBracketHost + ?Sized>(
     host: &mut H,
     previous: u32,
@@ -193,37 +196,11 @@ pub fn restore_after_front_attempt<H: FrontingBracketHost + ?Sized>(
     )
 }
 
-/// Request the previous application back at once, for a cutoff at the
-/// bracket's deadline: unlike [`restore_after_front_attempt`] with an
-/// unconfirmed activation, it does not first watch for that activation to
-/// land. It still leaves focus alone when person input has occurred since
-/// the front, or the hardware input observer could not watch throughout
-/// since then, or a third application is in front. An
-/// activation that lands after this request is the late watch's to put
-/// back.
-pub fn restore_without_awaiting_activation<H: FrontingBracketHost + ?Sized>(
-    host: &mut H,
-    previous: u32,
-    target: u32,
-    front_instant_ms: u64,
-    wait_ms: u64,
-) -> RestoreOutcome {
-    restore_attempt(
-        host,
-        previous,
-        target,
-        front_instant_ms,
-        wait_ms,
-        Activation::PendingAtCutoff,
-    )
-}
-
 #[derive(Clone, Copy)]
 enum Activation {
     ConfirmedByAction,
     ObservedByWatcher,
     ObserveIfTime,
-    PendingAtCutoff,
 }
 
 fn restore_attempt<H: FrontingBracketHost + ?Sized>(
@@ -262,9 +239,12 @@ fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
         Activation::ConfirmedByAction | Activation::ObservedByWatcher
     );
     if previous != target && matches!(activation, Activation::ObserveIfTime) {
-        // Observe only while this owner holds the decision: once the timer
-        // owns it, nothing read here is used.
-        while host.restore_decision_held() {
+        // Observe only until the restore reserve starts: from then on the
+        // request itself must be made, landing seen or not.
+        while host.restore_wait_left_ms() != Some(0) {
+            if host.restore_deadline_missed() {
+                return missed_deadline(host);
+            }
             let frontmost = host.frontmost_pid();
             let snapshot = host.hardware_input_snapshot();
             let input = observed_input_since(snapshot, front_instant_ms);
@@ -310,14 +290,17 @@ fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
                     restore_ms: None,
                 };
             }
-            if host.restore_decision_held() {
-                host.pause_ms(FRONTING_POLL_MS);
+            // Never sleep into the restore reserve.
+            let pause = host
+                .restore_wait_left_ms()
+                .map_or(FRONTING_POLL_MS, |left| left.min(FRONTING_POLL_MS));
+            if pause > 0 {
+                host.pause_ms(pause);
             }
         }
-        if !host.restore_decision_held() {
-            return lost_decision(host);
-        }
     }
+    // Waiting is over; what follows is the restore's own preparation.
+    host.restore_preparation_started();
     let wait_ms = wait_ms.saturating_sub(host.now_ms().saturating_sub(started));
     if previous == target {
         return RestoreOutcome {
@@ -328,23 +311,26 @@ fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
             restore_ms: None,
         };
     }
+    // Each read below is a native call: none starts once the request could
+    // no longer be made by its deadline.
+    if host.restore_deadline_missed() {
+        return missed_deadline(host);
+    }
     let first_front = host.frontmost_pid();
     let first_snapshot = host.hardware_input_snapshot();
     let requested_at = host.now_ms();
     // Revalidate immediately before requesting the previous application. These
     // reads shrink the race; they are not atomic with WindowServer activation.
     let snapshot = host.hardware_input_snapshot();
+    if host.restore_deadline_missed() {
+        return missed_deadline(host);
+    }
     let frontmost = host.frontmost_pid();
     // Disclose only observed input. Unknown coverage independently skips the
     // restore below; it must not be reported as a person event that was seen.
     let input = observed_input_since(snapshot, front_instant_ms);
     let input_coverage_unavailable =
         !covers(first_snapshot, front_instant_ms) || !covers(snapshot, front_instant_ms);
-    if !host.restore_decision_held() {
-        // The reads above may have outlasted this owner's phase: they are
-        // not evidence the decision may act on.
-        return lost_decision(host);
-    }
     if input_coverage_unavailable
         || (require_quiet && input)
         || first_front != frontmost
@@ -401,9 +387,10 @@ fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
     }
 }
 
-/// What a decision returns once its owner lost the decision to the timer.
-/// Nothing is requested; the caller discards it and awaits the timer's.
-fn lost_decision<H: FrontingBracketHost + ?Sized>(host: &mut H) -> RestoreOutcome {
+/// What a decision returns when its first restore request could no longer
+/// be made by its deadline: nothing is requested, and the host hands the
+/// obligation to the late watch.
+fn missed_deadline<H: FrontingBracketHost + ?Sized>(host: &mut H) -> RestoreOutcome {
     RestoreOutcome {
         restore: RestoreStatus::Failed {
             left_in_front: None,
@@ -620,8 +607,9 @@ pub(super) fn request_restore<H: FrontingBracketHost + ?Sized>(
 ) -> RestoreStatus {
     let previous = request.previous;
     let first_accepted = host.request_front(previous);
-    if !host.restore_decision_held() {
-        // Lost before the request was committed: the timer requests it.
+    if host.restore_deadline_missed() {
+        // Refused at its deadline: nothing more is written here, no second
+        // route and no wait, so the late watch can take over at once.
         return RestoreStatus::Failed {
             left_in_front: None,
         };
@@ -661,9 +649,6 @@ pub(super) fn wait_for_front<H: FrontingBracketHost + ?Sized>(
     budget_ms: u64,
 ) -> bool {
     loop {
-        if !host.restore_decision_held() {
-            return false;
-        }
         if host.frontmost_pid() == Some(pid) {
             return true;
         }
@@ -677,13 +662,13 @@ pub(super) fn wait_for_front<H: FrontingBracketHost + ?Sized>(
 /// Where one front attempt is, as the restore obligation records it.
 ///
 /// It moves only forward, `NotStarted` to `Dispatching` to `Dispatched`, and
-/// only under the [`super::CutoffGate`]'s lock, together with the restore
-/// owner, so the worker that fronts and the cleanup that may end the call
-/// early always agree on whether a front can have happened.
+/// only under the [`super::CutoffGate`]'s lock, so the worker that fronts and
+/// the cleanup that may end the call early always agree on whether a front
+/// can have happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrontAttemptState {
-    /// No front has been requested, and none will be once an owner has taken
-    /// the restore decision.
+    /// No front has been requested, and none will be once cleanup stopped
+    /// the front or the owner began ending it.
     NotStarted,
     /// The front request is being made and waited for. The instant is when
     /// it was made, and is the floor for hardware input afterwards.

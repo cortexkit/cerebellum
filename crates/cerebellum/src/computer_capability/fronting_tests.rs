@@ -485,7 +485,15 @@ struct ScreenState {
     register_blocks_ms: u64,
     /// The request to front the target blocks the bracket's thread for this
     /// long in real time before it takes effect, logging `front-returned`.
+    /// While the bracket caps its waits on the target, the request gives up
+    /// at the cap instead, as an accessibility message to a hung application
+    /// does at its messaging timeout, logging `front-timed-out`.
     front_blocks_ms: u64,
+    /// The front request blocks for its whole length whatever the cap, as a
+    /// native stall nothing here can cut short.
+    front_ignores_cap: bool,
+    /// The bracket's cap on its waits on the target, while it holds one.
+    target_wait_until: Option<std::time::Instant>,
     last_input_ms: Option<u64>,
     /// A chord's post fails with its keys possibly still held.
     post_unknown: bool,
@@ -528,6 +536,8 @@ struct ScreenState {
     fallback_works: bool,
     /// The process a registration told the restore host it will put back.
     remembered_previous: Option<u32>,
+    /// How many times a restore host was told which process to put back.
+    remember_calls: usize,
     /// The restore host refuses to ask for any process it was not told to
     /// put back, as the macOS host does, which checks that process's
     /// start time before asking.
@@ -567,6 +577,8 @@ impl Screen {
                 restore_requested_at: Vec::new(),
                 register_blocks_ms: 0,
                 front_blocks_ms: 0,
+                front_ignores_cap: false,
+                target_wait_until: None,
                 last_input_ms: None,
                 post_unknown: false,
                 post_cost_ms: 0,
@@ -584,6 +596,7 @@ impl Screen {
                 restores_ignored: 0,
                 fallback_works: false,
                 remembered_previous: None,
+                remember_calls: 0,
                 restore_needs_remembered_previous: false,
                 landings_at: Vec::new(),
                 restore_focus_delay_ms: 0,
@@ -743,7 +756,9 @@ impl FrontingRestoreHost for FakeRestore {
         self.0.front("restore", pid)
     }
     fn remember_previous(&mut self, pid: u32) {
-        self.0.state().remembered_previous = Some(pid);
+        let mut state = self.0.state();
+        state.remembered_previous = Some(pid);
+        state.remember_calls += 1;
     }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
         if self.0.state().fallback_works {
@@ -818,8 +833,8 @@ struct FakeBracket(Screen);
 
 impl RestoreHostSource for FakeBracket {
     fn restore_host(&self) -> Box<dyn FrontingRestoreHost> {
-        // Registration's cost, paid once: the cutoff timer's own restore host
-        // is made right after the obligation's and adds nothing here.
+        // Registration's cost, paid once, as the obligation's restore host is
+        // made.
         let blocks = std::mem::take(&mut self.0.state().register_blocks_ms);
         if blocks > 0 {
             std::thread::sleep(Duration::from_millis(blocks));
@@ -846,15 +861,42 @@ impl FrontingBracketHost for FakeBracket {
         self.0.frontmost()
     }
     fn request_front(&mut self, pid: u32) -> bool {
-        let blocks = self.0.state().front_blocks_ms;
+        let (blocks, cap) = {
+            let state = self.0.state();
+            let cap = state.target_wait_until.filter(|_| !state.front_ignores_cap);
+            (state.front_blocks_ms, cap)
+        };
         if pid != TARGET || blocks == 0 {
             return self.0.front("front", pid);
         }
         self.0.state().log.push(format!("front:{pid}"));
-        std::thread::sleep(Duration::from_millis(blocks));
+        let blocks = Duration::from_millis(blocks);
+        if let Some(until) = cap {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left < blocks {
+                std::thread::sleep(left);
+                self.0.state().log.push("front-timed-out".into());
+                return false;
+            }
+        }
+        std::thread::sleep(blocks);
         self.0.desk.state().frontmost = Some(pid);
         self.0.state().log.push("front-returned".into());
         true
+    }
+    fn cap_target_waits_until(
+        &mut self,
+        until: std::time::Instant,
+    ) -> Option<cerebellum_computer::dispatch::TargetWaitCap> {
+        /// Lifts the fake's cap when the bracket drops it.
+        struct Lifted(Screen);
+        impl Drop for Lifted {
+            fn drop(&mut self) {
+                self.0.state().target_wait_until = None;
+            }
+        }
+        self.0.state().target_wait_until = Some(until);
+        Some(Box::new(Lifted(self.0.clone())))
     }
     fn our_pid(&self) -> i64 {
         OUR_PID
@@ -1885,8 +1927,8 @@ async fn a_chord_that_may_hold_a_key_restores_only_after_the_release_is_confirme
         "the failed restore keeps saying which keys were sent: {reply}"
     );
     assert!(
-        rig.lock.held(),
-        "the obligation keeps the lock until terminal cleanup takes it"
+        !rig.lock.held(),
+        "the owner, finding the release unconfirmed, gives up the restore and the lock"
     );
 }
 

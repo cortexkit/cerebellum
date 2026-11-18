@@ -50,7 +50,9 @@ struct FakeDesk {
     frontmost_at_post: Vec<Option<u32>>,
     /// Every fronting request, in order.
     front_requests: Vec<u32>,
-    decision_held_until_ms: Option<u64>,
+    /// The start of the restore reserve, on the desk clock, for a restore
+    /// decision made against the desk itself.
+    reserve_start_ms: Option<u64>,
     /// The desk-clock instant of each entry in `front_requests`.
     front_request_times: Vec<u64>,
     /// The newest hardware input the process-wide observer saw.
@@ -118,7 +120,7 @@ impl FakeDesk {
             fronted_intervals: Vec::new(),
             frontmost_at_post: Vec::new(),
             front_requests: Vec::new(),
-            decision_held_until_ms: None,
+            reserve_start_ms: None,
             front_request_times: Vec::new(),
             hardware_input_ms: None,
             switch_after_unit: None,
@@ -179,9 +181,9 @@ impl FakeDesk {
 }
 
 impl FrontingBracketHost for FakeDesk {
-    fn restore_decision_held(&self) -> bool {
-        self.decision_held_until_ms
-            .is_none_or(|cutoff| self.now < cutoff)
+    fn restore_wait_left_ms(&mut self) -> Option<u64> {
+        self.reserve_start_ms
+            .map(|start| start.saturating_sub(self.now))
     }
     type Tap = ();
 
@@ -1140,19 +1142,18 @@ fn restore_after_front_requests_nothing_when_it_skips() {
     assert!(desk.front_requests.is_empty());
 }
 
-/// The front attempt moves only forward, and the first ordinary owner to
-/// claim the decision decides; the next one waits.
+/// The front attempt moves only forward. Terminal cleanup stops a front
+/// only before it is requested; after that the owner still decides.
 #[test]
 fn the_front_attempt_states_decide_what_cleanup_does() {
-    // Claimed before any front: the worker may not front.
+    // Stopped before any front: the worker may not front.
     let gate = CutoffGate::new();
     assert_eq!(gate.attempt_state(), FrontAttemptState::NotStarted);
-    assert_eq!(gate.claim_ordinary(), OrdinaryClaim::PreventedFront);
+    assert!(gate.stop_front(), "nothing to restore");
     assert!(!gate.begin_front_attempt(5));
     assert_eq!(gate.attempt_state(), FrontAttemptState::NotStarted);
-    assert_eq!(gate.claim_ordinary(), OrdinaryClaim::Await);
 
-    // Claimed while the front is in flight: decide, told it is in flight.
+    // Stopped while the front is in flight: the owner still decides.
     let gate = CutoffGate::new();
     assert!(gate.begin_front_attempt(5));
     assert_eq!(
@@ -1161,15 +1162,7 @@ fn the_front_attempt_states_decide_what_cleanup_does() {
             front_instant_ms: 5
         }
     );
-    assert!(matches!(
-        gate.claim_ordinary(),
-        OrdinaryClaim::Decide {
-            front_instant_ms: 5,
-            in_flight: true,
-            write_deadline: true,
-            ..
-        }
-    ));
+    assert!(!gate.stop_front(), "a requested front owes its restore");
     gate.front_attempt_returned();
     assert_eq!(
         gate.attempt_state(),
@@ -1177,22 +1170,13 @@ fn the_front_attempt_states_decide_what_cleanup_does() {
             front_instant_ms: 5
         }
     );
-    assert_eq!(gate.claim_ordinary(), OrdinaryClaim::Await);
 
-    // Claimed after the front returned: decide at once, floored at the front.
+    // One front per obligation.
     let gate = CutoffGate::new();
     assert!(gate.begin_front_attempt(7));
     assert!(!gate.begin_front_attempt(9), "one front per obligation");
     gate.front_attempt_returned();
-    assert!(matches!(
-        gate.claim_ordinary(),
-        OrdinaryClaim::Decide {
-            front_instant_ms: 7,
-            in_flight: false,
-            ..
-        }
-    ));
-    assert_eq!(gate.claim_ordinary(), OrdinaryClaim::Await);
+    assert!(!gate.stop_front());
 }
 
 /// Every fronting stop maps to its reason, and every reason is reached.
@@ -1482,28 +1466,28 @@ fn restore_new_activity_during_final_sampling_leaves_focus_alone() {
 }
 
 #[test]
-fn an_owner_watching_an_unconfirmed_activation_stops_at_the_restore_reserve_and_writes_nothing() {
+fn an_owner_watching_an_unconfirmed_activation_stops_watching_at_the_restore_reserve_and_requests_the_restore(
+) {
     let mut desk = FakeDesk::new();
     desk.front_latency_ms = 800;
-    desk.decision_held_until_ms = Some(150);
+    desk.reserve_start_ms = Some(150);
     desk.request_front(TARGET);
     desk.advance(100);
 
     let reply = restore_after_front_attempt(&mut desk, PREVIOUS, TARGET, 0, 300, false);
     assert_eq!(
-        desk.now, 150,
-        "the owner does not watch past the start of the restore reserve"
-    );
-    assert_eq!(
         desk.front_requests,
-        [TARGET],
-        "the timer owns the request from the reserve on"
+        [TARGET, PREVIOUS],
+        "the owner itself requests the restore once the reserve starts"
     );
     assert_eq!(
-        reply.restore,
-        RestoreStatus::Failed {
-            left_in_front: None
-        }
+        desk.front_request_times.get(1).copied(),
+        Some(150),
+        "it watches up to the start of the reserve and no further"
+    );
+    assert!(
+        matches!(reply.restore, RestoreStatus::Failed { .. }),
+        "a landing never seen is not reported restored: the late watch owns it"
     );
     assert!(desk.posted.is_empty());
 }
