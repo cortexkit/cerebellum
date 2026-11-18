@@ -59,7 +59,14 @@ async fn writer_failure_ends_connection_while_read_is_parked() {
     .await
     .expect("writer failure must end the connection while the read remains parked");
     let error = result.expect_err("the writer failure must be reported");
-    assert_eq!(error.to_string(), "writer-side sentinel");
+    // The sentinel surfaces from the flush when HELLO fits the egress
+    // buffer, and from the frame write (with its "frame I/O error:" prefix)
+    // when it does not. Either way it must be this writer's own error.
+    let message = error.to_string();
+    assert!(
+        message == "writer-side sentinel" || message == "frame I/O error: writer-side sentinel",
+        "unexpected writer error: {message}"
+    );
 }
 
 /// A cut daemon sends no GOODBYE and no drain; the module learns by EOF.
