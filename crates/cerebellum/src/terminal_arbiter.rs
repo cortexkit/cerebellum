@@ -17,7 +17,7 @@ use crate::{
 /// When each fronting lock still held for a held-key release that had not
 /// settled by its call's reply began to be held that way, in wall-clock
 /// milliseconds. Such a lock is the one fronting lock with no time bound
-/// (see [`RestoreCell::forgo_until_released`]), so module health reports it.
+/// (see [`RestoreCell::reply_sent_before_release`]), so module health reports it.
 static UNSETTLED_RELEASE_LOCKS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
 /// How many fronting locks are held for unsettled releases, and since when
@@ -260,9 +260,9 @@ pub struct RestoreObligation {
     /// Held until the restore decision completes.
     pub lock: FrontingLockGuard,
     pub host: Box<dyn RestoreHost>,
-    /// The bracket's gate, which says who owns the restore decision. `None`
-    /// for a front with no bracket gate: the cell then keeps its own, with
-    /// no timer.
+    /// The bracket's gate, which holds the front attempt and the front's
+    /// bound. `None` for a front with no bracket gate: the cell then keeps
+    /// its own, with no bound.
     pub gate: Option<Arc<crate::computer::dispatch::CutoffGate>>,
 }
 
@@ -294,23 +294,25 @@ pub struct RestoreDecided {
     pub front_requested: bool,
 }
 
-/// A backstop on how long an owner that does not hold the decision waits for
-/// the one that does, in real milliseconds. That decision is itself bounded
-/// by the front wait and the restore wait; this only keeps a waiter from
-/// blocking forever if the deciding side never returns. Only ordinary owners
-/// wait: the cutoff timer never waits for another owner.
-const DECISION_AWAIT_MS: u64 =
+/// How long, in real milliseconds, terminal cleanup waits for the decision
+/// of a worker that ended without a reply before abandoning it unrestored.
+/// The owner's sequence is itself bounded by the front wait and the restore
+/// wait; this only keeps a missing decision from holding the fronting lock
+/// forever.
+const OWNER_GONE_AFTER_MS: u64 =
     2 * (crate::computer::dispatch::FRONT_WAIT_MS + crate::computer::dispatch::RESTORE_WAIT_MS);
 
-/// A registered restore obligation, shared by the worker that fronts, the
-/// call's terminal cleanup and, for an app-use front, the cutoff timer. Its
-/// front attempt and the owner of its one restore decision live in its
-/// [`crate::computer::dispatch::CutoffGate`]: before the restore reserve
-/// starts, the first ordinary owner to call [`RestoreCell::decide`] decides
-/// and any other waits up to `DECISION_AWAIT_MS` for it; from the start of
-/// the reserve the timer decides ([`RestoreCell::decide_at_cutoff`]) and an
-/// ordinary owner still deciding stops without writing. The fronting lock
-/// is released when the decision completes.
+/// A registered restore obligation, shared by the worker whose bracket
+/// fronts and the call's terminal cleanup. The worker's bracket thread is its
+/// one owner: it makes the one restore decision ([`RestoreCell::decide`])
+/// once its front is over and any held input released. Terminal cleanup
+/// never restores: it stops a front not yet requested, or waits, bounded,
+/// for the owner's decision ([`RestoreCell::await_owner`]). A restore after
+/// the call returned is only ever the late watch's, once the owner handed
+/// the obligation to it. The front attempt and the front's bound live in the
+/// obligation's [`crate::computer::dispatch::CutoffGate`]. The fronting lock
+/// is released when the decision completes, unless a picture read or the
+/// late watch still needs it.
 pub struct RestoreCell {
     previous_pid: u32,
     target_pid: u32,
@@ -319,8 +321,8 @@ pub struct RestoreCell {
     purpose: FrontingPurpose,
     inner: std::sync::Mutex<RestoreCellInner>,
     changed: std::sync::Condvar,
-    /// Who owns the restore decision, and the front attempt; shared with the
-    /// bracket and its cutoff timer when one is armed.
+    /// The front attempt and the front's bound; shared with the bracket
+    /// when the front runs in one.
     gate: Arc<crate::computer::dispatch::CutoffGate>,
     pending_watch: late_fronting::PendingRegistration,
     #[cfg(all(feature = "desk-probe", target_os = "macos"))]
@@ -328,10 +330,13 @@ pub struct RestoreCell {
 }
 
 struct RestoreCellInner {
-    restore_deadline: Option<std::time::Instant>,
-    /// Keep the handoff evidence after the watcher takes the host and lock.
-    expired_write_handed_off: bool,
+    /// The first restore request missed its deadline, so the late watch is
+    /// owed the obligation.
+    handoff_owed: bool,
     late_start: Option<Box<dyn FnOnce() + Send>>,
+    /// The restore host, which carries the previous application's identity
+    /// as it was bound before the front. It moves, never copied, from the
+    /// owner's decision to the late watch.
     host: Option<Box<dyn RestoreHost>>,
     lock: Option<FrontingLockGuard>,
     decided: Option<RestoreDecided>,
@@ -345,11 +350,11 @@ struct RestoreCellInner {
     /// fronting lock is kept until the last one returns, even when the
     /// decision completed first, so no other front starts under a capture.
     reads_in_flight: usize,
-    /// A restore held back until a release that had not settled by the
-    /// reply does (see [`RestoreCell::forgo_until_released`]): the front
-    /// instant, and the wall-clock milliseconds since which the fronting
-    /// lock has been held for it. The host and the lock are kept while set.
-    release_wait: Option<(u64, u64)>,
+    /// The call's reply went out while the owner still waited for a key
+    /// release to settle (see [`RestoreCell::reply_sent_before_release`]):
+    /// the wall-clock milliseconds since which the fronting lock has been
+    /// held for it. Cleared by the owner's decision.
+    release_wait: Option<u64>,
 }
 
 impl RestoreCell {
@@ -366,8 +371,7 @@ impl RestoreCell {
             mode: obligation.mode,
             purpose: obligation.purpose,
             inner: std::sync::Mutex::new(RestoreCellInner {
-                restore_deadline: None,
-                expired_write_handed_off: false,
+                handoff_owed: false,
                 late_start: None,
                 host: Some(obligation.host),
                 lock: Some(obligation.lock),
@@ -404,8 +408,8 @@ impl RestoreCell {
     }
 
     /// The worker is about to request the front at `front_instant_ms`, on
-    /// the restore host's clock. `false` when cleanup already took the
-    /// obligation: the worker must not front.
+    /// the restore host's clock. `false` when cleanup already stopped the
+    /// front or its bound left no time: the worker must not front.
     pub fn begin_front_attempt(&self, front_instant_ms: u64) -> bool {
         let began = self.gate.begin_front_attempt(front_instant_ms);
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
@@ -415,8 +419,7 @@ impl RestoreCell {
         began
     }
 
-    /// The front request and its wait returned. An untimed owner that took
-    /// the decision meanwhile may be waiting for this.
+    /// The front request and its wait returned.
     pub fn front_attempt_returned(&self) {
         self.gate.front_attempt_returned();
     }
@@ -438,19 +441,11 @@ impl RestoreCell {
         self.inner().decided
     }
 
-    /// Whether cleanup, the worker's own or the call's terminal, or the
-    /// cutoff has taken the obligation: the front is ending.
+    /// Whether the front is ending: nothing new may start. The restore
+    /// reserve started, the owner began its restore, or the call's terminal
+    /// cleanup stopped the front.
     pub fn cleanup_taken(&self) -> bool {
-        self.gate.restore_taken()
-    }
-
-    /// The application a restore puts back.
-    pub(crate) fn previous_pid(&self) -> u32 {
-        self.previous_pid
-    }
-
-    pub(crate) fn set_restore_deadline(&self, deadline: std::time::Instant) {
-        self.inner().restore_deadline = Some(deadline);
+        self.gate.closed()
     }
 
     /// A picture read is starting while the target may be in front. The
@@ -477,7 +472,7 @@ impl RestoreCell {
     ) -> Option<ReadLockHold> {
         {
             let mut inner = self.inner();
-            if self.gate.restore_taken() || inner.lock.is_none() {
+            if self.gate.closed() || inner.lock.is_none() {
                 return None;
             }
             inner.reads_in_flight += 1;
@@ -498,7 +493,7 @@ impl RestoreCell {
                     STALLED_PICTURE_READS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
                     STALLED_PICTURE_READS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    cell.read_ended();
+                    cell.read_outlived_lifetime();
                 }
             }
         })) {
@@ -516,12 +511,23 @@ impl RestoreCell {
     /// One picture read no longer holds the fronting lock: release it when
     /// none does, the decision has completed, and nothing else keeps it.
     fn read_ended(&self) {
+        self.read_released(false);
+    }
+
+    /// A picture read outlived its lifetime. Its owner is inside a native
+    /// call it cannot leave, so the fronting lock is released without
+    /// waiting for the owner's decision: other fronts must not wait on a
+    /// stalled capture for ever. The owner still decides once it returns.
+    fn read_outlived_lifetime(&self) {
+        self.read_released(true);
+    }
+
+    fn read_released(&self, outlived: bool) {
         let mut inner = self.inner();
         inner.reads_in_flight = inner.reads_in_flight.saturating_sub(1);
         let lock = if inner.reads_in_flight == 0
-            && inner.decided.is_some()
+            && (outlived || inner.decided.is_some())
             && inner.pending_since.is_none()
-            && inner.release_wait.is_none()
         {
             inner.lock.take()
         } else {
@@ -546,93 +552,60 @@ impl RestoreCell {
         self.inner().pending_since.is_some()
     }
 
-    /// Run the restore decision as an ordinary owner (the worker's own
-    /// cleanup or the call's terminal), or wait for the owner that holds it.
-    /// Blocking: it reads the front, may request the previous application
-    /// and waits for it.
+    /// Make the one restore decision. Only the owner calls this, on the
+    /// bracket's thread, once its front is over and any input it pressed has
+    /// been released. Blocking: it reads the front, may request the previous
+    /// application and waits for it. A second call returns the first
+    /// decision.
     ///
-    /// Ownership follows the [`crate::computer::dispatch::CutoffGate`]'s
-    /// phases. An ordinary owner decides only while phase A lasts; when the
-    /// restore reserve starts the timer takes the decision over, and this
-    /// owner stops at its next step, writes nothing, and waits for the
-    /// timer's decision instead. Waiting here never delays the timer.
+    /// An app-use front keeps its bound here: an unconfirmed activation is
+    /// watched for only until the restore reserve starts, every native call
+    /// before the first restore request checks the deadline first, and that
+    /// request is refused once the deadline has passed. A refused request is
+    /// reported failed and leaves the obligation to the late watch, with the
+    /// host that carries the previous application's identity as it was bound
+    /// before the front.
     pub fn decide(&self) -> RestoreDecided {
-        use crate::computer::dispatch::{Awaited, OrdinaryClaim};
-        let give_up = std::time::Instant::now() + Duration::from_millis(DECISION_AWAIT_MS);
-        loop {
-            match self.gate.claim_ordinary() {
-                OrdinaryClaim::PreventedFront => {
-                    return self.complete(self.inner(), Self::not_needed());
-                }
-                OrdinaryClaim::Decide {
-                    ticket,
-                    front_instant_ms,
-                    in_flight,
-                    write_deadline,
-                } => {
-                    if let Some(decided) =
-                        self.decide_owned(&ticket, front_instant_ms, in_flight, write_deadline)
-                    {
-                        return decided;
-                    }
-                }
-                OrdinaryClaim::Await => {}
-            }
-            let remaining = give_up.saturating_duration_since(std::time::Instant::now());
-            match self.gate.await_owner(remaining, false) {
-                Awaited::Claimable => {}
-                Awaited::Decided => return self.await_decided(give_up),
-                Awaited::TimedOut => return self.failed(),
-            }
-        }
+        // A key still down at the deadline is the named exception: the
+        // restore follows its confirmed release without a deadline.
+        self.decide_bounded(!self.gate.held_past_deadline())
     }
 
-    /// The ordinary owner's decision while it holds `ticket`. `None` when it
-    /// lost the decision to the timer before settling it: nothing it read
-    /// counts, and it made no restore request.
-    fn decide_owned(
-        &self,
-        ticket: &crate::computer::dispatch::OrdinaryTicket,
-        front_instant_ms: u64,
-        in_flight: bool,
-        write_deadline: bool,
-    ) -> Option<RestoreDecided> {
-        let started = std::time::Instant::now();
-        if in_flight && self.inner().restore_deadline.is_none() {
-            // An untimed owner waits for the front request in flight, bounded
-            // by the front wait: deciding before it returns could restore
-            // under a front that lands afterwards. A timed owner never waits
-            // for it; a landing after its decision is the late watch's.
-            self.gate.wait_front_attempt(Duration::from_millis(
-                crate::computer::dispatch::FRONT_WAIT_MS,
-            ));
+    /// [`Self::decide`]; `timed` false runs it with no write deadline, for
+    /// the restore that follows a release confirmed only after the deadline.
+    fn decide_bounded(&self, timed: bool) -> RestoreDecided {
+        use crate::computer::dispatch::FrontAttemptState;
+        if let Some(decided) = self.decided() {
+            return decided;
         }
-        let (confirmed, deadline, host) = {
+        self.gate.end_front();
+        let front_instant_ms = match self.gate.attempt_state() {
+            FrontAttemptState::NotStarted => {
+                return self.complete(self.inner(), Self::not_needed());
+            }
+            FrontAttemptState::Dispatching { front_instant_ms }
+            | FrontAttemptState::Dispatched { front_instant_ms } => front_instant_ms,
+        };
+        let (confirmed, host) = {
             let mut inner = self.inner();
-            (
-                inner.front_confirmed,
-                // Kept unless input was still held when the deadline passed,
-                // the one restore that follows its release untimed.
-                inner.restore_deadline.filter(|_| write_deadline),
-                inner.host.take(),
-            )
+            (inner.front_confirmed, inner.host.take())
         };
         let Some(mut host) = host else {
-            if !self.gate.settle_ordinary(ticket) {
-                return None;
-            }
-            return Some(self.complete(self.inner(), self.failed()));
+            return self.complete(self.inner(), self.failed());
         };
+        let started = std::time::Instant::now();
+        let write_deadline = self.gate.deadline().filter(|_| timed).map(|deadline| {
+            restore_preparation::WriteDeadline::new(
+                deadline,
+                self.gate.reserve_start(),
+                started,
+                self.gate.native_overrun_until(),
+            )
+        });
         let mut adapter = RestoreDecisionHost {
             host: host.as_mut(),
             _target: self.target_pid,
-            write_deadline: deadline
-                .map(|deadline| restore_preparation::WriteDeadline::new(deadline, started, None)),
-            owner: DecisionOwner::Ordinary {
-                gate: &self.gate,
-                ticket,
-            },
-            cell: Some(self),
+            write_deadline,
             #[cfg(all(feature = "desk-probe", target_os = "macos"))]
             probe_timing: &self.probe_timing,
         };
@@ -644,89 +617,100 @@ impl RestoreCell {
             crate::computer::dispatch::RESTORE_WAIT_MS,
             confirmed,
         );
-        let expired = adapter
-            .write_deadline
-            .as_ref()
-            .is_some_and(|guard| guard.expired);
-        if !self.gate.settle_ordinary(ticket) {
-            // Lost to the timer. Hand the host back for a later owner, unless
-            // the timer already decided and gave its own to the late watch.
-            let mut inner = self.inner();
-            if inner.host.is_none() && inner.decided.is_none() {
-                inner.host = Some(host);
-            }
-            return None;
-        }
-        Some(self.finish_decision(outcome, expired, confirmed, front_instant_ms, host))
-    }
-
-    /// The timer's decision, once the gate gave it the decision at the start
-    /// of the restore reserve (or after a release that settled before the
-    /// deadline). It requests the restore at once on `host`, the timer's own
-    /// restore host: it does not wait for a front request still in flight,
-    /// for an unconfirmed activation to land, or for an ordinary owner still
-    /// inside a read on the obligation's host. An activation that lands
-    /// afterwards is the late watch's to put back. It still leaves focus
-    /// alone on person input since the front, or when the hardware input
-    /// observer could not watch throughout since then. Every such decision
-    /// trains the restore reserve.
-    pub fn decide_at_cutoff(
-        &self,
-        wake: crate::computer::dispatch::CutoffWake,
-        mut host: Box<dyn RestoreHost>,
-    ) -> RestoreDecided {
-        use crate::computer::dispatch::FrontAttemptState;
-        let started = std::time::Instant::now();
-        let front_instant_ms = match self.gate.attempt_state() {
-            FrontAttemptState::NotStarted => {
-                self.gate.timer_decided();
-                return self.complete(self.inner(), Self::not_needed());
-            }
-            FrontAttemptState::Dispatching { front_instant_ms }
-            | FrontAttemptState::Dispatched { front_instant_ms } => front_instant_ms,
-        };
-        let (confirmed, deadline) = {
-            let inner = self.inner();
-            (inner.front_confirmed, inner.restore_deadline)
-        };
-        let mut adapter = RestoreDecisionHost {
-            host: host.as_mut(),
-            _target: self.target_pid,
-            write_deadline: deadline.map(|deadline| {
-                restore_preparation::WriteDeadline::new(deadline, started, Some(wake))
-            }),
-            owner: DecisionOwner::Timer,
-            cell: Some(self),
-            #[cfg(all(feature = "desk-probe", target_os = "macos"))]
-            probe_timing: &self.probe_timing,
-        };
-        let outcome = if confirmed {
-            crate::computer::dispatch::restore_after_front_attempt(
-                &mut adapter,
-                self.previous_pid,
-                self.target_pid,
-                front_instant_ms,
-                crate::computer::dispatch::RESTORE_WAIT_MS,
-                true,
-            )
-        } else {
-            crate::computer::dispatch::restore_without_awaiting_activation(
-                &mut adapter,
-                self.previous_pid,
-                self.target_pid,
-                front_instant_ms,
-                crate::computer::dispatch::RESTORE_WAIT_MS,
-            )
-        };
+        // The owner's own restores train the reserve, a refused request too:
+        // each sample runs to the native write it reached.
         let expired = adapter.write_deadline.as_ref().is_some_and(|guard| {
             guard.record_sample();
             guard.expired
         });
-        self.gate.timer_decided();
         self.finish_decision(outcome, expired, confirmed, front_instant_ms, host)
     }
 
-    /// Record a decision its owner made: a first request refused at the
+    /// The owner's decision for a bracket that deferred its restore because
+    /// a key may have been held, once settling that release ended at
+    /// `settled_at`, `confirmed` when every key is known to be up.
+    ///
+    /// An unconfirmed release restores nothing: the previous application
+    /// would receive the held key. A release confirmed before the deadline is
+    /// followed at once by the restore under that deadline. One confirmed
+    /// only after it is the named exception to the bound: the restore follows
+    /// it without a deadline. When the call's reply already went out before
+    /// it settled, that restore is one attempt that puts the previous
+    /// application back only while the target is in front and nothing since
+    /// the front shows the person using it.
+    pub(crate) fn decide_after_release(
+        &self,
+        confirmed: bool,
+        settled_at: std::time::Instant,
+    ) -> RestoreDecided {
+        if let Some(decided) = self.decided() {
+            return decided;
+        }
+        if !confirmed {
+            return self.forgo();
+        }
+        self.gate.all_released();
+        if self
+            .gate
+            .deadline()
+            .is_none_or(|deadline| settled_at < deadline)
+        {
+            return self.decide_bounded(true);
+        }
+        if self.inner().release_wait.is_some() {
+            return self.restore_after_late_release();
+        }
+        self.decide_bounded(false)
+    }
+
+    /// Terminal cleanup's part in the obligation; it never restores. A front
+    /// not yet requested is stopped, and the decision is that nothing needs
+    /// restoring. Otherwise nothing new may start, and this waits until
+    /// `give_up` at most for the owner's decision: `None` when the owner has
+    /// not decided by then. Blocking.
+    pub fn await_owner(&self, give_up: std::time::Instant) -> Option<RestoreDecided> {
+        if self.gate.stop_front() {
+            return Some(self.complete(self.inner(), Self::not_needed()));
+        }
+        let (inner, _) = self
+            .changed
+            .wait_timeout_while(
+                self.inner(),
+                give_up.saturating_duration_since(std::time::Instant::now()),
+                |inner| inner.decided.is_none(),
+            )
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.decided
+    }
+
+    /// The call's reply goes out while the owner still waits for a key
+    /// release to settle. The reply reports the restore failed; the owner
+    /// keeps the host and the fronting lock, and decides once the release
+    /// settles. Until then module health counts the lock as held for an
+    /// unsettled release: the one fronting lock with no time bound.
+    pub(crate) fn reply_sent_before_release(&self) {
+        let mut inner = self.inner();
+        if inner.decided.is_some() || inner.release_wait.is_some() {
+            return;
+        }
+        let since_ms = wall_clock_ms();
+        UNSETTLED_RELEASE_LOCKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(since_ms);
+        inner.release_wait = Some(since_ms);
+    }
+
+    /// The worker that owned this obligation ended without deciding, so
+    /// nobody can decide it now. Nothing is restored; the fronting lock is
+    /// released, and a front that may have happened is reported failed.
+    pub(crate) fn abandon_undecided(&self) {
+        if self.decided().is_none() {
+            self.forgo();
+        }
+    }
+
+    /// Record a decision the owner made: a first request refused at the
     /// deadline reads as failed, and an activation the action never confirmed,
     /// or a refused request, leaves the host to the late watch.
     fn finish_decision(
@@ -752,7 +736,7 @@ impl RestoreCell {
         {
             let mut inner = self.inner();
             inner.pending_since = Some(front_instant_ms);
-            inner.expired_write_handed_off |= expired;
+            inner.handoff_owed |= expired;
             inner.pending_restored = matches!(
                 outcome.restore,
                 crate::computer::dispatch::RestoreStatus::Restored
@@ -771,13 +755,6 @@ impl RestoreCell {
         )
     }
 
-    /// The first native restore request was refused at its deadline.
-    /// Published at once, before any fallback or confirmation wait, so a
-    /// terminal reply finalized meanwhile discloses the handoff.
-    fn publish_expired_write(&self) {
-        self.inner().expired_write_handed_off = true;
-    }
-
     /// A decision that found nothing fronted.
     fn not_needed() -> RestoreDecided {
         RestoreDecided {
@@ -789,88 +766,48 @@ impl RestoreCell {
         }
     }
 
-    /// Take the obligation without requesting any restore, because a key or
-    /// button may still be held and restoring would deliver it to the
-    /// previous application. A front that may have happened is reported
-    /// failed, naming the target left in front; one that cleanup prevented
-    /// is `not_needed`. When another owner holds the decision, waits for it;
-    /// a timer that is only waiting for that input's release is ended
-    /// instead, since it could not restore anyway.
+    /// The owner's decision without any restore, because a key or button may
+    /// still be held and restoring would deliver it to the previous
+    /// application. A front that may have happened is reported failed,
+    /// naming the target left in front; one that never happened is
+    /// `not_needed`.
     fn forgo(&self) -> RestoreDecided {
-        use crate::computer::dispatch::{Awaited, ForgoClaim};
-        let give_up = std::time::Instant::now() + Duration::from_millis(DECISION_AWAIT_MS);
-        loop {
-            let decided = match self.gate.claim_forgo() {
-                ForgoClaim::PreventedFront => Self::not_needed(),
-                ForgoClaim::Taken { .. } => self.failed(),
-                ForgoClaim::Await => {
-                    let remaining = give_up.saturating_duration_since(std::time::Instant::now());
-                    match self.gate.await_owner(remaining, true) {
-                        Awaited::Claimable => continue,
-                        Awaited::Decided => return self.await_decided(give_up),
-                        Awaited::TimedOut => return self.failed(),
-                    }
-                }
-            };
-            let mut inner = self.inner();
-            inner.host.take();
-            return self.complete(inner, decided);
-        }
-    }
-
-    /// [`Self::forgo`] for a release still running when the reply had to be
-    /// sent: the reply reports the restore failed now, but the host and the
-    /// fronting lock are kept, so that [`Self::restore_after_release`] can
-    /// still put the previous application back once the release settles
-    /// confirmed. `None` when another owner holds the decision.
-    fn forgo_until_released(&self) -> Option<RestoreDecided> {
-        use crate::computer::dispatch::ForgoClaim;
-        let front_instant_ms = match self.gate.claim_forgo() {
-            ForgoClaim::Await => return None,
-            ForgoClaim::PreventedFront => {
-                let mut inner = self.inner();
-                inner.host.take();
-                return Some(self.complete(inner, Self::not_needed()));
+        use crate::computer::dispatch::FrontAttemptState;
+        self.gate.end_front();
+        let decided = match self.gate.attempt_state() {
+            FrontAttemptState::NotStarted => Self::not_needed(),
+            FrontAttemptState::Dispatching { .. } | FrontAttemptState::Dispatched { .. } => {
+                self.failed()
             }
-            ForgoClaim::Taken { front_instant_ms } => front_instant_ms,
         };
         let mut inner = self.inner();
-        let since_ms = wall_clock_ms();
-        UNSETTLED_RELEASE_LOCKS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(since_ms);
-        inner.release_wait = Some((front_instant_ms, since_ms));
-        let failed = self.failed();
-        Some(self.complete(inner, failed))
+        inner.host.take();
+        self.complete(inner, decided)
     }
 
-    /// The release a [`Self::forgo_until_released`] waited on settled with
-    /// every key confirmed up. Puts the previous application back if the
-    /// target is still in front and no person input or observer gap has
-    /// occurred since the front, then releases the fronting lock. Returns
-    /// what the restore did, `None` when nothing was waiting for it.
-    pub(crate) fn restore_after_release(&self) -> Option<crate::computer::dispatch::RestoreStatus> {
-        let (since, mut host, lock) = {
-            let mut inner = self.inner();
-            let (since, held_since_ms) = inner.release_wait.take()?;
-            unsettled_release_lock_ended(held_since_ms);
-            let host = inner.host.take();
-            (since, host, inner.lock.take())
+    /// The restore after a release that settled confirmed only after the
+    /// call's reply: one attempt, only while the target is in front and
+    /// nothing since the front says the person is using it, since the
+    /// release may have settled long after the reply.
+    fn restore_after_late_release(&self) -> RestoreDecided {
+        use crate::computer::dispatch::FrontAttemptState;
+        self.gate.end_front();
+        let since = match self.gate.attempt_state() {
+            FrontAttemptState::NotStarted => {
+                return self.complete(self.inner(), Self::not_needed());
+            }
+            FrontAttemptState::Dispatching { front_instant_ms }
+            | FrontAttemptState::Dispatched { front_instant_ms } => front_instant_ms,
         };
-        let restored = host.as_mut().map(|host| {
+        let host = self.inner().host.take();
+        let restored = host.map(|mut host| {
             let mut adapter = RestoreDecisionHost {
                 host: host.as_mut(),
                 _target: self.target_pid,
                 write_deadline: None,
-                owner: DecisionOwner::Unowned,
-                cell: None,
                 #[cfg(all(feature = "desk-probe", target_os = "macos"))]
                 probe_timing: &self.probe_timing,
             };
-            // One attempt, only while the target is in front and nothing
-            // since the front says the person is using it; the release may
-            // have settled long after the reply.
             crate::computer::dispatch::watch_late_activation(
                 &mut adapter,
                 self.previous_pid,
@@ -882,25 +819,13 @@ impl RestoreCell {
             )
             .0
         });
-        drop(host);
-        drop(lock);
-        restored
-    }
-
-    /// The release a [`Self::forgo_until_released`] waited on settled
-    /// without confirming every key up: no restore is requested, since a key
-    /// may still be down, and the fronting lock is released.
-    pub(crate) fn abandon_release_wait(&self) {
-        let (host, lock) = {
-            let mut inner = self.inner();
-            let Some((_, held_since_ms)) = inner.release_wait.take() else {
-                return;
-            };
-            unsettled_release_lock_ended(held_since_ms);
-            (inner.host.take(), inner.lock.take())
-        };
-        drop(host);
-        drop(lock);
+        self.complete(
+            self.inner(),
+            RestoreDecided {
+                restore: restored.unwrap_or(self.failed().restore),
+                ..self.failed()
+            },
+        )
     }
 
     /// A restore reported failed with the target named as left in front.
@@ -916,36 +841,27 @@ impl RestoreCell {
         }
     }
 
-    /// Another owner settled the decision: wait, until `give_up` at most,
-    /// for it to record what it decided.
-    fn await_decided(&self, give_up: std::time::Instant) -> RestoreDecided {
-        let (inner, _) = self
-            .changed
-            .wait_timeout_while(
-                self.inner(),
-                give_up.saturating_duration_since(std::time::Instant::now()),
-                |inner| inner.decided.is_none(),
-            )
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.decided.unwrap_or_else(|| self.failed())
-    }
-
-    /// Record the decision, wake any waiter, then release the fronting lock.
+    /// Record the decision, wake any waiter, then release the fronting lock
+    /// unless a picture read or the late watch still needs it. Only the
+    /// first decision counts.
     fn complete(
         &self,
         mut inner: std::sync::MutexGuard<'_, RestoreCellInner>,
         decided: RestoreDecided,
     ) -> RestoreDecided {
+        if let Some(first) = inner.decided {
+            return first;
+        }
         inner.decided = Some(decided);
+        if let Some(since_ms) = inner.release_wait.take() {
+            unsettled_release_lock_ended(since_ms);
+        }
         let late_start = if inner.reads_in_flight == 0 {
             inner.late_start.take()
         } else {
             None
         };
-        let lock = if inner.pending_since.is_none()
-            && inner.reads_in_flight == 0
-            && inner.release_wait.is_none()
-        {
+        let lock = if inner.pending_since.is_none() && inner.reads_in_flight == 0 {
             inner.lock.take()
         } else {
             None
@@ -1015,9 +931,9 @@ impl RestoreCell {
                 None => remedy,
             };
             let inner = self.inner();
-            if inner.expired_write_handed_off {
+            if inner.handoff_owed {
                 remedy.push_str(". The first restore request missed its deadline; the restore was handed off to a short-lived watcher that can retry only while the target remains in front and continuous input observation shows no person input.");
-            } else if inner.restore_deadline.is_some()
+            } else if self.gate.deadline().is_some()
                 && inner.late_start.is_some()
                 && inner.decided.is_none()
             {
@@ -1099,68 +1015,39 @@ pub(crate) fn stalled_picture_reads() -> (usize, u64) {
 struct RestoreDecisionHost<'a> {
     host: &'a mut dyn RestoreHost,
     _target: u32,
+    /// The owner's first restore request's deadline, when it has one. The
+    /// late watch has none.
     write_deadline: Option<restore_preparation::WriteDeadline>,
-    owner: DecisionOwner<'a>,
-    /// The cell a refused first write is published to at once.
-    cell: Option<&'a RestoreCell>,
     #[cfg(all(feature = "desk-probe", target_os = "macos"))]
     probe_timing: &'a probe_timing::ProbeTiming,
-}
-
-/// Which side runs a restore decision, and so what it must check between
-/// its steps. The gate's lock is taken only for these checks, never across
-/// a host call.
-enum DecisionOwner<'a> {
-    /// The late watch or a restore after a release: no gate decides for it.
-    Unowned,
-    /// An ordinary owner, which keeps the decision only while its claim
-    /// holds and must stop when the timer takes over.
-    Ordinary {
-        gate: &'a crate::computer::dispatch::CutoffGate,
-        ticket: &'a crate::computer::dispatch::OrdinaryTicket,
-    },
-    /// The timer, which owns its decision outright.
-    Timer,
-}
-
-impl DecisionOwner<'_> {
-    fn holds(&self) -> bool {
-        match self {
-            Self::Ordinary { gate, ticket } => gate.ordinary_holds(ticket),
-            Self::Unowned | Self::Timer => true,
-        }
-    }
-
-    /// At the native write: an ordinary owner settles the decision, and is
-    /// refused when it has lost it.
-    fn commit(&self) -> bool {
-        match self {
-            Self::Ordinary { gate, ticket } => gate.settle_ordinary(ticket),
-            Self::Unowned | Self::Timer => true,
-        }
-    }
 }
 
 impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> {
     type Tap = ();
 
-    fn restore_decision_held(&self) -> bool {
-        self.owner.holds()
+    fn restore_wait_left_ms(&mut self) -> Option<u64> {
+        self.write_deadline
+            .as_ref()
+            .and_then(restore_preparation::WriteDeadline::wait_left)
+            .map(|left| u64::try_from(left.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    fn restore_deadline_missed(&mut self) -> bool {
+        self.write_deadline
+            .as_mut()
+            .is_some_and(restore_preparation::WriteDeadline::missed)
+    }
+
+    fn restore_preparation_started(&mut self) {
+        if let Some(guard) = &mut self.write_deadline {
+            guard.preparation_started();
+        }
     }
 
     fn now_ms(&mut self) -> u64 {
         self.host.now_ms()
     }
     fn pause_ms(&mut self, milliseconds: u64) {
-        // An ordinary owner never sleeps into the timer's phase.
-        let milliseconds = match &self.owner {
-            DecisionOwner::Ordinary { gate, ticket } => gate
-                .ordinary_time_left(ticket)
-                .map_or(milliseconds, |left| {
-                    milliseconds.min(u64::try_from(left.as_millis()).unwrap_or(u64::MAX))
-                }),
-            DecisionOwner::Unowned | DecisionOwner::Timer => milliseconds,
-        };
         if milliseconds > 0 {
             self.host.pause_ms(milliseconds);
         }
@@ -1177,9 +1064,7 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
     }
     fn request_front(&mut self, pid: u32) -> bool {
         let mut check = restore_preparation::NativeWriteCheck {
-            owner: &self.owner,
             deadline: self.write_deadline.as_mut(),
-            cell: self.cell,
         };
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
         {
@@ -1196,9 +1081,7 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
     }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
         let mut check = restore_preparation::NativeWriteCheck {
-            owner: &self.owner,
             deadline: self.write_deadline.as_mut(),
-            cell: self.cell,
         };
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
         {
@@ -1861,8 +1744,8 @@ pub(crate) async fn run_arbitrated_route(
             tokio::time::Instant::now() + Duration::from_millis(budgets::RELEASE_BUDGET_MS);
         let mut held = None;
         // A release still running when its window ends. With a restore
-        // obligation, its restore is held back until it settles rather than
-        // given up on; see `restore_when_released`.
+        // obligation, the owner still restores once it settles; the reply
+        // only says the restore failed for now.
         let mut unsettled_release = None;
         if let Some(release) = release {
             let mut release_job = tokio::spawn(release);
@@ -1877,20 +1760,11 @@ pub(crate) async fn run_arbitrated_route(
                 },
             );
         }
+        if let (Some(cell), Some(_)) = (&restore, &unsettled_release) {
+            cell.reply_sent_before_release();
+        }
         let decided = match &restore {
-            Some(cell) => Some(match unsettled_release.take() {
-                Some(release_job) => match cell.forgo_until_released() {
-                    Some(decided) => {
-                        restore_when_released(Arc::clone(cell), release_job, &planes);
-                        decided
-                    }
-                    None => {
-                        detach_release(release_job, &planes);
-                        finish_restore(Arc::clone(cell), held, suffix_end, &planes).await
-                    }
-                },
-                None => finish_restore(Arc::clone(cell), held, suffix_end, &planes).await,
-            }),
+            Some(cell) => Some(finish_restore(Arc::clone(cell), suffix_end).await),
             None => None,
         };
         if let Some(release_job) = unsettled_release {
@@ -1941,11 +1815,18 @@ pub(crate) async fn run_arbitrated_route(
         }
     } else {
         if let Some(cell) = restore {
-            // The worker ended without a terminal reply. Nobody else can run
-            // its restore decision now, and an undecided obligation would
-            // keep the fronting lock, so run it detached.
+            // The worker ended without a terminal reply, so its decision is
+            // made or will not be. One still missing after the owner's whole
+            // bounded sequence is abandoned without any restore, so the
+            // fronting lock is not kept forever.
             let detached = planes.health.enter_detached_worker();
-            let decision = tokio::task::spawn_blocking(move || cell.decide());
+            let decision = tokio::task::spawn_blocking(move || {
+                let give_up =
+                    std::time::Instant::now() + Duration::from_millis(OWNER_GONE_AFTER_MS);
+                if cell.await_owner(give_up).is_none() {
+                    cell.abandon_undecided();
+                }
+            });
             tokio::spawn(async move {
                 let _detached = detached;
                 let _ = decision.await;
@@ -1993,71 +1874,20 @@ fn detach_release(release_job: tokio::task::JoinHandle<HeldState>, planes: &Plan
     });
 }
 
-/// The restore for a held-input release that had not settled when the reply
-/// was due ([`RestoreCell::forgo_until_released`] already reported it
-/// failed). It waits, detached, for the release: once every key is
-/// confirmed up, the previous application is put back if the target is
-/// still in front and nothing since the front shows the person using it;
-/// a release that settles unconfirmed requests nothing, since a key may
-/// still be down.
-///
-/// This is the one restore with no time bound: a release that never settles
-/// leaves the target in front and the fronting lock held, and the reply has
-/// already said `restore_failed`, never success. Putting the previous
-/// application back over a key that may still be down would deliver it to
-/// that application, which is worse than leaving the target in front.
-fn restore_when_released(
-    cell: Arc<RestoreCell>,
-    release_job: tokio::task::JoinHandle<HeldState>,
-    planes: &Planes,
-) {
-    let detached = planes.health.enter_detached_worker();
-    tokio::spawn(async move {
-        let _detached = detached;
-        match release_job.await {
-            Ok(HeldState::Released | HeldState::NoneHeld) => {
-                let _ = tokio::task::spawn_blocking(move || cell.restore_after_release()).await;
-            }
-            Ok(HeldState::Unknown) | Err(_) => cell.abandon_release_wait(),
-        }
-    });
-}
-
-/// Terminal cleanup's half of a restore obligation, after held-input release.
-///
-/// When that release was not confirmed, no restore is requested at all: a
-/// front that may have happened is reported failed, naming the target left
-/// in front, while the unconfirmed press stays in the held-input quarantine;
-/// a front cleanup prevented is `not_needed`. Otherwise the restore decision
-/// runs as an ordinary owner. Either runs on a blocking thread, awaiting the
-/// decision of whichever owner holds it, until `end`. A decision unfinished
-/// by then is reported failed and keeps running detached.
-async fn finish_restore(
-    cell: Arc<RestoreCell>,
-    held: Option<HeldState>,
-    end: tokio::time::Instant,
-    planes: &Planes,
-) -> RestoreDecided {
-    let forgo = matches!(held, Some(HeldState::Unknown));
-    let decider = Arc::clone(&cell);
-    let mut decision = tokio::task::spawn_blocking(move || {
-        if forgo {
-            decider.forgo()
-        } else {
-            decider.decide()
-        }
-    });
-    match tokio::time::timeout_at(end, &mut decision).await {
-        Ok(Ok(decided)) => decided,
-        Ok(Err(_)) => cell.failed(),
-        Err(_) => {
-            let detached = planes.health.enter_detached_worker();
-            tokio::spawn(async move {
-                let _detached = detached;
-                let _ = decision.await;
-            });
-            cell.failed()
-        }
+/// Terminal cleanup's half of a restore obligation, after held-input
+/// release. It never restores: the bracket's thread owns the decision. A
+/// front not yet requested is stopped and needs no restore; otherwise this
+/// waits on a blocking thread, until `end` at most, for the owner's
+/// decision. One not made by then is reported failed for now; the owner
+/// still makes it, and a late watch it owes starts once it has.
+async fn finish_restore(cell: Arc<RestoreCell>, end: tokio::time::Instant) -> RestoreDecided {
+    let waiter = Arc::clone(&cell);
+    let give_up =
+        std::time::Instant::now() + end.saturating_duration_since(tokio::time::Instant::now());
+    let wait = tokio::task::spawn_blocking(move || waiter.await_owner(give_up));
+    match tokio::time::timeout_at(end, wait).await {
+        Ok(Ok(Some(decided))) => decided,
+        Ok(Ok(None) | Err(_)) | Err(_) => cell.failed(),
     }
 }
 
@@ -3120,7 +2950,7 @@ mod restore_slot_tests {
         /// When each request was made, in real time.
         requested_at: Vec<std::time::Instant>,
         focus_delay: Option<Duration>,
-        /// Pauses also sleep for real, so a timer can overtake them.
+        /// Pauses also sleep for real, so a real-time bound passes during them.
         real_pause: bool,
         /// Release and restore steps in the order they happened.
         log: Vec<&'static str>,
@@ -3264,31 +3094,55 @@ mod restore_slot_tests {
         cell.front_attempt_returned();
     }
 
+    /// A registered cell whose bracket gate has a bound: the restore reserve
+    /// starts `reserve_in` from now and the deadline `deadline_in` from now.
+    fn bounded_cell(
+        terminal: &TerminalArbiter,
+        shared: &SharedScreen,
+        releases: &Arc<AtomicUsize>,
+        reserve_in: Duration,
+        deadline_in: Duration,
+    ) -> (
+        Arc<RestoreCell>,
+        Arc<crate::computer::dispatch::CutoffGate>,
+        std::time::Instant,
+    ) {
+        let gate = Arc::new(crate::computer::dispatch::CutoffGate::new());
+        let mut obligation = obligation(shared, releases);
+        obligation.gate = Some(Arc::clone(&gate));
+        let cell = terminal.register_restore(obligation).unwrap();
+        assert!(cell.begin_front_attempt(0));
+        cell.front_attempt_returned();
+        // Bound once the front was requested, so even a reserve already
+        // started has a front to restore.
+        let now = std::time::Instant::now();
+        let deadline = now + deadline_in;
+        gate.set_bound(now + reserve_in, deadline);
+        (cell, gate, deadline)
+    }
+
     #[test]
     fn a_slow_restore_focus_read_refuses_the_primary_write_and_hands_off_after_terminal() {
         let shared = screen(true);
         let releases = Arc::new(AtomicUsize::new(0));
         let terminal = TerminalArbiter::new(request());
-        let cell = terminal
-            .register_restore(obligation(&shared, &releases))
-            .unwrap();
-        assert!(cell.begin_front_attempt(0));
+        let (cell, _gate, _) = bounded_cell(
+            &terminal,
+            &shared,
+            &releases,
+            Duration::ZERO,
+            Duration::from_millis(10),
+        );
         cell.front_confirmed();
-        cell.front_attempt_returned();
-        cell.set_restore_deadline(std::time::Instant::now() + Duration::from_millis(10));
+        // The owner's focus read, a native call nothing can cut short,
+        // stalls past the deadline.
         shared.lock().unwrap().focus_delay = Some(Duration::from_millis(30));
 
         // Terminal has stopped waiting before the deciding owner returns.
         terminal.start_late_fronting(Some(&cell));
         let expired = restore_preparation::expired_writes();
-        let woke_at = std::time::Instant::now();
-        let decided = cell.decide_at_cutoff(
-            crate::computer::dispatch::CutoffWake {
-                scheduled_at: woke_at,
-                woke_at,
-            },
-            Box::new(FakeHost(Arc::clone(&shared))),
-        );
+        let os_delay = restore_preparation::expired_os_delay();
+        let decided = cell.decide();
         assert_eq!(
             decided.restore,
             RestoreStatus::Failed {
@@ -3297,6 +3151,10 @@ mod restore_slot_tests {
         );
         assert!(decided.restore_ms.is_none());
         assert!(restore_preparation::expired_writes() > expired);
+        assert!(
+            restore_preparation::expired_os_delay() > os_delay,
+            "the stalled read is counted as a native stall, not our own overrun"
+        );
         let mut reply = json!({"outcome": "completed", "effect_status": "effect_indeterminate"});
         cell.disclose(&mut reply, decided);
         assert_eq!(reply["outcome"], "restore_failed");
@@ -3321,177 +3179,81 @@ mod restore_slot_tests {
         );
     }
 
-    /// The decision of a cell whose bracket gate has a real cutoff timer:
-    /// the timer decides on its own fake host and reports what it decided
-    /// and how many reserve samples its thread recorded.
-    struct Timed {
-        cell: Arc<RestoreCell>,
-        gate: Arc<crate::computer::dispatch::CutoffGate>,
-        timer: crate::computer::dispatch::CutoffTimer,
-        decided: std::sync::mpsc::Receiver<(RestoreDecided, usize)>,
-        deadline: std::time::Instant,
-    }
-
-    /// A registered cell whose front attempt returned, then a timer armed
-    /// to take the decision `closes_in` from now, `deadline_in` before the
-    /// deadline. `prepare` runs on the cell and gate before arming.
-    fn timed_cell(
-        terminal: &TerminalArbiter,
-        shared: &SharedScreen,
-        releases: &Arc<AtomicUsize>,
-        closes_in: Duration,
-        deadline_in: Duration,
-        prepare: impl FnOnce(&RestoreCell, &crate::computer::dispatch::CutoffGate),
-    ) -> Timed {
-        use crate::computer::dispatch::{CutoffGate, CutoffTimer};
-        let gate = Arc::new(CutoffGate::new());
-        let mut obligation = obligation(shared, releases);
-        obligation.gate = Some(Arc::clone(&gate));
-        let cell = terminal.register_restore(obligation).unwrap();
-        assert!(cell.begin_front_attempt(0));
-        cell.front_attempt_returned();
-        prepare(&cell, &gate);
-        let armed = std::time::Instant::now();
-        let deadline = armed + deadline_in;
-        cell.set_restore_deadline(deadline);
-        let (sent, decided) = std::sync::mpsc::channel();
-        let timer_cell = Arc::clone(&cell);
-        let timer_host = FakeHost(Arc::clone(shared));
-        let timer = CutoffTimer::arm_with_wake(
-            Arc::clone(&gate),
-            armed + closes_in,
-            deadline,
-            Box::new(move |wake| {
-                let decided = timer_cell.decide_at_cutoff(wake, Box::new(timer_host));
-                let _ = sent.send((
-                    decided,
-                    restore_preparation::samples_recorded_on_this_thread(),
-                ));
-            }),
-        )
-        .unwrap();
-        Timed {
-            cell,
-            gate,
-            timer,
-            decided,
-            deadline,
-        }
-    }
-
     #[test]
-    fn an_owner_stalled_in_a_read_across_the_reserve_loses_to_the_timer_which_writes_by_the_deadline(
-    ) {
-        let shared = screen(true);
-        // The ordinary owner's first focus read stalls well past the reserve
-        // start and the deadline.
-        shared.lock().unwrap().focus_delay = Some(Duration::from_millis(150));
-        let releases = Arc::new(AtomicUsize::new(0));
-        let terminal = TerminalArbiter::new(request());
-        let timed = timed_cell(
-            &terminal,
-            &shared,
-            &releases,
-            Duration::from_millis(40),
-            Duration::from_millis(120),
-            |cell, _| cell.front_confirmed(),
-        );
-        let owner_cell = Arc::clone(&timed.cell);
-        let owner = std::thread::spawn(move || owner_cell.decide());
-        let (by_timer, samples) = timed
-            .decided
-            .recv_timeout(crate::test_support::HANG_GUARD)
-            .expect("the timer decided without waiting for the stalled owner");
-        let by_owner = owner.join().unwrap();
-        timed.timer.finish();
-        let screen = shared.lock().unwrap();
-        assert_eq!(screen.requests, [PREVIOUS], "one write, the timer's");
-        assert!(
-            screen.requested_at[0] <= timed.deadline,
-            "the timer requested the restore by the deadline"
-        );
-        assert_eq!(by_timer.restore, RestoreStatus::Restored);
-        assert_eq!(
-            by_owner, by_timer,
-            "the stalled owner reports the timer's decision"
-        );
-        assert!(samples > 0, "the timer's restore trained the reserve");
-        assert!(timed.gate.restore_started_by_cutoff());
-        assert_eq!(releases.load(SeqCst), 1);
-    }
-
-    #[test]
-    fn a_hold_that_clears_before_the_deadline_is_restored_by_the_timer_inside_it() {
+    fn a_release_settling_at_150_of_200_ms_is_restored_by_the_owner_inside_the_deadline() {
         let shared = screen(true);
         let releases = Arc::new(AtomicUsize::new(0));
         let terminal = TerminalArbiter::new(request());
         let started = std::time::Instant::now();
-        let timed = timed_cell(
+        let (cell, gate, deadline) = bounded_cell(
             &terminal,
             &shared,
             &releases,
-            Duration::from_millis(50),
+            Duration::from_millis(150),
             Duration::from_millis(200),
-            |cell, gate| {
-                cell.front_confirmed();
-                assert!(gate.begin_post(true), "a press held into the reserve");
-            },
+        );
+        cell.front_confirmed();
+        assert!(
+            gate.begin_post(true),
+            "a press whose release has not settled"
         );
         std::thread::sleep(Duration::from_millis(150).saturating_sub(started.elapsed()));
         let released = std::time::Instant::now();
-        timed.gate.all_released();
-        let (decided, samples) = timed
-            .decided
-            .recv_timeout(crate::test_support::HANG_GUARD)
-            .expect("the timer resumes its decision when the hold clears");
-        timed.timer.finish();
+        let samples = restore_preparation::samples_recorded_on_this_thread();
+        let decided = cell.decide_after_release(true, released);
         let screen = shared.lock().unwrap();
-        assert_eq!(screen.requests, [PREVIOUS]);
+        assert_eq!(screen.requests, [PREVIOUS], "the owner restored at once");
         assert!(screen.requested_at[0] >= released, "never under the hold");
         assert!(
-            screen.requested_at[0] <= timed.deadline,
+            screen.requested_at[0] <= deadline,
             "the release settled in time, so the restore is still bound by the deadline"
         );
         assert_eq!(decided.restore, RestoreStatus::Restored);
         assert!(
-            samples > 0,
+            restore_preparation::samples_recorded_on_this_thread() > samples,
             "the write ran under the original write deadline and trained the reserve"
         );
+        assert!(!gate.input_held());
+        assert_eq!(releases.load(SeqCst), 1);
     }
 
     #[test]
-    fn an_owner_sleeping_when_the_reserve_starts_stops_and_the_timer_requests_the_restore() {
+    fn an_owner_watching_an_unconfirmed_activation_requests_the_restore_at_the_reserve_by_the_deadline(
+    ) {
         let shared = screen(true);
         {
-            // The activation has not landed, so the ordinary owner keeps
-            // watching for it with real poll sleeps.
+            // The activation has not landed, so the owner watches for it
+            // with real poll sleeps until the reserve starts.
             let mut screen = shared.lock().unwrap();
             screen.frontmost = Some(PREVIOUS);
             screen.real_pause = true;
         }
         let releases = Arc::new(AtomicUsize::new(0));
         let terminal = TerminalArbiter::new(request());
-        let timed = timed_cell(
+        let (cell, gate, deadline) = bounded_cell(
             &terminal,
             &shared,
             &releases,
             Duration::from_millis(40),
             Duration::from_millis(140),
-            |_, _| {},
         );
-        let owner_cell = Arc::clone(&timed.cell);
-        let owner = std::thread::spawn(move || owner_cell.decide());
-        let (by_timer, _) = timed
-            .decided
-            .recv_timeout(crate::test_support::HANG_GUARD)
-            .expect("the timer took the decision from the watching owner");
-        let by_owner = owner.join().unwrap();
-        timed.timer.finish();
+        let reserve_start = gate.reserve_start().unwrap();
+        let decided = cell.decide();
         let screen = shared.lock().unwrap();
-        assert_eq!(screen.requests, [PREVIOUS], "one write, the timer's");
-        assert!(screen.requested_at[0] <= timed.deadline);
-        assert_eq!(by_owner, by_timer);
-        assert!(timed.gate.restore_started_by_cutoff());
+        assert_eq!(screen.requests, [PREVIOUS], "one write, the owner's own");
+        assert!(
+            screen.requested_at[0] + Duration::from_millis(1) >= reserve_start,
+            "it watched until the reserve started, sleeping no part of it"
+        );
+        assert!(
+            screen.requested_at[0] <= deadline,
+            "and wrote by the deadline"
+        );
+        assert!(
+            matches!(decided.restore, RestoreStatus::Failed { .. }),
+            "a landing never seen is not reported restored"
+        );
+        assert!(cell.late_watch_pending(), "the late watch is owed it");
     }
 
     #[test]
@@ -3616,12 +3378,13 @@ mod restore_slot_tests {
         // The target is in front when the attempt returns, as the worker saw.
         cell.front_confirmed();
         cell.front_attempt_returned();
+        let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
         let (worker, cleanup) = std::thread::scope(|scope| {
             let worker = scope.spawn(|| cell.decide());
-            let cleanup = scope.spawn(|| cell.decide());
+            let cleanup = scope.spawn(|| cell.await_owner(give_up));
             (worker.join().unwrap(), cleanup.join().unwrap())
         });
-        assert_eq!(worker, cleanup, "both sides see the one decision");
+        assert_eq!(Some(worker), cleanup, "both sides see the one decision");
         assert_eq!(worker.restore, RestoreStatus::Restored);
         assert_eq!(shared.lock().unwrap().requests, [PREVIOUS]);
         assert_eq!(releases.load(SeqCst), 1, "the lock was released once");
@@ -3637,7 +3400,9 @@ mod restore_slot_tests {
         let cell = terminal
             .register_restore(obligation(&shared, &releases))
             .unwrap();
-        let decided = cell.decide();
+        let decided = cell
+            .await_owner(std::time::Instant::now())
+            .expect("nothing was fronted, so cleanup decides at once");
         assert_eq!(decided.restore, RestoreStatus::NotNeeded);
         assert!(!decided.front_requested);
         assert_eq!(releases.load(SeqCst), 1);
@@ -3651,7 +3416,7 @@ mod restore_slot_tests {
     }
 
     #[test]
-    fn cleanup_during_a_front_request_waits_for_it_then_decides_once() {
+    fn cleanup_during_a_front_request_waits_for_the_owner_which_decides_once() {
         let releases = Arc::new(AtomicUsize::new(0));
         let shared = screen(true);
         shared.lock().unwrap().frontmost = Some(PREVIOUS);
@@ -3660,10 +3425,14 @@ mod restore_slot_tests {
             .register_restore(obligation(&shared, &releases))
             .unwrap();
         assert!(cell.begin_front_attempt(0));
+        let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
         let decided = std::thread::scope(|scope| {
-            let cleanup = scope.spawn(|| cell.decide());
+            let cleanup = scope.spawn(|| cell.await_owner(give_up));
+            // The worker's front request returns, then its owner decides.
             return_front_after_take(&cell, &shared);
-            cleanup.join().unwrap()
+            let owner = cell.decide();
+            assert_eq!(cleanup.join().unwrap(), Some(owner));
+            owner
         });
         assert_eq!(decided.restore, RestoreStatus::Restored);
         let screen = shared.lock().unwrap();
@@ -3822,12 +3591,53 @@ mod restore_slot_tests {
         serde_json::from_slice(&reply.body).unwrap()
     }
 
+    /// How a test's worker, the obligation's one owner, ends its front once
+    /// terminal cleanup has stopped it.
+    #[derive(Clone, Copy)]
+    enum Owner {
+        /// It sees the stop and restores.
+        Restores,
+        /// Its own release of a held key settled unconfirmed: it restores
+        /// nothing.
+        ReleaseUnconfirmed,
+        /// It never returns from settling a held key's release.
+        StuckInRelease,
+    }
+
+    /// Play the owner's side on its own thread, as a bracket that notices
+    /// the stop at its next check.
+    fn own_until_stopped(cell: Arc<RestoreCell>, owner: Owner) {
+        if let Owner::StuckInRelease = owner {
+            // A worker stuck settling its release still holds its
+            // obligation, as the real worker's hooks do.
+            std::mem::forget(cell);
+            return;
+        }
+        std::thread::spawn(move || {
+            let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+            while !cell.cleanup_taken() && std::time::Instant::now() < give_up {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            match owner {
+                Owner::Restores => {
+                    cell.decide();
+                }
+                Owner::ReleaseUnconfirmed => {
+                    cell.decide_after_release(false, std::time::Instant::now());
+                }
+                Owner::StuckInRelease => {}
+            }
+        });
+    }
+
     /// A worker that registers the obligation, fronts the target, and then
-    /// stays blocked until the route is cancelled.
+    /// stays blocked until the route is cancelled; its bracket, the
+    /// obligation's owner, then ends the front as `owner` says.
     fn fronted_worker(
         shared: SharedScreen,
         releases: Arc<AtomicUsize>,
         release: Option<ReleaseJob>,
+        owner: Owner,
     ) -> impl FnOnce(
         Arc<TerminalArbiter>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
@@ -3843,6 +3653,7 @@ mod restore_slot_tests {
             assert!(cell.begin_front_attempt(0));
             cell.front_confirmed();
             cell.front_attempt_returned();
+            own_until_stopped(cell, owner);
             Box::pin(std::future::pending())
         }
     }
@@ -3855,6 +3666,7 @@ mod restore_slot_tests {
             Arc::clone(&shared),
             Arc::clone(&releases),
             None,
+            Owner::Restores,
         ))
         .await;
         assert_eq!(reply["outcome"], "dispatch_outcome_unknown");
@@ -3872,6 +3684,7 @@ mod restore_slot_tests {
             Arc::clone(&shared),
             Arc::clone(&releases),
             None,
+            Owner::Restores,
         ))
         .await;
         assert_eq!(reply["outcome"], "restore_failed");
@@ -3895,6 +3708,7 @@ mod restore_slot_tests {
             Arc::clone(&shared),
             Arc::clone(&releases),
             Some(release),
+            Owner::Restores,
         ))
         .await;
         assert_eq!(shared.lock().unwrap().log, ["release", "restore"]);
@@ -3908,17 +3722,25 @@ mod restore_slot_tests {
         let unknown: fn(SharedScreen) -> ReleaseJob = |_| Box::pin(async { HeldState::Unknown });
         let stalled: fn(SharedScreen) -> ReleaseJob = |_| Box::pin(std::future::pending());
         // A release that settles unconfirmed gives up the restore and the
-        // lock. One that never settles keeps the lock: the restore it holds
-        // back still runs if the release is ever confirmed.
-        for (release, lock_releases) in [(unknown, 1), (stalled, 0)] {
+        // lock. One that never settles keeps the lock: the owner, still
+        // settling it, restores only if the release is ever confirmed.
+        for (release, owner, lock_releases) in [
+            (unknown, Owner::ReleaseUnconfirmed, 1),
+            (stalled, Owner::StuckInRelease, 0),
+        ] {
             let shared = screen(true);
             let releases = Arc::new(AtomicUsize::new(0));
             let reply = cancelled_route(fronted_worker(
                 Arc::clone(&shared),
                 Arc::clone(&releases),
                 Some(release(Arc::clone(&shared))),
+                owner,
             ))
             .await;
+            let give_up = std::time::Instant::now() + Duration::from_millis(200);
+            while releases.load(SeqCst) < lock_releases && std::time::Instant::now() < give_up {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             assert!(
                 shared.lock().unwrap().requests.is_empty(),
                 "no restore is requested while a key may be held"
@@ -3976,8 +3798,12 @@ mod restore_slot_tests {
                 .register_restore(obligation(&hop_screen, &lock_releases))
                 .unwrap();
             assert!(cell.begin_front_attempt(0));
-            // The worker's front request runs in its own blocking hop.
-            std::thread::spawn(move || return_front_after_take(&cell, &hop_screen));
+            // The worker's front request runs in its own blocking hop, and
+            // its owner decides once it returned.
+            std::thread::spawn(move || {
+                return_front_after_take(&cell, &hop_screen);
+                cell.decide();
+            });
             std::future::pending::<()>()
         })
         .await;
@@ -3990,7 +3816,7 @@ mod restore_slot_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_restore_unfinished_at_the_budget_is_reported_failed_and_runs_on_detached() {
+    async fn a_restore_unfinished_at_the_budget_is_reported_failed_and_its_owner_finishes_it() {
         /// A host whose restore request blocks its thread until the test lets
         /// it go, or for a few real seconds at most.
         struct StuckHost {
@@ -4048,6 +3874,7 @@ mod restore_slot_tests {
                 assert!(cell.begin_front_attempt(0));
                 cell.front_confirmed();
                 cell.front_attempt_returned();
+                own_until_stopped(Arc::clone(&cell), Owner::Restores);
                 let _ = ready.send(());
                 std::future::pending::<()>().await;
             })
@@ -4071,7 +3898,7 @@ mod restore_slot_tests {
         let reply: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(reply["outcome"], "restore_failed");
         assert_eq!(reply["fronting"]["restore"], "failed");
-        // The decision keeps running detached: once let go, it completes
+        // The owner keeps deciding after the reply: once let go, it completes
         // its restore request and releases the fronting lock.
         let_go.send(()).unwrap();
         while releases.load(SeqCst) == 0 {
@@ -4085,69 +3912,32 @@ mod restore_slot_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_write_refused_at_its_deadline_is_disclosed_as_handed_off_when_the_terminal_stops_waiting(
-    ) {
-        /// A host whose first pause, after the refused write, blocks its
-        /// thread until the test lets it go, or for a few real seconds.
-        struct PausedAfterRefusal {
-            inner: FakeHost,
-            refused: std::sync::mpsc::Sender<()>,
-            release: Option<std::sync::mpsc::Receiver<()>>,
-        }
-        impl RestoreHost for PausedAfterRefusal {
-            fn now_ms(&mut self) -> u64 {
-                self.inner.now_ms()
-            }
-            fn pause_ms(&mut self, milliseconds: u64) {
-                if let Some(release) = self.release.take() {
-                    let _ = self.refused.send(());
-                    let _ = release.recv_timeout(Duration::from_secs(5));
-                }
-                self.inner.pause_ms(milliseconds);
-            }
-            fn frontmost_pid(&mut self) -> Option<u32> {
-                self.inner.frontmost_pid()
-            }
-            fn request_front(&mut self, pid: u32) -> bool {
-                self.inner.request_front(pid)
-            }
-            fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
-                self.inner.hardware_input_snapshot()
-            }
-        }
-
+    async fn a_write_refused_at_its_deadline_is_disclosed_as_handed_off_once_the_watch_holds_it() {
         let shared = screen(true);
         let releases = Arc::new(AtomicUsize::new(0));
-        let (refused, write_refused) = std::sync::mpsc::channel();
-        let (let_go, release) = std::sync::mpsc::channel();
         let mut planes = crate::tests::management_bound_planes(1, 1);
-        let input = Mutex::new(Some((
-            Arc::clone(&shared),
-            Arc::clone(&releases),
-            refused,
-            release,
-        )));
+        let input = Mutex::new(Some((Arc::clone(&shared), Arc::clone(&releases))));
         let (ready, worker_started) = tokio::sync::oneshot::channel::<()>();
         let ready = Mutex::new(Some(ready));
         planes.route_test_handler = Some(Arc::new(move || {
-            let (shared, releases, refused, release) = input.lock().unwrap().take().unwrap();
+            let (shared, releases) = input.lock().unwrap().take().unwrap();
             let ready = ready.lock().unwrap().take().unwrap();
             Box::pin(async move {
                 let terminal = TerminalArbiter::current().unwrap();
                 terminal.set_step(CallStep::Dispatch);
                 assert!(terminal.gate.begin_mutation());
+                let gate = Arc::new(crate::computer::dispatch::CutoffGate::new());
                 let mut obligation = obligation(&shared, &releases);
-                obligation.host = Box::new(PausedAfterRefusal {
-                    inner: FakeHost(shared),
-                    refused,
-                    release: Some(release),
-                });
+                obligation.gate = Some(Arc::clone(&gate));
                 let cell = terminal.register_restore(obligation).unwrap();
                 assert!(cell.begin_front_attempt(0));
                 cell.front_confirmed();
                 cell.front_attempt_returned();
-                // Already past: the first restore write is refused.
-                cell.set_restore_deadline(std::time::Instant::now() - Duration::from_millis(1));
+                // The bound has passed since: the first restore write is
+                // refused.
+                let past = std::time::Instant::now() - Duration::from_millis(1);
+                gate.set_bound(past, past);
+                own_until_stopped(Arc::clone(&cell), Owner::Restores);
                 let _ = ready.send(());
                 std::future::pending::<()>().await;
             })
@@ -4156,31 +3946,16 @@ mod restore_slot_tests {
         handle_frame(request(), &tx, &planes).await.unwrap();
         worker_started.await.unwrap();
         handle_frame(cancel(), &tx, &planes).await.unwrap();
-        let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
-        while write_refused.try_recv().is_err() {
-            assert!(
-                std::time::Instant::now() < give_up,
-                "the write was never refused"
-            );
-            tokio::task::yield_now().await;
-        }
-        // The owner is still confirming its refused request when the
-        // terminal's budget runs out.
-        tokio::time::advance(Duration::from_millis(budgets::RELEASE_BUDGET_MS)).await;
         let reply = rx.recv().await.unwrap();
         let reply: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(reply["outcome"], "restore_failed");
         let remedy = reply["remedy"].as_str().unwrap();
         assert!(
             remedy.contains("restore was handed off"),
-            "a known miss is disclosed as a handoff, not as cleanup in progress: {remedy}"
+            "a known miss the watch holds is disclosed as a handoff: {remedy}"
         );
         assert!(!remedy.contains("still running"), "{remedy}");
-        assert!(
-            shared.lock().unwrap().requests.is_empty(),
-            "the refused write made no request"
-        );
-        let_go.send(()).unwrap();
+        let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
         while releases.load(SeqCst) == 0 {
             assert!(
                 std::time::Instant::now() < give_up,
@@ -4189,7 +3964,6 @@ mod restore_slot_tests {
             tokio::task::yield_now().await;
         }
     }
-
     #[tokio::test(start_paused = true)]
     async fn a_worker_decision_reaches_its_own_reply_with_one_restore_request() {
         let mut planes = crate::tests::management_bound_planes(1, 1);

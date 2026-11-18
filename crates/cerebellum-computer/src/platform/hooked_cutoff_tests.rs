@@ -1,9 +1,10 @@
-//! The hard cutoff against a restore history that understates the real
-//! restore: a file at the smallest believable restore cost lets a shortcut
-//! skip calibration and be admitted, while the person's application is in
-//! fact slow to come back. The cutoff, armed on the absolute bound, must
-//! still stop the shortcut's key press and request the restore by the bound,
-//! in real time, whatever the file said.
+//! The cutoff against a restore history that understates the real restore:
+//! a file at the smallest believable restore cost lets a shortcut skip
+//! calibration and be admitted, while the person's application is in fact
+//! slow to come back and the target's listing read stalls past the bound.
+//! The bound, stamped before the front, must still refuse the shortcut's key
+//! press, in real time, whatever the file said, and the bracket's one owner
+//! must restore as soon as the stalled read returns.
 
 use super::*;
 use crate::dispatch::{
@@ -222,14 +223,13 @@ impl FrontingBracketHost for ShortcutHost {
     }
 }
 
-/// Hooks whose one restore decision the cutoff's timer and the bracket
-/// share, as a call's `RestoreCell` does in the module.
+/// Hooks with the one restore decision, made by the bracket's own thread,
+/// as a call's `RestoreCell` makes it in the module.
 #[derive(Default)]
 struct Decision {
     host: Option<Box<dyn FrontingRestoreHost>>,
     previous: Option<u32>,
     decided: bool,
-    cutoff: Option<Arc<CutoffGate>>,
 }
 
 #[derive(Clone, Default)]
@@ -283,20 +283,8 @@ impl FrontedDispatchHooks for Hooks {
     fn decide_restore(&mut self) -> HookedRestore {
         self.decide()
     }
-    fn cutoff_restore(
-        &mut self,
-        _host: Box<dyn FrontingRestoreHost>,
-    ) -> Option<Box<dyn FnOnce(crate::dispatch::CutoffWake) + Send>> {
-        let hooks = self.clone();
-        Some(Box::new(move |_| {
-            hooks.decide();
-        }))
-    }
-    fn cutoff_armed(&mut self, gate: Arc<CutoffGate>) {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cutoff = Some(gate);
+    fn restore_reserve_ms(&self) -> Option<u64> {
+        Some(40)
     }
     fn finished(&mut self, _outcome: &crate::dispatch::BracketOutcome) {}
 }
@@ -369,7 +357,8 @@ fn a_picture_capture_leaves_shared_idle_history_unlocked() {
 }
 
 #[test]
-fn a_shortcut_admitted_on_a_floor_history_is_cut_off_at_the_bound_however_slow_the_restore() {
+fn a_shortcut_admitted_on_a_floor_history_posts_nothing_after_a_stall_past_the_bound_and_restores_next(
+) {
     let history = FloorHistory::new();
     let predictor = RestorePredictor::open_for_test(&history.0);
     let shared: Shared = Arc::new(Mutex::new(Desk {
@@ -408,14 +397,17 @@ fn a_shortcut_admitted_on_a_floor_history_is_cut_off_at_the_bound_however_slow_t
         desk.posted
     );
     assert_eq!(outcome.report.units_posted, 0);
-    // The restore was requested by the bound, not after the slow read.
+    // The one owner was inside the listing read, a native call nothing here
+    // can cut short, when the bound passed. Once it returned, the restore
+    // was the only thing it did next.
     let requested = desk
         .restore_requested_at
         .first()
         .map(|at| at.saturating_duration_since(started))
         .expect("the previous application was asked back");
     assert!(
-        requested < Duration::from_millis(BOUND_MS + SLACK_MS),
+        requested >= Duration::from_millis(LISTING_MS)
+            && requested < Duration::from_millis(LISTING_MS + SLACK_MS),
         "restore requested {requested:?} after the bracket began"
     );
     assert_eq!(desk.restore_requested_at.len(), 1, "one restore request");

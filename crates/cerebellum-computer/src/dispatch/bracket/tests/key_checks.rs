@@ -37,10 +37,10 @@ struct Keyboard {
     switch_after_posts: Option<usize>,
     during_listing: Cell<DuringListing>,
     gate: CutoffGate,
-    /// Whether the cutoff timer, firing while a post call was in progress,
-    /// would have started the restore, one entry per post.
-    restore_during_post: RefCell<Vec<bool>>,
-    fire_during_post: bool,
+    /// Whether input counted as held while each post call was in progress,
+    /// one entry per post: a restore must wait while it does.
+    held_during_post: RefCell<Vec<bool>>,
+    record_hold_during_post: bool,
     /// The transport's own preparation for each post (an authentication
     /// object, say) takes this long on the fake clock.
     preparation_ms: u64,
@@ -68,8 +68,8 @@ impl Keyboard {
             switch_after_posts: None,
             during_listing: Cell::new(DuringListing::Nothing),
             gate: CutoffGate::new(),
-            restore_during_post: RefCell::new(Vec::new()),
-            fire_during_post: false,
+            held_during_post: RefCell::new(Vec::new()),
+            record_hold_during_post: false,
             preparation_ms: 0,
             slow_generation_read: None,
             focus_moves_during_generation_read: None,
@@ -104,7 +104,11 @@ impl PerProcessEventTransport for Transport<'_> {
             DuringListing::FocusMoves => keyboard.frontmost.set(Some(THIRD)),
             DuringListing::DeadlinePasses => keyboard.now.set(keyboard.now.get() + 1_000),
             DuringListing::CutoffFires => {
-                keyboard.gate.fire();
+                // The restore reserve starts while the listing is read.
+                keyboard.gate.set_bound(
+                    std::time::Instant::now() - std::time::Duration::from_millis(1),
+                    std::time::Instant::now() + std::time::Duration::from_secs(3600),
+                );
             }
         }
         WindowServerVisibility::Visible
@@ -115,11 +119,11 @@ impl PerProcessEventTransport for Transport<'_> {
         event: &'static str,
     ) -> Result<PostCallMade, PostCallFailure> {
         let keyboard = self.0;
-        if keyboard.fire_during_post {
+        if keyboard.record_hold_during_post {
             keyboard
-                .restore_during_post
+                .held_during_post
                 .borrow_mut()
-                .push(keyboard.gate.fire());
+                .push(keyboard.gate.input_held());
         }
         keyboard.posted.borrow_mut().push(event);
         keyboard.now.set(keyboard.now.get() + POST_MS);
@@ -274,12 +278,12 @@ fn the_deadline_passing_during_the_listing_read_refuses_the_post() {
 }
 
 #[test]
-fn the_cutoff_firing_during_the_listing_read_refuses_the_post() {
+fn the_cutoff_passing_during_the_listing_read_refuses_the_post() {
     let keyboard = post_one_key_while(DuringListing::CutoffFires, &|| false);
     assert!(keyboard.posted.borrow().is_empty());
     assert!(
-        keyboard.gate.restore_started_by_cutoff(),
-        "nothing was in flight, so the timer started the restore"
+        !keyboard.gate.input_held(),
+        "nothing was committed, so nothing holds up the restore"
     );
 }
 
@@ -333,7 +337,7 @@ fn a_stop_during_the_listing_read_refuses_the_post() {
 #[test]
 fn a_self_contained_post_holds_the_cutoff_while_it_is_in_flight() {
     let mut keyboard = Keyboard::new();
-    keyboard.fire_during_post = true;
+    keyboard.record_hold_during_post = true;
     post_with(
         &keyboard,
         vec![SyntheticStep {
@@ -347,12 +351,12 @@ fn a_self_contained_post_holds_the_cutoff_while_it_is_in_flight() {
     )
     .unwrap();
     assert_eq!(
-        *keyboard.restore_during_post.borrow(),
-        [false],
-        "the timer must not restore while the post is in flight"
+        *keyboard.held_during_post.borrow(),
+        [true],
+        "input counts as held while the post is in flight"
     );
     assert!(
-        keyboard.gate.fire(),
+        !keyboard.gate.input_held(),
         "once the post returned nothing is held, so the restore may start"
     );
 }
@@ -482,9 +486,9 @@ fn a_stop_during_the_focus_read_refuses_the_post() {
 }
 
 #[test]
-fn the_absolute_deadline_refuses_the_post_even_when_the_timer_has_not_run() {
+fn the_absolute_deadline_refuses_the_post_even_without_a_cutoff_bound() {
     let keyboard = Keyboard::new();
     keyboard.now.set(600);
-    assert!(!keyboard.gate.fired(), "a late timer has not fired yet");
+    assert!(!keyboard.gate.closed(), "the gate itself has no bound yet");
     refused_before_any_post(&keyboard);
 }

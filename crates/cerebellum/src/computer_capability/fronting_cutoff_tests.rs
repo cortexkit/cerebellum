@@ -1,14 +1,14 @@
-//! The hard cutoff of an app-use front, run through the real hooks and
-//! restore cell: the timer starts the restore at the bound while the
-//! bracket's own thread is still blocked, the restore runs once whichever
-//! owner the cell's gate gives the decision to, and a unit that may hold a
-//! key is never restored under.
+//! The bound of an app-use front, run through the real hooks and restore
+//! cell. The bracket's own thread is the one owner of the front: nothing
+//! restores while it is still busy, it restores exactly once when it comes
+//! back, a unit that may hold a key is never restored under, and a front
+//! write stalled past the deadline leaves the restore to the late watch.
 
 use super::*;
 use cerebellum_computer::dispatch::BracketPlan;
 use std::time::Instant;
 
-/// The bracket's bound, in real milliseconds for the timer.
+/// The bracket's bound, in real milliseconds.
 const BOUND_MS: u64 = crate::budgets::FRONTING_BRACKET_MS;
 
 fn app_use_hooks() -> (CellHooks, Arc<std::sync::atomic::AtomicUsize>) {
@@ -46,25 +46,26 @@ fn restores(screen: &Screen) -> usize {
         .count()
 }
 
+/// Block, as a capture stuck in the window server would, until the restore
+/// reserve of `hooks`' front has started.
+fn block_past_reserve_start(hooks: &CellHooks) {
+    let until = hooks
+        .picture_wait_until()
+        .expect("an app-use front has a bound");
+    std::thread::sleep(until.saturating_duration_since(Instant::now()) + Duration::from_millis(2));
+}
+
 #[test]
-fn a_blocked_picture_read_has_its_restore_started_by_the_cutoff_exactly_once() {
+fn a_picture_read_blocked_past_the_reserve_start_is_restored_by_its_owner_exactly_once() {
     let screen = Screen::new(&mail_desk());
     let (hooks, releases) = app_use_hooks();
     let mut boxed = boxed_hooks(&hooks);
     let reader = screen.clone();
-    let mut restored_while_reading = false;
-    let started = Instant::now();
+    let blocked = hooks.clone();
+    let mut restored_while_reading = None;
     let mut read = || {
-        // The capture blocks until something else puts the previous
-        // application back, as a capture stuck in the window server would.
-        let give_up = Instant::now() + crate::test_support::HANG_GUARD;
-        while Instant::now() < give_up {
-            if restores(&reader) > 0 {
-                restored_while_reading = true;
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        block_past_reserve_start(&blocked);
+        restored_while_reading = Some(restores(&reader) > 0);
     };
     let outcome = cerebellum_computer::platform::run_hooked_fronted(
         &mut FakeBracket(screen.clone()),
@@ -74,14 +75,11 @@ fn a_blocked_picture_read_has_its_restore_started_by_the_cutoff_exactly_once() {
         boxed.as_mut(),
         Some(&mut read),
     );
-    assert!(
+    assert_eq!(
         restored_while_reading,
-        "no restore while the read was blocked: {:?}",
+        Some(false),
+        "nothing restores while the owner is still in its read: {:?}",
         screen.log()
-    );
-    assert!(
-        started.elapsed()
-            >= Duration::from_millis(BOUND_MS - crate::budgets::RESTORE_PREPARATION_RESERVE_MAX_MS)
     );
     assert!(outcome.report.restore_started_by_cutoff);
     assert_eq!(outcome.report.restore, RestoreStatus::Restored);
@@ -91,7 +89,7 @@ fn a_blocked_picture_read_has_its_restore_started_by_the_cutoff_exactly_once() {
     assert_eq!(
         end.cell.and_then(|cell| cell.decided()).map(|d| d.restore),
         Some(RestoreStatus::Restored),
-        "the worker and the timer shared the cell's one decision"
+        "the cell holds the owner's one decision"
     );
     assert_eq!(lock_releases(&releases), 1, "the lock was released once");
 }
@@ -100,7 +98,7 @@ fn a_blocked_picture_read_has_its_restore_started_by_the_cutoff_exactly_once() {
 fn a_unit_that_may_hold_a_key_past_the_bound_is_never_restored_under() {
     let screen = Screen::new(&mail_desk());
     // The fake chord does not check the cutoff at each of its posts, so the
-    // bracket holds the cutoff for the whole unit.
+    // bracket counts the whole unit as holding a key.
     screen.state().post_blocks_ms = 3 * BOUND_MS;
     let (hooks, releases) = app_use_hooks();
     let mut boxed = boxed_hooks(&hooks);
@@ -123,13 +121,15 @@ fn a_unit_that_may_hold_a_key_past_the_bound_is_never_restored_under() {
         ],
         "the restore waited for the unit"
     );
-    assert!(!outcome.report.restore_started_by_cutoff);
+    // Held through the deadline: the restore follows the release without
+    // one, rather than being refused.
+    assert!(outcome.report.restore_started_by_cutoff);
     assert_eq!(outcome.report.restore, RestoreStatus::Restored);
     assert_eq!(lock_releases(&releases), 1);
 }
 
 #[test]
-fn a_bracket_inside_its_bound_restores_itself_and_leaves_no_timer_running() {
+fn a_bracket_inside_its_bound_restores_itself_and_nothing_restores_after_it() {
     let screen = Screen::new(&mail_desk());
     let (hooks, _releases) = app_use_hooks();
     let mut boxed = boxed_hooks(&hooks);
@@ -158,26 +158,16 @@ fn first_restore_after(screen: &Screen, started: Instant) -> Duration {
         .expect("a restore was requested")
 }
 
-/// A picture read that blocks until the previous application is back.
-fn blocked_read(screen: &Screen) -> impl FnMut() + '_ {
-    move || {
-        let give_up = Instant::now() + crate::test_support::HANG_GUARD;
-        while Instant::now() < give_up && restores(screen) == 0 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-}
-
 #[test]
 fn a_slow_registration_does_not_move_the_cutoff_past_the_bound() {
     let screen = Screen::new(&mail_desk());
-    // Registration takes most of the bound before the timer is armed. The
-    // cutoff counts from the stamp made before it, not from the arming.
+    // Registration takes most of the bound. The reserve counts from the
+    // stamp made before it, not from when registration returned.
     screen.state().register_blocks_ms = BOUND_MS * 2 / 5;
     let (hooks, _releases) = app_use_hooks();
     let mut boxed = boxed_hooks(&hooks);
-    let reader = screen.clone();
-    let mut read = blocked_read(&reader);
+    let blocked = hooks.clone();
+    let mut read = || block_past_reserve_start(&blocked);
     let started = Instant::now();
     let outcome = cerebellum_computer::platform::run_hooked_fronted(
         &mut FakeBracket(screen.clone()),
@@ -221,15 +211,14 @@ fn a_registration_that_outlasts_the_bound_fronts_nothing() {
 }
 
 #[test]
-fn the_cutoff_requests_the_restore_at_once_while_the_activation_is_still_in_flight() {
+fn a_front_write_stalled_past_the_deadline_hands_the_restore_to_the_late_watch() {
     let screen = Screen::new(&mail_desk());
-    // The activation request blocks well past the bound.
-    let front_blocks_ms = 2 * BOUND_MS;
-    screen.state().front_blocks_ms = front_blocks_ms;
-    screen.state().restore_focus_delay_ms = 10;
+    // The activation request, a native call this fake does not cap, blocks
+    // well past the bound.
+    screen.state().front_blocks_ms = 2 * BOUND_MS;
     let (hooks, releases) = app_use_hooks();
     let mut boxed = boxed_hooks(&hooks);
-    let started = Instant::now();
+    let expired = crate::terminal_arbiter::restore_preparation::expired_writes();
     let outcome = cerebellum_computer::platform::run_hooked_fronted(
         &mut FakeBracket(screen.clone()),
         &mut UserIdleEstimator::new(),
@@ -241,23 +230,18 @@ fn the_cutoff_requests_the_restore_at_once_while_the_activation_is_still_in_flig
     let log = screen.log();
     assert_eq!(
         log,
-        [
-            format!("front:{TARGET}"),
-            format!("restore:{PREVIOUS}"),
-            "front-returned".to_owned(),
-        ],
-        "the restore is requested at the cutoff, not after the activation returns"
+        [format!("front:{TARGET}"), "front-returned".to_owned()],
+        "the owner, back past the deadline, writes no restore of its own"
     );
-    // The hard bound applies to the write, after the slow focus reads.
-    let restored_after = first_restore_after(&screen, started);
-    assert!(
-        restored_after <= Duration::from_millis(BOUND_MS),
-        "restore requested {restored_after:?} after the bracket began"
-    );
+    assert!(matches!(
+        outcome.report.restore,
+        RestoreStatus::Failed { .. }
+    ));
+    assert!(crate::terminal_arbiter::restore_preparation::expired_writes() > expired);
     assert!(outcome.report.restore_started_by_cutoff);
     assert_eq!(outcome.report.units_posted, 0);
-    // The activation landed after the restore request: the late watch is
-    // owed it, and keeps the fronting lock until it has run.
+    // The late watch is owed the restore, and keeps the fronting lock until
+    // it has run.
     let cell = hooks.cell().expect("registered");
     assert!(cell.late_watch_pending(), "{log:?}");
     assert_eq!(lock_releases(&releases), 0);
@@ -286,17 +270,14 @@ fn an_already_frontmost_picture_runs_with_a_fence_and_a_bounded_hold() {
             let _hold = cell
                 .hold_lock_for_read(Duration::from_millis(2 * BOUND_MS))
                 .unwrap();
-            let give_up = Instant::now() + crate::test_support::HANG_GUARD;
-            while !hooks.cutoff_fired() && Instant::now() < give_up {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert!(hooks.cutoff_fired(), "the no-switch cutoff ran");
+            block_past_reserve_start(&hooks);
             assert!(!hooks.picture_may_acquire(), "native acquisition is fenced");
             assert_eq!(
                 lock_releases(&releases),
                 0,
                 "held while capture is still within its lifetime"
             );
+            let give_up = Instant::now() + crate::test_support::HANG_GUARD;
             while lock_releases(&releases) == 0 && Instant::now() < give_up {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -308,6 +289,7 @@ fn an_already_frontmost_picture_runs_with_a_fence_and_a_bounded_hold() {
         }),
     );
     assert!(read_ran);
+    assert!(hooks.cutoff_fired(), "the read ended past its cutoff");
     assert_eq!(outcome.report.restore, RestoreStatus::NotNeeded);
     assert!(!outcome.report.restore_started_by_cutoff);
     assert!(
@@ -319,24 +301,19 @@ fn an_already_frontmost_picture_runs_with_a_fence_and_a_bounded_hold() {
 }
 
 #[test]
-fn a_picture_read_past_admission_when_the_cutoff_fires_keeps_the_lock_and_acquires_nothing() {
+fn a_picture_read_past_admission_when_the_cutoff_passes_keeps_the_lock_and_acquires_nothing() {
     let screen = Screen::new(&mail_desk());
     let (hooks, releases) = app_use_hooks();
     let mut boxed = boxed_hooks(&hooks);
     let reader = hooks.clone();
     let mut released_during_read = None;
-    let mut acquired = false;
+    let mut acquired = true;
     // As a fronted picture read does: hold the lock, pass admission, block
     // in the visibility inspection, then ask the fence right before the
     // pixels would be requested.
     let mut read = || {
         let _hold = reader.hold_lock_for_read().expect("bounded hold");
-        let give_up = Instant::now() + crate::test_support::HANG_GUARD;
-        while Instant::now() < give_up
-            && !reader.cell().is_some_and(|cell| cell.decided().is_some())
-        {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        block_past_reserve_start(&reader);
         released_during_read = Some(lock_releases(&releases));
         acquired = reader.picture_may_acquire();
     };
@@ -353,13 +330,13 @@ fn a_picture_read_past_admission_when_the_cutoff_fires_keeps_the_lock_and_acquir
     assert_eq!(
         released_during_read,
         Some(0),
-        "the cutoff's restore must not release the fronting lock under a read in flight"
+        "the fronting lock is not released under a read in flight"
     );
-    assert!(!acquired, "no pixels are acquired once the cutoff fired");
+    assert!(!acquired, "no pixels are acquired once the reserve started");
     assert_eq!(
         lock_releases(&releases),
         1,
-        "released once the read returned"
+        "released once the read returned and the restore was decided"
     );
 }
 
@@ -389,7 +366,7 @@ fn a_picture_read_inside_the_bound_may_acquire() {
 }
 
 #[test]
-fn a_restore_the_cutoff_ran_is_sampled_at_its_own_cost_not_the_readers_wait() {
+fn a_restore_after_a_long_read_is_sampled_at_its_own_cost_not_the_readers_wait() {
     let screen = Screen::new(&mail_desk());
     {
         // The first request to put the previous application back is ignored,
@@ -400,15 +377,8 @@ fn a_restore_the_cutoff_ran_is_sampled_at_its_own_cost_not_the_readers_wait() {
     }
     let (hooks, _releases) = app_use_hooks();
     let mut boxed = boxed_hooks(&hooks);
-    let reader = screen.clone();
-    let mut read = || {
-        // Blocks until the previous application is back, so the bracket's
-        // thread reads the cutoff's decision only once the restore is done.
-        let give_up = Instant::now() + crate::test_support::HANG_GUARD;
-        while Instant::now() < give_up && reader.frontmost() != Some(PREVIOUS) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    };
+    let blocked = hooks.clone();
+    let mut read = || block_past_reserve_start(&blocked);
     let outcome = cerebellum_computer::platform::run_hooked_fronted(
         &mut FakeBracket(screen.clone()),
         &mut UserIdleEstimator::new(),
@@ -427,15 +397,21 @@ fn a_restore_the_cutoff_ran_is_sampled_at_its_own_cost_not_the_readers_wait() {
 }
 
 #[test]
-fn a_picture_may_not_acquire_past_the_deadline_even_before_the_timer_runs() {
+fn a_picture_may_not_acquire_once_the_reserve_starts_whatever_the_owner_is_doing() {
+    let screen = Screen::new(&mail_desk());
     let (hooks, _releases) = app_use_hooks();
     let mut boxed = boxed_hooks(&hooks);
     let gate = Arc::new(cerebellum_computer::dispatch::CutoffGate::new());
-    gate.set_deadline(Instant::now() + Duration::from_secs(3600));
-    boxed.cutoff_armed(Arc::clone(&gate));
+    let far = Instant::now() + Duration::from_secs(3600);
+    gate.set_bound(far, far);
+    assert!(boxed.register(
+        PREVIOUS,
+        TARGET,
+        Box::new(FakeRestore(screen.clone())),
+        &gate
+    ));
     assert!(hooks.picture_may_acquire(), "inside the bound");
-    // A late-scheduled timer has not fired, but the deadline is behind.
-    gate.set_deadline(Instant::now() - Duration::from_millis(1));
-    assert!(!gate.fired());
+    // The owner is busy elsewhere; the clock alone closes the fence.
+    gate.set_bound(Instant::now() - Duration::from_millis(1), far);
     assert!(!hooks.picture_may_acquire());
 }

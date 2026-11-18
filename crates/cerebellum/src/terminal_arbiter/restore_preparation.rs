@@ -1,6 +1,8 @@
-//! Time from the planned cutoff wake to the first native restore write.
-//! Starting at the planned wake includes timer wake-up, gate and cell
-//! ownership, and caller-side setup, not just the OS checks.
+//! Time from the start of the owner's restore preparation to the first
+//! native restore write: the reads and setup the restore makes once it
+//! stops waiting, which the restore reserve must cover so that a restore
+//! begun at the start of the reserve still makes its request by the
+//! deadline. Samples come only from the bracket owner's own restores.
 //!
 //! Kept in memory like the restore samples: the largest of the last few
 //! measurements, never below `RESTORE_PREPARATION_RESERVE_MS` and never
@@ -11,7 +13,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use cerebellum_computer::dispatch::CutoffWake;
 use cerebellum_computer::platform::RestoreWriteCheck;
 
 /// How many recent preparations count.
@@ -34,32 +35,15 @@ pub(crate) fn expired_internal() -> u64 {
     EXPIRED_INTERNAL.load(Ordering::Relaxed)
 }
 
-/// The last check before a native restore write: the side writing must
-/// still own the decision, and the first write must be inside its deadline.
+/// The last check before a native restore write: the first write must be
+/// inside its deadline.
 pub(super) struct NativeWriteCheck<'a> {
-    pub(super) owner: &'a super::DecisionOwner<'a>,
     pub(super) deadline: Option<&'a mut WriteDeadline>,
-    /// Told at once when the deadline refuses the write.
-    pub(super) cell: Option<&'a super::RestoreCell>,
 }
 
 impl RestoreWriteCheck for NativeWriteCheck<'_> {
     fn permit(&mut self) -> bool {
-        // Ownership first: a write refused because the timer took over is
-        // not this owner's expiry, and is not counted as one.
-        if !self.owner.commit() {
-            return false;
-        }
-        let Some(guard) = self.deadline.as_mut() else {
-            return true;
-        };
-        let permitted = guard.permit();
-        if !permitted && guard.expired {
-            if let Some(cell) = self.cell {
-                cell.publish_expired_write();
-            }
-        }
-        permitted
+        self.deadline.as_mut().is_none_or(|guard| guard.permit())
     }
 
     fn identity_read(&mut self, started: Instant, finished: Instant) {
@@ -74,44 +58,98 @@ impl RestoreWriteCheck for NativeWriteCheck<'_> {
 /// still governed by the ordinary restore confirmation and safety checks.
 pub(super) struct WriteDeadline {
     deadline: Instant,
+    /// When the restore reserve starts: the decision waits no longer.
+    reserve_start: Option<Instant>,
+    /// When the owner began this decision's restore preparation.
     started: Instant,
-    wake: Option<CutoffWake>,
     boundary_at: Option<Instant>,
+    /// The first boundary was the native write itself, not a miss found
+    /// before it.
+    reached_write: bool,
     os_reads: Duration,
+    /// A native call, the owner's own before the decision or a read inside
+    /// it, was still running when the deadline passed.
     deadline_during_os_read: bool,
+    /// When the owner's last native call before this decision returned, if
+    /// that call was still running at the deadline.
+    native_overrun_until: Option<Instant>,
     pub(super) expired: bool,
 }
 
 impl WriteDeadline {
-    pub(super) fn new(deadline: Instant, started: Instant, wake: Option<CutoffWake>) -> Self {
+    pub(super) fn new(
+        deadline: Instant,
+        reserve_start: Option<Instant>,
+        started: Instant,
+        native_overrun_until: Option<Instant>,
+    ) -> Self {
         Self {
             deadline,
+            reserve_start,
             started,
-            wake,
             boundary_at: None,
+            reached_write: false,
             os_reads: Duration::ZERO,
-            deadline_during_os_read: false,
+            deadline_during_os_read: native_overrun_until.is_some(),
+            native_overrun_until,
             expired: false,
         }
     }
 
+    /// How long the decision may still wait before it must prepare its
+    /// request: zero once the reserve has started.
+    pub(super) fn wait_left(&self) -> Option<Duration> {
+        self.reserve_start
+            .map(|at| at.saturating_duration_since(Instant::now()))
+    }
+
+    /// The decision stopped waiting: what follows is its preparation.
+    pub(super) fn preparation_started(&mut self) {
+        if self.boundary_at.is_none() {
+            self.started = Instant::now();
+            self.os_reads = Duration::ZERO;
+        }
+    }
+
+    /// At the first native restore write: admitted only by the deadline,
+    /// and the outcome is fixed at this first boundary.
     pub(super) fn permit(&mut self) -> bool {
         if self.boundary_at.is_some() {
             return !self.expired;
         }
         let now = Instant::now();
         self.boundary_at = Some(now);
+        self.reached_write = true;
         if now > self.deadline {
-            self.expired = true;
-            EXPIRED_WRITES.fetch_add(1, Ordering::Relaxed);
-            if self.expiry_during_os(now) {
-                EXPIRED_OS_DELAY.fetch_add(1, Ordering::Relaxed);
-            } else {
-                EXPIRED_INTERNAL.fetch_add(1, Ordering::Relaxed);
-            }
+            self.expire(now);
             return false;
         }
         true
+    }
+
+    /// Before a native call that precedes the first write: once the deadline
+    /// has passed, that write can no longer be made in time, and the miss is
+    /// counted here as it would be at the write.
+    pub(super) fn missed(&mut self) -> bool {
+        if self.boundary_at.is_some() {
+            return self.expired;
+        }
+        let now = Instant::now();
+        if now > self.deadline {
+            self.boundary_at = Some(now);
+            self.expire(now);
+        }
+        self.expired
+    }
+
+    fn expire(&mut self, at: Instant) {
+        self.expired = true;
+        EXPIRED_WRITES.fetch_add(1, Ordering::Relaxed);
+        if self.expiry_during_os(at) {
+            EXPIRED_OS_DELAY.fetch_add(1, Ordering::Relaxed);
+        } else {
+            EXPIRED_INTERNAL.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(super) fn os_read(&mut self, started: Instant, finished: Instant) {
@@ -122,28 +160,34 @@ impl WriteDeadline {
     }
 
     fn expiry_during_os(&self, at: Instant) -> bool {
-        let running_since = self.wake.map_or(self.started, |wake| wake.woke_at);
+        // Our own work is what ran since the owner's stalled call returned,
+        // or since the decision began, less its native reads.
+        let running_since = self
+            .native_overrun_until
+            .map_or(self.started, |until| until.min(self.started));
         let own_work = at
             .saturating_duration_since(running_since)
             .saturating_sub(self.os_reads);
-        // If the timer woke too late it had no opportunity to run any code.
-        // Otherwise attribute expiry to a tagged read only if our own work
-        // was inside its allowance. Preemption elsewhere is indistinguishable
-        // from internal waiting; do not count that as an OS read stall.
-        self.wake.is_some_and(|wake| wake.woke_at > self.deadline)
-            || (self.deadline_during_os_read
-                && own_work <= Duration::from_millis(crate::budgets::RESTORE_PREPARATION_SLACK_MS))
+        // Attribute the expiry to a native call only if one was still running
+        // at the deadline and our own work stayed inside its allowance.
+        // Preemption elsewhere is indistinguishable from internal waiting; do
+        // not count that as a native stall.
+        self.deadline_during_os_read
+            && own_work <= Duration::from_millis(crate::budgets::RESTORE_PREPARATION_SLACK_MS)
     }
 
     fn sample_ms(&self) -> Option<u64> {
-        let wake = self.wake?;
+        if !self.reached_write {
+            return None;
+        }
         let nanos = self
             .boundary_at?
-            .saturating_duration_since(wake.scheduled_at)
+            .saturating_duration_since(self.started)
             .as_nanos();
         Some(u64::try_from(nanos.div_ceil(1_000_000)).unwrap_or(u64::MAX))
     }
 
+    /// Keep this decision's preparation, when it reached a native write.
     pub(super) fn record_sample(&self) {
         if let Some(ms) = self.sample_ms() {
             record(ms);
@@ -176,7 +220,7 @@ pub(crate) fn samples_recorded_on_this_thread() -> usize {
     RECORDED_ON_THIS_THREAD.with(std::cell::Cell::get)
 }
 
-/// How far before the deadline the cutoff fires, in milliseconds.
+/// How far before the deadline the restore reserve starts, in milliseconds.
 pub(crate) fn reserve_ms() -> u64 {
     let slowest = PREPARATIONS
         .lock()
@@ -198,60 +242,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cutoff_reserve_includes_an_internal_handoff_before_the_native_write() {
-        use cerebellum_computer::dispatch::{CutoffGate, CutoffTimer};
-        use std::sync::{mpsc, Arc};
-
-        let (reply, result) = mpsc::channel();
-        let scheduled_at = Instant::now() + Duration::from_millis(20);
-        let deadline = scheduled_at
-            + Duration::from_millis(crate::budgets::RESTORE_PREPARATION_RESERVE_MAX_MS);
-        let timer = CutoffTimer::arm_with_wake(
-            Arc::new(CutoffGate::new()),
-            scheduled_at,
-            deadline,
-            Box::new(move |wake| {
-                // A delayed internal handoff, before the restore owns a cell.
-                std::thread::sleep(Duration::from_millis(20));
-                let restore_entered = Instant::now();
-                let mut guard = WriteDeadline::new(deadline, restore_entered, Some(wake));
-                // The fake native write has the same final admission as AX.
-                let write = guard.permit().then(Instant::now);
-                reply
-                    .send((write, guard.sample_ms(), wake, restore_entered))
-                    .unwrap();
-            }),
-        )
-        .unwrap();
-        let (write, sample, wake, restore_entered) = result
-            .recv_timeout(crate::test_support::HANG_GUARD)
-            .unwrap();
-        timer.finish();
+    fn a_sample_covers_the_preparation_but_not_the_wait_before_it() {
+        let entered = Instant::now();
+        let deadline = entered + Duration::from_secs(60);
+        let mut guard = WriteDeadline::new(deadline, Some(deadline), entered, None);
+        // The decision waits for an unconfirmed activation first; that wait
+        // is not the restore's cost.
+        std::thread::sleep(Duration::from_millis(30));
+        guard.preparation_started();
+        let prepared_from = Instant::now();
+        // Its own reads and setup are.
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(guard.permit(), "inside the deadline");
+        let sample = guard.sample_ms().expect("the write was reached");
+        let wait_and_preparation = Instant::now().duration_since(entered).as_millis() as u64;
+        assert!(sample >= 15, "the preparation counts: {sample}");
         assert!(
-            write.is_some_and(|at| at <= deadline),
-            "bounded caller delay still allows writing: {write:?}"
-        );
-        assert_eq!(wake.scheduled_at, scheduled_at);
-        let pre_decision_ms = restore_entered.duration_since(scheduled_at).as_millis() as u64;
-        assert!(pre_decision_ms >= 20);
-        assert!(
-            sample.unwrap() >= pre_decision_ms,
-            "sample must include the handoff before restore starts"
+            sample < wait_and_preparation
+                && u128::from(sample)
+                    <= Instant::now().duration_since(prepared_from).as_millis() + 1,
+            "the wait before it does not: {sample} of {wait_and_preparation}"
         );
     }
 
     #[test]
+    fn a_miss_found_before_the_write_counts_once_and_supplies_no_sample() {
+        let started = Instant::now();
+        let mut guard = WriteDeadline::new(started, Some(started), started, None);
+        std::thread::sleep(Duration::from_millis(2));
+        let before = expired_writes();
+        assert!(guard.missed(), "the deadline is behind the clock");
+        assert!(guard.missed(), "and stays missed");
+        assert!(!guard.permit(), "no write follows a miss");
+        assert!(expired_writes() > before);
+        assert_eq!(guard.sample_ms(), None, "no write was reached");
+    }
+
+    #[test]
     fn expiry_attribution_requires_os_evidence_within_the_internal_allowance() {
-        let scheduled_at = Instant::now();
-        let plus = |ms| scheduled_at + Duration::from_millis(ms);
-        let mut guard = WriteDeadline::new(
-            plus(50),
-            scheduled_at,
-            Some(CutoffWake {
-                scheduled_at,
-                woke_at: plus(1),
-            }),
-        );
+        let started = Instant::now();
+        let plus = |ms| started + Duration::from_millis(ms);
+        let mut guard = WriteDeadline::new(plus(50), Some(plus(30)), plus(1), None);
         assert!(
             !guard.expiry_during_os(plus(55)),
             "internal work alone is not an OS stall"
@@ -265,17 +296,16 @@ mod tests {
             !guard.expiry_during_os(plus(75)),
             "unaccounted time exceeded our allowance"
         );
-        let late_wake = WriteDeadline::new(
-            plus(50),
-            plus(54),
-            Some(CutoffWake {
-                scheduled_at,
-                woke_at: plus(54),
-            }),
+        // The owner's own native call, before the decision, ran past the
+        // deadline: the owner reached its restore only once it returned.
+        let stalled = WriteDeadline::new(plus(50), Some(plus(30)), plus(55), Some(plus(54)));
+        assert!(
+            stalled.expiry_during_os(plus(56)),
+            "a native call before the decision was still running at the deadline"
         );
         assert!(
-            late_wake.expiry_during_os(plus(55)),
-            "waiting thread was not scheduled in time"
+            !stalled.expiry_during_os(plus(80)),
+            "our own work after that call returned outran the allowance"
         );
     }
 

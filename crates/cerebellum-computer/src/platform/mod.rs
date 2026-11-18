@@ -1854,8 +1854,9 @@ pub struct HookedRestore {
 
 /// What the caller of an admitted fronted dispatch owns around it: the
 /// registration of the restore obligation before the first front request,
-/// the front attempt's start and return, and the one restore decision, which
-/// the caller shares with its terminal cleanup so it runs exactly once.
+/// the front attempt's start and return, and the one restore decision. The
+/// bracket's thread makes that decision; the caller's terminal cleanup can
+/// only stop a front not yet requested, or wait for the decision.
 pub trait FrontedDispatchHooks: Send {
     /// Opt in only for a needs-front bracket admitted under app-use authority.
     /// Takeover brackets keep their existing, process-only reserve.
@@ -1865,9 +1866,9 @@ pub trait FrontedDispatchHooks: Send {
     /// Register the restore obligation for a front of `target` over
     /// `previous`, read with the fronting lock held. `host` is on the
     /// bracket's clock. `gate` is the bracket's: it holds the front attempt
-    /// and says who owns the restore decision, so the obligation must decide
-    /// through it. `false` when the call's terminal reply is already chosen:
-    /// nothing may be fronted.
+    /// and the front's bound, which the obligation's restore must keep.
+    /// `false` when the call's terminal reply is already chosen: nothing may
+    /// be fronted.
     fn register(
         &mut self,
         previous: u32,
@@ -1876,9 +1877,9 @@ pub trait FrontedDispatchHooks: Send {
         gate: &std::sync::Arc<crate::dispatch::CutoffGate>,
     ) -> bool;
     /// The front request is about to be made at `front_instant_ms` on the
-    /// bracket's clock. `false` when cleanup already took the obligation.
+    /// bracket's clock. `false` when cleanup already stopped the front.
     fn begin_front_attempt(&mut self, front_instant_ms: u64) -> bool;
-    /// Whether cleanup has not yet taken the obligation at the target write.
+    /// Whether cleanup has not stopped the front, asked at the target write.
     fn target_front_permitted(&self) -> bool {
         true
     }
@@ -1886,32 +1887,17 @@ pub trait FrontedDispatchHooks: Send {
     fn front_attempt_returned(&mut self);
     /// The action observed its target frontmost, not merely a request return.
     fn front_confirmed(&mut self) {}
-    /// Run, or await, the one restore decision.
+    /// Run the one restore decision, on the bracket's thread: the bracket
+    /// owns the front, and nothing else performs its restore while the call
+    /// runs.
     fn decide_restore(&mut self) -> HookedRestore;
-    /// The restore a cutoff timer makes once the gate hands it the decision
-    /// at the start of the restore reserve: the same decision as
-    /// [`Self::decide_restore`], run on the timer's thread through `host`, a
-    /// restore host of the timer's own. An ordinary owner may still be inside
-    /// a blocking read on the obligation's host, and the timer must not wait
-    /// for it. `None`, the default, arms no timer.
-    fn cutoff_restore(
-        &mut self,
-        _host: Box<dyn FrontingRestoreHost>,
-    ) -> Option<Box<dyn FnOnce(crate::dispatch::CutoffWake) + Send>> {
+    /// How many milliseconds before the bracket's deadline the restore
+    /// reserve starts, when this front's first restore request has an
+    /// absolute deadline: the time the restore lately took to prepare, so
+    /// that the request itself is made by the deadline. `None`, the default,
+    /// gives the front no absolute restore deadline.
+    fn restore_reserve_ms(&self) -> Option<u64> {
         None
-    }
-    /// The cutoff timer for this front was armed on `gate`. A caller that
-    /// reads pixels while the target is in front asks the gate immediately
-    /// before acquiring them, since the timer may fire while its read is
-    /// already under way. The default keeps nothing.
-    fn cutoff_armed(&mut self, _gate: std::sync::Arc<crate::dispatch::CutoffGate>) {}
-    /// The absolute deadline for issuing the first native restore request.
-    fn restore_deadline(&mut self, _deadline: std::time::Instant) {}
-    /// How many milliseconds before the bracket's deadline the cutoff fires:
-    /// the time its restore takes to prepare, so that the restore request
-    /// itself is made by the deadline. The default is none.
-    fn cutoff_lead_ms(&self) -> u64 {
-        0
     }
     /// The bracket ended with `outcome`, whose restore is already the hooked
     /// decision. A `deferred_restore` in it is still owed: the caller settles
@@ -1925,17 +1911,16 @@ enum Registration {
     NotYet,
     /// The terminal was already chosen; nothing was fronted.
     Refused,
-    /// Registered; `prevented` when cleanup took it before the front.
+    /// Registered; `prevented` when cleanup stopped it before the front.
     Registered {
         prevented: bool,
     },
 }
 
 /// The bracket's host with the restore routed through the hooks: the real
-/// host fronts the target, and only the hooks' decision ever asks for the
-/// previous application back. The bracket's [`crate::dispatch::CutoffGate`]
-/// decides which of the worker, terminal cleanup or cutoff timer owns that
-/// one decision.
+/// host fronts the target, and only the hooks' decision, made on this
+/// thread, ever asks for the previous application back. The bracket's
+/// [`crate::dispatch::CutoffGate`] holds the front's bound.
 struct HookedHost<'a, H> {
     inner: &'a mut H,
     hooks: &'a mut dyn FrontedDispatchHooks,
@@ -1946,10 +1931,9 @@ struct HookedHost<'a, H> {
     registration: Registration,
     dispatching: bool,
     decided: Option<HookedRestore>,
-    /// The bracket's bound, after which the cutoff timer fires.
+    /// The bracket's bound.
     bound_ms: u64,
     cutoff: std::sync::Arc<crate::dispatch::CutoffGate>,
-    timer: Option<crate::dispatch::CutoffTimer>,
     picture: bool,
 }
 
@@ -1986,19 +1970,20 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
     }
     fn request_front(&mut self, pid: u32) -> bool {
         if pid == self.target {
-            // The cutoff's deadline is stamped first, as the bracket stamps
-            // the start of the bounded interval just before this request:
-            // registration and arming can take time, and none of it may move
-            // the cutoff later than the bound.
+            // The bound is stamped first, as the bracket stamps the start of
+            // the bounded interval just before this request: registration
+            // can take time, and none of it may move the deadline later.
             let stamped = std::time::Instant::now();
             let deadline = stamped + std::time::Duration::from_millis(self.bound_ms);
-            // The cutoff fires early by the time its restore takes to prepare,
-            // so the restore request itself is made by the deadline.
-            let cutoff_at = deadline
-                .checked_sub(std::time::Duration::from_millis(
-                    self.hooks.cutoff_lead_ms(),
-                ))
-                .map_or(stamped, |at| at.max(stamped));
+            // The restore reserve starts early by the time the restore takes
+            // to prepare, so the restore request itself is made by the
+            // deadline. A front with no absolute restore deadline has no
+            // reserve to keep.
+            let reserve_start = self.hooks.restore_reserve_ms().map(|reserve| {
+                deadline
+                    .checked_sub(std::time::Duration::from_millis(reserve))
+                    .map_or(stamped, |at| at.max(stamped))
+            });
             if self.registration != Registration::NotYet {
                 // One temporary front per call: a later chunk is not
                 // fronted again under the same obligation.
@@ -2007,6 +1992,9 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             let Some(Some(previous)) = self.previous else {
                 return false;
             };
+            if let Some(reserve_start) = reserve_start {
+                self.cutoff.set_bound(reserve_start, deadline);
+            }
             if !self.hooks.register(
                 previous,
                 self.target,
@@ -2016,31 +2004,9 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
                 self.registration = Registration::Refused;
                 return false;
             }
-            // Armed before the request, which can block: from here the
-            // bound is enforced on another thread, whatever the bracket's
-            // own thread is doing. Without a timer nothing would enforce it,
-            // so nothing is fronted; the obligation then reads as prevented.
-            if let Some(restore) = self.hooks.cutoff_restore(self.inner.restore_host()) {
-                self.hooks.restore_deadline(deadline);
-                match crate::dispatch::CutoffTimer::arm_with_wake(
-                    std::sync::Arc::clone(&self.cutoff),
-                    cutoff_at,
-                    deadline,
-                    restore,
-                ) {
-                    Some(timer) => {
-                        self.timer = Some(timer);
-                        self.hooks.cutoff_armed(std::sync::Arc::clone(&self.cutoff));
-                    }
-                    None => {
-                        self.registration = Registration::Registered { prevented: true };
-                        return false;
-                    }
-                }
-            }
-            // A registration that outlasted the bound leaves no time to
-            // front in; the timer, firing at once, is already deciding.
-            if std::time::Instant::now() >= cutoff_at {
+            // A registration that outlasted the reserve leaves no time to
+            // front in: nothing new starts from its start.
+            if self.cutoff.closed() {
                 self.registration = Registration::Registered { prevented: true };
                 return false;
             }
@@ -2051,10 +2017,14 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             }
             self.registration = Registration::Registered { prevented: false };
             self.dispatching = true;
+            let started = std::time::Instant::now();
+            let cutoff = std::sync::Arc::clone(&self.cutoff);
+            let hooks = &*self.hooks;
+            // The write itself starts only before the reserve does.
             let requested = self.inner.request_front_while(pid, &mut || {
-                self.hooks.target_front_permitted()
-                    && (self.timer.is_none() || std::time::Instant::now() < cutoff_at)
+                hooks.target_front_permitted() && !cutoff.closed()
             });
+            self.cutoff.native_call(started, std::time::Instant::now());
             // A platform can complete activation before its request returns.
             // Preserve that observation even if input aborts the next poll.
             if requested && self.inner.frontmost_pid() == Some(pid) {
@@ -2079,6 +2049,13 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             return true;
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(self.bound_ms);
+        // Without an absolute deadline nothing would bound the read's hold.
+        let bounded = self.hooks.restore_reserve_ms().is_some();
+        if bounded {
+            // Nothing is restored, so the reserve is empty: the read may run
+            // to the deadline itself.
+            self.cutoff.set_bound(deadline, deadline);
+        }
         if !self
             .hooks
             .register(pid, pid, self.inner.restore_host(), &self.cutoff)
@@ -2086,28 +2063,12 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             self.registration = Registration::Refused;
             return false;
         }
-        self.registration = Registration::Registered { prevented: false };
-        // No activation is recorded: the timer can end the lock obligation,
-        // but neither the timer nor terminal cleanup may change the focus.
-        let timer = self
-            .hooks
-            .cutoff_restore(self.inner.restore_host())
-            .and_then(|finish| {
-                crate::dispatch::CutoffTimer::arm_with_wake(
-                    std::sync::Arc::clone(&self.cutoff),
-                    deadline,
-                    deadline,
-                    finish,
-                )
-            });
-        if let Some(timer) = timer {
-            self.timer = Some(timer);
-            self.hooks.cutoff_armed(std::sync::Arc::clone(&self.cutoff));
-            true
-        } else {
-            self.registration = Registration::Registered { prevented: true };
-            false
-        }
+        // No activation is recorded: neither the decision nor terminal
+        // cleanup may change the focus.
+        self.registration = Registration::Registered {
+            prevented: !bounded,
+        };
+        bounded
     }
     fn our_pid(&self) -> i64 {
         self.inner.our_pid()
@@ -2294,7 +2255,6 @@ pub(crate) fn run_hooked_fronted_with_predictor<
         decided: None,
         bound_ms: plan.maximum_interval_ms,
         cutoff: std::sync::Arc::new(crate::dispatch::CutoffGate::new()),
-        timer: None,
         picture: read.is_some(),
     };
     let mut outcome = match read {
@@ -2317,13 +2277,10 @@ pub(crate) fn run_hooked_fronted_with_predictor<
         ),
     };
     hooked.returned();
-    // No timer outlives the bracket: one that has not fired is stopped, and
-    // a restore it already started is waited for.
-    if let Some(timer) = hooked.timer.take() {
-        timer.finish();
-    }
+    // Nothing new starts once the bracket returned, whatever it still owes.
+    hooked.cutoff.end_front();
     outcome.report.restore_started_by_cutoff =
-        hooked.previous != Some(Some(hooked.target)) && hooked.cutoff.restore_started_by_cutoff();
+        hooked.previous != Some(Some(hooked.target)) && hooked.cutoff.ended_past_cutoff();
     match hooked.registration {
         Registration::NotYet => {}
         Registration::Refused | Registration::Registered { prevented: true } => {

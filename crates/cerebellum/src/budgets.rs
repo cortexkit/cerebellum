@@ -45,15 +45,16 @@ pub const FRONTING_READ_MS: u64 = 300;
 /// describes the takeover bracket; app-grant needs-front shortcuts use this
 /// budget instead.
 pub const FRONTING_BRACKET_MS: u64 = 200;
-/// How far before `FRONTING_BRACKET_MS` an app-use front's cutoff fires, so
-/// that the restore request itself, not merely the start of the work leading
-/// to it, is made by the deadline. The work between the cutoff firing and the
-/// native restore request is two frontmost readings (each a window-server
-/// window list), two reads of the hardware observer's timestamps, the
-/// previous application's start-time check and the accessibility write on an
-/// element resolved when the front was registered. The end-to-end sample
-/// starts at the planned timer wake, so it also covers wake-up latency,
-/// the cutoff and restore-cell locks, and setup before the OS checks.
+/// How far before `FRONTING_BRACKET_MS` an app-use front's restore reserve
+/// starts, so that the restore request itself, not merely the start of the
+/// work leading to it, is made by the deadline. The work between the start
+/// of the owner's restore preparation and the native restore request is two
+/// frontmost readings (each a window-server window list), two reads of the
+/// hardware observer's timestamps, the previous application's start-time
+/// check and the accessibility write on an element resolved when the front
+/// was registered. Each sample is the owner's own restore, from the start of
+/// that preparation to the native write, so it also covers the cell's lock
+/// and setup before the OS checks.
 /// Measured on a desk
 /// (two window-list reads and a start-time read, 40 runs): median about
 /// 1 ms, 90th percentile about 5 ms, slowest 33 ms. This floor covers the
@@ -62,12 +63,14 @@ pub const FRONTING_BRACKET_MS: u64 = 200;
 pub const RESTORE_PREPARATION_RESERVE_MS: u64 = 50;
 /// Extra room above a measured preparation for variation in caller-side work.
 pub const RESTORE_PREPARATION_SLACK_MS: u64 = 10;
-/// The most the cutoff fires early: half the bracket, to leave time to act.
-/// Two exceptions can leave the target in front past the bound. An unsettled
-/// input release defers restore until settlement. If OS focus reads stall
-/// into the deadline, the first native restore write is refused, the call
-/// reports `restore_failed`, and the watcher for late activations can retry
-/// if the target is still in front and input observation shows no intervention.
+/// The most the restore reserve starts early: half the bracket, to leave
+/// time to act. Two named exceptions can leave the target in front past the
+/// bound. A key release unsettled at the deadline holds the restore until it
+/// settles confirmed. A native call that cannot be capped (an OS focus read,
+/// an event post, a process lookup, the restore's own write) stalling past
+/// the deadline refuses the first native restore write: the call reports
+/// `restore_failed`, and the watcher for late activations can retry if the
+/// target is still in front and input observation shows no intervention.
 pub const RESTORE_PREPARATION_RESERVE_MAX_MS: u64 = 100;
 /// How long a fronted picture read may keep the fronting lock from its
 /// start. Its pixels are refused past `FRONTING_BRACKET_MS` anyway; this

@@ -818,8 +818,8 @@ struct FakeBracket(Screen);
 
 impl RestoreHostSource for FakeBracket {
     fn restore_host(&self) -> Box<dyn FrontingRestoreHost> {
-        // Registration's cost, paid once: the cutoff timer's own restore host
-        // is made right after the obligation's and adds nothing here.
+        // Registration's cost, paid once, as the obligation's restore host is
+        // made.
         let blocks = std::mem::take(&mut self.0.state().register_blocks_ms);
         if blocks > 0 {
             std::thread::sleep(Duration::from_millis(blocks));
@@ -1885,8 +1885,8 @@ async fn a_chord_that_may_hold_a_key_restores_only_after_the_release_is_confirme
         "the failed restore keeps saying which keys were sent: {reply}"
     );
     assert!(
-        rig.lock.held(),
-        "the obligation keeps the lock until terminal cleanup takes it"
+        !rig.lock.held(),
+        "the owner, finding the release unconfirmed, gives up the restore and the lock"
     );
 }
 

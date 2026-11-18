@@ -1162,8 +1162,9 @@ where
             let dispatched = dispatcher.dispatch(&mut audit, identity, request);
             own_input.end_posting(posting);
             let held = super::settle_held_input(ticket, &dispatched, make_driver.as_ref());
+            let settled_at = std::time::Instant::now();
             if let Some(hooks) = &worker_hooks {
-                super::fronting::finish_after_release(hooks, held, None);
+                super::fronting::finish_after_release(hooks, held, settled_at, None);
             }
             dispatched
         })
