@@ -172,7 +172,10 @@ async fn read_with_app_grant(
     )
     .with_permission_liveness(support::computer::live_permissions())
     .with_app_state_source(desk.source())
+    // Production admits a covered-window picture only where both the
+    // takeover review and the app-use fronting review bind; admit both.
     .with_fronting_bracket_admitted(true)
+    .with_app_use_fronting_admitted(true)
     .with_image_freshness_source(Arc::new(Freshness {
         frontmost: frontmost.clone(),
         still_covered,
@@ -409,8 +412,11 @@ async fn person_change_refuses_fronting_but_does_not_block_an_unfronted_read() {
         let shared = Shared::handle();
         let desk = background(focused_text_desk());
         desk.state().window = Some((1, Some("Before".into())));
-        let plane =
-            plane_on(&shared, &desk, true).with_image_freshness_source(Arc::new(Freshness {
+        // Production fronts a picture only where the app-use fronting
+        // review binds too.
+        let plane = plane_on(&shared, &desk, true)
+            .with_app_use_fronting_admitted(true)
+            .with_image_freshness_source(Arc::new(Freshness {
                 frontmost: shared.lock().unwrap().image_frontmost.clone(),
                 still_covered: false,
                 cover_during_capture: false,
