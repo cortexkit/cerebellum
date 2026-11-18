@@ -990,6 +990,12 @@ impl FrontedDispatchHooks for CellHooks {
         self.decide_using()
     }
 
+    fn forgo_restore(&mut self) {
+        if let Some(cell) = self.cell() {
+            self.state().decided = Some(cell.forgo());
+        }
+    }
+
     fn finished(&mut self, outcome: &BracketOutcome) {
         self.state().report = Some(outcome.report.clone());
         self.state().finished = Some((

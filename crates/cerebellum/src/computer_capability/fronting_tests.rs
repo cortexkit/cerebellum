@@ -501,6 +501,7 @@ struct ScreenState {
     /// A chord's post blocks the bracket's thread for this long in real
     /// time, logging `post-done` when it returns.
     post_blocks_ms: u64,
+    panic_during_post: bool,
     /// Whether the paired release of held keys returns.
     release_ok: bool,
     /// These elements of the desk read enabled while the target is
@@ -584,6 +585,7 @@ impl Screen {
                 post_unknown: false,
                 post_cost_ms: 0,
                 post_blocks_ms: 0,
+                panic_during_post: false,
                 release_ok: true,
                 enable_on_front: Vec::new(),
                 hold_until_stopped: None,
@@ -927,6 +929,35 @@ impl FrontingBracketHost for FakeBracket {
     ) -> HeartbeatObservation {
         seen(probe)
     }
+    fn unit_checks_cutoff(&self) -> bool {
+        self.0.state().panic_during_post
+    }
+
+    fn post_observed_unit(
+        &mut self,
+        index: usize,
+        observation: cerebellum_computer::dispatch::ObservedUnit<'_, Self::Tap>,
+    ) -> Result<UnitPosted, SequencePostFailure> {
+        let (panic, hold, posting) = {
+            let mut state = self.0.state();
+            if state.panic_during_post {
+                (true, state.post_unknown, state.posting.take())
+            } else {
+                (false, false, None)
+            }
+        };
+        if panic {
+            if hold {
+                assert!(observation.cutoff.unwrap().begin_post(true));
+            }
+            if let Some(posting) = posting {
+                posting.notify_one();
+            }
+            panic!("injected panic in the fronted action");
+        }
+        self.post_unit(index)
+    }
+
     fn post_unit(&mut self, _index: usize) -> Result<UnitPosted, SequencePostFailure> {
         let (mut unknown, hold, posting, post_cost_ms, post_blocks_ms) = {
             let mut state = self.0.state();
@@ -2080,6 +2111,9 @@ impl FrontedDispatchHooks for CleanupFirst {
     fn decide_restore(&mut self) -> cerebellum_computer::platform::HookedRestore {
         self.0.decide_restore()
     }
+    fn forgo_restore(&mut self) {
+        self.0.forgo_restore();
+    }
     fn finished(&mut self, outcome: &cerebellum_computer::dispatch::BracketOutcome) {
         self.0.finished(outcome);
     }
@@ -2265,6 +2299,43 @@ impl Routed {
             self.rx.try_recv().is_err(),
             "the route sent a frame after its one reply"
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicking_front_owner_restores_unless_input_may_be_held() {
+    for held in [false, true] {
+        let rig = rig(AppUse::Background, mail_desk()).await;
+        rig.read().await;
+        let posting = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut state = rig.screen.state();
+            state.panic_during_post = true;
+            state.post_unknown = held;
+            state.posting = Some(Arc::clone(&posting));
+        }
+        let mut call = routed(
+            &rig,
+            "computer.keys",
+            command_chord(),
+            |_, _| {},
+            Some(posting),
+        )
+        .await;
+        call.worker_finished_silently().await;
+        let reply = &call.reply;
+        let expected = if held { "failed" } else { "restored" };
+        assert_eq!(reply["fronting"]["restore"], expected, "{reply}");
+        assert!(!reply.to_string().contains("still running"), "{reply}");
+        assert_eq!(
+            rig.screen.log(),
+            if held {
+                vec!["front:4242"]
+            } else {
+                vec!["front:4242", "restore:100"]
+            }
+        );
+        assert!(!rig.lock.held());
     }
 }
 

@@ -786,7 +786,7 @@ impl RestoreCell {
     /// application. A front that may have happened is reported failed,
     /// naming the target left in front; one that never happened is
     /// `not_needed`.
-    fn forgo(&self) -> RestoreDecided {
+    pub(crate) fn forgo(&self) -> RestoreDecided {
         use crate::computer::dispatch::FrontAttemptState;
         self.gate.end_front();
         let decided = match self.gate.attempt_state() {

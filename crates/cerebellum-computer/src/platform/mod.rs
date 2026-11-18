@@ -1957,6 +1957,9 @@ pub trait FrontedDispatchHooks: Send {
     /// owns the front, and nothing else performs its restore while the call
     /// runs.
     fn decide_restore(&mut self) -> HookedRestore;
+    /// End the obligation without writing focus when an unwind leaves input
+    /// possibly held or interrupts restoration itself.
+    fn forgo_restore(&mut self);
     /// How many milliseconds before the bracket's deadline the restore
     /// reserve starts, when this front's first restore request has an
     /// absolute deadline: the time the restore lately took to prepare, so
@@ -2011,6 +2014,37 @@ impl<H: crate::dispatch::FrontingBracketHost> HookedHost<'_, H> {
         if self.dispatching {
             self.dispatching = false;
             self.hooks.front_attempt_returned();
+        }
+    }
+}
+
+impl<H> Drop for HookedHost<'_, H> {
+    fn drop(&mut self) {
+        if !std::thread::panicking()
+            || self.registration != (Registration::Registered { prevented: false })
+            || self.decided.is_some()
+        {
+            return;
+        }
+        // The bracket's own thread still owns this front during unwind.
+        // Close the gate and lift the target's cap before restore cleanup.
+        self.cutoff.end_front();
+        self.target_cap = None;
+        // A second panic during cleanup must not abort the process.
+        let recovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if self.dispatching {
+                self.hooks.front_attempt_returned();
+            }
+            if self.cutoff.input_held() {
+                self.hooks.forgo_restore();
+            } else {
+                self.hooks.decide_restore();
+            }
+        }));
+        if recovered.is_err() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.hooks.forgo_restore();
+            }));
         }
     }
 }
@@ -2995,6 +3029,9 @@ mod hooked_fronted_tests {
                 input_coverage_unavailable: false,
                 restore_ms: None,
             }
+        }
+        fn forgo_restore(&mut self) {
+            self.host = None;
         }
         fn finished(&mut self, _outcome: &crate::dispatch::BracketOutcome) {
             self.screen.lock().unwrap().hooks.push("finished");

@@ -283,6 +283,9 @@ impl FrontedDispatchHooks for Hooks {
     fn decide_restore(&mut self) -> HookedRestore {
         self.decide()
     }
+    fn forgo_restore(&mut self) {
+        self.0.lock().unwrap().host = None;
+    }
     fn restore_reserve_ms(&self) -> Option<u64> {
         Some(40)
     }
