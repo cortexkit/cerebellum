@@ -372,8 +372,8 @@ struct State {
     avatars: OnceLock<Arc<avatar::Avatars>>,
     #[cfg(target_os = "macos")]
     generation: std::sync::Mutex<Option<cerebellum_macos::ProcessGeneration>>,
-    /// The helper could not be started and will not be retried, so nothing
-    /// sent to it is drawn and no action waits for a badge.
+    /// Skip badge arrival waits after a failed visual write, but keep
+    /// sending new pictures or previews so they can start the helper.
     helper_down: std::sync::atomic::AtomicBool,
     reduce_motion: ReduceMotionCache,
     /// Preview frames waiting for the pipe: at most one per agent, the
@@ -1954,6 +1954,33 @@ impl Coordinator {
     pub(crate) fn send_scheduled_for_test(&self, event: CursorEvent) {
         self.send_unless_ended(event);
     }
+
+    /// Exercise a preview with no badge motion, using an in-memory cursor pipe.
+    #[cfg(test)]
+    pub(crate) fn show_preview_for_test(&self, identity: &Identity) -> impl Fn() -> bool + use<> {
+        self.record(identity);
+        let worker = super::preview::PreviewPlane::without_capture().worker(self);
+        let agent = identity.badge.clone();
+        worker.show(PreviewRequest {
+            agent: agent.clone(),
+            target: ProcessGrant {
+                pid: 42,
+                process_generation_evidence: "1000".into(),
+                bundle_identity: "com.apple.TextEdit".into(),
+            },
+            window: PreviewWindow::new(12, [0.0, 0.0, 100.0, 100.0]).unwrap(),
+            app: "TextEdit".into(),
+            icon_path: None,
+            label: None,
+            backing_scale: 1.0,
+        });
+        move || worker.is_shown(&agent)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_write_for_test(&self, line: &CursorLine) {
+        self.0.settle(line, Some(tokio::time::Instant::now()));
+    }
 }
 
 struct ScreenAimed {
@@ -2283,6 +2310,29 @@ impl State {
     /// Tell the action waiting for `line`, if any, when its write completed,
     /// or that it was not written.
     fn settle(&self, line: &CursorLine, written: Option<tokio::time::Instant>) {
+        #[cfg(any(target_os = "macos", test))]
+        if let CursorLine::Preview(preview) = line {
+            if let Some(listener) = self.turn_hints.get().filter(|_| written.is_some()) {
+                // Serialize with turn end. A preview that was hidden or
+                // retargeted while its write ran must not reopen the listener.
+                let drawn = self
+                    .drawn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !self.stopped.load(std::sync::atomic::Ordering::Acquire)
+                    && drawn.active.contains_key(&preview.preview_agent)
+                {
+                    let workers = self
+                        .preview_ends
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for worker in workers.iter().filter_map(std::sync::Weak::upgrade) {
+                        worker.if_current(preview, || listener.drawn(&preview.preview_agent));
+                    }
+                }
+            }
+            return;
+        }
         let key = match line {
             CursorLine::Picture(event) => (event.agent.clone(), event.serial),
             CursorLine::PreviewMotion(motion) => {
