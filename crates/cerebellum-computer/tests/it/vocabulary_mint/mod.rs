@@ -2756,3 +2756,26 @@ pub fn v35_from_v34(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// Revision 36 allows a known program path in the development-build refusal.
+pub fn v36_from_v35(previous: &Value, revision: &str) -> Value {
+    fn extend(schema: &mut Value) {
+        if let Some(properties) = schema
+            .pointer_mut("/properties/detail/properties/development_build_check/properties")
+            .and_then(Value::as_object_mut)
+        {
+            assert!(properties
+                .insert("path".into(), json!({"type":"string"}))
+                .is_none());
+        }
+        if let Some(branches) = schema.get_mut("anyOf").and_then(Value::as_array_mut) {
+            branches.iter_mut().for_each(extend);
+        }
+    }
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    for row in next["rows"].as_array_mut().unwrap() {
+        extend(&mut row["result_schema"]);
+    }
+    next
+}

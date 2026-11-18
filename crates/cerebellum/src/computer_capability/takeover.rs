@@ -773,7 +773,7 @@ where
             let grant = image_grant(&image);
             if let Some(refusal) = self
                 .operator_lookup(management, caller)
-                .pointer_refusal(&grant)
+                .pointer_refusal(&grant, "the image's app")
             {
                 return Err(refusal);
             }
@@ -836,7 +836,9 @@ where
                         // looked up.
                         application_under(source.as_ref(), &hit_management, &hit_image, *point)
                             .and_then(|owner| {
-                                if let Some(refusal) = lookup.pointer_refusal(&owner) {
+                                if let Some(refusal) =
+                                    lookup.pointer_refusal(&owner, "the app under the pointer")
+                                {
                                     Err(refusal)
                                 } else {
                                     Ok(owner)

@@ -323,12 +323,24 @@ fn development_snapshot_preserves_both_signature_errors_even_when_identity_fails
 #[tokio::test]
 async fn ckdesk_operator_refusal_reports_the_first_failed_development_check() {
     let rig = rig();
-    for (target, condition) in [
-        (DEV_RELEASE_SIGNED, "release_signed"),
-        (DEV_UNSIGNED, "signature_unreadable"),
-        (RELEASED_BY_ID, "not_a_development_build"),
-        (UNIDENTIFIED, "title_fallback"),
-        ("Alfonso Beta", "process_unresolved"),
+    for (target, condition, remedy_contains) in [
+        (DEV_RELEASE_SIGNED, "release_signed", None),
+        (
+            DEV_UNSIGNED,
+            "signature_unreadable",
+            Some("couldn't verify this app's signature"),
+        ),
+        (RELEASED_BY_ID, "not_a_development_build", None),
+        (
+            UNIDENTIFIED,
+            "title_fallback",
+            Some("its name suggests it may be the released app"),
+        ),
+        (
+            "Alfonso Beta",
+            "process_unresolved",
+            Some("couldn't identify this app's running process"),
+        ),
     ] {
         let reply = rig
             .serve_as(
@@ -338,6 +350,11 @@ async fn ckdesk_operator_refusal_reports_the_first_failed_development_check() {
             )
             .await;
         assert_refused(&reply, target);
+        if let Some(text) = remedy_contains {
+            assert!(reply["remedy"].as_str().unwrap().contains(text), "{reply}");
+        } else {
+            assert_eq!(reply["remedy"], operator_apps::refusal()["remedy"]);
+        }
         let check = &reply["detail"]["development_build_check"];
         assert_eq!(check["condition"], condition, "{target}: {reply}");
         match condition {
@@ -355,6 +372,143 @@ async fn ckdesk_operator_refusal_reports_the_first_failed_development_check() {
         }
     }
     assert!(rig.plane.result_schema_findings().is_empty());
+}
+
+#[tokio::test]
+async fn unreadable_program_location_refuses_with_path_error_and_recovery() {
+    const PATH: &str = "/Volumes/Test/AlfonsoReview.app/Contents/MacOS/alfonso-desktop";
+    let mut rig = rig();
+    rig.plane.process_executable = Arc::new(|_| {
+        Err(operator_apps::ProgramLocationUnreadable {
+            path: Some(PATH.into()),
+            error: Some(std::io::ErrorKind::PermissionDenied),
+            failed_read: None,
+        })
+    });
+    let reply = rig
+        .serve_as(&head(CKDESK), "computer.read_state", json!({"target": DEV}))
+        .await;
+    assert_refused(&reply, DEV);
+    assert_eq!(
+        reply["remedy"],
+        format!("Cerebellum couldn't read the running app's program location at {PATH} to confirm it's a development build, so it treats the app as the released one. Run the development build from a location Cerebellum can read (an internal disk), then retry. Cerebellum checked the named app ({DEV}).")
+    );
+    assert_eq!(
+        reply["detail"]["development_build_check"],
+        json!({"condition":"executable_unreadable", "path":PATH, "error":"permission denied"})
+    );
+    assert!(rig.plane.result_schema_findings().is_empty());
+}
+
+#[tokio::test]
+async fn every_action_rechecks_the_same_development_build_evidence() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut rig = rig();
+    let readable = Arc::new(AtomicBool::new(true));
+    let app_readable = Arc::clone(&readable);
+    let original = Arc::clone(&rig.plane.process_executable);
+    rig.plane.process_executable = Arc::new(move |process| {
+        if process.pid == DEV_PID && !app_readable.load(Ordering::Relaxed) {
+            return Err(operator_apps::ProgramLocationUnreadable {
+                error: Some(std::io::ErrorKind::PermissionDenied),
+                ..Default::default()
+            });
+        }
+        original(process)
+    });
+    let ckdesk = head(CKDESK);
+    let read = rig
+        .serve_as(&ckdesk, "computer.read_state", json!({"target": DEV}))
+        .await;
+    assert_eq!(read["outcome"], "completed", "{read}");
+    let element = rig.element_of(DEV);
+
+    readable.store(false, Ordering::Relaxed);
+    for (action, arguments, source) in [
+        (
+            "computer.read_state",
+            json!({"target": DEV}),
+            "the named app",
+        ),
+        (
+            "computer.press_element",
+            json!({"element_id": element}),
+            "the element's app",
+        ),
+        (
+            "computer.takeover_scroll",
+            json!({"target": DEV,"axis":"vertical","amount_lines":15}),
+            "the named app",
+        ),
+    ] {
+        let reply = rig.serve_as(&ckdesk, action, arguments).await;
+        assert_refused(&reply, action);
+        assert_eq!(
+            reply["detail"]["development_build_check"],
+            json!({"condition":"executable_unreadable", "error":"permission denied"}),
+            "{action}: {reply}"
+        );
+        assert!(
+            reply["remedy"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("Cerebellum checked {source} ({DEV}).")),
+            "{reply}"
+        );
+    }
+    assert!(rig.plane.result_schema_findings().is_empty());
+}
+
+#[tokio::test]
+async fn scroll_refusal_distinguishes_the_frontmost_app_and_the_app_under_the_pointer() {
+    let mut rig = rig();
+    let original = Arc::clone(&rig.plane.process_executable);
+    rig.plane.process_executable = Arc::new(move |process| {
+        if process.pid == DEV_PID {
+            return Err(operator_apps::ProgramLocationUnreadable {
+                failed_read: Some(
+                    "confirm the program location still belonged to the same running process",
+                ),
+                ..Default::default()
+            });
+        }
+        original(process)
+    });
+    for (hit, source) in [
+        (None, "the frontmost app"),
+        (Some((2, Some(DEV_PID))), "the app under the pointer"),
+    ] {
+        {
+            let mut desk = rig.desk.state();
+            desk.frontmost = Some(DEV_PID);
+            desk.real_cursor = Some((10.0, 10.0));
+            desk.system_wide_hit = hit;
+        }
+        let reply = rig
+            .serve_as(
+                &head(CKDESK),
+                "computer.takeover_scroll",
+                json!({"target":support::TARGET_BUNDLE_ID,"axis":"vertical","amount_lines":15}),
+            )
+            .await;
+        assert_refused(&reply, source);
+        assert_eq!(
+            reply["detail"]["development_build_check"],
+            json!({"condition":"executable_unreadable"})
+        );
+        let remedy = reply["remedy"].as_str().unwrap();
+        assert!(
+            remedy.contains(
+                "confirm the program location still belonged to the same running process"
+            ),
+            "{reply}"
+        );
+        assert!(
+            remedy.ends_with(&format!("Cerebellum checked {source} ({DEV}).")),
+            "{reply}"
+        );
+    }
 }
 
 #[tokio::test]

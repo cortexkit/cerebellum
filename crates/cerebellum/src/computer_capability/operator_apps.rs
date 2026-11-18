@@ -319,7 +319,7 @@ pub fn development_build_snapshot(management: &ManagementPlane, grant: &ProcessG
         json!({ "error": format!("{error:?}"), "detail": detail })
     }
 
-    let executable = native_executable(grant);
+    let executable = native_executable(grant).ok();
     let sighting = Sighting {
         bundle_identity: readable(&grant.bundle_identity),
         executable: executable.clone(),
@@ -472,7 +472,7 @@ pub(super) fn admits_development_build(
     drives_development_builds(caller)
         && Sighting {
             bundle_identity: readable(&grant.bundle_identity),
-            executable: executable(grant),
+            executable: executable(grant).ok(),
             titles: Vec::new(),
         }
         .verdict()
@@ -480,15 +480,77 @@ pub(super) fn admits_development_build(
         && signed_as_development_build(management, grant)
 }
 
+const OPERATOR_APP_REMEDY: &str =
+    "The agent may not use this app, because it confirms the person's own \
+    actions; nothing was read or done in it, and nobody was asked. No agent may \
+    use it, so ask the person to act in the app themselves.";
+
 /// The refusal every action answers for an operator app.
 pub(crate) fn refusal() -> Value {
     json!({
         "outcome": "authorization_denied",
         "reason": OPERATOR_APP_BLOCKED,
-        "remedy": "The agent may not use this app, because it confirms the person's own \
-                   actions; nothing was read or done in it, and nobody was asked. No agent may \
-                   use it, so ask the person to act in the app themselves.",
+        "remedy": OPERATOR_APP_REMEDY,
     })
+}
+
+fn development_remedy(
+    check: &Value,
+    running_app: bool,
+    failed_read: Option<&str>,
+) -> Option<String> {
+    let remedy = match check["condition"].as_str()? {
+        "process_unresolved" => "Cerebellum couldn't identify this app's running process to confirm it's a development build. Make sure the development build is running, then retry.",
+        "identity_unreadable" => "Cerebellum couldn't read this app's identity to confirm it's a development build, so it treats the app as the released one. Restart the development build, then retry.",
+        "executable_unreadable" if running_app => {
+            let location = check["path"].as_str().map_or_else(String::new, |path| {
+                format!(" at {}", cerebellum_computer::app_state::render::one_line(path))
+            });
+            let (read, recovery) = failed_read.map_or(
+                (
+                    "read the running app's program location",
+                    "Run the development build from a location Cerebellum can read (an internal disk), then retry.",
+                ),
+                |read| (read, "Restart the development build, then retry."),
+            );
+            return Some(format!("Cerebellum couldn't {read}{location} to confirm it's a development build, so it treats the app as the released one. {recovery}"));
+        }
+        "executable_unreadable" => "Cerebellum can't confirm this is a development build from the installed app entry, so it won't open the app. Target the running development build, or start it yourself first if it isn't running.",
+        "signature_unreadable" => "Cerebellum couldn't verify this app's signature to confirm it's a development build, so it treats the app as the released one. Run a signed development build, then retry.",
+        "title_fallback" => "Cerebellum couldn't read this app's full identity, and its name suggests it may be the released app. Make sure the intended development build is running, then retry with its app identifier.",
+        // A release identity or signature still gets the permanent refusal.
+        _ => return None,
+    };
+    Some(remedy.to_string())
+}
+
+fn refusal_with_development_check(
+    check: Value,
+    running_app: bool,
+    failed_read: Option<&str>,
+) -> Value {
+    let mut reply = refusal();
+    if let Some(remedy) = development_remedy(&check, running_app, failed_read) {
+        reply["remedy"] = json!(remedy);
+    }
+    reply["detail"] = json!({ "development_build_check": check });
+    reply
+}
+
+fn name_checked_app(reply: &mut Value, source: &str, name: &str) {
+    let check = &reply["detail"]["development_build_check"];
+    if matches!(check["condition"].as_str(), Some(condition) if !matches!(condition, "caller" | "not_a_development_build" | "release_signed"))
+    {
+        let name = cerebellum_computer::app_state::render::one_line(name);
+        let app = if name.is_empty() {
+            source.to_owned()
+        } else {
+            format!("{source} ({name})")
+        };
+        if let Some(remedy) = reply["remedy"].as_str() {
+            reply["remedy"] = json!(format!("{remedy} Cerebellum checked {app}."));
+        }
+    }
 }
 
 /// Whether `reply` is the operator-app refusal.
@@ -496,9 +558,29 @@ pub(crate) fn is_refusal(reply: &Value) -> bool {
     reply["outcome"] == "authorization_denied" && reply["reason"] == OPERATOR_APP_BLOCKED
 }
 
-/// Reads the file name of the executable a resolved process runs, or `None`
-/// when it cannot be read.
-pub type ExecutableReader = Arc<dyn Fn(&ProcessGrant) -> Option<String> + Send + Sync>;
+/// Why a running process's program name could not be established. A path
+/// is only kept if it is known to belong to the process that was checked.
+#[derive(Default)]
+pub struct ProgramLocationUnreadable {
+    pub(super) path: Option<std::path::PathBuf>,
+    pub(super) error: Option<std::io::ErrorKind>,
+    pub(super) failed_read: Option<&'static str>,
+}
+
+impl ProgramLocationUnreadable {
+    fn add_detail(&self, check: &mut Value) {
+        if let Some(path) = self.path.as_deref().and_then(std::path::Path::to_str) {
+            check["path"] = json!(path);
+        }
+        if let Some(error) = self.error {
+            check["error"] = json!(error.to_string());
+        }
+    }
+}
+
+/// Reads the file name of the executable a resolved process runs.
+pub type ExecutableReader =
+    Arc<dyn Fn(&ProcessGrant) -> Result<String, ProgramLocationUnreadable> + Send + Sync>;
 
 /// The platform's reading of a process's executable file name.
 ///
@@ -508,26 +590,48 @@ pub type ExecutableReader = Arc<dyn Fn(&ProcessGrant) -> Option<String> + Send +
 /// start-time evidence, as `list_apps` builds one from a running-app entry,
 /// skips that comparison. On Windows the identity a grant carries already is
 /// the executable's file name. Elsewhere nothing can be read.
-pub(crate) fn native_executable(grant: &ProcessGrant) -> Option<String> {
+pub(crate) fn native_executable(grant: &ProcessGrant) -> Result<String, ProgramLocationUnreadable> {
     #[cfg(target_os = "macos")]
     {
-        let path = cerebellum_macos::process_executable_path(grant.pid).ok()??;
+        let path = cerebellum_macos::process_executable_path(grant.pid)
+            .map_err(|errno| ProgramLocationUnreadable {
+                path: None,
+                error: (errno != 0).then(|| std::io::Error::from_raw_os_error(errno).kind()),
+                failed_read: None,
+            })?
+            .ok_or(ProgramLocationUnreadable {
+                path: None,
+                error: Some(std::io::ErrorKind::NotFound),
+                failed_read: Some("find the running process to read its program location"),
+            })?;
         if !grant.process_generation_evidence.is_empty()
-            && cerebellum_macos::process_start_time_micros(grant.pid)?.to_string()
-                != grant.process_generation_evidence
+            && !cerebellum_macos::process_start_time_micros(grant.pid)
+                .is_some_and(|started| started.to_string() == grant.process_generation_evidence)
         {
-            return None;
+            return Err(ProgramLocationUnreadable {
+                failed_read: Some(
+                    "confirm the program location still belonged to the same running process",
+                ),
+                ..ProgramLocationUnreadable::default()
+            });
         }
-        path.file_name()?.to_str().map(str::to_owned)
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .ok_or(ProgramLocationUnreadable {
+                path: Some(path),
+                error: None,
+                failed_read: Some("read the program name from the running app's location"),
+            })
     }
     #[cfg(target_os = "windows")]
     {
-        readable(&grant.bundle_identity)
+        readable(&grant.bundle_identity).ok_or_else(ProgramLocationUnreadable::default)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = grant;
-        None
+        Err(ProgramLocationUnreadable::default())
     }
 }
 
@@ -575,11 +679,11 @@ fn unresolved_process_facts(pid: u32) -> Value {
 
 impl Lookup {
     fn refusal(&self, check: Value) -> Value {
-        let mut reply = refusal();
         if self.drives_development_builds {
-            reply["detail"] = json!({ "development_build_check": check });
+            refusal_with_development_check(check, true, None)
+        } else {
+            refusal()
         }
-        reply
     }
 
     fn unresolved(&self, bundle_identity: &str, pid: Option<u32>, error: &str) -> Value {
@@ -626,14 +730,20 @@ impl Lookup {
     /// caller already knows it by; the application's running name and its
     /// focused window's title are added only when its identity is partly
     /// unreadable, the one case titles decide.
+    /// Read new evidence regardless of where the process grant came from:
+    /// an element or image can outlive the evidence that allowed its read.
     pub(super) fn process_refusal(
         &self,
         grant: &ProcessGrant,
         mut titles: Vec<String>,
     ) -> Option<Value> {
+        let (executable, unreadable) = match (self.executable)(grant) {
+            Ok(name) => (Some(name), None),
+            Err(error) => (None, Some(error)),
+        };
         let mut sighting = Sighting {
             bundle_identity: readable(&grant.bundle_identity),
-            executable: (self.executable)(grant),
+            executable,
             titles: Vec::new(),
         };
         if sighting.bundle_identity.is_none() || sighting.executable.is_none() {
@@ -645,7 +755,20 @@ impl Lookup {
         }
         match sighting.verdict() {
             Verdict::Ordinary => None,
-            Verdict::Blocked => Some(self.refusal(sighting.failed_development_check())),
+            Verdict::Blocked => {
+                let mut check = sighting.failed_development_check();
+                if self.drives_development_builds && check["condition"] == "executable_unreadable" {
+                    if let Some(unreadable) = unreadable {
+                        unreadable.add_detail(&mut check);
+                        return Some(refusal_with_development_check(
+                            check,
+                            true,
+                            unreadable.failed_read,
+                        ));
+                    }
+                }
+                Some(self.refusal(check))
+            }
             Verdict::DevelopmentBuild => {
                 if !self.drives_development_builds {
                     return Some(self.refusal(failed_check("caller")));
@@ -661,8 +784,12 @@ impl Lookup {
         self.process_refusal(grant, titles).is_some()
     }
 
-    pub(super) fn pointer_refusal(&self, grant: &ProcessGrant) -> Option<Value> {
+    pub(super) fn pointer_refusal(&self, grant: &ProcessGrant, source: &str) -> Option<Value> {
         let mut reply = self.process_refusal(grant, Vec::new())?;
+        if reply["remedy"] != OPERATOR_APP_REMEDY {
+            name_checked_app(&mut reply, source, &grant.bundle_identity);
+            return Some(reply);
+        }
         let name = self
             .source
             .running_apps()
@@ -697,7 +824,7 @@ impl Lookup {
             return None;
         };
         let grant = self.management.process_for_pid(pid)?;
-        self.pointer_refusal(&grant)
+        self.pointer_refusal(&grant, "the app under the pointer")
     }
 
     /// The refusal for a target given by name or app identity, if it is an operator app.
@@ -780,18 +907,19 @@ impl Lookup {
     fn frontmost_refusal(&self) -> Option<Value> {
         let pid = self.source.frontmost_pid()?;
         if let Some(grant) = self.management.process_for_pid(pid) {
-            return self.process_refusal(&grant, Vec::new());
+            let mut reply = self.process_refusal(&grant, Vec::new())?;
+            name_checked_app(&mut reply, "the frontmost app", &grant.bundle_identity);
+            return Some(reply);
         }
         // The process could not be identified by its start time; what the
         // running-application list says about that pid is all there is.
-        self.source
-            .running_apps()
-            .is_ok_and(|apps| {
-                apps.iter().filter(|app| app.pid == pid).any(|app| {
-                    identity_blocked(&app.bundle_identity) || title_names_operator_app(&app.name)
-                })
-            })
-            .then(|| self.unresolved("", Some(pid), "process_for_pid returned None"))
+        let app = self.source.running_apps().ok()?.into_iter().find(|app| {
+            app.pid == pid
+                && (identity_blocked(&app.bundle_identity) || title_names_operator_app(&app.name))
+        })?;
+        let mut reply = self.unresolved("", Some(pid), "process_for_pid returned None");
+        name_checked_app(&mut reply, "the frontmost app", &app.bundle_identity);
+        Some(reply)
     }
 }
 
@@ -934,19 +1062,24 @@ where
         if frontmost {
             frontmost = super::takeover::parse_request(capability.capability(), arguments).is_ok();
         }
+        let process_source = if matches!(capability.0, Served::PressElement | Served::WriteText) {
+            "the element's app"
+        } else {
+            "the image's app"
+        };
         let lookup = self.operator_lookup(context.management, &context.consent.caller);
         let (claimed, reply) = tokio::task::spawn_blocking(move || {
             if let Some(refused) = named.iter().find_map(|target| {
-                lookup
-                    .named_refusal(target)
-                    .map(|reply| (target.clone(), reply))
+                let mut reply = lookup.named_refusal(target)?;
+                name_checked_app(&mut reply, "the named app", target);
+                Some((target.clone(), reply))
             }) {
                 return Some(refused);
             }
             if let Some(refused) = processes.iter().find_map(|(id, grant)| {
-                lookup
-                    .process_refusal(grant, Vec::new())
-                    .map(|reply| (id.clone(), reply))
+                let mut reply = lookup.process_refusal(grant, Vec::new())?;
+                name_checked_app(&mut reply, process_source, &grant.bundle_identity);
+                Some((id.clone(), reply))
             }) {
                 return Some(refused);
             }
@@ -995,7 +1128,7 @@ impl Lookup {
         };
         let verdict = Sighting {
             bundle_identity: readable(&app.bundle_identity),
-            executable: (self.executable)(&entry),
+            executable: (self.executable)(&entry).ok(),
             titles: vec![app.name.clone()],
         }
         .verdict();
@@ -1029,18 +1162,19 @@ pub(super) fn installed_app_blocked(app: &InstalledApp) -> bool {
 }
 
 pub(super) fn installed_app_refusal(app: &InstalledApp, caller: &GrantCaller) -> Value {
-    let mut reply = refusal();
     if drives_development_builds(caller) {
         let sighting = Sighting {
             bundle_identity: readable(&app.bundle_identity),
             executable: None,
             titles: vec![app.name.clone()],
         };
-        reply["detail"] = json!({
-            "development_build_check": sighting.failed_development_check(),
-        });
+        let mut reply =
+            refusal_with_development_check(sighting.failed_development_check(), false, None);
+        name_checked_app(&mut reply, "the installed app", &app.bundle_identity);
+        reply
+    } else {
+        refusal()
     }
-    reply
 }
 
 #[cfg(test)]

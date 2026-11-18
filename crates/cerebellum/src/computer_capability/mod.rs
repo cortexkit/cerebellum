@@ -128,7 +128,7 @@ mod operator_apps;
 mod web_replace;
 #[doc(hidden)]
 pub use operator_apps::development_build_snapshot;
-pub use operator_apps::ExecutableReader;
+pub use operator_apps::{ExecutableReader, ProgramLocationUnreadable};
 #[cfg(test)]
 mod permission_tests;
 mod permissions;
@@ -872,7 +872,9 @@ where
             + Sync
             + 'static,
     ) -> Self {
-        self.process_executable = Arc::new(reader);
+        self.process_executable = Arc::new(move |grant| {
+            reader(grant).ok_or_else(operator_apps::ProgramLocationUnreadable::default)
+        });
         self
     }
 

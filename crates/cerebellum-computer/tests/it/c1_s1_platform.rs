@@ -15,11 +15,13 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v35.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v36.json");
 const V33_ARTIFACT_SHA256: &str =
     "bec5b6cad004606960c684bafea3c7b219fc780cec9630158c29ff935833c849";
 const V34_ARTIFACT_SHA256: &str =
     "7c36bfd082d83e1dd24db1fcf9110eb58c1ad2059aeea7b9b4068f7c9c0ab4bd";
+const V35_ARTIFACT_SHA256: &str =
+    "53779c253a1ceae727b8a19b1fe3bded97b88523ba33bfdb7630fb778877cfeb";
 /// The digests of retained historical artifacts: operator-app refusal, image
 /// handles and terminal-keystroke result envelopes, respectively.
 const V30_ARTIFACT_SHA256: &str =
@@ -145,6 +147,8 @@ fn every_repository_vocabulary_mirror_names_the_current_revision() {
                 V33_ARTIFACT_SHA256
             } else if path.ends_with("v34.json") {
                 V34_ARTIFACT_SHA256
+            } else if path.ends_with("v35.json") {
+                V35_ARTIFACT_SHA256
             } else {
                 panic!("{path} is a vocabulary artifact with no pinned digest")
             };
@@ -824,7 +828,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v33_from_v32(&generated, historical_revision(33).as_str().unwrap());
     let generated =
         vocabulary_mint::v34_from_v33(&generated, historical_revision(34).as_str().unwrap());
-    let generated = vocabulary_mint::v35_from_v34(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v35_from_v34(&generated, historical_revision(35).as_str().unwrap());
+    let generated = vocabulary_mint::v36_from_v35(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -2076,22 +2082,10 @@ fn v33_only_adds_the_optional_development_diagnostic_to_results() {
 #[ignore = "artifact-writing generator; run explicitly with --ignored --exact"]
 fn mint_current_vocabulary_artifact() {
     let resources = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
-    let previous_path = resources.join(format!(
-        "{}.json",
-        historical_revision(34).as_str().unwrap()
-    ));
-    let previous: Value = serde_json::from_slice(&std::fs::read(previous_path).unwrap()).unwrap();
-    assert_eq!(
-        hex_digest(&canonical_json_bytes(&previous).unwrap()),
-        "7c36bfd082d83e1dd24db1fcf9110eb58c1ad2059aeea7b9b4068f7c9c0ab4bd"
-    );
-    let generated = vocabulary_mint::v35_from_v34(&previous, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let revision = COMPUTER_ACTION_VOCABULARY_REVISION;
+    let generated = vocabulary_mint::v36_from_v35(&historical_v35(), revision);
     let bytes = canonical_json_bytes(&generated).unwrap();
-    std::fs::write(
-        resources.join(format!("{COMPUTER_ACTION_VOCABULARY_REVISION}.json")),
-        &bytes,
-    )
-    .unwrap();
+    std::fs::write(resources.join(format!("{revision}.json")), &bytes).unwrap();
     println!(
         "minted {} bytes; sha256 {}",
         bytes.len(),
@@ -2244,7 +2238,7 @@ fn recreated_v34() -> Value {
             _ => {}
         }
     }
-    let mut current: Value = serde_json::from_str(VOCABULARY).unwrap();
+    let mut current = historical_v35();
     current["revision"] = historical_revision(34);
     remove_reason(&mut current);
     let previous: Value = serde_json::from_slice(
@@ -2311,11 +2305,19 @@ fn recreated_v34() -> Value {
 
 #[test]
 fn v35_only_adds_running_list_failure_and_semantic_select_all_results() {
-    let current: Value = serde_json::from_str(VOCABULARY).unwrap();
     assert_eq!(
-        current,
-        vocabulary_mint::v35_from_v34(&recreated_v34(), COMPUTER_ACTION_VOCABULARY_REVISION)
+        historical_v35(),
+        vocabulary_mint::v35_from_v34(&recreated_v34(), historical_revision(35).as_str().unwrap())
     );
+}
+
+fn historical_v35() -> Value {
+    let resources = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
+    let revision = historical_revision(35);
+    let bytes = std::fs::read(resources.join(format!("{}.json", revision.as_str().unwrap())))
+        .expect("read the historical v35 artifact");
+    assert_eq!(hex_digest(&bytes), V35_ARTIFACT_SHA256);
+    serde_json::from_slice(&bytes).expect("v35 is valid JSON")
 }
 
 #[test]
