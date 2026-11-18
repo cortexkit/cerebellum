@@ -6,7 +6,9 @@
 //! task waits on a timer (never while blocking work runs), so a claim about
 //! when an action reached the application is exact.
 
-use super::cursor::{Coordinator, SessionScope, TurnOutcome, ACTING_AGENT, ACTING_SESSION};
+use super::cursor::{
+    BadgeSession, Coordinator, SessionScope, TurnOutcome, ACTING_AGENT, ACTING_SESSION,
+};
 use super::preview::{CaptureJob, NoFrameReason, PreviewCapturer, PreviewJpeg, PreviewPlane};
 use super::*;
 use cerebellum_computer::app_state::source::{ElementFacts, RawElement};
@@ -750,15 +752,16 @@ async fn with_the_agent_cursor_off_there_is_no_preview_badge_or_wait() {
 async fn the_preview_hides_on_turn_end_on_an_end_signal_and_on_a_switch_to_foreground() {
     let mut rig = rig(AppUse::Background, true, true).await;
     let me = agent();
-    let session = SessionScope {
-        scope_ref: "scope-1".into(),
-        epoch: 1,
+    let session = BadgeSession {
+        scope: Some(SessionScope {
+            scope_ref: "scope-1".into(),
+            epoch: 1,
+        }),
+        route_session: "session-1".into(),
     };
 
     // The turn ends.
-    ACTING_SESSION
-        .scope(Some(session.clone()), rig.read())
-        .await;
+    ACTING_SESSION.scope(session, rig.read()).await;
     rig.until_captured(1).await;
     assert!(rig.shown(&me));
     assert!(rig

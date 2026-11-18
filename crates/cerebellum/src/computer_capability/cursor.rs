@@ -169,9 +169,16 @@ pub(crate) fn helper_health() -> serde_json::Value {
 
 tokio::task_local! {
     pub(crate) static ACTING_AGENT: Option<String>;
-    /// The daemon-stamped scope of the head session this call belongs to,
-    /// so that session's turn ending can hide the badge the call drew.
-    pub(crate) static ACTING_SESSION: Option<SessionScope>;
+    /// Attribution from the accepted route bind, so a session's turn ending
+    /// can hide the badge the call drew.
+    pub(crate) static ACTING_SESSION: BadgeSession;
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct BadgeSession {
+    pub(crate) scope: Option<SessionScope>,
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) route_session: String,
 }
 
 /// A head session's scope as the daemon stamped it on the route.
@@ -191,7 +198,7 @@ pub(crate) struct Identity {
     /// The route call drawing the badge. Captured here because the drawing may
     /// be scheduled from a blocking thread, where task-locals are not visible.
     call: Option<Arc<TerminalArbiter>>,
-    session: Option<SessionScope>,
+    session: BadgeSession,
 }
 
 impl Identity {
@@ -206,7 +213,7 @@ impl Identity {
             badge: avatar_agent.clone().unwrap_or(fallback),
             avatar_agent,
             call: TerminalArbiter::current(),
-            session: ACTING_SESSION.try_with(Clone::clone).ok().flatten(),
+            session: ACTING_SESSION.try_with(Clone::clone).unwrap_or_default(),
         }
     }
 }
@@ -237,7 +244,7 @@ struct Drawn {
     sessions: VecDeque<(SessionScope, String)>,
     /// Current, not historical, badge ownership. An end consumes this entry so
     /// the other notification source cannot hide the same appearance twice.
-    active: HashMap<String, Option<SessionScope>>,
+    active: HashMap<String, BadgeSession>,
     #[cfg(any(target_os = "macos", test))]
     hint_sequences: HashMap<(&'static str, String, String), u64>,
     hint_sessions: HashMap<String, (&'static str, String)>,
@@ -559,9 +566,8 @@ impl Coordinator {
                 transport,
                 Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS),
                 move |notice| {
-                    if let Some(state) = weak.upgrade() {
-                        Coordinator(state).turn_hint(notice);
-                    }
+                    weak.upgrade()
+                        .map_or(0, |state| Coordinator(state).turn_hint(notice))
                 },
             )
         });
@@ -1182,12 +1188,12 @@ impl Coordinator {
     }
 
     /// Core's fallback notification ends the active badges drawn by its scope.
-    /// Live hints use the agent identity and runner sequence instead; both
-    /// paths consume the same active appearance under the drawing lock.
+    /// Thalamus hints name an agent; Broca events name the session on the
+    /// route bind. All end signals consume the appearance under the drawing lock.
     ///
-    /// Badges are matched on the daemon-stamped `scope_ref`, the only session
-    /// name a computer call carries. `session_ref` is the harness runner's own
-    /// ref. When a live start has associated an agent with a runner session,
+    /// The direct notification matches the daemon-stamped `scope_ref`.
+    /// `session_ref` is the harness runner's own ref. When a Thalamus live
+    /// start has associated an agent with a runner session,
     /// the fallback must agree with that session too.
     ///
     /// An unknown session is not an error; it simply drew nothing that is
@@ -1210,6 +1216,7 @@ impl Coordinator {
             .iter()
             .filter(|(agent, session)| {
                 session
+                    .scope
                     .as_ref()
                     .is_some_and(|session| session.scope_ref == scope_ref)
                     && drawn
@@ -1231,10 +1238,15 @@ impl Coordinator {
     }
 
     #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn turn_hint(&self, notice: crate::turn_hints::Notice) -> bool {
+    fn turn_hint(&self, notice: crate::turn_hints::Notice) -> usize {
+        use crate::turn_hints::{Kind, Notice};
         if self.0.stopped.load(std::sync::atomic::Ordering::Acquire) {
-            return false;
+            return 0;
         }
+        let notice = match notice {
+            Notice::Thalamus(notice) => notice,
+            Notice::Broca(notice) => return self.end_route_session(&notice.session),
+        };
         let mut drawn = self.drawn();
         let key = (notice.module, notice.session.clone(), notice.agent.clone());
         if drawn
@@ -1242,19 +1254,19 @@ impl Coordinator {
             .get(&key)
             .is_some_and(|seq| notice.seq <= *seq)
         {
-            return false;
+            return 0;
         }
         if drawn.hint_sequences.len() >= RECORD_CAP && !drawn.hint_sequences.contains_key(&key) {
             // Missing a cosmetic hint is safer than forgetting a known start
             // and then accepting an older end for a badge already tracked.
-            return false;
+            return 0;
         }
         drawn.hint_sequences.insert(key, notice.seq);
-        if notice.kind == crate::turn_hints::Kind::Started {
+        if notice.kind == Kind::Started {
             drawn
                 .hint_sessions
                 .insert(notice.agent, (notice.module, notice.session));
-            return false;
+            return 0;
         }
         if !drawn.active.contains_key(&notice.agent)
             || drawn
@@ -1264,13 +1276,31 @@ impl Coordinator {
                     *module != notice.module || *session != notice.session
                 })
         {
-            return false;
+            return 0;
         }
         self.end_locked(&notice.agent, &mut drawn);
         drop(drawn);
         self.finish_end(&notice.agent);
-        crate::turn_hints::HINT_GAUGES.matched();
-        true
+        1
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn end_route_session(&self, session: &str) -> usize {
+        let mut drawn = self.drawn();
+        let agents: Vec<_> = drawn
+            .active
+            .iter()
+            .filter(|(_, badge)| badge.route_session == session)
+            .map(|(agent, _)| agent.clone())
+            .collect();
+        for agent in &agents {
+            self.end_locked(agent, &mut drawn);
+        }
+        drop(drawn);
+        for agent in &agents {
+            self.finish_end(agent);
+        }
+        agents.len()
     }
 
     /// Remember who is drawing this badge, before any read starts, so an end
@@ -1292,7 +1322,7 @@ impl Coordinator {
                 .or_default()
                 .insert(agent.clone());
         }
-        if let Some(session) = &identity.session {
+        if let Some(session) = &identity.session.scope {
             // One record per (ref, agent): a revival's new epoch replaces the
             // old one rather than adding a second record for the same badge.
             drawn.sessions.retain(|(recorded, recorded_agent)| {
@@ -1938,8 +1968,17 @@ impl Identity {
             badge: badge.to_owned(),
             avatar_agent: None,
             call,
-            session,
+            session: BadgeSession {
+                scope: session,
+                ..BadgeSession::default()
+            },
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_route_session_for_test(mut self, session: &str) -> Self {
+        self.session.route_session = session.to_owned();
+        self
     }
 }
 

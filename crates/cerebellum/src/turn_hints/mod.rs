@@ -15,6 +15,7 @@ use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
 
 #[cfg(target_os = "macos")]
 pub(crate) use live::LiveTransport;
+use notice::{BrocaNotice, Delivery};
 pub(crate) use notice::{Kind, Notice};
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -22,6 +23,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 const LINGER: Duration = Duration::from_secs(30);
 const RETRY: Duration = Duration::from_secs(1);
 const OPEN_WINDOW: Duration = Duration::from_secs(4);
+const BROCA_SESSION_CAP: usize = 256;
 
 /// Process-lifetime counts for the live hint subscription, reported in health
 /// so a live check can tell whether hints arrived and whether the connection
@@ -34,6 +36,9 @@ pub(crate) struct HintGauges {
     closed: std::sync::atomic::AtomicU64,
     received: std::sync::atomic::AtomicU64,
     matched: std::sync::atomic::AtomicU64,
+    broca_received: std::sync::atomic::AtomicU64,
+    broca_missing_session: std::sync::atomic::AtomicU64,
+    broca_matched: std::sync::atomic::AtomicU64,
     open_now: std::sync::atomic::AtomicBool,
     active_badges: std::sync::atomic::AtomicU64,
 }
@@ -45,16 +50,14 @@ pub(crate) static HINT_GAUGES: HintGauges = HintGauges {
     closed: std::sync::atomic::AtomicU64::new(0),
     received: std::sync::atomic::AtomicU64::new(0),
     matched: std::sync::atomic::AtomicU64::new(0),
+    broca_received: std::sync::atomic::AtomicU64::new(0),
+    broca_missing_session: std::sync::atomic::AtomicU64::new(0),
+    broca_matched: std::sync::atomic::AtomicU64::new(0),
     open_now: std::sync::atomic::AtomicBool::new(false),
     active_badges: std::sync::atomic::AtomicU64::new(0),
 };
 
 impl HintGauges {
-    pub(crate) fn matched(&self) {
-        self.matched
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub(crate) fn insert_into(&self, metrics: &mut serde_json::Map<String, serde_json::Value>) {
         use std::sync::atomic::Ordering::{Acquire, Relaxed};
         for (name, value) in [
@@ -63,6 +66,18 @@ impl HintGauges {
             ("turnHintSubscriptionsClosed", self.closed.load(Relaxed)),
             ("turnHintNoticesReceived", self.received.load(Relaxed)),
             ("turnHintBadgesEnded", self.matched.load(Relaxed)),
+            (
+                "turnHintBrocaEventsReceived",
+                self.broca_received.load(Relaxed),
+            ),
+            (
+                "turnHintBrocaMissingSession",
+                self.broca_missing_session.load(Relaxed),
+            ),
+            (
+                "turnHintBrocaEventsMatched",
+                self.broca_matched.load(Relaxed),
+            ),
             ("turnHintActiveBadges", self.active_badges.load(Relaxed)),
         ] {
             metrics.insert(name.into(), serde_json::json!(value));
@@ -112,7 +127,7 @@ pub(crate) trait Transport: Send + Sync {
 }
 
 pub(crate) struct Connection {
-    notices: mpsc::Receiver<Notice>,
+    notices: mpsc::Receiver<Delivery>,
     refresh_at: Option<Instant>,
     // Owns the reader and every NATS client clone; dropping a subscription alone
     // would leave the connection's authentication/reconnect work alive.
@@ -135,7 +150,7 @@ impl Listener {
     pub(crate) fn new(
         transport: Arc<dyn Transport>,
         idle: Duration,
-        receive: impl Fn(Notice) + Send + Sync + 'static,
+        receive: impl Fn(Notice) -> usize + Send + Sync + 'static,
     ) -> Self {
         let (commands, receiver) = mpsc::unbounded_channel();
         tokio::spawn(run(transport, receiver, receive, &HINT_GAUGES));
@@ -166,10 +181,68 @@ impl Drop for Opening {
     }
 }
 
+#[derive(Default)]
+struct BrocaSequences(HashMap<String, (String, u64)>);
+
+impl BrocaSequences {
+    // Core NATS never replays a backlog, but an end published late can still
+    // reach an open listener. Without a timestamp or a newer sequence already
+    // seen for the same session incarnation, the listener cannot spot it.
+    fn advance(&mut self, hint: &BrocaNotice) -> bool {
+        if let Some((epoch, seq)) = self.0.get_mut(&hint.session) {
+            if *epoch == hint.epoch && hint.seq <= *seq {
+                return false;
+            }
+            epoch.clone_from(&hint.epoch);
+            *seq = hint.seq;
+        } else if self.0.len() < BROCA_SESSION_CAP {
+            self.0
+                .insert(hint.session.clone(), (hint.epoch.clone(), hint.seq));
+        } else {
+            // Keeping a known watermark is safer than evicting it and
+            // accepting an older end. Untracked badges can still idle out.
+            return false;
+        }
+        true
+    }
+}
+
+fn dispatch(
+    delivery: Delivery,
+    broca_sequences: &mut BrocaSequences,
+    receive: &impl Fn(Notice) -> usize,
+    gauges: &HintGauges,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let broca = !matches!(delivery, Delivery::Notice(Notice::Thalamus(_)));
+    if broca {
+        gauges.broca_received.fetch_add(1, Relaxed);
+    }
+    let notice = match delivery {
+        Delivery::Notice(notice) => notice,
+        Delivery::BrocaMissingSession => {
+            gauges.broca_missing_session.fetch_add(1, Relaxed);
+            return;
+        }
+        Delivery::BrocaInvalidSequence => return,
+    };
+    gauges.received.fetch_add(1, Relaxed);
+    if let Notice::Broca(hint) = &notice {
+        if !broca_sequences.advance(hint) || !hint.ended {
+            return;
+        }
+    }
+    let matched = receive(notice);
+    gauges.matched.fetch_add(matched as u64, Relaxed);
+    if broca && matched != 0 {
+        gauges.broca_matched.fetch_add(1, Relaxed);
+    }
+}
+
 async fn run(
     transport: Arc<dyn Transport>,
     mut commands: mpsc::UnboundedReceiver<Activity>,
-    receive: impl Fn(Notice),
+    receive: impl Fn(Notice) -> usize,
     gauges: &HintGauges,
 ) {
     let mut active = HashMap::<String, Instant>::new();
@@ -178,6 +251,7 @@ async fn run(
     let mut linger = None;
     let mut retry = None;
     let mut was_open = false;
+    let mut broca_sequences = BrocaSequences::default();
     loop {
         let now = Instant::now();
         let was_active = !active.is_empty();
@@ -262,11 +336,8 @@ async fn run(
                     None => std::future::pending().await,
                 }
             } => {
-                if let Some(notice) = notice {
-                    gauges
-                        .received
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    receive(notice);
+                if let Some(delivery) = notice {
+                    dispatch(delivery, &mut broca_sequences, &receive, gauges);
                 } else {
                     connection = None;
                     retry = Some(Instant::now() + RETRY);

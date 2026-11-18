@@ -94,7 +94,7 @@ async fn unanswered_ckbus_credential_times_out_and_retries() {
         let gauges = gauges.clone();
         let transport = Arc::new(LiveTransport::new(path, "cerebellum-turn-hint-test".into()));
         let (commands, receiver) = mpsc::unbounded_channel();
-        let task = tokio::spawn(async move { run(transport, receiver, |_| {}, &gauges).await });
+        let task = tokio::spawn(async move { run(transport, receiver, |_| 0, &gauges).await });
         (commands, task)
     };
     let start = Instant::now();

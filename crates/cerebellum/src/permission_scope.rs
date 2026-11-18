@@ -48,18 +48,16 @@ pub(crate) fn cursor_agent(
         .filter(|id| !id.is_empty())
 }
 
-/// The head session a call's cursor badge belongs to, as the scope the daemon
-/// stamped on the head's route. A worker's calls belong to the head it works
-/// for, through the parent link the daemon also stamped, so the head's turn
-/// ending covers its workers' badges too. Nothing here is read from a request
-/// body.
+/// The accepted route session and the head scope a call's badge belongs to.
+/// A worker's scope follows the parent link the daemon stamped, so the head's
+/// direct turn end covers its workers' badges too. The route session is what
+/// a Broca event names. Neither is read from the request body.
 pub(crate) fn cursor_session(
     facts: &AcceptedBindFacts,
-) -> Option<crate::computer_capability::cursor::SessionScope> {
+) -> crate::computer_capability::cursor::BadgeSession {
     let facts = facts.head_context();
-    use crate::computer_capability::cursor::SessionScope;
-    let stamp = facts.scope.as_ref()?;
-    match stamp.kind {
+    use crate::computer_capability::cursor::{BadgeSession, SessionScope};
+    let scope = facts.scope.as_ref().and_then(|stamp| match stamp.kind {
         ScopeKind::Head if stamp.owner_authorized => Some(SessionScope {
             scope_ref: stamp.scope_ref.clone(),
             epoch: stamp.scope_epoch,
@@ -69,6 +67,11 @@ pub(crate) fn cursor_session(
             epoch: parent.scope_epoch,
         }),
         _ => None,
+    });
+    BadgeSession {
+        scope,
+        #[cfg(any(target_os = "macos", test))]
+        route_session: facts.identity.conversation_key.clone(),
     }
 }
 
