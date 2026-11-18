@@ -177,6 +177,13 @@ fn an_over_budget_calibration_finishes_cleanup_and_remembers_a_timeout_as_the_fu
     assert_eq!(slow.stop, Some(BracketStop::BoundExceeded));
     assert!(!slow.restore_calibrated);
     assert_eq!(slow.restore, RestoreStatus::Restored);
+    // The restore is requested inside the bound. The previous application
+    // then takes 250 ms to come back, which no cutoff can shorten, so the
+    // overrun is reported rather than counted as a calibration.
+    assert_eq!(desk.front_requests, [TARGET, PREVIOUS]);
+    let fronted_at = desk.front_request_times[0];
+    assert!(desk.front_request_times[1] - fronted_at <= BOUND);
+    assert!(slow.longest_fronted_interval_ms > BOUND);
     assert_eq!(slow.longest_fronted_interval_ms, 256);
     assert_eq!(predictor.maximum(), Some(250));
     assert!(desk.posted.is_empty());

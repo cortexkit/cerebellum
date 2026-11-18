@@ -7,6 +7,7 @@ use crate::dispatch::seize::{HeartbeatMarker, IdleGateRefusal, OBSERVED_DISPATCH
 use crate::platform::{HeldStateDisposition, ProcessEventRefusal};
 
 mod calibration;
+mod cutoff;
 mod key_checks;
 mod listing;
 mod persisted_hints;
@@ -49,6 +50,8 @@ struct FakeDesk {
     frontmost_at_post: Vec<Option<u32>>,
     /// Every fronting request, in order.
     front_requests: Vec<u32>,
+    /// The desk-clock instant of each entry in `front_requests`.
+    front_request_times: Vec<u64>,
     /// The newest hardware input the process-wide observer saw.
     hardware_input_ms: Option<u64>,
     /// `(unit, pid, input)`: once unit `unit` is posted, the application with
@@ -114,6 +117,7 @@ impl FakeDesk {
             fronted_intervals: Vec::new(),
             frontmost_at_post: Vec::new(),
             front_requests: Vec::new(),
+            front_request_times: Vec::new(),
             hardware_input_ms: None,
             switch_after_unit: None,
             switch_after_read: None,
@@ -192,6 +196,7 @@ impl FrontingBracketHost for FakeDesk {
     }
     fn request_front(&mut self, pid: u32) -> bool {
         self.front_requests.push(pid);
+        self.front_request_times.push(self.now);
         if pid == PREVIOUS && self.refused_restores {
             return false;
         }

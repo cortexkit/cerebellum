@@ -357,6 +357,7 @@ mod tests {
                     heartbeat: HeartbeatObservation::Missed,
                     cancelled: &|| false,
                     deadline_ms: 1000,
+                    cutoff: None,
                 },
             );
             assert!(

@@ -106,6 +106,7 @@ fn post(
         deadline_ms,
         now_ms: || keyboard.now.get(),
         frontmost_pid: || keyboard.frontmost.get(),
+        cutoff: None,
     };
     post_event_sequence_fronted(
         ProcessEventTarget {

@@ -601,6 +601,14 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
         ))
     }
 
+    // Keystroke units check the cutoff before each key post and mark the
+    // keys they hold. A pointer gesture does not, so the bracket holds the
+    // cutoff for the whole gesture: a restore under a held button would
+    // hand the button's release to the previous application's window.
+    fn unit_checks_cutoff(&self) -> bool {
+        self.pointer.is_none()
+    }
+
     fn observe_heartbeat(
         &mut self,
         tap: &Self::Tap,
@@ -643,6 +651,7 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
                 frontmost_pid: || {
                     cerebellum_macos::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok())
                 },
+                cutoff: observation.cutoff,
             };
             let report = super::process_event::post_event_sequence_fronted(
                 self.target,

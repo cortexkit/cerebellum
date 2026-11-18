@@ -1,31 +1,48 @@
 //! What keeps a temporary front inside its bound once the target is in
-//! front: checks a keystroke unit makes before each of its own posts.
+//! front: checks a keystroke unit makes before each of its own posts, and a
+//! timer that starts the restore when the bound passes while the bracket's
+//! own thread is still busy in a unit.
+//!
+//! The timer is armed when the front is requested and fires at the bound,
+//! whatever any timing history predicted. Firing stops new posts at once,
+//! and starts the restore itself unless a key or button may be held: a
+//! restore under a held key would hand that key to the previous
+//! application, so then the unit's own paired releases run first and the
+//! bracket restores after them, as on any other stop. The timer and the
+//! bracket reach the restore through the same once-only decision, so the
+//! restore runs once whichever gets there first.
 
 use crate::platform::{FrontedKeyGuard, ProcessEventRefusal};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// The per-post checks for a keystroke unit posted while its target is in
-/// front: the target is still the frontmost application, and the bracket's
-/// deadline has not passed. The unit's cancellation is checked separately
-/// by the sequence, before these.
+/// front: the cutoff has not fired, the target is still the frontmost
+/// application, and the bracket's deadline has not passed. The unit's
+/// cancellation is checked separately by the sequence, before these.
 ///
 /// A post refused here was never made, so the refusal is
 /// [`ProcessEventRefusal::Cancelled`], which a reply reads as no post call
 /// for this event. Presses the unit already posted are released as on any
 /// other stop.
-pub struct FrontedKeyChecks<N, F> {
+pub struct FrontedKeyChecks<'a, N, F> {
     pub target_pid: u32,
     /// On the bracket's clock, as `now_ms` reads it.
     pub deadline_ms: u64,
     pub now_ms: N,
     pub frontmost_pid: F,
+    /// The bracket's cutoff, when a timer is armed for it.
+    pub cutoff: Option<&'a CutoffGate>,
 }
 
-impl<N, F> FrontedKeyGuard for FrontedKeyChecks<N, F>
+impl<N, F> FrontedKeyGuard for FrontedKeyChecks<'_, N, F>
 where
     N: FnMut() -> u64,
     F: FnMut() -> Option<u32>,
 {
-    fn before_post(&mut self, _press: bool) -> Result<(), ProcessEventRefusal> {
+    fn before_post(&mut self, press: bool) -> Result<(), ProcessEventRefusal> {
         // The focus read can take a moment; the deadline is read after it so
         // nothing that can block separates the deadline check from the post.
         if (self.frontmost_pid)() != Some(self.target_pid) {
@@ -34,6 +51,148 @@ where
         if (self.now_ms)() >= self.deadline_ms {
             return Err(ProcessEventRefusal::Cancelled);
         }
+        // Last, because a press marks the cutoff held from here until its
+        // release: the timer must not restore while this post is in flight.
+        if self.cutoff.is_some_and(|cutoff| !cutoff.begin_post(press)) {
+            return Err(ProcessEventRefusal::Cancelled);
+        }
         Ok(())
+    }
+
+    fn all_released(&mut self) {
+        if let Some(cutoff) = self.cutoff {
+            cutoff.all_released();
+        }
+    }
+}
+
+/// The state a bracket shares with its cutoff timer.
+#[derive(Debug, Default)]
+pub struct CutoffGate(Mutex<GateState>);
+
+#[derive(Debug, Default)]
+struct GateState {
+    /// The bound passed: no new post may start.
+    fired: bool,
+    /// The bracket began its own restore, so the timer has nothing to start.
+    disarmed: bool,
+    /// A press may be down, or a post that may press is in flight.
+    held: bool,
+    /// The timer started the restore.
+    restore_started_by_cutoff: bool,
+}
+
+impl CutoffGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn state(&self) -> MutexGuard<'_, GateState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A post is about to start. `false` once the cutoff fired: the post
+    /// must not be made. A `press` keeps the gate held until
+    /// [`Self::all_released`], so the timer will not restore meanwhile.
+    pub fn begin_post(&self, press: bool) -> bool {
+        let mut state = self.state();
+        if state.fired {
+            return false;
+        }
+        state.held |= press;
+        true
+    }
+
+    /// Nothing the unit pressed is still down.
+    pub fn all_released(&self) {
+        self.state().held = false;
+    }
+
+    /// Whether the bound passed.
+    pub fn fired(&self) -> bool {
+        self.state().fired
+    }
+
+    /// The bracket is starting its own restore; a timer firing after this
+    /// starts nothing.
+    pub fn disarm(&self) {
+        self.state().disarmed = true;
+    }
+
+    /// Whether the timer, not the bracket, started the restore.
+    pub fn restore_started_by_cutoff(&self) -> bool {
+        self.state().restore_started_by_cutoff
+    }
+
+    /// The bound passed. Returns whether the timer should start the restore
+    /// itself: not when the bracket already began one, and not while a key
+    /// may be held.
+    pub(super) fn fire(&self) -> bool {
+        let mut state = self.state();
+        if state.disarmed {
+            return false;
+        }
+        state.fired = true;
+        if state.held {
+            return false;
+        }
+        state.restore_started_by_cutoff = true;
+        true
+    }
+}
+
+/// A thread that fires a [`CutoffGate`] once `after` has passed, and then
+/// runs `restore` unless the gate says not to. It holds no lock while
+/// `restore` runs. Finishing it, or dropping it, stops a timer that has not
+/// fired and waits for one that has, so no timer outlives its bracket.
+pub struct CutoffTimer {
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl CutoffTimer {
+    /// `None` when no thread could be started; the caller must then not
+    /// front, since nothing would enforce the bound.
+    pub fn arm(
+        gate: Arc<CutoffGate>,
+        after: Duration,
+        restore: Box<dyn FnOnce() + Send>,
+    ) -> Option<Self> {
+        let (stop, stopped) = mpsc::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("fronting-cutoff".into())
+            .spawn(move || {
+                // Only the deadline passing fires the cutoff; the sender being
+                // dropped means the bracket finished first.
+                if let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(after) {
+                    if gate.fire() {
+                        restore();
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self {
+            stop: Some(stop),
+            thread: Some(thread),
+        })
+    }
+
+    /// Stop the timer if it has not fired, and wait for any restore it
+    /// started to return.
+    pub fn finish(mut self) {
+        self.stop_and_join();
+    }
+
+    fn stop_and_join(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for CutoffTimer {
+    fn drop(&mut self) {
+        self.stop_and_join();
     }
 }

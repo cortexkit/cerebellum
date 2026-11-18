@@ -81,6 +81,10 @@ pub struct ObservedUnit<'a, T> {
     pub heartbeat: HeartbeatObservation,
     pub cancelled: &'a dyn Fn() -> bool,
     pub deadline_ms: u64,
+    /// The bracket's cutoff, when its host armed a timer for it. A unit
+    /// that checks it itself ([`FrontingBracketHost::unit_checks_cutoff`])
+    /// must call [`CutoffGate::begin_post`] before each post.
+    pub cutoff: Option<&'a CutoffGate>,
 }
 
 /// The platform a bracket runs on.
@@ -196,6 +200,18 @@ pub trait FrontingBracketHost {
     fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
         None
     }
+    /// The cutoff shared with a timer that starts the restore once a front
+    /// outlasts the bound, when this host arms one. The default arms none.
+    fn cutoff_gate(&mut self) -> Option<std::sync::Arc<CutoffGate>> {
+        None
+    }
+    /// Whether [`Self::post_observed_unit`] checks the cutoff before each of
+    /// its own posts and marks the presses it holds. When it does not, the
+    /// bracket holds the cutoff for the whole unit, so the timer never
+    /// restores while such a unit may hold a key or button down.
+    fn unit_checks_cutoff(&self) -> bool {
+        false
+    }
 }
 
 /// Whether the previous application is back in front.
@@ -272,6 +288,9 @@ pub struct BracketReport {
     pub waiting_out_slow_restore: bool,
     /// A no-send calibration confirmed a restore within the allowance.
     pub restore_calibrated: bool,
+    /// The cutoff timer, not the bracket, started the restore: the front
+    /// reached its bound while the bracket was still busy in a unit.
+    pub restore_started_by_cutoff: bool,
 }
 
 impl BracketReport {
@@ -426,6 +445,7 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
         waiting_out_slow_post: false,
         waiting_out_slow_restore: false,
         restore_calibrated: false,
+        restore_started_by_cutoff: false,
     };
     let Some(previous) = host.frontmost_pid() else {
         report.stop = Some(BracketStop::PreviousUnknown);
@@ -434,6 +454,8 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
     report.previous_frontmost = Some(previous);
 
     let our_pid = host.our_pid();
+    let cutoff = host.cutoff_gate();
+    let unit_checks_cutoff = host.unit_checks_cutoff();
     let host = RefCell::new(host);
     let mut watcher = SeizeWatcher::new(plan.maximum_seize_detection_latency_ms);
     for _ in 0..plan.units {
@@ -547,7 +569,8 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
         while front_ok {
             let drained = host.borrow_mut().drain(&tap);
             observe_drained_events(&mut watcher, drained, our_pid, next_unit);
-            if cancelled() || watcher.abort_decision().is_some() {
+            let cutoff_fired = cutoff.as_deref().is_some_and(CutoffGate::fired);
+            if cancelled() || watcher.abort_decision().is_some() || cutoff_fired {
                 front_ok = false;
                 break;
             }
@@ -640,6 +663,19 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
                 }
                 break;
             }
+            // No unit starts once the cutoff fired. A unit that cannot check
+            // the cutoff at each of its posts holds it for its whole length.
+            if let Some(gate) = cutoff.as_deref() {
+                let may_start = if unit_checks_cutoff {
+                    !gate.fired()
+                } else {
+                    gate.begin_post(true)
+                };
+                if !may_start {
+                    stop = Some(BracketStop::BoundExceeded);
+                    break;
+                }
+            }
             let index = next_unit;
             let posted = dispatch_observed_post_in_order(
                 &mut watcher,
@@ -659,9 +695,20 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
                         heartbeat,
                         cancelled,
                         deadline_ms: fronted_at.saturating_add(bound),
+                        cutoff: cutoff.as_deref(),
                     },
                 )
             });
+            // A key that may still be down keeps the cutoff held, so the
+            // timer never restores over it; the caller settles it first.
+            if let Some(gate) = cutoff.as_deref() {
+                if !matches!(
+                    &posted,
+                    Ok(Err(failure)) if failure.held_state == HeldStateDisposition::Unknown
+                ) {
+                    gate.all_released();
+                }
+            }
             match posted {
                 Ok(Ok(unit)) => {
                     watcher.take_post_slot();
@@ -963,6 +1010,32 @@ pub(crate) fn run_fronting_read_with_predictor<H: FrontingBracketHost>(
         fn post_unit(&mut self, _index: usize) -> Result<UnitPosted, SequencePostFailure> {
             (self.read)();
             Ok(UnitPosted::default())
+        }
+        // A picture posts no input and holds nothing down, so the cutoff may
+        // restore while the read is still running. The read itself starts
+        // only inside the bound, before the cutoff and before cancellation.
+        fn post_observed_unit(
+            &mut self,
+            index: usize,
+            observation: ObservedUnit<'_, Self::Tap>,
+        ) -> Result<UnitPosted, SequencePostFailure> {
+            if (observation.cancelled)()
+                || observation.cutoff.is_some_and(CutoffGate::fired)
+                || self.host.now_ms() >= observation.deadline_ms
+            {
+                return Err(SequencePostFailure {
+                    posts_returned: 0,
+                    refusal: crate::platform::ProcessEventRefusal::Cancelled,
+                    held_state: HeldStateDisposition::NoneHeld,
+                });
+            }
+            self.post_unit(index)
+        }
+        fn cutoff_gate(&mut self) -> Option<std::sync::Arc<CutoffGate>> {
+            self.host.cutoff_gate()
+        }
+        fn unit_checks_cutoff(&self) -> bool {
+            true
         }
         // Forwarded, not left to the default: the default reports no input,
         // which would restore over a person's own switch.

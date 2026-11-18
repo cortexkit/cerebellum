@@ -620,6 +620,7 @@ mod tests {
             waiting_out_slow_post: false,
             waiting_out_slow_restore: false,
             restore_calibrated: false,
+            restore_started_by_cutoff: false,
         };
         assert_eq!(
             bracket_fronting(&report(104), 100),
@@ -647,6 +648,7 @@ mod tests {
             waiting_out_slow_post,
             waiting_out_slow_restore: false,
             restore_calibrated: false,
+            restore_started_by_cutoff: false,
         };
         let remedy = |bracket: Option<&BracketReport>| {
             dispatch_refusal_reply(&DispatchError::FrontingBoundExceeded, bracket)["remedy"]
@@ -681,6 +683,7 @@ mod tests {
             waiting_out_slow_post: false,
             waiting_out_slow_restore,
             restore_calibrated: false,
+            restore_started_by_cutoff: false,
         };
         let remedy = |bracket: &BracketReport| {
             dispatch_refusal_reply(&DispatchError::FrontingBoundExceeded, Some(bracket))["remedy"]
@@ -711,6 +714,7 @@ mod tests {
             waiting_out_slow_post: false,
             waiting_out_slow_restore: false,
             restore_calibrated: false,
+            restore_started_by_cutoff: false,
         }
     }
 

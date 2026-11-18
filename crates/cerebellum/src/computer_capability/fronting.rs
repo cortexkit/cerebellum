@@ -885,6 +885,24 @@ impl FrontedDispatchHooks for CellHooks {
             outcome.person_input_during_fronting,
         ));
     }
+
+    /// App-use fronts (shortcuts and pictures under the app's own grant)
+    /// get a cutoff timer; takeover fronts keep their existing bounds. The
+    /// timer runs this same hooks' decision, which goes through the one
+    /// restore cell, so the restore still runs exactly once.
+    fn cutoff_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        let app_use = self
+            .state()
+            .parts
+            .as_ref()
+            .is_some_and(|parts| parts.restore_fallback);
+        let mut hooks = self.clone();
+        app_use.then(|| {
+            Box::new(move || {
+                hooks.decide_restore();
+            }) as Box<dyn FnOnce() + Send>
+        })
+    }
 }
 
 /// The trait object the driver is handed.
