@@ -978,6 +978,15 @@ fn activation_policy_is_regular(pid: i32) -> Option<bool> {
 /// process (or none), when no running application has it, or when the system
 /// refused to send the request.
 pub fn activate_application(pid: u32, start_time_micros: u64) -> bool {
+    activate_application_while(pid, start_time_micros, &mut || true)
+}
+
+/// [`activate_application`] with a final caller check before the AppKit request.
+pub fn activate_application_while(
+    pid: u32,
+    start_time_micros: u64,
+    permitted: &mut dyn FnMut() -> bool,
+) -> bool {
     use objc2::msg_send;
     use objc2::runtime::AnyClass;
     use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
@@ -998,7 +1007,10 @@ pub fn activate_application(pid: u32, start_time_micros: u64) -> bool {
         let application: Option<Retained<NSRunningApplication>> =
             unsafe { msg_send![class, runningApplicationWithProcessIdentifier: raw_pid] };
         application.is_some_and(|application| {
-            application.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows)
+            process_start_time_micros(pid) == Some(start_time_micros)
+                && permitted()
+                && application
+                    .activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows)
         })
     })
 }

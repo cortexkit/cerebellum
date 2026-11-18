@@ -6,7 +6,7 @@
 //! them means making them frontmost. Fronting an application can take the
 //! person's own keystrokes, so the bracket runs under the same guards the
 //! observed pointer sequence does, through the same functions: the idle gate
-//! and heartbeat in [`begin_observed_sequence`], and the per-post heartbeat,
+//! and heartbeat in [`super::seize::begin_observed_sequence`], and the per-post heartbeat,
 //! focus and seize checks in [`dispatch_observed_post_in_order`]. Any input
 //! that is not ours stops it.
 //!
@@ -20,6 +20,12 @@
 //! posting rather than assumed: each unit's post time and each restore's
 //! latency are timed, and a chunk ends when the next unit and a restore would
 //! no longer fit.
+//! The cutoff starts restore preparation early. An unsettled input release
+//! defers the restore; if OS focus reads stall past the deadline, the first
+//! native restore write is refused instead and the restore reports failure.
+//! A short-lived watcher can retry only while the target is still frontmost
+//! and observation shows the person has not intervened. Neither exception assumes focus or
+//! input is safe merely because time has passed.
 //!
 //! Everything platform-specific is behind [`FrontingBracketHost`], so the
 //! ordering, the chunking and the bound are driven by a fake clock in tests.
@@ -67,9 +73,9 @@ use serde::{Deserialize, Serialize};
 
 use super::seize::SourcedInputKind;
 use super::seize::{
-    begin_observed_sequence, dispatch_observed_post_in_order, observe_drained_events,
-    AbortDecision, AbortReason, HeartbeatObservation, HeartbeatProbe, ObservedPostRefusal,
-    ObservedSequenceHooks, SeizeWatcher, SourcedInputEvent, UserIdleEstimator,
+    dispatch_observed_post_in_order, observe_drained_events, AbortDecision, AbortReason,
+    HeartbeatObservation, HeartbeatProbe, ObservedPostRefusal, ObservedSequenceHooks, SeizeWatcher,
+    SourcedInputEvent, UserIdleEstimator,
 };
 use crate::platform::{HeldStateDisposition, IdleReading, SequencePostFailure};
 
@@ -117,6 +123,15 @@ pub trait FrontingBracketHost {
     /// Ask the application `pid` runs to become frontmost. `false` when the
     /// request itself was refused.
     fn request_front(&mut self, pid: u32) -> bool;
+    /// Ask to front `pid` only if `permitted` still holds at the native write.
+    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
+        permitted() && self.request_front(pid)
+    }
+    /// Start a bounded interval without switching focus. Hooked picture
+    /// reads still need a deadline and a lock owner on this path.
+    fn begin_without_switch(&mut self, _pid: u32) -> bool {
+        true
+    }
     /// A second way to ask for `pid` to come to the front, used by a restore
     /// when [`Self::request_front`] was refused or has not taken effect within
     /// [`RESTORE_FALLBACK_AFTER_MS`]. `false` when the host has none or the
@@ -433,14 +448,40 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
     run_fronting_bracket_with_predictor(host, estimator, plan, admission, cancelled, None)
 }
 
-pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
+/// A bracket can update idle history without owning its mutex across native work.
+pub(crate) enum BracketIdle<'a> {
+    Local(&'a mut UserIdleEstimator),
+    #[cfg(any(target_os = "macos", test))]
+    Shared(&'a std::sync::Mutex<UserIdleEstimator>),
+}
+
+impl<'a> From<&'a mut UserIdleEstimator> for BracketIdle<'a> {
+    fn from(estimator: &'a mut UserIdleEstimator) -> Self {
+        Self::Local(estimator)
+    }
+}
+
+impl BracketIdle<'_> {
+    fn with<T>(&mut self, use_idle: impl FnOnce(&mut UserIdleEstimator) -> T) -> T {
+        match self {
+            Self::Local(estimator) => use_idle(estimator),
+            #[cfg(any(target_os = "macos", test))]
+            Self::Shared(estimator) => {
+                use_idle(&mut estimator.lock().unwrap_or_else(|p| p.into_inner()))
+            }
+        }
+    }
+}
+
+pub(crate) fn run_fronting_bracket_with_predictor<'a, H: FrontingBracketHost>(
     host: &mut H,
-    estimator: &mut UserIdleEstimator,
+    estimator: impl Into<BracketIdle<'a>>,
     plan: BracketPlan,
     admission: FrontingAdmission,
     cancelled: &dyn Fn() -> bool,
     predictor: Option<&RestorePredictor>,
 ) -> BracketOutcome {
+    let mut estimator = estimator.into();
     let unfronted = |report| BracketOutcome {
         report,
         person_input_during_fronting: false,
@@ -477,11 +518,10 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
         watcher.queue_post();
     }
     let idle_read_at = Instant::now();
-    let begun = begin_observed_sequence(
-        estimator,
+    let begun = super::seize::begin_observed_sequence_using(
+        |hid_idle| estimator.with(|estimator| estimator.user_idle(hid_idle, idle_read_at)),
         &mut watcher,
         our_pid,
-        idle_read_at,
         ObservedSequenceHooks {
             create_tap: || host.borrow_mut().create_tap(),
             read_idle: || host.borrow_mut().read_idle(),
@@ -503,7 +543,7 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
                 refusal,
                 ObservedPostRefusal::AlreadyAborted(AbortReason::UserSeizedControl)
             ) {
-                estimator.clear_carry();
+                estimator.with(UserIdleEstimator::clear_carry);
             }
             report.stop = Some(match watcher.abort_decision() {
                 Some(abort) => BracketStop::Aborted(abort),
@@ -519,7 +559,7 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
     // event happened to give the watcher a separate abort reason.
     watcher.observe_heartbeat(super::seize::heartbeat_liveness(probe, heartbeat), 0);
     if let Some(abort) = watcher.abort_decision() {
-        estimator.clear_carry();
+        estimator.with(UserIdleEstimator::clear_carry);
         report.stop = Some(BracketStop::Aborted(abort));
         return unfronted(report);
     }
@@ -580,8 +620,11 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
         let calibrating = calibration.is_some();
         let fronted_at = host.borrow_mut().now_ms();
         report.chunks += 1;
-        let requested =
-            plan.target_pid == previous || host.borrow_mut().request_front(plan.target_pid);
+        let requested = if plan.target_pid == previous {
+            host.borrow_mut().begin_without_switch(previous)
+        } else {
+            host.borrow_mut().request_front(plan.target_pid)
+        };
         let mut front_ok = requested;
         while front_ok {
             let drained = host.borrow_mut().drain(&tap);
@@ -852,12 +895,14 @@ pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
         Some(BracketStop::Aborted(abort))
             if matches!(abort.reason, AbortReason::UserSeizedControl) =>
         {
-            estimator.clear_carry();
+            estimator.with(UserIdleEstimator::clear_carry);
         }
         _ => {}
     }
-    host.borrow_mut()
-        .finish_observation(&tap, estimator, user_idle, idle_read_at);
+    estimator.with(|estimator| {
+        host.borrow_mut()
+            .finish_observation(&tap, estimator, user_idle, idle_read_at);
+    });
     BracketOutcome {
         report,
         person_input_during_fronting: person_input,
@@ -951,9 +996,9 @@ pub fn run_fronting_read_with<H: FrontingBracketHost>(
     run_fronting_read_with_predictor(host, estimator, plan, admission, cancelled, read, None)
 }
 
-pub(crate) fn run_fronting_read_with_predictor<H: FrontingBracketHost>(
+pub(crate) fn run_fronting_read_with_predictor<'a, H: FrontingBracketHost>(
     host: &mut H,
-    estimator: &mut UserIdleEstimator,
+    estimator: impl Into<BracketIdle<'a>>,
     mut plan: BracketPlan,
     admission: FrontingAdmission,
     cancelled: &dyn Fn() -> bool,
@@ -977,6 +1022,9 @@ pub(crate) fn run_fronting_read_with_predictor<H: FrontingBracketHost>(
         }
         fn request_front(&mut self, pid: u32) -> bool {
             self.host.request_front(pid)
+        }
+        fn begin_without_switch(&mut self, pid: u32) -> bool {
+            self.host.begin_without_switch(pid)
         }
         fn request_front_fallback(&mut self, pid: u32) -> bool {
             self.host.request_front_fallback(pid)
@@ -1040,7 +1088,7 @@ pub(crate) fn run_fronting_read_with_predictor<H: FrontingBracketHost>(
             observation: ObservedUnit<'_, Self::Tap>,
         ) -> Result<UnitPosted, SequencePostFailure> {
             if (observation.cancelled)()
-                || observation.cutoff.is_some_and(CutoffGate::fired)
+                || observation.cutoff.is_some_and(CutoffGate::past_deadline)
                 || self.host.now_ms() >= observation.deadline_ms
             {
                 return Err(SequencePostFailure {

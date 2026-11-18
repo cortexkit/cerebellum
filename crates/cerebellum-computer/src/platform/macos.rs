@@ -554,8 +554,13 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
     // unit: a picture or a keystroke is never fronted for a process that has
     // since taken over the pid.
     fn request_front(&mut self, pid: u32) -> bool {
+        self.request_front_while(pid, &mut || true)
+    }
+
+    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
         self.request_front_with(pid, |still_ours| {
-            cerebellum_macos::request_frontmost_while(pid, still_ours).is_ok()
+            cerebellum_macos::request_frontmost_while(pid, &mut || still_ours() && permitted())
+                .is_ok()
         })
     }
 
@@ -792,6 +797,10 @@ struct MacRestoreHost {
     /// the obligation names it; the second route to the front refuses any
     /// other process.
     previous: Option<(u32, u64)>,
+    /// The previous application's accessibility element, resolved when the
+    /// obligation named it, so a restore at the cutoff makes no lookup
+    /// before its request.
+    prepared: Option<cerebellum_macos::PreparedFrontmost>,
 }
 
 impl MacRestoreHost {
@@ -799,6 +808,7 @@ impl MacRestoreHost {
         Self {
             started,
             previous: None,
+            prepared: None,
         }
     }
 }
@@ -817,6 +827,10 @@ impl FrontingRestoreHost for MacRestoreHost {
     }
 
     fn request_front(&mut self, pid: u32) -> bool {
+        self.request_front_while(pid, &mut || true)
+    }
+
+    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
         // Only the process recorded as the previous application, and only
         // while it still holds the pid, checked again right before the
         // activation is written.
@@ -824,18 +838,35 @@ impl FrontingRestoreHost for MacRestoreHost {
             self.previous,
             pid,
             cerebellum_macos::process_start_time_micros,
-            |still_ours| cerebellum_macos::request_frontmost_while(pid, still_ours).is_ok(),
+            |still_ours| {
+                let permitted = &mut || still_ours() && permitted();
+                match &self.prepared {
+                    Some(prepared) if prepared.pid() == pid => {
+                        prepared.request_while(permitted).is_ok()
+                    }
+                    _ => cerebellum_macos::request_frontmost_while(pid, permitted).is_ok(),
+                }
+            },
         )
     }
 
     fn remember_previous(&mut self, pid: u32) {
         self.previous = cerebellum_macos::process_start_time_micros(pid).map(|start| (pid, start));
+        self.prepared = cerebellum_macos::prepare_frontmost(pid).ok();
     }
 
     fn request_front_fallback(&mut self, pid: u32) -> bool {
+        self.request_front_fallback_while(pid, &mut || true)
+    }
+
+    fn request_front_fallback_while(
+        &mut self,
+        pid: u32,
+        permitted: &mut dyn FnMut() -> bool,
+    ) -> bool {
         match self.previous {
             Some((previous, start)) if previous == pid => {
-                cerebellum_macos::activate_application(pid, start)
+                cerebellum_macos::activate_application_while(pid, start, permitted)
             }
             _ => false,
         }
@@ -2258,7 +2289,6 @@ impl PlatformDriver for MacOs26PlatformDriver {
             visibility: VisibilityMemo::new(VISIBLE_READING_MAX_AGE),
             pointer: None,
         };
-        let mut user_idle = self.user_idle.lock().unwrap_or_else(|p| p.into_inner());
         let plan = crate::dispatch::BracketPlan {
             target_pid: target.pid,
             units: 1,
@@ -2271,9 +2301,9 @@ impl PlatformDriver for MacOs26PlatformDriver {
                 read();
             }
         };
-        Ok(crate::platform::run_hooked_fronted(
+        Ok(crate::platform::run_hooked_fronted_with_idle(
             &mut host,
-            &mut user_idle,
+            crate::dispatch::BracketIdle::Shared(&self.user_idle),
             plan,
             cancelled,
             hooks.as_mut(),

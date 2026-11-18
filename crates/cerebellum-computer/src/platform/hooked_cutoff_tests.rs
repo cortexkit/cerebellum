@@ -329,6 +329,42 @@ impl Drop for FloorHistory {
 }
 
 #[test]
+fn a_picture_capture_leaves_shared_idle_history_unlocked() {
+    let idle = Mutex::new(UserIdleEstimator::new());
+    let history = FloorHistory::new();
+    let predictor = RestorePredictor::open_for_test(&history.0);
+    let shared = Arc::new(Mutex::new(Desk {
+        frontmost: Some(PREVIOUS),
+        ..Desk::default()
+    }));
+    let mut read_ran = false;
+    let outcome = run_hooked_fronted_with_predictor(
+        &mut ShortcutHost {
+            shared,
+            started: Instant::now(),
+        },
+        crate::dispatch::BracketIdle::Shared(&idle),
+        BracketPlan {
+            target_pid: TARGET,
+            units: 1,
+            maximum_interval_ms: BOUND_MS,
+            maximum_seize_detection_latency_ms: 50,
+        },
+        &|| false,
+        &mut Hooks::default(),
+        Some(&mut || {
+            read_ran = true;
+            assert!(
+                idle.try_lock().is_ok(),
+                "native capture must not hold idle history"
+            );
+        }),
+        Some(&predictor),
+    );
+    assert!(read_ran, "{:?}", outcome.report);
+}
+
+#[test]
 fn a_shortcut_admitted_on_a_floor_history_is_cut_off_at_the_bound_however_slow_the_restore() {
     let history = FloorHistory::new();
     let predictor = RestorePredictor::open_for_test(&history.0);

@@ -535,6 +535,7 @@ struct ScreenState {
     /// The target comes to the front again at each of these instants, as an
     /// activation delivered more than once does.
     landings_at: Vec<u64>,
+    restore_focus_delay_ms: u64,
 }
 
 #[derive(Clone)]
@@ -585,6 +586,7 @@ impl Screen {
                 remembered_previous: None,
                 restore_needs_remembered_previous: false,
                 landings_at: Vec::new(),
+                restore_focus_delay_ms: 0,
             })),
             desk: desk.clone(),
         }
@@ -701,6 +703,8 @@ impl FrontingRestoreHost for FakeRestore {
         self.0.advance(milliseconds);
     }
     fn frontmost_pid(&mut self) -> Option<u32> {
+        let delay = self.0.state().restore_focus_delay_ms;
+        std::thread::sleep(std::time::Duration::from_millis(delay));
         self.0.frontmost()
     }
     fn request_front(&mut self, pid: u32) -> bool {

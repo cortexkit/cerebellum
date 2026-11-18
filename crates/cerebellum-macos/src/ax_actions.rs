@@ -900,30 +900,85 @@ pub fn request_frontmost_while(
     #[cfg(feature = "desk-probe")]
     note_frontmost_call_for_probe(pid, None);
     require_trust()?;
-    let code = write_if_still_ours(
-        || application(pid),
-        still_ours,
-        |application: &AxRetainedElement| {
-            let name = CFString::from_static_str("AXFrontmost");
-            let value = CFBoolean::new(true);
-            // SAFETY: element, attribute name and the static Boolean are
-            // live for the call.
-            unsafe {
-                AXUIElementSetAttributeValue(
-                    application.as_ptr(),
-                    CFRetained::as_ptr(&name).as_ptr().cast(),
-                    (value as *const CFBoolean).cast(),
-                )
-            }
-        },
-    )?;
+    let code = write_frontmost(|| application(pid), still_ours)?;
     #[cfg(feature = "desk-probe")]
     note_frontmost_call_for_probe(pid, Some(code));
+    frontmost_result(code)
+}
+
+fn write_frontmost<E: std::borrow::Borrow<AxRetainedElement>>(
+    resolve: impl FnOnce() -> Result<E, AxElementActionError>,
+    still_ours: &mut dyn FnMut() -> bool,
+) -> Result<i32, AxElementActionError> {
+    let name = CFString::from_static_str("AXFrontmost");
+    let value = CFBoolean::new(true);
+    // SAFETY: element, attribute name and the static Boolean are live for the
+    // call.
+    write_if_still_ours(resolve, still_ours, |application| unsafe {
+        AXUIElementSetAttributeValue(
+            application.borrow().as_ptr(),
+            CFRetained::as_ptr(&name).as_ptr().cast(),
+            (value as *const CFBoolean).cast(),
+        )
+    })
+}
+
+fn frontmost_result(code: i32) -> Result<(), AxElementActionError> {
     if code == AX_ERROR_SUCCESS {
         Ok(())
     } else {
         Err(classify(code))
     }
+}
+
+/// An application's accessibility element resolved ahead of time, so that a
+/// later request to bring it forward (a restore at a deadline, say) makes no
+/// lookup first: only the caller's identity check and the write remain.
+pub struct PreparedFrontmost {
+    pid: u32,
+    application: AxRetainedElement,
+}
+
+impl PreparedFrontmost {
+    /// The process id the element was resolved for.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// [`request_frontmost_while`] on the element resolved ahead of time:
+    /// `still_ours` is asked immediately before `AXFrontmost` is written. The
+    /// same race remains: the system resolves the pid again when it delivers
+    /// the write.
+    pub fn request_while(
+        &self,
+        still_ours: &mut dyn FnMut() -> bool,
+    ) -> Result<(), AxElementActionError> {
+        #[cfg(feature = "desk-probe")]
+        note_frontmost_call_for_probe(self.pid, None);
+        require_trust()?;
+        let code = write_frontmost(
+            || {
+                // The element's messaging timeout follows this thread's
+                // budget, not the one in force when it was resolved.
+                bound_messages(self.application.as_ptr());
+                Ok(&self.application)
+            },
+            still_ours,
+        )?;
+        #[cfg(feature = "desk-probe")]
+        note_frontmost_call_for_probe(self.pid, Some(code));
+        frontmost_result(code)
+    }
+}
+
+/// Resolve `pid`'s application element now, for a later
+/// [`PreparedFrontmost::request_while`].
+pub fn prepare_frontmost(pid: u32) -> Result<PreparedFrontmost, AxElementActionError> {
+    require_trust()?;
+    Ok(PreparedFrontmost {
+        pid,
+        application: application(pid)?,
+    })
 }
 
 /// Resolve the element, then ask `still_ours`, then write: the identity

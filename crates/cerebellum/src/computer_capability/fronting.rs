@@ -670,8 +670,18 @@ impl RestoreHost for PlatformRestoreHost {
     fn request_front(&mut self, pid: u32) -> bool {
         self.host.request_front(pid)
     }
+    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
+        self.host.request_front_while(pid, permitted)
+    }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
         self.fallback && self.host.request_front_fallback(pid)
+    }
+    fn request_front_fallback_while(
+        &mut self,
+        pid: u32,
+        permitted: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        self.fallback && self.host.request_front_fallback_while(pid, permitted)
     }
     fn hardware_input_snapshot(
         &mut self,
@@ -688,24 +698,28 @@ pub(crate) fn decide_with_restore_budget(cell: &RestoreCell) -> RestoreDecided {
     with_restore_budget(cell, RestoreCell::decide)
 }
 
-fn with_restore_budget(
-    cell: &RestoreCell,
-    decide: fn(&RestoreCell) -> RestoreDecided,
-) -> RestoreDecided {
+type RestoreDecision = fn(&RestoreCell) -> RestoreDecided;
+
+fn with_restore_budget(cell: &RestoreCell, decide: RestoreDecision) -> RestoreDecided {
     std::thread::scope(|scope| {
         scope
-            .spawn(|| {
-                #[cfg(target_os = "macos")]
-                let _ax = cerebellum_macos::ax_budget::bound_messages_until(
-                    Instant::now() + Duration::from_millis(RESTORE_AX_MS),
-                );
-                #[cfg(not(target_os = "macos"))]
-                let _ = RESTORE_AX_MS;
-                decide(cell)
-            })
+            .spawn(|| with_restore_budget_here(cell, decide))
             .join()
             .unwrap_or_else(|_| decide(cell))
     })
+}
+
+/// [`with_restore_budget`] on the calling thread, which must carry no outer
+/// accessibility deadline: the cutoff's own timer thread, already running,
+/// so the restore at the cutoff does not wait for a new thread to start.
+fn with_restore_budget_here(cell: &RestoreCell, decide: RestoreDecision) -> RestoreDecided {
+    #[cfg(target_os = "macos")]
+    let _ax = cerebellum_macos::ax_budget::bound_messages_until(
+        Instant::now() + Duration::from_millis(RESTORE_AX_MS),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let _ = RESTORE_AX_MS;
+    decide(cell)
 }
 
 /// What a temporary front's obligation carries before it is registered.
@@ -739,7 +753,9 @@ impl ObligationParts {
         // every front: takeover fronts have no second route
         // (`restore_fallback` stays false), but their one route checks it
         // too.
-        host.remember_previous(previous);
+        if previous != target {
+            host.remember_previous(previous);
+        }
         self.terminal
             .register_restore(RestoreObligation {
                 previous_pid: previous,
@@ -822,7 +838,15 @@ impl CellHooks {
 
     /// Run `decide` on the cell under the restore's own budget, and keep
     /// what it decided.
-    fn decide_using(&self, decide: fn(&RestoreCell) -> RestoreDecided) -> HookedRestore {
+    fn decide_using(&self, decide: RestoreDecision) -> HookedRestore {
+        self.decide_with_budget(decide, with_restore_budget)
+    }
+
+    fn decide_with_budget(
+        &self,
+        decide: RestoreDecision,
+        budgeted: fn(&RestoreCell, RestoreDecision) -> RestoreDecided,
+    ) -> HookedRestore {
         let Some(cell) = self.cell() else {
             return HookedRestore {
                 restore: RestoreStatus::NotNeeded,
@@ -831,7 +855,7 @@ impl CellHooks {
                 restore_ms: None,
             };
         };
-        let decided = with_restore_budget(&cell, decide);
+        let decided = budgeted(&cell, decide);
         self.state().decided = Some(decided);
         HookedRestore {
             restore: decided.restore,
@@ -868,11 +892,9 @@ impl CellHooks {
     /// Keep the fronting lock for a picture read under way, until the hold
     /// is dropped; see [`RestoreCell::hold_lock_for_read`].
     pub(crate) fn hold_lock_for_read(&self) -> Option<crate::terminal_arbiter::ReadLockHold> {
-        self.cell().map(|cell| {
-            cell.hold_lock_for_read(Duration::from_millis(
-                crate::budgets::PICTURE_READ_LIFETIME_MS,
-            ))
-        })
+        self.cell()?.hold_lock_for_read(Duration::from_millis(
+            crate::budgets::PICTURE_READ_LIFETIME_MS,
+        ))
     }
 
     /// What the hooks hold now, without releasing an unregistered lock as
@@ -918,6 +940,10 @@ impl FrontedDispatchHooks for CellHooks {
             .is_some_and(|cell| cell.begin_front_attempt(front_instant_ms))
     }
 
+    fn target_front_permitted(&self) -> bool {
+        self.cell().is_some_and(|cell| !cell.cleanup_taken())
+    }
+
     fn front_attempt_returned(&mut self) {
         if let Some(cell) = self.cell() {
             cell.front_attempt_returned();
@@ -957,13 +983,39 @@ impl FrontedDispatchHooks for CellHooks {
         let hooks = self.clone();
         app_use.then(|| {
             Box::new(move || {
-                hooks.decide_using(RestoreCell::decide_at_cutoff);
+                // On the timer's own thread, already running: no thread is
+                // started between the cutoff firing and the restore request.
+                hooks.decide_with_budget(RestoreCell::decide_at_cutoff, with_restore_budget_here);
             }) as Box<dyn FnOnce() + Send>
         })
     }
 
+    /// App-use fronts' cutoffs fire early by the restore's measured
+    /// preparation time ([`crate::terminal_arbiter::restore_preparation`]).
+    fn cutoff_lead_ms(&self) -> u64 {
+        let app_use = self
+            .state()
+            .parts
+            .as_ref()
+            .is_some_and(|parts| parts.restore_fallback);
+        if app_use {
+            crate::terminal_arbiter::restore_preparation::reserve_ms()
+        } else {
+            0
+        }
+    }
+
     fn cutoff_armed(&mut self, gate: Arc<cerebellum_computer::dispatch::CutoffGate>) {
+        if let Some(cell) = self.cell() {
+            cell.set_cutoff(Arc::clone(&gate));
+        }
         self.state().cutoff = Some(gate);
+    }
+
+    fn restore_deadline(&mut self, deadline: Instant) {
+        if let Some(cell) = self.cell() {
+            cell.set_restore_deadline(deadline);
+        }
     }
 }
 

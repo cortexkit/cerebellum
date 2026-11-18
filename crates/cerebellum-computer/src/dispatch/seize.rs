@@ -607,13 +607,40 @@ where
     Drain: FnOnce(&Tap) -> Vec<SourcedInputEvent>,
     PostHeartbeat: FnOnce() -> Marker,
 {
+    begin_observed_sequence_using(
+        |hid_idle| estimator.user_idle(hid_idle, idle_read_at),
+        watcher,
+        our_pid,
+        hooks,
+    )
+}
+
+pub(crate) fn begin_observed_sequence_using<
+    CreateTap,
+    ReadIdle,
+    Drain,
+    PostHeartbeat,
+    Tap,
+    Marker,
+>(
+    estimate: impl FnOnce(IdleReading) -> IdleReading,
+    watcher: &mut SeizeWatcher,
+    our_pid: i64,
+    hooks: ObservedSequenceHooks<CreateTap, ReadIdle, Drain, PostHeartbeat>,
+) -> Result<(Tap, IdleReading, Marker), ObservedPostRefusal>
+where
+    CreateTap: FnOnce() -> Tap,
+    ReadIdle: FnOnce() -> IdleReading,
+    Drain: FnOnce(&Tap) -> Vec<SourcedInputEvent>,
+    PostHeartbeat: FnOnce() -> Marker,
+{
     if let Some(decision) = watcher.abort_decision() {
         return Err(ObservedPostRefusal::AlreadyAborted(decision.reason));
     }
 
     let tap = (hooks.create_tap)();
     let hid_idle = (hooks.read_idle)();
-    let user_idle = estimator.user_idle(hid_idle, idle_read_at);
+    let user_idle = estimate(hid_idle);
     if let Err(refusal) = idle_gate_with_hid(hid_idle, user_idle) {
         watcher.abort(AbortReason::IdleGateRefused(refusal), 0, None);
         return Err(ObservedPostRefusal::Idle(refusal));

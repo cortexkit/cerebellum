@@ -175,11 +175,21 @@ pub trait RestoreHost: Send {
     /// Ask the application `pid` runs to become frontmost. `false` when the
     /// request itself was refused.
     fn request_front(&mut self, pid: u32) -> bool;
+    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
+        permitted() && self.request_front(pid)
+    }
     /// A second way to ask for `pid`, the application a restore puts back,
     /// to come to the front, for when [`Self::request_front`] has not taken
     /// effect. `false` when the host has none or the request was refused.
     fn request_front_fallback(&mut self, _pid: u32) -> bool {
         false
+    }
+    fn request_front_fallback_while(
+        &mut self,
+        pid: u32,
+        permitted: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        permitted() && self.request_front_fallback(pid)
     }
     /// The process-wide session observer's hardware input timestamps, on
     /// this host's clock. `None` when unavailable, which the decision reads
@@ -303,6 +313,9 @@ pub struct RestoreCell {
 }
 
 struct RestoreCellInner {
+    restore_deadline: Option<std::time::Instant>,
+    cutoff: Option<Arc<crate::computer::dispatch::CutoffGate>>,
+    late_start: Option<Box<dyn FnOnce() + Send>>,
     attempt: crate::computer::dispatch::FrontAttempt,
     host: Option<Box<dyn RestoreHost>>,
     lock: Option<FrontingLockGuard>,
@@ -338,6 +351,9 @@ impl RestoreCell {
             mode: obligation.mode,
             purpose: obligation.purpose,
             inner: std::sync::Mutex::new(RestoreCellInner {
+                restore_deadline: None,
+                cutoff: None,
+                late_start: None,
                 attempt: crate::computer::dispatch::FrontAttempt::new(),
                 host: Some(obligation.host),
                 lock: Some(obligation.lock),
@@ -414,6 +430,14 @@ impl RestoreCell {
         self.inner().attempt.taken()
     }
 
+    pub(crate) fn set_restore_deadline(&self, deadline: std::time::Instant) {
+        self.inner().restore_deadline = Some(deadline);
+    }
+
+    pub(crate) fn set_cutoff(&self, cutoff: Arc<crate::computer::dispatch::CutoffGate>) {
+        self.inner().cutoff = Some(cutoff);
+    }
+
     /// A picture read is starting while the target may be in front. The
     /// fronting lock is kept until the returned hold is dropped, whenever
     /// the decision completes, but for at most `lifetime`: a read still
@@ -422,35 +446,56 @@ impl RestoreCell {
     /// and module health reports it (`pictureReadsPastLifetime`). Whatever
     /// that read later acquires is refused by its fence, whose deadline has
     /// long passed.
-    pub fn hold_lock_for_read(self: &Arc<Self>, lifetime: Duration) -> ReadLockHold {
-        self.inner().reads_in_flight += 1;
+    pub fn hold_lock_for_read(self: &Arc<Self>, lifetime: Duration) -> Option<ReadLockHold> {
+        self.hold_read_with_watchdog(lifetime, |watch| {
+            std::thread::Builder::new()
+                .name("picture-read-lifetime".into())
+                .spawn(watch)
+                .is_ok()
+        })
+    }
+
+    fn hold_read_with_watchdog(
+        self: &Arc<Self>,
+        lifetime: Duration,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> bool,
+    ) -> Option<ReadLockHold> {
+        {
+            let mut inner = self.inner();
+            if inner.attempt.taken() || inner.lock.is_none() {
+                return None;
+            }
+            inner.reads_in_flight += 1;
+        }
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (returned, wait) = std::sync::mpsc::channel::<()>();
         let cell = Arc::clone(self);
         let expiry_ended = Arc::clone(&ended);
-        // Without a watchdog the hold is only as bounded as the read itself.
-        let _ = std::thread::Builder::new()
-            .name("picture-read-lifetime".into())
-            .spawn(move || {
-                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(lifetime)
-                {
-                    // Counted as stalled before claiming the read, so a hold
-                    // dropped at this moment never takes the count below zero.
-                    STALLED_PICTURE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if expiry_ended.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                        STALLED_PICTURE_READS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    } else {
-                        STALLED_PICTURE_READS_TOTAL
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        cell.read_ended();
-                    }
+        let expires_at = std::time::Instant::now() + lifetime;
+        if !spawn(Box::new(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                wait.recv_timeout(expires_at.saturating_duration_since(std::time::Instant::now()))
+            {
+                // Counted as stalled before claiming the read, so a hold
+                // dropped at this moment never takes the count below zero.
+                STALLED_PICTURE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if expiry_ended.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    STALLED_PICTURE_READS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    STALLED_PICTURE_READS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    cell.read_ended();
                 }
-            });
-        ReadLockHold {
+            }
+        })) {
+            // Refuse before entering native capture if we cannot bound its hold.
+            self.read_ended();
+            return None;
+        }
+        Some(ReadLockHold {
             cell: Arc::clone(self),
             ended,
             _returned: returned,
-        }
+        })
     }
 
     /// One picture read no longer holds the fronting lock: release it when
@@ -467,8 +512,16 @@ impl RestoreCell {
         } else {
             None
         };
+        let late_start = if inner.reads_in_flight == 0 && inner.decided.is_some() {
+            inner.late_start.take()
+        } else {
+            None
+        };
         drop(inner);
         drop(lock);
+        if let Some(start) = late_start {
+            start();
+        }
     }
 
     /// Whether a late watch is owed for an activation this cell did not see
@@ -498,6 +551,7 @@ impl RestoreCell {
 
     fn decide_with(&self, at_cutoff: bool) -> RestoreDecided {
         use crate::computer::dispatch::{CleanupTake, FrontAttemptState};
+        let started = std::time::Instant::now();
         let mut inner = self.inner();
         let front_instant_ms = match inner.attempt.take() {
             CleanupTake::AlreadyTaken => return self.await_decision(inner),
@@ -544,6 +598,12 @@ impl RestoreCell {
             }
         };
         let confirmed = inner.front_confirmed;
+        let deadline = inner.restore_deadline.filter(|_| {
+            inner
+                .cutoff
+                .as_ref()
+                .is_none_or(|cutoff| !cutoff.restore_deferred_for_post())
+        });
         let host = inner.host.take();
         drop(inner);
         let outcome = match host {
@@ -551,10 +611,13 @@ impl RestoreCell {
                 let mut adapter = RestoreDecisionHost {
                     host: host.as_mut(),
                     _target: self.target_pid,
+                    write_deadline: deadline.map(|deadline| {
+                        restore_preparation::WriteDeadline::new(deadline, started, at_cutoff)
+                    }),
                     #[cfg(all(feature = "desk-probe", target_os = "macos"))]
                     probe_timing: &self.probe_timing,
                 };
-                let outcome = if at_cutoff && !confirmed {
+                let mut outcome = if at_cutoff && !confirmed {
                     crate::computer::dispatch::restore_without_awaiting_activation(
                         &mut adapter,
                         self.previous_pid,
@@ -572,10 +635,18 @@ impl RestoreCell {
                         confirmed,
                     )
                 };
+                let expired = adapter.write_deadline.as_ref().is_some_and(|guard| {
+                    guard.record_sample();
+                    guard.expired
+                });
+                if expired {
+                    outcome.restore = self.failed().restore;
+                    outcome.restore_ms = None;
+                }
                 // An activation the action never confirmed is always left to
                 // the late watch, even one restored here: the same activation
                 // can land again after this decision.
-                if !confirmed
+                if (expired || !confirmed)
                     && !matches!(
                         outcome.restore,
                         crate::computer::dispatch::RestoreStatus::NotNeeded
@@ -683,6 +754,7 @@ impl RestoreCell {
             let mut adapter = RestoreDecisionHost {
                 host: host.as_mut(),
                 _target: self.target_pid,
+                write_deadline: None,
                 #[cfg(all(feature = "desk-probe", target_os = "macos"))]
                 probe_timing: &self.probe_timing,
             };
@@ -751,6 +823,11 @@ impl RestoreCell {
         decided: RestoreDecided,
     ) -> RestoreDecided {
         inner.decided = Some(decided);
+        let late_start = if inner.reads_in_flight == 0 {
+            inner.late_start.take()
+        } else {
+            None
+        };
         let lock = if inner.pending_since.is_none()
             && inner.reads_in_flight == 0
             && inner.release_wait.is_none()
@@ -762,6 +839,9 @@ impl RestoreCell {
         drop(inner);
         self.changed.notify_all();
         drop(lock);
+        if let Some(start) = late_start {
+            start();
+        }
         decided
     }
 
@@ -894,6 +974,7 @@ pub(crate) fn stalled_picture_reads() -> (usize, u64) {
 struct RestoreDecisionHost<'a> {
     host: &'a mut dyn RestoreHost,
     _target: u32,
+    write_deadline: Option<restore_preparation::WriteDeadline>,
     #[cfg(all(feature = "desk-probe", target_os = "macos"))]
     probe_timing: &'a probe_timing::ProbeTiming,
 }
@@ -918,6 +999,8 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
         self.host.frontmost_pid()
     }
     fn request_front(&mut self, pid: u32) -> bool {
+        let guard = &mut self.write_deadline;
+        let mut permitted = || guard.as_mut().is_none_or(|guard| guard.permit());
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
         {
             probe_timing::request_restore(
@@ -925,12 +1008,15 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
                 self.probe_timing,
                 pid,
                 probe_timing::RestoreSlot::First,
+                &mut permitted,
             )
         }
         #[cfg(not(all(feature = "desk-probe", target_os = "macos")))]
-        self.host.request_front(pid)
+        self.host.request_front_while(pid, &mut permitted)
     }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
+        let guard = &mut self.write_deadline;
+        let mut permitted = || guard.as_mut().is_none_or(|guard| guard.permit());
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
         {
             probe_timing::request_restore(
@@ -938,10 +1024,11 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
                 self.probe_timing,
                 pid,
                 probe_timing::RestoreSlot::Second,
+                &mut permitted,
             )
         }
         #[cfg(not(all(feature = "desk-probe", target_os = "macos")))]
-        self.host.request_front_fallback(pid)
+        self.host.request_front_fallback_while(pid, &mut permitted)
     }
     fn late_activation_observed(&mut self, _latency_ms: u64) {
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
@@ -1012,6 +1099,7 @@ type TerminalHook = Box<dyn FnOnce() + Send>;
 mod late_fronting;
 #[cfg(all(feature = "desk-probe", target_os = "macos"))]
 pub(crate) mod probe_timing;
+pub(crate) mod restore_preparation;
 #[cfg(test)]
 pub(crate) use late_fronting::hold_watch_for_test;
 #[cfg(all(feature = "desk-probe", target_os = "macos"))]
@@ -1114,16 +1202,29 @@ impl TerminalArbiter {
             )
         };
         if let Some(cell) = cell {
-            late_fronting::start(
-                &cell,
-                request_id(&self.request),
-                self.fronting_domain
-                    .load(std::sync::atomic::Ordering::Acquire),
-                self.route_namespace
-                    .load(std::sync::atomic::Ordering::Acquire),
-                cause,
-                self.late_fronting_recorder.lock().unwrap().clone(),
-            );
+            let request = request_id(&self.request);
+            let domain = self
+                .fronting_domain
+                .load(std::sync::atomic::Ordering::Acquire);
+            let namespace = self
+                .route_namespace
+                .load(std::sync::atomic::Ordering::Acquire);
+            let recorder = self.late_fronting_recorder.lock().unwrap().clone();
+            let weak = Arc::downgrade(&cell);
+            let start = move || {
+                if let Some(cell) = weak.upgrade() {
+                    late_fronting::start(&cell, request, domain, namespace, cause, recorder);
+                }
+            };
+            let mut inner = cell.inner();
+            if inner.decided.is_none() || inner.reads_in_flight > 0 {
+                // Terminal cleanup can give up waiting before the restore
+                // owner hands the host and lock to the late activation watcher.
+                inner.late_start.get_or_insert_with(|| Box::new(start));
+            } else {
+                drop(inner);
+                start();
+            }
         }
     }
 
@@ -2832,6 +2933,7 @@ mod restore_slot_tests {
         comes_forward: bool,
         snapshot: Option<HardwareInputSnapshot>,
         requests: Vec<u32>,
+        focus_delay: Option<Duration>,
         /// Release and restore steps in the order they happened.
         log: Vec<&'static str>,
     }
@@ -2850,6 +2952,7 @@ mod restore_slot_tests {
                 last_input_ms: None,
             }),
             requests: Vec::new(),
+            focus_delay: None,
             log: Vec::new(),
         }))
     }
@@ -2864,6 +2967,10 @@ mod restore_slot_tests {
             self.0.lock().unwrap().now += milliseconds;
         }
         fn frontmost_pid(&mut self) -> Option<u32> {
+            let delay = self.0.lock().unwrap().focus_delay.take();
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
             self.0.lock().unwrap().frontmost
         }
         fn request_front(&mut self, pid: u32) -> bool {
@@ -2959,6 +3066,58 @@ mod restore_slot_tests {
     }
 
     #[test]
+    fn a_slow_restore_focus_read_refuses_the_primary_write_and_hands_off_after_terminal() {
+        let shared = screen(true);
+        let releases = Arc::new(AtomicUsize::new(0));
+        let terminal = TerminalArbiter::new(request());
+        let cell = terminal
+            .register_restore(obligation(&shared, &releases))
+            .unwrap();
+        assert!(cell.begin_front_attempt(0));
+        cell.front_confirmed();
+        cell.front_attempt_returned();
+        cell.set_restore_deadline(std::time::Instant::now() + Duration::from_millis(10));
+        shared.lock().unwrap().focus_delay = Some(Duration::from_millis(30));
+
+        // Terminal has stopped waiting before the deciding owner returns.
+        terminal.start_late_fronting(Some(&cell));
+        let expired = restore_preparation::expired_writes();
+        let decided = cell.decide_at_cutoff();
+        assert_eq!(
+            decided.restore,
+            RestoreStatus::Failed {
+                left_in_front: Some(TARGET)
+            }
+        );
+        assert!(decided.restore_ms.is_none());
+        assert!(restore_preparation::expired_writes() > expired);
+        let end = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+        while releases.load(SeqCst) == 0 && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(releases.load(SeqCst), 1, "late watch took the obligation");
+        assert_eq!(
+            shared.lock().unwrap().requests,
+            [PREVIOUS],
+            "only the watch wrote"
+        );
+    }
+
+    #[test]
+    fn a_picture_read_without_a_watchdog_is_not_admitted() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let terminal = TerminalArbiter::new(request());
+        let cell = terminal
+            .register_restore(obligation(&screen(true), &releases))
+            .unwrap();
+        assert!(cell
+            .hold_read_with_watchdog(Duration::from_secs(10), |_| false)
+            .is_none());
+        cell.decide();
+        assert_eq!(releases.load(SeqCst), 1, "a refused read keeps no hold");
+    }
+
+    #[test]
     fn a_picture_read_that_never_returns_releases_the_lock_at_its_lifetime() {
         let releases = Arc::new(AtomicUsize::new(0));
         let terminal = TerminalArbiter::new(request());
@@ -2968,7 +3127,7 @@ mod restore_slot_tests {
         let (_, total_before) = stalled_picture_reads();
         // The read's synchronous step never returns: its hold is never
         // dropped during the test's wait.
-        let hold = cell.hold_lock_for_read(Duration::from_millis(50));
+        let hold = cell.hold_lock_for_read(Duration::from_millis(50)).unwrap();
         cell.decide();
         assert_eq!(releases.load(SeqCst), 0, "kept while the read runs");
         let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;

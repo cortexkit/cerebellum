@@ -8,9 +8,9 @@
 //! has been requested. The restore's confirmation is reported, not promised
 //! within the bound: the person's application may come back late.
 //!
-//! The timer is armed when the front is requested and fires at the bound,
-//! whatever any timing history predicted. Firing stops new posts at once,
-//! and requests the restore itself at once, even while the front request is
+//! The timer is armed before the front is requested and can fire before the
+//! bound to leave time to prepare the restore. Firing stops new posts at once
+//! and begins the restore decision, even while the front request is
 //! still in flight, unless a key or button may be held: a restore under a
 //! held key would hand that key to the previous application, so then the
 //! unit's own paired releases run first and the bracket restores after
@@ -28,9 +28,8 @@ use std::time::Instant;
 /// front: the target is still the frontmost application, the unit has not
 /// been stopped, and the bracket's absolute deadline has not passed; then
 /// the post is committed on the cutoff gate. The sequence runs them after
-/// every preparation for the post (the listing read, the final generation
-/// lookup, any authentication the transport attaches), immediately before
-/// the OS post call.
+/// the window listing and transport authentication. The final generation
+/// lookup follows the focus read and precedes stop and commitment.
 ///
 /// A post refused here was never made, so the refusal is
 /// [`ProcessEventRefusal::Cancelled`], which a reply reads as no post call
@@ -55,12 +54,14 @@ where
         &mut self,
         press: bool,
         cancelled: &dyn Fn() -> bool,
+        revalidate: &mut dyn FnMut() -> Result<(), ProcessEventRefusal>,
     ) -> Result<(), ProcessEventRefusal> {
-        // The focus read can take a moment, so the stop and the deadline are
-        // read after it: nothing that can block separates them from the post.
+        // A numeric PID can survive a replacement during the focus read.
+        // Check its identity once more before checking stop and committing.
         if (self.frontmost_pid)() != Some(self.target_pid) {
             return Err(ProcessEventRefusal::Cancelled);
         }
+        revalidate()?;
         if cancelled() {
             return Err(ProcessEventRefusal::Cancelled);
         }
@@ -97,6 +98,7 @@ struct GateState {
     disarmed: bool,
     /// A post is in flight, or a press may be down.
     held: bool,
+    deferred_for_post: bool,
     /// The timer started the restore.
     restore_started_by_cutoff: bool,
     /// The absolute deadline the timer was armed for.
@@ -119,7 +121,7 @@ impl CutoffGate {
     /// released once it returns; a `press` only once its release has.
     pub fn begin_post(&self, _press: bool) -> bool {
         let mut state = self.state();
-        if state.fired {
+        if state.fired || state.deadline.is_some_and(|at| Instant::now() >= at) {
             return false;
         }
         state.held = true;
@@ -128,7 +130,16 @@ impl CutoffGate {
 
     /// No post is in flight and nothing the unit pressed is still down.
     pub fn all_released(&self) {
-        self.state().held = false;
+        let mut state = self.state();
+        if state.held && state.deadline.is_some_and(|at| Instant::now() >= at) {
+            state.deferred_for_post = true;
+        }
+        state.held = false;
+    }
+
+    /// A committed post or its paired release occupied the restore window.
+    pub fn restore_deferred_for_post(&self) -> bool {
+        self.state().deferred_for_post
     }
 
     /// Whether the bound passed.
@@ -173,6 +184,7 @@ impl CutoffGate {
         }
         state.fired = true;
         if state.held {
+            state.deferred_for_post = true;
             return false;
         }
         state.restore_started_by_cutoff = true;

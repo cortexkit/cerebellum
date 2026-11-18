@@ -1704,6 +1704,10 @@ pub trait FrontingRestoreHost: Send {
     fn pause_ms(&mut self, milliseconds: u64);
     fn frontmost_pid(&mut self) -> Option<u32>;
     fn request_front(&mut self, pid: u32) -> bool;
+    /// Check `permitted` at the actual restore write, after native preparation.
+    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
+        permitted() && self.request_front(pid)
+    }
     /// `None` when unavailable, which the decision reads as no input seen.
     fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot>;
     /// The application `pid` runs is the one a restore will put back. Called
@@ -1718,6 +1722,14 @@ pub trait FrontingRestoreHost: Send {
     /// process, or the request was refused.
     fn request_front_fallback(&mut self, _pid: u32) -> bool {
         false
+    }
+    /// The second restore route with the same final-write check.
+    fn request_front_fallback_while(
+        &mut self,
+        pid: u32,
+        permitted: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        permitted() && self.request_front_fallback(pid)
     }
 }
 
@@ -1845,6 +1857,10 @@ pub trait FrontedDispatchHooks: Send {
     /// The front request is about to be made at `front_instant_ms` on the
     /// bracket's clock. `false` when cleanup already took the obligation.
     fn begin_front_attempt(&mut self, front_instant_ms: u64) -> bool;
+    /// Whether cleanup has not yet taken the obligation at the target write.
+    fn target_front_permitted(&self) -> bool {
+        true
+    }
     /// The front request and its wait returned.
     fn front_attempt_returned(&mut self);
     /// The action observed its target frontmost, not merely a request return.
@@ -1863,6 +1879,14 @@ pub trait FrontedDispatchHooks: Send {
     /// before acquiring them, since the timer may fire while its read is
     /// already under way. The default keeps nothing.
     fn cutoff_armed(&mut self, _gate: std::sync::Arc<crate::dispatch::CutoffGate>) {}
+    /// The absolute deadline for issuing the first native restore request.
+    fn restore_deadline(&mut self, _deadline: std::time::Instant) {}
+    /// How many milliseconds before the bracket's deadline the cutoff fires:
+    /// the time its restore takes to prepare, so that the restore request
+    /// itself is made by the deadline. The default is none.
+    fn cutoff_lead_ms(&self) -> u64 {
+        0
+    }
     /// The bracket ended with `outcome`, whose restore is already the hooked
     /// decision. A `deferred_restore` in it is still owed: the caller settles
     /// the held input first.
@@ -1899,6 +1923,7 @@ struct HookedHost<'a, H> {
     bound_ms: u64,
     cutoff: std::sync::Arc<crate::dispatch::CutoffGate>,
     timer: Option<crate::dispatch::CutoffTimer>,
+    picture: bool,
 }
 
 impl<H: crate::dispatch::FrontingBracketHost> HookedHost<'_, H> {
@@ -1938,8 +1963,15 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             // the start of the bounded interval just before this request:
             // registration and arming can take time, and none of it may move
             // the cutoff later than the bound.
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(self.bound_ms);
+            let stamped = std::time::Instant::now();
+            let deadline = stamped + std::time::Duration::from_millis(self.bound_ms);
+            // The cutoff fires early by the time its restore takes to prepare,
+            // so the restore request itself is made by the deadline.
+            let cutoff_at = deadline
+                .checked_sub(std::time::Duration::from_millis(
+                    self.hooks.cutoff_lead_ms(),
+                ))
+                .map_or(stamped, |at| at.max(stamped));
             if self.registration != Registration::NotYet {
                 // One temporary front per call: a later chunk is not
                 // fronted again under the same obligation.
@@ -1960,9 +1992,10 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             // own thread is doing. Without a timer nothing would enforce it,
             // so nothing is fronted; the obligation then reads as prevented.
             if let Some(restore) = self.hooks.cutoff_restore() {
+                self.hooks.restore_deadline(deadline);
                 match crate::dispatch::CutoffTimer::arm(
                     std::sync::Arc::clone(&self.cutoff),
-                    deadline,
+                    cutoff_at,
                     restore,
                 ) {
                     Some(timer) => {
@@ -1977,7 +2010,7 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             }
             // A registration that outlasted the bound leaves no time to
             // front in; the timer, firing at once, is already deciding.
-            if std::time::Instant::now() >= deadline {
+            if std::time::Instant::now() >= cutoff_at {
                 self.registration = Registration::Registered { prevented: true };
                 return false;
             }
@@ -1988,7 +2021,10 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             }
             self.registration = Registration::Registered { prevented: false };
             self.dispatching = true;
-            let requested = self.inner.request_front(pid);
+            let requested = self.inner.request_front_while(pid, &mut || {
+                self.hooks.target_front_permitted()
+                    && (self.timer.is_none() || std::time::Instant::now() < cutoff_at)
+            });
             // A platform can complete activation before its request returns.
             // Preserve that observation even if input aborts the next poll.
             if requested && self.inner.frontmost_pid() == Some(pid) {
@@ -2008,6 +2044,30 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             self.decided = Some(self.hooks.decide_restore());
         }
         true
+    }
+    fn begin_without_switch(&mut self, pid: u32) -> bool {
+        if !self.picture {
+            return true;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(self.bound_ms);
+        if !self.hooks.register(pid, pid, self.inner.restore_host()) {
+            self.registration = Registration::Refused;
+            return false;
+        }
+        self.registration = Registration::Registered { prevented: false };
+        // No activation is recorded: the timer can end the lock obligation,
+        // but neither the timer nor terminal cleanup may change the focus.
+        let timer = self.hooks.cutoff_restore().and_then(|finish| {
+            crate::dispatch::CutoffTimer::arm(std::sync::Arc::clone(&self.cutoff), deadline, finish)
+        });
+        if let Some(timer) = timer {
+            self.timer = Some(timer);
+            self.hooks.cutoff_armed(std::sync::Arc::clone(&self.cutoff));
+            true
+        } else {
+            self.registration = Registration::Registered { prevented: true };
+            false
+        }
     }
     fn our_pid(&self) -> i64 {
         self.inner.our_pid()
@@ -2150,6 +2210,17 @@ pub fn run_hooked_fronted<H: crate::dispatch::FrontingBracketHost + RestoreHostS
     hooks: &mut dyn FrontedDispatchHooks,
     read: Option<&mut dyn FnMut()>,
 ) -> crate::dispatch::BracketOutcome {
+    run_hooked_fronted_with_idle(host, estimator.into(), plan, cancelled, hooks, read)
+}
+
+fn run_hooked_fronted_with_idle<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>(
+    host: &mut H,
+    estimator: crate::dispatch::BracketIdle<'_>,
+    plan: crate::dispatch::BracketPlan,
+    cancelled: &dyn Fn() -> bool,
+    hooks: &mut dyn FrontedDispatchHooks,
+    read: Option<&mut dyn FnMut()>,
+) -> crate::dispatch::BracketOutcome {
     let predictor = (host.supports_needs_front_restore_predictor()
         && hooks.uses_needs_front_restore_predictor())
     .then(crate::dispatch::needs_front_restore_predictor);
@@ -2159,10 +2230,11 @@ pub fn run_hooked_fronted<H: crate::dispatch::FrontingBracketHost + RestoreHostS
 /// [`run_hooked_fronted`] with the restore predictor named rather than
 /// chosen, so a test can hand it one loaded from its own history file.
 pub(crate) fn run_hooked_fronted_with_predictor<
+    'a,
     H: crate::dispatch::FrontingBracketHost + RestoreHostSource,
 >(
     host: &mut H,
-    estimator: &mut crate::dispatch::UserIdleEstimator,
+    estimator: impl Into<crate::dispatch::BracketIdle<'a>>,
     plan: crate::dispatch::BracketPlan,
     cancelled: &dyn Fn() -> bool,
     hooks: &mut dyn FrontedDispatchHooks,
@@ -2184,6 +2256,7 @@ pub(crate) fn run_hooked_fronted_with_predictor<
         bound_ms: plan.maximum_interval_ms,
         cutoff: std::sync::Arc::new(crate::dispatch::CutoffGate::new()),
         timer: None,
+        picture: read.is_some(),
     };
     let mut outcome = match read {
         None => crate::dispatch::run_fronting_bracket_with_predictor(
@@ -2210,7 +2283,8 @@ pub(crate) fn run_hooked_fronted_with_predictor<
     if let Some(timer) = hooked.timer.take() {
         timer.finish();
     }
-    outcome.report.restore_started_by_cutoff = hooked.cutoff.restore_started_by_cutoff();
+    outcome.report.restore_started_by_cutoff =
+        hooked.previous != Some(Some(hooked.target)) && hooked.cutoff.restore_started_by_cutoff();
     match hooked.registration {
         Registration::NotYet => {}
         Registration::Refused | Registration::Registered { prevented: true } => {
