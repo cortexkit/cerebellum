@@ -254,9 +254,10 @@ fn a_front_write_stalled_past_the_deadline_hands_the_restore_to_the_late_watch()
     assert!(cell.late_watch_pending(), "{log:?}");
     assert_eq!(lock_releases(&releases), 0);
 
-    // Once the call's reply starts it, the late watch writes through the
-    // obligation's own host, with the previous application as bound before
-    // the front: nothing bound it again.
+    // Terminal cleanup starts the late watch as the call's reply goes out,
+    // here by hand. The watch writes through the obligation's own host, with
+    // the previous application as bound before the front: nothing bound it
+    // again.
     screen.state().restore_needs_remembered_previous = true;
     terminal.start_late_fronting(Some(&cell));
     let give_up = Instant::now() + crate::test_support::HANG_GUARD;
