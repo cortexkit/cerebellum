@@ -8,9 +8,9 @@
 //! has been requested. The restore's confirmation is reported, not promised
 //! within the bound: the person's application may come back late.
 //!
-//! The timer is armed when the front is requested and fires at the bound,
-//! whatever any timing history predicted. Firing stops new posts at once,
-//! and requests the restore itself at once, even while the front request is
+//! The timer is armed before the front is requested and can fire before the
+//! bound to leave time to prepare the restore. Firing stops new posts at once
+//! and begins the restore decision, even while the front request is
 //! still in flight, unless a key or button may be held: a restore under a
 //! held key would hand that key to the previous application, so then the
 //! unit's own paired releases run first and the bracket restores after
@@ -97,6 +97,7 @@ struct GateState {
     disarmed: bool,
     /// A post is in flight, or a press may be down.
     held: bool,
+    deferred_for_post: bool,
     /// The timer started the restore.
     restore_started_by_cutoff: bool,
     /// The absolute deadline the timer was armed for.
@@ -128,7 +129,16 @@ impl CutoffGate {
 
     /// No post is in flight and nothing the unit pressed is still down.
     pub fn all_released(&self) {
-        self.state().held = false;
+        let mut state = self.state();
+        if state.held && state.deadline.is_some_and(|at| Instant::now() >= at) {
+            state.deferred_for_post = true;
+        }
+        state.held = false;
+    }
+
+    /// A committed post or its paired release occupied the restore window.
+    pub fn restore_deferred_for_post(&self) -> bool {
+        self.state().deferred_for_post
     }
 
     /// Whether the bound passed.
@@ -173,6 +183,7 @@ impl CutoffGate {
         }
         state.fired = true;
         if state.held {
+            state.deferred_for_post = true;
             return false;
         }
         state.restore_started_by_cutoff = true;

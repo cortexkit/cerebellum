@@ -670,8 +670,18 @@ impl RestoreHost for PlatformRestoreHost {
     fn request_front(&mut self, pid: u32) -> bool {
         self.host.request_front(pid)
     }
+    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
+        self.host.request_front_while(pid, permitted)
+    }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
         self.fallback && self.host.request_front_fallback(pid)
+    }
+    fn request_front_fallback_while(
+        &mut self,
+        pid: u32,
+        permitted: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        self.fallback && self.host.request_front_fallback_while(pid, permitted)
     }
     fn hardware_input_snapshot(
         &mut self,
@@ -934,6 +944,10 @@ impl FrontedDispatchHooks for CellHooks {
             .is_some_and(|cell| cell.begin_front_attempt(front_instant_ms))
     }
 
+    fn target_front_permitted(&self) -> bool {
+        self.cell().is_some_and(|cell| !cell.cleanup_taken())
+    }
+
     fn front_attempt_returned(&mut self) {
         if let Some(cell) = self.cell() {
             cell.front_attempt_returned();
@@ -996,7 +1010,16 @@ impl FrontedDispatchHooks for CellHooks {
     }
 
     fn cutoff_armed(&mut self, gate: Arc<cerebellum_computer::dispatch::CutoffGate>) {
+        if let Some(cell) = self.cell() {
+            cell.set_cutoff(Arc::clone(&gate));
+        }
         self.state().cutoff = Some(gate);
+    }
+
+    fn restore_deadline(&mut self, deadline: Instant) {
+        if let Some(cell) = self.cell() {
+            cell.set_restore_deadline(deadline);
+        }
     }
 }
 

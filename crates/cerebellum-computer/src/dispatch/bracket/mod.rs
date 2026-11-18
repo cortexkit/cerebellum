@@ -20,6 +20,12 @@
 //! posting rather than assumed: each unit's post time and each restore's
 //! latency are timed, and a chunk ends when the next unit and a restore would
 //! no longer fit.
+//! The cutoff starts restore preparation early. An unsettled input release
+//! defers the restore; if OS focus reads stall past the deadline, the first
+//! native restore write is refused instead and the restore reports failure.
+//! A short-lived watcher can retry only while the target is still frontmost
+//! and observation shows the person has not intervened. Neither exception assumes focus or
+//! input is safe merely because time has passed.
 //!
 //! Everything platform-specific is behind [`FrontingBracketHost`], so the
 //! ordering, the chunking and the bound are driven by a fake clock in tests.
@@ -117,6 +123,10 @@ pub trait FrontingBracketHost {
     /// Ask the application `pid` runs to become frontmost. `false` when the
     /// request itself was refused.
     fn request_front(&mut self, pid: u32) -> bool;
+    /// Ask to front `pid` only if `permitted` still holds at the native write.
+    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
+        permitted() && self.request_front(pid)
+    }
     /// A second way to ask for `pid` to come to the front, used by a restore
     /// when [`Self::request_front`] was refused or has not taken effect within
     /// [`RESTORE_FALLBACK_AFTER_MS`]. `false` when the host has none or the

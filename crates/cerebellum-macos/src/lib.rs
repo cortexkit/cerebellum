@@ -249,11 +249,11 @@ pub use launch::{
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
-    activate_application, application_bundle_path, capture_window, capture_window_fenced,
-    capture_window_owned_by, encode_png, enumerate_windows, establish_window_server_connection,
-    frontmost_process_id, hardware_uuid, is_off_main_thread, post_event_at_hid_tap_for_measurement,
-    post_event_globally, post_event_to_pid, process_owner, process_start_time,
-    process_start_time_micros, responsible_process, running_applications,
+    activate_application, activate_application_while, application_bundle_path, capture_window,
+    capture_window_fenced, capture_window_owned_by, encode_png, enumerate_windows,
+    establish_window_server_connection, frontmost_process_id, hardware_uuid, is_off_main_thread,
+    post_event_at_hid_tap_for_measurement, post_event_globally, post_event_to_pid, process_owner,
+    process_start_time, process_start_time_micros, responsible_process, running_applications,
     screen_capture_is_permitted, screen_is_locked, CaptureError, CaptureSourceRect,
     CgEventPostCall, OwnedCgEvent, ProcessOwner, ProcessStartTime, RawCapture, RawWindow,
     RunningApplication,

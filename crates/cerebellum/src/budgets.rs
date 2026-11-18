@@ -57,10 +57,12 @@ pub const FRONTING_BRACKET_MS: u64 = 200;
 /// slowest with room for scheduling; a preparation measured slower raises
 /// the reserve, up to `RESTORE_PREPARATION_RESERVE_MAX_MS`.
 pub const RESTORE_PREPARATION_RESERVE_MS: u64 = 50;
-/// The most the cutoff fires early, however slow preparation was measured:
-/// half the bracket, so a front always leaves time to act. A preparation
-/// slower than this makes the restore request late, and the late request is
-/// measured and reported like any other.
+/// The most the cutoff fires early: half the bracket, to leave time to act.
+/// Two exceptions can leave the target in front past the bound. An unsettled
+/// input release defers restore until settlement. If OS focus reads stall
+/// into the deadline, the first native restore write is refused, the call
+/// reports `restore_failed`, and the watcher for late activations can retry
+/// if the target is still in front and input observation shows no intervention.
 pub const RESTORE_PREPARATION_RESERVE_MAX_MS: u64 = 100;
 /// How long a fronted picture read may keep the fronting lock from its
 /// start. Its pixels are refused past `FRONTING_BRACKET_MS` anyway; this

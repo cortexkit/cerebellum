@@ -554,8 +554,13 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
     // unit: a picture or a keystroke is never fronted for a process that has
     // since taken over the pid.
     fn request_front(&mut self, pid: u32) -> bool {
+        self.request_front_while(pid, &mut || true)
+    }
+
+    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
         self.request_front_with(pid, |still_ours| {
-            cerebellum_macos::request_frontmost_while(pid, still_ours).is_ok()
+            cerebellum_macos::request_frontmost_while(pid, &mut || still_ours() && permitted())
+                .is_ok()
         })
     }
 
@@ -822,6 +827,10 @@ impl FrontingRestoreHost for MacRestoreHost {
     }
 
     fn request_front(&mut self, pid: u32) -> bool {
+        self.request_front_while(pid, &mut || true)
+    }
+
+    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
         // Only the process recorded as the previous application, and only
         // while it still holds the pid, checked again right before the
         // activation is written.
@@ -829,11 +838,14 @@ impl FrontingRestoreHost for MacRestoreHost {
             self.previous,
             pid,
             cerebellum_macos::process_start_time_micros,
-            |still_ours| match &self.prepared {
-                Some(prepared) if prepared.pid() == pid => {
-                    prepared.request_while(still_ours).is_ok()
+            |still_ours| {
+                let permitted = &mut || still_ours() && permitted();
+                match &self.prepared {
+                    Some(prepared) if prepared.pid() == pid => {
+                        prepared.request_while(permitted).is_ok()
+                    }
+                    _ => cerebellum_macos::request_frontmost_while(pid, permitted).is_ok(),
                 }
-                _ => cerebellum_macos::request_frontmost_while(pid, still_ours).is_ok(),
             },
         )
     }
@@ -844,9 +856,17 @@ impl FrontingRestoreHost for MacRestoreHost {
     }
 
     fn request_front_fallback(&mut self, pid: u32) -> bool {
+        self.request_front_fallback_while(pid, &mut || true)
+    }
+
+    fn request_front_fallback_while(
+        &mut self,
+        pid: u32,
+        permitted: &mut dyn FnMut() -> bool,
+    ) -> bool {
         match self.previous {
             Some((previous, start)) if previous == pid => {
-                cerebellum_macos::activate_application(pid, start)
+                cerebellum_macos::activate_application_while(pid, start, permitted)
             }
             _ => false,
         }

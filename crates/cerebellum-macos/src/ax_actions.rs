@@ -900,24 +900,27 @@ pub fn request_frontmost_while(
     #[cfg(feature = "desk-probe")]
     note_frontmost_call_for_probe(pid, None);
     require_trust()?;
-    let code = write_if_still_ours(|| application(pid), still_ours, write_frontmost)?;
+    let code = write_frontmost(|| application(pid), still_ours)?;
     #[cfg(feature = "desk-probe")]
     note_frontmost_call_for_probe(pid, Some(code));
     frontmost_result(code)
 }
 
-fn write_frontmost(application: &AxRetainedElement) -> i32 {
+fn write_frontmost<E: std::borrow::Borrow<AxRetainedElement>>(
+    resolve: impl FnOnce() -> Result<E, AxElementActionError>,
+    still_ours: &mut dyn FnMut() -> bool,
+) -> Result<i32, AxElementActionError> {
     let name = CFString::from_static_str("AXFrontmost");
     let value = CFBoolean::new(true);
     // SAFETY: element, attribute name and the static Boolean are live for the
     // call.
-    unsafe {
+    write_if_still_ours(resolve, still_ours, |application| unsafe {
         AXUIElementSetAttributeValue(
-            application.as_ptr(),
+            application.borrow().as_ptr(),
             CFRetained::as_ptr(&name).as_ptr().cast(),
             (value as *const CFBoolean).cast(),
         )
-    }
+    })
 }
 
 fn frontmost_result(code: i32) -> Result<(), AxElementActionError> {
@@ -953,7 +956,7 @@ impl PreparedFrontmost {
         #[cfg(feature = "desk-probe")]
         note_frontmost_call_for_probe(self.pid, None);
         require_trust()?;
-        let code = write_if_still_ours(
+        let code = write_frontmost(
             || {
                 // The element's messaging timeout follows this thread's
                 // budget, not the one in force when it was resolved.
@@ -961,7 +964,6 @@ impl PreparedFrontmost {
                 Ok(&self.application)
             },
             still_ours,
-            |application: &&AxRetainedElement| write_frontmost(application),
         )?;
         #[cfg(feature = "desk-probe")]
         note_frontmost_call_for_probe(self.pid, Some(code));

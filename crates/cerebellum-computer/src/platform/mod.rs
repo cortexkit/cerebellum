@@ -1704,6 +1704,10 @@ pub trait FrontingRestoreHost: Send {
     fn pause_ms(&mut self, milliseconds: u64);
     fn frontmost_pid(&mut self) -> Option<u32>;
     fn request_front(&mut self, pid: u32) -> bool;
+    /// Check `permitted` at the actual restore write, after native preparation.
+    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
+        permitted() && self.request_front(pid)
+    }
     /// `None` when unavailable, which the decision reads as no input seen.
     fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot>;
     /// The application `pid` runs is the one a restore will put back. Called
@@ -1718,6 +1722,14 @@ pub trait FrontingRestoreHost: Send {
     /// process, or the request was refused.
     fn request_front_fallback(&mut self, _pid: u32) -> bool {
         false
+    }
+    /// The second restore route with the same final-write check.
+    fn request_front_fallback_while(
+        &mut self,
+        pid: u32,
+        permitted: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        permitted() && self.request_front_fallback(pid)
     }
 }
 
@@ -1845,6 +1857,10 @@ pub trait FrontedDispatchHooks: Send {
     /// The front request is about to be made at `front_instant_ms` on the
     /// bracket's clock. `false` when cleanup already took the obligation.
     fn begin_front_attempt(&mut self, front_instant_ms: u64) -> bool;
+    /// Whether cleanup has not yet taken the obligation at the target write.
+    fn target_front_permitted(&self) -> bool {
+        true
+    }
     /// The front request and its wait returned.
     fn front_attempt_returned(&mut self);
     /// The action observed its target frontmost, not merely a request return.
@@ -1863,6 +1879,8 @@ pub trait FrontedDispatchHooks: Send {
     /// before acquiring them, since the timer may fire while its read is
     /// already under way. The default keeps nothing.
     fn cutoff_armed(&mut self, _gate: std::sync::Arc<crate::dispatch::CutoffGate>) {}
+    /// The absolute deadline for issuing the first native restore request.
+    fn restore_deadline(&mut self, _deadline: std::time::Instant) {}
     /// How many milliseconds before the bracket's deadline the cutoff fires:
     /// the time its restore takes to prepare, so that the restore request
     /// itself is made by the deadline. The default is none.
@@ -1973,6 +1991,7 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             // own thread is doing. Without a timer nothing would enforce it,
             // so nothing is fronted; the obligation then reads as prevented.
             if let Some(restore) = self.hooks.cutoff_restore() {
+                self.hooks.restore_deadline(deadline);
                 match crate::dispatch::CutoffTimer::arm(
                     std::sync::Arc::clone(&self.cutoff),
                     cutoff_at,
@@ -2001,7 +2020,10 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             }
             self.registration = Registration::Registered { prevented: false };
             self.dispatching = true;
-            let requested = self.inner.request_front(pid);
+            let requested = self.inner.request_front_while(pid, &mut || {
+                self.hooks.target_front_permitted()
+                    && (self.timer.is_none() || std::time::Instant::now() < cutoff_at)
+            });
             // A platform can complete activation before its request returns.
             // Preserve that observation even if input aborts the next poll.
             if requested && self.inner.frontmost_pid() == Some(pid) {

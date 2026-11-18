@@ -175,11 +175,21 @@ pub trait RestoreHost: Send {
     /// Ask the application `pid` runs to become frontmost. `false` when the
     /// request itself was refused.
     fn request_front(&mut self, pid: u32) -> bool;
+    fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
+        permitted() && self.request_front(pid)
+    }
     /// A second way to ask for `pid`, the application a restore puts back,
     /// to come to the front, for when [`Self::request_front`] has not taken
     /// effect. `false` when the host has none or the request was refused.
     fn request_front_fallback(&mut self, _pid: u32) -> bool {
         false
+    }
+    fn request_front_fallback_while(
+        &mut self,
+        pid: u32,
+        permitted: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        permitted() && self.request_front_fallback(pid)
     }
     /// The process-wide session observer's hardware input timestamps, on
     /// this host's clock. `None` when unavailable, which the decision reads
@@ -303,6 +313,9 @@ pub struct RestoreCell {
 }
 
 struct RestoreCellInner {
+    restore_deadline: Option<std::time::Instant>,
+    cutoff: Option<Arc<crate::computer::dispatch::CutoffGate>>,
+    late_start: Option<Box<dyn FnOnce() + Send>>,
     attempt: crate::computer::dispatch::FrontAttempt,
     host: Option<Box<dyn RestoreHost>>,
     lock: Option<FrontingLockGuard>,
@@ -338,6 +351,9 @@ impl RestoreCell {
             mode: obligation.mode,
             purpose: obligation.purpose,
             inner: std::sync::Mutex::new(RestoreCellInner {
+                restore_deadline: None,
+                cutoff: None,
+                late_start: None,
                 attempt: crate::computer::dispatch::FrontAttempt::new(),
                 host: Some(obligation.host),
                 lock: Some(obligation.lock),
@@ -412,6 +428,14 @@ impl RestoreCell {
     /// cutoff has taken the obligation: the front is ending.
     pub fn cleanup_taken(&self) -> bool {
         self.inner().attempt.taken()
+    }
+
+    pub(crate) fn set_restore_deadline(&self, deadline: std::time::Instant) {
+        self.inner().restore_deadline = Some(deadline);
+    }
+
+    pub(crate) fn set_cutoff(&self, cutoff: Arc<crate::computer::dispatch::CutoffGate>) {
+        self.inner().cutoff = Some(cutoff);
     }
 
     /// A picture read is starting while the target may be in front. The
@@ -545,6 +569,12 @@ impl RestoreCell {
             }
         };
         let confirmed = inner.front_confirmed;
+        let deadline = inner.restore_deadline.filter(|_| {
+            inner
+                .cutoff
+                .as_ref()
+                .is_none_or(|cutoff| !cutoff.restore_deferred_for_post())
+        });
         let host = inner.host.take();
         drop(inner);
         let outcome = match host {
@@ -552,11 +582,13 @@ impl RestoreCell {
                 let mut adapter = RestoreDecisionHost {
                     host: host.as_mut(),
                     _target: self.target_pid,
-                    requested_at: None,
+                    write_deadline: deadline.map(|deadline| {
+                        restore_preparation::WriteDeadline::new(deadline, started, at_cutoff)
+                    }),
                     #[cfg(all(feature = "desk-probe", target_os = "macos"))]
                     probe_timing: &self.probe_timing,
                 };
-                let outcome = if at_cutoff && !confirmed {
+                let mut outcome = if at_cutoff && !confirmed {
                     crate::computer::dispatch::restore_without_awaiting_activation(
                         &mut adapter,
                         self.previous_pid,
@@ -574,18 +606,18 @@ impl RestoreCell {
                         confirmed,
                     )
                 };
-                // How long the cutoff took to reach its restore request: the
-                // cutoff fires that much early next time.
-                if let (true, Some(requested_at)) = (at_cutoff, adapter.requested_at) {
-                    restore_preparation::record(
-                        u64::try_from(requested_at.saturating_duration_since(started).as_millis())
-                            .unwrap_or(u64::MAX),
-                    );
+                let expired = adapter.write_deadline.as_ref().is_some_and(|guard| {
+                    guard.record_sample();
+                    guard.expired
+                });
+                if expired {
+                    outcome.restore = self.failed().restore;
+                    outcome.restore_ms = None;
                 }
                 // An activation the action never confirmed is always left to
                 // the late watch, even one restored here: the same activation
                 // can land again after this decision.
-                if !confirmed
+                if (expired || !confirmed)
                     && !matches!(
                         outcome.restore,
                         crate::computer::dispatch::RestoreStatus::NotNeeded
@@ -693,7 +725,7 @@ impl RestoreCell {
             let mut adapter = RestoreDecisionHost {
                 host: host.as_mut(),
                 _target: self.target_pid,
-                requested_at: None,
+                write_deadline: None,
                 #[cfg(all(feature = "desk-probe", target_os = "macos"))]
                 probe_timing: &self.probe_timing,
             };
@@ -762,6 +794,7 @@ impl RestoreCell {
         decided: RestoreDecided,
     ) -> RestoreDecided {
         inner.decided = Some(decided);
+        let late_start = inner.late_start.take();
         let lock = if inner.pending_since.is_none()
             && inner.reads_in_flight == 0
             && inner.release_wait.is_none()
@@ -773,6 +806,9 @@ impl RestoreCell {
         drop(inner);
         self.changed.notify_all();
         drop(lock);
+        if let Some(start) = late_start {
+            start();
+        }
         decided
     }
 
@@ -905,8 +941,7 @@ pub(crate) fn stalled_picture_reads() -> (usize, u64) {
 struct RestoreDecisionHost<'a> {
     host: &'a mut dyn RestoreHost,
     _target: u32,
-    /// When the decision first asked for an application to come forward.
-    requested_at: Option<std::time::Instant>,
+    write_deadline: Option<restore_preparation::WriteDeadline>,
     #[cfg(all(feature = "desk-probe", target_os = "macos"))]
     probe_timing: &'a probe_timing::ProbeTiming,
 }
@@ -931,8 +966,8 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
         self.host.frontmost_pid()
     }
     fn request_front(&mut self, pid: u32) -> bool {
-        self.requested_at
-            .get_or_insert_with(std::time::Instant::now);
+        let guard = &mut self.write_deadline;
+        let mut permitted = || guard.as_mut().is_none_or(|guard| guard.permit());
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
         {
             probe_timing::request_restore(
@@ -940,12 +975,15 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
                 self.probe_timing,
                 pid,
                 probe_timing::RestoreSlot::First,
+                &mut permitted,
             )
         }
         #[cfg(not(all(feature = "desk-probe", target_os = "macos")))]
-        self.host.request_front(pid)
+        self.host.request_front_while(pid, &mut permitted)
     }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
+        let guard = &mut self.write_deadline;
+        let mut permitted = || guard.as_mut().is_none_or(|guard| guard.permit());
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
         {
             probe_timing::request_restore(
@@ -953,10 +991,11 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
                 self.probe_timing,
                 pid,
                 probe_timing::RestoreSlot::Second,
+                &mut permitted,
             )
         }
         #[cfg(not(all(feature = "desk-probe", target_os = "macos")))]
-        self.host.request_front_fallback(pid)
+        self.host.request_front_fallback_while(pid, &mut permitted)
     }
     fn late_activation_observed(&mut self, _latency_ms: u64) {
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
@@ -1130,16 +1169,29 @@ impl TerminalArbiter {
             )
         };
         if let Some(cell) = cell {
-            late_fronting::start(
-                &cell,
-                request_id(&self.request),
-                self.fronting_domain
-                    .load(std::sync::atomic::Ordering::Acquire),
-                self.route_namespace
-                    .load(std::sync::atomic::Ordering::Acquire),
-                cause,
-                self.late_fronting_recorder.lock().unwrap().clone(),
-            );
+            let request = request_id(&self.request);
+            let domain = self
+                .fronting_domain
+                .load(std::sync::atomic::Ordering::Acquire);
+            let namespace = self
+                .route_namespace
+                .load(std::sync::atomic::Ordering::Acquire);
+            let recorder = self.late_fronting_recorder.lock().unwrap().clone();
+            let weak = Arc::downgrade(&cell);
+            let start = move || {
+                if let Some(cell) = weak.upgrade() {
+                    late_fronting::start(&cell, request, domain, namespace, cause, recorder);
+                }
+            };
+            let mut inner = cell.inner();
+            if inner.decided.is_none() {
+                // Terminal cleanup can give up waiting before the restore
+                // owner hands the host and lock to the late activation watcher.
+                inner.late_start.get_or_insert_with(|| Box::new(start));
+            } else {
+                drop(inner);
+                start();
+            }
         }
     }
 
@@ -2848,6 +2900,7 @@ mod restore_slot_tests {
         comes_forward: bool,
         snapshot: Option<HardwareInputSnapshot>,
         requests: Vec<u32>,
+        focus_delay: Option<Duration>,
         /// Release and restore steps in the order they happened.
         log: Vec<&'static str>,
     }
@@ -2866,6 +2919,7 @@ mod restore_slot_tests {
                 last_input_ms: None,
             }),
             requests: Vec::new(),
+            focus_delay: None,
             log: Vec::new(),
         }))
     }
@@ -2880,6 +2934,10 @@ mod restore_slot_tests {
             self.0.lock().unwrap().now += milliseconds;
         }
         fn frontmost_pid(&mut self) -> Option<u32> {
+            let delay = self.0.lock().unwrap().focus_delay.take();
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
             self.0.lock().unwrap().frontmost
         }
         fn request_front(&mut self, pid: u32) -> bool {
@@ -2972,6 +3030,44 @@ mod restore_slot_tests {
         }
         cell.front_confirmed();
         cell.front_attempt_returned();
+    }
+
+    #[test]
+    fn a_slow_restore_focus_read_refuses_the_primary_write_and_hands_off_after_terminal() {
+        let shared = screen(true);
+        let releases = Arc::new(AtomicUsize::new(0));
+        let terminal = TerminalArbiter::new(request());
+        let cell = terminal
+            .register_restore(obligation(&shared, &releases))
+            .unwrap();
+        assert!(cell.begin_front_attempt(0));
+        cell.front_confirmed();
+        cell.front_attempt_returned();
+        cell.set_restore_deadline(std::time::Instant::now() + Duration::from_millis(10));
+        shared.lock().unwrap().focus_delay = Some(Duration::from_millis(30));
+
+        // Terminal has stopped waiting before the deciding owner returns.
+        terminal.start_late_fronting(Some(&cell));
+        let expired = restore_preparation::expired_writes();
+        let decided = cell.decide_at_cutoff();
+        assert_eq!(
+            decided.restore,
+            RestoreStatus::Failed {
+                left_in_front: Some(TARGET)
+            }
+        );
+        assert!(decided.restore_ms.is_none());
+        assert!(restore_preparation::expired_writes() > expired);
+        let end = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+        while releases.load(SeqCst) == 0 && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(releases.load(SeqCst), 1, "late watch took the obligation");
+        assert_eq!(
+            shared.lock().unwrap().requests,
+            [PREVIOUS],
+            "only the watch wrote"
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use cerebellum_computer::dispatch::BracketPlan;
 use std::time::Instant;
 
 /// The bracket's bound, in real milliseconds for the timer.
-const BOUND_MS: u64 = 100;
+const BOUND_MS: u64 = crate::budgets::FRONTING_BRACKET_MS;
 
 fn app_use_hooks() -> (CellHooks, Arc<std::sync::atomic::AtomicUsize>) {
     let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -79,7 +79,10 @@ fn a_blocked_picture_read_has_its_restore_started_by_the_cutoff_exactly_once() {
         "no restore while the read was blocked: {:?}",
         screen.log()
     );
-    assert!(started.elapsed() >= Duration::from_millis(BOUND_MS));
+    assert!(
+        started.elapsed()
+            >= Duration::from_millis(BOUND_MS - crate::budgets::RESTORE_PREPARATION_RESERVE_MAX_MS)
+    );
     assert!(outcome.report.restore_started_by_cutoff);
     assert_eq!(outcome.report.restore, RestoreStatus::Restored);
     assert_eq!(restores(&screen), 1, "one restore: {:?}", screen.log());
@@ -170,7 +173,7 @@ fn a_slow_registration_does_not_move_the_cutoff_past_the_bound() {
     let screen = Screen::new(&mail_desk());
     // Registration takes most of the bound before the timer is armed. The
     // cutoff counts from the stamp made before it, not from the arming.
-    screen.state().register_blocks_ms = BOUND_MS * 4 / 5;
+    screen.state().register_blocks_ms = BOUND_MS * 2 / 5;
     let (hooks, _releases) = app_use_hooks();
     let mut boxed = boxed_hooks(&hooks);
     let reader = screen.clone();
@@ -223,6 +226,7 @@ fn the_cutoff_requests_the_restore_at_once_while_the_activation_is_still_in_flig
     // The activation request blocks well past the bound.
     let front_blocks_ms = 2 * BOUND_MS;
     screen.state().front_blocks_ms = front_blocks_ms;
+    screen.state().restore_focus_delay_ms = 10;
     let (hooks, releases) = app_use_hooks();
     let mut boxed = boxed_hooks(&hooks);
     let started = Instant::now();
@@ -244,10 +248,10 @@ fn the_cutoff_requests_the_restore_at_once_while_the_activation_is_still_in_flig
         ],
         "the restore is requested at the cutoff, not after the activation returns"
     );
-    // The hard bound on the restore request: the cutoff, plus scheduling.
+    // The hard bound applies to the write, after the slow focus reads.
     let restored_after = first_restore_after(&screen, started);
     assert!(
-        restored_after < Duration::from_millis(BOUND_MS + BOUND_MS / 2),
+        restored_after <= Duration::from_millis(BOUND_MS),
         "restore requested {restored_after:?} after the bracket began"
     );
     assert!(outcome.report.restore_started_by_cutoff);
