@@ -46,8 +46,10 @@ use std::time::{Duration, Instant};
 /// front: the target is still the frontmost application, the unit has not
 /// been stopped, and the bracket's absolute deadline has not passed; then
 /// the post is committed on the cutoff gate. The sequence runs them after
-/// the window listing and transport authentication. The final generation
-/// lookup follows the focus read and precedes stop and commitment.
+/// the window listing and transport authentication. Focus is read before
+/// and again after the final generation lookup, so neither a replacement
+/// during the first focus read nor a focus change during the lookup is
+/// missed; stop and commitment follow the last focus read.
 ///
 /// A post refused here was never made, so the refusal is
 /// [`ProcessEventRefusal::Cancelled`], which a reply reads as no post call
@@ -80,6 +82,12 @@ where
             return Err(ProcessEventRefusal::Cancelled);
         }
         revalidate()?;
+        // The identity lookup is itself a blocking system call, and focus
+        // can move to another application during it while the target keeps
+        // its process. The last focus answer must postdate it.
+        if (self.frontmost_pid)() != Some(self.target_pid) {
+            return Err(ProcessEventRefusal::Cancelled);
+        }
         if cancelled() {
             return Err(ProcessEventRefusal::Cancelled);
         }

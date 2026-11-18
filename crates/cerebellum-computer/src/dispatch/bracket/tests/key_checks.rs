@@ -47,6 +47,9 @@ struct Keyboard {
     /// The process-generation reading with this number (from 1) takes past
     /// any deadline on the fake clock.
     slow_generation_read: Option<usize>,
+    /// During the process-generation reading with this number (from 1),
+    /// another application comes to the front; the target keeps its process.
+    focus_moves_during_generation_read: Option<usize>,
     generation_reads: Cell<usize>,
     /// The unit is stopped while focus is being read.
     stop_during_focus_read: bool,
@@ -69,6 +72,7 @@ impl Keyboard {
             fire_during_post: false,
             preparation_ms: 0,
             slow_generation_read: None,
+            focus_moves_during_generation_read: None,
             generation_reads: Cell::new(0),
             stop_during_focus_read: false,
             stopped: Cell::new(false),
@@ -87,6 +91,9 @@ impl PerProcessEventTransport for Transport<'_> {
         keyboard.generation_reads.set(reads);
         if keyboard.slow_generation_read == Some(reads) {
             keyboard.now.set(keyboard.now.get() + 1_000);
+        }
+        if keyboard.focus_moves_during_generation_read == Some(reads) {
+            keyboard.frontmost.set(Some(THIRD));
         }
         ProcessGenerationReading::Started(keyboard.generation.get())
     }
@@ -454,6 +461,16 @@ fn the_deadline_passing_during_the_final_generation_lookup_refuses_the_post() {
     // The first reading comes with the listing read; the second is the
     // final lookup just before the post.
     keyboard.slow_generation_read = Some(2);
+    refused_before_any_post(&keyboard);
+}
+
+#[test]
+fn focus_moving_during_the_final_generation_lookup_refuses_the_post() {
+    let mut keyboard = Keyboard::new();
+    // The first reading comes with the listing read; the second is the
+    // final lookup just before the post. The process is not replaced, so
+    // the lookup itself passes.
+    keyboard.focus_moves_during_generation_read = Some(2);
     refused_before_any_post(&keyboard);
 }
 
