@@ -99,6 +99,8 @@ struct GateState {
     held: bool,
     /// The timer started the restore.
     restore_started_by_cutoff: bool,
+    /// The absolute deadline the timer was armed for.
+    deadline: Option<Instant>,
 }
 
 impl CutoffGate {
@@ -132,6 +134,22 @@ impl CutoffGate {
     /// Whether the bound passed.
     pub fn fired(&self) -> bool {
         self.state().fired
+    }
+
+    /// Record the absolute deadline the timer is armed for, so a check need
+    /// not wait for the timer's thread to have run.
+    pub fn set_deadline(&self, deadline: Instant) {
+        self.state().deadline = Some(deadline);
+    }
+
+    /// Whether the bound passed: the timer fired, or the absolute deadline
+    /// is behind the clock even if the timer has not run yet.
+    pub fn past_deadline(&self) -> bool {
+        let state = self.state();
+        state.fired
+            || state
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     /// The bracket is starting its own restore; a timer firing after this
@@ -184,6 +202,7 @@ impl CutoffTimer {
         deadline: Instant,
         restore: Box<dyn FnOnce() + Send>,
     ) -> Option<Self> {
+        gate.set_deadline(deadline);
         let (stop, stopped) = mpsc::channel::<()>();
         let thread = std::thread::Builder::new()
             .name("fronting-cutoff".into())

@@ -842,17 +842,27 @@ impl CellHooks {
     }
 
     /// Whether a picture read may still acquire pixels: the cutoff has not
-    /// fired and no cleanup has taken the obligation. Asked immediately
-    /// before the pixels are requested, and again once they arrived, so a
-    /// read that was already under way when the bound passed acquires
-    /// nothing, or has what it acquired withheld.
+    /// fired, its absolute deadline has not passed (whether or not the timer
+    /// has run yet), and no cleanup has taken the obligation. Asked
+    /// immediately before the pixels are requested, by the completion before
+    /// any are copied, and again once they arrived, so a read that was
+    /// already under way when the bound passed acquires nothing, or has what
+    /// it acquired withheld.
     pub(crate) fn picture_may_acquire(&self) -> bool {
         let (cutoff, cell) = {
             let state = self.state();
             (state.cutoff.clone(), state.cell.clone())
         };
-        !cutoff.is_some_and(|cutoff| cutoff.fired())
+        !cutoff.is_some_and(|cutoff| cutoff.past_deadline())
             && !cell.is_some_and(|cell| cell.cleanup_taken())
+    }
+
+    /// Whether the cutoff timer fired for this front.
+    pub(crate) fn cutoff_fired(&self) -> bool {
+        self.state()
+            .cutoff
+            .as_ref()
+            .is_some_and(|cutoff| cutoff.fired())
     }
 
     /// Keep the fronting lock for a picture read under way, until the hold

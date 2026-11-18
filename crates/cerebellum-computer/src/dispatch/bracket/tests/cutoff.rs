@@ -136,3 +136,14 @@ fn key_checks_refuse_a_press_once_the_cutoff_fired_and_mark_a_press_held() {
     );
     checks.all_released();
 }
+
+#[test]
+fn a_passed_deadline_counts_before_the_timer_has_run() {
+    let gate = CutoffGate::new();
+    assert!(!gate.past_deadline(), "no deadline yet");
+    gate.set_deadline(Instant::now() + Duration::from_secs(3600));
+    assert!(!gate.past_deadline());
+    gate.set_deadline(Instant::now() - Duration::from_millis(1));
+    assert!(!gate.fired(), "the timer has not run");
+    assert!(gate.past_deadline(), "the clock alone closes it");
+}

@@ -366,3 +366,17 @@ fn a_restore_the_cutoff_ran_is_sampled_at_its_own_cost_not_the_readers_wait() {
         "the restore took at least the fallback delay, but was sampled at {sampled:?}"
     );
 }
+
+#[test]
+fn a_picture_may_not_acquire_past_the_deadline_even_before_the_timer_runs() {
+    let (hooks, _releases) = app_use_hooks();
+    let mut boxed = boxed_hooks(&hooks);
+    let gate = Arc::new(cerebellum_computer::dispatch::CutoffGate::new());
+    gate.set_deadline(Instant::now() + Duration::from_secs(3600));
+    boxed.cutoff_armed(Arc::clone(&gate));
+    assert!(hooks.picture_may_acquire(), "inside the bound");
+    // A late-scheduled timer has not fired, but the deadline is behind.
+    gate.set_deadline(Instant::now() - Duration::from_millis(1));
+    assert!(!gate.fired());
+    assert!(!hooks.picture_may_acquire());
+}

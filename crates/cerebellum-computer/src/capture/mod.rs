@@ -536,6 +536,16 @@ pub enum BackendTeardownProgress {
 pub const FENCE_CLOSED: &str =
     "the bounded time in front ended before the capture; no pixels were requested";
 
+/// Asked whether a bounded capture may still acquire pixels. Shared with
+/// the platform's capture completion, which may run on another thread after
+/// the request was made.
+pub type AcquisitionFence = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// A fence that never closes, for captures with no bound of their own.
+pub fn open_fence() -> AcquisitionFence {
+    std::sync::Arc::new(|| true)
+}
+
 /// The native ScreenCaptureKit implementation is expected to make these calls
 /// non-blocking.  In particular, teardown is split into begin/poll so a revoked
 /// stream cannot wedge the health lane while the window-server releases it.
@@ -599,7 +609,7 @@ pub trait CaptureBackend {
     fn capture_window_unencoded_for_vision_fenced(
         &mut self,
         request: &WindowCaptureRequest,
-        may_acquire: &dyn Fn() -> bool,
+        may_acquire: &AcquisitionFence,
     ) -> Result<PendingVisionWindowFrame, BackendError> {
         if !may_acquire() {
             return Err(BackendError::Capture(FENCE_CLOSED.into()));
@@ -811,7 +821,7 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         &mut self,
         now_ms: u64,
     ) -> Result<PendingSingleWindowCapture, SingleWindowCaptureError> {
-        self.capture_frontmost_window_unencoded_for_vision_fenced(now_ms, &|| true)
+        self.capture_frontmost_window_unencoded_for_vision_fenced(now_ms, &open_fence())
     }
 
     /// [`Self::capture_frontmost_window_unencoded_for_vision`] for a read
@@ -822,7 +832,7 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
     pub fn capture_frontmost_window_unencoded_for_vision_fenced(
         &mut self,
         now_ms: u64,
-        may_acquire: &dyn Fn() -> bool,
+        may_acquire: &AcquisitionFence,
     ) -> Result<PendingSingleWindowCapture, SingleWindowCaptureError> {
         let (window, request) = self.select_vision_window(now_ms)?;
         let frame = self
@@ -1524,11 +1534,14 @@ mod tests {
         let mut controller =
             ScopedCaptureController::with_v1_bounds(backend, owner.clone()).unwrap();
         assert!(controller
-            .capture_frontmost_window_unencoded_for_vision_fenced(5, &|| false)
+            .capture_frontmost_window_unencoded_for_vision_fenced(
+                5,
+                &(std::sync::Arc::new(|| false) as AcquisitionFence)
+            )
             .is_err());
         assert!(controller.backend().window_requests().is_empty());
         controller
-            .capture_frontmost_window_unencoded_for_vision_fenced(6, &|| true)
+            .capture_frontmost_window_unencoded_for_vision_fenced(6, &open_fence())
             .unwrap();
         assert_eq!(controller.backend().window_requests().len(), 1);
     }
