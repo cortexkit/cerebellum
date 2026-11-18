@@ -146,7 +146,7 @@ fn printed_build_provenance_matches_hello() {
 }
 
 #[test]
-fn invalid_configuration_prints_the_no_config_manifest_without_writes() {
+fn invalid_configuration_does_not_change_the_manifest_or_write_files() {
     let home = TestHome::new();
     let expected = inspect(home.path());
     let config_dir = home.path().join("config/cortexkit");
@@ -161,27 +161,32 @@ fn invalid_configuration_prints_the_no_config_manifest_without_writes() {
 }
 
 #[test]
-fn valid_configuration_advertises_browser_tools_without_writes() {
+fn browser_advertisement_depends_on_the_build_not_configuration() {
     let home = TestHome::new();
+    let without_file = inspect(home.path());
     let config_dir = home.path().join("config/cortexkit");
     std::fs::create_dir_all(&config_dir).unwrap();
     let config = config_dir.join("cerebellum.jsonc");
     let text = r#"{"browser":{"launch_handshake_deadline_ms":10000,"termination_grace_period_ms":5000,"browser_idle_timeout_ms":60000,"browser_exit_observation_deadline_ms":5000,"navigation_settle_deadline_ms":30000}}"#;
     std::fs::write(&config, text).unwrap();
     let manifest = inspect(home.path());
-    assert!(manifest["provides"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|provider| {
-            provider["tools"].as_array().is_some_and(|tools| {
-                tools.iter().any(|tool| {
-                    tool["name"]
-                        .as_str()
-                        .is_some_and(|name| name.starts_with("browser"))
+    assert_eq!(manifest, without_file);
+    assert_eq!(
+        manifest["provides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|provider| {
+                provider["tools"].as_array().is_some_and(|tools| {
+                    tools.iter().any(|tool| {
+                        tool["name"]
+                            .as_str()
+                            .is_some_and(|name| name.starts_with("browser"))
+                    })
                 })
-            })
-        }));
+            }),
+        cfg!(any(target_os = "macos", target_os = "linux"))
+    );
     assert!(manifest.get("browser_surface_refused").is_none());
     assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
     assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);

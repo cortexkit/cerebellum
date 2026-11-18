@@ -20,10 +20,11 @@
 //! would do. Pass `--allow` only after the operator has approved the clear;
 //! the approval should be recorded somewhere they can see.
 //!
-//! Run: `cargo run -p cerebellum --example clear_launch_recovery -- <agent_project_id> [--allow]`
+//! Run: `cargo run -p cerebellum --example clear_launch_recovery -- <agent_project_id> <browser-config-path> [--allow]`
 
 #[cfg(target_os = "macos")]
 mod live {
+    use std::path::Path;
     use std::process::ExitCode;
     use std::sync::Arc;
     use std::time::Duration;
@@ -64,8 +65,15 @@ mod live {
         .expect("frame")
     }
 
-    pub async fn run(project: String, allow: bool) -> ExitCode {
-        let config = match cerebellum::browser_config::load_browser_config_file() {
+    pub async fn run(project: String, config_path: &Path, allow: bool) -> ExitCode {
+        let text = match std::fs::read_to_string(config_path) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("cannot read the supplied browser configuration: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        let config = match cerebellum::browser_config::parse_browser_config(&text) {
             Ok(Some(config)) => config,
             Ok(None) => {
                 eprintln!("no browser is configured, so there is no launch journal to clear");
@@ -234,19 +242,27 @@ mod live {
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let mut project = None;
+    let mut config = None;
     let mut allow = false;
     for argument in std::env::args().skip(1) {
         if argument == "--allow" {
             allow = true;
         } else if project.is_none() {
             project = Some(argument);
+        } else if config.is_none() {
+            config = Some(argument);
+        } else {
+            eprintln!("unexpected argument: {argument}");
+            return std::process::ExitCode::from(2);
         }
     }
-    let Some(project) = project else {
-        eprintln!("usage: clear_launch_recovery <agent_project_id> [--allow]");
+    let (Some(project), Some(config)) = (project, config) else {
+        eprintln!(
+            "usage: clear_launch_recovery <agent_project_id> <browser-config-path> [--allow]"
+        );
         return std::process::ExitCode::from(2);
     };
-    live::run(project, allow).await
+    live::run(project, std::path::Path::new(&config), allow).await
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -408,7 +408,7 @@ mod daemon {
                 .scope(
                     std::cell::RefCell::new(None),
                     CALL.scope(self.call.clone(), async {
-                        let mode = live.current().unwrap();
+                        let mode = live.current_settings().unwrap();
                         let mode = live.approved_mode(mode, cancel).await;
                         (
                             mode,
@@ -503,6 +503,56 @@ mod daemon {
         set("foreground", 4);
         assert_eq!(f.mode(&live, &cancel).await.0, AppUse::Foreground);
         assert_eq!(f.prompts(), 3, "an unknown setting also ends approval");
+    }
+
+    async fn managed_settings_only_skip_confirmation_for_stamped_modes() {
+        use crate::settings::{config_apply, LiveSettings};
+        use subc_protocol::config::{ConfigStatus, ConfigView};
+
+        let f = Fixture::start("approve\napprove\n").await;
+        let live = LiveAppUse::without_file();
+        let cancel = crate::CancelHandle::pending();
+        let foreground = |status| {
+            config_apply(&ConfigView::new(
+                0,
+                json!({"computer_use":{"app_use":"foreground"}}),
+                Default::default(),
+                vec![],
+                status,
+            ))
+            .unwrap()
+        };
+
+        for status in [ConfigStatus::Active, ConfigStatus::Pending] {
+            live.apply(foreground(status));
+            assert_eq!(f.mode(&live, &cancel).await, (AppUse::Foreground, None));
+            assert_eq!(f.prompts(), 0);
+            live.apply(LiveSettings::default());
+            assert_eq!(f.mode(&live, &cancel).await, (AppUse::Background, None));
+        }
+
+        live.apply(foreground(ConfigStatus::Unstamped));
+        assert_eq!(f.mode(&live, &cancel).await, (AppUse::Foreground, None));
+        assert_eq!(f.prompts(), 1);
+
+        let restarted = LiveAppUse::without_file();
+        restarted.apply(foreground(ConfigStatus::Unstamped));
+        assert_eq!(
+            f.mode(&restarted, &cancel).await,
+            (AppUse::Foreground, None)
+        );
+        assert_eq!(f.prompts(), 2);
+
+        let f = Fixture::start("decline\n").await;
+        let live = LiveAppUse::without_file();
+        live.apply(foreground(ConfigStatus::Unstamped));
+        let (mode, note) = f.mode(&live, &cancel).await;
+        assert_eq!(mode, AppUse::Background);
+        assert!(note.unwrap().contains("declined"));
+        let (mode, note) = f.mode(&live, &cancel).await;
+        assert_eq!(mode, AppUse::Background);
+        assert!(note.unwrap().contains("retry after"));
+        assert_eq!(f.prompts(), 1);
     }
 
     async fn failures_and_deadlines() {
@@ -686,6 +736,7 @@ mod daemon {
                     return;
                 }
                 approvals_and_changes().await;
+                managed_settings_only_skip_confirmation_for_stamped_modes().await;
                 failures_and_deadlines().await;
                 concurrent_calls_share_one_prompt().await;
                 cancel_and_goodbye_withdraw().await;

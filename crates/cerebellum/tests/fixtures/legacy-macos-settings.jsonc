@@ -1,0 +1,49 @@
+// Cerebellum: motor execution for the browser and computer planes.
+//
+// Read once at module start. Changes take effect on the next restart.
+{
+  // The insulated health lane. These bound how stale the dispatch path may
+  // look before health.check reports degraded; they never gate execution.
+  "health": {
+    "dispatch_heartbeat_stale_ms": 5000,
+    "queue_age_stale_ms": 30000
+  },
+
+  // The browser an agent launches for itself.
+  //
+  // This names the EXECUTABLE to run, not a profile to use. Each agent gets
+  // its own profile directory minted under the cortexkit data dir, so a
+  // launched browser never opens the profile or the logins of the Chrome you
+  // use yourself. Removing this section makes browser.launch refuse with
+  // executable_missing, which is also the state before this file existed.
+  "browser": {
+    "executable_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+
+    // Verified against the executable's code signature before the process is
+    // released to run. A binary substituted at the path above is refused, so
+    // this is required whenever executable_path is set.
+    "expected_identity": "com.google.Chrome",
+
+    // How long to wait for the launched browser to answer over the control
+    // pipe. Generous because a cold start pays for macOS signature validation.
+    "launch_handshake_deadline_ms": 10000,
+
+    // How long a graceful close is given before the process is killed. A
+    // force-killed browser loses profile writes it has not flushed, which for
+    // a durable profile is the logged-in state, so this is not a value to trim.
+    "termination_grace_period_ms": 5000,
+
+    // How long a browser may sit unused before it is closed and its profile
+    // released. Idle teardown runs the same graceful ladder as an explicit
+    // close, so an expired session still flushes its writes.
+    "browser_idle_timeout_ms": 600000,
+
+    // How long to wait to observe that a closed browser has actually exited.
+    "browser_exit_observation_deadline_ms": 5000,
+
+    // The budget for a navigation asked to wait for settlement. Settlement
+    // needs a window of network quiet after load, so a value at or below that
+    // window is refused at parse rather than silently never settling.
+    "navigation_settle_deadline_ms": 10000
+  }
+}

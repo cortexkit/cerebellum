@@ -7,60 +7,17 @@
 //! complete while that manifest stays empty.
 
 fn main() {
-    // The browser half first, because its reachable set is the one most likely
-    // to be misjudged: a capability can be implemented and proved against a
-    // real browser, yet still answer unknown_method because the dispatch
-    // predicate does not name it. `configured` is what a host with a browser
-    // configured sees; the other column is what a host without one sees.
-    // Read from the installed config rather than assumed, so this answers what
-    // a caller sees ON THIS MACHINE. A browser section that is absent or
-    // malformed is why an agent gets executable_missing, and that is exactly
-    // the state this probe should be able to show.
-    let installed = match cerebellum::browser_config::load_browser_config_file() {
-        Ok(Some(config)) => {
-            println!(
-                "browser config:  {} (identity {})",
-                config
-                    .executable_path
-                    .as_deref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "no executable_path".to_string()),
-                config.expected_identity.as_deref().unwrap_or("none"),
-            );
-            config.executable_path.is_some()
-        }
-        Ok(None) => {
-            println!("browser config:  ABSENT -- launch would refuse executable_missing");
-            false
-        }
-        Err(error) => {
-            println!("browser config:  ERROR -- {error}");
-            false
-        }
-    };
-
-    println!();
-    println!("browser tools (this machine / a host with no browser):");
-    let configured = cerebellum::browser_wire_surface(installed);
-    let unconfigured = cerebellum::browser_wire_surface(false);
-    for (index, (name, reachable_when_configured)) in configured.iter().enumerate() {
-        let reachable_bare = unconfigured
-            .get(index)
-            .map(|(_, reachable)| *reachable)
-            .unwrap_or(false);
-        println!(
-            "  {name:<24} {} / {}",
-            if *reachable_when_configured {
-                "reachable"
-            } else {
-                "REFUSED  "
-            },
-            if reachable_bare {
-                "reachable"
-            } else {
-                "REFUSED"
+    println!("browser tools advertised by this build (runtime prerequisites checked at use):");
+    let manifest = cerebellum::manifest_for_inspection();
+    for provider in manifest["provides"].as_array().into_iter().flatten() {
+        for tool in provider["tools"].as_array().into_iter().flatten() {
+            if let Some(name) = tool["name"]
+                .as_str()
+                .filter(|name| name.starts_with("browser"))
+            {
+                println!("  {name}");
             }
-        );
+        }
     }
     println!();
 
