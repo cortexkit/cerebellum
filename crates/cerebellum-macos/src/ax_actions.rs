@@ -660,6 +660,38 @@ fn text_range_value(
 }
 
 #[cfg(test)]
+mod frontmost_write_tests {
+    use super::*;
+
+    /// The pid is replaced while the element is being resolved: the check
+    /// after the lookup sees it, and nothing is written.
+    #[test]
+    fn a_pid_replaced_during_the_element_lookup_is_never_written() {
+        let replaced = std::cell::Cell::new(false);
+        let mut written = false;
+        let result = write_if_still_ours(
+            || {
+                replaced.set(true);
+                Ok(())
+            },
+            &mut || !replaced.get(),
+            |_: &()| {
+                written = true;
+                AX_ERROR_SUCCESS
+            },
+        );
+        assert_eq!(result, Err(AxElementActionError::ElementGone));
+        assert!(!written, "AXFrontmost written for a replaced process");
+    }
+
+    #[test]
+    fn an_unreplaced_pid_is_written() {
+        let result = write_if_still_ours(|| Ok(()), &mut || true, |_: &()| AX_ERROR_SUCCESS);
+        assert_eq!(result, Ok(AX_ERROR_SUCCESS));
+    }
+}
+
+#[cfg(test)]
 mod text_range_tests {
     use super::*;
 
@@ -847,21 +879,44 @@ pub fn focused_window(
 /// A request, answered asynchronously: the caller watches which process is
 /// frontmost to learn whether and when it took effect.
 pub fn request_frontmost(pid: u32) -> Result<(), AxElementActionError> {
+    request_frontmost_while(pid, &mut || true)
+}
+
+/// [`request_frontmost`], asking `still_ours` after the application element
+/// has been resolved from `pid` and immediately before `AXFrontmost` is
+/// written. When it answers `false` (the process holding `pid` is no longer
+/// the one the caller means), nothing is written and the request is refused
+/// as [`AxElementActionError::ElementGone`].
+///
+/// This narrows the window for pid reuse to the write itself; it cannot
+/// close it. The accessibility element names a pid, not a process
+/// generation, and the system resolves that pid again when it delivers the
+/// write, so a process that takes the pid between `still_ours` and that
+/// delivery would receive the request.
+pub fn request_frontmost_while(
+    pid: u32,
+    still_ours: &mut dyn FnMut() -> bool,
+) -> Result<(), AxElementActionError> {
     #[cfg(feature = "desk-probe")]
     note_frontmost_call_for_probe(pid, None);
     require_trust()?;
-    let application = application(pid)?;
-    let name = CFString::from_static_str("AXFrontmost");
-    let value = CFBoolean::new(true);
-    // SAFETY: element, attribute name and the static Boolean are live for
-    // the call.
-    let code = unsafe {
-        AXUIElementSetAttributeValue(
-            application.as_ptr(),
-            CFRetained::as_ptr(&name).as_ptr().cast(),
-            (value as *const CFBoolean).cast(),
-        )
-    };
+    let code = write_if_still_ours(
+        || application(pid),
+        still_ours,
+        |application: &AxRetainedElement| {
+            let name = CFString::from_static_str("AXFrontmost");
+            let value = CFBoolean::new(true);
+            // SAFETY: element, attribute name and the static Boolean are
+            // live for the call.
+            unsafe {
+                AXUIElementSetAttributeValue(
+                    application.as_ptr(),
+                    CFRetained::as_ptr(&name).as_ptr().cast(),
+                    (value as *const CFBoolean).cast(),
+                )
+            }
+        },
+    )?;
     #[cfg(feature = "desk-probe")]
     note_frontmost_call_for_probe(pid, Some(code));
     if code == AX_ERROR_SUCCESS {
@@ -869,6 +924,20 @@ pub fn request_frontmost(pid: u32) -> Result<(), AxElementActionError> {
     } else {
         Err(classify(code))
     }
+}
+
+/// Resolve the element, then ask `still_ours`, then write: the identity
+/// check comes after the lookup so that nothing but the write follows it.
+fn write_if_still_ours<E>(
+    resolve: impl FnOnce() -> Result<E, AxElementActionError>,
+    still_ours: &mut dyn FnMut() -> bool,
+    write: impl FnOnce(&E) -> i32,
+) -> Result<i32, AxElementActionError> {
+    let element = resolve()?;
+    if !still_ours() {
+        return Err(AxElementActionError::ElementGone);
+    }
+    Ok(write(&element))
 }
 
 /// What the calling thread's latest [`request_frontmost`] did, for the manual

@@ -27,6 +27,15 @@
 //! held defers the restore to the caller instead of putting the previous
 //! application back under a held modifier. Without admission a bracket
 //! behaves as it always has.
+//!
+//! Every activation names a process by pid, and the operating system offers
+//! no activation bound to a process generation. The macOS host therefore
+//! checks the generation (the target's admitted one, or the previous
+//! application's start time) after resolving the application element and
+//! immediately before writing `AXFrontmost`. One race remains and cannot be
+//! closed from here: the system resolves the pid again when it delivers that
+//! write, so a process that takes over the pid between the last check and
+//! the delivery would be the one asked to come forward.
 
 mod cutoff;
 mod latency;

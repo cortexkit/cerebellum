@@ -2,18 +2,47 @@
 
 use super::*;
 
+/// Request a front of `pid` only while it is held by `target`'s process
+/// generation. The generation is checked before `front` runs, and `front` is
+/// handed the same check to ask again at its own last step, after it has
+/// resolved what it activates and immediately before the activation itself.
 pub(super) fn request_verified_front(
     target: Option<ProcessEventTarget>,
     pid: u32,
-    generation: impl FnOnce() -> super::super::process_event::ProcessGenerationReading,
-    front: impl FnOnce() -> bool,
+    mut generation: impl FnMut() -> super::super::process_event::ProcessGenerationReading,
+    front: impl FnOnce(&mut dyn FnMut() -> bool) -> bool,
 ) -> bool {
-    if let Some(target) = target.filter(|target| target.pid == pid) {
-        if super::super::process_event::require_exact_generation(target, generation()).is_err() {
-            return false;
-        }
+    let target = target.filter(|target| target.pid == pid);
+    let mut still_ours = || {
+        target.is_none_or(|target| {
+            super::super::process_event::require_exact_generation(target, generation()).is_ok()
+        })
+    };
+    if !still_ours() {
+        return false;
     }
-    front()
+    front(&mut still_ours)
+}
+
+/// Ask for the previous application `pid` back only while it is still the
+/// process `previous` names, as `(pid, start time)`: checked before `front`
+/// runs and handed to it to check again immediately before its activation.
+/// A restore of any other pid, or of a previous application whose start
+/// time could not be read, is refused.
+pub(super) fn request_previous_front(
+    previous: Option<(u32, u64)>,
+    pid: u32,
+    mut start_time: impl FnMut(u32) -> Option<u64>,
+    front: impl FnOnce(&mut dyn FnMut() -> bool) -> bool,
+) -> bool {
+    let Some((previous, start)) = previous.filter(|(previous, _)| *previous == pid) else {
+        return false;
+    };
+    let mut still_ours = || start_time(previous) == Some(start);
+    if !still_ours() {
+        return false;
+    }
+    front(&mut still_ours)
 }
 
 pub(super) trait PointerOperations {
@@ -739,12 +768,74 @@ fn native_pointer_replaced_generation_never_requests_front() {
         }),
         41,
         || super::super::process_event::ProcessGenerationReading::Started(456),
-        || {
+        |_| {
             requested = true;
             true
         },
     ));
     assert!(!requested);
+}
+
+#[cfg(test)]
+#[test]
+fn a_target_replaced_before_the_activation_write_is_never_activated() {
+    // The generation is right when checked first, and replaced by the time
+    // the activation asks again just before its write.
+    let mut readings = [123, 456].into_iter();
+    let mut written = false;
+    assert!(!request_verified_front(
+        Some(ProcessEventTarget {
+            pid: 41,
+            start_time_micros: 123
+        }),
+        41,
+        || {
+            super::super::process_event::ProcessGenerationReading::Started(
+                readings.next().unwrap_or(456),
+            )
+        },
+        |still_ours| {
+            // The element is resolved here, then the last check.
+            if still_ours() {
+                written = true;
+            }
+            written
+        },
+    ));
+    assert!(!written);
+}
+
+#[cfg(test)]
+#[test]
+fn a_previous_application_replaced_before_the_restore_write_is_never_activated() {
+    let mut readings = [Some(7), Some(9)].into_iter();
+    let mut written = false;
+    assert!(!request_previous_front(
+        Some((100, 7)),
+        100,
+        |_| readings.next().flatten(),
+        |still_ours| {
+            if still_ours() {
+                written = true;
+            }
+            written
+        },
+    ));
+    assert!(!written);
+    // Unknown or other previous applications are never asked back.
+    assert!(!request_previous_front(None, 100, |_| Some(7), |_| true));
+    assert!(!request_previous_front(
+        Some((100, 7)),
+        101,
+        |_| Some(7),
+        |_| true
+    ));
+    assert!(request_previous_front(
+        Some((100, 7)),
+        100,
+        |_| Some(7),
+        |still_ours| still_ours()
+    ));
 }
 
 #[cfg(test)]
