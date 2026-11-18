@@ -36,10 +36,14 @@ pub const MOVE_OBSERVE_MS: u64 = 200;
 pub const DRAG_OBSERVE_MS: u64 = 2_000;
 pub const SCROLL_OBSERVE_MS: u64 = 500;
 pub const FRONTING_READ_MS: u64 = 300;
-/// Needs-front app-grant shortcut bracket, from the front request through
-/// confirmed restore. The vocabulary row's
-/// `maximum_fronting_bracket_interval_ms` describes the takeover bracket;
-/// app-grant needs-front shortcuts use this budget instead.
+/// Needs-front app-grant bracket (shortcuts and pictures), counted from the
+/// front request to its deadline. After the deadline nothing new is posted
+/// or captured, and by the deadline the restore of the previous application
+/// has been requested. Whether and when that restore is confirmed is
+/// reported (the bracket's measured interval), not promised within this
+/// bound. The vocabulary row's `maximum_fronting_bracket_interval_ms`
+/// describes the takeover bracket; app-grant needs-front shortcuts use this
+/// budget instead.
 pub const FRONTING_BRACKET_MS: u64 = 200;
 // Bringing the target app to the front, for an action that needs it there.
 // Only one call fronts an app at a time, process-wide; a caller waits this

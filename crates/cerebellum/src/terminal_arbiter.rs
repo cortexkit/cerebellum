@@ -422,10 +422,31 @@ impl RestoreCell {
         ReadLockHold(Arc::clone(self))
     }
 
+    /// Whether a late watch is owed for an activation this cell did not see
+    /// through.
+    #[cfg(test)]
+    pub(crate) fn late_watch_pending(&self) -> bool {
+        self.inner().pending_since.is_some()
+    }
+
     /// Run the restore decision, or wait for the side that took the
     /// obligation first to finish it. Blocking: it reads the front, may
     /// request the previous application and waits for it.
     pub fn decide(&self) -> RestoreDecided {
+        self.decide_with(false)
+    }
+
+    /// [`Self::decide`] for the cutoff, at the bracket's deadline: the
+    /// restore is requested at once. It does not first wait for a front
+    /// request still in flight to return, nor watch for an unconfirmed
+    /// activation to land; an activation that lands afterwards is the late
+    /// watch's to put back. It still leaves focus alone on person input or
+    /// an observer gap since the front.
+    pub fn decide_at_cutoff(&self) -> RestoreDecided {
+        self.decide_with(true)
+    }
+
+    fn decide_with(&self, at_cutoff: bool) -> RestoreDecided {
         use crate::computer::dispatch::{CleanupTake, FrontAttemptState};
         let mut inner = self.inner();
         let front_instant_ms = match inner.attempt.take() {
@@ -443,6 +464,13 @@ impl RestoreCell {
                 );
             }
             CleanupTake::Decide { front_instant_ms } => front_instant_ms,
+            CleanupTake::AwaitFrontAttempt if at_cutoff => match inner.attempt.state() {
+                FrontAttemptState::Dispatching { front_instant_ms }
+                | FrontAttemptState::Dispatched { front_instant_ms } => front_instant_ms,
+                FrontAttemptState::NotStarted => {
+                    unreachable!("a front attempt never moves back to not started")
+                }
+            },
             CleanupTake::AwaitFrontAttempt => {
                 // The front request is in flight. Its wait is bounded by the
                 // front wait; deciding before it returns could restore
@@ -470,19 +498,30 @@ impl RestoreCell {
         drop(inner);
         let outcome = match host {
             Some(mut host) => {
-                let outcome = crate::computer::dispatch::restore_after_front_attempt(
-                    &mut RestoreDecisionHost {
-                        host: host.as_mut(),
-                        _target: self.target_pid,
-                        #[cfg(all(feature = "desk-probe", target_os = "macos"))]
-                        probe_timing: &self.probe_timing,
-                    },
-                    self.previous_pid,
-                    self.target_pid,
-                    front_instant_ms,
-                    crate::computer::dispatch::RESTORE_WAIT_MS,
-                    confirmed,
-                );
+                let mut adapter = RestoreDecisionHost {
+                    host: host.as_mut(),
+                    _target: self.target_pid,
+                    #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+                    probe_timing: &self.probe_timing,
+                };
+                let outcome = if at_cutoff && !confirmed {
+                    crate::computer::dispatch::restore_without_awaiting_activation(
+                        &mut adapter,
+                        self.previous_pid,
+                        self.target_pid,
+                        front_instant_ms,
+                        crate::computer::dispatch::RESTORE_WAIT_MS,
+                    )
+                } else {
+                    crate::computer::dispatch::restore_after_front_attempt(
+                        &mut adapter,
+                        self.previous_pid,
+                        self.target_pid,
+                        front_instant_ms,
+                        crate::computer::dispatch::RESTORE_WAIT_MS,
+                        confirmed,
+                    )
+                };
                 // An activation the action never confirmed is always left to
                 // the late watch, even one restored here: the same activation
                 // can land again after this decision.

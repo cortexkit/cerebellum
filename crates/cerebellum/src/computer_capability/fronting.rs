@@ -685,6 +685,13 @@ impl RestoreHost for PlatformRestoreHost {
 /// run on a fresh thread, which carries no outer deadline, so a call whose
 /// work deadline already passed still puts the previous application back.
 pub(crate) fn decide_with_restore_budget(cell: &RestoreCell) -> RestoreDecided {
+    with_restore_budget(cell, RestoreCell::decide)
+}
+
+fn with_restore_budget(
+    cell: &RestoreCell,
+    decide: fn(&RestoreCell) -> RestoreDecided,
+) -> RestoreDecided {
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -694,10 +701,10 @@ pub(crate) fn decide_with_restore_budget(cell: &RestoreCell) -> RestoreDecided {
                 );
                 #[cfg(not(target_os = "macos"))]
                 let _ = RESTORE_AX_MS;
-                cell.decide()
+                decide(cell)
             })
             .join()
-            .unwrap_or_else(|_| cell.decide())
+            .unwrap_or_else(|_| decide(cell))
     })
 }
 
@@ -813,6 +820,27 @@ impl CellHooks {
         self.state().cell.clone()
     }
 
+    /// Run `decide` on the cell under the restore's own budget, and keep
+    /// what it decided.
+    fn decide_using(&self, decide: fn(&RestoreCell) -> RestoreDecided) -> HookedRestore {
+        let Some(cell) = self.cell() else {
+            return HookedRestore {
+                restore: RestoreStatus::NotNeeded,
+                person_input_during_fronting: false,
+                input_coverage_unavailable: false,
+                restore_ms: None,
+            };
+        };
+        let decided = with_restore_budget(&cell, decide);
+        self.state().decided = Some(decided);
+        HookedRestore {
+            restore: decided.restore,
+            person_input_during_fronting: decided.person_input_during_fronting,
+            input_coverage_unavailable: decided.input_coverage_unavailable,
+            restore_ms: decided.restore_ms,
+        }
+    }
+
     /// Whether a picture read may still acquire pixels: the cutoff has not
     /// fired and no cleanup has taken the obligation. Asked immediately
     /// before the pixels are requested, and again once they arrived, so a
@@ -889,22 +917,7 @@ impl FrontedDispatchHooks for CellHooks {
     }
 
     fn decide_restore(&mut self) -> HookedRestore {
-        let Some(cell) = self.cell() else {
-            return HookedRestore {
-                restore: RestoreStatus::NotNeeded,
-                person_input_during_fronting: false,
-                input_coverage_unavailable: false,
-                restore_ms: None,
-            };
-        };
-        let decided = decide_with_restore_budget(&cell);
-        self.state().decided = Some(decided);
-        HookedRestore {
-            restore: decided.restore,
-            person_input_during_fronting: decided.person_input_during_fronting,
-            input_coverage_unavailable: decided.input_coverage_unavailable,
-            restore_ms: decided.restore_ms,
-        }
+        self.decide_using(RestoreCell::decide)
     }
 
     fn finished(&mut self, outcome: &BracketOutcome) {
@@ -917,19 +930,20 @@ impl FrontedDispatchHooks for CellHooks {
 
     /// App-use fronts (shortcuts and pictures under the app's own grant)
     /// get a cutoff timer; fronts made under the takeover (mouse-and-keyboard)
-    /// grant keep their existing bounds. The
-    /// timer runs this same hooks' decision, which goes through the one
-    /// restore cell, so the restore still runs exactly once.
+    /// grant keep their existing bounds. The timer runs this same hooks'
+    /// decision, which goes through the one restore cell, so the restore
+    /// still runs exactly once; at the cutoff it is requested at once
+    /// ([`RestoreCell::decide_at_cutoff`]).
     fn cutoff_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
         let app_use = self
             .state()
             .parts
             .as_ref()
             .is_some_and(|parts| parts.restore_fallback);
-        let mut hooks = self.clone();
+        let hooks = self.clone();
         app_use.then(|| {
             Box::new(move || {
-                hooks.decide_restore();
+                hooks.decide_using(RestoreCell::decide_at_cutoff);
             }) as Box<dyn FnOnce() + Send>
         })
     }

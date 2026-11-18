@@ -3,14 +3,20 @@
 //! timer that starts the restore when the bound passes while the bracket's
 //! own thread is still busy in a unit.
 //!
+//! What the bound means: after the deadline nothing new is posted or
+//! captured, and by the deadline the restore of the previous application
+//! has been requested. The restore's confirmation is reported, not promised
+//! within the bound: the person's application may come back late.
+//!
 //! The timer is armed when the front is requested and fires at the bound,
 //! whatever any timing history predicted. Firing stops new posts at once,
-//! and starts the restore itself unless a key or button may be held: a
-//! restore under a held key would hand that key to the previous
-//! application, so then the unit's own paired releases run first and the
-//! bracket restores after them, as on any other stop. The timer and the
-//! bracket reach the restore through the same once-only decision, so the
-//! restore runs once whichever gets there first.
+//! and requests the restore itself at once, even while the front request is
+//! still in flight, unless a key or button may be held: a restore under a
+//! held key would hand that key to the previous application, so then the
+//! unit's own paired releases run first and the bracket restores after
+//! them, as on any other stop. The timer and the bracket reach the restore
+//! through the same once-only decision, so the restore runs once whichever
+//! gets there first.
 
 use crate::platform::{FrontedKeyGuard, ProcessEventRefusal};
 use std::sync::mpsc::{self, RecvTimeoutError};
