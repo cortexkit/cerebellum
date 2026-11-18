@@ -420,6 +420,17 @@ fn refused_before_any_post(keyboard: &Keyboard) {
 }
 
 #[test]
+fn a_closed_reserve_gate_refuses_new_key_work_before_listing() {
+    let keyboard = Keyboard::new();
+    let now = std::time::Instant::now();
+    keyboard
+        .gate
+        .set_bound(now, now + std::time::Duration::from_secs(60));
+    refused_before_any_post(&keyboard);
+    assert_eq!(keyboard.generation_reads.get(), 0, "no listing preparation");
+}
+
+#[test]
 fn a_pid_replaced_during_focus_or_transport_preparation_never_receives_the_post() {
     for replace_during_focus in [true, false] {
         let mut keyboard = Keyboard::new();

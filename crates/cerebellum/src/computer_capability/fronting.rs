@@ -699,12 +699,14 @@ impl RestoreHost for PlatformRestoreHost {
 /// run on a fresh thread, which carries no outer deadline, so a call whose
 /// work deadline already passed still puts the previous application back.
 pub(crate) fn decide_with_restore_budget(cell: &RestoreCell) -> RestoreDecided {
-    with_restore_budget(cell, RestoreCell::decide)
+    with_restore_budget(cell, RestoreCell::decide_entered)
 }
 
-type RestoreDecision = fn(&RestoreCell) -> RestoreDecided;
-
-fn with_restore_budget(cell: &RestoreCell, decide: RestoreDecision) -> RestoreDecided {
+fn with_restore_budget(
+    cell: &RestoreCell,
+    decide: impl Fn(&RestoreCell, Instant) -> RestoreDecided + Sync,
+) -> RestoreDecided {
+    let entered = Instant::now();
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -716,10 +718,10 @@ fn with_restore_budget(cell: &RestoreCell, decide: RestoreDecision) -> RestoreDe
                 );
                 #[cfg(not(target_os = "macos"))]
                 let _ = RESTORE_AX_MS;
-                decide(cell)
+                decide(cell, entered)
             })
             .join()
-            .unwrap_or_else(|_| decide(cell))
+            .unwrap_or_else(|_| decide(cell, entered))
     })
 }
 
@@ -848,7 +850,7 @@ impl CellHooks {
 
     /// Run `decide` on the cell under the restore's own budget, and keep
     /// what it decided.
-    fn decide_using(&self, decide: RestoreDecision) -> HookedRestore {
+    fn decide_using(&self) -> HookedRestore {
         let Some(cell) = self.cell() else {
             return HookedRestore {
                 restore: RestoreStatus::NotNeeded,
@@ -857,7 +859,7 @@ impl CellHooks {
                 restore_ms: None,
             };
         };
-        let decided = with_restore_budget(&cell, decide);
+        let decided = decide_with_restore_budget(&cell);
         self.state().decided = Some(decided);
         HookedRestore {
             restore: decided.restore,
@@ -981,7 +983,7 @@ impl FrontedDispatchHooks for CellHooks {
     }
 
     fn decide_restore(&mut self) -> HookedRestore {
-        self.decide_using(RestoreCell::decide)
+        self.decide_using()
     }
 
     fn finished(&mut self, outcome: &BracketOutcome) {
@@ -1464,17 +1466,8 @@ pub(crate) fn finish_after_release(
             held,
             None | Some(crate::HeldState::Released | crate::HeldState::NoneHeld)
         );
-        let decided = std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    #[cfg(target_os = "macos")]
-                    let _ax = cerebellum_macos::ax_budget::bound_messages_until(
-                        Instant::now() + Duration::from_millis(RESTORE_AX_MS),
-                    );
-                    cell.decide_after_release(released, settled_at)
-                })
-                .join()
-                .unwrap_or_else(|_| cell.decide_after_release(released, settled_at))
+        let decided = with_restore_budget(cell, |cell, entered| {
+            cell.decide_after_release(released, settled_at, entered)
         });
         hooks.state().decided = Some(decided);
         end.decided = Some(decided);

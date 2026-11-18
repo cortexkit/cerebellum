@@ -2072,11 +2072,11 @@ where
             // back, since a key still held would land on it.
             let held = settle_held_input(ticket, &dispatched, make_driver.as_ref());
             let settled_at = std::time::Instant::now();
-            effects.sample(input_source.as_ref(), &effect_grant);
             let mut bracket = dispatcher.last_bracket().cloned();
             let hooked = driver_hooks.as_ref().map(|hooks| {
                 fronting::finish_after_release(hooks, held, settled_at, bracket.as_mut())
             });
+            effects.sample(input_source.as_ref(), &effect_grant);
             (dispatched, bracket, hooked, effects)
         })
         .await

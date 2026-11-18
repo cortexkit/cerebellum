@@ -570,14 +570,18 @@ impl RestoreCell {
     /// host that carries the previous application's identity as it was bound
     /// before the front.
     pub fn decide(&self) -> RestoreDecided {
+        self.decide_entered(std::time::Instant::now())
+    }
+
+    pub(crate) fn decide_entered(&self, entered: std::time::Instant) -> RestoreDecided {
         // A key still down at the deadline is the named exception: the
         // restore follows its confirmed release without a deadline.
-        self.decide_bounded(!self.gate.held_past_deadline())
+        self.decide_bounded(!self.gate.held_past_deadline(), entered)
     }
 
     /// [`Self::decide`]; `timed` false runs it with no write deadline, for
     /// the restore that follows a release confirmed only after the deadline.
-    fn decide_bounded(&self, timed: bool) -> RestoreDecided {
+    fn decide_bounded(&self, timed: bool, entered: std::time::Instant) -> RestoreDecided {
         use crate::computer::dispatch::FrontAttemptState;
         if let Some(decided) = self.decided() {
             return decided;
@@ -605,6 +609,7 @@ impl RestoreCell {
                 started,
                 self.gate.native_overrun_until(),
             )
+            .with_tail_from(entered)
         });
         let mut adapter = RestoreDecisionHost {
             host: host.as_mut(),
@@ -646,6 +651,7 @@ impl RestoreCell {
         &self,
         confirmed: bool,
         settled_at: std::time::Instant,
+        entered: std::time::Instant,
     ) -> RestoreDecided {
         if let Some(decided) = self.decided() {
             return decided;
@@ -659,12 +665,12 @@ impl RestoreCell {
             .deadline()
             .is_none_or(|deadline| settled_at < deadline)
         {
-            return self.decide_bounded(true);
+            return self.decide_bounded(true, entered);
         }
         if self.inner().release_wait.is_some() {
             return self.restore_after_late_release();
         }
-        self.decide_bounded(false)
+        self.decide_bounded(false, entered)
     }
 
     /// Terminal cleanup's part in the obligation; it never restores. A front
@@ -3249,7 +3255,7 @@ mod restore_slot_tests {
         std::thread::sleep(Duration::from_millis(150).saturating_sub(started.elapsed()));
         let released = std::time::Instant::now();
         let samples = restore_preparation::samples_recorded_on_this_thread();
-        let decided = cell.decide_after_release(true, released);
+        let decided = cell.decide_after_release(true, released, std::time::Instant::now());
         let screen = shared.lock().unwrap();
         assert_eq!(screen.requests, [PREVIOUS], "the owner restored at once");
         assert!(screen.requested_at[0] >= released, "never under the hold");
@@ -3672,7 +3678,8 @@ mod restore_slot_tests {
                     cell.decide();
                 }
                 Owner::ReleaseUnconfirmed => {
-                    cell.decide_after_release(false, std::time::Instant::now());
+                    let now = std::time::Instant::now();
+                    cell.decide_after_release(false, now, now);
                 }
                 Owner::StuckInRelease => {}
             }

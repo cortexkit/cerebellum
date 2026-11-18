@@ -63,6 +63,10 @@ where
     N: FnMut() -> u64,
     F: FnMut() -> Option<u32>,
 {
+    fn closed(&self) -> bool {
+        self.cutoff.is_some_and(CutoffGate::closed)
+    }
+
     fn before_post(
         &mut self,
         press: bool,

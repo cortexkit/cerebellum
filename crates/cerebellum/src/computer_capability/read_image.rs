@@ -118,6 +118,9 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
                     Err(_) if !fence() => return Err(ImageUnavailable::FrontingBoundExceeded),
                     Err(error) => return Err(image_capture_error(error)),
                 };
+                if !fence() {
+                    return Err(ImageUnavailable::FrontingBoundExceeded);
+                }
                 check_visibility(
                     freshness,
                     grant,
