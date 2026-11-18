@@ -251,7 +251,7 @@ pub(super) fn start(
             #[cfg(all(feature = "desk-probe", target_os = "macos"))]
             probe_timing: &probe_timing,
         };
-        let (mut restore, latency, input) = crate::computer::dispatch::watch_late_activation(
+        let ended = crate::computer::dispatch::watch_late_activation_ending(
             &mut adapter,
             previous,
             target,
@@ -260,6 +260,13 @@ pub(super) fn start(
             crate::computer::dispatch::LateWatch::WholeWindow { already_restored },
             &|| stop.load(Ordering::Acquire) != 0,
         );
+        // A watch that left focus alone because the input observer lost
+        // coverage (`ended.coverage_lost`) is recorded as `skipped_person`,
+        // as any other left-alone focus is: the record's shape is fixed. The
+        // gap itself is counted in module health, under
+        // `hardwareInputObserver.coverage_gap_count`.
+        let (mut restore, latency, input) =
+            (ended.restore, ended.first_landing_ms, ended.person_input);
         // Route close ends the task too, but first puts back a target that
         // has already landed if observation still proves no person input.
         if stop.load(Ordering::Acquire) == 2
