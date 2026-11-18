@@ -314,16 +314,26 @@ async fn unknown_agent_diverged_is_at_cut_without_any_outbound_call() {
 }
 
 #[tokio::test]
-async fn unmarked_agent_still_exports_a_record_and_union_import_never_loses_local_marks() {
+async fn unmarked_agent_exports_no_item_and_union_import_never_loses_local_marks() {
     let door = Arc::new(FakeDoor::default());
     let source = planes(&door);
     let receiver = planes(&door);
+    // No item and no admitted stream: the driver may then skip a receiver
+    // without cerebellum, since nothing in the cut could be lost there.
     let prepared = call(&source, "agent_data.prepare", params()).await;
-    assert!(prepared["items"][0]["endOffset"].as_u64().unwrap() > 0);
-    let payload: Value =
-        serde_json::from_slice(door.streams.lock().unwrap().values().next().unwrap()).unwrap();
-    assert_eq!(payload, json!({"v":1,"agent_id":AGENT,"sources":[]}));
+    assert_eq!(prepared["items"], json!([]));
+    assert_eq!(
+        call(&source, "agent_data.export", params()).await,
+        json!({"items":[]})
+    );
+    assert!(door.streams.lock().unwrap().is_empty());
     seal(&door, CUT, &prepared);
+    let fresh = planes(&door);
+    assert_eq!(
+        call(&fresh, "agent_data.import", params()).await,
+        json!({"items":[]})
+    );
+    assert!(fresh.private_content.export_agent(AGENT).is_empty());
     receiver
         .private_content
         .import_agent(AGENT, &BTreeSet::from([Source::DesktopApp]))
@@ -496,6 +506,11 @@ async fn abort_unknown_cut_prevents_delayed_prepare_and_status_names_aborted() {
 async fn failed_prepare_retries_its_original_snapshot_and_checks_admitted_prefix() {
     let door = Arc::new(FakeDoor::default());
     let source = planes(&door);
+    // A marked agent, so the snapshot has an item to upload and retry.
+    source
+        .private_content
+        .import_agent(AGENT, &BTreeSet::from([Source::PersonBrowser]))
+        .await;
     door.fail_cover
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let (ty, e) = wire(
@@ -521,12 +536,12 @@ async fn failed_prepare_retries_its_original_snapshot_and_checks_admitted_prefix
         .clone();
     assert_eq!(
         String::from_utf8(bytes).unwrap(),
-        r#"{"v":1,"agent_id":"agent-x","sources":[]}"#
+        r#"{"v":1,"agent_id":"agent-x","sources":["person_browser"]}"#
     );
     assert_eq!(
         prepared["items"][0]["digest"],
         door::hex(&Sha256::digest(
-            br#"{"v":1,"agent_id":"agent-x","sources":[]}"#
+            br#"{"v":1,"agent_id":"agent-x","sources":["person_browser"]}"#
         ))
     );
     assert!(door

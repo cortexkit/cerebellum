@@ -66,7 +66,7 @@ impl Participant {
         &self,
         agent: &str,
         cut: &str,
-    ) -> Result<(Item, Payload), ErrorBody> {
+    ) -> Result<(Option<Item>, Payload), ErrorBody> {
         let door = self.door()?;
         let metadata = door
             .call("cut.read", json!({"cutId":cut}))
@@ -81,9 +81,19 @@ impl Participant {
             .items
             .into_iter()
             .filter(|i| i.session_ref == session_ref(agent, cut) && i.stream == STREAM);
-        let item = matching
-            .next()
-            .ok_or_else(|| error(RefusalCode::DigestMismatch, "cut has no agent marks record"))?;
+        // The source writes no record for an agent with nothing marked, so
+        // that a computer without cerebellum can still receive that agent.
+        // A sealed cut with no record therefore means an empty mark set.
+        let Some(item) = matching.next() else {
+            return Ok((
+                None,
+                Payload {
+                    v: 1,
+                    agent_id: agent.to_owned(),
+                    sources: Default::default(),
+                },
+            ));
+        };
         if matching.next().is_some() || item.end_offset > 256 * 1024 || item.end_offset == 0 {
             return Err(error(
                 RefusalCode::DigestMismatch,
@@ -139,6 +149,6 @@ impl Participant {
                 "marks payload belongs to another agent",
             ));
         }
-        Ok((item, payload))
+        Ok((Some(item), payload))
     }
 }

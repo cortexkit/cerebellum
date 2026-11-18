@@ -221,9 +221,15 @@ impl Participant {
                         json!({"step":step,"refs":cut.refs}),
                     ));
                 }
+                // An agent with no marks gets no item: an empty cut entry
+                // lets the driver skip a receiver that runs no cerebellum,
+                // while any marked agent still needs a participant there.
                 let mut items = Vec::new();
                 for r in refs.as_slice() {
                     let payload = cut.payloads.get(&r.r#ref).expect("snapshot for ref");
+                    if payload.sources.is_empty() {
+                        continue;
+                    }
                     let item = self.upload(payload, id, step).await?;
                     let mut value = serde_json::to_value(item).unwrap();
                     let fields = value.as_object_mut().unwrap();
@@ -237,7 +243,7 @@ impl Participant {
             }
             Op::Export => {
                 let mut items = Vec::new();
-                for payload in cut.payloads.values() {
+                for payload in cut.payloads.values().filter(|p| !p.sources.is_empty()) {
                     let item = self.upload(payload, id, step).await?;
                     items.push(json!({"sessionRef":item.session_ref,"endOffset":item.end_offset}));
                 }
@@ -249,12 +255,14 @@ impl Participant {
                 for r in refs.as_slice() {
                     let (item, payload) = self.download(&r.r#ref, id).await?;
                     payloads.insert(r.r#ref.clone(), payload);
-                    items.push(json!({"sessionRef":item.session_ref,"endOffset":item.end_offset,"digest":item.digest}));
+                    if let Some(item) = item {
+                        items.push(json!({"sessionRef":item.session_ref,"endOffset":item.end_offset,"digest":item.digest}));
+                    }
                 }
                 // No replacement or staging: importing only adds marks, so it
                 // cannot discard anything recorded here, even reads made after
                 // this computer answered the driver's divergence check.
-                for payload in payloads.values() {
+                for payload in payloads.values().filter(|p| !p.sources.is_empty()) {
                     if !marks
                         .import_agent(&payload.agent_id, &payload.sources)
                         .await
