@@ -106,6 +106,8 @@ pub struct HardwareObserverHealth {
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
+// Only the macOS tap records these; other platforms read the names alone.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 enum ObserverProblem {
     NoInputMonitoring = 1,
     InstallThread,
