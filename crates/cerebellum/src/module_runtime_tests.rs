@@ -18,6 +18,57 @@ fn body(frame: &Frame) -> Value {
     serde_json::from_slice(&frame.body).unwrap()
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn browser_controls_check_the_executable_only_for_own_launch() {
+    let mut planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        None,
+        JournalPersistence::Isolated,
+    );
+    planes.runtime_browser = Some(BrowserSurface::NotConfigured);
+    let (writer, mut replies) = mpsc::channel(8);
+    for (corr, args, expected) in [
+        (1, json!({"action":"status"}), "no_session"),
+        (2, json!({"action":"status","browser":"user"}), "ok"),
+        (
+            3,
+            json!({"action":"close","browser_session_id":"absent"}),
+            "browser_session_not_found",
+        ),
+        (4, json!({"action":"launch"}), "executable_missing"),
+    ] {
+        let request = frame(
+            FrameType::Request,
+            4,
+            1,
+            corr,
+            json!({"name":"browser_use","arguments":args}),
+        );
+        handle_tool_request_for_test_with_planes(request, &writer, &planes)
+            .await
+            .unwrap();
+        let reply = replies.try_recv().unwrap();
+        let value = body(&reply);
+        assert_eq!(reply.header.ty, FrameType::Response, "{value}");
+        assert_eq!(value["outcome"], expected, "{value}");
+        if corr == 2 {
+            assert_eq!(value["browser"], "user");
+            assert_eq!(value["connected"], false);
+            assert_eq!(value["tabs"], json!([]));
+        }
+        if corr == 4 {
+            assert!(
+                value["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("browser.executable_path"),
+                "{value}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn settings_startup_serves_review_and_waits_for_the_effective_view() {
     let (mut reader, mut daemon) = tokio::io::duplex(4096);
@@ -86,7 +137,7 @@ async fn settings_startup_serves_review_and_waits_for_the_effective_view() {
         )
         .await
         .unwrap();
-        // Keep the transport open until the driver observes the view.
+        // Keep the transport open until startup processing observes the view.
         daemon
     };
     let (result, _daemon) = tokio::time::timeout(Duration::from_secs(2), async {

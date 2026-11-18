@@ -1,6 +1,6 @@
 //! Request delivery deadlines and bounded write-and-flush batches.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use subc_protocol::{Frame, FrameType};
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
@@ -19,10 +19,19 @@ pub(crate) struct ConnectionDeadlines {
     pub(crate) pending:
         std::sync::Mutex<std::collections::BTreeMap<RequestId, tokio::time::Instant>>,
     pub(crate) changed: tokio::sync::Notify,
-    pub(crate) display: Arc<crate::tool_display::Records>,
+    display: OnceLock<Arc<crate::tool_display::Records>>,
 }
 
 impl ConnectionDeadlines {
+    /// Start the writer for HELLO before the planes exist. Install their
+    /// display records before dispatch can arm its first tool reply.
+    pub(crate) fn install_display(&self, display: Arc<crate::tool_display::Records>) {
+        assert!(
+            self.display.set(display).is_ok(),
+            "display records already installed"
+        );
+    }
+
     pub(crate) fn arm(&self, request: RequestId, end: tokio::time::Instant) {
         self.pending.lock().unwrap().entry(request).or_insert(end);
         self.changed.notify_waiters();
@@ -75,7 +84,9 @@ where
         let mut displays = Vec::new();
         if matches!(frame.header.ty, FrameType::Response | FrameType::Error) {
             delivered.push(request_id(&frame));
-            displays.extend(deadlines.display.prepare(&frame));
+            if let Some(display) = deadlines.display.get() {
+                displays.extend(display.prepare(&frame));
+            }
         }
         write_frame(&mut writer, &frame)
             .await
@@ -89,7 +100,9 @@ where
             };
             if matches!(frame.header.ty, FrameType::Response | FrameType::Error) {
                 delivered.push(request_id(&frame));
-                displays.extend(deadlines.display.prepare(&frame));
+                if let Some(display) = deadlines.display.get() {
+                    displays.extend(display.prepare(&frame));
+                }
             }
             write_frame(&mut writer, &frame)
                 .await
@@ -100,8 +113,10 @@ where
             .await
             .map_err(|e| ModuleError::Message(e.to_string()))?;
         deadlines.delivered(&delivered);
-        for display in displays {
-            deadlines.display.delivered(display);
+        if let Some(records) = deadlines.display.get() {
+            for display in displays {
+                records.delivered(display);
+            }
         }
     }
     writer

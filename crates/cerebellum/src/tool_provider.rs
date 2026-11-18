@@ -41,11 +41,7 @@ pub(crate) fn browser_tools() -> Vec<subc_protocol::manifest::Tool> {
 }
 
 fn catalog_tools(planes: &Planes) -> Vec<CatalogTool> {
-    let browser_names = if planes
-        .runtime_browser
-        .as_ref()
-        .map_or(planes.browser_config.is_some(), |_| browser_build_admits())
-    {
+    let browser_names = if planes.browser_admitted() {
         browser_tools().into_iter().map(|tool| tool.name).collect()
     } else {
         Vec::new()

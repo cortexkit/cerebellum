@@ -163,8 +163,9 @@ fn review(
             .ok_or_else(|| refusal("value_invalid", &[], "malformed"))?;
         config::parse_config_value(&value).map_err(core_refusal)?;
 
-        // Keep parser reason words, but only require the five legacy deadlines
-        // after filling managed defaults. An explicitly empty string is invalid.
+        // Keep browser_config's refusal reasons (such as PathNotAbsolute), but
+        // fill managed defaults before checking the five required deadlines.
+        // An explicitly empty path or identity is still invalid.
         let mut candidate = value.clone();
         if let Some(browser) = candidate.get_mut("browser").and_then(Value::as_object_mut) {
             let defaults = schema.defaults();

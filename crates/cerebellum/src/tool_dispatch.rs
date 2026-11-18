@@ -1273,13 +1273,9 @@ pub(super) async fn handle_tool_request_inner(
     // of login material. With the rollout switch on, startup gives a running
     // module's plane the live vault source; planes built for tests get none
     // unless a test installs one.
-    if let Some((reason, remedy)) = browser_prerequisite(name, planes.runtime_browser.as_ref()) {
-        return send_route_error(writer, ver, channel, epoch, corr, reason, remedy).await;
-    }
-    let known_capability = dispatchable_tool_with_browser(name, planes.browser_config.is_some())
-        .or_else(|| {
-            browser::fill::admitted(name, &planes.browser, planes.browser_config.is_some())
-        });
+    let browser_admitted = planes.browser_admitted();
+    let known_capability = dispatchable_tool_with_browser(name, browser_admitted)
+        .or_else(|| browser::fill::admitted(name, &planes.browser, browser_admitted));
     let Some(capability_name) = known_capability else {
         if name == flat_tools::BROWSER_USE {
             return tool_provider::send_error(
@@ -1292,8 +1288,8 @@ pub(super) async fn handle_tool_request_inner(
         // Say WHICH kind of unavailable. A caller who named something this build
         // withholds and a caller who named something invented both arrive here,
         // and only one of them can do anything about it.
-        let withheld = capability_withheld(name, planes.browser_config.is_some())
-            .unwrap_or(CapabilityWithheld::Unknown);
+        let withheld =
+            capability_withheld(name, browser_admitted).unwrap_or(CapabilityWithheld::Unknown);
         if matches!(withheld, CapabilityWithheld::Unknown) {
             return tool_provider::send_error(
                 cortexkit_role_tool_provider::errors::unknown_tool(name),
@@ -1939,27 +1935,6 @@ pub(super) async fn handle_tool_request_inner(
     }
 }
 
-fn browser_prerequisite(
-    name: &str,
-    surface: Option<&BrowserSurface>,
-) -> Option<(&'static str, &'static str)> {
-    if !browser_build_admits()
-        || dispatchable_tool_with_browser(name, false).is_some()
-        || (dispatchable_tool_with_browser(name, true).is_none()
-            && name != browser::fill::FILL_LOGIN)
-    {
-        return None;
-    }
-    match surface? {
-        BrowserSurface::Refused(error) => Some((error.reason.reason_code(),
-            "Correct the browser executable and its expected identity in Cerebellum's settings, then restart the module.")),
-        BrowserSurface::NotConfigured => Some(("executable_missing",
-            "Configure browser.executable_path and browser.expected_identity in Cerebellum's settings, then restart the module.")),
-        BrowserSurface::Available(config) => (!config.executable_path.as_ref().is_some_and(|path| path.is_file())).then_some(("executable_missing",
-            "Make the configured browser executable available or correct browser.executable_path in Cerebellum's settings.")),
-    }
-}
-
 tokio::task_local! {
     pub(super) static BROWSER_CONSENT_PARK_LIMIT: Duration;
 }
@@ -2243,9 +2218,6 @@ pub(super) async fn handle_browser_control(
     accepted: &AcceptedBindFacts,
     planes: &Planes,
 ) -> Value {
-    let Some(config) = planes.browser_config.as_ref() else {
-        return json!({"outcome": "internal_failure"});
-    };
     let clock = planes.lease_clock.as_ref();
     match name {
         browser_session::BROWSER_STATUS => {
@@ -2262,6 +2234,9 @@ pub(super) async fn handle_browser_control(
             let browser_session_id = match browser_session::validate_close(arguments) {
                 Ok(id) => id,
                 Err(invalid) => return invalid,
+            };
+            let Some(config) = planes.browser_config.as_ref() else {
+                return json!({"outcome":"browser_session_not_found"});
             };
             let sessions = planes.sessions.clone();
             let route = accepted.identity.conversation_key.clone();
@@ -2299,6 +2274,10 @@ pub(super) async fn handle_browser_control(
             if accepted.identity.profile_disposition == ProfileDisposition::None {
                 return json!({"outcome": "no_profile", "profile_disposition": "none"});
             }
+            let Some(config) = planes.browser_config.as_ref() else {
+                return browser_launch_prerequisite(planes.runtime_browser.as_ref())
+                    .unwrap_or_else(|| json!({"outcome":"internal_failure"}));
+            };
             let browser_session_id = match planes.sessions.acquire_launch_slot_for_profile(
                 &accepted.identity.conversation_key,
                 (accepted.identity.profile_disposition == ProfileDisposition::Durable)
@@ -2313,7 +2292,11 @@ pub(super) async fn handle_browser_control(
                 browser_session::LaunchSlot::Acquired { browser_session_id } => browser_session_id,
                 browser_session::LaunchSlot::Refused(refusal) => return refusal,
             };
-            let launch = if let Some(service) = planes.launch_service.clone() {
+            let launch = if let Some(refusal) =
+                browser_launch_prerequisite(planes.runtime_browser.as_ref())
+            {
+                Err(refusal)
+            } else if let Some(service) = planes.launch_service.clone() {
                 let accepted = accepted.clone();
                 let id = browser_session_id.clone();
                 match tokio::task::spawn_blocking(move || {
@@ -2433,6 +2416,29 @@ pub(super) async fn handle_browser_control(
             }
         }
         _ => json!({"outcome": "internal_failure"}),
+    }
+}
+
+/// Report the configured executable's state only on the path that starts a
+/// browser process. Attached sessions and the Chrome extension do not use it.
+fn browser_launch_prerequisite(surface: Option<&BrowserSurface>) -> Option<Value> {
+    match surface? {
+        BrowserSurface::NotConfigured => Some(json!({
+            "outcome":"executable_missing",
+            "reason":"Configure browser.executable_path and browser.expected_identity in Cerebellum's settings, then restart the module.",
+        })),
+        BrowserSurface::Refused(error) => Some(json!({
+            "outcome":"identity_unverifiable", "reason_code":error.reason.reason_code(),
+            "reason":"Correct the browser executable and its expected identity in Cerebellum's settings, then restart the module.",
+        })),
+        BrowserSurface::Available(config) => match config.executable_path.as_deref() {
+            Some(path) if path.is_file() => None,
+            Some(path) => Some(json!({
+                "outcome":"executable_missing", "expected_path":path,
+                "reason":"Make the configured browser executable available or correct browser.executable_path in Cerebellum's settings.",
+            })),
+            None => browser_launch_prerequisite(Some(&BrowserSurface::NotConfigured)),
+        },
     }
 }
 

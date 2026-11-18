@@ -1,6 +1,14 @@
 use super::*;
 
 impl Planes {
+    pub(super) fn browser_admitted(&self) -> bool {
+        if self.runtime_browser.is_some() {
+            browser_build_admits()
+        } else {
+            self.browser_config.is_some()
+        }
+    }
+
     /// Configure how agent calls open Cingulate routes and persist the cards
     /// cerebellum raised, so a later call can apply their answers.
     pub fn with_cingulate(
@@ -203,12 +211,16 @@ impl Planes {
             .with_health(Arc::clone(&health));
         let lease_clock = Arc::new(cerebellum_core::clock::SystemClock::new());
         let browser_grants = management.browser_grants();
-        let browser = if let Some(config) = browser_config.as_ref() {
+        // An own-browser action still requires a session, even when no
+        // executable is configured.
+        let browser = if browser_config.is_some() || journal == JournalPersistence::Durable {
             Arc::new(
                 BrowserPlane::with_session_gate(
                     sessions.clone(),
                     Arc::clone(&lease_clock),
-                    config.navigation_settle_deadline_ms,
+                    browser_config
+                        .as_ref()
+                        .map_or(30_000, |config| config.navigation_settle_deadline_ms),
                 )
                 .with_result_schema_enforcement(
                     computer_capability::ResultSchemaEnforcement::Withhold,
@@ -223,9 +235,8 @@ impl Planes {
                 ),
             )
         } else {
-            // The action surface is unavailable without browser configuration,
-            // but browser.import_login still journals its typed configuration
-            // refusal on the management surface.
+            // An isolated management fixture can journal import refusals without
+            // installing a session gate for an unused action surface.
             Arc::new(
                 BrowserPlane::new()
                     .with_result_schema_enforcement(
@@ -254,10 +265,8 @@ impl Planes {
             ..Default::default()
         });
         let _ = calls.display.set(Arc::downgrade(&routes.display));
-        let egress_deadlines = Arc::new(ConnectionDeadlines {
-            display: Arc::clone(&routes.display),
-            ..Default::default()
-        });
+        let egress_deadlines = Arc::new(ConnectionDeadlines::default());
+        egress_deadlines.install_display(Arc::clone(&routes.display));
         #[cfg(target_os = "macos")]
         let global_dispatch_review_revision =
             compiled_release_inputs().global_dispatch_review_revision;

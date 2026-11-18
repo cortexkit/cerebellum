@@ -857,7 +857,7 @@ async fn accepted_effective_scope_is_not_widened_by_request_body() {
 /// actual daemon splice without opening a browser.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-async fn live_daemon_registers_browser_controls_but_refuses_use_when_config_is_absent() {
+async fn live_daemon_declares_browser_controls_without_an_executable() {
     let (mut daemon, connection) = start_live_daemon().await;
     let mut client = connect_client(&connection).await;
 
@@ -970,31 +970,15 @@ async fn live_daemon_registers_browser_controls_but_refuses_use_when_config_is_a
 
     let route = open_live_route(&mut client, 2).await;
 
-    // Both requests name browser.status on a host with NO browser configured, so
-    // both are refused at capability admission -- which happens before arguments
-    // are decoded. The first therefore never reaches argument validation despite
-    // carrying an unexpected field; it is kept because it proves admission runs
-    // FIRST, which is the property that keeps a rejected caller from touching
-    // any handler.
-    //
-    // The refused caller is told what to configure instead of being told the
-    // advertised capability does not exist.
-    let admission_precedes_arguments =
-        send_live_tool_request(&mut client, route, 3, json!({"unexpected": true})).await;
-    assert_eq!(admission_precedes_arguments.header.ty, FrameType::Error);
-    let invalid_body: subc_protocol::ErrorBody =
-        serde_json::from_slice(&admission_precedes_arguments.body).unwrap();
-    assert_eq!(invalid_body.code, "executable_missing");
-
-    let response = send_live_tool_request(&mut client, route, 4, json!({})).await;
-    assert_eq!(response.header.ty, FrameType::Error);
-    let body: subc_protocol::ErrorBody = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(body.code, "executable_missing");
-    assert!(
-        body.message.contains("browser.executable_path"),
-        "a live caller must be told what to configure: {}",
-        body.message
+    let denied = send_live_tool_request(&mut client, route, 3, json!({"action":"status"})).await;
+    assert_eq!(
+        denied.header.ty,
+        FrameType::Error,
+        "{}",
+        String::from_utf8_lossy(&denied.body)
     );
+    let denied: subc_protocol::ErrorBody = serde_json::from_slice(&denied.body).unwrap();
+    assert_eq!(denied.code, "session_caller_not_admitted");
 
     // Close the client before the daemon and module guards are dropped so the
     // daemon can release the route deterministically.
@@ -1162,15 +1146,6 @@ async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured(
         "expected ten browser tools and the flat browser_use adapter: {registered:?}"
     );
 
-    let route = open_live_route(&mut client, 2).await;
-    let response = send_live_tool_request(&mut client, route, 3, json!({})).await;
-    assert_eq!(response.header.ty, FrameType::Error);
-    let body: subc_protocol::ErrorBody = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(body.code, "executable_missing");
-    assert!(body
-        .message
-        .contains("Make the configured browser executable available"));
-
     // Close the client before the daemon and module guards are dropped so the
     // daemon can release the route deterministically.
     drop(client);
@@ -1249,8 +1224,8 @@ async fn start_live_daemon_with_browser(
     if browser {
         let config_dir = config_home.join("cortexkit");
         fs::create_dir_all(&config_dir).expect("create isolated module config directory");
-        // Point to a missing executable so the module reports a prerequisite
-        // refusal without depending on the machine having a browser installed.
+        // A missing executable provides a configured settings fixture without
+        // depending on the machine having a browser installed.
         fs::write(
             config_dir.join("cerebellum.jsonc"),
             serde_json::to_vec(&json!({
@@ -1565,7 +1540,7 @@ async fn send_live_tool_request(
         epoch,
         corr,
         serde_json::to_vec(&json!({
-            "name": "browser.status",
+            "name": "browser_use",
             "arguments": arguments,
         }))
         .unwrap(),
