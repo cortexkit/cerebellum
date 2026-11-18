@@ -1820,6 +1820,9 @@ pub struct HookedRestore {
     pub restore: crate::dispatch::RestoreStatus,
     pub person_input_during_fronting: bool,
     pub input_coverage_unavailable: bool,
+    /// How long the restore took, timed by the side that ran it; see
+    /// [`crate::dispatch::RestoreOutcome::restore_ms`].
+    pub restore_ms: Option<u64>,
 }
 
 /// What the caller of an admitted fronted dispatch owns around it: the
@@ -1853,6 +1856,11 @@ pub trait FrontedDispatchHooks: Send {
     fn cutoff_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
         None
     }
+    /// The cutoff timer for this front was armed on `gate`. A caller that
+    /// reads pixels while the target is in front asks the gate immediately
+    /// before acquiring them, since the timer may fire while its read is
+    /// already under way. The default keeps nothing.
+    fn cutoff_armed(&mut self, _gate: std::sync::Arc<crate::dispatch::CutoffGate>) {}
     /// The bracket ended with `outcome`, whose restore is already the hooked
     /// decision. A `deferred_restore` in it is still owed: the caller settles
     /// the held input first.
@@ -1924,6 +1932,12 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
     }
     fn request_front(&mut self, pid: u32) -> bool {
         if pid == self.target {
+            // The cutoff's deadline is stamped first, as the bracket stamps
+            // the start of the bounded interval just before this request:
+            // registration and arming can take time, and none of it may move
+            // the cutoff later than the bound.
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(self.bound_ms);
             if self.registration != Registration::NotYet {
                 // One temporary front per call: a later chunk is not
                 // fronted again under the same obligation.
@@ -1946,15 +1960,24 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             if let Some(restore) = self.hooks.cutoff_restore() {
                 match crate::dispatch::CutoffTimer::arm(
                     std::sync::Arc::clone(&self.cutoff),
-                    std::time::Duration::from_millis(self.bound_ms),
+                    deadline,
                     restore,
                 ) {
-                    Some(timer) => self.timer = Some(timer),
+                    Some(timer) => {
+                        self.timer = Some(timer);
+                        self.hooks.cutoff_armed(std::sync::Arc::clone(&self.cutoff));
+                    }
                     None => {
                         self.registration = Registration::Registered { prevented: true };
                         return false;
                     }
                 }
+            }
+            // A registration that outlasted the bound leaves no time to
+            // front in; the timer, firing at once, is already deciding.
+            if std::time::Instant::now() >= deadline {
+                self.registration = Registration::Registered { prevented: true };
+                return false;
             }
             let front_instant_ms = self.inner.now_ms();
             if !self.hooks.begin_front_attempt(front_instant_ms) {
@@ -2020,6 +2043,7 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
                 restore: crate::dispatch::RestoreStatus::NotNeeded,
                 person_input_during_fronting: false,
                 input_coverage_unavailable: false,
+                restore_ms: None,
                 finished_at_ms: self.inner.now_ms(),
             };
         }
@@ -2035,6 +2059,7 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             restore: decided.restore,
             person_input_during_fronting: decided.person_input_during_fronting,
             input_coverage_unavailable: decided.input_coverage_unavailable,
+            restore_ms: decided.restore_ms,
             finished_at_ms: self.inner.now_ms(),
         }
     }
@@ -2123,10 +2148,26 @@ pub fn run_hooked_fronted<H: crate::dispatch::FrontingBracketHost + RestoreHostS
     hooks: &mut dyn FrontedDispatchHooks,
     read: Option<&mut dyn FnMut()>,
 ) -> crate::dispatch::BracketOutcome {
-    use crate::dispatch::{BracketStop, FrontingAdmission, RestoreStatus};
     let predictor = (host.supports_needs_front_restore_predictor()
         && hooks.uses_needs_front_restore_predictor())
     .then(crate::dispatch::needs_front_restore_predictor);
+    run_hooked_fronted_with_predictor(host, estimator, plan, cancelled, hooks, read, predictor)
+}
+
+/// [`run_hooked_fronted`] with the restore predictor named rather than
+/// chosen, so a test can hand it one loaded from its own history file.
+pub(crate) fn run_hooked_fronted_with_predictor<
+    H: crate::dispatch::FrontingBracketHost + RestoreHostSource,
+>(
+    host: &mut H,
+    estimator: &mut crate::dispatch::UserIdleEstimator,
+    plan: crate::dispatch::BracketPlan,
+    cancelled: &dyn Fn() -> bool,
+    hooks: &mut dyn FrontedDispatchHooks,
+    read: Option<&mut dyn FnMut()>,
+    predictor: Option<&crate::dispatch::RestorePredictor>,
+) -> crate::dispatch::BracketOutcome {
+    use crate::dispatch::{BracketStop, FrontingAdmission, RestoreStatus};
     let admission = FrontingAdmission {
         app_use_fronting_admitted: true,
     };
@@ -2614,6 +2655,9 @@ mod tests {
 }
 
 #[cfg(test)]
+mod hooked_cutoff_tests;
+
+#[cfg(test)]
 mod hooked_fronted_tests {
     //! The hooked bracket on a fake desk: the hooks own the one front
     //! attempt and the one restore decision, and the bracket itself never
@@ -2785,6 +2829,7 @@ mod hooked_fronted_tests {
                     restore: RestoreStatus::NotNeeded,
                     person_input_during_fronting: false,
                     input_coverage_unavailable: false,
+                    restore_ms: None,
                 };
             }
             let host = self.host.as_mut().unwrap();
@@ -2793,6 +2838,7 @@ mod hooked_fronted_tests {
                 restore: RestoreStatus::Restored,
                 person_input_during_fronting: false,
                 input_coverage_unavailable: false,
+                restore_ms: None,
             }
         }
         fn finished(&mut self, _outcome: &crate::dispatch::BracketOutcome) {

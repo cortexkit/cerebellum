@@ -1734,3 +1734,36 @@ fn a_timed_out_activation_landing_during_in_call_cleanup_does_not_restore_over_i
     assert_eq!(desk.frontmost, Some(TARGET));
     assert!(desk.posted.is_empty());
 }
+
+/// A late watch that leaves focus alone says whether it did so because the
+/// input observer lost coverage, rather than for person input or a third
+/// application: all three end with the same restore status.
+#[test]
+fn a_late_watch_tells_lost_coverage_from_person_input_and_a_third_application() {
+    let watch = |desk: &mut FakeDesk| {
+        watch_late_activation_ending(desk, PREVIOUS, TARGET, 0, 5_000, WHOLE_WINDOW, &|| false)
+    };
+
+    let mut desk = FakeDesk::new();
+    desk.observer_lost = true;
+    let lost = watch(&mut desk);
+    assert!(matches!(lost.restore, RestoreStatus::SkippedPerson { .. }));
+    assert!(lost.coverage_lost && !lost.person_input, "{lost:?}");
+
+    let mut desk = FakeDesk::new();
+    desk.hardware_input_ms = Some(1);
+    let input = watch(&mut desk);
+    assert!(matches!(input.restore, RestoreStatus::SkippedPerson { .. }));
+    assert!(input.person_input && !input.coverage_lost, "{input:?}");
+
+    let mut desk = FakeDesk::new();
+    desk.frontmost = Some(THIRD);
+    let third = watch(&mut desk);
+    assert_eq!(
+        third.restore,
+        RestoreStatus::SkippedPerson {
+            now_front: Some(THIRD)
+        }
+    );
+    assert!(!third.person_input && !third.coverage_lost, "{third:?}");
+}

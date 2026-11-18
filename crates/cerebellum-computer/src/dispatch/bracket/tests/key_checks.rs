@@ -14,6 +14,16 @@ const GENERATION: u64 = 42;
 /// Each post call takes this long on the fake clock.
 const POST_MS: u64 = 10;
 
+/// What changes while the window server's listing of the target is read, a
+/// query that can block for a while on a busy desk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DuringListing {
+    Nothing,
+    FocusMoves,
+    DeadlinePasses,
+    CutoffFires,
+}
+
 /// What the keyboard sees: the clock, the frontmost application, and every
 /// event posted, in order. `switch_after_posts` brings `THIRD` to the front
 /// once that many events were posted.
@@ -22,6 +32,12 @@ struct Keyboard {
     frontmost: Cell<Option<u32>>,
     posted: RefCell<Vec<&'static str>>,
     switch_after_posts: Option<usize>,
+    during_listing: Cell<DuringListing>,
+    gate: CutoffGate,
+    /// Whether the cutoff timer, firing while a post call was in progress,
+    /// would have started the restore, one entry per post.
+    restore_during_post: RefCell<Vec<bool>>,
+    fire_during_post: bool,
 }
 
 impl Keyboard {
@@ -31,6 +47,10 @@ impl Keyboard {
             frontmost: Cell::new(Some(TARGET)),
             posted: RefCell::new(Vec::new()),
             switch_after_posts: None,
+            during_listing: Cell::new(DuringListing::Nothing),
+            gate: CutoffGate::new(),
+            restore_during_post: RefCell::new(Vec::new()),
+            fire_during_post: false,
         }
     }
 }
@@ -44,6 +64,15 @@ impl PerProcessEventTransport for Transport<'_> {
         ProcessGenerationReading::Started(GENERATION)
     }
     fn window_server_visibility(&mut self, _pid: u32) -> WindowServerVisibility {
+        let keyboard = self.0;
+        match keyboard.during_listing.get() {
+            DuringListing::Nothing => {}
+            DuringListing::FocusMoves => keyboard.frontmost.set(Some(THIRD)),
+            DuringListing::DeadlinePasses => keyboard.now.set(keyboard.now.get() + 1_000),
+            DuringListing::CutoffFires => {
+                keyboard.gate.fire();
+            }
+        }
         WindowServerVisibility::Visible
     }
     fn post_to_pid(
@@ -52,6 +81,12 @@ impl PerProcessEventTransport for Transport<'_> {
         event: &'static str,
     ) -> Result<PostCallMade, PostCallFailure> {
         let keyboard = self.0;
+        if keyboard.fire_during_post {
+            keyboard
+                .restore_during_post
+                .borrow_mut()
+                .push(keyboard.gate.fire());
+        }
         keyboard.posted.borrow_mut().push(event);
         keyboard.now.set(keyboard.now.get() + POST_MS);
         if keyboard.switch_after_posts == Some(keyboard.posted.borrow().len()) {
@@ -101,12 +136,30 @@ fn post(
     deadline_ms: u64,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<crate::platform::SequencePostReport, SequencePostFailure> {
+    post_with(
+        keyboard,
+        steps,
+        deadline_ms,
+        cancelled,
+        &mut VisibilityMemo::new(VISIBLE_READING_MAX_AGE),
+        None,
+    )
+}
+
+fn post_with(
+    keyboard: &Keyboard,
+    steps: Vec<SyntheticStep<&'static str>>,
+    deadline_ms: u64,
+    cancelled: &dyn Fn() -> bool,
+    visibility: &mut VisibilityMemo,
+    cutoff: Option<&CutoffGate>,
+) -> Result<crate::platform::SequencePostReport, SequencePostFailure> {
     let mut checks = FrontedKeyChecks {
         target_pid: TARGET,
         deadline_ms,
         now_ms: || keyboard.now.get(),
         frontmost_pid: || keyboard.frontmost.get(),
-        cutoff: None,
+        cutoff,
     };
     post_event_sequence_fronted(
         ProcessEventTarget {
@@ -115,10 +168,134 @@ fn post(
         },
         steps,
         &mut Transport(keyboard),
-        &mut VisibilityMemo::new(VISIBLE_READING_MAX_AGE),
+        visibility,
         cancelled,
         &mut checks,
     )
+}
+
+/// A key whose listing read is slow, while something that forbids the post
+/// happens during that read.
+fn post_one_key_while(change: DuringListing, cancelled: &dyn Fn() -> bool) -> Keyboard {
+    let keyboard = Keyboard::new();
+    keyboard.during_listing.set(change);
+    let failure = post_with(
+        &keyboard,
+        vec![press("a down"), release("a up")],
+        500,
+        cancelled,
+        &mut VisibilityMemo::uncached(),
+        Some(&keyboard.gate),
+    )
+    .unwrap_err();
+    assert_eq!(
+        failure.refusal,
+        ProcessEventRefusal::Cancelled,
+        "{change:?}"
+    );
+    assert_eq!(failure.posts_returned, 0, "{change:?}");
+    assert_eq!(
+        failure.held_state,
+        HeldStateDisposition::NoneHeld,
+        "{change:?}"
+    );
+    keyboard
+}
+
+#[test]
+fn focus_moving_during_the_listing_read_refuses_the_post() {
+    let keyboard = post_one_key_while(DuringListing::FocusMoves, &|| false);
+    assert!(keyboard.posted.borrow().is_empty());
+}
+
+#[test]
+fn the_deadline_passing_during_the_listing_read_refuses_the_post() {
+    let keyboard = post_one_key_while(DuringListing::DeadlinePasses, &|| false);
+    assert!(keyboard.posted.borrow().is_empty());
+}
+
+#[test]
+fn the_cutoff_firing_during_the_listing_read_refuses_the_post() {
+    let keyboard = post_one_key_while(DuringListing::CutoffFires, &|| false);
+    assert!(keyboard.posted.borrow().is_empty());
+    assert!(
+        keyboard.gate.restore_started_by_cutoff(),
+        "nothing was in flight, so the timer started the restore"
+    );
+}
+
+#[test]
+fn a_stop_during_the_listing_read_refuses_the_post() {
+    let listed = Cell::new(false);
+    let keyboard = Keyboard::new();
+    // Cancellation is first read before the listing, when it is still clear,
+    // and becomes true once the listing has been read.
+    struct Watching<'a>(&'a Keyboard, &'a Cell<bool>);
+    impl PerProcessEventTransport for Watching<'_> {
+        type Event = &'static str;
+        fn process_generation(&mut self, pid: u32) -> ProcessGenerationReading {
+            Transport(self.0).process_generation(pid)
+        }
+        fn window_server_visibility(&mut self, _pid: u32) -> WindowServerVisibility {
+            self.1.set(true);
+            WindowServerVisibility::Visible
+        }
+        fn post_to_pid(
+            &mut self,
+            pid: u32,
+            event: &'static str,
+        ) -> Result<PostCallMade, PostCallFailure> {
+            Transport(self.0).post_to_pid(pid, event)
+        }
+    }
+    let mut checks = FrontedKeyChecks {
+        target_pid: TARGET,
+        deadline_ms: 500,
+        now_ms: || keyboard.now.get(),
+        frontmost_pid: || keyboard.frontmost.get(),
+        cutoff: None,
+    };
+    let failure = post_event_sequence_fronted(
+        ProcessEventTarget {
+            pid: TARGET,
+            start_time_micros: GENERATION,
+        },
+        vec![press("a down"), release("a up")],
+        &mut Watching(&keyboard, &listed),
+        &mut VisibilityMemo::uncached(),
+        &|| listed.get(),
+        &mut checks,
+    )
+    .unwrap_err();
+    assert_eq!(failure.posts_returned, 0);
+    assert!(keyboard.posted.borrow().is_empty());
+}
+
+#[test]
+fn a_self_contained_post_holds_the_cutoff_while_it_is_in_flight() {
+    let mut keyboard = Keyboard::new();
+    keyboard.fire_during_post = true;
+    post_with(
+        &keyboard,
+        vec![SyntheticStep {
+            role: SyntheticStepRole::SelfContained,
+            event: "scroll",
+        }],
+        500,
+        &|| false,
+        &mut VisibilityMemo::uncached(),
+        Some(&keyboard.gate),
+    )
+    .unwrap();
+    assert_eq!(
+        *keyboard.restore_during_post.borrow(),
+        [false],
+        "the timer must not restore while the post is in flight"
+    );
+    assert!(
+        keyboard.gate.fire(),
+        "once the post returned nothing is held, so the restore may start"
+    );
 }
 
 #[test]

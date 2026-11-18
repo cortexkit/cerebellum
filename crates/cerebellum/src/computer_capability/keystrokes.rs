@@ -330,6 +330,74 @@ pub(crate) fn bracket_fronting(
     (false, Some(reason))
 }
 
+/// How a remedy that names the keys a refused shortcut already sent begins
+/// and where that sentence ends; see [`chord_keys_sent`].
+const KEYS_SENT_START: &str = "Already sent: ";
+const KEYS_SENT_END: &str = " before retrying.";
+
+/// The sentence a refused shortcut's remedy starts with when its key press
+/// was already posted, naming what was sent by key name, so the refusal never
+/// reads as though nothing was. `None` when nothing was posted.
+///
+/// A shortcut is posted as one press of its key with the modifiers held on
+/// it, then that key's release; `chord` is the shortcut's canonical key
+/// names, never typed or screen-derived text.
+pub(crate) fn chord_keys_sent(
+    chord: &str,
+    refusal: &DispatchError,
+    bracket: Option<&BracketReport>,
+) -> Option<String> {
+    let (posts, held) = match refusal {
+        DispatchError::Cancelled {
+            posts_returned,
+            held_state,
+        }
+        | DispatchError::SyntheticSequenceFailed {
+            posts_returned,
+            held_state,
+            ..
+        } => (*posts_returned, Some(*held_state)),
+        _ => (0, None),
+    };
+    let posts = posts.max(bracket.map_or(0, |bracket| bracket.posts_returned));
+    if posts == 0 {
+        return None;
+    }
+    let release = if posts >= 2
+        || matches!(held, Some(HeldStateDisposition::Released { posts_returned }) if posts_returned > 0)
+    {
+        " and released"
+    } else if matches!(held, Some(HeldStateDisposition::Unknown)) {
+        ", and its release was not confirmed when it stopped"
+    } else {
+        ""
+    };
+    Some(format!(
+        "{KEYS_SENT_START}the {chord} shortcut was pressed{release}. Read the application's \
+         state{KEYS_SENT_END}"
+    ))
+}
+
+/// Put `sent`, from [`chord_keys_sent`], in front of the reply's remedy.
+pub(crate) fn prepend_keys_sent(reply: &mut Value, sent: &str) {
+    let remedy = match reply["remedy"].as_str() {
+        Some(prior) => format!("{sent} {prior}"),
+        None => sent.to_owned(),
+    };
+    reply["remedy"] = json!(remedy);
+}
+
+/// The keys-sent sentence a remedy starts with, if it starts with one, so a
+/// later rewrite of the remedy (a failed restore's) can keep it.
+pub(crate) fn keys_sent_in(remedy: &str) -> Option<&str> {
+    if !remedy.starts_with(KEYS_SENT_START) {
+        return None;
+    }
+    remedy
+        .find(KEYS_SENT_END)
+        .map(|end| &remedy[..end + KEYS_SENT_END.len()])
+}
+
 /// A dispatch refusal on the wire, with a remedy for the fronting ones.
 /// `bracket` is the fronting bracket's report when one ran: a bound refusal
 /// caused only by recent slow posts, or only by recent slow restores of the
@@ -368,8 +436,8 @@ pub(crate) fn dispatch_refusal_reply(
         {
             Some(
                 "the measured restore and send costs are unknown or cannot fit the fronting \
-                 allowance. Nothing was sent and nothing was brought forward; retrying is safe. \
-                 Use write_text on a settable element when possible",
+                 allowance. No keys or clicks were sent and nothing was brought forward; \
+                 retrying is safe. Use write_text on a settable element when possible",
             )
         }
         DispatchError::FrontingFailed => Some(
@@ -736,6 +804,84 @@ mod tests {
             remedy.contains("No keys or clicks were sent; retry the shortcut"),
             "{reply}"
         );
+    }
+
+    /// A shortcut refused before anything was brought forward may still
+    /// have followed the observer's liveness marker, so it says no keys or
+    /// clicks were sent, not that nothing was.
+    #[test]
+    fn a_refusal_before_any_front_says_no_keys_or_clicks_were_sent() {
+        let mut bracket = bracket_stopped_before_front(0, 0);
+        bracket.stop = Some(BracketStop::BoundExceeded);
+        let reply = dispatch_refusal_reply(&DispatchError::FrontingBoundExceeded, Some(&bracket));
+        let remedy = reply["remedy"].as_str().unwrap();
+        assert!(
+            remedy.contains("No keys or clicks were sent and nothing was brought forward"),
+            "{reply}"
+        );
+        assert!(!remedy.contains("Nothing was sent"), "{reply}");
+    }
+
+    /// A shortcut refused after its key press was posted names the keys it
+    /// sent, by key name, and whether their release was confirmed; one that
+    /// posted nothing adds nothing.
+    #[test]
+    fn a_cut_off_shortcut_names_the_keys_already_sent() {
+        let cancelled = |posts_returned, held_state| DispatchError::Cancelled {
+            posts_returned,
+            held_state,
+        };
+        let released = chord_keys_sent(
+            "command+k",
+            &cancelled(1, HeldStateDisposition::Released { posts_returned: 1 }),
+            None,
+        )
+        .unwrap();
+        assert!(
+            released.starts_with("Already sent: the command+k shortcut was pressed and released."),
+            "{released}"
+        );
+        let unknown = chord_keys_sent(
+            "command+k",
+            &DispatchError::SyntheticSequenceFailed {
+                posts_returned: 1,
+                refusal: ProcessEventRefusal::Cancelled,
+                held_state: HeldStateDisposition::Unknown,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            unknown.contains("was pressed, and its release was not confirmed when it stopped"),
+            "{unknown}"
+        );
+        assert_eq!(
+            chord_keys_sent(
+                "command+k",
+                &cancelled(0, HeldStateDisposition::NoneHeld),
+                None
+            ),
+            None
+        );
+        // A bracket's count stands in when the refusal carries none.
+        let mut bracket = bracket_stopped_before_front(1, 1);
+        bracket.stop = Some(BracketStop::BoundExceeded);
+        assert!(chord_keys_sent(
+            "command+k",
+            &DispatchError::FrontingBoundExceeded,
+            Some(&bracket)
+        )
+        .is_some());
+
+        let mut reply = json!({"remedy": "the action was interrupted by the caller"});
+        prepend_keys_sent(&mut reply, &released);
+        let remedy = reply["remedy"].as_str().unwrap();
+        assert!(
+            remedy.ends_with("the action was interrupted by the caller"),
+            "{remedy}"
+        );
+        assert_eq!(keys_sent_in(remedy), Some(released.as_str()));
+        assert_eq!(keys_sent_in("the action was interrupted"), None);
     }
 
     /// A window list that could not be read before the first front answers

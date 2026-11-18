@@ -200,13 +200,22 @@ async fn native_move_and_scroll_stalled_posts_quarantine_before_terminal_restore
         );
         gate.release();
         reached(&done).await;
+        // The stalled send settled with nothing held, so the restore that
+        // terminal cleanup held back for it runs now, and only then is the
+        // fronting lock released.
+        let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+        while rig.lock.held() && std::time::Instant::now() < give_up {
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(
             rig.screen.log(),
             [
                 "front:4242",
                 "native-final-drain",
                 "native-post-enter",
-                "native-post-return"
+                "native-post-return",
+                "restore:100"
             ]
         );
         assert!(!rig.plane.held_input.global_send_outstanding());

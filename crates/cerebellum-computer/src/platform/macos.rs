@@ -517,8 +517,14 @@ struct MacPointerUnit {
 
 impl MacBracketHost {
     /// Request a front of `pid` through `front`, but only while `pid` is
-    /// still held by the admitted process generation.
-    fn request_front_with(&mut self, pid: u32, front: impl FnOnce() -> bool) -> bool {
+    /// still held by the admitted process generation: checked before
+    /// `front` runs, and handed to it to check again after it resolved the
+    /// application and immediately before it writes the activation.
+    fn request_front_with(
+        &mut self,
+        pid: u32,
+        front: impl FnOnce(&mut dyn FnMut() -> bool) -> bool,
+    ) -> bool {
         let transport = &mut self.transport;
         pointer::request_verified_front(
             Some(self.target),
@@ -548,7 +554,9 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
     // unit: a picture or a keystroke is never fronted for a process that has
     // since taken over the pid.
     fn request_front(&mut self, pid: u32) -> bool {
-        self.request_front_with(pid, || cerebellum_macos::request_frontmost(pid).is_ok())
+        self.request_front_with(pid, |still_ours| {
+            cerebellum_macos::request_frontmost_while(pid, still_ours).is_ok()
+        })
     }
 
     fn our_pid(&self) -> i64 {
@@ -809,7 +817,15 @@ impl FrontingRestoreHost for MacRestoreHost {
     }
 
     fn request_front(&mut self, pid: u32) -> bool {
-        cerebellum_macos::request_frontmost(pid).is_ok()
+        // Only the process recorded as the previous application, and only
+        // while it still holds the pid, checked again right before the
+        // activation is written.
+        pointer::request_previous_front(
+            self.previous,
+            pid,
+            cerebellum_macos::process_start_time_micros,
+            |still_ours| cerebellum_macos::request_frontmost_while(pid, still_ours).is_ok(),
+        )
     }
 
     fn remember_previous(&mut self, pid: u32) {
@@ -2482,7 +2498,7 @@ mod tests {
             pointer: None,
         };
         let mut requested = false;
-        assert!(!host.request_front_with(our_pid, || {
+        assert!(!host.request_front_with(our_pid, |_| {
             requested = true;
             true
         }));

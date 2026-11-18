@@ -29,7 +29,7 @@ fn at_the_bound_the_cutoff_stops_new_posts_and_starts_the_restore() {
     let restores = Arc::new(AtomicUsize::new(0));
     let timer = CutoffTimer::arm(
         Arc::clone(&gate),
-        Duration::from_millis(20),
+        Instant::now() + Duration::from_millis(20),
         counting_restore(&restores),
     )
     .unwrap();
@@ -43,13 +43,32 @@ fn at_the_bound_the_cutoff_stops_new_posts_and_starts_the_restore() {
 }
 
 #[test]
+fn the_cutoff_fires_at_its_stamped_deadline_however_late_it_is_armed() {
+    let gate = Arc::new(CutoffGate::new());
+    let restores = Arc::new(AtomicUsize::new(0));
+    let stamped = Instant::now();
+    let deadline = stamped + Duration::from_millis(100);
+    // Registration took longer than the whole bound before the timer was
+    // armed; the cutoff must not then wait a further bound.
+    std::thread::sleep(Duration::from_millis(200));
+    let armed = Instant::now();
+    let timer = CutoffTimer::arm(Arc::clone(&gate), deadline, counting_restore(&restores)).unwrap();
+    eventually(|| restores.load(Ordering::SeqCst) == 1);
+    assert!(
+        armed.elapsed() < Duration::from_millis(80),
+        "a deadline already past fires at once, not a bound after arming"
+    );
+    timer.finish();
+}
+
+#[test]
 fn the_cutoff_never_restores_while_a_key_may_be_held() {
     let gate = Arc::new(CutoffGate::new());
     let restores = Arc::new(AtomicUsize::new(0));
     assert!(gate.begin_post(true), "a press before the bound");
     let timer = CutoffTimer::arm(
         Arc::clone(&gate),
-        Duration::from_millis(5),
+        Instant::now() + Duration::from_millis(5),
         counting_restore(&restores),
     )
     .unwrap();
@@ -69,7 +88,7 @@ fn a_bracket_that_restores_first_leaves_the_timer_nothing_to_do() {
     let restores = Arc::new(AtomicUsize::new(0));
     let timer = CutoffTimer::arm(
         Arc::clone(&gate),
-        Duration::from_millis(5),
+        Instant::now() + Duration::from_millis(5),
         counting_restore(&restores),
     )
     .unwrap();
@@ -86,7 +105,7 @@ fn finishing_before_the_bound_stops_the_timer_without_waiting_for_it() {
     let restores = Arc::new(AtomicUsize::new(0));
     let timer = CutoffTimer::arm(
         Arc::clone(&gate),
-        Duration::from_secs(3600),
+        Instant::now() + Duration::from_secs(3600),
         counting_restore(&restores),
     )
     .unwrap();

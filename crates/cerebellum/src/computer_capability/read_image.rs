@@ -74,12 +74,26 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
                 || gate.is_some_and(|gate| gate.stopped())
         },
         &mut || {
+            // The fronting lock stays held until this read returns, even if
+            // the cutoff restores meanwhile, so no other front starts under
+            // a capture still in flight.
+            let _lock_hold = hooks.hold_lock_for_read();
             // Even a backend panic must return through the bracket's restore.
             captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 check_visibility(freshness, grant, evidence, None, false)?;
+                // The visibility check and the window lookup can block. The
+                // bound is asked again immediately before the pixels are
+                // requested: once it has passed, none are acquired.
                 let pending = controller
-                    .capture_frontmost_window_unencoded_for_vision(now_ms)
-                    .map_err(image_capture_error)?;
+                    .capture_frontmost_window_unencoded_for_vision_fenced(now_ms, &|| {
+                        hooks.picture_may_acquire()
+                    });
+                if !hooks.picture_may_acquire() {
+                    // Refused at the fence, or acquired as the bound passed:
+                    // either way nothing from this read is returned.
+                    return Err(ImageUnavailable::FrontingBoundExceeded);
+                }
+                let pending = pending.map_err(image_capture_error)?;
                 check_visibility(
                     freshness,
                     grant,

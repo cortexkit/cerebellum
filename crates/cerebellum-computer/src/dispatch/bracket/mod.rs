@@ -27,6 +27,15 @@
 //! held defers the restore to the caller instead of putting the previous
 //! application back under a held modifier. Without admission a bracket
 //! behaves as it always has.
+//!
+//! Every activation names a process by pid, and the operating system offers
+//! no activation bound to a process generation. The macOS host therefore
+//! checks the generation (the target's admitted one, or the previous
+//! application's start time) after resolving the application element and
+//! immediately before writing `AXFrontmost`. One race remains and cannot be
+//! closed from here: the system resolves the pid again when it delivers that
+//! write, so a process that takes over the pid between the last check and
+//! the delivery would be the one asked to come forward.
 
 mod cutoff;
 mod latency;
@@ -44,7 +53,7 @@ pub use press::*;
 pub use reason::*;
 pub use restore::*;
 pub(crate) use restore_predictor::needs_front_restore_predictor;
-use restore_predictor::RestorePredictor;
+pub(crate) use restore_predictor::RestorePredictor;
 pub use restore_predictor::{load_needs_front_restore_predictor, RESTORE_LATENCY_FORMAT};
 
 use std::cell::RefCell;
@@ -1016,8 +1025,11 @@ pub(crate) fn run_fronting_read_with_predictor<H: FrontingBracketHost>(
             Ok(UnitPosted::default())
         }
         // A picture unit posts no keys or clicks and holds nothing down, so
-        // the cutoff may restore while the read is still running. The read itself starts
-        // only inside the bound, before the cutoff and before cancellation.
+        // the cutoff may start the restore while the read is still running.
+        // The read starts only inside the bound, before the cutoff and
+        // before cancellation; a hooked caller asks the cutoff again
+        // immediately before acquiring pixels, withholds any acquired as it
+        // fired, and keeps its fronting lock until the read returns.
         fn post_observed_unit(
             &mut self,
             index: usize,
@@ -1113,28 +1125,41 @@ fn restore<H: FrontingBracketHost>(
                 .max(outcome.finished_at_ms.saturating_sub(restore_at));
         }
         let interval = outcome.finished_at_ms.saturating_sub(fronted_at);
-        let elapsed = outcome.finished_at_ms.saturating_sub(restore_at);
+        // The sample is the restore's own cost as the side that ran it timed
+        // it. The time this thread spent reaching the decision says nothing
+        // about that cost: when the cutoff's timer ran the restore while a
+        // picture blocked this thread, reading the decision afterwards would
+        // otherwise record a near-zero restore.
+        let sample = outcome.restore_ms;
         if let Some(predictor) = predictor {
             match outcome.restore {
                 RestoreStatus::Restored => {
                     report.restore_calibrated =
                         calibrating && activation_observed && interval <= bound && !*person_input;
-                    predictor.record(
-                        elapsed,
-                        report.restore_calibrated.then_some(bound),
-                        Instant::now(),
-                    );
+                    if let Some(sample) = sample {
+                        predictor.record(
+                            sample,
+                            report.restore_calibrated.then_some(bound),
+                            Instant::now(),
+                        );
+                    }
                 }
                 // As for the in-memory history: a failed wait is only a lower
                 // bound on the restore's cost, so it counts as at least the
                 // full cleanup allowance and can never shrink the reserve.
                 RestoreStatus::Failed { .. } => {
-                    predictor.record(elapsed.max(RESTORE_WAIT_MS), None, Instant::now());
+                    predictor.record(
+                        sample.unwrap_or(0).max(RESTORE_WAIT_MS),
+                        None,
+                        Instant::now(),
+                    );
                 }
                 RestoreStatus::NotNeeded | RestoreStatus::SkippedPerson { .. } => {}
             }
-        } else {
-            remember_restore(*host.borrow_mut(), outcome.restore, elapsed);
+        } else if let Some(sample) = sample {
+            remember_restore(*host.borrow_mut(), outcome.restore, sample);
+        } else if matches!(outcome.restore, RestoreStatus::Failed { .. }) {
+            remember_restore(*host.borrow_mut(), outcome.restore, RESTORE_WAIT_MS);
         }
         report.longest_fronted_interval_ms = report.longest_fronted_interval_ms.max(interval);
         report.restore = outcome.restore;

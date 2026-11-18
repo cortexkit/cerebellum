@@ -140,6 +140,12 @@ pub struct RestoreOutcome {
     /// When the previous application was seen back in front, or the decision
     /// otherwise finished, on the host's clock.
     pub finished_at_ms: u64,
+    /// How long this restore took, from the start of the decision that ran
+    /// it to `finished_at_ms`, as timed by whoever ran that decision. `None`
+    /// when the caller did not run it itself, for instance when it awaited
+    /// a decision another thread had already made: its own wait says
+    /// nothing about what the restore cost, so it is no timing sample.
+    pub restore_ms: Option<u64>,
 }
 
 /// Run the restore decision against `host` and carry it out: read the
@@ -192,6 +198,29 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
     require_quiet: bool,
 ) -> RestoreOutcome {
     let started = host.now_ms();
+    let mut outcome = untimed_restore_attempt(
+        host,
+        previous,
+        target,
+        front_instant_ms,
+        wait_ms,
+        activation_observed,
+        require_quiet,
+    );
+    outcome.restore_ms = Some(outcome.finished_at_ms.saturating_sub(started));
+    outcome
+}
+
+fn untimed_restore_attempt<H: FrontingBracketHost + ?Sized>(
+    host: &mut H,
+    previous: u32,
+    target: u32,
+    front_instant_ms: u64,
+    wait_ms: u64,
+    activation_observed: bool,
+    require_quiet: bool,
+) -> RestoreOutcome {
+    let started = host.now_ms();
     if previous != target && !activation_observed {
         loop {
             let frontmost = host.frontmost_pid();
@@ -210,6 +239,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
                     person_input_during_fronting: true,
                     input_coverage_unavailable,
                     finished_at_ms: host.now_ms(),
+                    restore_ms: None,
                 };
             }
             if frontmost == Some(target) {
@@ -223,6 +253,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
                     person_input_during_fronting: input,
                     input_coverage_unavailable,
                     finished_at_ms: host.now_ms(),
+                    restore_ms: None,
                 };
             }
             if host.now_ms().saturating_sub(started) >= wait_ms {
@@ -233,6 +264,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
                     person_input_during_fronting: input,
                     input_coverage_unavailable: false,
                     finished_at_ms: host.now_ms(),
+                    restore_ms: None,
                 };
             }
             host.pause_ms(FRONTING_POLL_MS);
@@ -245,6 +277,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
             person_input_during_fronting: false,
             input_coverage_unavailable: false,
             finished_at_ms: host.now_ms(),
+            restore_ms: None,
         };
     }
     let first_front = host.frontmost_pid();
@@ -271,6 +304,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
             person_input_during_fronting: input,
             input_coverage_unavailable,
             finished_at_ms: host.now_ms(),
+            restore_ms: None,
         };
     }
     match decide_restore(previous, target, frontmost, input) {
@@ -279,6 +313,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
             person_input_during_fronting: input,
             input_coverage_unavailable: false,
             finished_at_ms: host.now_ms(),
+            restore_ms: None,
         },
         RestoreDecision::Restore {
             person_input_during_fronting,
@@ -299,6 +334,7 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
                 person_input_during_fronting,
                 input_coverage_unavailable: false,
                 finished_at_ms: host.now_ms(),
+                restore_ms: None,
             }
         }
     }
@@ -327,7 +363,8 @@ fn restore_attempt<H: FrontingBracketHost + ?Sized>(
 ///
 /// Returns the restore status as the watch ended, the latency of the first
 /// landing it saw, and whether person input arrived while the target could
-/// still be in front.
+/// still be in front. [`watch_late_activation_ending`] also says why it
+/// stopped.
 pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
     host: &mut H,
     previous: u32,
@@ -337,6 +374,38 @@ pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
     watch: LateWatch,
     stop: &dyn Fn() -> bool,
 ) -> (RestoreStatus, Option<u64>, bool) {
+    let ended =
+        watch_late_activation_ending(host, previous, target, requested_at, watch_ms, watch, stop);
+    (ended.restore, ended.first_landing_ms, ended.person_input)
+}
+
+/// How a late watch ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LateWatchEnd {
+    pub restore: RestoreStatus,
+    /// The latency of the first landing the watch saw.
+    pub first_landing_ms: Option<u64>,
+    /// Person input arrived while the target could still be in front.
+    pub person_input: bool,
+    /// The watch left focus alone because the input observer could not show
+    /// gap-free coverage since the front, not because of person input or a
+    /// third application. A restore status of `SkippedPerson` alone does not
+    /// tell these apart. The observer counts each such gap in its own health
+    /// (`hardwareInputObserver.coverage_gap_count`), or reports itself not
+    /// running when it never covered the front.
+    pub coverage_lost: bool,
+}
+
+/// [`watch_late_activation`], saying also why the watch stopped.
+pub fn watch_late_activation_ending<H: FrontingBracketHost + ?Sized>(
+    host: &mut H,
+    previous: u32,
+    target: u32,
+    requested_at: u64,
+    watch_ms: u64,
+    watch: LateWatch,
+    stop: &dyn Fn() -> bool,
+) -> LateWatchEnd {
     let end = requested_at.saturating_add(watch_ms);
     let mut first_landing = None;
     let mut target_was_front = false;
@@ -363,14 +432,20 @@ pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
             }
         }
         target_was_front = target_front;
+        let ending = |restore, person_input, coverage_lost| LateWatchEnd {
+            restore,
+            first_landing_ms: first_landing,
+            person_input,
+            coverage_lost,
+        };
         if input || !covers(snapshot, requested_at) {
             if restored {
-                return (RestoreStatus::Restored, first_landing, false);
+                return ending(RestoreStatus::Restored, false, false);
             }
-            return (
+            return ending(
                 RestoreStatus::SkippedPerson { now_front: front },
-                first_landing,
                 input,
+                !input,
             );
         }
         let settled = || {
@@ -383,7 +458,7 @@ pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
             }
         };
         if stop() || now >= end || (first_attempt_only && front == Some(previous)) {
-            return (settled(), first_landing, false);
+            return ending(settled(), false, false);
         }
         if target_front {
             let result = restore_attempt(
@@ -396,10 +471,13 @@ pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
                 true,
             );
             if first_attempt_only {
-                return (
+                let coverage_lost = result.input_coverage_unavailable
+                    && !result.person_input_during_fronting
+                    && matches!(result.restore, RestoreStatus::SkippedPerson { .. });
+                return ending(
                     result.restore,
-                    first_landing,
                     result.person_input_during_fronting,
+                    coverage_lost,
                 );
             }
             match result.restore {
@@ -408,7 +486,7 @@ pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
                     target_was_front = false;
                 }
                 RestoreStatus::SkippedPerson { .. } if result.person_input_during_fronting => {
-                    return (result.restore, first_landing, true);
+                    return ending(result.restore, true, false);
                 }
                 // Not back yet, or a reading changed under the decision:
                 // look again, and ask again while the window lasts.
@@ -422,7 +500,7 @@ pub fn watch_late_activation<H: FrontingBracketHost + ?Sized>(
             } else {
                 RestoreStatus::SkippedPerson { now_front: front }
             };
-            return (restore, first_landing, false);
+            return ending(restore, false, false);
         }
         host.pause_ms(10);
     }

@@ -256,18 +256,24 @@ fn route_event_with_visibility<T: PerProcessEventTransport>(
     transport: &mut T,
     visibility: &mut VisibilityMemo,
 ) -> Result<(PostCallMade, u64), ProcessEventRefusal> {
-    let mut verifications = 0_u64;
     require_listed_generation(target, transport, visibility)?;
-    verifications += 1;
+    post_listed_target(target, event, transport, 1)
+}
 
+/// The post that follows a listing read: the post-time generation check, then
+/// the post call. `verifications` counts the checks already made for it.
+fn post_listed_target<T: PerProcessEventTransport>(
+    target: ProcessEventTarget,
+    event: T::Event,
+    transport: &mut T,
+    verifications: u64,
+) -> Result<(PostCallMade, u64), ProcessEventRefusal> {
     // This is the post-time identity check. Nothing that can block or inspect
     // another subsystem occurs between this reading and the selected post call.
     require_exact_generation(target, transport.process_generation(target.pid))?;
-    verifications += 1;
-
     transport
         .post_to_pid(target.pid, event)
-        .map(|made| (made, verifications))
+        .map(|made| (made, verifications + 1))
         .map_err(ProcessEventRefusal::PostCallFailed)
 }
 
@@ -378,21 +384,25 @@ fn post_paced_with_visibility<T: PerProcessEventTransport>(
 /// target is temporarily in front.
 pub trait FrontedKeyGuard {
     /// Runs before a press or self-contained post, never before a release
-    /// or a recovery release. `press` says the post may leave a key held
+    /// or a recovery release. It runs after the post's window-server listing
+    /// read, which can block, so that focus, the deadline and the cutoff it
+    /// checks are read last; only the post-time generation check separates
+    /// it from the post call. `press` says the post may leave a key held
     /// until its paired release. An error stops the unit before this post,
     /// and the presses already posted are released as on any other stop.
     fn before_post(&mut self, press: bool) -> Result<(), ProcessEventRefusal>;
-    /// Every press posted so far has been released.
+    /// No post is in flight and every press posted so far has been released.
     fn all_released(&mut self) {}
 }
 
 /// [`post_event_sequence_with_visibility`] for a unit posted while its
-/// target is temporarily in front. `guard` runs before every press and
-/// self-contained post, after the caller's cancellation check, so focus and
-/// the bracket's deadline are checked at each post rather than once per
-/// unit. Releases are not held back by it: like every post here they go to
-/// the target process, and leaving a key down is worse than releasing it
-/// after the target lost focus.
+/// target is temporarily in front. Before every press and self-contained
+/// post, the blocking listing read comes first; then cancellation is checked
+/// again and `guard` runs, so focus, cancellation, the bracket's deadline and
+/// its cutoff are all read after anything that can block, immediately before
+/// the post-time generation check and the post call. Releases are not held
+/// back by it: like every post here they go to the target process, and
+/// leaving a key down is worse than releasing it after the target lost focus.
 pub fn post_event_sequence_fronted<T: PerProcessEventTransport>(
     target: ProcessEventTarget,
     steps: Vec<SyntheticStep<T::Event>>,
@@ -409,11 +419,21 @@ pub fn post_event_sequence_fronted<T: PerProcessEventTransport>(
             return Ok(0);
         };
         let role = roles[index];
-        if !recovery && role != SyntheticStepRole::Release {
-            guard.before_post(role == SyntheticStepRole::Press)?;
+        let routed = if !recovery && role != SyntheticStepRole::Release {
+            require_listed_generation(target, transport, visibility)
+                .and_then(|()| {
+                    if cancelled() {
+                        Err(ProcessEventRefusal::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .and_then(|()| guard.before_post(role == SyntheticStepRole::Press))
+                .and_then(|()| post_listed_target(target, event, transport, 1))
+        } else {
+            route_event_with_visibility(target, event, transport, visibility)
         }
-        let routed = route_event_with_visibility(target, event, transport, visibility)
-            .map(|(_, checks)| checks);
+        .map(|(_, checks)| checks);
         if routed.is_ok() {
             match role {
                 SyntheticStepRole::Press => presses_down += 1,
@@ -425,6 +445,11 @@ pub fn post_event_sequence_fronted<T: PerProcessEventTransport>(
                 }
                 SyntheticStepRole::SelfContained => {}
             }
+        }
+        // A guarded post holds the cutoff while it is in flight. Once it has
+        // returned, made or not, with nothing pressed, nothing is held.
+        if !recovery && role != SyntheticStepRole::Release && presses_down == 0 {
+            guard.all_released();
         }
         routed
     })

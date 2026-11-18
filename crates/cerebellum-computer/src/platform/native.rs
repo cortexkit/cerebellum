@@ -597,11 +597,24 @@ impl CaptureBackend for NativeCaptureBackend {
         &mut self,
         request: &WindowCaptureRequest,
     ) -> Result<PendingVisionWindowFrame, BackendError> {
+        self.capture_window_unencoded_for_vision_fenced(request, &|| true)
+    }
+
+    // Asked in the owner gate, which runs after the window has been found
+    // and immediately before the one-window filter is built and the pixels
+    // are requested: the last point before ScreenCaptureKit acquires them.
+    fn capture_window_unencoded_for_vision_fenced(
+        &mut self,
+        request: &WindowCaptureRequest,
+        may_acquire: &dyn Fn() -> bool,
+    ) -> Result<PendingVisionWindowFrame, BackendError> {
         let window_id: u32 = request.filter.window_id.parse().map_err(|_| {
             BackendError::Capture(format!("not a window id: {}", request.filter.window_id))
         })?;
         let capture = capture_granted_window(window_id, &request.target, |accept_owner| {
-            cerebellum_macos::capture_window_owned_by(window_id, self.timeout, None, accept_owner)
+            cerebellum_macos::capture_window_owned_by(window_id, self.timeout, None, &mut |owner| {
+                accept_owner(owner) && may_acquire()
+            })
         })?;
         let captured_width_px = u32::try_from(capture.width)
             .map_err(|_| BackendError::Capture("the capture is too wide".into()))?;

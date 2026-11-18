@@ -461,6 +461,12 @@ async fn send_principal_denied(
 /// - `hardwareInputObserver`, whether the
 ///   timestamp-only hardware observer is running and how often it recovered
 ///   from a disabled tap. Reading health never starts the observer.
+/// - `frontingLockHeldForUnsettledRelease`, how many fronting locks are kept
+///   because a held key's release had not settled when its call replied
+///   (`count`), and since when the oldest has been held (`oldest_since_ms`,
+///   wall-clock milliseconds, or `null`). Such a lock has no time bound: it
+///   is released only when that release settles, so a nonzero count that
+///   stays is a stuck release, and no app is brought forward meanwhile.
 ///
 /// Counters are atomic and none changes the status. The helper PID, when
 /// present, is checked against the OS process-start time without waiting on
@@ -581,6 +587,11 @@ pub(super) fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleCo
             "last_problem": Value::Null,
         });
         metrics.insert("hardwareInputObserver".to_string(), observer);
+        let (count, oldest_since_ms) = crate::terminal_arbiter::unsettled_release_fronting_locks();
+        metrics.insert(
+            "frontingLockHeldForUnsettledRelease".to_string(),
+            json!({"count": count, "oldest_since_ms": oldest_since_ms}),
+        );
     }
     report
 }

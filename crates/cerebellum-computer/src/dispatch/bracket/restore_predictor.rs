@@ -3,8 +3,9 @@
 //! The history on disk is a hint, never an authority: it can only make the
 //! admission check stricter. Every persisted sample must look like something
 //! this module measured (within [`MIN_RESTORE_SAMPLE_MS`] and
-//! [`MAX_RESTORE_SAMPLE_MS`], with a measurement time that is not in the
-//! future), and only samples younger than [`RESTORE_SAMPLE_MAX_AGE`] count.
+//! [`MAX_RESTORE_SAMPLE_MS`], with a measurement time no later than the
+//! time it is read, with no allowance), and only samples younger than
+//! [`RESTORE_SAMPLE_MAX_AGE`] count.
 //! A document that fails any check is ignored as a whole, which leaves the
 //! predictor cold: the next eligible call calibrates instead of trusting a
 //! reserve.
@@ -56,11 +57,6 @@ pub(super) const MAX_RESTORE_SAMPLE_MS: u64 = 10_000;
 /// when the file is loaded and stop counting in memory; when none is younger,
 /// the predictor is cold again and the next eligible call calibrates.
 pub(super) const RESTORE_SAMPLE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-
-/// How far after this process's clock a stored measurement time may lie, to
-/// tolerate a small clock step between the write and the read. A later time
-/// is not one this module wrote, and the file is ignored.
-const FUTURE_TOLERANCE: Duration = Duration::from_secs(60);
 
 static PROCESS_PREDICTOR: OnceLock<RestorePredictor> = OnceLock::new();
 
@@ -125,6 +121,13 @@ fn maximum_of(samples: &VecDeque<Sample>, now_unix_ms: u64) -> Option<u64> {
 impl RestorePredictor {
     pub(super) fn open(data_home: Option<&Path>) -> Self {
         Self::open_at(data_home, unix_ms(SystemTime::now()))
+    }
+
+    /// A predictor loaded from `data_home`'s history, for tests outside this
+    /// module that must not touch the process-wide one.
+    #[cfg(test)]
+    pub(crate) fn open_for_test(data_home: &Path) -> Self {
+        Self::open(Some(data_home))
     }
 
     pub(super) fn open_at(data_home: Option<&Path>, now_unix_ms: u64) -> Self {
@@ -242,13 +245,15 @@ impl RestorePredictor {
 
 /// The loaded samples that count, or none when any of them could not have
 /// been written by this module: a cost outside the allowed range (zero
-/// included) or a measurement time in the future. Stale samples are dropped
-/// one by one; a file of only stale samples leaves the predictor cold.
+/// included) or a measurement time later than now. There is no allowance
+/// for a clock step: a sample dated even a moment ahead is not one this
+/// module wrote, and a wall clock stepped back only costs a calibration.
+/// Stale samples are dropped one by one; a file of only stale samples leaves
+/// the predictor cold.
 fn usable_samples(samples: Vec<Sample>, now_unix_ms: u64) -> VecDeque<Sample> {
-    let latest_allowed = now_unix_ms.saturating_add(duration_ms(FUTURE_TOLERANCE));
     if samples.iter().any(|sample| {
         !(MIN_RESTORE_SAMPLE_MS..=MAX_RESTORE_SAMPLE_MS).contains(&sample.ms)
-            || sample.at_unix_ms > latest_allowed
+            || sample.at_unix_ms > now_unix_ms
     }) {
         return VecDeque::new();
     }
