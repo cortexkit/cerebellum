@@ -53,7 +53,7 @@ pub use press::*;
 pub use reason::*;
 pub use restore::*;
 pub(crate) use restore_predictor::needs_front_restore_predictor;
-use restore_predictor::RestorePredictor;
+pub(crate) use restore_predictor::RestorePredictor;
 pub use restore_predictor::{load_needs_front_restore_predictor, RESTORE_LATENCY_FORMAT};
 
 use std::cell::RefCell;

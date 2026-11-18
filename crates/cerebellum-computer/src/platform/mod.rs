@@ -2148,10 +2148,26 @@ pub fn run_hooked_fronted<H: crate::dispatch::FrontingBracketHost + RestoreHostS
     hooks: &mut dyn FrontedDispatchHooks,
     read: Option<&mut dyn FnMut()>,
 ) -> crate::dispatch::BracketOutcome {
-    use crate::dispatch::{BracketStop, FrontingAdmission, RestoreStatus};
     let predictor = (host.supports_needs_front_restore_predictor()
         && hooks.uses_needs_front_restore_predictor())
     .then(crate::dispatch::needs_front_restore_predictor);
+    run_hooked_fronted_with_predictor(host, estimator, plan, cancelled, hooks, read, predictor)
+}
+
+/// [`run_hooked_fronted`] with the restore predictor named rather than
+/// chosen, so a test can hand it one loaded from its own history file.
+pub(crate) fn run_hooked_fronted_with_predictor<
+    H: crate::dispatch::FrontingBracketHost + RestoreHostSource,
+>(
+    host: &mut H,
+    estimator: &mut crate::dispatch::UserIdleEstimator,
+    plan: crate::dispatch::BracketPlan,
+    cancelled: &dyn Fn() -> bool,
+    hooks: &mut dyn FrontedDispatchHooks,
+    read: Option<&mut dyn FnMut()>,
+    predictor: Option<&crate::dispatch::RestorePredictor>,
+) -> crate::dispatch::BracketOutcome {
+    use crate::dispatch::{BracketStop, FrontingAdmission, RestoreStatus};
     let admission = FrontingAdmission {
         app_use_fronting_admitted: true,
     };
@@ -2637,6 +2653,9 @@ mod tests {
         assert_eq!(advertised, vec!["computer.wait"]);
     }
 }
+
+#[cfg(test)]
+mod hooked_cutoff_tests;
 
 #[cfg(test)]
 mod hooked_fronted_tests {

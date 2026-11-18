@@ -123,6 +123,13 @@ impl RestorePredictor {
         Self::open_at(data_home, unix_ms(SystemTime::now()))
     }
 
+    /// A predictor loaded from `data_home`'s history, for tests outside this
+    /// module that must not touch the process-wide one.
+    #[cfg(test)]
+    pub(crate) fn open_for_test(data_home: &Path) -> Self {
+        Self::open(Some(data_home))
+    }
+
     pub(super) fn open_at(data_home: Option<&Path>, now_unix_ms: u64) -> Self {
         let file = data_home.map(|home| StoreFile {
             path: module_directory(home).join(TREE).join(FILE_NAME),
