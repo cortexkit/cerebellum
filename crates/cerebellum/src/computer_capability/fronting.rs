@@ -744,11 +744,13 @@ impl ObligationParts {
     /// Register the obligation for a front of `target` over `previous`.
     /// `None` when the call's terminal reply is already chosen; the lock is
     /// then released and nothing may be fronted.
+    /// `gate` is the bracket's, when the front runs in one.
     pub(crate) fn register(
         &mut self,
         previous: u32,
         target: u32,
         host: Box<dyn FrontingRestoreHost>,
+        gate: Option<Arc<cerebellum_computer::dispatch::CutoffGate>>,
     ) -> Option<Arc<RestoreCell>> {
         let lock = self.lock.take()?;
         let mut host = host;
@@ -772,6 +774,7 @@ impl ObligationParts {
                     host,
                     fallback: self.restore_fallback,
                 }),
+                gate,
             })
             .ok()
     }
@@ -914,12 +917,18 @@ impl FrontedDispatchHooks for CellHooks {
         })
     }
 
-    fn register(&mut self, previous: u32, target: u32, host: Box<dyn FrontingRestoreHost>) -> bool {
+    fn register(
+        &mut self,
+        previous: u32,
+        target: u32,
+        host: Box<dyn FrontingRestoreHost>,
+        gate: &Arc<cerebellum_computer::dispatch::CutoffGate>,
+    ) -> bool {
         let mut state = self.state();
         let Some(parts) = state.parts.as_mut() else {
             return false;
         };
-        match parts.register(previous, target, host) {
+        match parts.register(previous, target, host, Some(Arc::clone(gate))) {
             Some(cell) => {
                 state.cell = Some(cell);
                 true
@@ -966,27 +975,38 @@ impl FrontedDispatchHooks for CellHooks {
 
     /// App-use fronts (shortcuts and pictures under the app's own grant)
     /// get a cutoff timer; fronts made under the takeover (mouse-and-keyboard)
-    /// grant keep their existing bounds. The timer runs this same hooks'
-    /// decision, which goes through the one restore cell, so the restore
-    /// still runs exactly once; at the cutoff it is requested at once
-    /// ([`RestoreCell::decide_at_cutoff`]).
+    /// grant keep their existing bounds. The timer decides through the same
+    /// restore cell, which the cell's gate hands it at the start of the
+    /// restore reserve, so the restore still runs exactly once; it is then
+    /// requested at once ([`RestoreCell::decide_at_cutoff`]) on `host`, the
+    /// timer's own restore host.
     fn cutoff_restore(
         &mut self,
+        host: Box<dyn FrontingRestoreHost>,
     ) -> Option<Box<dyn FnOnce(cerebellum_computer::dispatch::CutoffWake) + Send>> {
         let state = self.state();
-        if !state
+        let fallback = state
             .parts
             .as_ref()
-            .is_some_and(|parts| parts.restore_fallback)
-        {
+            .is_some_and(|parts| parts.restore_fallback);
+        if !fallback {
             return None;
         }
         // Resolve the cell before arming. At cutoff the ready thread can
         // claim it directly without taking the hooks' separate mutex.
         let cell = state.cell.clone()?;
+        drop(state);
+        let mut host = host;
+        // Prepared now, as the obligation's host was at registration, so the
+        // timer's restore makes no lookup before its request either.
+        if cell.previous_pid() != cell.target_pid() {
+            host.remember_previous(cell.previous_pid());
+        }
+        let host: Box<dyn crate::terminal_arbiter::RestoreHost> =
+            Box::new(PlatformRestoreHost { host, fallback });
         let hooks = self.clone();
         Some(Box::new(move |wake| {
-            let decided = with_restore_budget_here(|| cell.decide_at_cutoff(wake));
+            let decided = with_restore_budget_here(|| cell.decide_at_cutoff(wake, host));
             hooks.state().decided = Some(decided);
         }))
     }
@@ -1007,9 +1027,6 @@ impl FrontedDispatchHooks for CellHooks {
     }
 
     fn cutoff_armed(&mut self, gate: Arc<cerebellum_computer::dispatch::CutoffGate>) {
-        if let Some(cell) = self.cell() {
-            cell.set_cutoff(Arc::clone(&gate));
-        }
         self.state().cutoff = Some(gate);
     }
 

@@ -34,15 +34,36 @@ pub(crate) fn expired_internal() -> u64 {
     EXPIRED_INTERNAL.load(Ordering::Relaxed)
 }
 
-pub(super) struct NativeWriteCheck<'a>(pub(super) Option<&'a mut WriteDeadline>);
+/// The last check before a native restore write: the side writing must
+/// still own the decision, and the first write must be inside its deadline.
+pub(super) struct NativeWriteCheck<'a> {
+    pub(super) owner: &'a super::DecisionOwner<'a>,
+    pub(super) deadline: Option<&'a mut WriteDeadline>,
+    /// Told at once when the deadline refuses the write.
+    pub(super) cell: Option<&'a super::RestoreCell>,
+}
 
 impl RestoreWriteCheck for NativeWriteCheck<'_> {
     fn permit(&mut self) -> bool {
-        self.0.as_mut().is_none_or(|guard| guard.permit())
+        // Ownership first: a write refused because the timer took over is
+        // not this owner's expiry, and is not counted as one.
+        if !self.owner.commit() {
+            return false;
+        }
+        let Some(guard) = self.deadline.as_mut() else {
+            return true;
+        };
+        let permitted = guard.permit();
+        if !permitted && guard.expired {
+            if let Some(cell) = self.cell {
+                cell.publish_expired_write();
+            }
+        }
+        permitted
     }
 
     fn identity_read(&mut self, started: Instant, finished: Instant) {
-        if let Some(guard) = &mut self.0 {
+        if let Some(guard) = &mut self.deadline {
             guard.os_read(started, finished);
         }
     }
@@ -139,6 +160,20 @@ fn record(milliseconds: u64) {
     while samples.len() > SAMPLES {
         samples.pop_front();
     }
+    #[cfg(test)]
+    RECORDED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECORDED_ON_THIS_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many preparations this thread recorded, so a test can tell its own
+/// sample from those of tests running beside it.
+#[cfg(test)]
+pub(crate) fn samples_recorded_on_this_thread() -> usize {
+    RECORDED_ON_THIS_THREAD.with(std::cell::Cell::get)
 }
 
 /// How far before the deadline the cutoff fires, in milliseconds.
@@ -174,6 +209,7 @@ mod tests {
         let timer = CutoffTimer::arm_with_wake(
             Arc::new(CutoffGate::new()),
             scheduled_at,
+            deadline,
             Box::new(move |wake| {
                 // A delayed internal handoff, before the restore owns a cell.
                 std::thread::sleep(Duration::from_millis(20));

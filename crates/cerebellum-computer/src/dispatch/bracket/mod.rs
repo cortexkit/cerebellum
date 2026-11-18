@@ -20,12 +20,17 @@
 //! posting rather than assumed: each unit's post time and each restore's
 //! latency are timed, and a chunk ends when the next unit and a restore would
 //! no longer fit.
-//! The cutoff starts restore preparation early. An unsettled input release
-//! defers the restore; if OS focus reads stall past the deadline, the first
-//! native restore write is refused instead and the restore reports failure.
-//! A short-lived watcher can retry only while the target is still frontmost
-//! and observation shows the person has not intervened. Neither exception assumes focus or
-//! input is safe merely because time has passed.
+//! Who decides the restore is set by time (see [`CutoffGate`]): before the
+//! restore reserve starts, the action's own cleanup or the call's terminal
+//! cleanup may decide; from its start the cutoff timer owns the decision
+//! outright and decides on its own restore host, so no blocking step of
+//! another owner can delay it. Input still held at the deadline defers the
+//! restore until its release; if OS focus reads stall past the deadline,
+//! the first native restore write is refused instead and the restore
+//! reports failure. A short-lived watcher can retry only while the target
+//! is still frontmost and observation shows the person has not intervened.
+//! Neither exception assumes focus or input is safe merely because time has
+//! passed.
 //! macOS is not a real-time scheduler: it can preempt even the ready cutoff
 //! thread. The reserve includes time from its planned wake through the last
 //! check, and the write is refused if that check is late. A timeout wake
@@ -148,10 +153,12 @@ pub trait FrontingBracketHost {
     }
     /// Optional diagnostic observation; it never authorizes more action input.
     fn late_activation_observed(&mut self, _latency_ms: u64) {}
-    /// Whoever performs the restore (the action's own cleanup or the deadline
-    /// timer) may keep watching for a pending activation to land only until
-    /// the safety reads and restore request must begin to meet the deadline.
-    fn restore_observation_open(&self) -> bool {
+    /// Whether the side running this restore decision still owns it. An
+    /// ordinary owner (the action's cleanup or the terminal's) owns it only
+    /// until the restore reserve starts, when the timer takes it over; the
+    /// decision checks between its steps and stops, writing nothing, once
+    /// this is `false`. Hosts without a timer always own their decision.
+    fn restore_decision_held(&self) -> bool {
         true
     }
     /// The action's confirmation wait ended. Later observations belong only
