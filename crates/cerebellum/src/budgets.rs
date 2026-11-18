@@ -45,6 +45,13 @@ pub const FRONTING_READ_MS: u64 = 300;
 /// describes the takeover bracket; app-grant needs-front shortcuts use this
 /// budget instead.
 pub const FRONTING_BRACKET_MS: u64 = 200;
+/// How long a fronted picture read may keep the fronting lock from its
+/// start. Its pixels are refused past `FRONTING_BRACKET_MS` anyway; this
+/// bounds only how long a read whose synchronous step never returns can
+/// keep every other front waiting. Past it the lock is released as for a
+/// read whose capture timed out, and module health counts the read
+/// (`pictureReadsPastLifetime`).
+pub const PICTURE_READ_LIFETIME_MS: u64 = 5_000;
 // Bringing the target app to the front, for an action that needs it there.
 // Only one call fronts an app at a time, process-wide; a caller waits this
 // long for that lock, then stops with `fronting_busy`.
