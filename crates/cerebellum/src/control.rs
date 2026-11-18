@@ -607,6 +607,10 @@ pub(super) fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleCo
             json!({"still_running": stalled, "total": stalled_total}),
         );
         metrics.insert(
+            "frontingPreviousBindFailed".to_string(),
+            json!(crate::terminal_arbiter::restore_preparation::previous_bind_failures()),
+        );
+        metrics.insert(
             "frontingRestoreExpiredAtWrite".to_string(),
             json!(crate::terminal_arbiter::restore_preparation::expired_writes()),
         );

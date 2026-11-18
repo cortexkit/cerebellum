@@ -1716,8 +1716,11 @@ pub trait FrontingRestoreHost: Send {
     /// ([`PreviousBinding`]) and every restore request it makes, the first
     /// route and the second alike, refuses a pid that has since passed to
     /// another process. A host binds only once: a later call never replaces
-    /// the binding, and a bind that failed admits no restore write at all.
-    fn remember_previous(&mut self, _pid: u32) {}
+    /// the binding. `false` means the process could not be bound, so no
+    /// temporary front or restore write can be made.
+    fn remember_previous(&mut self, _pid: u32) -> bool {
+        true
+    }
     /// A second way to ask for `pid`, the remembered previous application,
     /// to come to the front, for when [`Self::request_front`] has not taken
     /// effect. `false` when the host has none, `pid` is not the remembered
@@ -1974,7 +1977,7 @@ enum Registration {
     NotYet,
     /// The terminal was already chosen; nothing was fronted.
     Refused,
-    /// Registered; `prevented` when cleanup stopped it before the front.
+    /// Registered; `prevented` when the front cannot be requested.
     Registered {
         prevented: bool,
     },
@@ -2070,8 +2073,8 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
                 self.registration = Registration::Refused;
                 return false;
             }
-            // A registration that outlasted the reserve leaves no time to
-            // front in: nothing new starts from its start.
+            // Registration can close the gate when there is no safe
+            // previous process to restore, or when it outlasts the reserve.
             if self.cutoff.closed() {
                 self.registration = Registration::Registered { prevented: true };
                 return false;

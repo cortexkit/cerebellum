@@ -338,17 +338,25 @@ where
     fn dispatch_gate_open(&mut self) -> bool {
         self.gate.begin_mutation()
     }
-    fn register_restore_obligation(&mut self, previous: u32, target: u32) -> bool {
+    fn register_restore_obligation(
+        &mut self,
+        previous: u32,
+        target: u32,
+    ) -> Result<(), FrontingStop> {
         let host = self.session.as_ref().restore_host();
         let Some(parts) = self.parts.as_mut() else {
-            return false;
+            return Err(FrontingStop::TerminalAlreadyChosen);
         };
         match parts.register(previous, target, host, None) {
-            Some(cell) => {
+            Some((cell, true)) => {
                 self.cell = Some(cell);
-                true
+                Ok(())
             }
-            None => false,
+            Some((cell, false)) => {
+                cell.decide();
+                Err(FrontingStop::PreviousUnknown)
+            }
+            None => Err(FrontingStop::TerminalAlreadyChosen),
         }
     }
     fn begin_front_attempt(&mut self, front_instant_ms: u64) -> bool {

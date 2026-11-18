@@ -142,8 +142,12 @@ pub trait FrontingPressHost: FrontingBracketHost {
     /// Whether the dispatch gate still admits a mutation.
     fn dispatch_gate_open(&mut self) -> bool;
     /// Step 5: register the restore obligation for a front of `target` over
-    /// `previous`. `false` when the call's terminal reply is already chosen.
-    fn register_restore_obligation(&mut self, previous: u32, target: u32) -> bool;
+    /// `previous`. An error stops the action before any front is requested.
+    fn register_restore_obligation(
+        &mut self,
+        previous: u32,
+        target: u32,
+    ) -> Result<(), FrontingStop>;
     /// The front request is about to be made at `front_instant_ms`. `false`
     /// when cleanup already took the obligation, so no front may happen.
     fn begin_front_attempt(&mut self, front_instant_ms: u64) -> bool;
@@ -542,9 +546,7 @@ fn front_target<H: FrontingPressHost>(
     if !host.dispatch_gate_open() {
         return Err(FrontingStop::DispatchGateClosed);
     }
-    if !host.register_restore_obligation(previous, plan.target_pid) {
-        return Err(FrontingStop::TerminalAlreadyChosen);
-    }
+    host.register_restore_obligation(previous, plan.target_pid)?;
     *progress.obligation_registered = true;
     let session = progress.fronted.insert(Fronted {
         tap,

@@ -22,6 +22,15 @@ static PREPARATIONS: Mutex<VecDeque<u64>> = Mutex::new(VecDeque::new());
 static EXPIRED_WRITES: AtomicU64 = AtomicU64::new(0);
 static EXPIRED_OS_DELAY: AtomicU64 = AtomicU64::new(0);
 static EXPIRED_INTERNAL: AtomicU64 = AtomicU64::new(0);
+static PREVIOUS_BIND_UNAVAILABLE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn previous_bind_failed() {
+    PREVIOUS_BIND_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn previous_bind_failures() -> u64 {
+    PREVIOUS_BIND_UNAVAILABLE.load(Ordering::Relaxed)
+}
 
 pub(crate) fn expired_writes() -> u64 {
     EXPIRED_WRITES.load(Ordering::Relaxed)

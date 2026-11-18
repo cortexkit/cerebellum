@@ -538,6 +538,7 @@ struct ScreenState {
     remembered_previous: Option<u32>,
     /// How many times a restore host was told which process to put back.
     remember_calls: usize,
+    previous_bind_fails: bool,
     /// The restore host refuses to ask for any process it was not told to
     /// put back, as the macOS host does, which checks that process's
     /// start time before asking.
@@ -597,6 +598,7 @@ impl Screen {
                 fallback_works: false,
                 remembered_previous: None,
                 remember_calls: 0,
+                previous_bind_fails: false,
                 restore_needs_remembered_previous: false,
                 landings_at: Vec::new(),
                 restore_focus_delay_ms: 0,
@@ -755,10 +757,14 @@ impl FrontingRestoreHost for FakeRestore {
         }
         self.0.front("restore", pid)
     }
-    fn remember_previous(&mut self, pid: u32) {
+    fn remember_previous(&mut self, pid: u32) -> bool {
         let mut state = self.0.state();
-        state.remembered_previous = Some(pid);
         state.remember_calls += 1;
+        if state.previous_bind_fails {
+            return false;
+        }
+        state.remembered_previous = Some(pid);
+        true
     }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
         if self.0.state().fallback_works {
@@ -1789,6 +1795,33 @@ async fn a_background_command_chord_fronts_posts_and_restores() {
         !rig.lock.held(),
         "released when the restore decision completed"
     );
+}
+
+#[tokio::test]
+async fn a_failed_previous_bind_refuses_a_background_chord_before_fronting() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    rig.read().await;
+    {
+        let mut state = rig.screen.state();
+        state.previous_bind_fails = true;
+        state.restore_needs_remembered_previous = true;
+    }
+    let terminal = under_terminal();
+    let reply = rig
+        .call_under(&terminal, "computer.keys", command_chord())
+        .await;
+    assert!(
+        rig.screen.log().is_empty(),
+        "{reply}: {:?}",
+        rig.screen.log()
+    );
+    assert_eq!(rig.screen.state().remember_calls, 1);
+    assert_eq!(reply["effect_status"], "not_dispatched", "{reply}");
+    assert_eq!(
+        reply["fronting"]["not_fronted_reason"], "previous_unknown",
+        "{reply}"
+    );
+    assert!(!rig.lock.held());
 }
 
 #[tokio::test]
