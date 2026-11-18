@@ -145,8 +145,14 @@ impl Registered {
                 .push(json!(capability));
         }
         if module_id == "ckbus" {
+            // Only roles that list operations as objects take the fake credential
+            // op; an internal service lists its operations as plain names.
             for role in manifest["provides"].as_array_mut().unwrap() {
-                if let Some(operations) = role.get_mut("operations").and_then(Value::as_array_mut) {
+                if let Some(operations) = role
+                    .get_mut("operations")
+                    .and_then(Value::as_array_mut)
+                    .filter(|operations| operations.iter().all(Value::is_object))
+                {
                     operations.push(json!({"name":"ckbus.credential","kind":"query"}));
                 }
             }

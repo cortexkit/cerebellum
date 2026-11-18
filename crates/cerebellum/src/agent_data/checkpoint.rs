@@ -90,7 +90,7 @@ impl Participant {
             return Err(unavailable("checkpoint file exceeds size limit"));
         }
         tokio::task::spawn_blocking(move || {
-            // Keep transaction admission until the actual disk write ends,
+            // Keep the checkpoint lock held until the actual disk write ends,
             // even when the request waiting for this thread is cancelled.
             let floor = FormatFloor::at(
                 path.parent()

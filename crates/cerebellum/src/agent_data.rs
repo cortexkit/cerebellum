@@ -196,8 +196,9 @@ impl Participant {
         let mut cut = current.cloned().unwrap_or_default();
         let reply = match op {
             Op::Prepare => {
-                // Persist the snapshot before door admission. A failed upload
-                // must retry the same bytes even if more marks arrive meanwhile.
+                // Persist the snapshot before uploading it to engram's session
+                // stream. A failed upload must retry the same bytes even if more
+                // marks arrive meanwhile.
                 if cut.payloads.is_empty() {
                     cut.refs = Some(refs.clone());
                     for r in refs.as_slice() {
@@ -250,8 +251,9 @@ impl Participant {
                     payloads.insert(r.r#ref.clone(), payload);
                     items.push(json!({"sessionRef":item.session_ref,"endOffset":item.end_offset,"digest":item.digest}));
                 }
-                // No replacement or staging: adding provenance cannot discard
-                // local data, even if reads happened since diverged answered.
+                // No replacement or staging: importing only adds marks, so it
+                // cannot discard anything recorded here, even reads made after
+                // this computer answered the driver's divergence check.
                 for payload in payloads.values() {
                     if !marks
                         .import_agent(&payload.agent_id, &payload.sources)
