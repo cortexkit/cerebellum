@@ -273,8 +273,8 @@ pub use process_table::{
 };
 #[cfg(target_os = "macos")]
 pub use skylight::{
-    keyboard_auth_available, post_key_to_pid, post_single_key_to_pid, skylight_available,
-    OwnedKeyEvent, PostResult,
+    keyboard_auth_available, post_key_to_pid, post_single_key_to_pid, post_single_key_to_pid_after,
+    skylight_available, OwnedKeyEvent, PostResult,
 };
 #[cfg(target_os = "macos")]
 pub use window_image::{

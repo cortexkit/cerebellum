@@ -25,12 +25,12 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 /// The per-post checks for a keystroke unit posted while its target is in
-/// front: the cutoff has not fired, the target is still the frontmost
-/// application, and the bracket's deadline has not passed. The unit's
-/// cancellation is checked separately by the sequence, just before these.
-/// The sequence runs them after the post's window-server listing read, the
-/// one step that can block, so nothing slow lies between these checks and
-/// the post call.
+/// front: the target is still the frontmost application, the unit has not
+/// been stopped, and the bracket's absolute deadline has not passed; then
+/// the post is committed on the cutoff gate. The sequence runs them after
+/// every preparation for the post (the listing read, the final generation
+/// lookup, any authentication the transport attaches), immediately before
+/// the OS post call.
 ///
 /// A post refused here was never made, so the refusal is
 /// [`ProcessEventRefusal::Cancelled`], which a reply reads as no post call
@@ -51,12 +51,21 @@ where
     N: FnMut() -> u64,
     F: FnMut() -> Option<u32>,
 {
-    fn before_post(&mut self, press: bool) -> Result<(), ProcessEventRefusal> {
-        // The focus read can take a moment; the deadline is read after it so
-        // nothing that can block separates the deadline check from the post.
+    fn before_post(
+        &mut self,
+        press: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), ProcessEventRefusal> {
+        // The focus read can take a moment, so the stop and the deadline are
+        // read after it: nothing that can block separates them from the post.
         if (self.frontmost_pid)() != Some(self.target_pid) {
             return Err(ProcessEventRefusal::Cancelled);
         }
+        if cancelled() {
+            return Err(ProcessEventRefusal::Cancelled);
+        }
+        // The absolute deadline itself, not only whether the timer has run:
+        // a late-scheduled timer must not leave a post open past it.
         if (self.now_ms)() >= self.deadline_ms {
             return Err(ProcessEventRefusal::Cancelled);
         }

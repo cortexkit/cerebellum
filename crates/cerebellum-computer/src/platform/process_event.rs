@@ -144,6 +144,22 @@ pub trait PerProcessEventTransport {
         pid: u32,
         event: Self::Event,
     ) -> Result<PostCallMade, PostCallFailure>;
+    /// [`Self::post_to_pid`], with every preparation the transport makes
+    /// for the post (an authentication object built and attached to the
+    /// event, say) done first, and `last_check` asked immediately before the
+    /// OS post call, with nothing between its answer and that call. A refusal
+    /// from it posts nothing and is returned as it is. The default has no
+    /// preparation, so it asks just before [`Self::post_to_pid`].
+    fn post_to_pid_after(
+        &mut self,
+        pid: u32,
+        event: Self::Event,
+        last_check: &mut dyn FnMut() -> Result<(), ProcessEventRefusal>,
+    ) -> Result<PostCallMade, ProcessEventRefusal> {
+        last_check()?;
+        self.post_to_pid(pid, event)
+            .map_err(ProcessEventRefusal::PostCallFailed)
+    }
 }
 
 /// Route one event to the exact process generation named by `target`.
@@ -384,23 +400,37 @@ fn post_paced_with_visibility<T: PerProcessEventTransport>(
 /// target is temporarily in front.
 pub trait FrontedKeyGuard {
     /// Runs before a press or self-contained post, never before a release
-    /// or a recovery release. It runs after the post's window-server listing
-    /// read, which can block, so that focus, the deadline and the cutoff it
-    /// checks are read last; only the post-time generation check separates
-    /// it from the post call. `press` says the post may leave a key held
-    /// until its paired release. An error stops the unit before this post,
-    /// and the presses already posted are released as on any other stop.
-    fn before_post(&mut self, press: bool) -> Result<(), ProcessEventRefusal>;
+    /// or a recovery release. It runs after every preparation for the post
+    /// (the window-server listing read, the final process-generation lookup
+    /// and whatever the transport prepares, such as an authentication
+    /// object attached to the event), immediately before the OS post call:
+    /// nothing runs between its answer and that call. It reads focus, then
+    /// `cancelled` (so a stop arriving during the focus read is seen), then
+    /// the absolute deadline, and last commits the post. `press` says the
+    /// post may leave a key held until its paired release. An error stops
+    /// the unit before this post, and the presses already posted are
+    /// released as on any other stop.
+    ///
+    /// One race is left, inside the OS call itself: the call is made after
+    /// the commit, and the system delivers the event after it returns, so
+    /// focus, the deadline or the process can still change between the last
+    /// check and delivery.
+    fn before_post(
+        &mut self,
+        press: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), ProcessEventRefusal>;
     /// No post is in flight and every press posted so far has been released.
     fn all_released(&mut self) {}
 }
 
 /// [`post_event_sequence_with_visibility`] for a unit posted while its
 /// target is temporarily in front. Before every press and self-contained
-/// post, the blocking listing read comes first; then cancellation is checked
-/// again and `guard` runs, so focus, cancellation, the bracket's deadline and
-/// its cutoff are all read after anything that can block, immediately before
-/// the post-time generation check and the post call. Releases are not held
+/// post, all preparation comes first: the blocking listing read, the final
+/// process-generation lookup, and the transport's own preparation. Then
+/// `guard` reads focus, cancellation and the bracket's absolute deadline
+/// and commits the post, immediately before the OS post call (see
+/// [`PerProcessEventTransport::post_to_pid_after`]). Releases are not held
 /// back by it: like every post here they go to the target process, and
 /// leaving a key down is worse than releasing it after the target lost focus.
 pub fn post_event_sequence_fronted<T: PerProcessEventTransport>(
@@ -420,16 +450,17 @@ pub fn post_event_sequence_fronted<T: PerProcessEventTransport>(
         };
         let role = roles[index];
         let routed = if !recovery && role != SyntheticStepRole::Release {
+            let press = role == SyntheticStepRole::Press;
             require_listed_generation(target, transport, visibility)
                 .and_then(|()| {
-                    if cancelled() {
-                        Err(ProcessEventRefusal::Cancelled)
-                    } else {
-                        Ok(())
-                    }
+                    require_exact_generation(target, transport.process_generation(target.pid))
                 })
-                .and_then(|()| guard.before_post(role == SyntheticStepRole::Press))
-                .and_then(|()| post_listed_target(target, event, transport, 1))
+                .and_then(|GenerationVerified| {
+                    transport.post_to_pid_after(target.pid, event, &mut || {
+                        guard.before_post(press, cancelled)
+                    })
+                })
+                .map(|made| (made, 2))
         } else {
             route_event_with_visibility(target, event, transport, visibility)
         }
@@ -804,6 +835,72 @@ impl PerProcessEventTransport for MacOsPerProcessEventTransport {
             self.evidence
                 .record(PerProcessTransport::PublicCoreGraphics, self.recovery);
             Ok(PostCallMade::public_core_graphics())
+        }
+    }
+
+    // The private route's authentication object is built and attached before
+    // `last_check` is asked; the public route has no preparation. Either way
+    // the OS post call follows its answer directly.
+    fn post_to_pid_after(
+        &mut self,
+        pid: u32,
+        event: Self::Event,
+        last_check: &mut dyn FnMut() -> Result<(), ProcessEventRefusal>,
+    ) -> Result<PostCallMade, ProcessEventRefusal> {
+        let pid = i32::try_from(pid).map_err(|_| {
+            ProcessEventRefusal::PostCallFailed(PostCallFailure::new(
+                "process id does not fit macOS pid_t",
+            ))
+        })?;
+        let refused = std::cell::RefCell::new(None);
+        let gate = std::cell::RefCell::new(last_check);
+        let check = || match (**gate.borrow_mut())() {
+            Ok(()) => true,
+            Err(refusal) => {
+                *refused.borrow_mut() = Some(refusal);
+                false
+            }
+        };
+        let withheld = || PostCallFailure::new("withheld before the post call");
+        let public = || {
+            if !check() {
+                return Err(withheld());
+            }
+            let _call_made_not_delivery = cerebellum_macos::post_event_to_pid(pid, &event);
+            Ok(())
+        };
+        let posted = if let Some(keyboard) = self.keyboard {
+            keyboard.post(
+                self.recovery,
+                &mut self.evidence,
+                |attach_auth| match cerebellum_macos::post_single_key_to_pid_after(
+                    pid,
+                    &event,
+                    attach_auth,
+                    &mut || check(),
+                ) {
+                    cerebellum_macos::PostResult::Posted { .. } => Ok(()),
+                    cerebellum_macos::PostResult::Withheld => Err(withheld()),
+                    cerebellum_macos::PostResult::AuthUnavailable
+                    | cerebellum_macos::PostResult::AuthFailed => Err(PostCallFailure::new(
+                        super::input_route::PRIVATE_INPUT_AUTH_FAILED,
+                    )),
+                    error => Err(PostCallFailure::new(format!(
+                        "SkyLight post failed: {error:?}"
+                    ))),
+                },
+                public,
+            )
+        } else {
+            public().map(|()| {
+                self.evidence
+                    .record(PerProcessTransport::PublicCoreGraphics, self.recovery);
+                PostCallMade::public_core_graphics()
+            })
+        };
+        match refused.into_inner() {
+            Some(refusal) => Err(refusal),
+            None => posted.map_err(ProcessEventRefusal::PostCallFailed),
         }
     }
 }

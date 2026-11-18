@@ -128,10 +128,10 @@ fn key_checks_refuse_a_press_once_the_cutoff_fired_and_mark_a_press_held() {
         cutoff: Some(&gate),
     };
     use crate::platform::FrontedKeyGuard;
-    assert!(checks.before_post(true).is_ok());
+    assert!(checks.before_post(true, &|| false).is_ok());
     assert!(!gate.fire(), "held: the timer must not restore");
     assert!(
-        checks.before_post(false).is_err(),
+        checks.before_post(false, &|| false).is_err(),
         "no post after the cutoff"
     );
     checks.all_released();
