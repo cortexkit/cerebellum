@@ -477,6 +477,15 @@ struct ScreenState {
     /// Every front and restore request, and every post and release, in
     /// order.
     log: Vec<String>,
+    /// When each request to bring the previous application back was made,
+    /// in real time, for the cutoff's real-time bound.
+    restore_requested_at: Vec<std::time::Instant>,
+    /// Handing the restore host to the obligation blocks the bracket's
+    /// thread for this long in real time, as a slow registration would.
+    register_blocks_ms: u64,
+    /// The request to front the target blocks the bracket's thread for this
+    /// long in real time before it takes effect, logging `front-returned`.
+    front_blocks_ms: u64,
     last_input_ms: Option<u64>,
     /// A chord's post fails with its keys possibly still held.
     post_unknown: bool,
@@ -548,6 +557,9 @@ impl Screen {
                 restore_until: None,
                 measured_restore_ms: Some(0),
                 log: Vec::new(),
+                restore_requested_at: Vec::new(),
+                register_blocks_ms: 0,
+                front_blocks_ms: 0,
                 last_input_ms: None,
                 post_unknown: false,
                 post_cost_ms: 0,
@@ -700,6 +712,9 @@ impl FrontingRestoreHost for FakeRestore {
         }
         {
             let mut state = self.0.state();
+            if pid != TARGET {
+                state.restore_requested_at.push(std::time::Instant::now());
+            }
             if pid != TARGET && state.restores_ignored > 0 {
                 state.restores_ignored -= 1;
                 state.log.push(format!("restore:{pid}"));
@@ -781,6 +796,10 @@ struct FakeBracket(Screen);
 
 impl RestoreHostSource for FakeBracket {
     fn restore_host(&self) -> Box<dyn FrontingRestoreHost> {
+        let blocks = self.0.state().register_blocks_ms;
+        if blocks > 0 {
+            std::thread::sleep(Duration::from_millis(blocks));
+        }
         Box::new(FakeRestore(self.0.clone()))
     }
 }
@@ -803,7 +822,15 @@ impl FrontingBracketHost for FakeBracket {
         self.0.frontmost()
     }
     fn request_front(&mut self, pid: u32) -> bool {
-        self.0.front("front", pid)
+        let blocks = self.0.state().front_blocks_ms;
+        if pid != TARGET || blocks == 0 {
+            return self.0.front("front", pid);
+        }
+        self.0.state().log.push(format!("front:{pid}"));
+        std::thread::sleep(Duration::from_millis(blocks));
+        self.0.desk.state().frontmost = Some(pid);
+        self.0.state().log.push("front-returned".into());
+        true
     }
     fn our_pid(&self) -> i64 {
         OUR_PID

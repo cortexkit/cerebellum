@@ -16,7 +16,7 @@ use crate::platform::{FrontedKeyGuard, ProcessEventRefusal};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::Instant;
 
 /// The per-post checks for a keystroke unit posted while its target is in
 /// front: the cutoff has not fired, the target is still the frontmost
@@ -147,10 +147,15 @@ impl CutoffGate {
     }
 }
 
-/// A thread that fires a [`CutoffGate`] once `after` has passed, and then
+/// A thread that fires a [`CutoffGate`] at an absolute `deadline`, and then
 /// runs `restore` unless the gate says not to. It holds no lock while
 /// `restore` runs. Finishing it, or dropping it, stops a timer that has not
 /// fired and waits for one that has, so no timer outlives its bracket.
+///
+/// The deadline is an instant the caller stamped before the front was
+/// requested, not a span measured from when the thread happens to start, so
+/// a slow registration or a late-scheduled thread cannot move the cutoff
+/// later than the bound. A deadline already past fires at once.
 pub struct CutoffTimer {
     stop: Option<mpsc::Sender<()>>,
     thread: Option<JoinHandle<()>>,
@@ -161,7 +166,7 @@ impl CutoffTimer {
     /// front, since nothing would enforce the bound.
     pub fn arm(
         gate: Arc<CutoffGate>,
-        after: Duration,
+        deadline: Instant,
         restore: Box<dyn FnOnce() + Send>,
     ) -> Option<Self> {
         let (stop, stopped) = mpsc::channel::<()>();
@@ -170,7 +175,8 @@ impl CutoffTimer {
             .spawn(move || {
                 // Only the deadline passing fires the cutoff; the sender being
                 // dropped means the bracket finished first.
-                if let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(after) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(remaining) {
                     if gate.fire() {
                         restore();
                     }

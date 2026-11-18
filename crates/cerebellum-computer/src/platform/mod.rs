@@ -1924,6 +1924,12 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
     }
     fn request_front(&mut self, pid: u32) -> bool {
         if pid == self.target {
+            // The cutoff's deadline is stamped first, as the bracket stamps
+            // the start of the bounded interval just before this request:
+            // registration and arming can take time, and none of it may move
+            // the cutoff later than the bound.
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(self.bound_ms);
             if self.registration != Registration::NotYet {
                 // One temporary front per call: a later chunk is not
                 // fronted again under the same obligation.
@@ -1946,7 +1952,7 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             if let Some(restore) = self.hooks.cutoff_restore() {
                 match crate::dispatch::CutoffTimer::arm(
                     std::sync::Arc::clone(&self.cutoff),
-                    std::time::Duration::from_millis(self.bound_ms),
+                    deadline,
                     restore,
                 ) {
                     Some(timer) => self.timer = Some(timer),
@@ -1955,6 +1961,12 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
                         return false;
                     }
                 }
+            }
+            // A registration that outlasted the bound leaves no time to
+            // front in; the timer, firing at once, is already deciding.
+            if std::time::Instant::now() >= deadline {
+                self.registration = Registration::Registered { prevented: true };
+                return false;
             }
             let front_instant_ms = self.inner.now_ms();
             if !self.hooks.begin_front_attempt(front_instant_ms) {

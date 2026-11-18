@@ -144,3 +144,122 @@ fn a_bracket_inside_its_bound_restores_itself_and_leaves_no_timer_running() {
     std::thread::sleep(Duration::from_millis(2 * BOUND_MS));
     assert_eq!(restores(&screen), 1, "nothing restored after the bracket");
 }
+
+/// When the restore was first requested, measured from `started`.
+fn first_restore_after(screen: &Screen, started: Instant) -> Duration {
+    screen
+        .state()
+        .restore_requested_at
+        .first()
+        .map(|at| at.saturating_duration_since(started))
+        .expect("a restore was requested")
+}
+
+/// A picture read that blocks until the previous application is back.
+fn blocked_read(screen: &Screen) -> impl FnMut() + '_ {
+    move || {
+        let give_up = Instant::now() + crate::test_support::HANG_GUARD;
+        while Instant::now() < give_up && restores(screen) == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+#[test]
+fn a_slow_registration_does_not_move_the_cutoff_past_the_bound() {
+    let screen = Screen::new(&mail_desk());
+    // Registration takes most of the bound before the timer is armed. The
+    // cutoff counts from the stamp made before it, not from the arming.
+    screen.state().register_blocks_ms = BOUND_MS * 4 / 5;
+    let (hooks, _releases) = app_use_hooks();
+    let mut boxed = boxed_hooks(&hooks);
+    let reader = screen.clone();
+    let mut read = blocked_read(&reader);
+    let started = Instant::now();
+    let outcome = cerebellum_computer::platform::run_hooked_fronted(
+        &mut FakeBracket(screen.clone()),
+        &mut UserIdleEstimator::new(),
+        plan(),
+        &|| false,
+        boxed.as_mut(),
+        Some(&mut read),
+    );
+    let restored_after = first_restore_after(&screen, started);
+    assert!(
+        restored_after < Duration::from_millis(BOUND_MS + BOUND_MS / 2),
+        "the restore was requested {restored_after:?} after the bracket began, past the bound"
+    );
+    assert!(outcome.report.restore_started_by_cutoff);
+    assert_eq!(restores(&screen), 1, "{:?}", screen.log());
+}
+
+#[test]
+fn a_registration_that_outlasts_the_bound_fronts_nothing() {
+    let screen = Screen::new(&mail_desk());
+    screen.state().register_blocks_ms = BOUND_MS * 3 / 2;
+    let (hooks, releases) = app_use_hooks();
+    let mut boxed = boxed_hooks(&hooks);
+    let outcome = cerebellum_computer::platform::run_hooked_fronted(
+        &mut FakeBracket(screen.clone()),
+        &mut UserIdleEstimator::new(),
+        plan(),
+        &|| false,
+        boxed.as_mut(),
+        None,
+    );
+    assert!(
+        !screen.log().iter().any(|entry| entry.starts_with("front:")),
+        "the bound passed before the front was requested: {:?}",
+        screen.log()
+    );
+    assert_eq!(outcome.report.units_posted, 0);
+    assert_eq!(outcome.report.restore, RestoreStatus::NotNeeded);
+    assert_eq!(lock_releases(&releases), 1);
+}
+
+#[test]
+fn the_cutoff_firing_during_a_blocked_activation_restores_once_it_returns() {
+    let screen = Screen::new(&mail_desk());
+    // The activation request blocks past the bound, but returns within the
+    // wait the restore decision allows an activation in flight.
+    let front_blocks_ms = 2 * BOUND_MS;
+    assert!(front_blocks_ms < crate::budgets::FRONT_WAIT_MS);
+    screen.state().front_blocks_ms = front_blocks_ms;
+    let (hooks, releases) = app_use_hooks();
+    let mut boxed = boxed_hooks(&hooks);
+    let started = Instant::now();
+    let outcome = cerebellum_computer::platform::run_hooked_fronted(
+        &mut FakeBracket(screen.clone()),
+        &mut UserIdleEstimator::new(),
+        plan(),
+        &|| false,
+        boxed.as_mut(),
+        None,
+    );
+    let log = screen.log();
+    assert_eq!(
+        log,
+        [
+            format!("front:{TARGET}"),
+            "front-returned".to_owned(),
+            format!("restore:{PREVIOUS}"),
+        ],
+        "never restored under the pending activation, and nothing posted"
+    );
+    // The hard bound on the restore request: the cutoff plus, at most, the
+    // wait for an activation still in flight.
+    let restored_after = first_restore_after(&screen, started);
+    assert!(
+        restored_after >= Duration::from_millis(front_blocks_ms),
+        "{restored_after:?}"
+    );
+    assert!(
+        restored_after
+            < Duration::from_millis(BOUND_MS + crate::budgets::FRONT_WAIT_MS + BOUND_MS / 2),
+        "{restored_after:?}"
+    );
+    assert!(outcome.report.restore_started_by_cutoff);
+    assert_eq!(outcome.report.units_posted, 0);
+    assert_eq!(outcome.report.restore, RestoreStatus::Restored);
+    assert_eq!(lock_releases(&releases), 1);
+}
