@@ -101,6 +101,7 @@ pub(super) async fn run(
                         legacy = legacy_file;
                     }
                     let mut prepared = prepare_module(&config, prepare, real_module);
+                    deadlines.install_display(Arc::clone(&prepared.planes.routes.display));
                     prepared.planes.egress_deadlines = deadlines;
                     if real_module {
                         prepared.planes.runtime_browser = Some(config.browser.clone());

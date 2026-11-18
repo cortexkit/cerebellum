@@ -199,15 +199,26 @@ fn cursor_helper_mode_is_selected_before_the_runtime_is_built() {
 
 #[test]
 fn cursor_avatar_work_never_runs_on_the_frame_reader() {
+    let startup = source_scan::shipped_code(include_str!("../../src/module_runtime.rs"));
+    let start = startup.find("pub(super) async fn run(").unwrap();
+    let end = startup[start..].find("fn is_draining(").unwrap() + start;
+    let startup_reader = &startup[start..end];
+    assert!(startup_reader.contains("Incoming::new(&mut read_half, read_one)"));
+    assert!(startup_reader.contains("incoming.read()"));
+    assert!(startup_reader.contains("spawn_blocking(move ||"));
+
     let source = source_scan::shipped_code(include_str!("../../src/lib.rs"));
-    let start = source.find("async fn module_loop<").unwrap();
+    let start = source.find("async fn serve_registered<").unwrap();
     let end = source[start..].find("async fn send_hello(").unwrap() + start;
-    let reader = &source[start..end];
-    assert!(reader.contains("read_one(read_half)"));
-    for token in ["avatar", "render_tree", "fetch_and_render", "rasterize"] {
-        assert!(
-            !reader.contains(token),
-            "avatar work on the frame reader: {token}"
-        );
+    let steady_reader = &source[start..end];
+    assert!(steady_reader.contains("read_frame(reader)"));
+    assert!(steady_reader.contains("incoming.read()"));
+    for reader in [startup_reader, steady_reader] {
+        for token in ["avatar", "render_tree", "fetch_and_render", "rasterize"] {
+            assert!(
+                !reader.contains(token),
+                "avatar work on the frame reader: {token}"
+            );
+        }
     }
 }

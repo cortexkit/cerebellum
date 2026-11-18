@@ -2234,7 +2234,7 @@ fn prepare_module(
     // bind the extension listener leaves the Chrome extension disconnected;
     // the daemon-owned browser and browser_use advertisement are unaffected.
     #[cfg(target_os = "macos")]
-    let user_browser_listener = if enable_user_bridge && browser_config.is_some() {
+    let user_browser_listener = if enable_user_bridge {
         user_browser_bridge::BridgeListener::bind(planes.user_browser.clone()).ok()
     } else {
         None
