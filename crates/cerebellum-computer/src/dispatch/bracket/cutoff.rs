@@ -28,9 +28,8 @@ use std::time::Instant;
 /// front: the target is still the frontmost application, the unit has not
 /// been stopped, and the bracket's absolute deadline has not passed; then
 /// the post is committed on the cutoff gate. The sequence runs them after
-/// every preparation for the post (the listing read, the final generation
-/// lookup, any authentication the transport attaches), immediately before
-/// the OS post call.
+/// the window listing and transport authentication. The final generation
+/// lookup follows the focus read and precedes stop and commitment.
 ///
 /// A post refused here was never made, so the refusal is
 /// [`ProcessEventRefusal::Cancelled`], which a reply reads as no post call
@@ -55,12 +54,14 @@ where
         &mut self,
         press: bool,
         cancelled: &dyn Fn() -> bool,
+        revalidate: &mut dyn FnMut() -> Result<(), ProcessEventRefusal>,
     ) -> Result<(), ProcessEventRefusal> {
-        // The focus read can take a moment, so the stop and the deadline are
-        // read after it: nothing that can block separates them from the post.
+        // A numeric PID can survive a replacement during the focus read.
+        // Check its identity once more before checking stop and committing.
         if (self.frontmost_pid)() != Some(self.target_pid) {
             return Err(ProcessEventRefusal::Cancelled);
         }
+        revalidate()?;
         if cancelled() {
             return Err(ProcessEventRefusal::Cancelled);
         }
@@ -120,7 +121,7 @@ impl CutoffGate {
     /// released once it returns; a `press` only once its release has.
     pub fn begin_post(&self, _press: bool) -> bool {
         let mut state = self.state();
-        if state.fired {
+        if state.fired || state.deadline.is_some_and(|at| Instant::now() >= at) {
             return false;
         }
         state.held = true;

@@ -154,13 +154,17 @@ pub trait PerProcessEventTransport {
         &mut self,
         pid: u32,
         event: Self::Event,
-        last_check: &mut dyn FnMut() -> Result<(), ProcessEventRefusal>,
+        last_check: &mut FinalPostCheck<'_>,
     ) -> Result<PostCallMade, ProcessEventRefusal> {
-        last_check()?;
+        last_check(&mut || self.process_generation(pid))?;
         self.post_to_pid(pid, event)
             .map_err(ProcessEventRefusal::PostCallFailed)
     }
 }
+
+/// Final post guard with a fresh generation reader supplied by the transport.
+pub type FinalPostCheck<'a> =
+    dyn FnMut(&mut dyn FnMut() -> ProcessGenerationReading) -> Result<(), ProcessEventRefusal> + 'a;
 
 /// Route one event to the exact process generation named by `target`.
 ///
@@ -401,11 +405,10 @@ fn post_paced_with_visibility<T: PerProcessEventTransport>(
 pub trait FrontedKeyGuard {
     /// Runs before a press or self-contained post, never before a release
     /// or a recovery release. It runs after every preparation for the post
-    /// (the window-server listing read, the final process-generation lookup
-    /// and whatever the transport prepares, such as an authentication
+    /// (the window-server listing read and whatever the transport prepares, such as an authentication
     /// object attached to the event), immediately before the OS post call:
-    /// nothing runs between its answer and that call. It reads focus, then
-    /// `cancelled` (so a stop arriving during the focus read is seen), then
+    /// nothing runs between its answer and that call. It reads focus, calls
+    /// `revalidate` to verify process generation, reads `cancelled`, then
     /// the absolute deadline, and last commits the post. `press` says the
     /// post may leave a key held until its paired release. An error stops
     /// the unit before this post, and the presses already posted are
@@ -419,6 +422,7 @@ pub trait FrontedKeyGuard {
         &mut self,
         press: bool,
         cancelled: &dyn Fn() -> bool,
+        revalidate: &mut dyn FnMut() -> Result<(), ProcessEventRefusal>,
     ) -> Result<(), ProcessEventRefusal>;
     /// No post is in flight and every press posted so far has been released.
     fn all_released(&mut self) {}
@@ -426,9 +430,9 @@ pub trait FrontedKeyGuard {
 
 /// [`post_event_sequence_with_visibility`] for a unit posted while its
 /// target is temporarily in front. Before every press and self-contained
-/// post, all preparation comes first: the blocking listing read, the final
-/// process-generation lookup, and the transport's own preparation. Then
-/// `guard` reads focus, cancellation and the bracket's absolute deadline
+/// post, all preparation comes first: the blocking listing read and the
+/// transport's own preparation. Then `guard` reads focus, revalidates the
+/// process generation, checks cancellation and the bracket's absolute deadline
 /// and commits the post, immediately before the OS post call (see
 /// [`PerProcessEventTransport::post_to_pid_after`]). Releases are not held
 /// back by it: like every post here they go to the target process, and
@@ -453,11 +457,10 @@ pub fn post_event_sequence_fronted<T: PerProcessEventTransport>(
             let press = role == SyntheticStepRole::Press;
             require_listed_generation(target, transport, visibility)
                 .and_then(|()| {
-                    require_exact_generation(target, transport.process_generation(target.pid))
-                })
-                .and_then(|GenerationVerified| {
-                    transport.post_to_pid_after(target.pid, event, &mut || {
-                        guard.before_post(press, cancelled)
+                    transport.post_to_pid_after(target.pid, event, &mut |generation| {
+                        guard.before_post(press, cancelled, &mut || {
+                            require_exact_generation(target, generation()).map(|_| ())
+                        })
                     })
                 })
                 .map(|made| (made, 2))
@@ -757,6 +760,22 @@ impl MacOsPerProcessEventTransport {
 }
 
 #[cfg(target_os = "macos")]
+fn mac_process_generation(pid: u32) -> ProcessGenerationReading {
+    match cerebellum_macos::process_start_time(pid) {
+        cerebellum_macos::ProcessStartTime::Started(micros) => {
+            ProcessGenerationReading::Started(micros)
+        }
+        cerebellum_macos::ProcessStartTime::NoSuchProcess => ProcessGenerationReading::Gone,
+        cerebellum_macos::ProcessStartTime::NotPermitted
+        | cerebellum_macos::ProcessStartTime::LayoutMismatch
+        | cerebellum_macos::ProcessStartTime::Unclassified(_)
+        | cerebellum_macos::ProcessStartTime::NoStartTime => {
+            ProcessGenerationReading::NotInspectable
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl PerProcessEventTransport for MacOsPerProcessEventTransport {
     type Event = cerebellum_macos::OwnedCgEvent;
 
@@ -765,18 +784,7 @@ impl PerProcessEventTransport for MacOsPerProcessEventTransport {
     }
 
     fn process_generation(&mut self, pid: u32) -> ProcessGenerationReading {
-        match cerebellum_macos::process_start_time(pid) {
-            cerebellum_macos::ProcessStartTime::Started(micros) => {
-                ProcessGenerationReading::Started(micros)
-            }
-            cerebellum_macos::ProcessStartTime::NoSuchProcess => ProcessGenerationReading::Gone,
-            cerebellum_macos::ProcessStartTime::NotPermitted
-            | cerebellum_macos::ProcessStartTime::LayoutMismatch
-            | cerebellum_macos::ProcessStartTime::Unclassified(_)
-            | cerebellum_macos::ProcessStartTime::NoStartTime => {
-                ProcessGenerationReading::NotInspectable
-            }
-        }
+        mac_process_generation(pid)
     }
 
     fn window_server_visibility(&mut self, pid: u32) -> WindowServerVisibility {
@@ -845,8 +853,9 @@ impl PerProcessEventTransport for MacOsPerProcessEventTransport {
         &mut self,
         pid: u32,
         event: Self::Event,
-        last_check: &mut dyn FnMut() -> Result<(), ProcessEventRefusal>,
+        last_check: &mut FinalPostCheck<'_>,
     ) -> Result<PostCallMade, ProcessEventRefusal> {
+        let raw_pid = pid;
         let pid = i32::try_from(pid).map_err(|_| {
             ProcessEventRefusal::PostCallFailed(PostCallFailure::new(
                 "process id does not fit macOS pid_t",
@@ -854,7 +863,7 @@ impl PerProcessEventTransport for MacOsPerProcessEventTransport {
         })?;
         let refused = std::cell::RefCell::new(None);
         let gate = std::cell::RefCell::new(last_check);
-        let check = || match (**gate.borrow_mut())() {
+        let check = || match (**gate.borrow_mut())(&mut || mac_process_generation(raw_pid)) {
             Ok(()) => true,
             Err(refusal) => {
                 *refused.borrow_mut() = Some(refusal);

@@ -128,10 +128,12 @@ fn key_checks_refuse_a_press_once_the_cutoff_fired_and_mark_a_press_held() {
         cutoff: Some(&gate),
     };
     use crate::platform::FrontedKeyGuard;
-    assert!(checks.before_post(true, &|| false).is_ok());
+    assert!(checks.before_post(true, &|| false, &mut || Ok(())).is_ok());
     assert!(!gate.fire(), "held: the timer must not restore");
     assert!(
-        checks.before_post(false, &|| false).is_err(),
+        checks
+            .before_post(false, &|| false, &mut || Ok(()))
+            .is_err(),
         "no post after the cutoff"
     );
     checks.all_released();
@@ -146,4 +148,9 @@ fn a_passed_deadline_counts_before_the_timer_has_run() {
     gate.set_deadline(Instant::now() - Duration::from_millis(1));
     assert!(!gate.fired(), "the timer has not run");
     assert!(gate.past_deadline(), "the clock alone closes it");
+    assert!(
+        !gate.begin_post(true),
+        "an expired gate cannot commit a post"
+    );
+    assert!(gate.fire(), "a refused post does not block restore");
 }

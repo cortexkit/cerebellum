@@ -4,8 +4,8 @@
 
 use super::*;
 use crate::platform::{
-    post_event_sequence_fronted, PerProcessEventTransport, PostCallFailure, PostCallMade,
-    ProcessEventRefusal, ProcessEventTarget, ProcessGenerationReading, SyntheticStep,
+    post_event_sequence_fronted, FinalPostCheck, PerProcessEventTransport, PostCallFailure,
+    PostCallMade, ProcessEventRefusal, ProcessEventTarget, ProcessGenerationReading, SyntheticStep,
     SyntheticStepRole, VisibilityMemo, WindowServerVisibility, VISIBLE_READING_MAX_AGE,
 };
 use std::cell::{Cell, RefCell};
@@ -29,6 +29,9 @@ enum DuringListing {
 /// once that many events were posted.
 struct Keyboard {
     now: Cell<u64>,
+    generation: Cell<u64>,
+    replace_during_focus: bool,
+    replace_during_preparation: bool,
     frontmost: Cell<Option<u32>>,
     posted: RefCell<Vec<&'static str>>,
     switch_after_posts: Option<usize>,
@@ -54,6 +57,9 @@ impl Keyboard {
     fn new() -> Self {
         Self {
             now: Cell::new(0),
+            generation: Cell::new(GENERATION),
+            replace_during_focus: false,
+            replace_during_preparation: false,
             frontmost: Cell::new(Some(TARGET)),
             posted: RefCell::new(Vec::new()),
             switch_after_posts: None,
@@ -82,7 +88,7 @@ impl PerProcessEventTransport for Transport<'_> {
         if keyboard.slow_generation_read == Some(reads) {
             keyboard.now.set(keyboard.now.get() + 1_000);
         }
-        ProcessGenerationReading::Started(GENERATION)
+        ProcessGenerationReading::Started(keyboard.generation.get())
     }
     fn window_server_visibility(&mut self, _pid: u32) -> WindowServerVisibility {
         let keyboard = self.0;
@@ -119,13 +125,16 @@ impl PerProcessEventTransport for Transport<'_> {
         &mut self,
         pid: u32,
         event: &'static str,
-        last_check: &mut dyn FnMut() -> Result<(), ProcessEventRefusal>,
+        last_check: &mut FinalPostCheck<'_>,
     ) -> Result<PostCallMade, ProcessEventRefusal> {
         let keyboard = self.0;
         keyboard
             .now
             .set(keyboard.now.get() + keyboard.preparation_ms);
-        last_check()?;
+        if keyboard.replace_during_preparation {
+            keyboard.generation.set(GENERATION + 1);
+        }
+        last_check(&mut || self.process_generation(pid))?;
         self.post_to_pid(pid, event)
             .map_err(ProcessEventRefusal::PostCallFailed)
     }
@@ -194,6 +203,9 @@ fn post_with(
         deadline_ms,
         now_ms: || keyboard.now.get(),
         frontmost_pid: || {
+            if keyboard.replace_during_focus {
+                keyboard.generation.set(GENERATION + 1);
+            }
             if keyboard.stop_during_focus_read {
                 keyboard.stopped.set(true);
             }
@@ -401,6 +413,32 @@ fn refused_before_any_post(keyboard: &Keyboard) {
     assert_eq!(failure.refusal, ProcessEventRefusal::Cancelled);
     assert_eq!(failure.posts_returned, 0);
     assert!(keyboard.posted.borrow().is_empty());
+}
+
+#[test]
+fn a_pid_replaced_during_focus_or_transport_preparation_never_receives_the_post() {
+    for replace_during_focus in [true, false] {
+        let mut keyboard = Keyboard::new();
+        keyboard.replace_during_focus = replace_during_focus;
+        keyboard.replace_during_preparation = !replace_during_focus;
+        let failure = post_with(
+            &keyboard,
+            vec![press("a down"), release("a up")],
+            500,
+            &|| false,
+            &mut VisibilityMemo::uncached(),
+            Some(&keyboard.gate),
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.refusal,
+            ProcessEventRefusal::ProcessReplaced {
+                expected_start_time_micros: GENERATION,
+                observed_start_time_micros: GENERATION + 1,
+            }
+        );
+        assert!(keyboard.posted.borrow().is_empty());
+    }
 }
 
 #[test]
