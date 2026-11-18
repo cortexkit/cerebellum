@@ -309,6 +309,12 @@ pub fn parse_browser_config(text: &str) -> Result<Option<BrowserConfig>, Browser
         field: "config".to_string(),
         reason: BrowserConfigReason::Malformed(error.to_string()),
     })?;
+    parse_browser_config_value(&value)
+}
+
+pub(crate) fn parse_browser_config_value(
+    value: &Value,
+) -> Result<Option<BrowserConfig>, BrowserConfigError> {
     let top = value.as_object().ok_or_else(|| BrowserConfigError {
         field: "config".to_string(),
         reason: BrowserConfigReason::NotObject,

@@ -856,7 +856,8 @@ async fn accepted_effective_scope_is_not_widened_by_request_body() {
 /// registration, route binding, and the flat capability response survive the
 /// actual daemon splice without opening a browser.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_daemon_registers_without_browser_controls_when_config_is_absent() {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn live_daemon_registers_browser_controls_but_refuses_use_when_config_is_absent() {
     let (mut daemon, connection) = start_live_daemon().await;
     let mut client = connect_client(&connection).await;
 
@@ -956,16 +957,16 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
     // A build with no review keys bound admits no computer row: every tree
     // read waits for the app_state review, and typing for the input review.
     // So there is no computer tool, and no flat computer_use tool either,
-    // because that tool is derived from the admitted computer rows. The
-    // browser tools are absent too, because no browser is configured.
+    // because that tool is derived from the admitted computer rows. The browser
+    // tools are declared by the build whether or not an executable is configured.
+    let names: std::collections::BTreeSet<_> =
+        tools.iter().map(|tool| tool.name.as_str()).collect();
     assert!(
-        tools.is_empty(),
-        "a build with no reviews bound must register no tools: {:?}",
-        tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>()
+        names.iter().all(|name| name.starts_with("browser")),
+        "{names:?}"
     );
+    assert!(names.contains("browser.status"), "{names:?}");
+    assert!(names.contains("browser_use"), "{names:?}");
 
     let route = open_live_route(&mut client, 2).await;
 
@@ -976,21 +977,19 @@ async fn live_daemon_registers_without_browser_controls_when_config_is_absent() 
     // FIRST, which is the property that keeps a rejected caller from touching
     // any handler.
     //
-    // browser_not_configured rather than unknown_method: this daemon would serve
-    // browser.status if the host had a browser, and an operator four lines of
-    // config away from working should be told that rather than told the
-    // capability does not exist.
+    // The refused caller is told what to configure instead of being told the
+    // advertised capability does not exist.
     let admission_precedes_arguments =
         send_live_tool_request(&mut client, route, 3, json!({"unexpected": true})).await;
     assert_eq!(admission_precedes_arguments.header.ty, FrameType::Error);
     let invalid_body: subc_protocol::ErrorBody =
         serde_json::from_slice(&admission_precedes_arguments.body).unwrap();
-    assert_eq!(invalid_body.code, "browser_not_configured");
+    assert_eq!(invalid_body.code, "executable_missing");
 
     let response = send_live_tool_request(&mut client, route, 4, json!({})).await;
     assert_eq!(response.header.ty, FrameType::Error);
     let body: subc_protocol::ErrorBody = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(body.code, "browser_not_configured");
+    assert_eq!(body.code, "executable_missing");
     assert!(
         body.message.contains("browser.executable_path"),
         "a live caller must be told what to configure: {}",
@@ -1103,16 +1102,12 @@ fn module_output_report(path: &Path, wait: Duration) -> String {
 
 /// The browser surface survives the real daemon splice.
 ///
-/// The sibling test above proves registration with NO browser configured, which
-/// is the state a machine is in before anyone points the module at a browser.
-/// It cannot see the browser surface at all, so every browser capability could
-/// have failed to register and it would still pass.
-///
 /// Asserted against the DAEMON's catalogue rather than the manifest builder's
 /// output: the difference is between advertising a surface and the daemon
 /// accepting one. A tool the daemon declined would be absent here while every
 /// local manifest test stayed green.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured() {
     let (mut daemon, connection) = start_live_daemon_with_browser(true).await;
     let mut client = connect_client(&connection).await;
@@ -1161,14 +1156,20 @@ async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured(
     // Typing ordinary form values is a production browser capability.
     assert!(registered.contains(&"browser.type"), "{registered:?}");
 
-    // The sibling test asserts this catalogue carries no tools when no browser
-    // is configured. Asserting the count here too is what makes the two tests
-    // measure a DIFFERENCE rather than each measuring its own world.
     assert_eq!(
         registered.len(),
         11,
         "expected ten browser tools and the flat browser_use adapter: {registered:?}"
     );
+
+    let route = open_live_route(&mut client, 2).await;
+    let response = send_live_tool_request(&mut client, route, 3, json!({})).await;
+    assert_eq!(response.header.ty, FrameType::Error);
+    let body: subc_protocol::ErrorBody = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body.code, "executable_missing");
+    assert!(body
+        .message
+        .contains("Make the configured browser executable available"));
 
     // Close the client before the daemon and module guards are dropped so the
     // daemon can release the route deterministically.
@@ -1202,10 +1203,8 @@ fn install_daemon_trace_subscriber() {
 /// Start the real daemon, optionally giving the spawned module a browser
 /// configuration in its isolated home.
 ///
-/// The config decides which capabilities the module registers, so a test that
-/// wants the browser surface has to put one where the module reads it rather
-/// than where this process reads it -- the isolated HOME is what keeps this
-/// test independent of whatever is installed on the machine running it.
+/// The isolated HOME supplies the startup settings without depending on what
+/// is configured on the machine running the test.
 async fn start_live_daemon_with_browser(
     browser: bool,
 ) -> (LiveDaemonGuard, subc_transport::ConnectionInfo) {
@@ -1250,10 +1249,8 @@ async fn start_live_daemon_with_browser(
     if browser {
         let config_dir = config_home.join("cortexkit");
         fs::create_dir_all(&config_dir).expect("create isolated module config directory");
-        // The executable need not exist: the parser requires an absolute path
-        // and defers existence to launch time, and this test is about what the
-        // module REGISTERS rather than whether a browser starts. Pointing at a
-        // real Chrome would make the test depend on the machine having one.
+        // Point to a missing executable so the module reports a prerequisite
+        // refusal without depending on the machine having a browser installed.
         fs::write(
             config_dir.join("cerebellum.jsonc"),
             serde_json::to_vec(&json!({
@@ -1553,6 +1550,7 @@ async fn open_live_route(stream: &mut TcpStream, corr: u64) -> (u16, u32) {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn send_live_tool_request(
     stream: &mut TcpStream,
     (channel, epoch): (u16, u32),

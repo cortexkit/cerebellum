@@ -143,6 +143,17 @@ impl ControlRequests {
         request: &impl serde::Serialize,
         deadline: Duration,
     ) -> Option<ControlAnswer> {
+        self.request_with_version(writer, request, deadline, subc_protocol::PROTOCOL_VERSION)
+            .await
+    }
+
+    pub(crate) async fn request_with_version(
+        &self,
+        writer: &mpsc::Sender<Frame>,
+        request: &impl serde::Serialize,
+        deadline: Duration,
+        ver: u8,
+    ) -> Option<ControlAnswer> {
         let body = serde_json::to_vec(request).ok()?;
         let value: Value = serde_json::from_slice(&body).ok()?;
         let operation = value.get("op")?.as_str()?.to_owned();
@@ -162,7 +173,16 @@ impl ControlRequests {
             );
         }
         let _forget = ForgetControl(self, corr);
-        let frame = Frame::build(FrameType::Request, crate::control_flags(), 0, 0, corr, body).ok();
+        let frame = Frame::build_with_version(
+            ver,
+            FrameType::Request,
+            crate::control_flags(),
+            0,
+            0,
+            corr,
+            body,
+        )
+        .ok();
         let answer = match frame {
             Some(frame) => tokio::time::timeout(deadline, async {
                 writer.send(frame).await.ok()?;

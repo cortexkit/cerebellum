@@ -557,7 +557,15 @@ pub(super) fn facts(
     } else if let Some(line) = outcome.and_then(|code| outcome_line(code, object)) {
         lines.push(line);
     }
-    if let Some(remedy) = text(object, "remedy").filter(|remedy| !remedy.trim().is_empty()) {
+    let remedy = text(object, "remedy")
+        .filter(|remedy| !remedy.trim().is_empty())
+        .or(match outcome {
+            Some("identity_unverifiable" | "executable_identity_mismatch") => Some(
+                "Verify the browser executable and correct browser.executable_path or browser.expected_identity in Cerebellum's settings, then restart the module",
+            ),
+            _ => None,
+        });
+    if let Some(remedy) = remedy {
         // Some remedies are only the next call's name, `close`.
         if remedy.trim().contains(char::is_whitespace) {
             lines.push(sentence(remedy));
@@ -979,6 +987,21 @@ mod tests {
             lines.contains(&"detail.required: credential false; financial false; tier 2.".into()),
             "{lines:#?}"
         );
+    }
+
+    #[test]
+    fn launch_identity_refusals_point_to_browser_settings() {
+        for outcome in ["identity_unverifiable", "executable_identity_mismatch"] {
+            let reply = json!({"outcome": outcome});
+            let facts = facts(reply.as_object().unwrap(), None, true);
+            assert!(
+                facts
+                    .iter()
+                    .any(|line| line.contains("browser.expected_identity")
+                        && line.contains("restart the module")),
+                "{facts:?}"
+            );
+        }
     }
 
     #[test]

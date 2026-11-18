@@ -96,6 +96,7 @@ mod management_bounds;
 pub mod manifest;
 #[cfg(test)]
 mod model_view_tests;
+mod module_runtime;
 pub mod network;
 mod open_app_history;
 pub mod outlook_guard;
@@ -115,6 +116,7 @@ mod result_negotiation_tests;
 #[cfg(test)]
 mod route_future_size_tests;
 pub mod scope_watch;
+mod settings;
 pub mod snapshot_store;
 mod terminal_arbiter;
 #[cfg(test)]
@@ -877,10 +879,7 @@ pub fn serialize_manifest_with_browser_configuration(
 /// The registration manifest for offline `--manifest` inspection, without startup.
 ///
 /// Advertisement depends on embedded build/release bindings, the target platform,
-/// `SUBC_MODULE_ID`, and the read-only XDG cerebellum config. Missing, unreadable,
-/// or invalid config uses the no-config surface. Valid browser config is parsed
-/// but its executable is never probed: runtime executable-probe refusals and
-/// `browser_surface_refused` are therefore not reported here.
+/// and `SUBC_MODULE_ID`, not on the browser's runtime configuration.
 ///
 /// No permission preflight, launch-nonce read, store, journal, runtime, or daemon
 /// is needed. `provenance.launch_nonce_source` is omitted because launch delivery
@@ -891,22 +890,15 @@ pub fn manifest_for_inspection() -> Value {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string());
-    let browser = cerebellum_core::config::config_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| {
-            parse_config(&text).ok()?;
-            browser_config::parse_browser_config(&text).ok().flatten()
-        })
-        .map_or(BrowserSurface::NotConfigured, BrowserSurface::Available);
     let context = ComputerCapabilityAdvertisementContext {
         inputs: compiled_release_inputs(),
         permissions: Default::default(),
         startup: StartupCapabilityProbe::default(),
     };
-    compose_manifest(
+    compose_hello_manifest(
         &module_id,
         &context,
-        &browser,
+        None,
         manifest::build_offline_provenance(),
     )
 }
@@ -930,10 +922,21 @@ fn compose_manifest(
     browser_surface: &BrowserSurface,
     provenance: Option<subc_protocol::manifest::ManifestProvenance>,
 ) -> Value {
-    let browser_configured = matches!(browser_surface, BrowserSurface::Available(_));
+    compose_hello_manifest(module_id, context, Some(browser_surface), provenance)
+}
+
+fn compose_hello_manifest(
+    module_id: &str,
+    context: &ComputerCapabilityAdvertisementContext,
+    browser_fixture: Option<&BrowserSurface>,
+    provenance: Option<subc_protocol::manifest::ManifestProvenance>,
+) -> Value {
+    let browser_admitted = browser_fixture.map_or_else(browser_build_admits, |surface| {
+        matches!(surface, BrowserSurface::Available(_))
+    });
     let mut manifest =
         build_manifest_with_computer_plane_and_provenance(module_id, context, provenance);
-    if browser_configured {
+    if browser_admitted {
         let subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } =
             &mut manifest.provides[0]
         else {
@@ -985,7 +988,7 @@ fn compose_manifest(
     // means do not route, which is the correct outcome for both states. Anything that
     // needs this distinction daemon-side needs a typed field in subc-protocol, not
     // another key here.
-    if let BrowserSurface::Refused(error) = browser_surface {
+    if let Some(BrowserSurface::Refused(error)) = browser_fixture {
         let mut refusal = json!({
             "field": error.field,
             "reason_code": error.reason.reason_code(),
@@ -1002,6 +1005,10 @@ fn compose_manifest(
             .insert("browser_surface_refused".to_string(), refusal);
     }
     value
+}
+
+fn browser_build_admits() -> bool {
+    cfg!(any(target_os = "macos", target_os = "linux"))
 }
 
 /// The tool names this module can actually serve, or `None` for a name it
@@ -1946,9 +1953,7 @@ fn consent_context(
     context
 }
 
-/// The binary entry point: read config from env, load the health config
-/// file, and run the module loop. Exposed publicly so the thin `main.rs`
-/// binary can delegate here.
+/// The binary entry point: read the registration environment and run the module.
 ///
 /// It also decides how the process ends: a SIGTERM ending does not return at
 /// all, because the process re-raises the signal once teardown has finished.
@@ -1966,38 +1971,11 @@ pub async fn run_entry() -> Result<(), ModuleError> {
     cerebellum_computer::dispatch::load_needs_front_restore_predictor(
         cerebellum_core::platform_dirs::data_home().as_deref(),
     );
-    let ending = run(
-        config,
-        read_live_settings_from_config_file,
-        true,
-        registration,
-    )
-    .await;
+    let ending = module_runtime::run(config, |_| {}, true, registration).await;
     #[cfg(target_os = "macos")]
     drop(cursor_executable);
     conclude(ending)
 }
-
-/// Point the planes at the settings a running module re-reads from its config
-/// file, `cerebellum.jsonc`, while it runs: today only `computer_use.app_use`.
-///
-/// Only [`run_entry`] calls this, because only it loaded that file to
-/// register. Every plane constructor reads no config file, so in-process
-/// tests, child-process tests through [`run_entry_prepared_for_test`] and
-/// examples never act on the config of whoever runs them.
-fn read_live_settings_from_config_file(planes: &mut Planes) {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    if let Ok(computer) = &planes.computer {
-        computer.read_app_use_from_config_file();
-    }
-    // No other platform builds a computer plane, so nothing reads app_use.
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let _ = planes;
-}
-
-#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
-#[path = "lib_tests/live_settings_tests.rs"]
-mod live_settings_tests;
 
 /// [`run_entry`] with the configuration supplied here instead of read from the
 /// environment, and `prepare` applied to the planes before the module wires its
@@ -2009,7 +1987,7 @@ mod live_settings_tests;
 pub async fn run_entry_prepared_for_test(
     connection_file_path: PathBuf,
     browser: BrowserConfig,
-    prepare: impl FnOnce(&mut Planes),
+    prepare: impl FnOnce(&mut Planes) + Send + 'static,
 ) -> Result<(), ModuleError> {
     let registration = registration::take_before_any_spawn()?;
     launch_nonce::read_before_any_spawn();
@@ -2020,7 +1998,7 @@ pub async fn run_entry_prepared_for_test(
         agent_cursor: false,
         browser: BrowserSurface::Available(browser),
     };
-    conclude(run(config, prepare, false, registration).await)
+    conclude(module_runtime::run(config, prepare, false, registration).await)
 }
 
 /// How a module run ended, which decides how the process exits.
@@ -2183,49 +2161,23 @@ impl ModuleConfig {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string());
-        // Load the health config file at boot. A missing file uses defaults;
-        // a present-but-malformed file fails registration deterministically
-        // rather than silently falling back (Spec A: zero, negative,
-        // fractional, non-numeric, and unknown-member values are
-        // configuration errors).
-        let parsed = cerebellum_core::config::load_config_file().map_err(ModuleError::Config)?;
-        let browser = match browser_config::load_browser_config_file() {
-            Ok(None) => BrowserSurface::NotConfigured,
-            Ok(Some(browser)) => match browser_config::validate_browser_config_at_load(&browser) {
-                Ok(()) => BrowserSurface::Available(browser),
-                Err(error) => BrowserSurface::Refused(error),
-            },
-            Err(error) => BrowserSurface::Refused(error),
-        };
         Ok(Self {
             connection_file_path,
             module_id,
-            health: parsed.health,
-            agent_cursor: parsed.computer_use.agent_cursor,
-            browser,
+            health: HealthConfig::default(),
+            agent_cursor: true,
+            browser: BrowserSurface::NotConfigured,
         })
     }
 }
 
-async fn run(
-    config: ModuleConfig,
+fn prepare_module(
+    config: &ModuleConfig,
     prepare: impl FnOnce(&mut Planes),
     enable_user_bridge: bool,
-    registration: Option<registration::Stream>,
-) -> ModuleEnding {
+) -> module_runtime::Prepared {
     #[cfg(not(target_os = "macos"))]
     let _ = enable_user_bridge;
-    // Listening starts before the connection is made, so a SIGTERM that
-    // arrives while connecting is held until the module can act on it rather
-    // than ending the process with no teardown.
-    #[cfg(unix)]
-    let mut sigterm = listen_for_sigterm();
-    let stream = match connect_to_subc(&config.connection_file_path, registration).await {
-        Ok(stream) => stream,
-        Err(error) => return ModuleEnding::Disconnected(Err(error)),
-    };
-    let (mut read_half, write_half) = tokio::io::split(stream);
-
     let mut health_config = config.health;
     health_config.in_flight_age_stale_ms = budgets::IN_FLIGHT_AGE_STALE_MS;
     let health_state = Arc::new(HealthState::with_config(health_config));
@@ -2282,7 +2234,7 @@ async fn run(
     // bind the extension listener leaves the Chrome extension disconnected;
     // the daemon-owned browser and browser_use advertisement are unaffected.
     #[cfg(target_os = "macos")]
-    let _user_browser_listener = if enable_user_bridge && browser_config.is_some() {
+    let user_browser_listener = if enable_user_bridge && browser_config.is_some() {
         user_browser_bridge::BridgeListener::bind(planes.user_browser.clone()).ok()
     } else {
         None
@@ -2355,12 +2307,12 @@ async fn run(
         Arc::clone(&planes.private_content),
         Arc::clone(&planes.browser_resumes),
     );
-    let serving = serve_then_tear_down(&mut read_half, write_half, &config, planes, &teardown);
-    #[cfg(unix)]
-    let ending = end_on_disconnect_or_sigterm(serving, sigterm.as_mut(), &teardown).await;
-    #[cfg(not(unix))]
-    let ending = ModuleEnding::Disconnected(serving.await);
-    ending
+    module_runtime::Prepared {
+        planes,
+        teardown,
+        #[cfg(target_os = "macos")]
+        _user_browser_listener: user_browser_listener,
+    }
 }
 
 /// Set when the SIGTERM listener could not be installed, and read by the
@@ -2418,14 +2370,11 @@ fn sigterm_listener_state() -> &'static str {
 /// Serve until the daemon connection ends or SIGTERM arrives, whichever is
 /// first, and run the shutdown teardown either way.
 ///
-/// On SIGTERM the connection future is dropped, which stops serving. A teardown
-/// that the connection ending had already started keeps running on its own
-/// thread and is joined here, never started a second time.
+/// On SIGTERM drop the connection before its caller joins teardown.
 #[cfg(unix)]
 async fn end_on_disconnect_or_sigterm(
     serving: impl std::future::Future<Output = Result<(), ModuleError>>,
     sigterm: Option<&mut tokio::signal::unix::Signal>,
-    teardown: &ShutdownTeardown,
 ) -> ModuleEnding {
     let Some(sigterm) = sigterm else {
         return ModuleEnding::Disconnected(serving.await);
@@ -2433,7 +2382,6 @@ async fn end_on_disconnect_or_sigterm(
     tokio::select! {
         biased;
         Some(()) = sigterm.recv() => {
-            teardown.run_or_join().await;
             ModuleEnding::Terminated
         }
         result = serving => {
@@ -2511,6 +2459,7 @@ fn planes_cursor(planes: &Planes) -> Option<computer_capability::cursor::Coordin
 
 /// The connection-ending half of [`serve_until_disconnect`], sharing its
 /// teardown with whatever else can end the module.
+#[cfg(test)]
 async fn serve_then_tear_down<R, W>(
     read_half: &mut R,
     write_half: W,
@@ -2657,6 +2606,7 @@ fn report_writer_first(writer_result: WriterTaskResult) -> Result<(), ModuleErro
     }
 }
 
+#[cfg(test)]
 async fn run_connection<R, W>(
     read_half: &mut R,
     write_half: W,
@@ -2667,10 +2617,26 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
     let deadlines = Arc::clone(&planes.egress_deadlines);
+    drive_connection(write_half, deadlines, |tx| {
+        module_loop(read_half, tx, config, planes)
+    })
+    .await
+}
+
+async fn drive_connection<W, F, Fut>(
+    write_half: W,
+    deadlines: Arc<ConnectionDeadlines>,
+    run_loop: F,
+) -> Result<(), ModuleError>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+    F: FnOnce(mpsc::Sender<Frame>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), ModuleError>>,
+{
+    let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
     let mut writer = tokio::spawn(drain_writer(write_half, rx, Arc::clone(&deadlines)));
-    let mut loop_task = Box::pin(module_loop(read_half, tx.clone(), config, planes));
+    let mut loop_task = Box::pin(run_loop(tx.clone()));
 
     let loop_result = tokio::select! {
         // Preserve the existing diagnostic precedence when both sides become
@@ -2734,6 +2700,7 @@ impl IdleWake for PeriodicIdleWake {
     }
 }
 
+#[cfg(test)]
 async fn module_loop<R>(
     read_half: &mut R,
     writer: mpsc::Sender<Frame>,
@@ -2743,9 +2710,31 @@ async fn module_loop<R>(
 where
     R: AsyncRead + Unpin,
 {
-    send_hello(&writer, config).await?;
+    send_hello(&writer, config, false, false).await?;
     expect_hello_ack(read_half).await?;
+    serve_registered(
+        Incoming::new(read_half, read_one),
+        Default::default(),
+        writer,
+        config,
+        planes,
+        None,
+    )
+    .await
+}
 
+async fn serve_registered<R, F, Next>(
+    incoming: Incoming<F, Next>,
+    waiting: std::collections::VecDeque<Frame>,
+    writer: mpsc::Sender<Frame>,
+    config: &ModuleConfig,
+    planes: Planes,
+    settings: Option<&settings::Session>,
+) -> Result<(), ModuleError>
+where
+    F: std::future::Future<Output = (Result<Option<Frame>, String>, R)>,
+    Next: Fn(R) -> F,
+{
     planes.scopes.control.connect(&writer);
     let _registration = registration::connect(&writer)?;
     #[cfg(not(test))]
@@ -2775,7 +2764,18 @@ where
     let handler = move |frame: Frame| {
         let writer = writer.clone();
         let planes = handler_planes.clone();
-        async move { handle_frame(frame, &writer, &planes).await }
+        async move {
+            if let Some(settings) = settings {
+                if settings.take(&frame) {
+                    return Ok(true);
+                }
+                if settings.is_review(&frame) {
+                    settings.review(&writer, frame, &config.module_id).await?;
+                    return Ok(true);
+                }
+            }
+            handle_frame(frame, &writer, &planes).await
+        }
     };
     // A handler may itself wait for the daemon's answer to a control request
     // this module sent, such as a claim mint for an outbound connection. That
@@ -2783,9 +2783,10 @@ where
     // handler is still running instead of after it.
     let reply_planes = planes.clone();
     let take_reply = move |frame: Frame| {
-        if frame.header.channel == 0
-            && matches!(frame.header.ty, FrameType::Response | FrameType::Error)
-            && deliver_control_reply(&frame, &reply_planes)
+        if settings.is_some_and(|settings| settings.take(&frame))
+            || (frame.header.channel == 0
+                && matches!(frame.header.ty, FrameType::Response | FrameType::Error)
+                && deliver_control_reply(&frame, &reply_planes))
         {
             Ok(())
         } else {
@@ -2794,7 +2795,8 @@ where
     };
 
     run_dispatch_loop_taking_replies(
-        read_half,
+        incoming,
+        waiting,
         &planes.health,
         &clock,
         &mut idle_wake,
@@ -2820,6 +2822,32 @@ where
     (result, reader)
 }
 
+/// Keep an in-progress read when startup work or an idle wake wins a select.
+/// Cancelling `read_frame` itself would lose bytes already read from the stream.
+struct Incoming<F, Next> {
+    pending: std::pin::Pin<Box<F>>,
+    start: Next,
+}
+
+impl<R, F, Next> Incoming<F, Next>
+where
+    F: std::future::Future<Output = (Result<Option<Frame>, String>, R)>,
+    Next: Fn(R) -> F,
+{
+    fn new(reader: R, start: Next) -> Self {
+        Self {
+            pending: Box::pin(start(reader)),
+            start,
+        }
+    }
+
+    async fn read(&mut self) -> Result<Option<Frame>, String> {
+        let (frame, reader) = self.pending.as_mut().await;
+        self.pending.set((self.start)(reader));
+        frame
+    }
+}
+
 /// [`run_dispatch_loop_taking_replies`] for a loop with no control requests of
 /// its own: every frame goes to `handler`, in arrival order.
 #[cfg(test)]
@@ -2837,7 +2865,16 @@ where
     H: FnMut(Frame) -> Fut,
     Fut: std::future::Future<Output = Result<bool, ModuleError>>,
 {
-    run_dispatch_loop_taking_replies(read_half, health_state, clock, idle_wake, Err, handler).await
+    run_dispatch_loop_taking_replies(
+        Incoming::new(read_half, read_one),
+        Default::default(),
+        health_state,
+        clock,
+        idle_wake,
+        Err,
+        handler,
+    )
+    .await
 }
 
 /// The bounded-idle-wake dispatch loop.
@@ -2876,8 +2913,9 @@ where
 ///
 /// The end of the stream, or a read error, is reported only after the frames
 /// read before it have been handled.
-async fn run_dispatch_loop_taking_replies<R, C, W, T, H, Fut>(
-    read_half: &mut R,
+async fn run_dispatch_loop_taking_replies<R, F, Next, C, W, T, H, Fut>(
+    mut incoming: Incoming<F, Next>,
+    mut waiting: std::collections::VecDeque<Frame>,
     health_state: &Arc<HealthState>,
     clock: &C,
     idle_wake: &mut W,
@@ -2885,7 +2923,8 @@ async fn run_dispatch_loop_taking_replies<R, C, W, T, H, Fut>(
     mut handler: H,
 ) -> Result<(), ModuleError>
 where
-    R: AsyncRead + Unpin,
+    F: std::future::Future<Output = (Result<Option<Frame>, String>, R)>,
+    Next: Fn(R) -> F,
     C: cerebellum_core::clock::MonotonicClock,
     W: IdleWake,
     T: FnMut(Frame) -> Result<(), Frame>,
@@ -2895,9 +2934,6 @@ where
     // Stamp the initial heartbeat so a freshly-started module reports healthy.
     health_state.stamp_heartbeat_with_clock(clock);
 
-    // One read future at a time, re-polled until it completes (see above).
-    let mut read = std::pin::pin!(read_one(read_half));
-    let mut waiting = std::collections::VecDeque::<Frame>::new();
     // How the stream ended, once a read has seen it end. No read is polled
     // after that.
     let mut ended: Option<Result<(), ModuleError>> = None;
@@ -2916,11 +2952,10 @@ where
                     // processed before an idle re-stamp (a wake never pre-empts a
                     // ready frame), and so the wake/frame ordering is deterministic.
                     biased;
-                    (result, reader) = &mut read => {
+                    result = incoming.read() => {
                         let Some(frame) = result.map_err(ModuleError::Message)? else {
                             return Ok(()); // clean EOF: subc closed the connection.
                         };
-                        read.set(read_one(reader));
                         break frame;
                     }
                     _ = wake => {
@@ -2938,12 +2973,11 @@ where
             tokio::select! {
                 biased;
                 result = &mut handling => break result?,
-                (result, reader) = &mut read,
+                result = incoming.read(),
                     if ended.is_none() && waiting.len() < DISPATCH_LOOKAHEAD_FRAMES =>
                 {
                     match result {
                         Ok(Some(frame)) => {
-                            read.set(read_one(reader));
                             if let Err(frame) = take_reply(frame) {
                                 waiting.push_back(frame);
                             }
@@ -2963,24 +2997,31 @@ where
 async fn send_hello(
     writer: &mpsc::Sender<Frame>,
     config: &ModuleConfig,
+    production: bool,
+    managed: bool,
 ) -> Result<(), ModuleError> {
+    let mut control_ops = vec![
+        "route.bind".into(),
+        "route.status".into(),
+        MODULE_CONTROL_OP_HEALTH_CHECK.into(),
+    ];
+    if managed {
+        control_ops.push(subc_protocol::config::CONFIG_REVIEW_OP.into());
+    }
     let mut body = serde_json::to_value(ModuleHelloBody {
         manifest: manifest::build(&config.module_id),
         protocol_ver: PROTOCOL_VERSION,
-        control_ops: Some(vec![
-            "route.bind".to_string(),
-            "route.status".to_string(),
-            MODULE_CONTROL_OP_HEALTH_CHECK.to_string(),
-        ]),
+        control_ops: Some(control_ops),
         launch_nonce: launch_nonce::for_hello().map_err(|error| {
             ModuleError::Message(format!("cannot read the launch nonce: {error}"))
         })?,
     })
     .map_err(ModuleError::Json)?;
-    body["manifest"] = serialize_manifest_with_computer_plane_configured(
+    body["manifest"] = compose_hello_manifest(
         &config.module_id,
         &default_computer_context(),
-        &config.browser,
+        (!production).then_some(&config.browser),
+        manifest::build_provenance(),
     );
     let body = serde_json::to_vec(&body).map_err(ModuleError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
@@ -3182,6 +3223,7 @@ pub struct Planes {
     pub routes: Arc<RouteBindings>,
     pub browser: Arc<BrowserPlane>,
     pub browser_config: Option<BrowserConfig>,
+    runtime_browser: Option<BrowserSurface>,
     pub sessions: browser_session::BrowserSessions,
     pub user_browser: user_browser_bridge::UserBrowserBridge,
     pub lease_clock: Arc<cerebellum_core::clock::SystemClock>,

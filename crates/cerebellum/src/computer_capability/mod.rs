@@ -883,17 +883,15 @@ where
         self
     }
 
-    /// Read `computer_use.app_use` from the person's config file,
-    /// `config_path()`, for every call from now on.
-    ///
-    /// Every constructor builds a plane that reads no file, so test binaries
-    /// and examples never act on the config of whoever runs them. Only the
-    /// module's own startup, which already loads that file to register,
-    /// calls this.
-    // Only macOS and Windows build a computer plane in a running module.
-    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
-    pub(crate) fn read_app_use_from_config_file(&self) {
-        self.app_use.read_config_file();
+    /// Enable per-call reading only for the legacy daemon path.
+    #[cfg(any(test, target_os = "macos", target_os = "windows"))]
+    pub(crate) fn read_app_use_from_config_file(&self, path: PathBuf) {
+        self.app_use.read_config_file(path);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub(crate) fn apply_live_settings(&self, settings: crate::settings::LiveSettings) {
+        self.app_use.apply(settings);
     }
 
     /// The config file this plane's calls read `app_use` from, if any.
@@ -1030,7 +1028,7 @@ where
         // action of any kind may run under a guess. A missing file is not
         // this case; it means background. Nothing has been looked up or
         // dispatched yet.
-        let app_use = match self.app_use.current() {
+        let app_use = match self.app_use.current_settings() {
             Ok(mode) => mode,
             Err(invalid) => {
                 let reply = match capability.0 {

@@ -622,9 +622,6 @@ mod census {
     }
 
     fn preconditions() -> Result<Setup, Precondition> {
-        let config = cerebellum::browser_config::load_browser_config_file().map_err(|error| {
-            Precondition(format!("the module config could not be read: {error}"))
-        })?;
         let mut with_fake_home = false;
         let mut executable = None;
         for argument in std::env::args_os().skip(1) {
@@ -639,19 +636,8 @@ mod census {
                 )));
             }
         }
-        let executable = match executable {
-            Some(executable) => executable,
-            None => config
-                .as_ref()
-                .and_then(|config| config.executable_path.clone())
-                .ok_or_else(|| {
-                    Precondition(
-                        "no executable: pass one as an argument or set \
-                         browser.executable_path in the module config"
-                            .to_string(),
-                    )
-                })?,
-        };
+        let executable = executable
+            .ok_or_else(|| Precondition("pass the browser executable as an argument".into()))?;
         if !executable.is_absolute() || !executable.is_file() {
             return Err(Precondition(format!(
                 "the browser executable {} does not exist",
@@ -673,17 +659,8 @@ mod census {
                 ))
             }
         }
-        // Production's defaults when the config names no value.
-        let grace = Duration::from_millis(
-            config
-                .as_ref()
-                .map_or(5_000, |config| config.termination_grace_period_ms),
-        );
-        let handshake = Duration::from_millis(
-            config
-                .as_ref()
-                .map_or(10_000, |config| config.launch_handshake_deadline_ms),
-        );
+        let grace = Duration::from_millis(5_000);
+        let handshake = Duration::from_millis(10_000);
         Ok(Setup {
             executable,
             grace,

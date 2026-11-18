@@ -1,11 +1,10 @@
 //! The live `computer_use.app_use` setting.
 //!
-//! Every other key in `~/.config/cortexkit/cerebellum.jsonc` takes effect only
-//! at startup. `app_use` is read again while the module runs, so a person who
-//! switches to background sees the change on the next call. Foreground use
-//! additionally needs the person's operator confirmation, held only in memory.
+//! Each call takes the latest effective mode delivered by the daemon. A
+//! foreground setting that the daemon did not attest as approved still needs
+//! the person's operator confirmation, held only in memory.
 //!
-//! The cost of that is one `stat` of the config file per call. When the file's
+//! The legacy fallback costs one `stat` of the config file per call. When the file's
 //! modification time is the one seen last time, the mode read last time is used
 //! and nothing else happens. When it changed, the whole file is parsed again
 //! with [`parse_config`], the same parser registration uses, so an edit that
@@ -26,6 +25,8 @@ use std::time::SystemTime;
 
 use cerebellum_core::config::{parse_config, AppUse};
 use serde_json::{json, Value};
+
+use crate::settings::LiveSettings;
 
 /// The two file operations the live read needs, so tests can supply a file
 /// system whose modification times and contents they control.
@@ -100,14 +101,8 @@ struct Reading {
     outcome: Result<AppUse, ConfigInvalid>,
 }
 
-/// The config file's `computer_use.app_use`, re-read whenever the file
-/// changes.
-///
-/// A plane starts with no file to read, so every call is background. Only the
-/// module a person runs switches it to their config file, through
-/// [`LiveAppUse::read_config_file`]. Test binaries and examples build planes
-/// too, and must never take a mode, or a `config_invalid` refusal, from
-/// whatever the developer running them has in their own config file.
+/// Defaults to background without reading a file. Only the legacy daemon
+/// path can install a file source; managed settings replace that source.
 pub(crate) struct LiveAppUse {
     /// Held across the `stat` and any re-read, so two calls arriving together
     /// parse a changed file once rather than twice.
@@ -116,11 +111,10 @@ pub(crate) struct LiveAppUse {
 }
 
 struct State {
-    /// `None` when there is no file to look at, which reads as a missing
-    /// file.
     path: Option<PathBuf>,
     files: Arc<dyn ConfigFiles>,
     last: Option<Reading>,
+    managed: LiveSettings,
 }
 
 impl LiveAppUse {
@@ -131,6 +125,7 @@ impl LiveAppUse {
                 path,
                 files,
                 last: None,
+                managed: LiveSettings::default(),
             }),
         }
     }
@@ -151,15 +146,23 @@ impl LiveAppUse {
         live
     }
 
-    /// Read the person's config file, `config_path()`, from the next call on.
-    /// The cached result is cleared, so the next call parses the file if there
-    /// is a config path and the file exists.
-    pub(crate) fn read_config_file(&self) {
+    #[cfg(any(test, target_os = "macos", target_os = "windows"))]
+    pub(crate) fn read_config_file(&self, path: PathBuf) {
         let mut state = self.lock();
-        state.path = cerebellum_core::config::config_path();
+        state.path = Some(path);
         state.files = Arc::new(NativeConfigFiles);
         state.last = None;
         self.approval.observe(None);
+    }
+
+    #[cfg(any(test, target_os = "macos", target_os = "windows"))]
+    pub(crate) fn apply(&self, settings: LiveSettings) {
+        let mut state = self.lock();
+        state.path = None;
+        state.last = None;
+        state.managed = settings;
+        self.approval
+            .observe((!settings.approved).then_some(settings.app_use));
     }
 
     /// The file calls are read from, if any.
@@ -175,15 +178,41 @@ impl LiveAppUse {
     }
 
     /// The mode for the call about to run.
+    #[cfg(test)]
     pub(crate) fn current(&self) -> Result<AppUse, ConfigInvalid> {
+        self.current_settings().map(|settings| settings.app_use)
+    }
+
+    pub(crate) fn current_settings(&self) -> Result<LiveSettings, ConfigInvalid> {
         let mut state = self.lock();
-        let outcome = Self::read(&mut state);
-        self.approval.observe(outcome.as_ref().ok().copied());
+        let outcome = if state.path.is_some() {
+            Self::read(&mut state).map(|app_use| LiveSettings {
+                app_use,
+                approved: false,
+            })
+        } else {
+            Ok(state.managed)
+        };
+        self.approval.observe(
+            outcome
+                .as_ref()
+                .ok()
+                .filter(|settings| !settings.approved)
+                .map(|settings| settings.app_use),
+        );
         outcome
     }
 
-    pub(crate) async fn approved_mode(&self, mode: AppUse, cancel: &crate::CancelHandle) -> AppUse {
-        self.approval.resolve(mode, cancel).await
+    pub(crate) async fn approved_mode(
+        &self,
+        settings: LiveSettings,
+        cancel: &crate::CancelHandle,
+    ) -> AppUse {
+        if settings.approved {
+            settings.app_use
+        } else {
+            self.approval.resolve(settings.app_use, cancel).await
+        }
     }
 
     #[cfg(test)]
@@ -193,7 +222,9 @@ impl LiveAppUse {
     }
 
     fn read(state: &mut State) -> Result<AppUse, ConfigInvalid> {
-        let State { path, files, last } = state;
+        let State {
+            path, files, last, ..
+        } = state;
         let Some(path) = path.as_deref() else {
             return Ok(AppUse::Background);
         };
@@ -595,8 +626,7 @@ mod serve_tests {
 
     /// Test binaries and examples build planes with these same
     /// constructors, so none of them may read the config file of whoever
-    /// runs them. Only the explicit opt-in that module startup makes points a
-    /// plane at `config_path()`.
+    /// runs them. Only legacy startup explicitly installs a file source.
     #[test]
     fn a_plane_from_any_constructor_reads_no_config_file() {
         let planes: [Plane; 3] = [
@@ -612,11 +642,9 @@ mod serve_tests {
         ];
         for plane in planes {
             assert_eq!(plane.app_use_config_path_for_test(), None);
-            plane.read_app_use_from_config_file();
-            assert_eq!(
-                plane.app_use_config_path_for_test(),
-                cerebellum_core::config::config_path()
-            );
+            let path = PathBuf::from("fixture-settings.jsonc");
+            plane.read_app_use_from_config_file(path.clone());
+            assert_eq!(plane.app_use_config_path_for_test(), Some(path));
         }
     }
 

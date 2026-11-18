@@ -1273,6 +1273,9 @@ pub(super) async fn handle_tool_request_inner(
     // of login material. With the rollout switch on, startup gives a running
     // module's plane the live vault source; planes built for tests get none
     // unless a test installs one.
+    if let Some((reason, remedy)) = browser_prerequisite(name, planes.runtime_browser.as_ref()) {
+        return send_route_error(writer, ver, channel, epoch, corr, reason, remedy).await;
+    }
     let known_capability = dispatchable_tool_with_browser(name, planes.browser_config.is_some())
         .or_else(|| {
             browser::fill::admitted(name, &planes.browser, planes.browser_config.is_some())
@@ -1933,6 +1936,27 @@ pub(super) async fn handle_tool_request_inner(
             )
             .await
         }
+    }
+}
+
+fn browser_prerequisite(
+    name: &str,
+    surface: Option<&BrowserSurface>,
+) -> Option<(&'static str, &'static str)> {
+    if !browser_build_admits()
+        || dispatchable_tool_with_browser(name, false).is_some()
+        || (dispatchable_tool_with_browser(name, true).is_none()
+            && name != browser::fill::FILL_LOGIN)
+    {
+        return None;
+    }
+    match surface? {
+        BrowserSurface::Refused(error) => Some((error.reason.reason_code(),
+            "Correct the browser executable and its expected identity in Cerebellum's settings, then restart the module.")),
+        BrowserSurface::NotConfigured => Some(("executable_missing",
+            "Configure browser.executable_path and browser.expected_identity in Cerebellum's settings, then restart the module.")),
+        BrowserSurface::Available(config) => (!config.executable_path.as_ref().is_some_and(|path| path.is_file())).then_some(("executable_missing",
+            "Make the configured browser executable available or correct browser.executable_path in Cerebellum's settings.")),
     }
 }
 
