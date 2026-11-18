@@ -721,6 +721,16 @@ impl RestoreCell {
             } else {
                 "the application that was in front before could not be put back; switch back to the application you were using".to_owned()
             };
+            // A shortcut that already sent keys keeps saying which.
+            let sent = object
+                .get("remedy")
+                .and_then(Value::as_str)
+                .and_then(crate::computer_capability::keystrokes::keys_sent_in)
+                .map(str::to_owned);
+            let remedy = match sent {
+                Some(sent) => format!("{sent} {remedy}"),
+                None => remedy,
+            };
             object.insert("remedy".into(), json!(remedy));
         } else if let RestoreStatus::SkippedPerson { now_front } = decided.restore {
             let explanation = if decided.input_coverage_unavailable {

@@ -120,7 +120,7 @@ use read_image::ImageReadPlan;
 #[cfg(test)]
 mod development_build_tests;
 mod held_input;
-mod keystrokes;
+pub(crate) mod keystrokes;
 mod open_app;
 #[cfg(test)]
 mod open_app_tests;
@@ -1951,6 +1951,14 @@ where
             SyntheticAction::TypeText { text } => Some(text.clone()),
             _ => None,
         };
+        // The shortcut's canonical key names, for a refusal that must say
+        // which keys were already sent.
+        let chord_names = match &parsed.action {
+            SyntheticAction::KeyCombination { key, modifiers } => {
+                Some(describe_chord(*modifiers, *key))
+            }
+            _ => None,
+        };
         let held_press = held_input::HeldPress::per_process(&grant, &parsed.action);
         let mut request = DispatchRequest::new(
             row,
@@ -2077,6 +2085,7 @@ where
             None,
             action_effects::ActionEffects::default(),
         ));
+        let mut keys_sent = None;
         let mut reply = match dispatched {
             Ok(report) => {
                 let Some(containment_rung) = report.containment.rung() else {
@@ -2132,6 +2141,9 @@ where
                         refused["posts_returned"] = json!(bracket.posts_returned);
                     }
                 }
+                keys_sent = chord_names.as_deref().and_then(|chord| {
+                    keystrokes::chord_keys_sent(chord, &refusal, bracket.as_ref())
+                });
                 refused
             }
         };
@@ -2139,6 +2151,11 @@ where
         // else happened, because the person's next keystrokes go to it.
         if let Some(bracket) = &bracket {
             keystrokes::disclose_failed_restore(&mut reply, bracket, &grant);
+        }
+        // Last, so no rewrite of the remedy drops it: a shortcut cut off
+        // after its key press was posted says which keys were sent.
+        if let Some(sent) = &keys_sent {
+            keystrokes::prepend_keys_sent(&mut reply, sent);
         }
         // Applied after the restore disclosure, which rewrites the reply: a
         // bracket can fail to put the previous application back without ever
@@ -3272,9 +3289,10 @@ fn parse_keys_request(object: &serde_json::Map<String, Value>) -> Result<ParsedS
 
 /// The chord in the wire's own spelling, rebuilt from the parsed parts.
 ///
-/// Used only when the parser's retained text is absent, which it is not
-/// today; kept so a refusal never has to choose between a panic and an
-/// empty chord field.
+/// A blocked-chord refusal uses it only when the parser's retained text is
+/// absent, which it is not today, so that refusal never has to choose
+/// between a panic and an empty chord field. A refused shortcut that already
+/// sent its key press names it with this, from key names alone.
 fn describe_chord(modifiers: SyntheticKeyModifiers, key: SyntheticKey) -> String {
     let mut parts = Vec::with_capacity(5);
     if modifiers.command {

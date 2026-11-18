@@ -1827,6 +1827,12 @@ async fn a_chord_that_may_hold_a_key_restores_only_after_the_release_is_confirme
         "{reply}"
     );
     assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
+    assert!(
+        reply["remedy"]
+            .as_str()
+            .is_some_and(|remedy| remedy.starts_with("Already sent: the command+")),
+        "a shortcut stopped after its press says which keys were sent: {reply}"
+    );
     assert!(!rig.lock.held());
 
     let rig = self::rig(AppUse::Background, mail_desk()).await;
@@ -1847,6 +1853,13 @@ async fn a_chord_that_may_hold_a_key_restores_only_after_the_release_is_confirme
     );
     assert_eq!(reply["outcome"], "restore_failed", "{reply}");
     assert_eq!(reply["fronting"]["restore"], "failed");
+    let remedy = reply["remedy"].as_str().unwrap_or_default();
+    assert!(
+        remedy.starts_with("Already sent: the command+")
+            && remedy.contains("release was not confirmed")
+            && remedy.contains("was left in front"),
+        "the failed restore keeps saying which keys were sent: {reply}"
+    );
     assert!(
         rig.lock.held(),
         "the obligation keeps the lock until terminal cleanup takes it"
