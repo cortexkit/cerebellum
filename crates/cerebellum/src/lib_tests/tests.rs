@@ -3906,7 +3906,7 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
         assert_eq!((removed, replaced), (2, 1));
         assert_eq!(
             digest(&previous),
-            "f3044a4a847579d999d1e615e37afea785eab78501db7dca735aa84b95637075"
+            "91a8d792d2688cbf7818e62aa989e11c02f1d70382c330eda12eec6b139d46ea"
         );
         previous
     } else {
@@ -3939,8 +3939,8 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
     ];
     #[cfg(target_os = "macos")]
     let before_read_pins = [
-        "36b634587d38fe35aeab157ab028be55ba6f5e57d238e2a38d0b04dca7ef7892",
-        "30c989be33e0848f18b00cba45d88940b5fec6353a456331572382732228567b",
+        "f1d836f66a286cc76034c0b43014c6b45ced89616182a58291839d113c1f6602",
+        "c91f8cb9efa64fb61735541fcca446613e625d2151b95b27189ce43e65d17188",
     ];
     assert_eq!(
         [digest(&before_read), digest(&before_read_unbound)],
@@ -3955,8 +3955,8 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
     ];
     #[cfg(target_os = "macos")]
     let prior = [
-        "be75638b3892bed37282a867be03a1daa283bd0a6ec2bc7a099deb591d2707fd",
-        "ec71302313702fd18b8cfcff461b523b7b5946265b0104261172081b0bfb991d",
+        "ae5964cc14a0e7872cdb9833a2db31825639e0c2cea7bf979c3fb5e4bea283a2",
+        "471542719ed51536d8f0c6e6795b0f5444a6102024222ea14e11b83b99bb386a",
     ];
     for (current, prior) in [&before_read, &before_read_unbound].into_iter().zip(prior) {
         let mut previous = current.clone();
@@ -4032,12 +4032,12 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
     #[cfg(target_os = "linux")]
     let before_views = "f46b5ddc8c5b081adb40a3c2982d27822f9c7400bc62d189d74816a5eaa5d466";
     #[cfg(target_os = "macos")]
-    let before_views = "6c98e57299920c8ee405321aecbd63e4e514a5c23676632df8b971f900f3f436";
+    let before_views = "b4839c9eee9e533d0aaf92dc4211a39bd379b1aa86b7bd927ad57c8b5f3df5c2";
     assert_eq!(digest(&without_views), before_views);
     #[cfg(target_os = "linux")]
     let previous = "76dbb08edce1bb7742f5efc2686b7e2ec42ad623586d16d91be1fbd52fa15662";
     #[cfg(target_os = "macos")]
-    let previous = "33166b72e5c0aefea0f0f6ec91a764a66a83684096d09f39bc21bc0baedee21d";
+    let previous = "808fb3381e8697e228ce49fb644a7116246b6691faf61d81fbafd6aa7a7af335";
     let mut predecessor = without_views;
     predecessor["capabilities"]["provides"]
         .as_array_mut()
@@ -4049,7 +4049,7 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
         "62fe03bb1a213e8c6d0c73000fca4de891118d5347440e35b96f8534a4c1fd51";
     #[cfg(target_os = "macos")]
     let before_pointer_fronting =
-        "129c9cf0b18bcd2f225d4a8aa0189f097991ec4685348e0e3fa294cc495829ff";
+        "9e432098108c67566ea9e6502e98000a398f10fb7ff762ee3159b49d8c8e520d";
     assert_eq!(digest(&legacy), before_pointer_fronting);
 
     // Full HELLO pins include the internal move participant. Historical
@@ -4057,11 +4057,11 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
     #[cfg(target_os = "linux")]
     let expected = "5e4cf4f41c7b6fde17ee788a3f8250ed8e8ca25e1e32bdfbd6aad915f1249e45";
     #[cfg(target_os = "macos")]
-    let expected = "2b229d687f88fff67aa6ebfe2bea7cc48d534d97c5c85232f5705b7348b8e1ae";
+    let expected = "817914f8a74d1ae1957976136eaca692c592226b50d5332accc4836136778d20";
     #[cfg(target_os = "linux")]
     let expected_unbound = "beddf7ef0765904a344b386bc49380d88187854fe5c8c341334970b9218ee1c3";
     #[cfg(target_os = "macos")]
-    let expected_unbound = "9140c4593045fc0e40510ed767652c0df83be83223a2ab474bd6e5d81dc2f2e3";
+    let expected_unbound = "4e38e12b36acc3830816c1ec886a6b23cf713e02ca1e009eb30cede5ed7ef7e0";
     assert_eq!(digest(&value), expected);
     assert_eq!(digest(&unbound), expected_unbound);
 }

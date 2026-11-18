@@ -62,7 +62,7 @@ pub(crate) const TAKEOVER_SCROLL_NOTE: &str = "takeover_scroll carries no locati
 fn describe_computer_field(name: &str, schema: &mut Value, pointer_fronting: bool) {
     let description = match name {
         "target" => "The app to act in, by name (Calculator) or app id (com.apple.calculator on macOS). On element actions it is optional and only checked against the element's app.",
-        "bring_to_front" => "With include_image, front then restore under held mouse/keyboard takeover. Never prompts; else image_needs_takeover.",
+        "bring_to_front" => "With include_image, briefly front a covered app for its picture, then restore. Uses the app's own grant.",
         "app" => "App id of the app whose elements the predicate names, such as com.apple.calculator on macOS.",
         "text" => "Text to enter; a secure text field is refused.",
         "keys" => "Key names for one chord. On macOS the modifiers are command, shift, option and control, for example [\"command\", \"s\"]. Session-ending chords are refused.",
@@ -1434,8 +1434,8 @@ mod tests {
         );
         assert_eq!(
             legacy.len(),
-            6973,
-            "the unbound definition must remain byte-identical"
+            6961,
+            "the unbound definition changed size; repin only for a deliberate wording change"
         );
         assert!(legacy.len() <= 7000);
         let browser_names = [

@@ -40,7 +40,7 @@
       },
       "bring_to_front": {
         "default": false,
-        "description": "With include_image, front then restore under held mouse/keyboard takeover. Never prompts; else image_needs_takeover.",
+        "description": "With include_image, briefly front a covered app for its picture, then restore. Uses the app's own grant.",
         "type": "boolean"
       },
       "element_id": {

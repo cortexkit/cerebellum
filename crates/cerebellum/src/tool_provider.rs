@@ -572,10 +572,10 @@ mod tests {
                         "7492560906aaf5f1c1b03b6af2849ddfd28b449f6bf7a33ad84a43c69a03d647"
                     }
                     "computer_use" if !pointer_fronting => {
-                        "fbef38d68cd09cb42c8283f195871cb13c88180570f989314bc89a833258ac1c"
+                        "76491f4fde457660f1697f85a3eddc3df244b6008c3ed0751afb2dad8da28b11"
                     }
                     "computer_use" => {
-                        "955b32959d12b2829fea214c162a7c83ec4c39c7e45783033e59b45793047af3"
+                        "47f88551fdc964b610ed6f2d197ac454381d2df0dcae57ff343818765c906e70"
                     }
                     _ => unreachable!("only the two flat model tools are served"),
                 };
