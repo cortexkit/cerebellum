@@ -1227,8 +1227,9 @@ mod gate_tests {
     /// A late watch record with a restore word the reader has never seen
     /// (`skipped_coverage`) is opaque completion material: a module started
     /// over that journal opens it, recovers nothing, and reads the row back.
-    /// The journal reader here is the one the released build carries, so a
-    /// plain-swap rollback reads the new word the same way.
+    /// The journal reader here is the one the released build carries, so
+    /// rolling back to that build (replacing the binary, keeping the
+    /// journal) reads the new word the same way.
     #[test]
     fn a_journal_with_a_new_cleanup_restore_word_opens_and_reads_normally() {
         let storage = InMemoryJournalStorage::new();

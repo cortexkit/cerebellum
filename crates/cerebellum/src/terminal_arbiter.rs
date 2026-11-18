@@ -489,8 +489,9 @@ impl RestoreCell {
     /// restore is requested at once. It does not first wait for a front
     /// request still in flight to return, nor watch for an unconfirmed
     /// activation to land; an activation that lands afterwards is the late
-    /// watch's to put back. It still leaves focus alone on person input or
-    /// an observer gap since the front.
+    /// watch's to put back. It still leaves focus alone on person input
+    /// since the front, or when the hardware input observer could not watch
+    /// throughout since then.
     pub fn decide_at_cutoff(&self) -> RestoreDecided {
         self.decide_with(true)
     }

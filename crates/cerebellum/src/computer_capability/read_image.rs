@@ -67,8 +67,8 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
         return Err(ImageUnavailable::FrontingUnavailable);
     }
     // Whether this read may still acquire pixels: the cutoff has not fired
-    // and its absolute deadline has not passed, no cleanup has taken the
-    // obligation, and the call has not been stopped. Shared with the
+    // and its absolute deadline has not passed, no cleanup has taken over
+    // restoring the person's application, and the call has not been stopped. Shared with the
     // platform's capture completion, which may run after the request.
     let fence: cerebellum_computer::capture::AcquisitionFence = {
         let hooks = hooks.clone();
@@ -98,7 +98,9 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
                 // The visibility check and the window lookup can block. The
                 // fence is asked again immediately before the pixels are
                 // requested, and by the completion before any are copied:
-                // once it has closed, none are acquired.
+                // once it has closed, no pixels are requested, and none are
+                // copied or returned even if ScreenCaptureKit completes a
+                // request already made.
                 let pending =
                     controller.capture_frontmost_window_unencoded_for_vision_fenced(now_ms, &fence);
                 let pending = match pending {

@@ -843,11 +843,11 @@ impl CellHooks {
 
     /// Whether a picture read may still acquire pixels: the cutoff has not
     /// fired, its absolute deadline has not passed (whether or not the timer
-    /// has run yet), and no cleanup has taken the obligation. Asked
-    /// immediately before the pixels are requested, by the completion before
-    /// any are copied, and again once they arrived, so a read that was
-    /// already under way when the bound passed acquires nothing, or has what
-    /// it acquired withheld.
+    /// has run yet), and no cleanup has taken over restoring the person's
+    /// application. Asked immediately before the pixels are requested, by
+    /// the completion before any are copied, and again once they arrived, so
+    /// a read that was already under way when the bound passed requests no
+    /// pixels, copies none, or has what it copied withheld.
     pub(crate) fn picture_may_acquire(&self) -> bool {
         let (cutoff, cell) = {
             let state = self.state();
