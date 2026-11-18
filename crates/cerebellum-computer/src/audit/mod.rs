@@ -1224,6 +1224,51 @@ mod gate_tests {
         assert_eq!(audit.recover_active().len(), 0);
     }
 
+    /// A late watch record with a restore word the reader has never seen
+    /// (`skipped_coverage`) is opaque completion material: a module started
+    /// over that journal opens it, recovers nothing, and reads the row back.
+    /// The journal reader here is the one the released build carries, so a
+    /// plain-swap rollback reads the new word the same way.
+    #[test]
+    fn a_journal_with_a_new_cleanup_restore_word_opens_and_reads_normally() {
+        let storage = InMemoryJournalStorage::new();
+        let open = || {
+            ComputerAudit::new(
+                UnavailablePolicy,
+                taxonomy(),
+                JournalConfig {
+                    journal_retention_bytes: 200_000,
+                    journal_max_entry_bytes: 40_000,
+                },
+                storage.clone(),
+                custody(),
+            )
+            .unwrap()
+        };
+        let mut audit = open();
+        let mut identity =
+            journal_identity("principal", "conversation", "project", SessionKind::Primary);
+        identity.witness = cerebellum_core::dispatch_witness::DispatchWitness::armed();
+        audit
+            .record_fronting_cleanup(
+                identity,
+                ComputerCapability::Keys,
+                serde_json::json!({"cleanup":"restore", "restore":"skipped_coverage",
+                    "person_input_during_fronting":false}),
+            )
+            .unwrap();
+        drop(audit);
+        // A restart over the same journal.
+        let mut reopened = open();
+        assert_eq!(reopened.recover_active().len(), 0);
+        let exported = reopened.journal().export();
+        let row = ComputerJournalCodec::decode_entry(exported.trim().as_bytes()).unwrap();
+        let result_bytes: Vec<u8> =
+            serde_json::from_value(row["completed_result"].clone()).unwrap();
+        let result: Value = serde_json::from_slice(&result_bytes).unwrap();
+        assert_eq!(result["restore"], "skipped_coverage");
+    }
+
     #[test]
     fn failed_front_cannot_serialize_as_confirmed_in_reply_or_audit() {
         for body in [

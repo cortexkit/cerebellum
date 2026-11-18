@@ -136,7 +136,14 @@ async fn landing_after_reply(caller: Caller) {
             assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
             assert_eq!(rig.screen.log(), ["front:4242", "restore:100"]);
         } else {
-            assert_eq!(record["restore"], "skipped_person", "{evidence}: {record}");
+            // A lost or gapped observer is recorded apart from person input
+            // and a third application.
+            let word = if matches!(evidence, "unreadable" | "gap") {
+                "skipped_coverage"
+            } else {
+                "skipped_person"
+            };
+            assert_eq!(record["restore"], word, "{evidence}: {record}");
             assert_eq!(rig.screen.log(), ["front:4242"]);
         }
         // Neither capture nor posting may run after the action's frontmost-

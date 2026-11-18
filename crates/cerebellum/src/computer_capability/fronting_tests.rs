@@ -3727,7 +3727,13 @@ async fn a_pending_chord_landing_after_its_reply_only_restores_and_never_posts()
             assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
             assert_eq!(rig.screen.log(), ["front:4242", "restore:100"]);
         } else {
-            assert_eq!(record["restore"], "skipped_person");
+            // A lost observer is recorded apart from person input.
+            let word = if evidence == "input" {
+                "skipped_person"
+            } else {
+                "skipped_coverage"
+            };
+            assert_eq!(record["restore"], word, "{evidence}");
             assert_eq!(record["person_input_during_fronting"], evidence == "input");
             assert_eq!(rig.screen.log(), ["front:4242"]);
         }
@@ -3774,7 +3780,14 @@ async fn late_fronting_route_close_restores_only_with_quiet_known_input_coverage
             assert_eq!(record["restore"], "restored");
             assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
         } else {
-            assert_eq!(record["restore"], "skipped_person");
+            // Person input and a lost observer both leave focus alone, and
+            // the record says which.
+            let word = if evidence == "input" {
+                "skipped_person"
+            } else {
+                "skipped_coverage"
+            };
+            assert_eq!(record["restore"], word, "{evidence}");
             assert_eq!(rig.screen.frontmost(), Some(TARGET));
         }
         assert!(!rig.screen.log().iter().any(|event| event == "post"));
