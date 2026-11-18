@@ -567,12 +567,11 @@ impl RestoreCell {
     /// decision.
     ///
     /// An app-use front keeps its bound here: an unconfirmed activation is
-    /// watched for only until the restore reserve starts, every native call
-    /// before the first restore request checks the deadline first, and that
-    /// request is refused once the deadline has passed. A refused request is
-    /// reported failed and leaves the obligation to the late watch, with the
-    /// host that carries the previous application's identity as it was bound
-    /// before the front.
+    /// watched for only until the restore reserve starts. The deadline is
+    /// checked before reading focus and at the first restore write. A refused
+    /// request is reported failed and leaves the obligation to the late watch,
+    /// with the host that carries the previous application's identity as it was
+    /// bound before the front.
     pub fn decide(&self) -> RestoreDecided {
         self.decide_entered(std::time::Instant::now())
     }
@@ -717,9 +716,9 @@ impl RestoreCell {
         inner.release_wait = Some(since_ms);
     }
 
-    /// The worker that owned this obligation ended without deciding, so
-    /// nobody can decide it now. Nothing is restored; the fronting lock is
-    /// released, and a front that may have happened is reported failed.
+    /// Retire a front after its worker sends no reply, unless the owner is
+    /// already deciding. Nothing is restored on abandonment, the fronting
+    /// lock is released, and a front that may have happened is reported failed.
     pub(crate) fn abandon_undecided(&self) {
         let inner = self.inner();
         if inner.decided.is_none() && !inner.deciding {

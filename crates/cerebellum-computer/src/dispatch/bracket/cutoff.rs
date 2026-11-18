@@ -21,7 +21,8 @@
 //!   held input and restores.
 //! - **The deadline**: the first native restore request must be made by it.
 //!   A request that can no longer be made by then is refused, reported as a
-//!   failed restore and handed to the bounded late watch.
+//!   failed restore. The bounded late watch starts at terminal cleanup,
+//!   once the owner has handed over the obligation.
 //!
 //! The call's terminal cleanup never restores. It may stop a front that has
 //! not been requested yet, which then never happens, and otherwise waits a
@@ -40,9 +41,9 @@ use std::time::{Duration, Instant};
 /// transport authentication. Focus is read once, then the focused pid's
 /// generation is validated, so a pid reused by another process fails; stop,
 /// the deadline and commitment follow, with no further focus or
-/// process-generation read between that validation and the post. Focus moving to another application during the
-/// generation lookup is the accepted race with delivery: the post still goes
-/// only to the granted process.
+/// process-generation read between that validation and the post. Focus may
+/// still move between the focus read and delivery. The post names the target
+/// pid; the OS may resolve that pid after it has passed to another process.
 ///
 /// A post refused here was never made, so the refusal is
 /// [`ProcessEventRefusal::Cancelled`], which a reply reads as no post call

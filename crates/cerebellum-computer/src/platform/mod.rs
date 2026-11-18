@@ -1775,13 +1775,6 @@ impl PreviousBinding {
     pub fn identity(&self) -> Option<(u32, u64)> {
         self.start.map(|start| (self.pid, start))
     }
-
-    /// Whether a restore write to `pid`, whose start time reads `current`
-    /// right before the write, puts back the bound process: the same pid, a
-    /// start time read at the bind, and the same start time now.
-    pub fn admits(&self, pid: u32, current: Option<u64>) -> bool {
-        self.pid == pid && self.start.is_some() && self.start == current
-    }
 }
 
 /// Where a restore host keeps its [`PreviousBinding`]: empty until the one
@@ -1804,11 +1797,6 @@ impl PreviousSlot {
     /// failed one.
     pub fn identity(&self) -> Option<(u32, u64)> {
         self.0.and_then(|binding| binding.identity())
-    }
-
-    /// See [`PreviousBinding::admits`]; nothing is admitted before the bind.
-    pub fn admits(&self, pid: u32, current: Option<u64>) -> bool {
-        self.0.is_some_and(|binding| binding.admits(pid, current))
     }
 }
 

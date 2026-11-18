@@ -52,9 +52,9 @@ pub const FRONTING_BRACKET_MS: u64 = 200;
 /// frontmost readings (each a window-server window list), two reads of the
 /// hardware observer's timestamps, the previous application's start-time
 /// check and the accessibility write on an element resolved when the front
-/// was registered. Each sample is the owner's own restore, from the start of
-/// that preparation to the native write, so it also covers the cell's lock
-/// and setup before the OS checks.
+/// was registered. The in-memory reserve adds the recent worst time spent
+/// finishing the action after the reserve starts and starting the restore
+/// thread to the recent worst preparation time through the native write.
 /// Measured on a desk
 /// (two window-list reads and a start-time read, 40 runs): median about
 /// 1 ms, 90th percentile about 5 ms, slowest 33 ms. This floor covers the
@@ -66,11 +66,14 @@ pub const RESTORE_PREPARATION_SLACK_MS: u64 = 10;
 /// The most the restore reserve starts early: half the bracket, to leave
 /// time to act. Two named exceptions can leave the target in front past the
 /// bound. A key release unsettled at the deadline holds the restore until it
-/// settles confirmed. A native call that cannot be capped (an OS focus read,
-/// an event post, a process lookup, the restore's own write) stalling past
-/// the deadline refuses the first native restore write: the call reports
-/// `restore_failed`, and the watcher for late activations can retry if the
-/// target is still in front and input observation shows no intervention.
+/// settles confirmed. Uncapped work can stall: window-server setup and focus,
+/// listing or visibility reads; event posts, auth preparation and
+/// `AXIsProcessTrusted`; a process lookup; capture or a pixel copy while
+/// holding the lock the caller needs to mark the capture `abandoned` on
+/// timeout; thread creation; and the restore's own write.
+/// An owner that never returns cannot restore or hand off the obligation.
+/// If it returns past the deadline before writing, the first restore write
+/// is refused and terminal cleanup can start the late watch.
 pub const RESTORE_PREPARATION_RESERVE_MAX_MS: u64 = 100;
 /// How long a fronted picture read may keep the fronting lock from its
 /// start. Its pixels are refused past `FRONTING_BRACKET_MS` anyway; this
