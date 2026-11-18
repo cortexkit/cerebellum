@@ -536,6 +536,8 @@ struct ScreenState {
     fallback_works: bool,
     /// The process a registration told the restore host it will put back.
     remembered_previous: Option<u32>,
+    /// How many times a restore host was told which process to put back.
+    remember_calls: usize,
     /// The restore host refuses to ask for any process it was not told to
     /// put back, as the macOS host does, which checks that process's
     /// start time before asking.
@@ -594,6 +596,7 @@ impl Screen {
                 restores_ignored: 0,
                 fallback_works: false,
                 remembered_previous: None,
+                remember_calls: 0,
                 restore_needs_remembered_previous: false,
                 landings_at: Vec::new(),
                 restore_focus_delay_ms: 0,
@@ -753,7 +756,9 @@ impl FrontingRestoreHost for FakeRestore {
         self.0.front("restore", pid)
     }
     fn remember_previous(&mut self, pid: u32) {
-        self.0.state().remembered_previous = Some(pid);
+        let mut state = self.0.state();
+        state.remembered_previous = Some(pid);
+        state.remember_calls += 1;
     }
     fn request_front_fallback(&mut self, pid: u32) -> bool {
         if self.0.state().fallback_works {

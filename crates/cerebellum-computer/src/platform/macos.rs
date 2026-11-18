@@ -793,17 +793,18 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
 /// The restore half of a front on this Mac, on the clock of the bracket or
 /// session it came from: the window list's frontmost application, fronting
 /// through accessibility, and the process-wide session observer's hardware
-/// input timestamps. It holds nothing but that clock's origin, so it is
-/// `Send` and can run on a cleanup thread.
+/// input timestamps. It holds that clock's origin and the previous
+/// application's binding, so it is `Send` and moves, binding and all, from
+/// the owner's restore to the late watch.
 struct MacRestoreHost {
     started: Instant,
-    /// The application a restore puts back, as `(pid, start time)`, once
-    /// the obligation names it; the second route to the front refuses any
-    /// other process.
-    previous: Option<(u32, u64)>,
+    /// The application a restore puts back, bound once as `(pid, start
+    /// time)` when the obligation names it, before the front. Both routes to
+    /// the front refuse any other process, and every process when the bind
+    /// failed.
+    previous: super::PreviousSlot,
     /// The previous application's accessibility element, resolved when the
-    /// obligation named it, so a restore at the cutoff makes no lookup
-    /// before its request.
+    /// obligation named it, so a restore makes no lookup before its request.
     prepared: Option<cerebellum_macos::PreparedFrontmost>,
 }
 
@@ -811,7 +812,7 @@ impl MacRestoreHost {
     fn new(started: Instant) -> Self {
         Self {
             started,
-            previous: None,
+            previous: super::PreviousSlot::default(),
             prepared: None,
         }
     }
@@ -840,7 +841,7 @@ impl FrontingRestoreHost for MacRestoreHost {
         // activation is written.
         let check = std::cell::RefCell::new(check);
         pointer::request_previous_front(
-            self.previous,
+            self.previous.identity(),
             pid,
             |pid| restore_start_time(pid, &mut **check.borrow_mut()),
             |still_ours| {
@@ -856,8 +857,15 @@ impl FrontingRestoreHost for MacRestoreHost {
     }
 
     fn remember_previous(&mut self, pid: u32) {
-        self.previous = cerebellum_macos::process_start_time_micros(pid).map(|start| (pid, start));
-        self.prepared = cerebellum_macos::prepare_frontmost(pid).ok();
+        // Once: a later call never rebinds, so a pid that has since passed to
+        // another process, or a failed first bind, is never replaced by a
+        // fresh lookup.
+        if self
+            .previous
+            .bind_once(pid, cerebellum_macos::process_start_time_micros)
+        {
+            self.prepared = cerebellum_macos::prepare_frontmost(pid).ok();
+        }
     }
 
     fn request_front_fallback(&mut self, pid: u32) -> bool {
@@ -869,7 +877,7 @@ impl FrontingRestoreHost for MacRestoreHost {
         pid: u32,
         check: &mut dyn super::RestoreWriteCheck,
     ) -> bool {
-        match self.previous {
+        match self.previous.identity() {
             Some((previous, start)) if previous == pid => {
                 let check = std::cell::RefCell::new(check);
                 cerebellum_macos::activate_application_while(

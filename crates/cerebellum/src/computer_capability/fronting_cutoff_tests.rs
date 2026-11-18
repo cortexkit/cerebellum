@@ -12,9 +12,15 @@ use std::time::Instant;
 const BOUND_MS: u64 = crate::budgets::FRONTING_BRACKET_MS;
 
 fn app_use_hooks() -> (CellHooks, Arc<std::sync::atomic::AtomicUsize>) {
+    app_use_hooks_under(under_terminal())
+}
+
+fn app_use_hooks_under(
+    terminal: Arc<crate::TerminalArbiter>,
+) -> (CellHooks, Arc<std::sync::atomic::AtomicUsize>) {
     let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let hooks = CellHooks::new(ObligationParts {
-        terminal: under_terminal(),
+        terminal,
         lock: Some(Box::new(CountedLock(Arc::clone(&releases)))),
         target_name: "Mail".into(),
         mode: crate::terminal_arbiter::FrontingMode::Background,
@@ -217,7 +223,8 @@ fn a_front_write_stalled_past_the_deadline_hands_the_restore_to_the_late_watch()
     // the cap on the target's messages cannot cut short.
     screen.state().front_blocks_ms = 2 * BOUND_MS;
     screen.state().front_ignores_cap = true;
-    let (hooks, releases) = app_use_hooks();
+    let terminal = under_terminal();
+    let (hooks, releases) = app_use_hooks_under(Arc::clone(&terminal));
     let mut boxed = boxed_hooks(&hooks);
     let expired = crate::terminal_arbiter::restore_preparation::expired_writes();
     let outcome = cerebellum_computer::platform::run_hooked_fronted(
@@ -246,6 +253,26 @@ fn a_front_write_stalled_past_the_deadline_hands_the_restore_to_the_late_watch()
     let cell = hooks.cell().expect("registered");
     assert!(cell.late_watch_pending(), "{log:?}");
     assert_eq!(lock_releases(&releases), 0);
+
+    // Once the call's reply starts it, the late watch writes through the
+    // obligation's own host, with the previous application as bound before
+    // the front: nothing bound it again.
+    screen.state().restore_needs_remembered_previous = true;
+    terminal.start_late_fronting(Some(&cell));
+    let give_up = Instant::now() + crate::test_support::HANG_GUARD;
+    while lock_releases(&releases) == 0 && Instant::now() < give_up {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(lock_releases(&releases), 1, "the watch ran and ended");
+    assert_eq!(
+        restores(&screen),
+        1,
+        "the watch restored: {:?}",
+        screen.log()
+    );
+    let state = screen.state();
+    assert_eq!(state.remembered_previous, Some(PREVIOUS));
+    assert_eq!(state.remember_calls, 1, "bound once, before the front");
 }
 
 #[test]

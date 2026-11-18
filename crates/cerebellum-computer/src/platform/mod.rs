@@ -1694,11 +1694,11 @@ pub trait PlatformDriver {
 
 /// The platform side of a restore after a temporary front: the frontmost
 /// read, the front request and a clock, plus the session observer's hardware
-/// input timestamps for the restore decision. It is `Send`, so the call's
-/// terminal cleanup can run the decision on another thread when the worker
-/// that fronted is stuck or gone. Its clock is the clock of the session or
-/// bracket it came from, so a front instant read there can be compared with
-/// it.
+/// input timestamps for the restore decision. It is `Send`, so the owner's
+/// restore can run on a thread of its own and the host can move, with the
+/// previous application's identity bound on it, to the late watch. Its clock
+/// is the clock of the session or bracket it came from, so a front instant
+/// read there can be compared with it.
 pub trait FrontingRestoreHost: Send {
     fn now_ms(&mut self) -> u64;
     fn pause_ms(&mut self, milliseconds: u64);
@@ -1711,10 +1711,12 @@ pub trait FrontingRestoreHost: Send {
     /// `None` when unavailable, which the decision reads as no input seen.
     fn hardware_input_snapshot(&mut self) -> Option<crate::dispatch::HardwareInputSnapshot>;
     /// The application `pid` runs is the one a restore will put back. Called
-    /// at every registration, whether or not the second route is allowed: a
-    /// host records which process that is, so its restore requests (the
-    /// first route and the second alike) can refuse a pid that has since
-    /// passed to another process.
+    /// once, at registration, before the front, whether or not the second
+    /// route is allowed: a host binds that process's identity
+    /// ([`PreviousBinding`]) and every restore request it makes, the first
+    /// route and the second alike, refuses a pid that has since passed to
+    /// another process. A host binds only once: a later call never replaces
+    /// the binding, and a bind that failed admits no restore write at all.
     fn remember_previous(&mut self, _pid: u32) {}
     /// A second way to ask for `pid`, the remembered previous application,
     /// to come to the front, for when [`Self::request_front`] has not taken
@@ -1743,6 +1745,67 @@ pub trait RestoreWriteCheck {
 impl<F: FnMut() -> bool> RestoreWriteCheck for F {
     fn permit(&mut self) -> bool {
         self()
+    }
+}
+
+/// The previous application's identity, bound once before the front as its
+/// pid and start time. It travels by value with the restore host, from the
+/// owner's restore to the late watch; nothing binds it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviousBinding {
+    pid: u32,
+    /// `None` when the start time could not be read at the bind: no restore
+    /// write is then ever admitted.
+    start: Option<u64>,
+}
+
+impl PreviousBinding {
+    /// Bind `pid` to the start time `start_time` reads for it now.
+    pub fn bind(pid: u32, start_time: impl FnOnce(u32) -> Option<u64>) -> Self {
+        Self {
+            pid,
+            start: start_time(pid),
+        }
+    }
+
+    /// The bound `(pid, start time)`, or `None` when the bind failed.
+    pub fn identity(&self) -> Option<(u32, u64)> {
+        self.start.map(|start| (self.pid, start))
+    }
+
+    /// Whether a restore write to `pid`, whose start time reads `current`
+    /// right before the write, puts back the bound process: the same pid, a
+    /// start time read at the bind, and the same start time now.
+    pub fn admits(&self, pid: u32, current: Option<u64>) -> bool {
+        self.pid == pid && self.start.is_some() && self.start == current
+    }
+}
+
+/// Where a restore host keeps its [`PreviousBinding`]: empty until the one
+/// bind, which a later bind never replaces.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PreviousSlot(Option<PreviousBinding>);
+
+impl PreviousSlot {
+    /// Bind once; `false` when the slot was already bound, failed or not, and
+    /// is left as it was.
+    pub fn bind_once(&mut self, pid: u32, start_time: impl FnOnce(u32) -> Option<u64>) -> bool {
+        if self.0.is_some() {
+            return false;
+        }
+        self.0 = Some(PreviousBinding::bind(pid, start_time));
+        true
+    }
+
+    /// The bound `(pid, start time)`; `None` before the bind or after a
+    /// failed one.
+    pub fn identity(&self) -> Option<(u32, u64)> {
+        self.0.and_then(|binding| binding.identity())
+    }
+
+    /// See [`PreviousBinding::admits`]; nothing is admitted before the bind.
+    pub fn admits(&self, pid: u32, current: Option<u64>) -> bool {
+        self.0.is_some_and(|binding| binding.admits(pid, current))
     }
 }
 
@@ -2742,6 +2805,8 @@ mod tests {
 
 #[cfg(test)]
 mod hooked_cutoff_tests;
+#[cfg(test)]
+mod previous_binding_tests;
 
 #[cfg(test)]
 mod hooked_fronted_tests {
