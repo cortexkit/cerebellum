@@ -827,7 +827,9 @@ impl TakeoverDispatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsentRefusal {
     /// The person has been asked and has not answered yet.
-    Pending { ask_id: String },
+    Pending {
+        ask_id: String,
+    },
     /// The person declined, now or earlier in this conversation.
     Denied {
         grant_kind: &'static str,
@@ -836,13 +838,16 @@ pub enum ConsentRefusal {
     /// The person allowed it while several calls waited; another of them
     /// acted, and this one did not run.
     GrantedNotExecuted,
+    OnceNotExecuted,
     /// Nobody could be asked, or the question ended with no usable answer.
     Unavailable {
         reason: &'static str,
         remedy: &'static str,
     },
     /// A flow needs a durable application permission.
-    MissingFlowGrant { detail: Value },
+    MissingFlowGrant {
+        detail: Value,
+    },
     /// The module began draining while the call waited.
     Draining,
     /// The call's route unbound while it waited; nobody is left to answer.
@@ -886,6 +891,10 @@ impl ConsentRefusal {
                 "outcome": "consent_granted_not_executed",
                 "remedy": "The person allowed it while several calls waited and another one \
                            ran. The grant is held: retry this call now.",
+            }),
+            Self::OnceNotExecuted => json!({
+                "outcome": "consent_granted_not_executed",
+                "remedy": "The person allowed one call, but this call did not run and no grant was saved. A new call needs its own approval.",
             }),
             Self::Unavailable { reason, remedy } => json!({
                 "outcome": "consent_unavailable",
@@ -1477,7 +1486,7 @@ impl ComputerGrants {
                     ..GrantAdmission::default()
                 })
             }
-            Ending::Settled(Settlement::Once, _) => Err(ConsentRefusal::GrantedNotExecuted),
+            Ending::Settled(Settlement::Once, _) => Err(ConsentRefusal::OnceNotExecuted),
             Ending::Settled(Settlement::Allowed { persisted }, executor) => {
                 if executor != Some(waiter.id) {
                     return Err(ConsentRefusal::GrantedNotExecuted);
