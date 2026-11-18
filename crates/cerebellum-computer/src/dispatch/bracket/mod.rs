@@ -130,6 +130,10 @@ use crate::platform::{HeldStateDisposition, IdleReading, SequencePostFailure};
 /// itself does not use up the interval.
 pub const FRONTING_POLL_MS: u64 = 2;
 
+/// What [`FrontingBracketHost::cap_target_waits_until`] keeps: the cap lasts
+/// while it is held and is lifted when it is dropped, on the same thread.
+pub type TargetWaitCap = Box<dyn std::any::Any>;
+
 /// What one unit's posting did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UnitPosted {
@@ -296,6 +300,15 @@ pub trait FrontingBracketHost {
     /// The front's bound, shared with its restore cell and the call's
     /// terminal cleanup, when this host keeps one. The default keeps none.
     fn cutoff_gate(&mut self) -> Option<std::sync::Arc<CutoffGate>> {
+        None
+    }
+    /// Cap, until the returned value is dropped, how long anything this
+    /// thread asks of the target can block: every accessibility message (its
+    /// messaging timeout, refreshed before each call) and every wait for a
+    /// system callback ends by `until`, the start of the restore reserve. A
+    /// hung target then costs at most the time left before it. The default
+    /// caps nothing.
+    fn cap_target_waits_until(&mut self, _until: Instant) -> Option<TargetWaitCap> {
         None
     }
     /// Whether [`Self::post_observed_unit`] checks the cutoff before each of

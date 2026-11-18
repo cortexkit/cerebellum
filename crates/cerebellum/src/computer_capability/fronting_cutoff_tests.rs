@@ -213,9 +213,10 @@ fn a_registration_that_outlasts_the_bound_fronts_nothing() {
 #[test]
 fn a_front_write_stalled_past_the_deadline_hands_the_restore_to_the_late_watch() {
     let screen = Screen::new(&mail_desk());
-    // The activation request, a native call this fake does not cap, blocks
-    // well past the bound.
+    // The activation request blocks well past the bound, as a native stall
+    // the cap on the target's messages cannot cut short.
     screen.state().front_blocks_ms = 2 * BOUND_MS;
+    screen.state().front_ignores_cap = true;
     let (hooks, releases) = app_use_hooks();
     let mut boxed = boxed_hooks(&hooks);
     let expired = crate::terminal_arbiter::restore_preparation::expired_writes();
@@ -245,6 +246,45 @@ fn a_front_write_stalled_past_the_deadline_hands_the_restore_to_the_late_watch()
     let cell = hooks.cell().expect("registered");
     assert!(cell.late_watch_pending(), "{log:?}");
     assert_eq!(lock_releases(&releases), 0);
+}
+
+#[test]
+fn a_hung_target_front_write_is_capped_at_the_reserve_start_and_the_restore_is_made_by_the_deadline(
+) {
+    let screen = Screen::new(&mail_desk());
+    // The target does not answer its front write for far longer than the
+    // bound; its messaging timeout is what ends the wait.
+    screen.state().front_blocks_ms = 30 * BOUND_MS;
+    let (hooks, _releases) = app_use_hooks();
+    let mut boxed = boxed_hooks(&hooks);
+    let started = Instant::now();
+    let outcome = cerebellum_computer::platform::run_hooked_fronted(
+        &mut FakeBracket(screen.clone()),
+        &mut UserIdleEstimator::new(),
+        plan(),
+        &|| false,
+        boxed.as_mut(),
+        None,
+    );
+    assert_eq!(
+        screen.log(),
+        [
+            format!("front:{TARGET}"),
+            "front-timed-out".to_owned(),
+            format!("restore:{PREVIOUS}"),
+        ],
+        "the hung write gave up at the cap, then the owner restored"
+    );
+    let restored_after = first_restore_after(&screen, started);
+    assert!(
+        restored_after <= Duration::from_millis(BOUND_MS),
+        "restore requested {restored_after:?} after the bracket began, past the deadline"
+    );
+    assert_eq!(outcome.report.units_posted, 0);
+    assert!(
+        screen.state().target_wait_until.is_none(),
+        "the cap is lifted once the restore begins"
+    );
 }
 
 #[test]

@@ -878,7 +878,9 @@ impl CellHooks {
     }
 
     /// When a picture read's waits for the system must end: the start of the
-    /// restore reserve, when the front has one.
+    /// restore reserve, when the front has one. The bracket's own cap on its
+    /// waits on the target ends them there in production.
+    #[cfg(test)]
     pub(crate) fn picture_wait_until(&self) -> Option<Instant> {
         self.state()
             .cutoff

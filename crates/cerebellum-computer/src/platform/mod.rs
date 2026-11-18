@@ -1934,6 +1934,9 @@ struct HookedHost<'a, H> {
     /// The bracket's bound.
     bound_ms: u64,
     cutoff: std::sync::Arc<crate::dispatch::CutoffGate>,
+    /// The cap on the bracket thread's waits on the target, from the front
+    /// request until the restore begins.
+    target_cap: Option<crate::dispatch::TargetWaitCap>,
     picture: bool,
 }
 
@@ -2017,6 +2020,12 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             }
             self.registration = Registration::Registered { prevented: false };
             self.dispatching = true;
+            // From here a hung target costs at most the time left before the
+            // reserve: its accessibility messages, the front write's among
+            // them, and every callback wait end by then.
+            if let Some(reserve_start) = reserve_start {
+                self.target_cap = self.inner.cap_target_waits_until(reserve_start);
+            }
             let started = std::time::Instant::now();
             let cutoff = std::sync::Arc::clone(&self.cutoff);
             let hooks = &*self.hooks;
@@ -2039,6 +2048,7 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
         // decision does that, or decides not to. Nothing was fronted when
         // registration was refused, so there is nothing to ask for.
         self.returned();
+        self.target_cap = None;
         if matches!(self.registration, Registration::Registered { .. }) && self.decided.is_none() {
             self.decided = Some(self.hooks.decide_restore());
         }
@@ -2053,8 +2063,9 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
         let bounded = self.hooks.restore_reserve_ms().is_some();
         if bounded {
             // Nothing is restored, so the reserve is empty: the read may run
-            // to the deadline itself.
+            // to the deadline itself, and its waits end there.
             self.cutoff.set_bound(deadline, deadline);
+            self.target_cap = self.inner.cap_target_waits_until(deadline);
         }
         if !self
             .hooks
@@ -2100,6 +2111,7 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
         _activation_observed: bool,
     ) -> crate::dispatch::RestoreOutcome {
         self.returned();
+        self.target_cap = None;
         if !matches!(self.registration, Registration::Registered { .. }) {
             return crate::dispatch::RestoreOutcome {
                 restore: crate::dispatch::RestoreStatus::NotNeeded,
@@ -2255,6 +2267,7 @@ pub(crate) fn run_hooked_fronted_with_predictor<
         decided: None,
         bound_ms: plan.maximum_interval_ms,
         cutoff: std::sync::Arc::new(crate::dispatch::CutoffGate::new()),
+        target_cap: None,
         picture: read.is_some(),
     };
     let mut outcome = match read {
@@ -2277,6 +2290,7 @@ pub(crate) fn run_hooked_fronted_with_predictor<
         ),
     };
     hooked.returned();
+    hooked.target_cap = None;
     // Nothing new starts once the bracket returned, whatever it still owes.
     hooked.cutoff.end_front();
     outcome.report.restore_started_by_cutoff =

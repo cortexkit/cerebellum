@@ -626,6 +626,10 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
         ))
     }
 
+    fn cap_target_waits_until(&mut self, until: Instant) -> Option<crate::dispatch::TargetWaitCap> {
+        Some(cap_target_waits_until(until))
+    }
+
     // Keystroke units check the cutoff before each key post and mark the
     // keys they hold. A pointer gesture does not, so the bracket holds the
     // cutoff for the whole gesture: a restore under a held button would
@@ -888,6 +892,17 @@ impl FrontingRestoreHost for MacRestoreHost {
             last_input,
         ))
     }
+}
+
+/// Cap this thread's accessibility messages and system-callback waits at
+/// `until` while the returned value is held: the target's application
+/// element and every element messaged while it is in front get a messaging
+/// timeout no longer than the time left, set again before each call.
+fn cap_target_waits_until(until: Instant) -> crate::dispatch::TargetWaitCap {
+    Box::new((
+        cerebellum_macos::ax_budget::bound_messages_until(until),
+        cerebellum_macos::ax_budget::bound_callback_waits_until(until),
+    ))
 }
 
 fn restore_start_time(pid: u32, check: &mut dyn super::RestoreWriteCheck) -> Option<u64> {
@@ -2514,6 +2529,24 @@ impl PlatformDriver for MacOs26PlatformDriver {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    /// While the target is in front, the bracket thread's accessibility
+    /// messages and callback waits end at the start of the restore reserve,
+    /// and the cap is lifted once the restore begins.
+    #[test]
+    fn the_target_wait_cap_ends_messages_and_callback_waits_at_the_reserve_start() {
+        use cerebellum_macos::ax_budget;
+        let until = Instant::now() + Duration::from_millis(80);
+        let cap = cap_target_waits_until(until);
+        assert!(ax_budget::messaging_timeout(Duration::from_secs(6)) <= Duration::from_millis(80));
+        assert!(ax_budget::callback_wait(Duration::from_secs(5)) <= Duration::from_millis(80));
+        drop(cap);
+        assert_eq!(ax_budget::remaining(), None);
+        assert_eq!(
+            ax_budget::callback_wait(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
 
     /// A picture bracket fronts only the admitted process generation: once
     /// another process holds the pid, no front is requested at all.
