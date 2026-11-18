@@ -108,6 +108,27 @@ fn a_history_measured_in_the_future_or_above_the_ceiling_leaves_the_predictor_co
 }
 
 #[test]
+fn a_sample_measured_one_second_in_the_future_leaves_the_predictor_cold() {
+    let now = now_unix_ms();
+    // Beside a believable sample, one dated a second ahead discredits the
+    // whole file: no clock-step allowance lets a writer post-date a sample.
+    assert_loads_cold(&format!(
+        "{{\"version\":2,\"samples\":[{{\"ms\":120,\"at_unix_ms\":{now}}},{{\"ms\":40,\"at_unix_ms\":{}}}]}}",
+        now + 1_000
+    ));
+}
+
+#[test]
+fn a_sample_measured_now_counts() {
+    let now = now_unix_ms();
+    let home = Home::with_samples(&format!(
+        "{{\"version\":2,\"samples\":[{{\"ms\":120,\"at_unix_ms\":{now}}}]}}"
+    ));
+    let predictor = RestorePredictor::open_at(Some(&home.0), now);
+    assert_eq!(predictor.maximum_at(now), Some(120));
+}
+
+#[test]
 fn only_the_fresh_samples_of_a_partly_stale_history_count() {
     let home = Home::with_samples(&dated(&[(250, 8 * DAY_MS), (120, DAY_MS)]));
     assert_eq!(RestorePredictor::open(Some(&home.0)).maximum(), Some(120));
