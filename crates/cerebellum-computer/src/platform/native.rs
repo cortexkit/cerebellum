@@ -387,6 +387,46 @@ fn capture_ownership_verdict(
     }
 }
 
+/// Capture `window_id` for `target` through `capture`, which must ask the
+/// gate it is handed about the window's owner before requesting any pixels.
+/// An owner that is not the granted process generation is refused there, so
+/// a replacement process's pixels are never acquired, with the same verdict a
+/// check after the capture would give. The owner the capture reports is
+/// checked again afterwards.
+fn capture_granted_window(
+    window_id: u32,
+    target: &ProcessGrant,
+    capture: impl FnOnce(
+        &mut dyn FnMut(u32) -> bool,
+    ) -> Result<cerebellum_macos::RawCapture, cerebellum_macos::CaptureError>,
+) -> Result<cerebellum_macos::RawCapture, BackendError> {
+    let mut refused = None;
+    let captured = capture(&mut |owner| match capture_ownership_verdict(
+        window_id,
+        owner,
+        target,
+        verify_grant(owner, target),
+    ) {
+        Ok(()) => true,
+        Err(refusal) => {
+            refused = Some(refusal);
+            false
+        }
+    });
+    if let Some(refusal) = refused {
+        return Err(refusal);
+    }
+    let capture = captured.map_err(map_macos_capture_error)?;
+    // Read at capture time by the system, not carried from enumeration.
+    capture_ownership_verdict(
+        window_id,
+        capture.owner_pid_at_capture,
+        target,
+        verify_grant(capture.owner_pid_at_capture, target),
+    )?;
+    Ok(capture)
+}
+
 impl CaptureBackend for NativeCaptureBackend {
     fn screen_recording_liveness(&self) -> PermissionLiveness {
         if cerebellum_macos::screen_capture_is_permitted() {
@@ -497,16 +537,14 @@ impl CaptureBackend for NativeCaptureBackend {
                 width: f64::from(region.width_px),
                 height: f64::from(region.height_px),
             });
-        let capture = cerebellum_macos::capture_window(window_id, self.timeout, source_rect)
-            .map_err(map_macos_capture_error)?;
-
-        // Read at capture time by the system, not carried from enumeration.
-        capture_ownership_verdict(
-            window_id,
-            capture.owner_pid_at_capture,
-            &request.target,
-            verify_grant(capture.owner_pid_at_capture, &request.target),
-        )?;
+        let capture = capture_granted_window(window_id, &request.target, |accept_owner| {
+            cerebellum_macos::capture_window_owned_by(
+                window_id,
+                self.timeout,
+                source_rect,
+                accept_owner,
+            )
+        })?;
 
         // Encoded here rather than downstream, because this is the last point
         // that holds raw pixels and everything past it accounts for what it is
@@ -562,14 +600,9 @@ impl CaptureBackend for NativeCaptureBackend {
         let window_id: u32 = request.filter.window_id.parse().map_err(|_| {
             BackendError::Capture(format!("not a window id: {}", request.filter.window_id))
         })?;
-        let capture = cerebellum_macos::capture_window(window_id, self.timeout, None)
-            .map_err(map_macos_capture_error)?;
-        capture_ownership_verdict(
-            window_id,
-            capture.owner_pid_at_capture,
-            &request.target,
-            verify_grant(capture.owner_pid_at_capture, &request.target),
-        )?;
+        let capture = capture_granted_window(window_id, &request.target, |accept_owner| {
+            cerebellum_macos::capture_window_owned_by(window_id, self.timeout, None, accept_owner)
+        })?;
         let captured_width_px = u32::try_from(capture.width)
             .map_err(|_| BackendError::Capture("the capture is too wide".into()))?;
         let captured_height_px = u32::try_from(capture.height)
@@ -682,6 +715,44 @@ mod tests {
                 "{refused:?} did not refuse the capture"
             );
         }
+    }
+
+    /// A window whose owner holds the granted pid under another process
+    /// generation (the pid was reused) is refused before any pixels are
+    /// requested, not discarded after they were acquired.
+    #[test]
+    fn a_reused_pid_is_refused_before_its_pixels_are_acquired() {
+        let our_pid = std::process::id();
+        let target = ProcessGrant {
+            pid: our_pid,
+            bundle_identity: "com.example.target".into(),
+            // Not this process's start time: the grant was made for an
+            // earlier process that held the same pid.
+            process_generation_evidence: "1".into(),
+        };
+        let mut acquired = false;
+        let refused = capture_granted_window(7, &target, |accept_owner| {
+            if !accept_owner(our_pid) {
+                return Err(cerebellum_macos::CaptureError::Capture(
+                    "owner refused".into(),
+                ));
+            }
+            acquired = true;
+            Ok(cerebellum_macos::RawCapture {
+                width: 1,
+                height: 1,
+                bgra: vec![0; 4],
+                owner_pid_at_capture: our_pid,
+            })
+        })
+        .err()
+        .expect("a replaced generation is refused");
+        assert!(!acquired, "pixels were requested for a replaced process");
+        assert_eq!(
+            refused,
+            capture_ownership_verdict(7, our_pid, &target, GrantVerification::TargetReplaced)
+                .unwrap_err()
+        );
     }
 
     /// Preserve screen-locked captures as a distinct backend error so callers can

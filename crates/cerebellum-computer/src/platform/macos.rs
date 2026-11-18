@@ -515,6 +515,20 @@ struct MacPointerUnit {
     observed_abort: Option<crate::dispatch::AbortDecision>,
 }
 
+impl MacBracketHost {
+    /// Request a front of `pid` through `front`, but only while `pid` is
+    /// still held by the admitted process generation.
+    fn request_front_with(&mut self, pid: u32, front: impl FnOnce() -> bool) -> bool {
+        let transport = &mut self.transport;
+        pointer::request_verified_front(
+            Some(self.target),
+            pid,
+            || transport.process_generation(pid),
+            front,
+        )
+    }
+}
+
 impl crate::dispatch::FrontingBracketHost for MacBracketHost {
     type Tap = cerebellum_macos::SessionEventTap;
 
@@ -530,13 +544,11 @@ impl crate::dispatch::FrontingBracketHost for MacBracketHost {
         cerebellum_macos::frontmost_process_id().and_then(|pid| u32::try_from(pid).ok())
     }
 
+    // Every front is bound to the admitted process generation, whatever the
+    // unit: a picture or a keystroke is never fronted for a process that has
+    // since taken over the pid.
     fn request_front(&mut self, pid: u32) -> bool {
-        pointer::request_verified_front(
-            self.pointer.as_ref().map(|_| self.target),
-            pid,
-            || self.transport.process_generation(pid),
-            || cerebellum_macos::request_frontmost(pid).is_ok(),
-        )
+        self.request_front_with(pid, || cerebellum_macos::request_frontmost(pid).is_ok())
     }
 
     fn our_pid(&self) -> i64 {
@@ -2442,6 +2454,40 @@ impl PlatformDriver for MacOs26PlatformDriver {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    /// A picture bracket fronts only the admitted process generation: once
+    /// another process holds the pid, no front is requested at all.
+    #[test]
+    fn a_picture_bracket_never_fronts_a_reused_pid() {
+        let started = Instant::now();
+        let our_pid = std::process::id();
+        let mut host = MacBracketHost {
+            pointer_primitives: None,
+            started,
+            tap: None,
+            heartbeat: HeartbeatPoster {
+                marker: HeartbeatMarker::new(1),
+                event: None,
+                started,
+                our_pid: i64::from(our_pid),
+            },
+            // This pid, but an earlier process's start time.
+            target: ProcessEventTarget {
+                pid: our_pid,
+                start_time_micros: 1,
+            },
+            units: Vec::new(),
+            transport: MacOsPerProcessEventTransport::for_keyboard(WINDOW_LIST_READ_TIMEOUT),
+            visibility: VisibilityMemo::new(VISIBLE_READING_MAX_AGE),
+            pointer: None,
+        };
+        let mut requested = false;
+        assert!(!host.request_front_with(our_pid, || {
+            requested = true;
+            true
+        }));
+        assert!(!requested, "a front was requested for a replaced process");
+    }
 
     #[test]
     fn native_fronted_operations_require_restore_hooks_before_os_calls() {
