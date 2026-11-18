@@ -25,9 +25,9 @@ use std::sync::OnceLock;
 // the format to /v2. A reviewer read the mismatch as a mistake before finding
 // both fields in the artifact, so it is stated here rather than re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v2";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v35";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v36";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v35.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v36.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "53779c253a1ceae727b8a19b1fe3bded97b88523ba33bfdb7630fb778877cfeb";
+    "b8fcf12d5524665f806bbb5e7da2cedd38f3ef2a61afcdf1a35c34c79ffbd1d8";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -1489,6 +1489,7 @@ mod tests {
     fn development_build_refusal_details_are_closed_and_optional_on_action_rows() {
         let checks = [
             serde_json::json!({"condition":"signature_unreadable","error_kind":"Failed","error":"TimedOut"}),
+            serde_json::json!({"condition":"executable_unreadable","path":"/development/alfonso-desktop","error":"permission denied"}),
             serde_json::json!({"condition":"not_a_development_build","classes":{"bundle_identity":"always","executable":"unmatched"}}),
             serde_json::json!({"condition":"title_fallback","bundle_identity_present":true,"executable_present":false}),
             serde_json::json!({"condition":"process_unresolved","processes":[{"pid":30601,"pid_alive":1,"total_windows":3,"on_screen_windows":0,"windows_on_active_display":3,"windows_on_awake_display":0}]}),
