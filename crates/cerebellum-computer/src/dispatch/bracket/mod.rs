@@ -32,6 +32,7 @@ mod latency;
 mod press;
 mod reason;
 mod restore;
+mod restore_predictor;
 
 pub use latency::UNIT_POST_COST_MAX_AGE;
 // Only the macOS keystroke host keeps unit post costs process-wide.
@@ -40,6 +41,9 @@ pub(crate) use latency::{measured_unit_post_cost_ms, record_unit_post_cost_ms};
 pub use press::*;
 pub use reason::*;
 pub use restore::*;
+pub(crate) use restore_predictor::needs_front_restore_predictor;
+use restore_predictor::RestorePredictor;
+pub use restore_predictor::{load_needs_front_restore_predictor, RESTORE_LATENCY_FORMAT};
 
 use std::cell::RefCell;
 use std::time::Instant;
@@ -264,6 +268,8 @@ pub struct BracketReport {
     /// fit. A refusal while no restore has been measured yet (the full restore
     /// allowance stands in) does not count: nothing was seen to be slow.
     pub waiting_out_slow_restore: bool,
+    /// A no-send calibration confirmed a restore within the allowance.
+    pub restore_calibrated: bool,
 }
 
 impl BracketReport {
@@ -388,6 +394,17 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
     admission: FrontingAdmission,
     cancelled: &dyn Fn() -> bool,
 ) -> BracketOutcome {
+    run_fronting_bracket_with_predictor(host, estimator, plan, admission, cancelled, None)
+}
+
+pub(crate) fn run_fronting_bracket_with_predictor<H: FrontingBracketHost>(
+    host: &mut H,
+    estimator: &mut UserIdleEstimator,
+    plan: BracketPlan,
+    admission: FrontingAdmission,
+    cancelled: &dyn Fn() -> bool,
+    predictor: Option<&RestorePredictor>,
+) -> BracketOutcome {
     let unfronted = |report| BracketOutcome {
         report,
         person_input_during_fronting: false,
@@ -406,6 +423,7 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
         stop: None,
         waiting_out_slow_post: false,
         waiting_out_slow_restore: false,
+        restore_calibrated: false,
     };
     let Some(previous) = host.frontmost_pid() else {
         report.stop = Some(BracketStop::PreviousUnknown);
@@ -491,24 +509,34 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
             report.stop = Some(BracketStop::PostFailed(failure));
             break;
         }
-        // A refusal must not briefly cover the person's work just to learn
-        // the restore cost. Unknown cost reserves the full cleanup allowance.
-        let measured_restore = host.borrow_mut().measured_restore_latency_ms();
+        let measured_restore = restore_measurement(&host, predictor);
         let restore_reserve = if previous == plan.target_pid {
             0
         } else {
             measured_restore.unwrap_or(RESTORE_WAIT_MS)
         };
         let unit_reserve = host.borrow_mut().measured_unit_post_cost_ms().unwrap_or(0);
-        if restore_reserve.saturating_add(unit_reserve) > bound {
-            report.stop = Some(BracketStop::BoundExceeded);
-            report.waiting_out_slow_post = restore_reserve <= bound;
-            report.waiting_out_slow_restore = previous != plan.target_pid
-                && measured_restore.is_some()
-                && !report.waiting_out_slow_post
-                && unit_reserve <= bound;
-            break;
+        let mut calibration = None;
+        let cold = predictor.is_some() && previous != plan.target_pid && measured_restore.is_none();
+        if cold || restore_reserve.saturating_add(unit_reserve) > bound {
+            let restore_blocks =
+                previous != plan.target_pid && restore_reserve > bound && unit_reserve <= bound;
+            // Only app-use needs-front may measure without posting. A cold
+            // predictor, or one whose slow restore prevents any newer sample,
+            // can otherwise keep every later call from even requesting a front.
+            if (cold || restore_blocks) && next_unit == 0 {
+                calibration = predictor.and_then(|predictor| {
+                    predictor.try_calibrate(measured_restore, Instant::now())
+                });
+            }
+            if calibration.is_none() {
+                report.stop = Some(BracketStop::BoundExceeded);
+                report.waiting_out_slow_post = restore_reserve <= bound;
+                report.waiting_out_slow_restore = restore_blocks && measured_restore.is_some();
+                break;
+            }
         }
+        let calibrating = calibration.is_some();
         let fronted_at = host.borrow_mut().now_ms();
         report.chunks += 1;
         let requested =
@@ -549,9 +577,11 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
                     fronted_at,
                     bound,
                     activation_observed: false,
+                    calibrating,
                 },
                 admitted,
                 &mut person_input,
+                predictor,
             );
             break;
         }
@@ -559,7 +589,7 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
         let front_latency = host.borrow_mut().now_ms().saturating_sub(fronted_at);
         let mut chunk_units = 0;
         let mut stop = None;
-        while next_unit < plan.units {
+        while !calibrating && next_unit < plan.units {
             let now = host.borrow_mut().now_ms();
             let elapsed = now.saturating_sub(fronted_at);
             // Without a restore measurement, reserve the full restore allowance.
@@ -569,7 +599,7 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
             let measured_restore = if previous == plan.target_pid {
                 None
             } else {
-                host.borrow_mut().measured_restore_latency_ms()
+                restore_measurement(&host, predictor)
             };
             let restore_latency = if previous == plan.target_pid {
                 0
@@ -701,9 +731,11 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
                 fronted_at,
                 bound,
                 activation_observed: true,
+                calibrating,
             },
             admitted,
             &mut person_input,
+            predictor,
         );
         if stop.is_some() {
             report.stop = stop;
@@ -744,6 +776,10 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
             }
             break;
         }
+        if calibrating {
+            report.stop = Some(BracketStop::BoundExceeded);
+            break;
+        }
     }
 
     match &report.stop {
@@ -760,6 +796,16 @@ pub fn run_fronting_bracket_with<H: FrontingBracketHost>(
         report,
         person_input_during_fronting: person_input,
         deferred_restore,
+    }
+}
+
+fn restore_measurement<H: FrontingBracketHost>(
+    host: &RefCell<&mut H>,
+    predictor: Option<&RestorePredictor>,
+) -> Option<u64> {
+    match predictor {
+        Some(predictor) => predictor.maximum(),
+        None => host.borrow_mut().measured_restore_latency_ms(),
     }
 }
 
@@ -831,10 +877,22 @@ pub fn run_fronting_read<H: FrontingBracketHost>(
 pub fn run_fronting_read_with<H: FrontingBracketHost>(
     host: &mut H,
     estimator: &mut UserIdleEstimator,
+    plan: BracketPlan,
+    admission: FrontingAdmission,
+    cancelled: &dyn Fn() -> bool,
+    read: &mut dyn FnMut(),
+) -> BracketOutcome {
+    run_fronting_read_with_predictor(host, estimator, plan, admission, cancelled, read, None)
+}
+
+pub(crate) fn run_fronting_read_with_predictor<H: FrontingBracketHost>(
+    host: &mut H,
+    estimator: &mut UserIdleEstimator,
     mut plan: BracketPlan,
     admission: FrontingAdmission,
     cancelled: &dyn Fn() -> bool,
     read: &mut dyn FnMut(),
+    predictor: Option<&RestorePredictor>,
 ) -> BracketOutcome {
     struct ReadingHost<'a, H> {
         host: &'a mut H,
@@ -911,12 +969,13 @@ pub fn run_fronting_read_with<H: FrontingBracketHost>(
         }
     }
     plan.units = 1;
-    run_fronting_bracket_with(
+    run_fronting_bracket_with_predictor(
         &mut ReadingHost { host, read },
         estimator,
         plan,
         admission,
         cancelled,
+        predictor,
     )
 }
 
@@ -927,6 +986,7 @@ struct Chunk {
     fronted_at: u64,
     bound: u64,
     activation_observed: bool,
+    calibrating: bool,
 }
 
 /// Put the previous application back and record how long the target was in
@@ -941,6 +1001,7 @@ fn restore<H: FrontingBracketHost>(
     chunk: Chunk,
     admitted: bool,
     person_input: &mut bool,
+    predictor: Option<&RestorePredictor>,
 ) -> u64 {
     let Chunk {
         previous,
@@ -948,6 +1009,7 @@ fn restore<H: FrontingBracketHost>(
         fronted_at,
         bound,
         activation_observed,
+        calibrating,
     } = chunk;
     if previous == target {
         report.restore = RestoreStatus::NotNeeded;
@@ -971,12 +1033,21 @@ fn restore<H: FrontingBracketHost>(
                 .slowest_restore_ms
                 .max(outcome.finished_at_ms.saturating_sub(restore_at));
         }
-        remember_restore(
-            *host.borrow_mut(),
-            outcome.restore,
-            outcome.finished_at_ms.saturating_sub(restore_at),
-        );
         let interval = outcome.finished_at_ms.saturating_sub(fronted_at);
+        let elapsed = outcome.finished_at_ms.saturating_sub(restore_at);
+        if let Some(predictor) = predictor {
+            if outcome.restore == RestoreStatus::Restored {
+                report.restore_calibrated =
+                    calibrating && activation_observed && interval <= bound && !*person_input;
+                predictor.record(
+                    elapsed,
+                    report.restore_calibrated.then_some(bound),
+                    Instant::now(),
+                );
+            }
+        } else {
+            remember_restore(*host.borrow_mut(), outcome.restore, elapsed);
+        }
         report.longest_fronted_interval_ms = report.longest_fronted_interval_ms.max(interval);
         report.restore = outcome.restore;
         return interval;

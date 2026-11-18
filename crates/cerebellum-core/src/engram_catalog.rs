@@ -270,7 +270,8 @@ mod tests {
                 ("browser", Class::Excluded),
                 ("journal", Class::Portable),
                 ("private-content", Class::Portable),
-                ("agent-data", Class::Portable)
+                ("agent-data", Class::Portable),
+                ("restore-latency", Class::DeviceLocal)
             ]
         );
         // Every tree that keeps a format floor holds durable data the module

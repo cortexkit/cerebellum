@@ -355,6 +355,15 @@ pub(crate) fn dispatch_refusal_reply(
     let mut reply = super::synthetic_dispatch_refusal(refusal);
     let remedy = match refusal {
         DispatchError::FrontingBoundExceeded
+            if bracket.is_some_and(|bracket| bracket.restore_calibrated) =>
+        {
+            Some(
+                "the application was brought forward only to measure restoring the person's app, \
+                 which is back in front. Nothing was sent; retry the shortcut now that the \
+                 restore time is known",
+            )
+        }
+        DispatchError::FrontingBoundExceeded
             if bracket.is_some_and(|bracket| bracket.chunks == 0) =>
         {
             Some(
@@ -610,6 +619,7 @@ mod tests {
             stop: None,
             waiting_out_slow_post: false,
             waiting_out_slow_restore: false,
+            restore_calibrated: false,
         };
         assert_eq!(
             bracket_fronting(&report(104), 100),
@@ -636,6 +646,7 @@ mod tests {
             stop: Some(BracketStop::BoundExceeded),
             waiting_out_slow_post,
             waiting_out_slow_restore: false,
+            restore_calibrated: false,
         };
         let remedy = |bracket: Option<&BracketReport>| {
             dispatch_refusal_reply(&DispatchError::FrontingBoundExceeded, bracket)["remedy"]
@@ -669,6 +680,7 @@ mod tests {
             stop: Some(BracketStop::BoundExceeded),
             waiting_out_slow_post: false,
             waiting_out_slow_restore,
+            restore_calibrated: false,
         };
         let remedy = |bracket: &BracketReport| {
             dispatch_refusal_reply(&DispatchError::FrontingBoundExceeded, Some(bracket))["remedy"]
@@ -698,7 +710,28 @@ mod tests {
             stop: None,
             waiting_out_slow_post: false,
             waiting_out_slow_restore: false,
+            restore_calibrated: false,
         }
+    }
+
+    #[test]
+    fn a_calibrated_shortcut_refusal_says_nothing_was_sent_and_to_retry() {
+        let mut bracket = bracket_stopped_before_front(1, 0);
+        bracket.stop = Some(BracketStop::BoundExceeded);
+        bracket.restore = RestoreStatus::Restored;
+        bracket.restore_calibrated = true;
+        let refusal = DispatchError::FrontingBoundExceeded;
+        assert_eq!(post_call_made(&refusal, Some(&bracket)), Some(false));
+        let reply = refused_before_posting(dispatch_refusal_reply(&refusal, Some(&bracket)));
+        assert_eq!(reply["outcome"], "fronting_bound_exceeded");
+        assert_eq!(reply["effect_status"], "not_dispatched");
+        assert_eq!(reply["posts_returned"], 0);
+        let remedy = reply["remedy"].as_str().unwrap();
+        assert!(remedy.contains("back in front"), "{reply}");
+        assert!(
+            remedy.contains("Nothing was sent; retry the shortcut"),
+            "{reply}"
+        );
     }
 
     /// A window list that could not be read before the first front answers

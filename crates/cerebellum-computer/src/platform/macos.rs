@@ -802,6 +802,10 @@ impl RestoreHostSource for MacBracketHost {
     fn restore_host(&self) -> Box<dyn FrontingRestoreHost> {
         Box::new(MacRestoreHost::new(self.started))
     }
+
+    fn supports_needs_front_restore_predictor(&self) -> bool {
+        true
+    }
 }
 
 /// A front outside the keystroke bracket on this Mac. Its reads, requests,

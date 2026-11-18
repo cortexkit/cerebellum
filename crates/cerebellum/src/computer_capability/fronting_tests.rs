@@ -1932,6 +1932,26 @@ impl Drop for CountedLock {
     }
 }
 
+#[test]
+fn only_app_use_needs_front_hooks_opt_into_restore_calibration() {
+    use crate::terminal_arbiter::{FrontingMode, FrontingPurpose};
+    for (purpose, restore_fallback, expected) in [
+        (FrontingPurpose::NeedsFront, true, true),
+        (FrontingPurpose::NeedsFront, false, false),
+        (FrontingPurpose::BringToFront, true, false),
+    ] {
+        let hooks = CellHooks::new(ObligationParts {
+            terminal: under_terminal(),
+            lock: None,
+            target_name: "Mail".into(),
+            mode: FrontingMode::Background,
+            purpose,
+            restore_fallback,
+        });
+        assert_eq!(hooks.uses_needs_front_restore_predictor(), expected);
+    }
+}
+
 /// Cleanup that takes the obligation after it is registered and before the
 /// front leaves the worker unfronted: no front request ever follows, the
 /// restore is `not_needed`, and the lock is released once.

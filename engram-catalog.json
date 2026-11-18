@@ -29,6 +29,13 @@
       "reason": "Move participant checkpoints retain cut steps, replay replies and compact agent source sets, never page or app content, so a restored participant can safely resume an interrupted move.",
       "mechanism": "filetree",
       "path": "agent-data"
+    },
+    {
+      "entry_id": "cerebellum/restore-latency",
+      "class": "device-local",
+      "reason": "Restore timings contain only millisecond samples and are specific to this desktop. The module measures them again if the file is missing.",
+      "mechanism": "filetree",
+      "path": "restore-latency"
     }
   ]
 }

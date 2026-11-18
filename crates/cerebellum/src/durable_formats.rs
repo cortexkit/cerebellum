@@ -44,6 +44,7 @@ pub fn readable_formats() -> Vec<DurableFormat> {
         // store a plain swap: their staging gate ignores this tree's floor.
         crate::private_content::PRIVATE_CONTENT_FORMAT,
         crate::agent_data::CHECKPOINT_FORMAT,
+        cerebellum_computer::dispatch::RESTORE_LATENCY_FORMAT,
     ]
 }
 
@@ -85,5 +86,10 @@ mod tests {
         assert!(
             readable_formats().contains(&crate::cingulate_client::desk::CINGULATE_RAISED_FORMAT)
         );
+    }
+
+    #[test]
+    fn restore_latency_is_listed_for_the_staging_floor_gate() {
+        assert!(readable_formats().contains(&cerebellum_computer::dispatch::RESTORE_LATENCY_FORMAT));
     }
 }

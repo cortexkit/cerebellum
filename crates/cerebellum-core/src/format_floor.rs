@@ -44,7 +44,13 @@ pub const FORMAT_FLOOR_FILE: &str = "format-floor.json";
 
 /// The data trees under the module's directory that each keep a floor: every
 /// durable store this module writes to the operator's disk lives in one.
-pub const FLOOR_TREES: [&str; 4] = ["journal", "browser", "private-content", "agent-data"];
+pub const FLOOR_TREES: [&str; 5] = [
+    "journal",
+    "browser",
+    "private-content",
+    "agent-data",
+    "restore-latency",
+];
 
 /// The floor file's own format. It is read by staging as well as by the
 /// module, so it is versioned and refused by name like every other record.
