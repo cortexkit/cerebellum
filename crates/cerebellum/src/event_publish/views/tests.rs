@@ -441,18 +441,12 @@ async fn bus_refusal_does_not_change_tool_views_or_display_records() {
     );
     planes.calls.events.tool_display(&write);
     assert_eq!(
-        planes.calls.events.records.lock().unwrap().read(
-            &identity(
-                &cortexkit_role_tool_display::idempotency_key(
-                    &subc_protocol::Principal::Reserved {
-                        module_id: "cerebellum".into()
-                    },
-                    &write
-                )
-                .unwrap()
-            ),
-            Instant::now()
-        ),
+        planes
+            .calls
+            .events
+            .display_read(&display_identity(&write).unwrap())
+            .await
+            .unwrap(),
         Some(serde_json::to_vec(&write).unwrap())
     );
     super::super::tests::settle().await;

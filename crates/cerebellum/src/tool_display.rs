@@ -31,6 +31,21 @@ pub(crate) fn schema() -> RecordSchema {
     )
 }
 
+pub(crate) fn valid_for_delivery(write: &DisplayWrite) -> bool {
+    // The published validators reject an entire record containing an empty
+    // array, even though the fields we produce are scalars.
+    match write.kind {
+        DisplayKind::Record => {
+            cortexkit_role_tool_display::schema::validate_record(&write.body, &schema())
+        }
+        DisplayKind::Completion => {
+            cortexkit_role_tool_display::schema::validate_completion(&write.body, &schema())
+        }
+        _ => return false,
+    }
+    .is_ok()
+}
+
 type Future<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 pub(crate) trait Backend: Send + Sync {
     fn declarers(&self) -> Future<'_, Option<Vec<String>>>;
@@ -395,6 +410,7 @@ impl Records {
         read.validate().map_err(|error| error.refusal())?;
         self.events
             .display_read(&read.record_id)
+            .await
             .map_err(|_| subc_protocol::ErrorBody::new(NOT_READY, "provider is not ready"))?
             .ok_or_else(|| {
                 subc_protocol::ErrorBody::new(DISPLAY_RECORD_UNKNOWN, "display record is unknown")
@@ -673,18 +689,7 @@ impl Records {
     }
 
     fn spawn(self: &Arc<Self>, write: DisplayWrite) {
-        // The published validators reject an entire record containing an empty
-        // array. Validate before scheduling, even though our fields are scalars.
-        let valid = match write.kind {
-            DisplayKind::Record => {
-                cortexkit_role_tool_display::schema::validate_record(&write.body, &schema())
-            }
-            DisplayKind::Completion => {
-                cortexkit_role_tool_display::schema::validate_completion(&write.body, &schema())
-            }
-            _ => return,
-        };
-        if valid.is_err() {
+        if !valid_for_delivery(&write) {
             return;
         }
         self.events.tool_display(&write);

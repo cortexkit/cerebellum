@@ -913,9 +913,14 @@ impl CallRecords {
     /// The operator's records under the cerebellum data home, beside the audit
     /// journal so they share its backup enrolment.
     pub fn open_durable(now_ms: u64) -> Self {
+        let events = Arc::new(crate::event_publish::Publisher::production());
         match cerebellum_core::journal::journal_data_path(CALL_RECORD_FILE) {
-            Ok(path) => Self::open(Box::new(FilesystemCallRecordStorage::new(path)), now_ms),
-            Err(error) => Self::broken(CallRecordError::Unreadable(format!("{error:?}"))),
+            Ok(path) => Self::open_with_events(
+                Box::new(FilesystemCallRecordStorage::new(path)),
+                now_ms,
+                events,
+            ),
+            Err(error) => Self::broken(CallRecordError::Unreadable(format!("{error:?}")), events),
         }
     }
 
@@ -924,10 +929,10 @@ impl CallRecords {
         Self::open(Box::new(InMemoryCallRecordStorage::new()), 0)
     }
 
-    fn broken(error: CallRecordError) -> Self {
+    fn broken(error: CallRecordError, events: Arc<crate::event_publish::Publisher>) -> Self {
         Self {
             display: std::sync::OnceLock::new(),
-            events: Arc::default(),
+            events,
             storage: Box::new(InMemoryCallRecordStorage::new()),
             inner: Mutex::new(Inner {
                 broken: Some(error),
@@ -962,6 +967,14 @@ impl CallRecords {
     /// A crashed record can be reconciled in memory again on the next start
     /// without rewriting the file.
     pub fn open(storage: Box<dyn CallRecordStorage>, now_ms: u64) -> Self {
+        Self::open_with_events(storage, now_ms, Arc::default())
+    }
+
+    fn open_with_events(
+        storage: Box<dyn CallRecordStorage>,
+        now_ms: u64,
+        events: Arc<crate::event_publish::Publisher>,
+    ) -> Self {
         let loaded = storage.load().and_then(|bytes| match bytes {
             None => Ok(None),
             Some(bytes) if bytes.is_empty() => Ok(None),
@@ -971,7 +984,7 @@ impl CallRecords {
             Ok(Some((version, records))) => (records, true, version),
             Ok(None) => (Vec::new(), false, ORDINARY_CALL_RECORD_VERSION),
             Err(error) => {
-                let mut broken = Self::broken(error);
+                let mut broken = Self::broken(error, events);
                 broken.storage = storage;
                 return broken;
             }
@@ -1016,7 +1029,7 @@ impl CallRecords {
         }
         let records = Self {
             display: std::sync::OnceLock::new(),
-            events: Arc::default(),
+            events,
             storage,
             inner: Mutex::new(inner),
         };
