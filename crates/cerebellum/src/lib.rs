@@ -3639,10 +3639,10 @@ async fn handle_frame(
                 return Ok(true);
             }
             let arrived = tokio::time::Instant::now();
-            let display = planes
-                .routes
-                .get(frame.header.channel, frame.header.epoch)
-                .and_then(|facts| planes.routes.display.arm(&frame, &facts));
+            let display = match wire::preflight_request(&frame, writer, planes).await? {
+                std::ops::ControlFlow::Continue(display) => display,
+                std::ops::ControlFlow::Break(()) => return Ok(true),
+            };
             let (envelope_ms, reply_ms) = route_limits(&frame, planes);
             let connection_end = arrived + Duration::from_millis(reply_ms);
             planes
