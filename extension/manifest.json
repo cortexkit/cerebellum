@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CortexKit Agent Tabs",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Hand tabs in your signed-in Chrome to CortexKit, and take them back at any time.",
   "minimum_chrome_version": "137",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyHcwdQ6UQq9vCfCvfUtsoBzv2Nc6Tc0KX7tLbunrVjVO14a70w3gn2gn4ovsxPCO2QijT+7zRr+M/2EAPytHJOZPrqYlRsLJjKP4LqE9NXRI/nVnrZaDmDnqn29JBjnXRGNQ8fl0IXb3QKqOwrUh92w0TK8ZCMaOOHNv6o7ctl3HNor8iKnFR/v+YRTsaCXwzeYkcSN/LL4o4LJVFwAdM5iv2tfJDq3n1DAlHDNZVzsFDPFmLpiOfMphNIQpBopX8ZEH6RjQ4llYakTiYX/UlGX2eZe20e6lCbCt12s7arMA22OMYViKnrVTkMG27vAJRuRydze5SAUydLg3ngycqwIDAQAB",

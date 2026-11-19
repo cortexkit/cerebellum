@@ -5012,6 +5012,9 @@ async fn status_reports_an_outdated_or_newer_extension_before_any_action() {
     let (reply, _) = fixture.call(1, status, "allow_30m").await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
     assert_eq!(reply["connected"], true);
+    // Status names the revision of the extension copy Chrome is running.
+    assert_eq!(reply["extension_revision"], EXTENSION_REVISION, "{reply}");
+    assert!(crate::browser::validate_user_browser_result("status", &reply).is_ok());
 }
 
 #[tokio::test]

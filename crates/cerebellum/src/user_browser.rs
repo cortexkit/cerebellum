@@ -815,43 +815,6 @@ fn classification_changed(
     reply
 }
 
-/// The revision of the cerebellum-to-extension contract this build speaks.
-/// The extension stamps its own revision (`EXTENSION_REVISION` in
-/// `extension/revision.mjs`) on every completed reply and every refusal, and
-/// both numbers must change together whenever a plan, reply or refusal shape
-/// changes. The manifest `version` is not used for this: the person's Chrome
-/// can keep running an old unpacked copy that reports the same `version`, and
-/// replies from such a copy must refuse with a reload remedy instead of
-/// failing to decode.
-pub(crate) const EXTENSION_REVISION: u64 = 5;
-
-const MINIMUM_EXTENSION_REVISION: u64 = 4;
-
-const EXTENSION_OUTDATED_REMEDY: &str = "The CortexKit Chrome extension is out of date. Ask the person to reload it in chrome://extensions, then retry.";
-const EXTENSION_NEWER_REMEDY: &str = "The CortexKit Chrome extension is newer than this cerebellum. Ask the person to load the extension copy installed with this cerebellum and reload it in chrome://extensions, or update cerebellum, then retry.";
-
-/// The refusal for a reply whose extension revision cannot serve the operation.
-/// A missing revision means an extension older than
-/// the handshake itself, so it counts as outdated. Every reply from such an
-/// extension is untrusted for decoding, so nothing of it is relayed except
-/// whether input was dispatched.
-fn extension_revision_mismatch(found: Option<u64>, input_dispatched: Option<bool>) -> Value {
-    let newer = found.is_some_and(|revision| revision > EXTENSION_REVISION);
-    let mut reply = refusal(if newer {
-        "extension_newer"
-    } else {
-        "extension_outdated"
-    });
-    reply["remedy"] = json!(if newer {
-        EXTENSION_NEWER_REMEDY
-    } else {
-        EXTENSION_OUTDATED_REMEDY
-    });
-    reply["detail"] = json!({"extension_revision":found, "required_revision":EXTENSION_REVISION});
-    reply["input_dispatched"] = json!(input_dispatched);
-    reply
-}
-
 /// A reply from a current extension that still could not be decoded. It stays
 /// fail-closed, but names the decoding `step` and, when serde reports one, the
 /// field, so the next contract drift is diagnosable from the refusal alone.
@@ -1259,15 +1222,17 @@ async fn invoke(
 ) -> Result<Value, Value> {
     command["version"] = json!(2);
     command["action"] = json!(action);
-    let minimum_revision = if command["commands"].as_array().is_some_and(|commands| {
-        commands
-            .iter()
-            .any(|command| command["params"]["functionDeclaration"] == functions::CHOOSE_OPTION)
-    }) {
-        EXTENSION_REVISION
-    } else {
-        MINIMUM_EXTENSION_REVISION
-    };
+    // An outdated refusal names the revision this operation needs.
+    let (minimum_revision, required_revision) =
+        if command["commands"].as_array().is_some_and(|commands| {
+            commands
+                .iter()
+                .any(|command| command["params"]["functionDeclaration"] == functions::CHOOSE_OPTION)
+        }) {
+            (NATIVE_SELECT_MIN_REVISION, NATIVE_SELECT_MIN_REVISION)
+        } else {
+            (MINIMUM_EXTENSION_REVISION, EXTENSION_REVISION)
+        };
     let compatible = |revision: Option<u64>| {
         revision.is_some_and(|revision| (minimum_revision..=EXTENSION_REVISION).contains(&revision))
     };
@@ -1288,7 +1253,12 @@ async fn invoke(
             return Err(extension_revision_mismatch(
                 revision,
                 outcome.input_dispatched,
+                required_revision,
             ));
+        }
+        // Status reports the revision of the extension copy Chrome is running.
+        if action == "status" {
+            result["extension_revision"] = json!(revision);
         }
         return Ok(result);
     }
@@ -1300,7 +1270,8 @@ async fn invoke(
             .ok()
             .and_then(|detail| detail.get("extension_revision").and_then(Value::as_u64));
         if !compatible(revision) {
-            let mut reply = extension_revision_mismatch(revision, outcome.input_dispatched);
+            let mut reply =
+                extension_revision_mismatch(revision, outcome.input_dispatched, required_revision);
             reply["outcome"] = serde_json::to_value(outcome.terminal).expect("terminal serializes");
             return Err(reply);
         }
@@ -2467,7 +2438,10 @@ async fn serve_inner(
         action,
     };
     if action == "status" {
-        let raw = invoke(bridge, route, &context.cancel, "status", json!({})).await?;
+        let mut raw = invoke(bridge, route, &context.cancel, "status", json!({})).await?;
+        let running = raw
+            .as_object_mut()
+            .and_then(|raw| raw.remove("extension_revision"));
         let inventory: Inventory = decode("status_reply", raw)?;
         if inventory.connection_epoch != connection {
             return Err(read_again(false));
@@ -2496,7 +2470,7 @@ async fn serve_inner(
             }
         }
         return Ok(
-            json!({"browser":"user","outcome":"ok","connected":true,"connection_epoch":connection,"tabs":visible}),
+            json!({"browser":"user","outcome":"ok","connected":true,"connection_epoch":connection,"extension_revision":running,"tabs":visible}),
         );
     }
     if action == "close" {
@@ -4912,6 +4886,11 @@ fn declared_severity(args: &Value) -> Result<Severity, Value> {
 
 mod agent_enforcement;
 pub(crate) mod functions;
+pub(crate) use revision::EXTENSION_REVISION;
+use revision::{
+    extension_revision_mismatch, MINIMUM_EXTENSION_REVISION, NATIVE_SELECT_MIN_REVISION,
+};
+mod revision;
 mod session_claims;
 use session_claims::SessionClaims;
 mod typing;
