@@ -2203,7 +2203,6 @@ fn prepare_module(
         .display
         .connect(Arc::new(tool_display::DaemonDisplay::new(
             config.connection_file_path.clone(),
-            config.module_id.clone(),
         )));
     planes
         .agent_data

@@ -47,12 +47,15 @@ pub(crate) fn valid_for_delivery(write: &DisplayWrite) -> bool {
 }
 
 type Future<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+/// The daemon catalog, read to recognise the display module that may call
+/// `display.read`. Cerebellum never sends display records to that module: it
+/// keeps each one in the display store and announces it on the bus.
 pub(crate) trait Backend: Send + Sync {
     fn declarers(&self) -> Future<'_, Option<Vec<String>>>;
-    fn write<'a>(&'a self, module: &'a str, write: DisplayWrite) -> Future<'a, bool>;
 }
 
-const WRITE_WINDOW: Duration = Duration::from_secs(3);
+/// How long one catalog read may take, connection and authentication included.
+const CATALOG_WINDOW: Duration = Duration::from_secs(3);
 const DECLARER_TTL: Duration = Duration::from_secs(30);
 /// How often one module left out of the cached catalog answer may make
 /// cerebellum read the catalog again. A display module that restarts binds
@@ -73,6 +76,10 @@ pub(crate) struct Records {
     declarers: Mutex<DeclarerCache>,
     metrics: ArmMetrics,
     state: Mutex<State>,
+    /// Every write handed to the display store, in order, so tests can check
+    /// record contents without reaching into the store.
+    #[cfg(test)]
+    recorded: Mutex<Vec<DisplayWrite>>,
 }
 
 #[derive(Default)]
@@ -307,7 +314,7 @@ impl Records {
                 }
             };
             if let Some(sender) = sender {
-                let answer = tokio::time::timeout(WRITE_WINDOW, backend.declarers())
+                let answer = tokio::time::timeout(CATALOG_WINDOW, backend.declarers())
                     .await
                     .ok()
                     .flatten();
@@ -486,8 +493,9 @@ impl Records {
             return None;
         }
         // Bound ID-only duplicate suppression with a recent FIFO window. For a
-        // replay older than this window, display.write idempotency is the backstop:
-        // the same canonical bytes answer already_stored; different bytes are refused.
+        // replay older than this window, the display store is the backstop: a
+        // record's id is derived from its runner, call key and kind, so the
+        // replay lands on the same id instead of announcing a second record.
         if state.recent_calls.len() >= MAX_RECENT_CALLS {
             if let Some((identity, local)) = state.recent_calls.pop_front() {
                 state.identities.remove(&identity);
@@ -632,7 +640,7 @@ impl Records {
             writes
         };
         for write in writes {
-            self.spawn(write);
+            self.record(write);
         }
     }
 
@@ -660,7 +668,7 @@ impl Records {
             }
         };
         if let Some(write) = write {
-            self.spawn(write);
+            self.record(write);
         }
     }
 
@@ -688,27 +696,22 @@ impl Records {
         }
     }
 
-    fn spawn(self: &Arc<Self>, write: DisplayWrite) {
+    /// Hands a finished record to the display store, which announces it on the
+    /// bus for the display module to fetch with `display.read`. Storing never
+    /// waits: a record the store cannot take is dropped and counted there, so
+    /// no display failure can delay or fail the tool call.
+    fn record(&self, write: DisplayWrite) {
         if !valid_for_delivery(&write) {
             return;
         }
+        #[cfg(test)]
+        self.recorded.lock().unwrap().push(write.clone());
         self.events.tool_display(&write);
-        let Some(backend) = self.backend.get().cloned() else {
-            return;
-        };
-        // Bounded exception to live-call-only outbound routes: after reply flush,
-        // open a fresh display route for this one write, then close it. No standing
-        // connection, retry, or display failure can delay or fail the tool call.
-        tokio::spawn(async move {
-            let _ = tokio::time::timeout(WRITE_WINDOW, async {
-                let modules = backend.declarers().await?;
-                if let [module] = modules.as_slice() {
-                    let _ = backend.write(module, write).await;
-                }
-                Some(())
-            })
-            .await;
-        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorded(&self) -> std::sync::MutexGuard<'_, Vec<DisplayWrite>> {
+        self.recorded.lock().unwrap()
     }
 }
 
