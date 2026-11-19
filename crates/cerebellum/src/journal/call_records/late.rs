@@ -441,14 +441,26 @@ impl CallRecords {
             consent: Some(ask_id.into()),
         });
         self.write(&mut inner, &record, now_ms)?;
-        inner.entries.get_mut(&key).unwrap().record = record;
-        if inner.ended_scopes.contains(&scope) {
+        let scope_ended = inner.ended_scopes.contains(&scope);
+        let head_ended = inner.entries[&key]
+            .browser_hold
+            .as_ref()
+            .and_then(|hold| hold.head_scope.as_ref())
+            .is_some_and(|scope| inner.ended_scopes.contains(scope));
+        let entry = inner.entries.get_mut(&key).unwrap();
+        entry.record = record;
+        if head_ended {
+            entry.clear_browser_request();
+        }
+        if scope_ended {
             self.finish_held_locked(
                 &mut inner,
                 &key,
                 LateOutcome::Scope(ScopeEnding::ScopeEnded),
                 now_ms,
             )?;
+        } else if let Some(hold) = entry.browser_hold.as_mut() {
+            hold.idle.start(CACHE_MAX_AGE);
         }
         Ok(())
     }
@@ -462,6 +474,15 @@ impl CallRecords {
     ) -> Result<(), CallRecordError> {
         let mut inner = self.lock();
         inner.ended_scopes.insert(scope.clone());
+        for entry in inner.entries.values_mut().filter(|entry| {
+            entry
+                .browser_hold
+                .as_ref()
+                .and_then(|hold| hold.head_scope.as_ref())
+                == Some(scope)
+        }) {
+            entry.clear_browser_request();
+        }
         let keys: Vec<_> = inner
             .entries
             .iter()
@@ -756,10 +777,13 @@ impl CallRecords {
             CallState::Replied
         };
         record.settled_at_ms = Some(now_ms);
+        // An observed terminal event releases the browser even if persisting
+        // that event must be retried later.
+        inner.entries.get_mut(key).unwrap().browser_hold = None;
         self.write(inner, &record, now_ms)?;
         let result = settled_result(&record).expect("settled handoff has a result");
         let entry = inner.entries.get_mut(key).expect("settled record exists");
-        entry.browser_resume = None;
+        entry.clear_browser_request();
         entry.record = record;
         // A resend must not receive login_pending after its entry was acked:
         // that would create another hold with no remaining settlement to pull.

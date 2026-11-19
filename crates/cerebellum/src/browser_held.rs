@@ -70,7 +70,6 @@ pub(crate) fn retain(planes: &Planes, facts: &AcceptedBindFacts, call_key: &str,
         return;
     };
     if body["name"] != flat_tools::BROWSER_USE
-        || !can_resume(&body["arguments"])
         || facts.codemode_head.is_none()
         || !cortexkit_role_tool_provider::consumer_reads_held_reply_v1(
             facts.consumer_capabilities(),
@@ -91,18 +90,42 @@ pub(crate) fn retain(planes: &Planes, facts: &AcceptedBindFacts, call_key: &str,
     let Some(head_sequence) = planes.routes.bind_sequence(head.channel, head.epoch) else {
         return;
     };
+    let hold = (body["arguments"]["browser"] != "user")
+        .then(|| {
+            planes.sessions.idle_hold(
+                &facts.identity.conversation_key,
+                Arc::clone(&planes.lease_clock),
+            )
+        })
+        .flatten()
+        .map(|idle| journal::call_records::BrowserHold {
+            idle,
+            request: (frame.header.channel, frame.header.epoch, frame.header.corr),
+            head_route: (head.channel, head.epoch),
+            head_scope: facts
+                .codemode_head
+                .as_ref()
+                .and_then(|head| head.scope.as_ref())
+                .map(journal::call_records::ScopeIdentity::from_stamp),
+        });
+    let resume = can_resume(&body["arguments"]).then(|| journal::call_records::BrowserResume {
+        frame: frame.clone(),
+        facts: facts.clone(),
+        bind_sequence,
+        head: Some(((head.channel, head.epoch), head_sequence)),
+        approved: false,
+        ask_id: String::new(),
+        created: std::time::Instant::now(),
+        idle_hold: None,
+    });
+    if hold.is_none() && resume.is_none() {
+        return;
+    }
     planes.calls.retain_browser_request(
         &journal::call_records::principal_label(facts.principal.as_ref()),
         call_key,
-        journal::call_records::BrowserResume {
-            frame: frame.clone(),
-            facts: facts.clone(),
-            bind_sequence,
-            head: Some(((head.channel, head.epoch), head_sequence)),
-            approved: false,
-            ask_id: String::new(),
-            created: std::time::Instant::now(),
-        },
+        resume,
+        hold,
         &planes.browser_resumes,
     );
 }

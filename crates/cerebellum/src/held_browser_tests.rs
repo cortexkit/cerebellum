@@ -19,6 +19,7 @@ const PNG: &str =
 
 #[derive(Default)]
 struct Page {
+    navigation_attempts: AtomicUsize,
     navigations: AtomicUsize,
     inputs: AtomicUsize,
     private_redirect: std::sync::atomic::AtomicBool,
@@ -50,6 +51,7 @@ impl OwnedBrowserProcess for Browser {
         _: u64,
         tracker: &mut browser::Tracker,
     ) -> Result<(), NavigationDriveError> {
+        self.0.navigation_attempts.fetch_add(1, Ordering::SeqCst);
         let gate = self.0.gate.lock().unwrap().clone();
         if let Some(gate) = gate {
             self.0.navigation_started.notify_one();
@@ -239,6 +241,93 @@ async fn start_navigation(planes: &Planes) {
     assert_eq!(planes.calls.browser_request_count(), 1);
 }
 
+fn session_status(planes: &Planes) -> Value {
+    planes.sessions.status(
+        "head-conversation",
+        planes.lease_clock.as_ref(),
+        std::time::SystemTime::now(),
+    )
+}
+
+fn advance_and_sweep(planes: &Planes, elapsed: Duration) {
+    planes.lease_clock.advance_for_test(elapsed);
+    planes.sessions.expire_all(
+        planes.lease_clock.as_ref(),
+        planes.browser_config.as_ref().unwrap(),
+    );
+}
+
+fn idle_timeout(planes: &Planes) -> Duration {
+    Duration::from_millis(
+        planes
+            .browser_config
+            .as_ref()
+            .unwrap()
+            .browser_idle_timeout_ms,
+    )
+}
+
+fn assert_idles_after_full_timeout(planes: &Planes) {
+    let tick = Duration::from_millis(1);
+    advance_and_sweep(planes, idle_timeout(planes) - tick);
+    assert_eq!(session_status(planes)["outcome"], "ready");
+    advance_and_sweep(planes, tick);
+    assert_eq!(session_status(planes)["terminal_outcome"], "idle_expired");
+}
+
+#[tokio::test]
+async fn late_held_approval_keeps_the_same_session_past_its_idle_deadline() {
+    let (planes, consent, page, _) = fixture().await;
+    planes.lease_clock.pause_for_test();
+    let session = session_status(&planes)["browser_session_id"].clone();
+    start_navigation(&planes).await;
+    advance_and_sweep(&planes, idle_timeout(&planes) + Duration::from_secs(1));
+
+    consent.feed(json!([answered("browser-card", "allow_30m")]));
+    let reply = late_key(&planes, 9, "held-navigation").await;
+    assert_eq!(reply["entries"][0]["kind"], "result", "{reply}");
+    assert_eq!(
+        reply["entries"][0]["result"]["structuredContent"]["outcome"], "ok",
+        "{reply}"
+    );
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 1);
+    let status = session_status(&planes);
+    assert_eq!(status["outcome"], "ready", "{status}");
+    assert_eq!(status["browser_session_id"], session);
+}
+
+#[tokio::test]
+async fn explicit_close_is_not_blocked_by_held_consent() {
+    let (planes, consent, page, _) = fixture().await;
+    planes.lease_clock.pause_for_test();
+    let session = session_status(&planes)["browser_session_id"].clone();
+    start_navigation(&planes).await;
+    advance_and_sweep(&planes, idle_timeout(&planes));
+    consent.feed(json!([]));
+    let close = decode(
+        exchange(
+            &planes,
+            8,
+            10,
+            json!({"name":"browser_use","arguments":{
+                "action":"close","browser_session_id":session,
+            }}),
+        )
+        .await,
+    );
+    assert_eq!(close["outcome"], "closed", "{close}");
+    assert_eq!(session_status(&planes)["terminal_outcome"], "closed");
+
+    consent.feed(json!([answered("browser-card", "allow_30m")]));
+    let reply = late_key(&planes, 9, "held-navigation").await;
+    assert_eq!(reply["entries"][0]["kind"], "result", "{reply}");
+    assert_eq!(
+        reply["entries"][0]["result"]["structuredContent"]["outcome"], "no_session",
+        "{reply}"
+    );
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn approval_while_held_runs_navigate_and_returns_its_page_without_persisting_text() {
     let (planes, consent, page, storage) = fixture().await;
@@ -347,6 +436,7 @@ async fn refused_private_landing_after_navigation_is_not_misreported_as_not_star
 #[tokio::test]
 async fn held_click_point_never_runs_after_approval() {
     let (planes, consent, page, _) = fixture().await;
+    planes.lease_clock.pause_for_test();
     let identity = &planes.routes.get(8, 3).unwrap().identity;
     let view = coordinate::ViewportObservation::new(
         0,
@@ -367,11 +457,14 @@ async fn held_click_point_never_runs_after_approval() {
     let request = json!({"name":"browser_use","call_key":"held-point","arguments":{"action":"click_point","snapshot_id":snapshot["snapshot_id"],"point":{"x":0,"y":0},"image_width_px":1,"image_height_px":1,"severity":{"tier":3,"credential":false,"financial":false},"intent":"press at the old image position"}});
     assert_held(&decode(exchange(&planes, 9, 3, request).await), "consent");
     assert_eq!(planes.calls.browser_request_count(), 0);
+    advance_and_sweep(&planes, idle_timeout(&planes));
+    assert_eq!(session_status(&planes)["outcome"], "ready");
     consent.feed(json!([answered("browser-card", "allow_30m")]));
     let reply = late(&planes, 9).await;
     assert_eq!(reply["entries"][0]["kind"], "not_started", "{reply}");
     assert_eq!(reply["entries"][0]["detail"]["consent"], "approved");
     assert_eq!(page.inputs.load(Ordering::SeqCst), 0);
+    assert_idles_after_full_timeout(&planes);
 }
 
 #[tokio::test]
@@ -400,7 +493,10 @@ async fn late_approval_after_explicit_withdrawal_cannot_run_the_navigation() {
 #[tokio::test]
 async fn cancel_after_first_held_reply_removes_the_original_request() {
     let (planes, consent, page, _) = fixture().await;
+    planes.lease_clock.pause_for_test();
     start_navigation(&planes).await;
+    advance_and_sweep(&planes, idle_timeout(&planes));
+    assert_eq!(session_status(&planes)["outcome"], "ready");
     let mut cancel = request(9, 3, json!({}));
     cancel.header.ty = FrameType::Cancel;
     let (writer, _) = mpsc::channel(16);
@@ -408,6 +504,7 @@ async fn cancel_after_first_held_reply_removes_the_original_request() {
         .await
         .unwrap();
     assert_eq!(planes.calls.browser_request_count(), 0);
+    assert_idles_after_full_timeout(&planes);
     consent.feed(json!([answered("browser-card", "allow_30m")]));
     assert_eq!(late(&planes, 9).await["entries"][0]["kind"], "not_started");
     assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
@@ -420,11 +517,15 @@ async fn deny_and_card_expiry_remove_the_original_request() {
         json!({"elicitation_id":"browser-card","state":"expired"}),
     ] {
         let (planes, consent, page, _) = fixture().await;
+        planes.lease_clock.pause_for_test();
         start_navigation(&planes).await;
+        advance_and_sweep(&planes, idle_timeout(&planes));
+        assert_eq!(session_status(&planes)["outcome"], "ready");
         consent.feed(json!([record]));
         assert_eq!(late(&planes, 9).await["entries"][0]["kind"], "not_started");
         assert_eq!(planes.calls.browser_request_count(), 0);
         assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
+        assert_idles_after_full_timeout(&planes);
     }
 }
 
@@ -455,6 +556,35 @@ async fn scope_end_removes_the_original_request() {
         .unwrap();
     assert_eq!(planes.calls.browser_request_count(), 0);
     assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn head_scope_end_releases_the_session_for_idle_expiry() {
+    let (planes, _, _, _) = fixture().await;
+    planes.lease_clock.pause_for_test();
+    start_navigation(&planes).await;
+    advance_and_sweep(&planes, idle_timeout(&planes));
+    assert_eq!(session_status(&planes)["outcome"], "ready");
+    let facts = planes.routes.get(9, 3).unwrap();
+    let head_scope = facts
+        .codemode_head
+        .as_ref()
+        .unwrap()
+        .scope
+        .as_ref()
+        .unwrap();
+    assert_ne!(Some(head_scope), facts.scope.as_ref());
+    settle_scope_holds(&planes, &scope_watch::ScopeKey::from_stamp(head_scope));
+    assert_idles_after_full_timeout(&planes);
+}
+
+#[tokio::test]
+async fn a_lost_consent_ending_cannot_pin_the_session_forever() {
+    let (planes, _, _, _) = fixture().await;
+    planes.lease_clock.pause_for_test();
+    start_navigation(&planes).await;
+    advance_and_sweep(&planes, journal::call_records::CACHE_MAX_AGE);
+    assert_idles_after_full_timeout(&planes);
 }
 
 #[tokio::test]
@@ -604,7 +734,7 @@ async fn expired_memory_hold_keeps_approval_for_a_fresh_call_without_running() {
     planes.calls.retain_browser_request(
         "reserved:basal",
         "held-navigation",
-        journal::call_records::BrowserResume {
+        Some(journal::call_records::BrowserResume {
             frame: request(9, 3, body),
             facts: planes.routes.get(9, 3).unwrap(),
             bind_sequence: planes.routes.bind_sequence(9, 3).unwrap(),
@@ -614,7 +744,9 @@ async fn expired_memory_hold_keeps_approval_for_a_fresh_call_without_running() {
             created: std::time::Instant::now()
                 - journal::call_records::CACHE_MAX_AGE
                 - Duration::from_secs(1),
-        },
+            idle_hold: None,
+        }),
+        None,
         &planes.browser_resumes,
     );
     consent.feed(json!([answered("browser-card", "allow_30m")]));
@@ -760,16 +892,8 @@ async fn queued_fixture(
     Arc<Page>,
     Arc<tokio::sync::Semaphore>,
 ) {
-    let (mut planes, consent, page, _) = fixture_with_consent(
-        true,
-        BrowserConfig {
-            // Held calls don't renew the browser's idle lease. Keep the mock
-            // session live throughout the queue test, even if approval is slow.
-            browser_idle_timeout_ms: 60 * 60 * 1_000,
-            ..Planes::short_test_browser_config()
-        },
-    )
-    .await;
+    let (mut planes, consent, page, _) = fixture().await;
+    planes.lease_clock.pause_for_test();
     planes.browser_resumes = Arc::new(browser_held::Tasks::new(per_head, global));
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     *page.gate.lock().unwrap() = Some(gate.clone());
@@ -797,6 +921,31 @@ async fn queued_fixture(
         panic!("expected one continuation at the browser and two waiting in the bounded task queue; readiness: {ready:?}, counts (total, active): {counts:?}");
     }
     (planes, consent, page, gate)
+}
+
+#[tokio::test]
+async fn idle_window_starts_when_the_last_queued_resumption_finishes() {
+    let (planes, _, page, gate) = queued_fixture(1, 1).await;
+    advance_and_sweep(&planes, idle_timeout(&planes));
+    gate.add_permits(2);
+    let third_started = tokio::time::timeout(HANG_GUARD, async {
+        while page.navigation_attempts.load(Ordering::SeqCst) != 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    advance_and_sweep(&planes, idle_timeout(&planes));
+    gate.add_permits(3);
+    third_started.expect("the last queued call was admitted past the original deadline");
+    tokio::time::timeout(HANG_GUARD, async {
+        while planes.browser_resumes.counts() != (0, 0) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the last continuation finishes");
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 3);
+    assert_idles_after_full_timeout(&planes);
 }
 
 #[tokio::test]

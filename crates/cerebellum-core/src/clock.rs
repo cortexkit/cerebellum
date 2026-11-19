@@ -72,6 +72,8 @@ pub trait MonotonicClock {
 #[derive(Debug, Clone)]
 pub struct SystemClock {
     epoch: Instant,
+    #[cfg(feature = "test-support")]
+    paused: std::sync::Arc<std::sync::OnceLock<std::sync::atomic::AtomicU64>>,
 }
 
 impl Default for SystemClock {
@@ -85,12 +87,33 @@ impl SystemClock {
     pub fn new() -> Self {
         Self {
             epoch: Instant::now(),
+            #[cfg(feature = "test-support")]
+            paused: Default::default(),
         }
+    }
+
+    /// Freeze this clock and its clones so a test can drive lease boundaries.
+    #[cfg(feature = "test-support")]
+    pub fn pause_for_test(&self) {
+        assert!(self.paused.set(self.now().as_nanos().into()).is_ok());
+    }
+
+    /// Advance a paused clock without a wall-clock wait.
+    #[cfg(feature = "test-support")]
+    pub fn advance_for_test(&self, delta: Duration) {
+        self.paused.get().expect("clock is not paused").fetch_add(
+            MonoInstant::from_duration(delta).as_nanos(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
 impl MonotonicClock for SystemClock {
     fn now(&self) -> MonoInstant {
+        #[cfg(feature = "test-support")]
+        if let Some(paused) = self.paused.get() {
+            return MonoInstant::from_nanos(paused.load(std::sync::atomic::Ordering::Relaxed));
+        }
         MonoInstant(self.epoch.elapsed())
     }
 }

@@ -69,7 +69,7 @@ use subc_protocol::{Frame, FrameType, Principal};
 
 mod browser_resume;
 mod late;
-pub(crate) use browser_resume::BrowserResume;
+pub(crate) use browser_resume::{BrowserHold, BrowserResume};
 pub use late::{ConsentEnding, HandoffEnding, HeldHandoff};
 
 /// The file name under the journal data home.
@@ -784,6 +784,7 @@ type Key = (String, String);
 #[derive(Debug)]
 struct Entry {
     browser_resume: Option<BrowserResume>,
+    browser_hold: Option<BrowserHold>,
     resumed_result: bool,
     consent_ended: bool,
     // Capture can start depositing after its held reply. Process-local only:
@@ -1001,6 +1002,7 @@ impl CallRecords {
                 key,
                 Entry {
                     browser_resume: None,
+                    browser_hold: None,
                     resumed_result: false,
                     consent_ended: false,
                     held_dispatched: false,
@@ -1251,6 +1253,7 @@ impl CallRecords {
         }
         let entry = Entry {
             browser_resume: None,
+            browser_hold: None,
             resumed_result: false,
             consent_ended: false,
             held_dispatched: false,
@@ -1304,7 +1307,7 @@ impl CallRecords {
             .as_ref()
             .is_some_and(|held| held.is_consent() && matches!(held.phase, late::Phase::Pending))
         {
-            entry.browser_resume = None;
+            entry.clear_browser_request();
         }
         let record = entry.record.clone();
         let _ = self.write(inner, &record, now_ms);
@@ -1338,7 +1341,7 @@ impl CallRecords {
         let Some(entry) = inner.entries.get_mut(&ticket.key) else {
             return;
         };
-        entry.browser_resume = None;
+        entry.clear_browser_request();
         if entry.record.outcome.as_deref()
             == Some(cortexkit_role_tool_provider::late_results::reasons::SCOPE_ENDED)
         {
@@ -1404,7 +1407,7 @@ impl CallRecords {
         let mut freed = 0;
         for entry in inner.entries.values_mut() {
             if entry.conversation_key == conversation_key {
-                entry.browser_resume = None;
+                entry.clear_browser_request();
             }
             if entry.conversation_key == conversation_key && entry.reply.is_some() {
                 entry.reply = None;

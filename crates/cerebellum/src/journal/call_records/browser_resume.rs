@@ -2,6 +2,7 @@
 
 use super::late::{ConsentEnding, HandoffEnding, LateOutcome, Phase};
 use super::*;
+use crate::browser_session::IdleHold;
 use cortexkit_role_tool_provider::late_results::LateEntry;
 
 pub(crate) struct BrowserResume {
@@ -12,6 +13,24 @@ pub(crate) struct BrowserResume {
     pub approved: bool,
     pub ask_id: String,
     pub created: Instant,
+    pub idle_hold: Option<IdleHold>,
+}
+
+/// Even an action that must never resume (such as a coordinate click) can
+/// hold a session for consent. Retain only the pin and its cancellation keys.
+#[derive(Debug)]
+pub(crate) struct BrowserHold {
+    pub idle: IdleHold,
+    pub request: (u16, u32, u64),
+    pub head_route: (u16, u32),
+    pub head_scope: Option<ScopeIdentity>,
+}
+
+impl Entry {
+    pub(super) fn clear_browser_request(&mut self) {
+        self.browser_hold = None;
+        self.browser_resume = None;
+    }
 }
 
 impl std::fmt::Debug for BrowserResume {
@@ -36,7 +55,8 @@ impl CallRecords {
         &self,
         principal: &str,
         key: &str,
-        resume: BrowserResume,
+        resume: Option<BrowserResume>,
+        hold: Option<BrowserHold>,
         tasks: &crate::browser_held::Tasks,
     ) {
         let mut inner = self.lock();
@@ -48,17 +68,20 @@ impl CallRecords {
             .fold((0, 0), |(count, bytes), resume| {
                 (count + 1, bytes + resume.frame.body.len())
             });
-        if count + running >= CACHE_MAX_REPLIES
-            || bytes
-                .saturating_add(running_bytes)
-                .saturating_add(resume.frame.body.len())
-                > CACHE_MAX_BYTES
-            || resume.frame.body.len() > CACHE_MAX_REPLY_BYTES
-        {
-            return;
-        }
         if let Some(entry) = inner.entries.get_mut(&(principal.into(), key.into())) {
-            entry.browser_resume = Some(resume);
+            if let Some(hold) = hold {
+                entry.browser_hold = Some(hold);
+            }
+            if let Some(resume) = resume.filter(|resume| {
+                count + running < CACHE_MAX_REPLIES
+                    && bytes
+                        .saturating_add(running_bytes)
+                        .saturating_add(resume.frame.body.len())
+                        <= CACHE_MAX_BYTES
+                    && resume.frame.body.len() <= CACHE_MAX_REPLY_BYTES
+            }) {
+                entry.browser_resume = Some(resume);
+            }
         }
     }
 
@@ -131,6 +154,7 @@ impl CallRecords {
         entry.record = record;
         entry.held_dispatched = true;
         if let Some(resume) = entry.browser_resume.as_mut() {
+            resume.idle_hold = entry.browser_hold.take().map(|hold| hold.idle);
             resume.ask_id = entry
                 .record
                 .handoff
@@ -154,11 +178,11 @@ impl CallRecords {
         let Some(entry) = inner
             .entries
             .get_mut(&key)
-            .filter(|entry| entry.browser_resume.is_some())
+            .filter(|entry| entry.browser_resume.is_some() || entry.browser_hold.is_some())
         else {
             return Ok(());
         };
-        entry.browser_resume = None;
+        entry.clear_browser_request();
         self.finish_held_locked(
             &mut inner,
             &key,
@@ -173,7 +197,10 @@ impl CallRecords {
             .entries
             .iter()
             .filter(|(_, entry)| {
-                entry.browser_resume.as_ref().is_some_and(|resume| {
+                entry.browser_hold.as_ref().is_some_and(|hold| {
+                    (hold.request.0, hold.request.1) == (channel, epoch)
+                        || hold.head_route == (channel, epoch)
+                }) || entry.browser_resume.as_ref().is_some_and(|resume| {
                     (resume.frame.header.channel, resume.frame.header.epoch) == (channel, epoch)
                         || resume
                             .head
@@ -188,7 +215,10 @@ impl CallRecords {
             let approved = inner
                 .entries
                 .get_mut(&key)
-                .and_then(|entry| entry.browser_resume.take())
+                .and_then(|entry| {
+                    entry.browser_hold = None;
+                    entry.browser_resume.take()
+                })
                 .is_some_and(|resume| resume.approved);
             // Closing a route is not proof that its scope ended. Leave an
             // unanswered card answerable, but discard its executable request.
@@ -215,10 +245,14 @@ impl CallRecords {
             .entries
             .iter()
             .filter(|(_, entry)| {
-                entry.browser_resume.as_ref().is_some_and(|resume| {
-                    let header = &resume.frame.header;
-                    (header.channel, header.epoch, header.corr) == (channel, epoch, corr)
-                })
+                entry
+                    .browser_hold
+                    .as_ref()
+                    .is_some_and(|hold| hold.request == (channel, epoch, corr))
+                    || entry.browser_resume.as_ref().is_some_and(|resume| {
+                        let header = &resume.frame.header;
+                        (header.channel, header.epoch, header.corr) == (channel, epoch, corr)
+                    })
             })
             .map(|(key, _)| key.clone())
             .collect();
