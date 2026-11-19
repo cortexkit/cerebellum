@@ -87,6 +87,44 @@ test("a failed cleanup release still detaches and reports unconfirmed input", as
   assert.equal(f.chrome.calls.filter(call => call[0] === "detach").length, 2);
 });
 
+test("a release Chrome rejects stays owed and cleanup sends only that release", async () => {
+  const f = await setup();
+  const epoch = (await f.fresh()).interaction_epoch;
+  const send = f.chrome.debugger.sendCommand;
+  let releases = 0;
+  f.chrome.debugger.sendCommand = async (...args) => {
+    // Chrome refuses the planned release before delivering it.
+    if (args[2].type === "mouseReleased" && releases++ === 0) throw new Error("release rejected");
+    return send(...args);
+  };
+  await f.run(f.input(epoch));
+  assert.deepEqual(inputs(f.chrome).map(call => call[3]), [press.params, release.params]);
+  assert.equal(releases, 2);
+});
+
+test("a key-down refused before its key-up is released before detach and nothing is typed", async () => {
+  const f = await setup();
+  const epoch = (await f.fresh()).interaction_epoch;
+  const keyDown = { method: "Input.dispatchKeyEvent", params: { type: "keyDown", key: "End", code: "End", windowsVirtualKeyCode: 35 } };
+  const keyUp = { method: "Input.dispatchKeyEvent", params: { type: "keyUp", key: "End", code: "End", windowsVirtualKeyCode: 35 } };
+  const insert = { method: "Input.insertText", params: { text: "42" } };
+  const send = f.chrome.debugger.sendCommand;
+  f.chrome.debugger.sendCommand = async (...args) => {
+    const result = await send(...args);
+    // The person touches the page between the key-down and its key-up.
+    if (args[2]?.type === "keyDown") f.epochs.bump(2);
+    return result;
+  };
+  const start = f.chrome.calls.length;
+  await assert.rejects(
+    f.run({ ...f.cdp([keyDown, keyUp, insert]), interaction_epoch: epoch }),
+    error => error.detail.input_dispatched === true,
+  );
+  const sent = f.chrome.calls.slice(start).filter(call => call[0] === "detach" || call[0] === "cdp" && call[2].startsWith("Input."));
+  assert.deepEqual(sent.map(call => call[0] === "detach" ? "detach" : call[3].type ?? call[2]), ["keyDown", "keyUp", "detach"]);
+  assert.deepEqual(sent[1][3], keyUp.params);
+});
+
 test("group membership is rechecked before attachment", async () => {
   const f = await setup();
   f.chrome.calls.length = 0;
