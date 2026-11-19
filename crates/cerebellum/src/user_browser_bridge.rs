@@ -328,6 +328,11 @@ struct State {
     replies: BTreeMap<u64, mpsc::Sender<MessageBody>>,
     calls: BTreeMap<u64, (Route, CancelHandle)>,
     controls: BTreeMap<u64, CallControl>,
+    /// Whether the socket writer wrote each action's Attach (`true`) or
+    /// dropped it because the action had already been cancelled (`false`),
+    /// as it first judged that Attach.
+    #[cfg(any(target_os = "macos", test))]
+    attaches_written: BTreeMap<u64, bool>,
 }
 
 struct Inner {
@@ -435,6 +440,8 @@ impl UserBrowserBridge {
                 replies: BTreeMap::new(),
                 calls: BTreeMap::new(),
                 controls: BTreeMap::new(),
+                #[cfg(any(target_os = "macos", test))]
+                attaches_written: BTreeMap::new(),
             }),
             lane: tokio::sync::Mutex::new(()),
             target: crate::user_browser::UserBrowser::new(grants),
@@ -614,20 +621,36 @@ impl UserBrowserBridge {
 
     #[cfg(any(target_os = "macos", test))]
     pub(super) fn should_send(&self, message: &Message) -> bool {
-        let state = self.state();
+        let mut state = self.state();
         if state.stopped || state.connection.as_ref().map(|c| c.epoch) != Some(message.epoch) {
             return false;
         }
         match message.body {
             MessageBody::Attach { .. } | MessageBody::Dispatch => {
-                state
-                    .calls
-                    .get(&message.id)
-                    .is_some_and(|(_, cancel)| !cancel.is_cancelled())
+                let registered = state.calls.get(&message.id);
+                let send = registered.is_some_and(|(_, cancel)| !cancel.is_cancelled())
                     && state
                         .controls
                         .get(&message.id)
-                        .is_none_or(CallControl::live)
+                        .is_none_or(CallControl::live);
+                if registered.is_some() && matches!(message.body, MessageBody::Attach { .. }) {
+                    state.attaches_written.entry(message.id).or_insert(send);
+                }
+                send
+            }
+            // The writer judges an action's Attach before the Cancel queued
+            // behind it. When it dropped that Attach, the extension has no
+            // entry to cancel and would never answer, so the receipt the
+            // cleanup waits for is given here instead of sending the Cancel.
+            // An Attach that was written, or not yet judged, keeps the Cancel.
+            MessageBody::Cancel if state.attaches_written.get(&message.id) == Some(&false) => {
+                if let Some(sender) = state.replies.get(&message.id) {
+                    let _ = sender.try_send(MessageBody::Cancelled {
+                        input_dispatched: false,
+                        detached: true,
+                    });
+                }
+                false
             }
             _ => true,
         }
@@ -718,6 +741,9 @@ impl UserBrowserBridge {
         self.state().replies.insert(id, sender);
         outcome.phases.push(ActionPhase::Attaching);
         let mut failure = send_message(&outgoing, attach, &cancel, closed).await.err();
+        // An Attach refused here never reached the writer queue, so the
+        // extension cannot have heard of this action.
+        let attach_queued = failure.is_none();
         if failure.is_none() {
             failure = match next_reply(
                 &mut replies,
@@ -833,6 +859,10 @@ impl UserBrowserBridge {
         // Prevent an Attach or Dispatch still queued in the socket writer from
         // being sent after this action has begun cancellation or timed out.
         cancel.cancel();
+        if !attach_queued {
+            outcome.finish(terminal, Some(reason));
+            return outcome;
+        }
         // Cleanup is bounded separately, and deliberately ignores an already
         // cancelled request while waiting for the extension's detach receipt.
         let cleanup = async {
@@ -850,6 +880,27 @@ impl UserBrowserBridge {
                         input_dispatched,
                         detached: true,
                     }) => return Ok(input_dispatched),
+                    // The extension may have finished the action before it
+                    // saw the Cancel: it then ignores the Cancel, and the
+                    // detached terminal it already sent is the proof that it
+                    // let go. Its content is discarded; only its input
+                    // witness is kept.
+                    Some(
+                        MessageBody::Completed {
+                            input_dispatched,
+                            detached: true,
+                            ..
+                        }
+                        | MessageBody::Refused {
+                            input_dispatched,
+                            detached: true,
+                            ..
+                        }
+                        | MessageBody::ReplyEnd {
+                            input_dispatched,
+                            detached: true,
+                        },
+                    ) => return Ok(input_dispatched),
                     Some(_) => {}
                     None => return Err(()),
                 }
@@ -983,6 +1034,8 @@ impl Drop for Registration {
         state.calls.remove(&self.id);
         state.controls.remove(&self.id);
         state.replies.remove(&self.id);
+        #[cfg(any(target_os = "macos", test))]
+        state.attaches_written.remove(&self.id);
     }
 }
 

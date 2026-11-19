@@ -910,3 +910,95 @@ async fn extension_refusals_end_once_and_preserve_the_typed_detail() {
         assert!(bridge.state().calls.is_empty());
     }
 }
+
+/// A detached Completed already queued when a Cancel wins the reply wait is
+/// the extension's proof it let go: the extension has deleted its entry and
+/// ignores the Cancel, so waiting for a Cancelled receipt would time out and
+/// tear down the whole connection.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_racing_a_detached_completion_keeps_the_connection() {
+    let bridge = UserBrowserBridge::new();
+    let (epoch, mut outgoing, _) = bridge.connect().unwrap();
+    let cancel = CancelHandle::pending();
+    let task = launch(&bridge, "click", &cancel);
+    let attach = outgoing.recv().await.unwrap();
+    let reply = |body| {
+        bridge.receive(Message {
+            id: attach.id,
+            epoch,
+            body,
+        })
+    };
+    reply(MessageBody::Attached);
+    assert_eq!(outgoing.recv().await.unwrap().body, MessageBody::Dispatch);
+    reply(MessageBody::Dispatched {
+        input_dispatched: true,
+    });
+    tokio::task::yield_now().await;
+    // Both are ready before the action is polled again.
+    reply(MessageBody::Completed {
+        result: json!({"page": "the cancelled content"}),
+        input_dispatched: true,
+        detached: true,
+    });
+    cancel.cancel();
+    assert_eq!(outgoing.recv().await.unwrap().body, MessageBody::Cancel);
+    let result = task.await.unwrap();
+    assert_eq!(result.terminal, Terminal::Cancelled);
+    assert_eq!(result.reason, Some(Reason::CancelRequested));
+    assert_eq!(result.result, None, "the cancelled content was returned");
+    assert_eq!(result.input_dispatched, Some(true));
+    assert_eq!(bridge.connected_epoch(), Some(epoch));
+
+    let task = launch(&bridge, "snapshot", &CancelHandle::pending());
+    let attach = outgoing.recv().await.unwrap();
+    assert!(matches!(attach.body, MessageBody::Attach { .. }));
+    let reply = |body| {
+        bridge.receive(Message {
+            id: attach.id,
+            epoch,
+            body,
+        })
+    };
+    reply(MessageBody::Attached);
+    assert_eq!(outgoing.recv().await.unwrap().body, MessageBody::Dispatch);
+    reply(MessageBody::Dispatched {
+        input_dispatched: false,
+    });
+    reply(MessageBody::Completed {
+        result: json!({"page": "next"}),
+        input_dispatched: false,
+        detached: true,
+    });
+    let result = task.await.unwrap();
+    assert_eq!(result.terminal, Terminal::Completed);
+    assert_eq!(result.result, Some(json!({"page": "next"})));
+}
+
+/// An Attach still queued in the socket writer when its action is cancelled
+/// is never written, so the extension has nothing to cancel: the action ends
+/// cancelled without writing the Cancel and without resetting the
+/// connection.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_before_the_writer_sends_the_attach_writes_nothing_and_keeps_the_connection() {
+    let bridge = UserBrowserBridge::new();
+    let (epoch, mut outgoing, _) = bridge.connect().unwrap();
+    let cancel = CancelHandle::pending();
+    let task = launch(&bridge, "click", &cancel);
+    // The writer has taken the Attach from its queue but not yet judged it.
+    let attach = outgoing.recv().await.unwrap();
+    cancel.cancel();
+    assert!(!bridge.should_send(&attach));
+    let cancel_frame = outgoing.recv().await.unwrap();
+    assert_eq!(cancel_frame.body, MessageBody::Cancel);
+    assert!(
+        !bridge.should_send(&cancel_frame),
+        "a Cancel for an action the extension never heard of was written"
+    );
+    let result = task.await.unwrap();
+    assert_eq!(result.terminal, Terminal::Cancelled);
+    assert_eq!(result.reason, Some(Reason::CancelRequested));
+    assert_eq!(result.input_dispatched, Some(false));
+    assert_eq!(bridge.connected_epoch(), Some(epoch));
+    assert!(bridge.state().attaches_written.is_empty());
+}
