@@ -1364,7 +1364,7 @@ mod desk {
     }
 
     /// Even if TextEdit restarts between ownership proof and call admission,
-    /// the picture arm must never use a grant to that replacement process.
+    /// the picture attempt must never use a grant to that replacement process.
     struct PictureTarget(PlatformResolver, ScratchProcess);
 
     impl TargetResolver for PictureTarget {
