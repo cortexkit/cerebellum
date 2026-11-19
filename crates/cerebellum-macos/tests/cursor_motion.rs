@@ -36,6 +36,7 @@ fn main() {
 fn main() {
     const TEST_NAME: &str = "cursor_glides_with_unthrottled_frames_and_rests_with_no_activity";
     const IDLE_TEST_NAME: &str = "idle_cursor_services_the_main_run_loop_bursts_and_eof";
+    const LOAD_TEST_NAME: &str = "cursor_answers_recipient_queries_under_appkit_load";
     let mut filters = Vec::new();
     let mut skips = Vec::new();
     let mut arguments = std::env::args().skip(1);
@@ -54,7 +55,14 @@ fn main() {
             && (filters.is_empty() || filters.iter().any(|filter| name.contains(filter.as_str())))
     };
     if selected(IDLE_TEST_NAME) {
-        check_idle_loop(IDLE_TEST_NAME);
+        check_without_window(IDLE_TEST_NAME, || {
+            cerebellum_macos::probe_cursor_run_loop(motion())
+                .map(|(ping, eof)| format!("idle ping {ping:?}, EOF {eof:?}"))
+                .map_err(str::to_owned)
+        });
+    }
+    if selected(LOAD_TEST_NAME) {
+        check_without_window(LOAD_TEST_NAME, check_recipient_load);
     }
     if !selected(TEST_NAME) {
         return;
@@ -100,7 +108,7 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-fn check_idle_loop(name: &str) {
+fn check_without_window(name: &str, check: impl FnOnce() -> Result<String, String>) {
     let (finished, completion) = std::sync::mpsc::sync_channel(1);
     let name = name.to_owned();
     let watchdog = std::thread::spawn({
@@ -115,16 +123,41 @@ fn check_idle_loop(name: &str) {
             }
         }
     });
-    let result = cerebellum_macos::probe_cursor_run_loop(motion());
+    let result = check();
     let _ = finished.send(());
     watchdog.join().expect("the watchdog did not panic");
     match result {
-        Ok((ping, eof)) => println!("test {name} ... ok (idle ping {ping:?}, EOF {eof:?})"),
+        Ok(summary) => println!("test {name} ... ok ({summary})"),
         Err(reason) => {
             eprintln!("test {name} ... FAILED: {reason}");
             std::process::exit(101);
         }
     }
+}
+
+/// Check the helper's main-thread service time under load, leaving at least
+/// 10 ms of the 50 ms budget for the transport, which this test does not cover.
+#[cfg(target_os = "macos")]
+fn check_recipient_load() -> Result<String, String> {
+    use std::time::Duration;
+
+    const LIMIT: Duration = Duration::from_millis(40);
+    let mut latencies = cerebellum_macos::probe_cursor_recipient_load(motion())?;
+    let count = latencies.len();
+    if count < 50 {
+        return Err(format!("too few measured recipient replies: {count}"));
+    }
+    latencies.sort_unstable();
+    let p50 = latencies[(count * 50).div_ceil(100) - 1];
+    let p99 = latencies[(count * 99).div_ceil(100) - 1];
+    let max = latencies[count - 1];
+    let summary = format!("{count} recipient replies: p50 {p50:?}, p99 {p99:?}, max {max:?}");
+    if max >= LIMIT {
+        return Err(format!(
+            "recipient replies must all arrive in under {LIMIT:?}; {summary}"
+        ));
+    }
+    Ok(summary)
 }
 
 /// Stand-ins for the module's motion curves: a 300 ms ease-out glide and no
