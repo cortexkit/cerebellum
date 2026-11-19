@@ -341,35 +341,29 @@ async fn consent_scope_question(replies: &mut mpsc::Receiver<Frame>) -> Frame {
     let body: Value = serde_json::from_slice(&question.body).unwrap();
     assert_eq!(body["op"], "scope.describe");
     assert_eq!(body["ref"], "card-tests");
+    assert_eq!(body["owner"]["module_id"], "prefrontal");
     question
 }
 
 async fn answer_consent_scope(
     planes: &Planes,
     writer: &mpsc::Sender<Frame>,
-    replies: &mut mpsc::Receiver<Frame>,
     question: &Frame,
     ty: subc_protocol::FrameType,
     answer: Value,
 ) {
-    let mut current = question.clone();
-    for index in 0..2 {
-        let frame = Frame::build(
-            ty,
-            crate::control_flags(),
-            0,
-            0,
-            current.header.corr,
-            serde_json::to_vec(&answer).unwrap(),
-        )
+    let frame = Frame::build(
+        ty,
+        crate::control_flags(),
+        0,
+        0,
+        question.header.corr,
+        serde_json::to_vec(&answer).unwrap(),
+    )
+    .unwrap();
+    crate::handle_frame_for_test(frame, writer, planes)
+        .await
         .unwrap();
-        crate::handle_frame_for_test(frame, writer, planes)
-            .await
-            .unwrap();
-        if index == 0 {
-            current = consent_scope_question(replies).await;
-        }
-    }
 }
 
 async fn wait_for_consent_session_end(planes: &Planes) {
@@ -432,7 +426,6 @@ async fn route_goodbye_waits_for_confirmed_session_end_without_revoking_the_save
     answer_consent_scope(
         &planes,
         &writer,
-        &mut replies,
         &question,
         subc_protocol::FrameType::Error,
         json!({"code":"unavailable","message":"try again"}),
@@ -452,7 +445,6 @@ async fn route_goodbye_waits_for_confirmed_session_end_without_revoking_the_save
     answer_consent_scope(
         &planes,
         &writer,
-        &mut replies,
         &question,
         subc_protocol::FrameType::Response,
         json!({"op":"scope.describe","status":"ended","scope_epoch":1,
@@ -549,7 +541,7 @@ async fn restarted_consent_desk_waits_for_scope_evidence_before_settling_an_unus
             None
         );
         assert_eq!(rows(&fixture), granted);
-        answer_consent_scope(&recovered, &writer, &mut replies, &question, ty, answer).await;
+        answer_consent_scope(&recovered, &writer, &question, ty, answer).await;
     }
     let question = consent_scope_question(&mut replies).await;
     assert_eq!(
@@ -564,7 +556,6 @@ async fn restarted_consent_desk_waits_for_scope_evidence_before_settling_an_unus
     answer_consent_scope(
         &recovered,
         &writer,
-        &mut replies,
         &question,
         subc_protocol::FrameType::Response,
         json!({"op":"scope.describe","status":"ended","scope_epoch":1,

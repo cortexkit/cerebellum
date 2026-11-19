@@ -118,7 +118,7 @@ async fn resumed_notices_use_settled_codes_and_the_pulled_event_id() {
         let calls = CallRecords::open(Box::new(InMemoryCallRecordStorage::new()), 100);
         let fake = Arc::new(Fake::default());
         calls.events.connect(Arc::new(fake.clone()));
-        let owner = "reserved:prefrontal-core";
+        let owner = "reserved:prefrontal";
         assert!(matches!(
             calls.begin(owner, "call:resume", "scope", 100),
             Begin::Execute(_)
@@ -163,7 +163,7 @@ async fn resumed_notices_use_settled_codes_and_the_pulled_event_id() {
         assert_eq!(writes.len(), 1, "{body}");
         assert_eq!(
             writes[0].id,
-            format!("{}:prefrontal-core", initial.entries[0].event_id)
+            format!("{}:prefrontal", initial.entries[0].event_id)
         );
         assert_eq!(
             writes[0].bytes,

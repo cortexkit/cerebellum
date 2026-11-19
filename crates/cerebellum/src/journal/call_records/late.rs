@@ -992,7 +992,7 @@ fn store_error(error: CallRecordError) -> subc_protocol::ErrorBody {
 mod tests {
     use super::*;
 
-    const OWNER: &str = "reserved:prefrontal-core";
+    const OWNER: &str = "reserved:prefrontal";
     const ORIGIN: &str = "https://login.example";
     fn scope(reference: &str) -> ScopeIdentity {
         ScopeIdentity {
@@ -1149,7 +1149,7 @@ mod tests {
             assert_eq!(
                 writes[0].kind,
                 Kind::LateResultReady {
-                    custodian_module: Some("prefrontal-core".into())
+                    custodian_module: Some("prefrontal".into())
                 }
             );
             assert_eq!(
@@ -1166,7 +1166,7 @@ mod tests {
             assert_eq!(late.entries.len(), 1);
             assert_eq!(
                 writes[0].id,
-                format!("{}:prefrontal-core", late.entries[0].event_id)
+                format!("{}:prefrontal", late.entries[0].event_id)
             );
             let body = serde_json::to_value(&late.entries[0]).unwrap();
             assert_eq!(body["call_key"], "opaque:key");

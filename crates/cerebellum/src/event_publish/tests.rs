@@ -228,7 +228,7 @@ fn bus_notice_disabled_display_does_not_queue_but_recovered_late_result_does() {
 
 #[test]
 fn custodian_tail_requires_exact_reserved_module_label() {
-    for module in ["thalamus-harness", "prefrontal-core", "broca"] {
+    for module in ["thalamus-harness", "prefrontal", "broca"] {
         assert_eq!(
             late_result_ready_reader(&format!("reserved:{module}")),
             Some(module)

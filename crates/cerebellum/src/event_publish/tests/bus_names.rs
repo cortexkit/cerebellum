@@ -34,10 +34,7 @@ fn bus_names_used_by_cerebellum_are_pinned() {
             "broca",
             "ck.test.event.cerebellum.late_result_ready.v1.broca",
         ),
-        (
-            "prefrontal-core",
-            "ck.test.event.cerebellum.late_result_ready.v1.prefrontal-core",
-        ),
+        ("aft", "ck.test.event.cerebellum.late_result_ready.v1.aft"),
         (
             "prefrontal",
             "ck.test.event.cerebellum.late_result_ready.v1.prefrontal",

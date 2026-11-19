@@ -192,7 +192,7 @@ mod tests {
     fn full() -> Value {
         json!({
             "session_ref": SESSION,
-            "scope": {"owner": {"kind": "reserved", "module_id": "prefrontal-core"}, "ref": "s-1", "epoch": 3},
+            "scope": {"owner": {"kind": "reserved", "module_id": "prefrontal"}, "ref": "s-1", "epoch": 3},
             "harness": "claude-code",
             "turn_id": "t-1",
             "outcome": "completed",

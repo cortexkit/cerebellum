@@ -344,7 +344,7 @@ async fn handler_planes() -> crate::Planes {
     );
     let bind = json!({
         "op": "route.bind", "route_channel": 9, "epoch": 1,
-        "principal": subc_protocol::Principal::Reserved { module_id: "prefrontal-core".into() },
+        "principal": subc_protocol::Principal::Reserved { module_id: "prefrontal".into() },
         "identity": subc_protocol::BindIdentity::new("test", "views"),
         "target": subc_protocol::RouteTarget::ToolProvider { module_id: "cerebellum".into() },
     });
@@ -432,7 +432,7 @@ async fn bus_refusal_does_not_change_tool_views_or_display_records() {
     assert!(transport.bucket.values.lock().unwrap().is_empty());
     let write = cortexkit_role_tool_display::DisplayWrite::new(
         subc_protocol::Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         },
         "call",
         cortexkit_role_tool_display::DisplayKind::Record,

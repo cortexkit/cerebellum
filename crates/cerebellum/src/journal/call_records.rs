@@ -1498,15 +1498,15 @@ mod tests {
         };
 
         let first = CallRecords::open(storage(), 1_000);
-        let _ticket = executed(first.begin("reserved:prefrontal-core", "pf:1", "c", 1_000));
+        let _ticket = executed(first.begin("reserved:prefrontal", "pf:1", "c", 1_000));
         drop(first);
 
         let reopened = CallRecords::open(storage(), 2_000);
         assert!(matches!(
-            reopened.begin("reserved:prefrontal-core", "pf:1", "c", 2_000),
+            reopened.begin("reserved:prefrontal", "pf:1", "c", 2_000),
             Begin::OutcomeUnknown
         ));
-        match reopened.lookup("reserved:prefrontal-core", "pf:1") {
+        match reopened.lookup("reserved:prefrontal", "pf:1") {
             Lookup::Own(snapshot) => assert_eq!(
                 withdraw_answer(&snapshot),
                 json!({"answer": "already_started", "outcome": "unknown"})
@@ -1690,7 +1690,7 @@ mod tests {
         let (_scratch, path, floor) = v1_on_disk("v1-one-call");
         let records = open_on_disk(&path, &floor, 30);
         let _ticket = executed(records.begin_attributed(
-            "reserved:prefrontal-core",
+            "reserved:prefrontal",
             "pf:v2",
             "c",
             None,
@@ -1739,7 +1739,7 @@ mod tests {
         fs::write(&path, &v2).unwrap();
         let records = open_on_disk(&path, &floor, 30);
         let ticket = executed(records.begin_attributed(
-            "reserved:prefrontal-core",
+            "reserved:prefrontal",
             "pf:ordinary",
             "c",
             None,
@@ -1773,7 +1773,7 @@ mod tests {
         let (_scratch, path, floor) = v1_on_disk("consent-reader");
         let records = open_on_disk(&path, &floor, 30);
         let scope = ScopeIdentity {
-            owner: "reserved:prefrontal-core".into(),
+            owner: "reserved:prefrontal".into(),
             reference: "run".into(),
             scope_epoch: 1,
         };
@@ -1817,7 +1817,7 @@ mod tests {
     fn a_fresh_ordinary_call_starts_in_version_2() {
         let storage = InMemoryCallRecordStorage::new();
         let records = CallRecords::open(Box::new(storage.clone()), 0);
-        let _ticket = executed(records.begin("reserved:prefrontal-core", "pf:ordinary", "c", 10));
+        let _ticket = executed(records.begin("reserved:prefrontal", "pf:ordinary", "c", 10));
         let written = String::from_utf8(storage.contents().unwrap()).unwrap();
         assert_eq!(
             written.lines().next(),
@@ -1831,7 +1831,7 @@ mod tests {
         storage.replace(b"", 2).unwrap();
         let records = CallRecords::open(Box::new(storage.clone()), 0);
         assert_eq!(storage.contents().unwrap(), b"");
-        let _ticket = executed(records.begin("reserved:prefrontal-core", "pf:ordinary", "c", 10));
+        let _ticket = executed(records.begin("reserved:prefrontal", "pf:ordinary", "c", 10));
         let written = String::from_utf8(storage.contents().unwrap()).unwrap();
         assert_eq!(
             written.lines().next(),

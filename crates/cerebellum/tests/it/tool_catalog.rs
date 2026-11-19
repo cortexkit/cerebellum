@@ -619,7 +619,7 @@ async fn fork_tool_call_vectors_are_refused() {
         ("pi", include_str!("../vectors/fork-tools-v1/pi.json")),
     ] {
         let planes = planes(true);
-        bind(&planes, 9, "prefrontal-core").await;
+        bind(&planes, 9, "prefrontal").await;
         let sample: Value = serde_json::from_str(sample).unwrap();
         let mut request = sample["tool.call"]["request"].clone();
         let original = exchange(&planes, 9, request.clone()).await;
@@ -639,7 +639,7 @@ async fn fork_tool_call_writes_no_call_record_or_journal_row() {
     let mut planes = planes(true);
     let records = InMemoryCallRecordStorage::new();
     planes.calls = Arc::new(CallRecords::open(Box::new(records.clone()), 0));
-    bind(&planes, 9, "prefrontal-core").await;
+    bind(&planes, 9, "prefrontal").await;
     let pin = browser_status_pin(&planes).await;
     let journal_before = planes.browser.journal_export_for_test().await;
     let records_before = records.contents();
@@ -671,7 +671,7 @@ async fn fork_tool_call_writes_no_call_record_or_journal_row() {
 #[tokio::test]
 async fn fork_tool_call_leaves_absent_and_null_ids_unchanged() {
     let planes = planes(true);
-    bind(&planes, 9, "prefrontal-core").await;
+    bind(&planes, 9, "prefrontal").await;
     let mut request = json!({
         "name": "browser_use",
         "arguments": {"action": "status"},
