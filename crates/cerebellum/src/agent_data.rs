@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -83,10 +83,19 @@ impl Participant {
     }
 
     pub(crate) fn production() -> Self {
-        let path = cerebellum_core::platform_dirs::data_home().map(|home| {
-            cerebellum_core::format_floor::module_directory(&home)
-                .join("agent-data")
-                .join("cuts.json")
+        Self::with_data_home(cerebellum_core::platform_dirs::data_home().as_deref())
+    }
+
+    fn with_data_home(home: Option<&Path>) -> Self {
+        let path = home.map(|home| {
+            let directory =
+                cerebellum_core::format_floor::module_directory(home).join("agent-data");
+            // Backups look for this directory even before an agent move writes a checkpoint.
+            // Leave existing permissions alone; checkpoint writes still report storage errors.
+            if !directory.is_dir() {
+                let _ = cerebellum_core::private_fs::create_dir_all(&directory);
+            }
+            directory.join("cuts.json")
         });
         Self {
             path,

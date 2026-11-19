@@ -53,6 +53,38 @@ impl Drop for Scratch {
     }
 }
 
+#[test]
+fn production_startup_creates_private_backup_directory_without_touching_existing_one() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = Scratch::new();
+    let directory = scratch.0.join("cortexkit/cerebellum/agent-data");
+    assert!(!directory.exists());
+
+    Participant::with_data_home(Some(&scratch.0));
+    assert!(directory.is_dir(), "startup did not create {directory:?}");
+    assert!(directory.read_dir().unwrap().next().is_none());
+    #[cfg(unix)]
+    assert_eq!(
+        directory.metadata().unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+
+    let existing_record = directory.join("existing-record");
+    std::fs::write(&existing_record, b"keep").unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o710)).unwrap();
+
+    Participant::with_data_home(Some(&scratch.0));
+    assert_eq!(std::fs::read(&existing_record).unwrap(), b"keep");
+    #[cfg(unix)]
+    assert_eq!(
+        directory.metadata().unwrap().permissions().mode() & 0o777,
+        0o710
+    );
+}
+
 #[derive(Default)]
 struct FakeDoor {
     streams: Mutex<BTreeMap<String, Vec<u8>>>,
