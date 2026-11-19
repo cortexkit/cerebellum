@@ -1599,7 +1599,7 @@ async fn a_crash_after_successful_writes_still_answers_marked() {
     assert_eq!(
         planes.private_content.answer(&["unknown"], day_later)["private_content"],
         false,
-        "the window ends a day after the dead process started"
+        "the window ends a day after the dead process's marker was found"
     );
 }
 

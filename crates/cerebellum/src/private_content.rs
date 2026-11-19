@@ -246,14 +246,34 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// The in-use marker. A successor that finds it answers every query as marked
-/// until `fail_closed_until_ms`: this process may have delivered content whose
-/// marks never reached the file. Any field this build does not understand, or
-/// an unreadable marker, counts as 24 hours from when it was found, so the
-/// marker needs no format floor.
+/// for a while: this process may have delivered content whose marks never
+/// reached the file. A marker left by a running process means it stopped
+/// without a clean shutdown, however long ago it started, so the successor
+/// answers marked for at least 24 hours from when it found the marker. An
+/// unreadable marker counts the same way, so the marker needs no format floor.
 #[derive(Serialize, Deserialize)]
 struct Marker {
     started_ms: u64,
     fail_closed_until_ms: u64,
+    /// Written only by a clean shutdown that persisted every mark it made
+    /// while an inherited window was still open. The successor then honours
+    /// just the recorded window instead of starting a new one, so restarts
+    /// inside a window do not extend it for good. Builds that predate the
+    /// field ignore it and read the same recorded window.
+    #[serde(default, skip_serializing_if = "is_false")]
+    clean_shutdown: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl Marker {
+    /// The window every reader, old or new, derives from the stored fields.
+    fn recorded_until(&self) -> u64 {
+        self.fail_closed_until_ms
+            .max(self.started_ms.saturating_add(RETENTION_MS))
+    }
 }
 
 fn read_marker(path: &Path, now: u64) -> u64 {
@@ -261,18 +281,23 @@ fn read_marker(path: &Path, now: u64) -> u64 {
         Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
         Err(_) => now + RETENTION_MS,
         Ok(bytes) => match serde_json::from_slice::<Marker>(&bytes) {
-            Ok(marker) => marker
-                .fail_closed_until_ms
-                .max(marker.started_ms.saturating_add(RETENTION_MS)),
+            Ok(marker) if marker.clean_shutdown => marker.recorded_until(),
+            Ok(marker) => marker.recorded_until().max(now + RETENTION_MS),
             Err(_) => now + RETENTION_MS,
         },
     }
 }
 
-fn write_marker(path: &Path, started_ms: u64, fail_closed_until_ms: u64) -> io::Result<()> {
+fn write_marker(
+    path: &Path,
+    started_ms: u64,
+    fail_closed_until_ms: u64,
+    clean_shutdown: bool,
+) -> io::Result<()> {
     let bytes = serde_json::to_vec(&Marker {
         started_ms,
         fail_closed_until_ms,
+        clean_shutdown,
     })
     .expect("marker serializes");
     write_atomically(path, &bytes)
@@ -387,7 +412,10 @@ impl PrivateContent {
         };
         let marker = path.with_file_name(MARKER_NAME);
         let inherited = read_marker(&marker, now);
-        let marker_written = write_marker(&marker, now, now + RETENTION_MS).is_ok();
+        // Carry an inherited window in this process's own marker, so a crash
+        // inside it still fails closed for at least as long.
+        let marker_written =
+            write_marker(&marker, now, inherited.max(now + RETENTION_MS), false).is_ok();
         {
             let mut state = store.state.lock().unwrap();
             *state = State::new(now);
@@ -426,8 +454,11 @@ impl PrivateContent {
 
     /// Called by the draining (SIGTERM) teardown after the last reply. Removes
     /// the in-use marker only when every mark this process made reached the
-    /// file and no earlier unclean shutdown's window is still open; otherwise
-    /// the next start keeps answering everything marked.
+    /// file and no earlier unclean shutdown's window is still open. With every
+    /// mark persisted but a window open, it records the clean shutdown and
+    /// that window, so the next start keeps answering marked until the window
+    /// ends and no longer. Otherwise the running marker stays and the next
+    /// start treats it as a crash.
     pub(crate) fn shut_down_cleanly(&self) {
         self.shut_down_cleanly_at(crate::wall_clock_ms());
     }
@@ -437,7 +468,13 @@ impl PrivateContent {
             return;
         };
         let state = self.state.lock().unwrap();
-        if state.unpersisted || state.fails_closed(now) {
+        if state.unpersisted || state.write_failed || state.marker_missing || state.load_failed {
+            return;
+        }
+        if now < state.inherited_until_ms {
+            // A failed rewrite leaves the running marker, which reads as a
+            // crash: more conservative, never less.
+            let _ = write_marker(&marker, state.started_ms, state.inherited_until_ms, true);
             return;
         }
         let _ = fs::remove_file(&marker);
@@ -656,8 +693,11 @@ impl PrivateContent {
         let Some(marker) = self.marker_path() else {
             return;
         };
-        let started = self.state.lock().unwrap().started_ms;
-        let _ = write_marker(&marker, started, now + RETENTION_MS);
+        let (started, inherited) = {
+            let state = self.state.lock().unwrap();
+            (state.started_ms, state.inherited_until_ms)
+        };
+        let _ = write_marker(&marker, started, inherited.max(now + RETENTION_MS), false);
     }
 
     /// Writes the current document atomically. `failures` is the failure
@@ -679,8 +719,16 @@ impl PrivateContent {
         let marker_missing = self.state.lock().unwrap().marker_missing;
         if marker_missing {
             let marker = self.marker_path().expect("durable marker path");
-            let started = self.state.lock().unwrap().started_ms;
-            write_marker(&marker, started, started + RETENTION_MS)?;
+            let (started, inherited) = {
+                let state = self.state.lock().unwrap();
+                (state.started_ms, state.inherited_until_ms)
+            };
+            write_marker(
+                &marker,
+                started,
+                inherited.max(started + RETENTION_MS),
+                false,
+            )?;
             self.state.lock().unwrap().marker_missing = false;
         }
         let document = self.state.lock().unwrap().document.clone();
@@ -1156,6 +1204,113 @@ pub(crate) fn scope_union(planes: &Planes, scope: &str, parent: Option<&str>) ->
         scopes.push(parent.to_owned());
     }
     scopes
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch() -> Scratch {
+        let scratch = Scratch(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/scratch/private-content-marker-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )));
+        cerebellum_core::private_fs::create_dir_all(&scratch.0).unwrap();
+        scratch
+    }
+
+    fn marked(store: &PrivateContent, now: u64) -> bool {
+        store.answer(&["unmarked"], now)["private_content"] == true
+    }
+
+    const DAY: u64 = RETENTION_MS;
+
+    /// A process that ran for more than a day and then died without its
+    /// shutdown teardown may have delivered content whose mark never reached
+    /// the file. Its marker is past the deadline it wrote at startup, but it
+    /// still proves an unclean stop.
+    #[test]
+    fn a_marker_left_by_a_process_older_than_a_day_still_answers_marked() {
+        let scratch = scratch();
+        let path = scratch.0.join(FILE_NAME);
+        drop(PrivateContent::open_at(path.clone(), 1_000));
+        // No shutdown: the process died two days after it started.
+        let found = 1_000 + 2 * DAY;
+        let successor = PrivateContent::open_at(path, found);
+        assert!(marked(&successor, found));
+        assert!(marked(&successor, found + DAY - 1));
+        assert!(!marked(&successor, found + DAY));
+    }
+
+    /// A clean shutdown inside an inherited window records that window, and
+    /// the next start honours exactly it rather than opening a new day. A
+    /// crash after that start still extends the window from when its marker
+    /// is found.
+    #[test]
+    fn a_clean_shutdown_keeps_only_its_window_and_a_later_crash_extends_it() {
+        let scratch = scratch();
+        let path = scratch.0.join(FILE_NAME);
+        let marker = path.with_file_name(MARKER_NAME);
+        drop(PrivateContent::open_at(path.clone(), 1_000));
+        let second_start = 2_000;
+        let second = PrivateContent::open_at(path.clone(), second_start);
+        let window = second_start + DAY;
+        assert!(marked(&second, second_start));
+        second.shut_down_cleanly_at(second_start + 10);
+        let recorded: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(recorded["clean_shutdown"], true, "{recorded}");
+        assert_eq!(recorded["fail_closed_until_ms"], window, "{recorded}");
+
+        let third_start = window - 100;
+        let third = PrivateContent::open_at(path.clone(), third_start);
+        assert!(marked(&third, third_start));
+        assert!(
+            !marked(&third, window),
+            "a recorded clean shutdown must not open a new day"
+        );
+        // The third process dies inside the window.
+        drop(third);
+        let found = third_start + DAY / 2;
+        let fourth = PrivateContent::open_at(path, found);
+        assert!(marked(&fourth, window + 1));
+        assert!(marked(&fourth, found + DAY - 1));
+        assert!(!marked(&fourth, found + DAY));
+    }
+
+    /// A build from before the clean-shutdown field reads its marker with
+    /// this shape, ignoring unknown fields. It must derive the same window as
+    /// this build does from a clean-shutdown marker.
+    #[test]
+    fn an_older_reader_derives_the_same_window_from_a_clean_shutdown_marker() {
+        #[derive(Deserialize)]
+        struct OldMarker {
+            started_ms: u64,
+            fail_closed_until_ms: u64,
+        }
+        let scratch = scratch();
+        let path = scratch.0.join(FILE_NAME);
+        let marker = path.with_file_name(MARKER_NAME);
+        drop(PrivateContent::open_at(path.clone(), 1_000));
+        let second = PrivateContent::open_at(path, 5_000);
+        second.shut_down_cleanly_at(5_010);
+        let bytes = fs::read(&marker).unwrap();
+        let old: OldMarker = serde_json::from_slice(&bytes).unwrap();
+        let old_window = old
+            .fail_closed_until_ms
+            .max(old.started_ms.saturating_add(RETENTION_MS));
+        let later = 5_000 + DAY / 2;
+        assert_eq!(read_marker(&marker, later), old_window);
+        assert_eq!(old_window, 5_000 + DAY);
+    }
 }
 
 #[cfg(test)]
