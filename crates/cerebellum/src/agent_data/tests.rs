@@ -275,6 +275,7 @@ async fn round_trip_through_engram_preserves_marks_and_release_keeps_source_copy
     );
     let mut release = params();
     release["holder"] = json!("02020202020202020202020202020202");
+    release["holderBox"] = json!("0123456789abcdef0123456789abcdef");
     assert_eq!(
         call(&source, "agent_data.release", release.clone()).await,
         json!({"enforced":false})
@@ -480,6 +481,108 @@ async fn cut_steps_and_replays_survive_restart_and_checkpoint_failure_is_retryab
             .answer(&["public"], crate::wall_clock_ms())["private_content"],
         false
     );
+}
+
+fn pinned_release_vector_file(name: &str, sha256: &str) -> Value {
+    let bytes = cortexkit_role_agent_data::vectors::file(name).unwrap();
+    assert_eq!(
+        door::hex(&Sha256::digest(bytes.as_bytes())),
+        sha256,
+        "{name}"
+    );
+    serde_json::from_str(bytes).unwrap()
+}
+
+#[tokio::test]
+async fn release_vectors_validate_before_save_and_compare_holder_box_after_restart() {
+    let requests = pinned_release_vector_file(
+        "requests.json",
+        "1f09e1ce476f4db143536c9900fd7e9906460a3f839fd3928fa490cbd8a472b0",
+    );
+    let replies = pinned_release_vector_file(
+        "replies.json",
+        "7431aab0a16df7b36974d0ad0499b0a524dac2496d3786bc58a2030a8488366c",
+    );
+    let method = "agent_data.release";
+    let adapt = |section: &str, name: &str| {
+        let mut sample = requests[section]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|sample| sample["name"] == name)
+            .unwrap()
+            .clone();
+        assert_eq!(sample["method"], method);
+        // The published samples use other participants' ref kinds.
+        sample["params"]["refs"] = params()["refs"].clone();
+        sample
+    };
+    let legacy = adapt("requests", "release names the new holder");
+    let boxed = adapt("requests", "release names the new holder with a box id");
+    let malformed = adapt("refused", "release with malformed holderBox");
+    let expected = &replies["replies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|sample| sample["method"] == method && sample["reply"]["enforced"] == false)
+        .unwrap()["reply"];
+    let mut changed = boxed["params"].clone();
+    changed["holderBox"] = json!("fedcba9876543210fedcba9876543210");
+    let cut_id = legacy["params"]["cutId"].as_str().unwrap();
+    let cut = json!({"cutId":cut_id,"refs":params()["refs"]});
+
+    for (release, conflicts) in [
+        (&legacy["params"], &[&boxed["params"]][..]),
+        (&boxed["params"], &[&legacy["params"], &changed][..]),
+    ] {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("cuts.json");
+        let open = || {
+            Arc::new(Participant {
+                path: Some(path.clone()),
+                ..Participant::in_memory()
+            })
+        };
+        let mut source = Planes::new(Arc::new(HealthState::new()));
+        source.agent_data = open();
+        call(&source, "agent_data.prepare", cut.clone()).await;
+        call(&source, "agent_data.export", cut.clone()).await;
+        let before = std::fs::read(&path).unwrap();
+        let (ty, refusal) = wire(
+            &source,
+            facts("entorhinal"),
+            json!({"method":method,"params":malformed["params"]}),
+        )
+        .await;
+        assert_eq!(ty, FrameType::Error);
+        assert_eq!(refusal["code"], malformed["code"]);
+        assert!(refusal["message"].as_str().unwrap().contains("holderBox"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        assert_eq!(&call(&source, method, release.clone()).await, expected);
+        let saved = std::fs::read(&path).unwrap();
+        let checkpoint: Value = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(checkpoint["format_version"], 1);
+        // A request without holderBox must keep the old v1 shape, with no null field.
+        assert_eq!(
+            checkpoint["cuts"][cut_id]["replies"][method],
+            json!({"request":release,"reply":expected})
+        );
+
+        source.agent_data = open();
+        assert_eq!(&call(&source, method, release.clone()).await, expected);
+        for repeat in conflicts {
+            let (ty, refusal) = wire(
+                &source,
+                facts("entorhinal"),
+                json!({"method":method,"params":repeat}),
+            )
+            .await;
+            assert_eq!(ty, FrameType::Error, "{release} repeated as {repeat}");
+            assert_eq!(refusal["code"], "id_reused");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+    }
 }
 
 #[tokio::test]
