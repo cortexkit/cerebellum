@@ -1,5 +1,7 @@
 #[path = "tests/capture_audit_tests.rs"]
 mod capture_audit_tests;
+#[path = "tests/capture_cancel_tests.rs"]
+mod capture_cancel_tests;
 use crate::test_support::HANG_GUARD;
 #[tokio::test]
 async fn isolated_plane_without_profile_lifecycle_refuses_rebind_without_touching_data_home() {

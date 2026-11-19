@@ -1436,6 +1436,15 @@ impl CaptureModule {
                 );
             }
         };
+        // The launch runs on the blocking pool and cannot see a Cancel that
+        // arrives while it starts the browser. Nothing has been shown to the
+        // person yet, so a call cancelled meanwhile ends here.
+        if (call.cancelled)() {
+            let disposal = self.dispose(Some(browser), &placement).await;
+            return record
+                .with_deletion(disposal.deleted)
+                .ended("cancelled", None);
+        }
 
         let (browser, end) = self
             .hand_off(browser, request, &origin, &call.cancelled, handoff)
@@ -1631,9 +1640,23 @@ impl CaptureModule {
     ) {
         let deadline_ms = self.env.drive_deadline_ms;
         let login_url = request.login_url.clone();
+        let (browser, navigated) = on_browser(browser, move |browser| {
+            browser.navigate(&login_url, deadline_ms)
+        })
+        .await;
+        let Some(browser) = browser else {
+            return (None, Err("present"));
+        };
+        if navigated != Some(Ok(())) {
+            return (Some(browser), Err("present"));
+        }
+        // Navigation can outlast a Cancel; the window is not shown for a
+        // call that was cancelled meanwhile.
+        if cancelled() {
+            return (Some(browser), Ok(HandoffEnd::Cancelled));
+        }
         let opening_origin = origin.to_string();
         let (browser, opened) = on_browser(browser, move |browser| {
-            browser.navigate(&login_url, deadline_ms)?;
             browser.present(deadline_ms)?;
             let names = browser.cookie_names_for_origin(&opening_origin, deadline_ms)?;
             // Preserve the credential step even if sign-in finishes before the
@@ -1651,6 +1674,11 @@ impl CaptureModule {
             return (None, Err("present"));
         };
 
+        // The window is shown, but the caller has not been told it was
+        // handed over: a Cancel that came in meanwhile still ends the capture.
+        if cancelled() {
+            return (Some(browser), Ok(HandoffEnd::Cancelled));
+        }
         if let Some(handoff) = handoff {
             let (proceed, saved) = tokio::sync::oneshot::channel();
             let ready = CaptureHandoff {
