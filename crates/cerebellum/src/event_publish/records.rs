@@ -29,7 +29,8 @@ const MAX_BYTES: usize = 32 * 1024 * 1024;
 // At capacity we reject new records rather than shorten an existing promise.
 // Nothing else delivers a rejected record, so the display module never shows
 // that call; the displayRecordsDroppedStoreFull health counter counts them.
-// Size both bounds for a 24-hour outage at the fleet's call rate.
+// Both bounds are meant to hold a 24-hour outage at the call rate measured
+// in the comment on MAX_RECORDS.
 const HEADER_BYTES: usize = 16;
 
 struct Entry {

@@ -34,8 +34,8 @@ async fn authenticated(connection_file: &std::path::Path) -> Option<TcpStream> {
 /// client, and a claim would cost a mint on the module connection for each
 /// refresh. The connection never leaves this function and carries nothing but
 /// `catalog.list`: a route opened on it would be stamped as an unattested
-/// direct client, so anything that acts as this module needs its own claimed
-/// connection instead.
+/// direct client, so anything that acts as this module needs a connection that
+/// first presents a claim, which tells the daemon which module it acts for.
 async fn read_catalog_unclaimed(
     connection_file: &std::path::Path,
 ) -> Option<Vec<subc_control::CatalogEntry>> {
