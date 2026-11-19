@@ -579,6 +579,119 @@ async fn mismatched_schema_pins_are_refused_before_dispatch() {
     assert_eq!(body(&unknown)["code"], "unknown_tool");
 }
 
+async fn browser_status_pin(planes: &Planes) -> String {
+    let answer = body(&catalog(planes, json!({})).await);
+    let catalog: CatalogAnswer = serde_json::from_value(answer).unwrap();
+    let tool = catalog
+        .tools
+        .iter()
+        .find(|t| t.name == "browser_use")
+        .unwrap();
+    SchemaPin::new(&tool.name, &tool.schema_digest, tool.semantics)
+        .encode()
+        .unwrap()
+}
+
+fn assert_fork_refusal(reply: &Frame, case: &str) {
+    assert_eq!(reply.header.ty, FrameType::Error, "{case}: {}", body(reply));
+    assert_eq!(
+        body(reply),
+        json!({
+            "code": "fork_calls_unsupported",
+            "message": "this provider does not serve fork tool calls",
+            "detail": {"field": "fork_id", "retryable": false},
+        }),
+        "{case}"
+    );
+}
+
+#[tokio::test]
+async fn fork_tool_call_vectors_are_refused() {
+    for (host, sample) in [
+        (
+            "claude-code",
+            include_str!("../vectors/fork-tools-v1/claude-code.json"),
+        ),
+        (
+            "opencode2",
+            include_str!("../vectors/fork-tools-v1/opencode2.json"),
+        ),
+        ("pi", include_str!("../vectors/fork-tools-v1/pi.json")),
+    ] {
+        let planes = planes(true);
+        bind(&planes, 9, "prefrontal-core").await;
+        let sample: Value = serde_json::from_str(sample).unwrap();
+        let mut request = sample["tool.call"]["request"].clone();
+        let original = exchange(&planes, 9, request.clone()).await;
+        request["name"] = json!("browser_use");
+        request["arguments"] = json!({"action": "status"});
+        request["schema_pin"] = json!(browser_status_pin(&planes).await);
+        let browser = exchange(&planes, 9, request).await;
+        assert_fork_refusal(&original, &format!("{host} original"));
+        assert_fork_refusal(&browser, &format!("{host} browser_use"));
+    }
+}
+
+#[tokio::test]
+async fn fork_tool_call_writes_no_call_record_or_journal_row() {
+    use cerebellum::journal::call_records::{CallRecords, InMemoryCallRecordStorage};
+
+    let mut planes = planes(true);
+    let records = InMemoryCallRecordStorage::new();
+    planes.calls = Arc::new(CallRecords::open(Box::new(records.clone()), 0));
+    bind(&planes, 9, "prefrontal-core").await;
+    let pin = browser_status_pin(&planes).await;
+    let journal_before = planes.browser.journal_export_for_test().await;
+    let records_before = records.contents();
+    let reply = exchange(
+        &planes,
+        9,
+        json!({
+            "name": "browser_use",
+            "arguments": {"action": "status"},
+            "schema_pin": pin,
+            "call_key": "fork:browser-status",
+            "fork_id": "fork_11111111111111111111111111111111",
+            "preset": "worker",
+        }),
+    )
+    .await;
+    assert_eq!(
+        planes.browser.journal_export_for_test().await,
+        journal_before
+    );
+    assert!(
+        records.contents() == records_before,
+        "fork call wrote a call record: {}",
+        body(&reply)
+    );
+    assert_fork_refusal(&reply, "keyed browser status");
+}
+
+#[tokio::test]
+async fn fork_tool_call_leaves_absent_and_null_ids_unchanged() {
+    let planes = planes(true);
+    bind(&planes, 9, "prefrontal-core").await;
+    let mut request = json!({
+        "name": "browser_use",
+        "arguments": {"action": "status"},
+        "schema_pin": browser_status_pin(&planes).await,
+    });
+    let ordinary = exchange(&planes, 9, request.clone()).await;
+    assert_eq!(ordinary.header.ty, FrameType::Response);
+    assert_eq!(
+        body(&ordinary)["structuredContent"]["outcome"],
+        "no_session"
+    );
+    request["fork_id"] = Value::Null;
+    let null_fork_id = exchange(&planes, 9, request).await;
+    assert_eq!(null_fork_id.header.ty, FrameType::Response);
+    assert_eq!(
+        body(&null_fork_id)["structuredContent"]["detail"],
+        json!({"field": "fork_id", "reason_code": "unknown_field"})
+    );
+}
+
 #[tokio::test]
 async fn another_principals_key_is_an_unknown_call() {
     let planes = planes(true);
