@@ -1345,47 +1345,32 @@ impl CaptureModule {
                 "remedy": remedy,
             })
         };
-        if self.env.fs.prepare_root(&root).is_err() {
-            return record.refused(
-                "capture_location_not_excluded",
-                not_excluded("capture_directory_unusable"),
-            );
-        }
-        // Read first, and add an exclusion only when the root is not already
-        // excluded. The per-user temporary directory is excluded by Time
-        // Machine's own rules, and `tmutil addexclusion` was measured at about
-        // 11 s on this machine while `isexcluded` answers in under 1.5 s, so
-        // adding unconditionally made every capture outrun its deadline on an
-        // exclusion that was already in place.
-        match self.env.exclusion.is_excluded(&root) {
-            Ok(true) => {}
-            Ok(false) => {
-                if let Err(error) = self.env.exclusion.add_exclusion(&root) {
-                    return record.refused(
-                        "capture_location_not_excluded",
-                        not_excluded(error.as_str()),
-                    );
-                }
-                match self.env.exclusion.is_excluded(&root) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return record
-                            .refused("capture_location_not_excluded", not_excluded("included"))
-                    }
-                    Err(error) => {
-                        return record.refused(
-                            "capture_location_not_excluded",
-                            not_excluded(error.as_str()),
-                        )
-                    }
-                }
+        // Each step below can run `tmutil` for seconds, so the sequence runs
+        // on the blocking pool rather than holding an async worker.
+        let (fs, exclusion, probe_root) = (
+            Arc::clone(&self.env.fs),
+            Arc::clone(&self.env.exclusion),
+            root.clone(),
+        );
+        let proved = tokio::task::spawn_blocking(move || {
+            prove_excluded(fs.as_ref(), exclusion.as_ref(), &probe_root)
+        })
+        .await;
+        match proved {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => {
+                return record.refused("capture_location_not_excluded", not_excluded(reason))
             }
-            Err(error) => {
+            // A check that did not finish proved nothing.
+            Err(_) => {
                 return record.refused(
                     "capture_location_not_excluded",
-                    not_excluded(error.as_str()),
+                    not_excluded(ToolError::Failed.as_str()),
                 )
             }
+        }
+        if (call.cancelled)() {
+            return record.ended("cancelled", None);
         }
 
         let capture_id = new_capture_id();
@@ -1915,6 +1900,33 @@ impl VerificationRecord {
     /// The last failure, when the heuristic held but no verification passed.
     fn last_failure(&self) -> Option<VerificationFailure> {
         self.last.as_ref().map(|(_, _, failure)| *failure)
+    }
+}
+
+/// Prepare the capture root and prove the backup tool excludes it, or name
+/// why it could not be proved. Blocking: each step may run a subprocess.
+///
+/// The root is read first, and an exclusion is added only when it is not
+/// already excluded. The per-user temporary directory is excluded by Time
+/// Machine's own rules, and `tmutil addexclusion` was measured at about 11 s
+/// on this machine while `isexcluded` answers in under 1.5 s, so adding
+/// unconditionally made every capture outrun its deadline on an exclusion
+/// that was already in place.
+fn prove_excluded(
+    fs: &dyn CaptureFs,
+    exclusion: &dyn BackupExclusion,
+    root: &Path,
+) -> Result<(), &'static str> {
+    if fs.prepare_root(root).is_err() {
+        return Err("capture_directory_unusable");
+    }
+    if exclusion.is_excluded(root).map_err(ToolError::as_str)? {
+        return Ok(());
+    }
+    exclusion.add_exclusion(root).map_err(ToolError::as_str)?;
+    match exclusion.is_excluded(root).map_err(ToolError::as_str)? {
+        true => Ok(()),
+        false => Err("included"),
     }
 }
 

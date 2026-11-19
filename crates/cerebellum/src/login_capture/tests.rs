@@ -10,8 +10,8 @@ use subc_protocol::Principal;
 use crate::test_support::HANG_GUARD;
 
 use super::test_support::{
-    contains_bytes, fixture, fixture_with, BrowserScript, FakeEntry, FakeReply, Fixture,
-    ScriptedVerification, PLANTED_VALUE, ROOT,
+    contains_bytes, fixture, fixture_with, BlockingGate, BrowserScript, FakeEntry, FakeReply,
+    Fixture, ScriptedVerification, PLANTED_VALUE, ROOT,
 };
 use super::vault::VaultReachError;
 use super::*;
@@ -382,6 +382,39 @@ async fn an_included_capture_directory_refuses_before_any_file_or_profile_exists
         "refused:capture_location_not_excluded"
     );
     assert_eq!(outcome.journal.deletion_succeeded, None);
+}
+
+/// `tmutil` can take seconds, and the check must not hold the async worker
+/// meanwhile: on this single-threaded runtime another task still runs while
+/// the exclusion check is held, and opens it before the watchdog thread
+/// would. Run inline, the check would block the only thread until the
+/// watchdog let it go, and the other task would find the gate already open.
+#[tokio::test]
+async fn the_exclusion_check_leaves_the_async_worker_free() {
+    let fixture = fixture();
+    let gate = Arc::new(BlockingGate::default());
+    *fixture.exclusion.probe_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let watchdog = Arc::clone(&gate);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        watchdog.open();
+    });
+    let other_task = async {
+        while !gate.entered() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let ran_while_held = !gate.is_open();
+        gate.open();
+        ran_while_held
+    };
+    let request = ollama();
+    let ((outcome, _), ran_while_held) =
+        tokio::join!(capture(&fixture, &request, allow()), other_task);
+    assert!(
+        ran_while_held,
+        "the exclusion check blocked the runtime's only thread"
+    );
+    assert_eq!(outcome.reply["outcome"], "captured", "{}", outcome.reply);
 }
 
 #[tokio::test]

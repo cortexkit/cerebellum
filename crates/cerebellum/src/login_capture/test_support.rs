@@ -256,6 +256,8 @@ pub(crate) struct FakeExclusion {
     pub(crate) added: std::sync::atomic::AtomicBool,
     pub(crate) add_fails: Mutex<Option<ToolError>>,
     pub(crate) events: Events,
+    /// When set, each `is_excluded` waits here before it answers.
+    pub(crate) probe_gate: Mutex<Option<Arc<BlockingGate>>>,
 }
 
 impl BackupExclusion for FakeExclusion {
@@ -276,6 +278,10 @@ impl BackupExclusion for FakeExclusion {
 
     fn is_excluded(&self, _path: &Path) -> Result<bool, ToolError> {
         self.events.push("tmutil_isexcluded");
+        let gate = self.probe_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.pass();
+        }
         if self.added.load(Ordering::SeqCst) {
             if let Some(answer) = *self.answer_after_add.lock().unwrap() {
                 return answer;
@@ -489,6 +495,10 @@ impl BlockingGate {
     pub(crate) fn entered(&self) -> bool {
         self.state.lock().unwrap().0
     }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.state.lock().unwrap().1
+    }
 }
 
 impl CaptureLauncher for FakeLauncher {
@@ -701,6 +711,7 @@ fn fixture_configuring_launcher(
         added: std::sync::atomic::AtomicBool::new(false),
         add_fails: Mutex::new(None),
         events: events.clone(),
+        probe_gate: Mutex::new(None),
     });
     let launcher = Arc::new(FakeLauncher {
         script: Mutex::new(BrowserScript::default()),
