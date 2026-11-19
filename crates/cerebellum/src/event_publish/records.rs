@@ -21,8 +21,9 @@ const CONFIRMED_MS: u64 = 10 * 60 * 1_000;
 const MAX_RECORDS: usize = 20_000;
 const MAX_BYTES: usize = 32 * 1024 * 1024;
 
-// Older builds ignore this optional directory, so its format does not
-// need a floor that blocks rollback to those builds.
+// Older builds ignore this optional directory, so its on-disk format does
+// not need to stay readable by them, and rolling back to one stays a plain
+// binary swap.
 // Each file holds two little-endian u64 millisecond timestamps (zero for no
 // confirmation), then the DisplayWrite JSON. Confirming does not grow the file.
 // At capacity we reject new records rather than shorten an existing promise.
