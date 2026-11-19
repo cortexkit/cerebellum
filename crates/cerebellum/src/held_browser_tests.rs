@@ -23,6 +23,7 @@ struct Page {
     inputs: AtomicUsize,
     private_redirect: std::sync::atomic::AtomicBool,
     gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    navigation_started: tokio::sync::Notify,
     url: Mutex<String>,
 }
 
@@ -51,6 +52,7 @@ impl OwnedBrowserProcess for Browser {
     ) -> Result<(), NavigationDriveError> {
         let gate = self.0.gate.lock().unwrap().clone();
         if let Some(gate) = gate {
+            self.0.navigation_started.notify_one();
             tokio::runtime::Handle::current()
                 .block_on(gate.acquire())
                 .unwrap()
@@ -163,11 +165,12 @@ async fn fixture() -> (
     Arc<Page>,
     journal::call_records::InMemoryCallRecordStorage,
 ) {
-    fixture_with_consent(true).await
+    fixture_with_consent(true, Planes::short_test_browser_config()).await
 }
 
 async fn fixture_with_consent(
     detached: bool,
+    config: BrowserConfig,
 ) -> (
     Planes,
     tests::ScriptedConsent,
@@ -181,7 +184,11 @@ async fn fixture_with_consent(
         consent.raises("browser-card");
     }
     let mut planes = attach_consent(
-        isolated_test_planes(&Arc::new(HealthState::new())),
+        Planes::with_browser_config_journaling(
+            Arc::new(HealthState::new()),
+            Some(config),
+            JournalPersistence::Isolated,
+        ),
         &consent,
     );
     let storage = journal::call_records::InMemoryCallRecordStorage::new();
@@ -697,7 +704,8 @@ fn browser_late_approval_classification_keeps_refs_but_never_image_coordinates()
 
 #[tokio::test]
 async fn direct_navigation_already_runs_when_approval_arrives_in_call() {
-    let (planes, consent, page, _) = fixture_with_consent(false).await;
+    let (planes, consent, page, _) =
+        fixture_with_consent(false, Planes::short_test_browser_config()).await;
     consent.script.then(
         cingulate_client::wire::CONSENT_AWAIT,
         cingulate_client::Reply::Result(answered("browser-card", "allow_30m")),
@@ -712,7 +720,8 @@ async fn direct_navigation_already_runs_when_approval_arrives_in_call() {
 
 #[tokio::test]
 async fn direct_coordinate_click_does_not_run_after_waiting_for_approval() {
-    let (planes, consent, page, _) = fixture_with_consent(false).await;
+    let (planes, consent, page, _) =
+        fixture_with_consent(false, Planes::short_test_browser_config()).await;
     consent.script.then(
         cingulate_client::wire::CONSENT_AWAIT,
         cingulate_client::Reply::Result(answered("browser-card", "allow_30m")),
@@ -751,7 +760,16 @@ async fn queued_fixture(
     Arc<Page>,
     Arc<tokio::sync::Semaphore>,
 ) {
-    let (mut planes, consent, page, _) = fixture().await;
+    let (mut planes, consent, page, _) = fixture_with_consent(
+        true,
+        BrowserConfig {
+            // Held calls don't renew the browser's idle lease. Keep the mock
+            // session live throughout the queue test, even if approval is slow.
+            browser_idle_timeout_ms: 60 * 60 * 1_000,
+            ..Planes::short_test_browser_config()
+        },
+    )
+    .await;
     planes.browser_resumes = Arc::new(browser_held::Tasks::new(per_head, global));
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     *page.gate.lock().unwrap() = Some(gate.clone());
@@ -767,14 +785,17 @@ async fn queued_fixture(
         );
     }
     consent.feed(json!([answered("browser-card", "allow_30m")]));
-    let _ = late(&planes, 9).await;
-    tokio::time::timeout(HANG_GUARD, async {
-        while planes.browser_resumes.counts() != (3, 1) {
-            tokio::task::yield_now().await;
-        }
+    let ready = tokio::time::timeout(HANG_GUARD, async {
+        let _ = late(&planes, 9).await;
+        page.navigation_started.notified().await;
     })
-    .await
-    .expect("one continuation runs while the rest wait in the bounded task queue");
+    .await;
+    let counts = planes.browser_resumes.counts();
+    if ready.is_err() || counts != (3, 1) {
+        // Unblock the mock before unwinding so runtime shutdown can join it.
+        gate.add_permits(3);
+        panic!("expected one continuation at the browser and two waiting in the bounded task queue; readiness: {ready:?}, counts (total, active): {counts:?}");
+    }
     (planes, consent, page, gate)
 }
 
