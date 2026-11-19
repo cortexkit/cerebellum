@@ -275,6 +275,7 @@ async fn an_action_with_a_drawn_badge_is_sent_when_the_badge_arrives_and_not_bef
             let mut state = desk.state();
             state.application_hit = Some((BUTTONS[0].0, Some(grant().pid)));
             state.element_windows.insert(BUTTONS[0].0, 77);
+            state.window_frames.insert(77, [100.0, 50.0, 1000.0, 600.0]);
         }
         let base = plane(&desk);
         let management = granted_management().await;
@@ -325,6 +326,48 @@ async fn an_action_with_a_drawn_badge_is_sent_when_the_badge_arrives_and_not_bef
             sent[0] - start
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_point_press_rechecks_its_imaged_window_after_the_badge_wait() {
+    let desk = desk();
+    {
+        let mut state = desk.state();
+        state.application_hit = Some((BUTTONS[0].0, Some(grant().pid)));
+        state.element_windows.insert(BUTTONS[0].0, 77);
+        state.window_frames.insert(77, [100.0, 50.0, 1000.0, 600.0]);
+    }
+    let base = plane(&desk);
+    let management = granted_management().await;
+    let read = serve_with(
+        &base,
+        &management,
+        CancelHandle::pending(),
+        "computer.read_state",
+        json!({"target": TARGET_BUNDLE_ID, "include_image": true}),
+        capturing(),
+    )
+    .await;
+    let image = read["image"]["image_id"].as_str().unwrap();
+    let (cursor, mut pictures) = Coordinator::channel();
+    let plane = base.with_cursor(cursor);
+    let moved = desk.clone();
+    desk.state().on_cursor_frame = Some(support::computer::DeskHook(Arc::new(move || {
+        let mut state = moved.state();
+        assert_eq!(state.hit_scopes.len(), 1, "the point was already resolved");
+        state.window_frames.remove(&77);
+    })));
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_point",
+        json!({"image_id": image, "x": 625, "y": 125}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "state_changed_by_person", "{reply}");
+    assert_eq!(reply["reason"], "window_changed", "{reply}");
+    assert!(picture(&mut pictures).await.label.is_some());
+    assert!(desk.state().presses.is_empty());
 }
 
 /// With no badge to draw, an action is sent at once: the badge is switched

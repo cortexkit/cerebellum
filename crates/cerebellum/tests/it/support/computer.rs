@@ -775,6 +775,7 @@ pub struct DeskState {
     /// The window-server number of the window each element sits in. An
     /// element missing here is one whose window cannot be established.
     pub element_windows: std::collections::HashMap<u64, u32>,
+    pub window_frames: std::collections::HashMap<u32, [f64; 4]>,
     /// The window element (a token) each element sits in, as a badge's
     /// window read finds it; `cursor_frames` gives its frame and
     /// `element_windows` its window-server number. An element missing here
@@ -880,6 +881,7 @@ impl Desk {
             system_wide_hit: None,
             system_wide_hits_at: Vec::new(),
             element_windows: std::collections::HashMap::new(),
+            window_frames: std::collections::HashMap::new(),
             cursor_windows: std::collections::HashMap::new(),
             focused_cursor_window: None,
             minimized_windows: std::collections::HashSet::new(),
@@ -987,6 +989,13 @@ impl AppStateSource for Desk {
 
     fn visible_window_numbers(&self, _: &ProcessGrant) -> Option<Vec<u32>> {
         self.state().visible_windows.clone()
+    }
+
+    fn window_frame(&self, target: &ProcessGrant, window_number: u32) -> Option<[f64; 4]> {
+        if target.pid != grant().pid {
+            return None;
+        }
+        self.state().window_frames.get(&window_number).copied()
     }
 
     fn watch_cursor_window(

@@ -131,6 +131,7 @@ pub(super) struct FrontedPress<'a> {
     pub(super) grant: ProcessGrant,
     pub(super) element_id: String,
     pub(super) handle: ElementHandle,
+    pub(super) imaged_window: Option<ImagedWindow>,
     /// What the hit test of a point press read, carried to the press's row.
     pub(super) reads: Option<&'static str>,
     pub(super) gate: Arc<BadgeGate>,
@@ -157,6 +158,7 @@ where
     conversation_key: &'a str,
     grant: &'a ProcessGrant,
     steps: &'a [PressStep],
+    imaged_window: Option<ImagedWindow>,
     /// One journal per step, each finished only after the restore decision
     /// so its row records how the front ended.
     journals: Vec<ElementJournal<'a, R, T, S>>,
@@ -401,6 +403,7 @@ where
             self.grant,
             &pressed.element_id,
             &pressed.handle,
+            self.imaged_window.take(),
         );
         if self.gate.refused_for_end() {
             reply = cancelled_before_dispatch_reply();
@@ -566,6 +569,7 @@ where
             grant,
             element_id,
             handle,
+            imaged_window,
             reads,
             gate,
             work,
@@ -664,6 +668,7 @@ where
                 conversation_key: &conversation_key,
                 grant: &grant,
                 steps: &steps,
+                imaged_window,
                 journals,
                 held: &held,
                 cancel: &cancel,

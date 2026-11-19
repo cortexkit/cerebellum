@@ -140,7 +140,7 @@ fn after_send() -> Vec<RawElement> {
 }
 
 fn desk() -> Desk {
-    Desk::new(window_and_menus())
+    let desk = Desk::new(window_and_menus())
         .with_element(
             10,
             DeskElement {
@@ -168,7 +168,11 @@ fn desk() -> Desk {
                 applies_writes: true,
                 ..DeskElement::default()
             },
-        )
+        );
+    desk.state()
+        .window_frames
+        .insert(77, [100.0, 50.0, 1000.0, 600.0]);
+    desk
 }
 
 /// The ids of a read, by the label that follows each.
@@ -1415,6 +1419,43 @@ async fn a_point_is_hit_tested_in_its_own_application_and_pressed() {
     );
     assert_eq!(ids(&reply, "added").len(), 1, "{reply}");
     assert!(plane.result_schema_findings().is_empty());
+}
+
+#[tokio::test]
+async fn a_point_press_refuses_when_its_imaged_window_moves_over_the_point() {
+    let desk = desk();
+    {
+        let mut state = desk.state();
+        state.frontmost = Some(999);
+        state.window_frames.insert(77, [100.0, 50.0, 1000.0, 600.0]);
+        state.application_hit = Some((10, Some(grant().pid)));
+        state.element_windows.extend([(10, 77), (60, 77)]);
+        let button = DeskElement {
+            facts: facts("AXButton", &["AXPress"]),
+            ..DeskElement::default()
+        };
+        state.elements.insert(60, button);
+    }
+    let plane = plane(&desk);
+    let management = granted_management().await;
+    let image_id = read_with_image(&plane, &management).await;
+    {
+        let mut state = desk.state();
+        // The old desktop point is still in window 77, now on another button.
+        state.window_frames.insert(77, [125.0, 50.0, 1000.0, 600.0]);
+        state.application_hit = Some((60, Some(grant().pid)));
+    }
+    let reply = serve(
+        &plane,
+        &management,
+        "computer.press_point",
+        json!({"image_id": image_id, "x": 625, "y": 125}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "state_changed_by_person", "{reply}");
+    assert_eq!(reply["reason"], "window_changed", "{reply}");
+    assert!(desk.state().presses.is_empty());
+    assert!(desk.state().hit_scopes.is_empty());
 }
 
 #[tokio::test]

@@ -504,6 +504,11 @@ pub trait AppStateSource: Send + Sync {
         None
     }
 
+    /// Desktop frame of this exact window number, if owned by the target.
+    fn window_frame(&self, _target: &ProcessGrant, _window_number: u32) -> Option<[f64; 4]> {
+        None
+    }
+
     /// A point in a target window not hidden by another app's normal window.
     /// An exact point wins; otherwise the centre of the element frame's
     /// visible part; with neither, the middle of the window's content.

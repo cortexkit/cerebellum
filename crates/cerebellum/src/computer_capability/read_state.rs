@@ -547,9 +547,13 @@ where
                 // not remembered, and such an image refuses every coordinate
                 // action rather than acting on an unconfirmed window.
                 let image_id = match image.window_id.parse::<u32>() {
-                    Ok(window_number) if window_number != 0 => {
-                        sessions.register_window_image(&conversation_key, registered, window_number)
-                    }
+                    Ok(window_number) if window_number != 0 => sessions
+                        .register_framed_window_image(
+                            &conversation_key,
+                            registered,
+                            window_number,
+                            image.window_frame,
+                        ),
                     _ => sessions.register_image(&conversation_key, registered),
                 };
                 reply["image"] = json!({
