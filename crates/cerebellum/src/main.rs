@@ -56,8 +56,7 @@ fn agent_cursor() {
     const _: () = assert!(
         cerebellum_computer::cursor::AVATAR_SIZE as usize == cerebellum_macos::AVATAR_PIXELS
     );
-    let (sender, receiver) = std::sync::mpsc::sync_channel(32);
-    std::thread::spawn(move || {
+    let read = |sender: cerebellum_macos::OverlaySender| {
         use cerebellum_computer::pointer_query::{
             answer_prepare_request, answer_request, PrepareRequest, Request, QUERY_TIMEOUT,
         };
@@ -253,9 +252,9 @@ fn agent_cursor() {
             };
             let _ = sender.try_send(message);
         }
-    });
+    };
     cerebellum_macos::run_agent_cursor(
-        receiver,
+        read,
         cerebellum_macos::CursorMotion {
             duration_ms: cerebellum_computer::cursor::duration_ms,
             position: cerebellum_computer::cursor::position,

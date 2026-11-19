@@ -69,7 +69,7 @@ use subc_protocol::{Frame, FrameType, Principal};
 
 mod browser_resume;
 mod late;
-pub(crate) use browser_resume::BrowserResume;
+pub(crate) use browser_resume::{BrowserHold, BrowserResume};
 pub use late::{ConsentEnding, HandoffEnding, HeldHandoff};
 
 /// The file name under the journal data home.
@@ -784,6 +784,7 @@ type Key = (String, String);
 #[derive(Debug)]
 struct Entry {
     browser_resume: Option<BrowserResume>,
+    browser_hold: Option<BrowserHold>,
     resumed_result: bool,
     consent_ended: bool,
     // Capture can start depositing after its held reply. Process-local only:
@@ -913,9 +914,14 @@ impl CallRecords {
     /// The operator's records under the cerebellum data home, beside the audit
     /// journal so they share its backup enrolment.
     pub fn open_durable(now_ms: u64) -> Self {
+        let events = Arc::new(crate::event_publish::Publisher::production());
         match cerebellum_core::journal::journal_data_path(CALL_RECORD_FILE) {
-            Ok(path) => Self::open(Box::new(FilesystemCallRecordStorage::new(path)), now_ms),
-            Err(error) => Self::broken(CallRecordError::Unreadable(format!("{error:?}"))),
+            Ok(path) => Self::open_with_events(
+                Box::new(FilesystemCallRecordStorage::new(path)),
+                now_ms,
+                events,
+            ),
+            Err(error) => Self::broken(CallRecordError::Unreadable(format!("{error:?}")), events),
         }
     }
 
@@ -924,10 +930,10 @@ impl CallRecords {
         Self::open(Box::new(InMemoryCallRecordStorage::new()), 0)
     }
 
-    fn broken(error: CallRecordError) -> Self {
+    fn broken(error: CallRecordError, events: Arc<crate::event_publish::Publisher>) -> Self {
         Self {
             display: std::sync::OnceLock::new(),
-            events: Arc::default(),
+            events,
             storage: Box::new(InMemoryCallRecordStorage::new()),
             inner: Mutex::new(Inner {
                 broken: Some(error),
@@ -962,6 +968,14 @@ impl CallRecords {
     /// A crashed record can be reconciled in memory again on the next start
     /// without rewriting the file.
     pub fn open(storage: Box<dyn CallRecordStorage>, now_ms: u64) -> Self {
+        Self::open_with_events(storage, now_ms, Arc::default())
+    }
+
+    fn open_with_events(
+        storage: Box<dyn CallRecordStorage>,
+        now_ms: u64,
+        events: Arc<crate::event_publish::Publisher>,
+    ) -> Self {
         let loaded = storage.load().and_then(|bytes| match bytes {
             None => Ok(None),
             Some(bytes) if bytes.is_empty() => Ok(None),
@@ -971,7 +985,7 @@ impl CallRecords {
             Ok(Some((version, records))) => (records, true, version),
             Ok(None) => (Vec::new(), false, ORDINARY_CALL_RECORD_VERSION),
             Err(error) => {
-                let mut broken = Self::broken(error);
+                let mut broken = Self::broken(error, events);
                 broken.storage = storage;
                 return broken;
             }
@@ -1001,6 +1015,7 @@ impl CallRecords {
                 key,
                 Entry {
                     browser_resume: None,
+                    browser_hold: None,
                     resumed_result: false,
                     consent_ended: false,
                     held_dispatched: false,
@@ -1016,7 +1031,7 @@ impl CallRecords {
         }
         let records = Self {
             display: std::sync::OnceLock::new(),
-            events: Arc::default(),
+            events,
             storage,
             inner: Mutex::new(inner),
         };
@@ -1251,6 +1266,7 @@ impl CallRecords {
         }
         let entry = Entry {
             browser_resume: None,
+            browser_hold: None,
             resumed_result: false,
             consent_ended: false,
             held_dispatched: false,
@@ -1304,7 +1320,7 @@ impl CallRecords {
             .as_ref()
             .is_some_and(|held| held.is_consent() && matches!(held.phase, late::Phase::Pending))
         {
-            entry.browser_resume = None;
+            entry.clear_browser_request();
         }
         let record = entry.record.clone();
         let _ = self.write(inner, &record, now_ms);
@@ -1338,7 +1354,7 @@ impl CallRecords {
         let Some(entry) = inner.entries.get_mut(&ticket.key) else {
             return;
         };
-        entry.browser_resume = None;
+        entry.clear_browser_request();
         if entry.record.outcome.as_deref()
             == Some(cortexkit_role_tool_provider::late_results::reasons::SCOPE_ENDED)
         {
@@ -1404,7 +1420,7 @@ impl CallRecords {
         let mut freed = 0;
         for entry in inner.entries.values_mut() {
             if entry.conversation_key == conversation_key {
-                entry.browser_resume = None;
+                entry.clear_browser_request();
             }
             if entry.conversation_key == conversation_key && entry.reply.is_some() {
                 entry.reply = None;

@@ -27,6 +27,12 @@ fn defaults(status: ConfigStatus) -> ConfigView {
 }
 
 #[test]
+fn managed_settings_schema_passes_canonical_validation() {
+    let declaration = config_declaration(Path::new("/fixtures/cerebellum.jsonc")).unwrap();
+    Schema::new(declaration.schema).unwrap().digest().unwrap();
+}
+
+#[test]
 fn schema_and_defaults_are_accepted() {
     let declaration = config_declaration(Path::new("/fixtures/cerebellum.jsonc")).unwrap();
     Schema::new(declaration.schema).unwrap();

@@ -143,15 +143,20 @@ impl ControlRequests {
         request: &impl serde::Serialize,
         deadline: Duration,
     ) -> Option<ControlAnswer> {
-        self.request_with_version(writer, request, deadline, subc_protocol::PROTOCOL_VERSION)
-            .await
+        self.request_with_version(
+            writer,
+            request,
+            Some(deadline),
+            subc_protocol::PROTOCOL_VERSION,
+        )
+        .await
     }
 
     pub(crate) async fn request_with_version(
         &self,
         writer: &mpsc::Sender<Frame>,
         request: &impl serde::Serialize,
-        deadline: Duration,
+        deadline: Option<Duration>,
         ver: u8,
     ) -> Option<ControlAnswer> {
         let body = serde_json::to_vec(request).ok()?;
@@ -182,24 +187,15 @@ impl ControlRequests {
             corr,
             body,
         )
-        .ok();
-        let answer = match frame {
-            Some(frame) => tokio::time::timeout(deadline, async {
-                writer.send(frame).await.ok()?;
-                answer.await.ok()
-            })
-            .await
-            .ok()
-            .flatten(),
-            None => None,
+        .ok()?;
+        let wait = async {
+            writer.send(frame).await.ok()?;
+            answer.await.ok()
         };
-        // Forget the question whether or not it was answered, so an answer
-        // arriving after the deadline finds nobody and is dropped.
-        self.pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&corr);
-        answer
+        match deadline {
+            Some(deadline) => tokio::time::timeout(deadline, wait).await.ok().flatten(),
+            None => wait.await,
+        }
     }
 
     /// Hand an answer that arrived on channel 0 to whoever asked. Returns

@@ -472,8 +472,8 @@ async fn bus_notice_waits_for_flush_and_failure_leaves_reply_and_direct_display_
                 body
             );
             {
-                let direct = display.writes.lock().unwrap();
-                let bus = fake.writes.lock().unwrap();
+                let direct = display.writes.lock().unwrap().clone();
+                let bus = fake.writes.lock().unwrap().clone();
                 assert_eq!(direct.len(), 1);
                 assert_eq!(bus.len(), 1);
                 assert_eq!(
@@ -485,6 +485,7 @@ async fn bus_notice_waits_for_flush_and_failure_leaves_reply_and_direct_display_
                     .display
                     .events
                     .display_read(&bus[0].id)
+                    .await
                     .unwrap()
                     .unwrap();
                 assert_eq!(retained, serde_json::to_vec(&direct[0]).unwrap());
@@ -496,6 +497,59 @@ async fn bus_notice_waits_for_flush_and_failure_leaves_reply_and_direct_display_
             assert_eq!(display.writes.lock().unwrap().len(), 1);
         }
     }
+}
+
+#[tokio::test]
+async fn display_disk_write_failure_drops_wake_but_preserves_reply_and_direct_write() {
+    let scratch = cortexkit_test_support::ScratchDir::new("display-write-failure");
+    let path = scratch.path().join("display-records");
+    let gauges = Arc::new(crate::event_publish::Gauges::default());
+    let events = Arc::new(crate::event_publish::Publisher::with_display_directory(
+        path.clone(),
+        gauges.clone(),
+    ));
+    // A file in place of the directory makes writes fail even as root.
+    std::fs::write(path, b"not a directory").unwrap();
+    let bus = Arc::new(crate::event_publish::tests::Fake::default());
+    events.connect(Arc::new(bus.clone()));
+    let records = Arc::new(Records::with_events(events.clone()));
+    let display = DisplayDouble::new(&["display"]);
+    records.connect(display.clone());
+    let deadlines = Arc::new(crate::egress::ConnectionDeadlines::default());
+    deadlines.install_display(records.clone());
+    records.arm(&frame(request()), &install(&planes())).unwrap();
+
+    let body = json!({"outcome":"ok", "screen_text":"planted-screen-text"});
+    let mut reply = frame(body.clone());
+    reply.header.ty = FrameType::Response;
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(reply).await.unwrap();
+    drop(tx);
+    let (sink, mut client) = tokio::io::duplex(4096);
+    crate::egress::drain_writer(sink, rx, deadlines)
+        .await
+        .unwrap();
+    let emitted = subc_transport::read_frame(&mut client)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&emitted.body).unwrap(),
+        body
+    );
+    display.count(1).await;
+    // Reads share the worker queue, so this resolves after the failed write.
+    assert!(events
+        .display_read(&"0".repeat(64))
+        .await
+        .unwrap()
+        .is_none());
+    crate::event_publish::tests::settle().await;
+    assert!(bus.writes.lock().unwrap().is_empty());
+    let mut metrics = serde_json::Map::new();
+    gauges.insert_into(&mut metrics);
+    assert_eq!(metrics["displayRecordDiskWriteFailures"], 1);
+    assert_eq!(metrics["displayRecordsHeld"], 0);
 }
 
 #[tokio::test]

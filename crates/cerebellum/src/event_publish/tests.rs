@@ -24,6 +24,7 @@ pub(crate) struct Fake {
     hang_open: AtomicBool,
     pub(crate) hang_publish: AtomicBool,
     pub(crate) readable: Mutex<Option<std::sync::Weak<Publisher>>>,
+    wrote: tokio::sync::Notify,
 }
 
 struct FakeConnection(Arc<Fake>);
@@ -55,16 +56,16 @@ impl Connection for FakeConnection {
     ) -> BoxFuture<'a, Result<(), Failure>> {
         Box::pin(async move {
             if *kind == Kind::DisplayRecordReady {
-                if let Some(publisher) = self
+                let publisher = self
                     .0
                     .readable
                     .lock()
                     .unwrap()
                     .as_ref()
-                    .and_then(std::sync::Weak::upgrade)
-                {
+                    .and_then(std::sync::Weak::upgrade);
+                if let Some(publisher) = publisher {
                     assert!(
-                        publisher.display_read(message_id).unwrap().is_some(),
+                        publisher.display_read(message_id).await.unwrap().is_some(),
                         "pointer must be readable before publish starts"
                     );
                 }
@@ -74,6 +75,7 @@ impl Connection for FakeConnection {
                 id: message_id.into(),
                 bytes: bytes.into(),
             });
+            self.0.wrote.notify_one();
             if self.0.hang_publish.load(Relaxed) {
                 return std::future::pending().await;
             }
@@ -108,8 +110,37 @@ fn write(kind: DisplayKind) -> DisplayWrite {
         "opaque:key",
         kind,
         "served-pin",
-        json!({"outcome":"success"}).as_object().unwrap().clone(),
+        json!({"outcome":"success", "plane":"browser", "action":"status", "durationMs":12, "queuedMs":0})
+            .as_object().unwrap().clone(),
     )
+}
+
+#[tokio::test]
+async fn announced_display_record_remains_readable_after_restart() {
+    let directory = cortexkit_test_support::ScratchDir::new("cerebellum-display-restart");
+    let path = directory.path().join("display-records");
+    let notice = {
+        let publisher = Publisher::with_display_directory(path.clone(), Arc::default());
+        let bus = Arc::new(Fake::default());
+        publisher.connect(Arc::new(bus.clone()));
+        publisher.tool_display(&write(DisplayKind::Record));
+        tokio::time::timeout(crate::test_support::HANG_GUARD, bus.wrote.notified())
+            .await
+            .expect("durable write and bus publication finished");
+        let published = bus.writes.lock().unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].kind, Kind::DisplayRecordReady);
+        let pointer: Value = serde_json::from_slice(&published[0].bytes).unwrap();
+        pointer["record_id"].as_str().unwrap().to_owned()
+    };
+
+    let restarted = Publisher::with_display_directory(path, Arc::default());
+    assert_eq!(
+        restarted.display_read(&notice).await.unwrap(),
+        Some(serde_json::to_vec(&write(DisplayKind::Record)).unwrap()),
+        "a record the bus announced must survive a restart without the writer or bus"
+    );
+    assert_eq!(restarted.gauges.display_loaded.load(Relaxed), 1);
 }
 
 #[test]
@@ -238,7 +269,7 @@ async fn bus_notice_bodies_and_ids_are_narrow_and_stable() {
     publisher.tool_display(&changed);
     publisher.tool_display(&write(DisplayKind::Completion));
     settle().await;
-    let writes = fake.writes.lock().unwrap();
+    let writes = fake.writes.lock().unwrap().clone();
     assert_eq!(writes.len(), 6);
     assert_eq!(
         writes[0].kind,
@@ -261,7 +292,11 @@ async fn bus_notice_bodies_and_ids_are_narrow_and_stable() {
         serde_json::from_slice(&writes[3].bytes).unwrap();
     pointer.validate().unwrap();
     assert_eq!(
-        publisher.display_read(&writes[3].id).unwrap().unwrap(),
+        publisher
+            .display_read(&writes[3].id)
+            .await
+            .unwrap()
+            .unwrap(),
         serde_json::to_vec(&changed).unwrap()
     );
     assert_eq!(
@@ -381,13 +416,15 @@ fn bus_notice_health_is_counts_and_reason_words_only() {
     assert_eq!(metrics["busEventsLastFailureReason"], Value::Null);
     gauges.failed(Failure::Unavailable);
     gauges.insert_into(&mut metrics);
-    assert_eq!(metrics, json!({"busEventsPublished":0, "busEventsFailed":1, "busEventsLastFailureReason":"unavailable"}).as_object().unwrap().clone());
+    assert_eq!(metrics, json!({"busEventsPublished":0, "busEventsFailed":1, "busEventsLastFailureReason":"unavailable",
+        "displayRecordsHeld":0, "displayRecordDiskWriteFailures":0, "displayRecordsLoadedAtStartup":0, "displayRecordDamagedFilesSkipped":0
+    }).as_object().unwrap().clone());
 }
 
 #[tokio::test]
 async fn record_capacity_drops_only_the_new_pointer_and_counts_its_reason() {
     let (publisher, fake) = publisher();
-    *publisher.records.lock().unwrap() = records::Records::with_limits(1, 32 * 1024);
+    publisher.limit_display(1, 32 * 1024);
     publisher.tool_display(&write(DisplayKind::Record));
     publisher.tool_display(&write(DisplayKind::Completion));
     settle().await;

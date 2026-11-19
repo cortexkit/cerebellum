@@ -3,6 +3,7 @@
 
 use std::{
     future::Future,
+    path::PathBuf,
     pin::Pin,
     sync::{
         atomic::{
@@ -116,6 +117,10 @@ pub(crate) struct Gauges {
     published: AtomicU64,
     failed: AtomicU64,
     last_failure: AtomicU8,
+    display_held: AtomicU64,
+    display_disk_failures: AtomicU64,
+    display_loaded: AtomicU64,
+    display_damaged: AtomicU64,
 }
 
 static GAUGES: OnceLock<Arc<Gauges>> = OnceLock::new();
@@ -145,6 +150,17 @@ impl Gauges {
             _ => None,
         };
         metrics.insert("busEventsLastFailureReason".into(), json!(reason));
+        for (name, count) in [
+            ("displayRecordsHeld", &self.display_held),
+            (
+                "displayRecordDiskWriteFailures",
+                &self.display_disk_failures,
+            ),
+            ("displayRecordsLoadedAtStartup", &self.display_loaded),
+            ("displayRecordDamagedFilesSkipped", &self.display_damaged),
+        ] {
+            metrics.insert(name.into(), json!(count.load(Relaxed)));
+        }
     }
 }
 
@@ -153,7 +169,13 @@ pub(crate) struct Publisher {
     receiver: Mutex<Option<mpsc::Receiver<Event>>>,
     transport_installed: AtomicBool,
     gauges: Arc<Gauges>,
-    records: Mutex<records::Records>,
+    records: DisplayStore,
+}
+
+enum DisplayStore {
+    Memory(Mutex<records::Records>),
+    Disk(records::DiskWorker),
+    Unavailable,
 }
 
 impl Default for Publisher {
@@ -174,14 +196,37 @@ fn identity(bytes: &[u8]) -> String {
 }
 
 impl Publisher {
+    pub(crate) fn production() -> Self {
+        let gauges = Arc::clone(gauges());
+        let Some(home) = cerebellum_core::platform_dirs::data_home() else {
+            return Self::with_store(gauges, DisplayStore::Unavailable);
+        };
+        Self::with_display_directory(
+            cerebellum_core::format_floor::module_directory(&home).join("display-records"),
+            gauges,
+        )
+    }
+
+    pub(crate) fn with_display_directory(directory: PathBuf, gauges: Arc<Gauges>) -> Self {
+        let records = records::Records::open(directory, &gauges);
+        Self::with_store(
+            gauges,
+            DisplayStore::Disk(records::DiskWorker::new(records)),
+        )
+    }
+
     fn new(gauges: Arc<Gauges>) -> Self {
+        Self::with_store(gauges, DisplayStore::Memory(Mutex::default()))
+    }
+
+    fn with_store(gauges: Arc<Gauges>, records: DisplayStore) -> Self {
         let (sender, receiver) = mpsc::channel(CAPACITY);
         Self {
             sender,
             receiver: Mutex::new(Some(receiver)),
             transport_installed: AtomicBool::new(false),
             gauges,
-            records: Mutex::new(records::Records::default()),
+            records,
         }
     }
 
@@ -204,6 +249,9 @@ impl Publisher {
                 reconcile_views,
             ));
             self.transport_installed.store(true, Release);
+        }
+        if let DisplayStore::Disk(records) = &self.records {
+            records.start(self.sender.clone(), self.gauges.clone());
         }
     }
 
@@ -229,80 +277,128 @@ impl Publisher {
     }
 
     pub(crate) fn tool_display(&self, write: &DisplayWrite) {
-        use cortexkit_role_tool_display::{
-            DisplayLimits, MAX_COMPLETION_BYTES, MAX_DETAIL_BYTES, MAX_RECORD_BYTES,
-        };
-        let limits =
-            DisplayLimits::new(MAX_RECORD_BYTES, MAX_DETAIL_BYTES, MAX_COMPLETION_BYTES, 0);
-        if cortexkit_role_tool_display::validate_write(write, &limits).is_err() {
+        let Some(id) = display_identity(write) else {
             return;
-        }
-        let writer = subc_protocol::Principal::Reserved {
-            module_id: "cerebellum".into(),
         };
-        let key = cortexkit_role_tool_display::idempotency_key(&writer, write)
-            .expect("display identity serializes");
-        let record_id = identity(&key);
-        if !self.records.lock().unwrap().insert(
-            &record_id,
-            serde_json::to_vec(write).expect("display write serializes"),
-            Instant::now(),
-        ) {
-            self.gauges.failed(Failure::RecordCapacity);
-            return;
-        }
-        if self.transport_installed.load(Acquire) {
-            self.enqueue(
-                Kind::DisplayRecordReady,
-                record_id.clone(),
-                display_pointer(&record_id),
-            );
+        let bytes = serde_json::to_vec(write).expect("display write serializes");
+        let publish = self.transport_installed.load(Acquire);
+        match &self.records {
+            DisplayStore::Memory(records) => {
+                let mut records = records.lock().unwrap();
+                let now = records.now();
+                if records
+                    .insert(id.clone(), bytes, now, &self.gauges)
+                    .expect("memory store")
+                {
+                    if publish {
+                        let pointer = display_pointer(&id);
+                        self.enqueue(Kind::DisplayRecordReady, id, pointer);
+                    }
+                } else {
+                    self.gauges.failed(Failure::RecordCapacity);
+                }
+            }
+            DisplayStore::Disk(records) => {
+                records.start(self.sender.clone(), self.gauges.clone());
+                if let Err(reason) = records.store(id, bytes, publish) {
+                    self.gauges.failed(reason);
+                }
+            }
+            DisplayStore::Unavailable => {
+                self.gauges.display_disk_failures.fetch_add(1, Relaxed);
+                self.gauges.failed(Failure::Unavailable);
+            }
         }
     }
 
-    pub(crate) fn display_read(&self, id: &str) -> Result<Option<Vec<u8>>, ()> {
-        self.records
-            .try_lock()
-            .map_err(|_| ())
-            .map(|mut records| records.read(id, Instant::now()))
+    pub(crate) async fn display_read(&self, id: &str) -> Result<Option<Vec<u8>>, ()> {
+        match &self.records {
+            DisplayStore::Memory(records) => {
+                let mut records = records.try_lock().map_err(|_| ())?;
+                let now = records.now();
+                records.read(id, now, &self.gauges).map_err(|_| ())
+            }
+            DisplayStore::Disk(records) => {
+                records.start(self.sender.clone(), self.gauges.clone());
+                records.read(id).await
+            }
+            DisplayStore::Unavailable => Err(()),
+        }
+    }
+
+    #[cfg(test)]
+    fn memory(&self) -> &Mutex<records::Records> {
+        let DisplayStore::Memory(records) = &self.records else {
+            panic!("test requires an isolated display store");
+        };
+        records
     }
 
     #[cfg(test)]
     pub(crate) fn seed_display(&self, id: &str, write: &DisplayWrite) {
-        assert!(self.records.lock().unwrap().insert(
-            id,
-            serde_json::to_vec(write).unwrap(),
-            Instant::now()
-        ));
+        let mut records = self.memory().lock().unwrap();
+        let now = records.now();
+        assert!(records
+            .insert(
+                id.into(),
+                serde_json::to_vec(write).unwrap(),
+                now,
+                &self.gauges
+            )
+            .unwrap());
     }
 
     #[cfg(test)]
     pub(crate) fn limit_display(&self, count: usize, bytes: usize) {
-        *self.records.lock().unwrap() = records::Records::with_limits(count, bytes);
+        *self.memory().lock().unwrap() = records::Records::with_limits(count, bytes);
     }
 
     #[cfg(test)]
     pub(crate) fn unavailable_display(&self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = self.records.lock().unwrap();
+            let _guard = self.memory().lock().unwrap();
             panic!("simulate unavailable display map");
         }));
     }
 
     fn enqueue(&self, kind: Kind, message_id: String, bytes: Vec<u8>) {
-        let event = Event {
-            kind,
-            message_id,
-            bytes,
-            queued_at: Instant::now(),
-        };
-        if let Err(error) = self.sender.try_send(event) {
-            self.gauges.failed(match error {
-                mpsc::error::TrySendError::Full(_) => Failure::Overflow,
-                mpsc::error::TrySendError::Closed(_) => Failure::Unavailable,
-            });
-        }
+        enqueue(&self.sender, &self.gauges, kind, message_id, bytes);
     }
+}
+
+fn enqueue(
+    sender: &mpsc::Sender<Event>,
+    gauges: &Gauges,
+    kind: Kind,
+    message_id: String,
+    bytes: Vec<u8>,
+) {
+    let event = Event {
+        kind,
+        message_id,
+        bytes,
+        queued_at: Instant::now(),
+    };
+    if let Err(error) = sender.try_send(event) {
+        gauges.failed(match error {
+            mpsc::error::TrySendError::Full(_) => Failure::Overflow,
+            mpsc::error::TrySendError::Closed(_) => Failure::Unavailable,
+        });
+    }
+}
+
+fn display_identity(write: &DisplayWrite) -> Option<String> {
+    use cortexkit_role_tool_display::{
+        DisplayLimits, MAX_COMPLETION_BYTES, MAX_DETAIL_BYTES, MAX_RECORD_BYTES,
+    };
+    let limits = DisplayLimits::new(MAX_RECORD_BYTES, MAX_DETAIL_BYTES, MAX_COMPLETION_BYTES, 0);
+    cortexkit_role_tool_display::validate_write(write, &limits).ok()?;
+    let writer = subc_protocol::Principal::Reserved {
+        module_id: "cerebellum".into(),
+    };
+    let key = cortexkit_role_tool_display::idempotency_key(&writer, write)
+        .expect("display identity serializes");
+    Some(identity(&key))
 }
 
 fn display_pointer(record_id: &str) -> Vec<u8> {

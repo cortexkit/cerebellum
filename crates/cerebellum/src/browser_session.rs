@@ -1618,6 +1618,7 @@ struct SessionMeta {
     lifecycle: Lifecycle,
     disposition: ProfileDisposition,
     lease: BrowserLease,
+    idle_holds: held_idle::IdleHolds,
     pending_operations: usize,
     terminal: Option<BrowserSessionTerminalOutcome>,
     cleanup_failure: Option<CleanupStage>,
@@ -1843,6 +1844,7 @@ impl SessionCell {
                     monotonic_deadline: MonoInstant::from_nanos(0),
                     custody_holder_id: None,
                 },
+                idle_holds: held_idle::IdleHolds::default(),
                 pending_operations: 0,
                 terminal: None,
                 cleanup_failure: None,
@@ -2919,7 +2921,7 @@ impl BrowserSessions {
             .ok_or(PresentRefusal::NoSession)?;
         let mut admission = {
             let mut meta = cell.meta().map_err(|_| PresentRefusal::NoSession)?;
-            if !meta.admits_calls() || clock.now() >= meta.lease.deadline() {
+            if !meta.admits_calls() || held_idle::idle_expired(&mut meta, clock, clock.now()) {
                 return Err(PresentRefusal::NoSession);
             }
             if meta.handoff_opening || matches!(meta.handoff, Some(HandoffState::Open(_))) {
@@ -3369,39 +3371,6 @@ impl BrowserSessions {
         self
     }
 
-    pub fn accept_dispatch<C: MonotonicClock>(
-        &self,
-        route_key: &str,
-        clock: &C,
-    ) -> DispatchAdmission {
-        let cell = match self.active_cell(route_key) {
-            Ok(Some(cell)) => cell,
-            Ok(None) => return DispatchAdmission::NoSession,
-            Err(()) => return DispatchAdmission::StateUnavailable,
-        };
-        let Ok(mut meta) = cell.meta() else {
-            return DispatchAdmission::StateUnavailable;
-        };
-        // A session with no browser in its driver slot answers "launch
-        // pending", as it did when the process lived in the table: that is a
-        // launch still starting, or a teardown that has already taken the
-        // process out.
-        if matches!(
-            meta.lifecycle,
-            Lifecycle::Launching | Lifecycle::TeardownOwned
-        ) {
-            return DispatchAdmission::LaunchPending;
-        }
-        if !meta.admits_calls() {
-            return DispatchAdmission::NoSession;
-        }
-        if clock.now() >= meta.lease.deadline() {
-            return DispatchAdmission::NoSession;
-        }
-        meta.lease.renew(clock);
-        DispatchAdmission::Accepted(self.admit(&cell, &mut meta, false))
-    }
-
     pub fn expire_idle<C: MonotonicClock>(
         &self,
         route_key: &str,
@@ -3412,36 +3381,6 @@ impl BrowserSessions {
             Some(cell) => self.expire_cell(&cell, clock, config),
             None => false,
         }
-    }
-
-    fn expire_cell<C: MonotonicClock>(
-        &self,
-        cell: &Arc<SessionCell>,
-        clock: &C,
-        config: &BrowserConfig,
-    ) -> bool {
-        {
-            let mut meta = recovered(cell.meta());
-            let now = clock.now();
-            if meta.lifecycle != Lifecycle::Ready
-                || meta.terminal.is_some()
-                || meta.pending_operations != 0
-                || meta.handoff.as_ref().is_some_and(
-                    |handoff| matches!(handoff, HandoffState::Open(open) if now < open.expires_at),
-                )
-                || now < meta.lease.deadline()
-            {
-                return false;
-            }
-            meta.terminal = Some(BrowserSessionTerminalOutcome::IdleExpired);
-        }
-        cell.notify();
-        self.finish_teardown(
-            cell,
-            BrowserSessionTerminalOutcome::IdleExpired,
-            configured_grace(config),
-        );
-        true
     }
 
     /// Tear down every session whose browser has exited on its own, after
@@ -8477,3 +8416,5 @@ mod tests {
 #[doc(hidden)]
 #[cfg(unix)]
 pub mod connection_worker;
+mod held_idle;
+pub(crate) use held_idle::IdleHold;

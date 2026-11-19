@@ -3161,6 +3161,11 @@ mod restore_slot_tests {
         Arc<crate::computer::dispatch::CutoffGate>,
         std::time::Instant,
     ) {
+        // Fake screens have independent fronting locks. Give each its own
+        // watch domain so parallel tests using TARGET don't share a watch.
+        terminal
+            .fronting_domain
+            .store(Arc::as_ptr(shared) as usize, SeqCst);
         let gate = Arc::new(crate::computer::dispatch::CutoffGate::new());
         let mut obligation = obligation(shared, releases);
         obligation.gate = Some(Arc::clone(&gate));
@@ -4132,35 +4137,59 @@ mod restore_slot_tests {
         let shared = screen(true);
         let releases = Arc::new(AtomicUsize::new(0));
         let mut planes = crate::tests::management_bound_planes(1, 1);
-        let input = Mutex::new(Some((Arc::clone(&shared), Arc::clone(&releases))));
-        let (ready, worker_started) = tokio::sync::oneshot::channel::<()>();
+        let (let_owner_decide, owner_can_decide) = std::sync::mpsc::channel();
+        let input = Mutex::new(Some((
+            Arc::clone(&shared),
+            Arc::clone(&releases),
+            owner_can_decide,
+        )));
+        let (ready, worker_started) = tokio::sync::oneshot::channel();
         let ready = Mutex::new(Some(ready));
         planes.route_test_handler = Some(Arc::new(move || {
-            let (shared, releases) = input.lock().unwrap().take().unwrap();
+            let (shared, releases, owner_can_decide) = input.lock().unwrap().take().unwrap();
             let ready = ready.lock().unwrap().take().unwrap();
             Box::pin(async move {
                 let terminal = TerminalArbiter::current().unwrap();
                 terminal.set_step(CallStep::Dispatch);
                 assert!(terminal.gate.begin_mutation());
-                let gate = Arc::new(crate::computer::dispatch::CutoffGate::new());
-                let mut obligation = obligation(&shared, &releases);
-                obligation.gate = Some(Arc::clone(&gate));
-                let cell = terminal.register_restore(obligation).unwrap();
-                assert!(cell.begin_front_attempt(0));
+                let (cell, gate, _) = bounded_cell(
+                    &terminal,
+                    &shared,
+                    &releases,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                );
                 cell.front_confirmed();
-                cell.front_attempt_returned();
                 // The bound is already in the past, so the first restore
                 // write is refused.
                 let past = std::time::Instant::now() - Duration::from_millis(1);
                 gate.set_bound(past, past);
-                own_until_stopped(Arc::clone(&cell), Owner::Restores);
-                let _ = ready.send(());
+                // Terminal cleanup normally starts the watch. Arm it here so
+                // cancellation can test a handoff that has already happened.
+                terminal.start_late_fronting(Some(&cell));
+                let owner_cell = Arc::clone(&cell);
+                std::thread::spawn(move || {
+                    owner_can_decide
+                        .recv_timeout(crate::test_support::HANG_GUARD)
+                        .unwrap();
+                    owner_cell.decide();
+                });
+                let _ = ready.send(cell);
                 std::future::pending::<()>().await;
             })
         }));
         let (tx, mut rx) = mpsc::channel(8);
         handle_frame(request(), &tx, &planes).await.unwrap();
-        worker_started.await.unwrap();
+        let cell = worker_started.await.unwrap();
+        let_owner_decide.send(()).unwrap();
+        let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+        while !cell.inner().watch_holds {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the late watch never took the restore obligation"
+            );
+            tokio::task::yield_now().await;
+        }
         handle_frame(cancel(), &tx, &planes).await.unwrap();
         let reply = rx.recv().await.unwrap();
         let reply: Value = serde_json::from_slice(&reply.body).unwrap();

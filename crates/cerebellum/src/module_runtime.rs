@@ -4,7 +4,10 @@
 use std::collections::VecDeque;
 use std::future::Future;
 
-use subc_protocol::config::{ConfigAppliedRequest, CONFIG_GATE_CAPABILITY};
+use subc_protocol::{
+    config::{ConfigAppliedRequest, CONFIG_GATE_CAPABILITY},
+    session::HealthStatus,
+};
 use tokio::task::JoinHandle;
 
 use super::*;
@@ -47,7 +50,8 @@ pub(super) async fn run(
         } else {
             None
         };
-        let can_declare = path.as_ref().and_then(|path| path.to_str()).is_some();
+        let declaration = path.as_deref().and_then(settings::config_declaration);
+        let can_declare = declaration.is_some();
         send_hello(&writer, &config, real_module, can_declare).await?;
         let ack = expect_hello_ack(&mut read_half).await?;
         let managed = can_declare
@@ -60,15 +64,12 @@ pub(super) async fn run(
         let mut waiting = VecDeque::new();
         let module_id = config.module_id.clone();
         let startup = async {
-            let delivery = if let Some(session) = &session {
-                Some(
-                    session
-                        .initial(&writer, path.as_deref().expect("managed path"))
-                        .await,
-                )
+            let delivery = if let (Some(session), Some(declaration)) = (&session, declaration) {
+                Some(session.initial(&writer, declaration).await)
             } else {
                 None
             };
+            let managed_delivery = matches!(delivery, Some(Ok(_)));
             let old_daemon = !ack
                 .subc_capabilities
                 .iter()
@@ -76,7 +77,8 @@ pub(super) async fn run(
             let output = preparing_slot
                 .insert(tokio::task::spawn_blocking(move || {
                     let (startup, report) = match delivery {
-                        Some((settings, report)) => (Some(settings), report),
+                        Some(Ok((settings, report))) => (Some(settings), report),
+                        Some(Err(())) => (Some(settings::config_files(path.as_deref())?), None),
                         None if real_module && old_daemon => {
                             (Some(settings::config_files(path.as_deref())?), None)
                         }
@@ -112,7 +114,14 @@ pub(super) async fn run(
                 }))
                 .await;
             preparing_slot.take();
-            output.map_err(|error| ModuleError::Message(error.to_string()))?
+            let output = output.map_err(|error| ModuleError::Message(error.to_string()))?;
+            if let Some(session) = session
+                .as_ref()
+                .filter(|_| managed_delivery && output.is_ok())
+            {
+                session.mark_applied();
+            }
+            output
         };
         let result = wait_for_startup(
             &mut incoming,
@@ -140,7 +149,7 @@ pub(super) async fn run(
         if let Some(session) = &session {
             tokio::select! {
                 result = serve => result,
-                () = session.live(&writer, report, |settings| apply_live(&planes, settings)) => unreachable!("settings live loop ends with the connection"),
+                () = session.live(&writer, report, move |settings| apply_live(&planes, settings)) => unreachable!("settings live loop ends with the connection"),
             }
         } else {
             serve.await
@@ -196,6 +205,7 @@ where
 {
     let mut work = std::pin::pin!(work);
     let mut timeout = std::pin::pin!(tokio::time::sleep(STARTUP_WAIT));
+    let health = HealthState::new();
     let mut expired = false;
     loop {
         tokio::select! {
@@ -209,9 +219,20 @@ where
             }
             incoming = incoming.read() => {
                 let Some(frame) = incoming.map_err(ModuleError::Message)? else { return Ok(None) };
+                if control::is_health_request(&frame) {
+                    let mut report = health.report();
+                    if let Some(session) = session {
+                        session.annotate_health(&mut report);
+                    } else if let ModuleControlResponse::HealthCheck { status, detail, .. } = &mut report {
+                        *status = HealthStatus::Degraded;
+                        *detail = Some("startup_in_progress".into());
+                    }
+                    control::send_control_response(&frame, writer, report).await?;
+                    continue;
+                }
                 if session.is_some_and(|session| session.take(&frame)) { continue; }
                 if let Some(session) = session.filter(|session| session.is_review(&frame)) {
-                    session.review(writer, frame, module_id).await?;
+                    session.review(writer, &frame, module_id).await?;
                     continue;
                 }
                 if frame.header.channel == 0 {
@@ -261,9 +282,37 @@ async fn refuse_early(frame: Frame, writer: &mpsc::Sender<Frame>) -> Result<(), 
         header.epoch,
         header.corr,
         "not_ready",
-        "Cerebellum has not applied its startup settings yet; retry shortly.",
+        "Cerebellum is still initializing; retry this request later.",
     )
     .await
+}
+
+pub(super) async fn offer_settings_control(
+    session: &Session,
+    frame: &Frame,
+    writer: &mpsc::Sender<Frame>,
+    module_id: &str,
+    planes: &Planes,
+) -> Result<bool, ModuleError> {
+    if session.take(frame) {
+        return Ok(true);
+    }
+    if control::is_health_request(frame) {
+        let mut report = control::health_report(
+            &planes.health,
+            &planes.routes,
+            Some(&planes.call_record_workers),
+            Some(&planes.private_content),
+        );
+        session.annotate_health(&mut report);
+        control::send_control_response(frame, writer, report).await?;
+        return Ok(true);
+    }
+    if session.is_review(frame) {
+        session.review(writer, frame, module_id).await?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn apply_live(planes: &Planes, settings: LiveSettings) {

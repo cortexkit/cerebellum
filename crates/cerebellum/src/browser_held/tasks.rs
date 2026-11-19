@@ -13,6 +13,7 @@ type Key = (String, String);
 
 struct Job {
     cancel: CancelHandle,
+    idle_hold: Option<browser_session::IdleHold>,
     bytes: usize,
     route: (u16, u32, u64),
     head_route: Option<(u16, u32)>,
@@ -105,6 +106,7 @@ impl Tasks {
             key.clone(),
             Job {
                 cancel: CancelHandle::pending(),
+                idle_hold: None,
                 bytes,
                 route: (0, 0, 0),
                 head_route: None,
@@ -122,7 +124,7 @@ impl Tasks {
     pub(crate) fn spawn(
         self: &Arc<Self>,
         reservation: Reservation,
-        resume: BrowserResume,
+        mut resume: BrowserResume,
         planes: Planes,
     ) {
         let key = reservation.key.clone();
@@ -142,6 +144,7 @@ impl Tasks {
         let Some(job) = state.jobs.get_mut(&key) else {
             return;
         };
+        job.idle_hold = resume.idle_hold.take();
         job.route = (
             resume.frame.header.channel,
             resume.frame.header.epoch,
@@ -244,11 +247,15 @@ impl Tasks {
             .lock()
             .unwrap()
             .jobs
-            .values()
+            .values_mut()
             .filter(|job| matches(job))
         {
+            job.idle_hold = None;
             job.cancel.cancel();
         }
+    }
+    pub(crate) fn cancel_handle(&self, cancel: &CancelHandle) {
+        self.cancel_matching(|job| Arc::ptr_eq(&job.cancel.0, &cancel.0));
     }
     pub(crate) fn cancel_route(&self, channel: u16, epoch: u32) {
         self.cancel_matching(|job| {
@@ -268,7 +275,8 @@ impl Tasks {
     pub(crate) fn stop(&self) {
         let mut state = self.state.lock().unwrap();
         state.stopped = true;
-        for job in state.jobs.values() {
+        for job in state.jobs.values_mut() {
+            job.idle_hold = None;
             job.cancel.cancel();
         }
         state.tasks.abort_all();

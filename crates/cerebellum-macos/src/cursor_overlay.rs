@@ -9,7 +9,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::Path;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use crate::cursor_geometry::{
@@ -35,6 +35,11 @@ pub use capture_probe::{
 // with the same private drawing code as the badge's own panel.
 mod preview_window;
 use preview_window::{primary_visible_area, PreviewWindow};
+mod event_loop;
+pub use event_loop::OverlaySender;
+use event_loop::{OverlayReceiver, MESSAGE_BUDGET};
+mod loop_probe;
+pub use loop_probe::{probe_cursor_recipient_load, probe_cursor_run_loop};
 
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -1048,14 +1053,10 @@ impl Picture {
 /// Hand every pending window change to the window server now.
 ///
 /// AppKit sends window ordering, placement and opacity changes to the window
-/// server when the main thread next fetches an event. This helper's main
-/// thread does not sit in AppKit's event loop: with nothing left to animate it
-/// blocks on its event channel. Measured with this panel: right after an
-/// order-out the window was still in the window server's on-screen list (and
-/// stayed there for as long as no event was fetched), and it left the list on
-/// the next fetch. So a badge hidden just before that block stayed on screen
-/// indefinitely. Asking AppKit for an event without waiting sends the changes
-/// before the thread can block.
+/// server when the main thread next fetches an event. In particular, a panel
+/// can still be in the window server's on-screen list immediately after an
+/// order-out. Fetch without waiting so a hide reaches the window server before
+/// the caller continues, without relying on the next turn of the event loop.
 fn commit_window_changes(mtm: MainThreadMarker) {
     // A date in the past never waits, and nothing is dequeued: an event that
     // is waiting stays queued for the helper's loop to handle as usual.
@@ -1280,8 +1281,15 @@ pub fn reduce_motion() -> bool {
 
 /// Run only in the hidden helper mode, before any asynchronous runtime exists.
 /// EOF closes the channel and ends the main-thread run loop without saving state.
-pub fn run_agent_cursor(events: Receiver<OverlayMessage>, motion: CursorMotion) {
-    run_cursor_loop(events, motion, None);
+pub fn run_agent_cursor(read: impl FnOnce(OverlaySender) + Send + 'static, motion: CursorMotion) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some((sender, events)) = event_loop::channel(mtm) else {
+        return;
+    };
+    std::thread::spawn(move || read(sender));
+    run_cursor_loop(mtm, events, motion, None);
 }
 
 /// While it animates, the helper tells macOS that it is doing latency-critical
@@ -1334,13 +1342,11 @@ impl AnimationActivity {
 }
 
 fn run_cursor_loop(
-    events: Receiver<OverlayMessage>,
+    mtm: MainThreadMarker,
+    events: OverlayReceiver,
     motion: CursorMotion,
     mut probe: Option<&mut LoopRecord>,
 ) {
-    let Some(mtm) = MainThreadMarker::new() else {
-        return;
-    };
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     if let crate::ProcessStartTime::Started(start_time_micros) =
@@ -1360,13 +1366,13 @@ fn run_cursor_loop(
         token: None,
         enabled: probe.as_ref().is_none_or(|probe| probe.hold_activity),
     };
-    let mut pending = None;
     loop {
-        let wait = objc2::rc::autoreleasepool(|_| {
+        let connected = objc2::rc::autoreleasepool(|_| {
             // Bounded by the producer's queue; animation still gets a turn when
             // a noisy agent is continuously sending events.
-            for _ in 0..32 {
-                match pending.take().map_or_else(|| events.try_recv(), Ok) {
+            let mut batch_full = true;
+            for _ in 0..MESSAGE_BUDGET {
+                match events.messages.try_recv() {
                     Ok(OverlayMessage::Ready { reply }) => {
                         let _ = reply.try_send(());
                     }
@@ -1458,8 +1464,11 @@ fn run_cursor_loop(
                             picture.update(mtm, *event, now);
                         }
                     }
-                    Err(TryRecvError::Disconnected) => return None,
-                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => return false,
+                    Err(TryRecvError::Empty) => {
+                        batch_full = false;
+                        break;
+                    }
                 }
             }
             let now = Instant::now();
@@ -1483,64 +1492,15 @@ fn run_cursor_loop(
                     tip,
                 });
             }
-            if let Wait::Frame(interval) = wait {
-                let date = NSDate::dateWithTimeIntervalSinceNow(interval.as_secs_f64());
-                // Only live pictures need AppKit's timed pump; it never posts input.
-                if let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                    NSEventMask::Any,
-                    Some(&date),
-                    unsafe { NSDefaultRunLoopMode },
-                    true,
-                ) {
-                    app.sendEvent(&event);
-                }
-            } else {
-                // About to block outside the run loop, until the next event
-                // or a fade is due. Handle whatever AppKit already queued and
-                // let the run loop turn once, so it commits this pass's window
-                // changes (above all an order-out) instead of leaving them
-                // pending while the thread sleeps; never blocks.
-                for _ in 0..16 {
-                    let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                        NSEventMask::Any,
-                        Some(&NSDate::distantPast()),
-                        unsafe { NSDefaultRunLoopMode },
-                        true,
-                    ) else {
-                        break;
-                    };
-                    app.sendEvent(&event);
-                }
-            }
+            let deadline = event_loop::deadline(wait, batch_full);
             // Flush the final draw or orderOut before sleeping.
             app.updateWindows();
             commit_window_changes(mtm);
-            Some(wait)
+            event_loop::pump(&app, &deadline);
+            true
         });
-        match wait {
-            None => break,
-            Some(Wait::Event) => {
-                // The stdin reader already runs in the background. Receiving here
-                // wakes immediately on new pictures or EOF, without an idle timer
-                // or a synthetic AppKit event that could carry input authority.
-                match events.recv() {
-                    Ok(event) => pending = Some(event),
-                    Err(_) => break,
-                }
-            }
-            Some(Wait::Timed(until)) => {
-                // Every picture is resting. Sleep until the next event, until
-                // the oldest one is due to fade, or until a dragged window
-                // has been still long enough for its badge to fly back, with
-                // no frames in between, so a badge left on screen costs no
-                // CPU while its agent thinks or its window is being dragged.
-                match events.recv_timeout(until) {
-                    Ok(event) => pending = Some(event),
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            Some(Wait::Frame(_)) => {}
+        if !connected {
+            break;
         }
     }
     // The helper is exiting; leave no activity behind it.
@@ -1668,7 +1628,8 @@ pub fn probe_cursor_motion(
         }))
     };
     let start = Instant::now();
-    let (sender, receiver) = std::sync::mpsc::sync_channel(32);
+    let (sender, receiver) =
+        event_loop::channel(mtm).ok_or("could not create the cursor channel")?;
     let script = std::thread::spawn(move || {
         let since = |at: Instant| at.duration_since(start).as_secs_f64() * 1000.0;
         std::thread::sleep(idle);
@@ -1702,7 +1663,7 @@ pub fn probe_cursor_motion(
         passes: Vec::new(),
     };
     // Returns once the script drops its sender.
-    run_cursor_loop(receiver, motion, Some(&mut record));
+    run_cursor_loop(mtm, receiver, motion, Some(&mut record));
     let [entry_sent_ms, glide_sent_ms, follow_sent_ms, hide_sent_ms] = script
         .join()
         .ok()

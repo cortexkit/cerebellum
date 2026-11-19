@@ -337,45 +337,71 @@ pub(super) async fn handle_control_request(
             // Accept the bind — capability scope is checked at dispatch time.
             ModuleControlResponse::RouteBindAck {}
         }
-        ModuleControlRequest::HealthCheck {} => {
-            // Insulated health-v2 lane: the report is a mechanical mapper over
-            // atomics stamped by the dispatch path. It never blocks on a lock
-            // and never forms its own opinion (Health-Path-Rule-v2).
-            let mut report = with_process_gauges(health_state.report());
-            if let ModuleControlResponse::HealthCheck {
-                metrics: Some(Value::Object(metrics)),
-                ..
-            } = &mut report
-            {
-                metrics.insert("toolDisplay".into(), route_bindings.display.metrics());
-                metrics.insert(
-                    "privateContentStore".into(),
-                    json!(private_content.map_or("not_opened", |store| store.health())),
-                );
-            }
-            let mut report = match call_record_workers {
-                Some(workers) => workers.health_report(report),
-                None => report,
-            };
-            if let ModuleControlResponse::HealthCheck {
-                metrics: Some(Value::Object(metrics)),
-                ..
-            } = &mut report
-            {
-                let records = metrics
-                    .get("detachedCallRecordWorkers")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let workers = metrics
-                    .get("detachedWorkers")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                metrics.insert("detachedWorkers".into(), json!(workers + records));
-            }
-            report
-        }
+        ModuleControlRequest::HealthCheck {} => health_report(
+            health_state,
+            route_bindings,
+            call_record_workers,
+            private_content,
+        ),
     };
-    let body = serde_json::to_vec(&response_body).map_err(ModuleError::Json)?;
+    send_control_response(&frame, writer, response_body).await
+}
+
+pub(super) fn health_report(
+    health_state: &HealthState,
+    route_bindings: &RouteBindings,
+    call_record_workers: Option<&CallRecordWorkers>,
+    private_content: Option<&private_content::PrivateContent>,
+) -> ModuleControlResponse {
+    // The health report reads published gauges without waiting on dispatch.
+    let mut report = with_process_gauges(health_state.report());
+    if let ModuleControlResponse::HealthCheck {
+        metrics: Some(Value::Object(metrics)),
+        ..
+    } = &mut report
+    {
+        metrics.insert("toolDisplay".into(), route_bindings.display.metrics());
+        metrics.insert(
+            "privateContentStore".into(),
+            json!(private_content.map_or("not_opened", |store| store.health())),
+        );
+    }
+    if let Some(workers) = call_record_workers {
+        report = workers.health_report(report);
+    }
+    if let ModuleControlResponse::HealthCheck {
+        metrics: Some(Value::Object(metrics)),
+        ..
+    } = &mut report
+    {
+        let records = metrics
+            .get("detachedCallRecordWorkers")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let workers = metrics
+            .get("detachedWorkers")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        metrics.insert("detachedWorkers".into(), json!(workers + records));
+    }
+    report
+}
+
+pub(super) fn is_health_request(frame: &Frame) -> bool {
+    frame.header.channel == 0
+        && frame.header.ty == FrameType::Request
+        && matches!(
+            serde_json::from_slice(&frame.body),
+            Ok(ModuleControlRequest::HealthCheck {})
+        )
+}
+
+pub(super) async fn send_control_response(
+    frame: &Frame,
+    writer: &mpsc::Sender<Frame>,
+    body: ModuleControlResponse,
+) -> Result<(), ModuleError> {
+    let body = serde_json::to_vec(&body).map_err(ModuleError::Json)?;
     let response = Frame::build_with_version(
         frame.header.ver,
         FrameType::Response,
