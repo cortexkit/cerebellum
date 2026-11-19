@@ -8,8 +8,8 @@
 //! arrives on the same connection the daemon uses to send `route.bind` and
 //! `health.check`, so these tests drive exactly that traffic: head routes opened
 //! together under an attested scope, a health probe while their binds are in
-//! flight, and a tool call whose display record opens a route of cerebellum's
-//! own. Each answer must arrive well inside the daemon's own budget; a module
+//! flight, and a tool call whose display record announcement opens a bus route
+//! of cerebellum's own. Each answer must arrive well inside the daemon's own budget; a module
 //! that only answers near the budget is one burst of reconnecting agents away
 //! from timing every bind out.
 //!
@@ -51,6 +51,10 @@ const HEADS: usize = 4;
 /// in milliseconds; this bound leaves ample room for a loaded build machine
 /// while staying far below the point where queued binds start timing out.
 const ANSWER_BUDGET: Duration = Duration::from_secs(2);
+/// How long the display module must stay untouched after the tool call's bus
+/// route opens. Cerebellum once pushed each record to the display module within
+/// three seconds of the reply; it now only announces the record on the bus.
+const DISPLAY_QUIET: Duration = Duration::from_secs(3);
 
 async fn connect(connection: &subc_transport::ConnectionInfo) -> TcpStream {
     let endpoint = connection.endpoints.first().expect("an endpoint");
@@ -125,11 +129,13 @@ fn reserved(module_id: &str) -> Principal {
 }
 
 /// A module registered by this test with a nonce the daemon handed a helper.
-/// It acknowledges every bind and records each one it receives.
+/// It acknowledges every bind and records each one it receives, and records
+/// the body of every request that arrives on a route.
 struct Registered {
     writer: mpsc::Sender<Frame>,
     answers: mpsc::Receiver<Frame>,
     binds: tokio::sync::Mutex<mpsc::UnboundedReceiver<Value>>,
+    requests: tokio::sync::Mutex<mpsc::UnboundedReceiver<Value>>,
 }
 
 impl Registered {
@@ -187,6 +193,7 @@ impl Registered {
         let (writer, mut outgoing) = mpsc::channel::<Frame>(16);
         let (answered, answers) = mpsc::channel::<Frame>(16);
         let (bound, binds) = mpsc::unbounded_channel();
+        let (requested, requests) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(frame) = outgoing.recv().await {
                 if write_frame(&mut writer_half, &frame).await.is_err() {
@@ -221,6 +228,8 @@ impl Registered {
                         let _ = answered.send(frame).await;
                     }
                     (FrameType::Request, _) => {
+                        let _ = requested
+                            .send(serde_json::from_slice::<Value>(&frame.body).unwrap_or_default());
                         let reply = Frame::build(FrameType::Error, cerebellum::control_flags(),
                             frame.header.channel, frame.header.epoch, frame.header.corr,
                             serde_json::to_vec(&json!({"code":"test_bus_unavailable","message":"no NATS server in the registration fixture"})).unwrap()).unwrap();
@@ -234,6 +243,7 @@ impl Registered {
             writer,
             answers,
             binds: tokio::sync::Mutex::new(binds),
+            requests: tokio::sync::Mutex::new(requests),
         }
     }
 
@@ -661,11 +671,12 @@ async fn serves_binds_health_and_outbound_routes(registration_channel: bool) {
         "health.check answered only after {elapsed:?}: {health}"
     );
 
-    // A tool call on one head route. After its reply, cerebellum opens a route
-    // of its own to the display module to record the call. The display module
-    // sees the bind only if cerebellum's outbound connection was admitted as
+    // A tool call on one head route. After its reply, cerebellum stores the
+    // call's display record and announces it on the bus, which opens a route
+    // of its own to ckbus. The daemon must stamp that outbound route as
     // cerebellum: with a self claim on the channel path, with its launch nonce
-    // on the nonce path.
+    // on the nonce path. The display module fetches records itself, so
+    // cerebellum never opens a route to it or sends it display.write.
     let (client, channel, epoch) = routes.first_mut().expect("a head route");
     let (reply, elapsed) = browser_status(client, *channel, *epoch).await;
     assert_eq!(
@@ -678,24 +689,14 @@ async fn serves_binds_health_and_outbound_routes(registration_channel: bool) {
         elapsed < ANSWER_BUDGET,
         "browser_use status answered only after {elapsed:?}"
     );
-    let bind = timeout(HANG_GUARD, async {
-        fixture.display.binds.lock().await.recv().await
-    })
-    .await
-    .expect("cerebellum opens a display route after the tool call")
-    .expect("display module connection open");
-    assert_eq!(
-        bind["principal"],
-        serde_json::to_value(reserved("cerebellum")).unwrap(),
-        "the daemon stamped cerebellum's own outbound route as cerebellum: {bind}"
-    );
     let bus_bind = timeout(HANG_GUARD, fixture.ckbus.binds.lock().await.recv())
         .await
         .expect("publisher opens the SDK credential route")
         .expect("fake ckbus remains registered");
     assert_eq!(
         bus_bind["principal"],
-        serde_json::to_value(reserved("cerebellum")).unwrap()
+        serde_json::to_value(reserved("cerebellum")).unwrap(),
+        "the daemon stamped cerebellum's own outbound route as cerebellum: {bus_bind}"
     );
     if registration_channel {
         assert_eq!(
@@ -703,6 +704,18 @@ async fn serves_binds_health_and_outbound_routes(registration_channel: bool) {
             "production bus consumer must present a self claim: {bus_bind}"
         );
     }
+    sleep(DISPLAY_QUIET).await;
+    let mut requests = fixture.display.requests.lock().await;
+    while let Ok(request) = requests.try_recv() {
+        assert_ne!(
+            request["name"], "display.write",
+            "cerebellum sent display.write to the display module: {request}"
+        );
+    }
+    assert!(
+        fixture.display.binds.lock().await.try_recv().is_err(),
+        "cerebellum opened a route to the display module"
+    );
 }
 
 async fn browser_status(client: &mut TcpStream, channel: u16, epoch: u32) -> (Frame, Duration) {
