@@ -464,6 +464,7 @@ struct ScreenState {
     idle_ms: u64,
     observer: bool,
     comes_forward: bool,
+    replacement_during_foreground_resolution: bool,
     front_delay_ms: Option<u64>,
     pending_front_at: Option<u64>,
     late_watch_gate: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -567,6 +568,7 @@ impl Screen {
                 idle_ms: OBSERVED_DISPATCH_IDLE_MS + 500,
                 observer: true,
                 comes_forward: true,
+                replacement_during_foreground_resolution: false,
                 front_delay_ms: None,
                 pending_front_at: None,
                 late_watch_gate: None,
@@ -796,6 +798,14 @@ impl FrontingSession for FakeSession {
     }
     fn request_front(&mut self, pid: u32) -> bool {
         self.0.front("front", pid)
+    }
+    fn request_granted_front(&mut self, grant: &ProcessGrant) -> bool {
+        let expected = support::grant();
+        if self.0.state().replacement_during_foreground_resolution {
+            self.0.state().log.push("resolved replacement".into());
+            return false;
+        }
+        *grant == expected && self.0.front("front", grant.pid)
     }
     fn our_pid(&self) -> i64 {
         OUR_PID
@@ -1607,6 +1617,21 @@ async fn a_foreground_read_fronts_its_application_one_way() {
     let reply = rig.read().await;
     assert_eq!(reply["fronting"]["fronted"], false, "{reply}");
     assert_eq!(rig.screen.log(), ["front:4242"]);
+}
+
+#[tokio::test]
+async fn one_way_front_refuses_a_pid_reused_during_application_lookup() {
+    let rig = rig(AppUse::Foreground, mail_desk()).await;
+    rig.screen.state().replacement_during_foreground_resolution = true;
+    let reply = rig.read().await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["fronting"]["fronted"], false, "{reply}");
+    assert_eq!(
+        reply["fronting"]["not_fronted_reason"], "front_failed",
+        "{reply}"
+    );
+    assert_eq!(rig.screen.log(), ["resolved replacement"]);
+    assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
 }
 
 /// The idle gate refusing a foreground read's front leaves the read
@@ -2644,7 +2669,7 @@ async fn input_after_a_picture_restore_is_not_hidden_by_the_read() {
     let desk = rig.desk.clone();
     rig.screen.state().after_picture_bracket = Some(support::DeskHook(Arc::new(move || {
         let mut state = desk.state();
-        assert_eq!(state.frontmost, Some(PREVIOUS), "restore must have completed");
+        assert_eq!(state.frontmost, Some(PREVIOUS));
         // The person returns and types without changing the focused element.
         state.frontmost = Some(TARGET);
         state.input.push((0, std::time::Instant::now()));

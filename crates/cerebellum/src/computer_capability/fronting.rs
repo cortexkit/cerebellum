@@ -36,7 +36,7 @@ use cerebellum_computer::dispatch::{
     FRONTING_POLL_MS,
 };
 use cerebellum_computer::platform::{
-    FrontedDispatchHooks, FrontingRestoreHost, HookedRestore, ProcessGrant,
+    FrontedDispatchHooks, FrontingRestoreHost, FrontingSession, HookedRestore, ProcessGrant,
 };
 use cerebellum_core::config::AppUse;
 use serde_json::{json, Value};
@@ -541,12 +541,13 @@ pub(crate) struct OneWayFront {
 /// heartbeat, `admit` (cancellation and the dispatch gate), the front request,
 /// and a wait of at most `FRONT_WAIT_MS` for the target to come forward. It
 /// never restores.
-pub(crate) fn front_one_way<H: FrontingBracketHost>(
-    host: &mut H,
+pub(crate) fn front_one_way(
+    host: &mut Box<dyn FrontingSession>,
     estimator: &mut UserIdleEstimator,
-    target: u32,
+    grant: &ProcessGrant,
     admit: &mut dyn FnMut() -> Option<FrontingStop>,
 ) -> Result<OneWayFront, FrontingStop> {
+    let target = grant.pid;
     let Some(previous) = host.frontmost_pid() else {
         return Err(FrontingStop::PreviousUnknown);
     };
@@ -561,7 +562,7 @@ pub(crate) fn front_one_way<H: FrontingBracketHost>(
         return Err(stop);
     }
     let requested_at = host.now_ms();
-    if !host.request_front(target) {
+    if !host.request_granted_front(grant) {
         return Err(FrontingStop::FrontFailed);
     }
     loop {
@@ -1171,7 +1172,7 @@ where
             let mut estimator = estimator
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let front = front_one_way(&mut session, &mut estimator, grant.pid, &mut || {
+            let front = front_one_way(&mut session, &mut estimator, &grant, &mut || {
                 if cancel.is_cancelled() {
                     Some(FrontingStop::Cancelled)
                 } else if work.stopped() {

@@ -1822,6 +1822,11 @@ pub trait FrontingSession {
     fn pause_ms(&mut self, milliseconds: u64);
     fn frontmost_pid(&mut self) -> Option<u32>;
     fn request_front(&mut self, pid: u32) -> bool;
+    /// Request a one-way front only while the original process holds this PID.
+    /// Refuse unless the platform checks that ownership at the activation write.
+    fn request_granted_front(&mut self, _grant: &ProcessGrant) -> bool {
+        false
+    }
     fn our_pid(&self) -> i64;
     /// Start watching session input. `false` when no observer can be
     /// started, which is how Input Monitoring that is not live shows.
