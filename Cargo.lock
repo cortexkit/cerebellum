@@ -211,7 +211,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "avatar-genome"
 version = "0.1.0"
-source = "git+ssh://git@github.com/cortexkit/avatar.git?rev=b9696127a4095e76b5ace3503aab877d449702f0#b9696127a4095e76b5ace3503aab877d449702f0"
+source = "git+ssh://git@github.com/cortexkit/avatar.git?rev=722ea8ae411510913be8941c836dd74cd97e0b96#722ea8ae411510913be8941c836dd74cd97e0b96"
 dependencies = [
  "avatar-phenotype",
  "avatar-tables",
@@ -221,7 +221,7 @@ dependencies = [
 [[package]]
 name = "avatar-phenotype"
 version = "0.1.0"
-source = "git+ssh://git@github.com/cortexkit/avatar.git?rev=b9696127a4095e76b5ace3503aab877d449702f0#b9696127a4095e76b5ace3503aab877d449702f0"
+source = "git+ssh://git@github.com/cortexkit/avatar.git?rev=722ea8ae411510913be8941c836dd74cd97e0b96#722ea8ae411510913be8941c836dd74cd97e0b96"
 dependencies = [
  "serde_json",
 ]
@@ -229,7 +229,7 @@ dependencies = [
 [[package]]
 name = "avatar-svg"
 version = "0.1.0"
-source = "git+ssh://git@github.com/cortexkit/avatar.git?rev=b9696127a4095e76b5ace3503aab877d449702f0#b9696127a4095e76b5ace3503aab877d449702f0"
+source = "git+ssh://git@github.com/cortexkit/avatar.git?rev=722ea8ae411510913be8941c836dd74cd97e0b96#722ea8ae411510913be8941c836dd74cd97e0b96"
 dependencies = [
  "avatar-genome",
  "avatar-phenotype",
@@ -239,7 +239,7 @@ dependencies = [
 [[package]]
 name = "avatar-tables"
 version = "0.1.0"
-source = "git+ssh://git@github.com/cortexkit/avatar.git?rev=b9696127a4095e76b5ace3503aab877d449702f0#b9696127a4095e76b5ace3503aab877d449702f0"
+source = "git+ssh://git@github.com/cortexkit/avatar.git?rev=722ea8ae411510913be8941c836dd74cd97e0b96#722ea8ae411510913be8941c836dd74cd97e0b96"
 dependencies = [
  "blake3",
 ]
