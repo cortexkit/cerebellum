@@ -2,7 +2,7 @@
 
 `avatar-read.json` is copied byte for byte from `cortexkit/entorhinal`,
 `test-vectors/agent-identity-reads-v1/avatar-read.json`, at commit
-`b9c18d3a5a1c3e7049772ae3bbac9217c9e101d1`.
+`c1f8d0d9bd4153d6de9acae32891eef1503ddba1` (tag `agent-identity-reads-v1.3`).
 
 `SHA256SUMS` pins the owner's published bytes. The vectors cover present,
 missing and avatar-less identities, deduplication, and request bounds. They are

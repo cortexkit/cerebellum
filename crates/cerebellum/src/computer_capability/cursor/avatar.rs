@@ -332,7 +332,7 @@ mod tests {
     fn pinned_entorhinal_vectors_decode_and_pin_the_request_envelope() {
         assert_eq!(
             format!("{:x}", Sha256::digest(VECTORS)),
-            "40b1d942b8b69117121441574cc550826d6f1243a4a8a0768a15ce80efcb125a"
+            "23dbaf8d6c254d5ee99bae6787c7cbdccd307d10099a943a8e065f6ae54b5a5b"
         );
         assert_eq!(
             format!("{:x}", Sha256::digest(REAL_GENOME.as_bytes())),
