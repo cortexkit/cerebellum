@@ -537,7 +537,7 @@
     "template": {
       "page": {
         "catalog": {
-          "digest": "sha256:af4559652b832b8908f4dc39364874eea6950ab708567e70f17d304e8c0f9a32",
+          "digest": "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4",
           "version": "1.1"
         },
         "executionDialect": "1.0",
@@ -548,7 +548,7 @@
       },
       "row": {
         "catalog": {
-          "digest": "sha256:af4559652b832b8908f4dc39364874eea6950ab708567e70f17d304e8c0f9a32",
+          "digest": "sha256:a95693cfabc0bf2d7e7276fd1c634128d96c11605c1cdfe480da9ac2418683a4",
           "version": "1.1"
         },
         "executionDialect": "1.0",
@@ -558,7 +558,7 @@
         "source": "export const action = input.action == \"snapshot\" ? \"Read page\" : input.action == \"navigate\" ? \"Navigate\" : input.action == \"click\" || input.action == \"click_point\" ? \"Click\" : input.action == \"type\" ? \"Type\" : input.action == \"screenshot\" ? \"Screenshot\" : input.action == \"open_tab\" ? \"Open tab\" : input.action == \"claim_tab\" ? \"Use tab\" : input.action == \"fill_login\" ? \"Fill login\" : input.action == \"open_grant\" ? \"Request approval\" : input.action == \"present\" ? \"Sign in\" : input.action == \"resume\" ? \"Resume\" : input.action == \"import_login\" ? \"Import login\" : input.action == \"capture_login\" ? \"Save login\" : input.action == \"revoke_access\" ? \"Revoke access\" : input.action == \"launch\" ? \"Open browser\" : input.action == \"close\" ? \"Close browser\" : input.action == \"scroll\" ? \"Scroll\" : input.action == \"status\" ? \"Status\" : Replace(input.action, \"_\", \" \")\nexport const authority = Last(Split(First(Split(First(Split(First(Split(Last(Split(view.record.site ?? input.url ?? \"\", \"://\")), \"/\")), \"?\")), \"#\")), \"@\"))\nexport const host = StartsWith(authority, \"[\") ? First(Split(authority, \"]\")) + \"]\" : First(Split(authority, \":\"))\nexport const outcome = view.completion.outcome ?? view.record.outcome\nexport const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason\n\n<Card appearance=\"clear\" direction=\"row\" gap=\"s\" align=\"center\">\n<TextContent text={action} maxLines={1} />\n<Slot width=\"fill\">\n<TextContent text={host} size=\"small\" maxLines={1} />\n</Slot>\n<Slot width=\"short\">\n{outcome == \"held\" ? <Badge text={reason == \"login_handoff\" ? \"Signed out\" : \"Asked you\"} tone=\"neutral\" /> : outcome == \"error\" ? <Badge text=\"Refused\" tone=\"danger\" /> : outcome == \"partial\" ? <Badge text=\"Unknown\" tone=\"warning\" /> : outcome == \"success\" ? <Badge text=\"Done\" tone=\"neutral\" /> : null}\n</Slot>\n<Slot width=\"short\">\n{outcome == null && view.call.phase == \"running\" ? <Elapsed start={view.call.startedAtMs ?? now} /> : view.completion.durationMs == null && view.record.durationMs == null ? null : <TextContent text={FormatDuration(view.completion.durationMs ?? view.record.durationMs ?? 0)} size=\"small\" maxLines={1} />}\n</Slot>\n</Card>\n"
       }
     },
-    "template_revision": 4,
+    "template_revision": 3,
     "tool": {
       "input_schema": {
         "additionalProperties": false,

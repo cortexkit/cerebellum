@@ -235,15 +235,20 @@ export CEREBELLUM_PRIVATE_INPUT_ROUTE_REVIEW_REVISION="private-input-route-revie
 #     restoring the previous application (or not, when the person switched
 #     apps), with the restore held until a held key's release is confirmed;
 #   - preview capture: the background-mode preview's capture of a covered
-#     window's pixels, outside capture custody.
+#     window's pixels, outside capture custody;
+#   - a picture of a covered window under the app grant alone, which briefly
+#     brings the application forward for the capture, then restores.
 # It gates no capability row. With the takeover review it admits that
 # fronting; with the capture review it admits preview capture. Once the module
 # consults it, a build without it acts in foreground mode without fronting,
 # refuses a press on a disabled element with element_disabled, keeps the
 # takeover bracket for chords, and shows the application's icon in the preview.
-# Minted by SUBC over dccb87c9..d5c517a7, after the 2026-11-17 desk run at the
-# 200 ms needs-front bound Ufuk set. Bind it only on builds from d5c517a7 or later.
-export CEREBELLUM_APP_USE_FRONTING_REVIEW_REVISION="app-use-fronting-review/v1@d5c517a7"
+# v2 was minted by SUBC over 1e916cd2..c4310e1a after eight review rounds of the
+# single-owner restore design Ufuk approved: one thread fronts, acts and
+# restores within his 200 ms bound, and after the bound nothing new is sent or
+# captured. It replaces v1 (d5c517a7), which did not cover pictures. Bind it
+# only on builds from c4310e1a or later.
+export CEREBELLUM_APP_USE_FRONTING_REVIEW_REVISION="app-use-fronting-review/v2@c4310e1a"
 
 # Takeover pointer gestures (move, scroll, click, drag) on a covered app: the
 # module brings the app forward for the one gesture, then restores the person's
