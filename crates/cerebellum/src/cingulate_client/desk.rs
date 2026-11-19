@@ -779,12 +779,41 @@ impl ConsentDesk {
         self.save()
     }
 
+    /// End a person's-Chrome site card's ability to grant, whatever the
+    /// consent service later says about it: its call stopped holding it
+    /// (turn-stop, or the route closed), and the card's answer belongs only to
+    /// that call. The card stays in the registry while it may still be open
+    /// remotely, so a later drain withdraws it, or acknowledges an answer
+    /// that was already given, without storing a grant: with no deferred use
+    /// and no retained grant, the site adapter has nothing pending to apply.
+    pub(crate) fn void_grant_intent(&self, id: &str) {
+        let voided = match lock(&self.registry).get_mut(id) {
+            Some(card) if card.kind == CardKind::UserBrowserSite => {
+                card.lifecycle.deferred_use = false;
+                card.lifecycle.user_browser_grant = None;
+                true
+            }
+            _ => false,
+        };
+        if voided {
+            // A failed save leaves the voided card in memory for this run;
+            // nothing better can be done without the registry file.
+            let _ = self.save();
+        }
+    }
+
     /// The open card this session raised about `subject`, for a call that
-    /// should wait on it rather than raise a second one.
+    /// should wait on it rather than raise a second one. A site card whose
+    /// grant intent was voided is never joined: its answer must not grant.
     pub fn open_card_for(&self, session: &SessionKey, subject: &str) -> Option<RaisedCard> {
         lock(&self.registry)
             .values()
-            .find(|card| !card.applied && card.session == *session && card.subject == subject)
+            .find(|card| {
+                !card.applied
+                    && card.session == *session
+                    && card.subject == subject
+                    && !(card.kind == CardKind::UserBrowserSite && !card.lifecycle.deferred_use)
+            })
             .cloned()
     }
 
@@ -1282,17 +1311,32 @@ impl DeskSession<'_> {
         wait: Duration,
         cancelled: impl Future<Output = ()>,
     ) -> InCall {
+        let desk = self.desk;
         let result = self
             .park(elicitation_id, wait, async {
                 cancelled.await;
+                // Void the card's grant intent before the withdrawal is even
+                // sent, so neither a failed withdrawal nor a crash during it
+                // leaves a cancelled card able to grant.
+                desk.void_grant_intent(elicitation_id);
                 LetGo::Withdraw
             })
             .await;
-        if matches!(
-            result,
-            InCall::Settled(Ending::NoAnswer | Ending::Withdrawn)
-        ) {
-            self.desk.forget(&[elicitation_id.to_string()]);
+        match result {
+            InCall::Settled(Ending::NoAnswer | Ending::Withdrawn) => {
+                self.desk.forget(&[elicitation_id.to_string()]);
+            }
+            InCall::Cancelled | InCall::RouteClosed => {
+                // This call still counts as the card's holder here, so a drain
+                // pass cannot store the answer yet. Waiting for the session's
+                // settlement lock lets a pass that read the card before it was
+                // voided finish first; every later pass sees the voided card
+                // and acknowledges its answer without granting.
+                let settlement = self.desk.settlement_lock(self.live.session());
+                let _pass = settlement.lock().await;
+                self.desk.void_grant_intent(elicitation_id);
+            }
+            _ => {}
         }
         result
     }
