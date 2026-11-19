@@ -102,6 +102,7 @@ cerebellum-linux = { path = "../cerebellum-linux" }
 [dev-dependencies]
 cerebellum-core = { path = "../cerebellum-core", features = ["test-support"] }
 async-trait = "0.1"
+cortexkit-role-agent-data = { workspace = true, features = ["test-vectors"] }
 cortexkit-role-tool-provider-conformance = "=0.15.11"
 cortexkit-role-tool-provider = { version = "=0.15.10", features = ["test-vectors"] }
 cortexkit-role-tool-display = { version = "=0.1.8", features = ["test-vectors"] }
