@@ -1045,7 +1045,7 @@ impl CallRecords {
             if let Err(error) = records.bound_late(&mut inner, now_ms) {
                 inner.broken = Some(error);
             }
-            let dropped = Self::apply_retention(&mut inner, now_ms);
+            let dropped = Self::apply_retention(&mut inner, now_ms, None);
             if existed
                 && file_version >= HANDOFF_CALL_RECORD_VERSION
                 && (reconciled || dropped || line_count != inner.entries.len())
@@ -1078,12 +1078,14 @@ impl CallRecords {
     }
 
     /// Drop settled records past retention, then the oldest settled ones past
-    /// the count bound. Returns whether anything was dropped.
-    fn apply_retention(inner: &mut Inner, now_ms: u64) -> bool {
+    /// the count bound. Returns whether anything was dropped. `keep` names a
+    /// record being written right now, which its writer still has to install.
+    fn apply_retention(inner: &mut Inner, now_ms: u64, keep: Option<&Key>) -> bool {
         let before = inner.entries.len();
         let horizon = now_ms.saturating_sub(RETENTION.as_millis() as u64);
-        inner.entries.retain(|_, entry| {
-            entry.record.state == CallState::Started
+        inner.entries.retain(|key, entry| {
+            Some(key) == keep
+                || entry.record.state == CallState::Started
                 || late::unacked(&entry.record)
                 || entry.record.last_written_ms() >= horizon
         });
@@ -1091,8 +1093,10 @@ impl CallRecords {
             let mut settled: Vec<(u64, Key)> = inner
                 .entries
                 .iter()
-                .filter(|(_, entry)| {
-                    entry.record.state != CallState::Started && !late::unacked(&entry.record)
+                .filter(|(key, entry)| {
+                    Some(*key) != keep
+                        && entry.record.state != CallState::Started
+                        && !late::unacked(&entry.record)
                 })
                 .map(|(key, entry)| (entry.record.last_written_ms(), key.clone()))
                 .collect();
@@ -1113,9 +1117,32 @@ impl CallRecords {
 
     /// Rewrite the file as one line per kept record.
     fn compact(&self, inner: &mut Inner, version: u64) -> Result<(), CallRecordError> {
+        self.compact_with(inner, version, None)
+    }
+
+    /// [`Self::compact`] with `incoming` standing in for its key's entry.
+    ///
+    /// Writers append a record before installing it in `inner.entries`, so a
+    /// compaction triggered by that append would otherwise rewrite the file
+    /// from the previous state and erase the row that was just synced: a
+    /// fresh admission would vanish and a retry after a crash could run the
+    /// call a second time.
+    fn compact_with(
+        &self,
+        inner: &mut Inner,
+        version: u64,
+        incoming: Option<&CallRecord>,
+    ) -> Result<(), CallRecordError> {
         let mut bytes = header(version);
-        let mut records: Vec<&CallRecord> =
-            inner.entries.values().map(|entry| &entry.record).collect();
+        let replaced =
+            |key: &Key| incoming.is_some_and(|r| r.principal == key.0 && r.call_key == key.1);
+        let mut records: Vec<&CallRecord> = inner
+            .entries
+            .iter()
+            .filter(|(key, _)| !replaced(key))
+            .map(|(_, entry)| &entry.record)
+            .chain(incoming)
+            .collect();
         records.sort_by(|left, right| {
             (left.started_at_ms, &left.principal, &left.call_key).cmp(&(
                 right.started_at_ms,
@@ -1158,8 +1185,9 @@ impl CallRecords {
         self.storage.append(&line(record)?, inner.file_version)?;
         inner.appended_since_compaction += 1;
         if inner.appended_since_compaction >= MAX_RECORDS {
-            Self::apply_retention(inner, now_ms);
-            self.compact(inner, version)?;
+            let key: Key = (record.principal.clone(), record.call_key.clone());
+            Self::apply_retention(inner, now_ms, Some(&key));
+            self.compact_with(inner, version, Some(record))?;
         }
         Ok(())
     }
@@ -1515,6 +1543,35 @@ mod tests {
         }
         let floor = fs::read_to_string(directory.join("floor.json")).unwrap();
         assert!(floor.contains("call-records"), "{floor}");
+    }
+
+    /// The append that reaches the compaction threshold may be a fresh
+    /// admission. Compaction rewrites the file before `begin` installs the
+    /// entry, so the rewrite must still carry the admission's `started` row.
+    #[test]
+    fn an_admission_that_triggers_compaction_survives_a_crash_as_outcome_unknown() {
+        let storage = InMemoryCallRecordStorage::new();
+        let first = CallRecords::open(Box::new(storage.clone()), 1_000);
+        // The first write creates the file and does not count as an append.
+        let _earlier = executed(first.begin("direct", "k:earlier", "c", 1_000));
+        first.lock().appended_since_compaction = MAX_RECORDS - 1;
+        let _ticket = executed(first.begin("direct", "k:at-threshold", "c", 1_001));
+        assert_eq!(
+            first.lock().appended_since_compaction,
+            0,
+            "the admission must have triggered compaction"
+        );
+        drop(first);
+
+        let reopened = CallRecords::open(Box::new(storage), 2_000);
+        assert!(matches!(
+            reopened.begin("direct", "k:at-threshold", "c", 2_000),
+            Begin::OutcomeUnknown
+        ));
+        assert!(matches!(
+            reopened.begin("direct", "k:earlier", "c", 2_000),
+            Begin::OutcomeUnknown
+        ));
     }
 
     #[test]

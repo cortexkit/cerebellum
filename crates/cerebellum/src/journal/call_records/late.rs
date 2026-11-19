@@ -1227,6 +1227,42 @@ mod tests {
             .is_empty());
     }
 
+    /// An acknowledgement whose append reaches the compaction threshold must
+    /// be part of the rewritten file, or a restart would deliver the acked
+    /// result again.
+    #[test]
+    fn an_ack_that_triggers_compaction_stays_acked_after_restart() {
+        let storage = InMemoryCallRecordStorage::new();
+        let calls = CallRecords::open(Box::new(storage.clone()), 100);
+        settled(&calls, "pf:acked", "s1", 100);
+        let pulled = calls
+            .late_results(OWNER, &LateResultsRequest::new(), 100)
+            .unwrap();
+        assert_eq!(pulled.entries.len(), 1);
+        calls.lock().appended_since_compaction = MAX_RECORDS - 1;
+        calls
+            .ack_late_results(
+                OWNER,
+                &AckRequest {
+                    through: pulled.cursor,
+                },
+                101,
+            )
+            .unwrap();
+        assert_eq!(
+            calls.lock().appended_since_compaction,
+            0,
+            "the acknowledgement must have triggered compaction"
+        );
+        drop(calls);
+        let reopened = CallRecords::open(Box::new(storage), 102);
+        assert!(reopened
+            .late_results(OWNER, &LateResultsRequest::new(), 102)
+            .unwrap()
+            .entries
+            .is_empty());
+    }
+
     #[test]
     fn caps_drop_oldest_results_per_session_and_expired_per_owner() {
         let calls = CallRecords::in_memory();
