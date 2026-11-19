@@ -328,6 +328,90 @@ async fn explicit_close_is_not_blocked_by_held_consent() {
     assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
 }
 
+/// The approved continuation re-enters the dispatcher with the original
+/// request's address, but its reply goes to the late-result store, not to
+/// the live connection. It must not leave a delivery deadline on that
+/// connection, or the connection is torn down long after the call succeeded.
+/// Every request here, late pulls included, travels the real egress drain.
+#[tokio::test]
+async fn a_resumed_continuation_leaves_no_delivery_deadline_on_the_live_connection() {
+    let (planes, consent, page, _) = fixture().await;
+    let deadlines = Arc::clone(&planes.egress_deadlines);
+    let (mut peer, socket) = tokio::io::duplex(1 << 20);
+    let (inbound, mut received) = mpsc::channel(64);
+    let reader = tokio::spawn(async move {
+        while let Ok(Some(frame)) = subc_transport::read_frame(&mut peer).await {
+            if inbound.send(frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    async fn call(
+        planes: &Planes,
+        tx: &mpsc::Sender<Frame>,
+        received: &mut mpsc::Receiver<Frame>,
+        corr: &mut u64,
+        body: Value,
+    ) -> Value {
+        *corr += 1;
+        handle_frame_for_test(request(9, *corr, body), tx, planes)
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(HANG_GUARD, received.recv())
+            .await
+            .expect("the connection answers")
+            .unwrap();
+        // The writer clears a request's deadline just after its flush.
+        tokio::time::timeout(HANG_GUARD, async {
+            let delivering = || {
+                let pending = planes.egress_deadlines.pending.lock().unwrap();
+                pending.keys().any(|request| request.2 == *corr)
+            };
+            while delivering() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the writer acknowledges the reply");
+        decode(reply)
+    }
+    let connection = crate::drive_connection(socket, deadlines, move |tx| async move {
+        let mut corr = 3;
+        let pull = || json!({"name":"late_results","arguments":{"since":null}});
+        let reply = call(&planes, &tx, &mut received, &mut corr, navigate_request()).await;
+        assert_held(&reply, "consent");
+        consent.feed(json!([answered("browser-card", "allow_30m")]));
+        let settled = tokio::time::timeout(HANG_GUARD, async {
+            loop {
+                let reply = call(&planes, &tx, &mut received, &mut corr, pull()).await;
+                if reply["entries"][0]["kind"] == "result" {
+                    return reply;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the held call settles");
+        assert_eq!(
+            settled["entries"][0]["call_key"], "held-navigation",
+            "{settled}"
+        );
+        assert_eq!(page.navigations.load(Ordering::SeqCst), 1);
+        // Past any reply budget, the same connection must still serve. The
+        // sleep lets the connection driver poll its deadline watch.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60 * 60)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::resume();
+        let again = call(&planes, &tx, &mut received, &mut corr, pull()).await;
+        assert!(again["entries"].is_array(), "{again}");
+        Ok(())
+    })
+    .await;
+    connection.expect("the connection outlives the resumed call");
+    reader.abort();
+}
+
 #[tokio::test]
 async fn approval_while_held_runs_navigate_and_returns_its_page_without_persisting_text() {
     let (planes, consent, page, storage) = fixture().await;

@@ -3631,9 +3631,13 @@ async fn handle_frame(
             };
             let (envelope_ms, reply_ms) = route_limits(&frame, planes);
             let connection_end = arrived + Duration::from_millis(reply_ms);
-            planes
-                .egress_deadlines
-                .arm(request_id(&frame), connection_end);
+            // A resumed held call replies on a private channel, never this
+            // connection's writer, so nothing would clear its deadline here.
+            if !browser_held::resuming() {
+                planes
+                    .egress_deadlines
+                    .arm(request_id(&frame), connection_end);
+            }
             if planes.draining.load(std::sync::atomic::Ordering::Acquire) {
                 let (reason, deadline_ms) =
                     planes.drain_notice.get().expect("drain notice published");
