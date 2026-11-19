@@ -1010,6 +1010,7 @@ async fn handle_tool_withdraw(
                     .run_calls
                     .cancellation(&carrier, &call_key, stamped.as_ref())
             {
+                planes.browser_resumes.cancel_handle(&cancel);
                 cancel.cancel();
                 if let (Some(agent), Some(cursor)) = (cancel.cursor_agent(), planes_cursor(planes))
                 {
@@ -1957,7 +1958,7 @@ pub async fn handle_browser_consent_deadline_for_test(
 
 /// Ask only after dispatch has returned its refusal and released its conversation
 /// lane and session operation guard. The outer call queue preserves browser
-/// order during consent, without holding CDP access or the session's idle sweep.
+/// order during consent without holding CDP access.
 pub(super) async fn serve_browser_with_consent(
     planes: &Planes,
     facts: &AcceptedBindFacts,
