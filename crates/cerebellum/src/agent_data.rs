@@ -162,6 +162,7 @@ impl Participant {
             }
             return Ok(json!({"refs":answers}));
         }
+        // Compare every decoded parameter, including the optional holderBox on release.
         let canonical = request.with_sorted_refs().params();
         if let Some(saved) = current.and_then(|c| c.replies.get(op.method())) {
             return if saved.request == canonical {

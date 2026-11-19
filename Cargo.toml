@@ -30,7 +30,7 @@ subc-control = "=0.41.0"
 subc-daemon = "=0.49.0"
 subc-jsonc = "=0.1.2"
 cortexkit-store-types = "=0.2.2"
-cortexkit-role-agent-data = "=0.3.1"
+cortexkit-role-agent-data = "=0.3.3"
 cortexkit-resource-busy = { git = "https://github.com/cortexkit/commons", rev = "067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7" }
 
 serde = { version = "1", features = ["derive"] }
