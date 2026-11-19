@@ -125,10 +125,11 @@ pub use cursor_overlay::{
 };
 #[cfg(target_os = "macos")]
 pub use cursor_overlay::{
-    probe_cursor_hide, probe_cursor_motion, probe_cursor_run_loop, probe_preview_hide,
-    reduce_motion, render_cursor_gallery_png, run_agent_cursor, CursorMotion, GalleryShot,
-    HideProbe, MotionProbe, OverlayAccent, OverlayColours, OverlayEvent, OverlayGesture,
-    OverlayMessage, OverlaySender, PictureTiming, PreviewHideProbe, ProbePass, AVATAR_PIXELS,
+    probe_cursor_hide, probe_cursor_motion, probe_cursor_recipient_load, probe_cursor_run_loop,
+    probe_preview_hide, reduce_motion, render_cursor_gallery_png, run_agent_cursor, CursorMotion,
+    GalleryShot, HideProbe, MotionProbe, OverlayAccent, OverlayColours, OverlayEvent,
+    OverlayGesture, OverlayMessage, OverlaySender, PictureTiming, PreviewHideProbe, ProbePass,
+    AVATAR_PIXELS,
 };
 #[cfg(all(target_os = "macos", feature = "desk-probe"))]
 pub use macos::{

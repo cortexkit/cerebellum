@@ -39,7 +39,7 @@ mod event_loop;
 pub use event_loop::OverlaySender;
 use event_loop::{OverlayReceiver, MESSAGE_BUDGET};
 mod loop_probe;
-pub use loop_probe::probe_cursor_run_loop;
+pub use loop_probe::{probe_cursor_recipient_load, probe_cursor_run_loop};
 
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
