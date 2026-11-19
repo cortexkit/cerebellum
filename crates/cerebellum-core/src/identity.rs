@@ -925,7 +925,7 @@ mod tests {
     #[test]
     fn scope_admission_ephemeral_kind_is_not_worker() {
         let core = Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         };
         let stamp = subc_protocol::scope::ScopeStamp::new(
             core.clone(),
@@ -958,7 +958,7 @@ mod tests {
     #[test]
     fn scope_admission_flow_stamp_attests_nothing() {
         let core = Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         };
         let stamp = subc_protocol::scope::ScopeStamp::new(
             core.clone(),
@@ -1749,13 +1749,13 @@ mod tests {
         assert_eq!(operator.surface, RouteSurface::Management);
     }
 
-    fn prefrontal_alias_cases() -> Vec<(Principal, bool)> {
+    fn prefrontal_admission_cases() -> Vec<(Principal, bool)> {
         vec![
             (
                 Principal::Reserved {
                     module_id: "prefrontal-core".into(),
                 },
-                true,
+                false,
             ),
             (
                 Principal::Reserved {
@@ -1774,7 +1774,7 @@ mod tests {
         ]
     }
 
-    fn prefrontal_alias_stamp(owner: Principal) -> subc_protocol::scope::ScopeStamp {
+    fn prefrontal_admission_stamp(owner: Principal) -> subc_protocol::scope::ScopeStamp {
         subc_protocol::scope::ScopeStamp::new(
             owner,
             "scope-alias",
@@ -1790,12 +1790,12 @@ mod tests {
     }
 
     #[test]
-    fn prefrontal_aliases_admit_scope_identity() {
-        for (owner, owner_admitted) in prefrontal_alias_cases() {
-            for (caller, caller_admitted) in prefrontal_alias_cases() {
+    fn only_prefrontal_admits_scope_identity() {
+        for (owner, owner_admitted) in prefrontal_admission_cases() {
+            for (caller, caller_admitted) in prefrontal_admission_cases() {
                 for authorized in [true, false] {
                     let stamp =
-                        prefrontal_alias_stamp(owner.clone()).with_owner_authorized(authorized);
+                        prefrontal_admission_stamp(owner.clone()).with_owner_authorized(authorized);
                     let accepted = AcceptedBindFacts::from_bind(
                         &bind_identity("conversation"),
                         Some(caller.clone()),
@@ -1820,15 +1820,15 @@ mod tests {
     }
 
     #[test]
-    fn prefrontal_aliases_admit_flow_owners() {
+    fn only_prefrontal_admits_flow_owners() {
         let basal = Some(Principal::Reserved {
             module_id: "basal".into(),
         });
-        for (owner, expected) in prefrontal_alias_cases() {
-            let mut stamp = prefrontal_alias_stamp(owner.clone());
+        for (owner, expected) in prefrontal_admission_cases() {
+            let mut stamp = prefrontal_admission_stamp(owner.clone());
             stamp.attributes.flow_id = Some("flow".into());
             assert_eq!(flow_carrier_admitted(&stamp, &basal), expected, "{owner:?}");
-            for (caller, _) in prefrontal_alias_cases() {
+            for (caller, _) in prefrontal_admission_cases() {
                 assert!(!flow_carrier_admitted(&stamp, &Some(caller)));
             }
             stamp.owner_authorized = false;
@@ -1840,13 +1840,13 @@ mod tests {
     }
 
     #[test]
-    fn prefrontal_aliases_admit_codemode_owners() {
+    fn only_prefrontal_admits_codemode_owners() {
         use subc_protocol::call_mode::CallMode;
         let basal = Some(Principal::Reserved {
             module_id: "basal".into(),
         });
-        for (owner, expected) in prefrontal_alias_cases() {
-            let mut stamp = prefrontal_alias_stamp(owner.clone());
+        for (owner, expected) in prefrontal_admission_cases() {
+            let mut stamp = prefrontal_admission_stamp(owner.clone());
             stamp.kind = subc_protocol::scope::ScopeKind::Ephemeral;
             stamp.attributes.run_id = Some("run".into());
             assert_eq!(
@@ -1854,7 +1854,7 @@ mod tests {
                 expected,
                 "{owner:?}"
             );
-            for (caller, _) in prefrontal_alias_cases() {
+            for (caller, _) in prefrontal_admission_cases() {
                 assert!(!codemode_carrier_candidate(
                     &stamp,
                     &Some(caller),
@@ -1874,7 +1874,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_prefrontal_core_bind_admits_session_calls() {
+    fn only_a_prefrontal_bind_admits_session_calls() {
         let bind = |principal| {
             AcceptedBindFacts::from_bind(
                 &bind_identity("conversation-live"),
@@ -1885,7 +1885,7 @@ mod tests {
             )
         };
         assert!(bind(Some(Principal::Reserved {
-            module_id: "prefrontal-core".to_string()
+            module_id: "prefrontal".to_string()
         }))
         .admits_session_calls());
         assert!(!bind(Some(Principal::Direct)).admits_session_calls());

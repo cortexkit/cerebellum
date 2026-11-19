@@ -163,7 +163,7 @@ fn bind_management(planes: &Planes, principal: Option<subc_protocol::Principal>)
 
 fn prefrontal() -> Option<subc_protocol::Principal> {
     Some(subc_protocol::Principal::Reserved {
-        module_id: "prefrontal-core".to_string(),
+        module_id: "prefrontal".to_string(),
     })
 }
 
@@ -171,7 +171,7 @@ fn prefrontal() -> Option<subc_protocol::Principal> {
 fn params(scope_ref: &str, outcome: &str) -> Value {
     json!({
         "session_ref": "0123456789abcdef0123456789abcdef",
-        "scope": {"owner": {"kind": "reserved", "module_id": "prefrontal-core"}, "ref": scope_ref, "epoch": 3},
+        "scope": {"owner": {"kind": "reserved", "module_id": "prefrontal"}, "ref": scope_ref, "epoch": 3},
         "harness": "claude-code",
         "turn_id": "turn-1",
         "outcome": outcome,
@@ -562,7 +562,7 @@ mod vectors {
     pub(super) fn check(case: &str, state: &str, request: &Frame, reply: &Frame) {
         let value = json!({
             "contract": "session-turn-ended-v1", "case": case, "state": state,
-            "principal": "reserved:prefrontal-core",
+            "principal": "reserved:prefrontal",
             "request": frame(request), "reply": frame(reply),
         });
         let bytes = format!("{}\n", serde_json::to_string_pretty(&value).unwrap());

@@ -1109,7 +1109,7 @@ async fn an_operator_rebind_cannot_raise_a_card_for_its_named_conversation() {
         rebind_attributed_conversation(
             "session-caller",
             Some(Principal::Reserved {
-                module_id: "prefrontal-core".to_string(),
+                module_id: "prefrontal".to_string(),
             }),
         )
         .await,

@@ -238,7 +238,7 @@ impl QuestionCarrier for ScriptedCarrier {
     > {
         use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
         let stamp = ScopeStamp::new(
-            subc_protocol::Principal::Reserved { module_id: "prefrontal-core".into() },
+            subc_protocol::Principal::Reserved { module_id: "prefrontal".into() },
             "computer-test",
             1,
             ScopeKind::Head,
@@ -278,7 +278,7 @@ impl Drop for TemporaryRegistry {
 pub fn stamp(agent: &str) -> subc_protocol::scope::ScopeStamp {
     use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
     ScopeStamp::new(
-        subc_protocol::Principal::Reserved { module_id: "prefrontal-core".into() },
+        subc_protocol::Principal::Reserved { module_id: "prefrontal".into() },
         "browser-tests",
         1,
         ScopeKind::Head,

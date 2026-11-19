@@ -380,7 +380,7 @@ async fn non_mac_setup_commits_under_one_lock_while_a_read_holds_the_other_reser
             std::time::Duration::from_secs(1),
             exchange(
                 &planes,
-                &facts("prefrontal-core"),
+                &facts("prefrontal"),
                 json!({"method":SETUP,"params":{"token":Token::Calendar.as_str()}}),
             ),
         )
@@ -708,12 +708,7 @@ async fn unsupported_os_refuses_after_binding_before_the_busy_unit_and_describe_
     assert!(entries(&planes).await.is_empty());
     assert_eq!(active(&planes).await, 0);
     drop(holder);
-    let reply = exchange(
-        &planes,
-        &facts("prefrontal-core"),
-        json!({"method":DESCRIBE}),
-    )
-    .await;
+    let reply = exchange(&planes, &facts("prefrontal"), json!({"method":DESCRIBE})).await;
     let tokens = body(&reply)["tokens"].as_array().unwrap().clone();
     for token in [Token::Calendar, Token::Reminders] {
         let row = tokens

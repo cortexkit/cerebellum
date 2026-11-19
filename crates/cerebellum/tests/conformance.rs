@@ -676,7 +676,7 @@ async fn mcp_facade_principal_is_untrusted() {
 #[tokio::test]
 async fn eligible_first_party_principal_discovers_browser_status() {
     let trust = principal::trust_for_principal(&Some(Principal::Reserved {
-        module_id: "prefrontal-core".to_string(),
+        module_id: "prefrontal".to_string(),
     }));
     assert!(trust.is_first_party());
 }

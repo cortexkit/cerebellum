@@ -16,7 +16,7 @@ pub(super) fn describe_head(planes: &Planes, agent: &str) {
             let request: Value = serde_json::from_slice(&frame.body).unwrap();
             assert_eq!(
                 request,
-                json!({"op":"scope.describe", "owner":{"kind":"reserved","module_id":"prefrontal-core"}, "ref":"sc_head_alf"})
+                json!({"op":"scope.describe", "owner":{"kind":"reserved","module_id":"prefrontal"}, "ref":"sc_head_alf"})
             );
             let reply = Frame::build(FrameType::Response, Flags::new(false, Priority::Passive, false), 0, 0, frame.header.corr,
                 serde_json::to_vec(&json!({

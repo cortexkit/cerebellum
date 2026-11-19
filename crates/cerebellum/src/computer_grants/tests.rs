@@ -167,7 +167,7 @@ impl Drop for CardService {
 pub(crate) fn stamp(agent: &str) -> ScopeStamp {
     ScopeStamp::new(
         Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         },
         "card-tests",
         1,

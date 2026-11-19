@@ -604,7 +604,7 @@ impl CallHold for TestHold {
 fn stamp(scope_ref: &str, agent: Option<&str>) -> ScopeStamp {
     ScopeStamp::new(
         Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         },
         scope_ref,
         3,

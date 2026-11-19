@@ -226,11 +226,10 @@ fn other_first_party_principals() -> Vec<(Option<Principal>, &'static str)> {
 }
 
 #[tokio::test]
-async fn prefrontal_aliases_dispatch_through_tool_and_management_routes() {
+async fn prefrontal_dispatches_through_tool_and_management_routes() {
     for (principal, admitted, bind_allowed) in [
-        (reserved("prefrontal-core"), true, true),
         (reserved("prefrontal"), true, true),
-        (reserved("prefrontal-corex"), false, false),
+        (reserved("prefrontalx"), false, false),
         (Some(Principal::Unverified), false, false),
         (Some(Principal::Direct), false, true),
     ] {
@@ -276,6 +275,22 @@ async fn prefrontal_aliases_dispatch_through_tool_and_management_routes() {
     }
 }
 
+#[tokio::test]
+async fn retired_prefrontal_core_cannot_bind() {
+    for target in [tool_route(), management_route()] {
+        let planes = planes_with_a_grant().await;
+        let reply = bind(&planes, reserved("prefrontal-core"), target).await;
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Error,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        let error: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(error.code, "principal_denied");
+    }
+}
+
 /// The admitted caller reaches its agent's grant: navigating to the
 /// granted site passes authorization and stops only because no browser is
 /// running, while the ungranted site is put to the person instead.
@@ -285,7 +300,7 @@ async fn the_session_caller_acts_on_its_agents_grant() {
     let planes = service.install(planes_with_a_grant().await);
     let bound = bind_with_scope(
         &planes,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         tool_route(),
         Some(super::support::computer::cingulate::stamp(
             "pj-session-admission",
@@ -388,11 +403,11 @@ async fn a_refused_caller_cannot_open_a_grant_on_the_management_surface() {
 #[tokio::test]
 async fn principals_resembling_the_session_caller_are_refused() {
     for module_id in [
-        "prefrontal-cor",
-        "prefrontal-core-x",
-        "Prefrontal-Core",
-        "prefrontal-core ",
-        "xprefrontal-core",
+        "prefronta",
+        "prefrontal-x",
+        "Prefrontal",
+        "prefrontal ",
+        "xprefrontal",
     ] {
         let planes = planes_with_a_grant().await;
         let reply = bind(&planes, reserved(module_id), tool_route()).await;
@@ -515,7 +530,7 @@ async fn an_unscoped_session_route_cannot_raise_login_cards() {
         );
         bind_acked(
             &planes,
-            reserved("prefrontal-core"),
+            reserved("prefrontal"),
             if capture {
                 tool_route()
             } else {

@@ -3274,7 +3274,7 @@ mod executable_identity_launch_tests {
             let mut head = accepted_facts(Path::new("/test/project"));
             head.identity.conversation_key = "head-holder".into();
             head.principal = Some(subc_protocol::Principal::Reserved {
-                module_id: "prefrontal-core".into(),
+                module_id: "prefrontal".into(),
             });
             let mut flow = head.clone();
             flow.flow_id = Some("flow-7".into());

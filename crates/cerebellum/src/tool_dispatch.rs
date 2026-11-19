@@ -928,31 +928,21 @@ async fn handle_tool_withdraw(
     use cortexkit_role_tool_provider::withdraw::{
         check_record_scope, resolve_carrier, CallerProblem, CarrierResolution, WithdrawArguments,
     };
-    let caller_owner = ScopeIdentity {
-        owner: principal.clone(),
-        reference: String::new(),
-        scope_epoch: 0,
-    }
-    .owner_key();
-    let to_wire = |scope: &ScopeIdentity| {
-        let owner = scope.owner_key();
-        WireScope {
-            // The wire checker compares literal owner labels to the caller.
-            // Use its raw spelling for an equivalent owner, so resolving
-            // authority never changes the raw carrier chosen for the journal.
-            owner: if owner == caller_owner {
-                principal.clone()
-            } else {
-                owner
-            },
-            scope_ref: scope.reference.clone(),
-            scope_epoch: scope.scope_epoch,
-        }
+    let to_wire = |scope: &ScopeIdentity, owner| WireScope {
+        owner,
+        scope_ref: scope.reference.clone(),
+        scope_epoch: scope.scope_epoch,
     };
     let stamped = facts.scope.as_ref().map(ScopeIdentity::from_stamp);
-    let wire_stamp = stamped.as_ref().map(to_wire);
+    let wire_stamp = stamped
+        .as_ref()
+        .map(|scope| to_wire(scope, scope.owner.clone()));
     let mut arguments = WithdrawArguments::new(&call_key);
-    arguments.scope = named_scope.as_ref().map(to_wire);
+    // A requested scope can name a pre-rename record. The caller, live stamp,
+    // and carrier still use the daemon's exact identity.
+    arguments.scope = named_scope
+        .as_ref()
+        .map(|scope| to_wire(scope, scope.owner_key()));
     arguments.carrier = carrier;
     let resolution = match resolve_carrier(&principal, wire_stamp.as_ref(), &arguments) {
         Ok(resolution) => resolution,
@@ -985,7 +975,10 @@ async fn handle_tool_withdraw(
     let lookup =
         call_record_supervisor::lookup_call_record(planes, carrier.clone(), call_key.clone()).await;
     if let Lookup::Own(snapshot) = &lookup {
-        let record_scope = snapshot.scope.as_ref().map(to_wire);
+        let record_scope = snapshot
+            .scope
+            .as_ref()
+            .map(|scope| to_wire(scope, scope.owner_key()));
         if let Err(problem) = check_record_scope(record_scope.as_ref(), wire_stamp.as_ref()) {
             return tool_provider::send_error(problem.error(), (ver, channel, epoch, corr), writer)
                 .await;

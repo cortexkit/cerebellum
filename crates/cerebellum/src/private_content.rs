@@ -1188,7 +1188,7 @@ mod growth_tests {
         // which would fail the store closed for the wrong reason.
         store.set_write_deadline(crate::test_support::HANG_GUARD);
         let principal = subc_protocol::Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         };
         let mut facts = AcceptedBindFacts::from_bind(
             &subc_protocol::BindIdentity::new("fixture", "conversation"),

@@ -3446,21 +3446,7 @@ async fn handle_frame(
                         })
                         .collect();
                     for scope in scopes {
-                        if cerebellum_core::principal::is_prefrontal(&scope.owner) {
-                            // This push ends only one raw registration. Its
-                            // renamed copy may still own the held call.
-                            if planes.scopes.note_retained(&scope) {
-                                tokio::spawn(watch_run_scope_holds(
-                                    planes.clone(),
-                                    writer.clone(),
-                                    scope,
-                                ));
-                            } else {
-                                planes.scopes.closed_again(&scope).notify_one();
-                            }
-                        } else {
-                            settle_scope_holds(planes, &scope);
-                        }
+                        settle_scope_holds(planes, &scope);
                     }
                 }
             }
@@ -4247,7 +4233,7 @@ pub fn mint_image_handle_for_test(
     let facts = facts.clone().with_scope(Some(
         subc_protocol::scope::ScopeStamp::new(
             subc_protocol::Principal::Reserved {
-                module_id: "prefrontal-core".to_owned(),
+                module_id: "prefrontal".to_owned(),
             },
             scope_ref,
             1,
@@ -4756,7 +4742,7 @@ pub async fn handle_tool_request_for_test_with_planes_scoped(
     install_test_bind(&planes.routes, &frame);
     let stamp = subc_protocol::scope::ScopeStamp::new(
         subc_protocol::Principal::Reserved {
-            module_id: "prefrontal-core".to_owned(),
+            module_id: "prefrontal".to_owned(),
         },
         scope_ref,
         1,

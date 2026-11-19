@@ -141,7 +141,7 @@ async fn reserved(planes: &Planes, request_body: Value) -> Frame {
     let route = if method == CALL {
         flow()
     } else {
-        facts("prefrontal-core")
+        facts("prefrontal")
     };
     let result = dispatch(
         &planes.management.abilities,
@@ -463,7 +463,7 @@ async fn production_dispatch_serves_with_a_real_journal_reservation() {
             .len(),
         1
     );
-    assert_eq!(body(&exchange(&planes, &facts("prefrontal-core"), json!({"method":SCOPE_CHOICES,"params":{"token":Token::Calendar.as_str(),"key":"calendar"}})).await)["choices"], json!([]));
+    assert_eq!(body(&exchange(&planes, &facts("prefrontal"), json!({"method":SCOPE_CHOICES,"params":{"token":Token::Calendar.as_str(),"key":"calendar"}})).await)["choices"], json!([]));
     assert_eq!(source.calls.load(Ordering::SeqCst), 4);
     assert_eq!(
         planes
@@ -508,7 +508,7 @@ async fn non_mac_setup_neither_uses_source_nor_takes_a_busy_unit() {
             for &token in platform.tokens() {
                 let frame = exchange(
                     &planes,
-                    &facts("prefrontal-core"),
+                    &facts("prefrontal"),
                     json!({"method":SETUP,"params":{"token":token.as_str()}}),
                 )
                 .await;
@@ -1005,7 +1005,7 @@ async fn stopped_status_preflight_never_starts_read_or_choices() {
         let route = if method == CALL {
             flow()
         } else {
-            facts("prefrontal-core")
+            facts("prefrontal")
         };
         let result = dispatch(
             &planes.management.abilities,

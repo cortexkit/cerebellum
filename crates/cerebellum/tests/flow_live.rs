@@ -22,7 +22,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-const OWNER: &str = "prefrontal-core";
+const OWNER: &str = "prefrontal";
 const AGENT: &str = "flow-live-agent";
 const STARTUP: Duration = HANG_GUARD;
 

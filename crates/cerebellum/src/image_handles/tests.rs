@@ -244,7 +244,7 @@ fn a_capture_reply_carries_a_handle_its_bytes_resolve_by() {
     .with_scope(Some(
         subc_protocol::scope::ScopeStamp::new(
             subc_protocol::Principal::Reserved {
-                module_id: "prefrontal-core".to_owned(),
+                module_id: "prefrontal".to_owned(),
             },
             "head-scope",
             1,

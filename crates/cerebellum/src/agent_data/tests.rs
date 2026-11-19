@@ -220,7 +220,7 @@ async fn round_trip_through_engram_preserves_marks_and_release_keeps_source_copy
     let receiver = planes(&door);
     let stamp = subc_protocol::scope::ScopeStamp::new(
         Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         },
         "old-scope",
         1,
@@ -229,7 +229,7 @@ async fn round_trip_through_engram_preserves_marks_and_release_keeps_source_copy
     .with_attributes(
         subc_protocol::scope::ScopeAttributes::new().with_agent_id(Some(AGENT.into())),
     );
-    let marked = facts("prefrontal-core").with_scope(Some(stamp));
+    let marked = facts("prefrontal").with_scope(Some(stamp));
     crate::private_content::mark_delivered(
         &source,
         &marked,
@@ -384,13 +384,7 @@ async fn legacy_scope_marks_ship_only_unattributed_not_scope_refs_or_times() {
 async fn admission_and_strict_envelope_precede_any_state_or_door_access() {
     let door = Arc::new(FakeDoor::default());
     let planes = planes(&door);
-    for module in [
-        "prefrontal-core",
-        "broca",
-        "cingulate",
-        "callosum",
-        "cerebellum",
-    ] {
+    for module in ["prefrontal", "broca", "cingulate", "callosum", "cerebellum"] {
         // Call the internal handler directly to verify its own admission even
         // when a caller bypasses the daemon's earlier bind rejection.
         let frame = Frame::build(

@@ -412,8 +412,7 @@ impl RouteBindings {
             .any(|facts| {
                 admitted_head_scope(facts.head_context()).is_some_and(|scope| {
                     serde_json::from_str::<Principal>(owner).is_ok_and(|owner| {
-                        cerebellum_core::principal::canonical_scope_owner(&scope.owner)
-                            == cerebellum_core::principal::canonical_scope_owner(&owner)
+                        scope.owner == cerebellum_core::principal::read_legacy_scope_owner(&owner)
                     }) && scope.scope_ref == scope_ref
                 })
             })
@@ -443,8 +442,7 @@ impl RouteBindings {
             .iter()
             .filter(|(_, facts)| {
                 admitted_head_scope(facts).is_some_and(|stamp| {
-                    cerebellum_core::principal::canonical_scope_owner(&stamp.owner)
-                        == cerebellum_core::principal::canonical_scope_owner(&parent.owner)
+                    stamp.owner == parent.owner
                         && stamp.scope_ref == parent.scope_ref
                         && stamp.scope_epoch == parent.scope_epoch
                 })

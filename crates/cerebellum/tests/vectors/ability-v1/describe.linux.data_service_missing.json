@@ -1325,7 +1325,7 @@
     "call_mode": "classic",
     "codemode_head": null,
     "flow_id": null,
-    "principal": "reserved:prefrontal-core",
+    "principal": "reserved:prefrontal",
     "stamp": null
   },
   "tag": "ability-v1"

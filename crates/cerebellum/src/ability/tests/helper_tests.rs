@@ -288,7 +288,7 @@ async fn dispatch_setup(
     dispatch(
         &planes.management.abilities,
         &planes.browser,
-        &facts("prefrontal-core"),
+        &facts("prefrontal"),
         SETUP,
         body.as_object().unwrap(),
         gate,

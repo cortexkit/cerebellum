@@ -8,7 +8,7 @@
 //!
 //! The daemon admits a scope sync only from the connection that presented the
 //! owner's launch nonce, which only a process the daemon spawned is given. So
-//! the owner (`prefrontal-core`, which the daemon authorizes by default) is
+//! the owner (`prefrontal`, which the daemon authorizes by default) is
 //! configured as a module whose test helper writes its nonce to a file
 //! and stays alive, and this test registers and syncs as that module with
 //! the nonce. The same nonce, presented on a client connection, opens routes
@@ -57,7 +57,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
-const OWNER: &str = "prefrontal-core";
+const OWNER: &str = "prefrontal";
 const CONVERSATION: &str = "live-scope-conversation";
 const SCOPE_REF: &str = "live-s-1";
 

@@ -51,7 +51,7 @@ async fn isolated_plane_without_profile_lifecycle_refuses_rebind_without_touchin
 fn scope_admission_nondelegating_routes_do_not_read_or_offer_standing_grants() {
     use super::*;
     let core = Principal::Reserved {
-        module_id: "prefrontal-core".into(),
+        module_id: "prefrontal".into(),
     };
     let bind = subc_protocol::BindIdentity::new("test", "conversation");
     let target = subc_protocol::RouteTarget::ToolProvider {
@@ -741,7 +741,7 @@ mod would_ask_tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].identity.principal, "reserved:prefrontal-core");
+        assert_eq!(entries[0].identity.principal, "reserved:prefrontal");
         assert_eq!(
             entries[0].detail,
             Some(
@@ -3685,7 +3685,7 @@ fn principal_backstop_accepts_direct() {
 #[test]
 fn principal_backstop_accepts_the_executive() {
     let trust = trust_for_principal(&Some(Principal::Reserved {
-        module_id: "prefrontal-core".to_string(),
+        module_id: "prefrontal".to_string(),
     }));
     assert!(trust.is_first_party());
 }

@@ -62,7 +62,7 @@ pub fn trust_for_principal(principal: &Option<Principal>) -> PrincipalTrust {
 }
 
 /// Other daemon-spawned module ids trusted as first-party consumers of cerebellum
-/// capabilities, alongside [`PREFRONTAL_MODULE_IDS`].
+/// capabilities, alongside [`SESSION_CALLER_MODULE_ID`].
 ///
 /// Membership is deliberately tight: a module belongs here only if driving
 /// browser or computer use is part of its normal orchestration. The subc-mcp
@@ -77,25 +77,18 @@ pub fn trust_for_principal(principal: &Option<Principal>) -> PrincipalTrust {
 /// the old one only once no module registers under it.
 pub(crate) const FIRST_PARTY_MODULE_IDS: &[&str] = &["striatum", "aft", "broca"];
 
-/// The agent's orchestrator (prefrontal) registers as `prefrontal-core` today
-/// and as `prefrontal` after its rename; both are accepted until the rename is
-/// done everywhere. Remove `prefrontal-core` only once no orchestrator
-/// registers under it.
-pub const PREFRONTAL_MODULE_IDS: &[&str] = &["prefrontal-core", "prefrontal"];
-
-/// Whether a reserved principal identifies the agent's orchestrator.
+/// Whether a live reserved principal identifies the agent's orchestrator.
 pub fn is_prefrontal(principal: &Principal) -> bool {
-    matches!(principal, Principal::Reserved { module_id } if PREFRONTAL_MODULE_IDS.contains(&module_id.as_str()))
+    matches!(principal, Principal::Reserved { module_id } if module_id == SESSION_CALLER_MODULE_ID)
 }
 
-/// Treats `prefrontal-core` and `prefrontal` as one session-scope owner, so a
-/// scope prefrontal re-syncs under its new name (same ref and epoch) is the same
-/// session. Keep the original owner in stored records and daemon requests; only
-/// keys and comparisons use this projection.
-pub fn canonical_scope_owner(owner: &Principal) -> Principal {
-    if is_prefrontal(owner) {
+/// Read the retired `prefrontal-core` spelling as `prefrontal` when matching
+/// an existing record to its session. Do not rewrite the record or use this
+/// projection to authorize a live principal or scope stamp.
+pub fn read_legacy_scope_owner(owner: &Principal) -> Principal {
+    if matches!(owner, Principal::Reserved { module_id } if module_id == "prefrontal-core") {
         Principal::Reserved {
-            module_id: "prefrontal".into(),
+            module_id: SESSION_CALLER_MODULE_ID.into(),
         }
     } else {
         owner.clone()
@@ -105,7 +98,7 @@ pub fn canonical_scope_owner(owner: &Principal) -> Principal {
 /// Whether a daemon-spawned module id is a trusted first-party consumer of
 /// cerebellum capabilities.
 fn is_first_party_module_id(module_id: &str) -> bool {
-    PREFRONTAL_MODULE_IDS.contains(&module_id) || FIRST_PARTY_MODULE_IDS.contains(&module_id)
+    module_id == SESSION_CALLER_MODULE_ID || FIRST_PARTY_MODULE_IDS.contains(&module_id)
 }
 
 /// The one module admitted to call cerebellum in a conversation's name.
@@ -113,15 +106,12 @@ fn is_first_party_module_id(module_id: &str) -> bool {
 /// Cerebellum's standing permissions (site grants, app grants, the takeover
 /// grant) belong to the conversation a person gave them in. Every session's
 /// browser and computer calls reach cerebellum through Prefrontal's forwarding
-/// operations, so Prefrontal's core module is the only caller that may act
+/// operations, so Prefrontal is the only caller that may act
 /// under a conversation. Any other first-party module (AFT, Broca, the routing
 /// module, a `direct` host plugin) could otherwise open a route under a
 /// conversation and act on the permissions given there without anyone being
 /// asked.
-///
-/// Kept for callers that need to stamp a representative session caller. Admission
-/// accepts every id in [`PREFRONTAL_MODULE_IDS`], not just this representative.
-pub const SESSION_CALLER_MODULE_ID: &str = PREFRONTAL_MODULE_IDS[0];
+pub const SESSION_CALLER_MODULE_ID: &str = "prefrontal";
 
 /// The refusal code for a call that needs a conversation, made by a caller
 /// not admitted to act in one.
@@ -186,7 +176,7 @@ mod tests {
     /// could silently revoke that module's first-party admission.
     #[test]
     fn each_dependent_module_is_admitted() {
-        for module_id in ["prefrontal-core", "striatum", "aft", "broca"] {
+        for module_id in ["prefrontal", "striatum", "aft", "broca"] {
             assert_eq!(
                 trust_for_principal(&Some(Principal::Reserved {
                     module_id: module_id.to_string()
@@ -266,19 +256,19 @@ mod tests {
             // caller.
             "prefrontal-host:abc123",
             // Extends a trusted id.
-            "prefrontal-core-evil",
+            "prefrontal-evil",
             "aft-shim",
             // Is extended BY a trusted id.
             "prefront",
             "af",
             // Contains a trusted id without being one.
-            "not-prefrontal-core",
+            "not-prefrontal",
             "evil-aft",
             // Differs from a trusted id only in content a comparison might
             // normalize away.
-            "prefrontal-core ",
-            "prefrontal-core\0",
-            "PREFRONTAL-CORE",
+            "prefrontal ",
+            "prefrontal\0",
+            "PREFRONTAL",
             "",
         ] {
             assert_eq!(
@@ -298,11 +288,11 @@ mod tests {
     }
 
     #[test]
-    fn prefrontal_aliases_require_reserved_principals() {
+    fn prefrontal_matching_requires_the_exact_reserved_principal() {
         for (principal, admitted) in [
-            (reserved("prefrontal-core"), true),
+            (reserved("prefrontal-core"), false),
             (reserved("prefrontal"), true),
-            (reserved("prefrontal-corex"), false),
+            (reserved("prefrontalx"), false),
             (Some(Principal::Unverified), false),
             (Some(Principal::Direct), false),
             (None, false),
@@ -316,11 +306,11 @@ mod tests {
     }
 
     #[test]
-    fn prefrontal_aliases_have_first_party_trust() {
+    fn prefrontal_trust_requires_the_current_name() {
         for (principal, trusted) in [
-            (reserved("prefrontal-core"), true),
+            (reserved("prefrontal-core"), false),
             (reserved("prefrontal"), true),
-            (reserved("prefrontal-corex"), false),
+            (reserved("prefrontalx"), false),
             (Some(Principal::Unverified), false),
             (None, false),
         ] {
@@ -333,22 +323,17 @@ mod tests {
     }
 
     #[test]
-    fn prefrontal_aliases_admit_session_calls() {
+    fn only_prefrontal_makes_session_calls() {
         for (principal, admitted) in [
-            (reserved("prefrontal-core"), true),
+            (reserved("prefrontal-core"), false),
             (reserved("prefrontal"), true),
-            (reserved("prefrontal-corex"), false),
+            (reserved("prefrontalx"), false),
             (Some(Principal::Unverified), false),
             (Some(Principal::Direct), false),
             (None, false),
         ] {
             assert_eq!(admits_session_calls(&principal), admitted, "{principal:?}");
         }
-    }
-
-    #[test]
-    fn only_prefrontal_core_makes_session_calls() {
-        assert!(admits_session_calls(&reserved("prefrontal-core")));
     }
 
     /// Other first-party principals cannot make session calls, and retired
@@ -386,15 +371,15 @@ mod tests {
     #[test]
     fn ids_resembling_the_session_caller_make_no_session_calls() {
         for module_id in [
-            "prefrontal-cor",
-            "prefrontal-core-x",
-            "Prefrontal-Core",
-            "PREFRONTAL-CORE",
-            "prefrontal-core ",
-            " prefrontal-core",
-            "prefrontal-core\0",
-            "xprefrontal-core",
-            "prefrontal-host:prefrontal-core",
+            "prefronta",
+            "prefrontal-x",
+            "Prefrontal",
+            "PREFRONTAL",
+            "prefrontal ",
+            " prefrontal",
+            "prefrontal\0",
+            "xprefrontal",
+            "prefrontal-host:prefrontal",
             "",
         ] {
             assert!(

@@ -148,7 +148,7 @@ async fn worker_provider_operations_bypass_unsynced_head() {
             assert_eq!(frame.header.channel, 0);
             assert_eq!(
                 request,
-                json!({"op":"scope.describe", "owner":{"kind":"reserved","module_id":"prefrontal-core"}, "ref":"sc_head_alf"})
+                json!({"op":"scope.describe", "owner":{"kind":"reserved","module_id":"prefrontal"}, "ref":"sc_head_alf"})
             );
             observed.fetch_add(1, Ordering::SeqCst);
             let reply = Frame::build(
@@ -171,12 +171,12 @@ async fn worker_provider_operations_bypass_unsynced_head() {
         }
     });
     let owner = Principal::Reserved {
-        module_id: "prefrontal-core".into(),
+        module_id: "prefrontal".into(),
     };
     let mut worker = ScopeStamp::new(owner.clone(), "sc_worker_catalog", 3, ScopeKind::Worker)
         .with_owner_authorized(true);
     worker.parent = Some(ScopeParent::new(owner, "sc_head_alf", 7));
-    bind_with_scope(&planes, 9, "prefrontal-core", Some(worker)).await;
+    bind_with_scope(&planes, 9, "prefrontal", Some(worker)).await;
 
     // An unsynced owner must still prevent a tool call from using its head's grants.
     let browser = exchange(
@@ -206,7 +206,7 @@ async fn worker_provider_operations_bypass_unsynced_head() {
     let withdrawal = exchange(
         &planes,
         9,
-        json!({"name":"tool.withdraw", "arguments":{"call_key":"unknown-worker-call", "carrier":"reserved:prefrontal-core"}}),
+        json!({"name":"tool.withdraw", "arguments":{"call_key":"unknown-worker-call", "carrier":"reserved:prefrontal"}}),
     )
     .await;
     assert_eq!(
@@ -248,7 +248,7 @@ async fn tool_views_are_advertised_and_match_catalog_pins() {
         TOOL_VIEWS_CAPABILITY,
     };
     let planes = planes(true);
-    bind(&planes, 9, "prefrontal-core").await;
+    bind(&planes, 9, "prefrontal").await;
     let description = exchange(&planes, 9, json!({"name":"role.describe","arguments":{}})).await;
     let description: RoleDescribe = serde_json::from_value(body(&description)).unwrap();
     assert!(description
@@ -320,7 +320,7 @@ async fn tool_views_are_advertised_and_match_catalog_pins() {
 #[tokio::test]
 async fn catalog_matches_hello_and_digest_is_stable() {
     let planes = planes(true);
-    bind(&planes, 9, "prefrontal-core").await;
+    bind(&planes, 9, "prefrontal").await;
     let first = catalog(&planes, json!({"params":{}})).await;
     let repeated = catalog(&planes, json!({"params":{}})).await;
     assert_eq!(first.body, repeated.body);
@@ -387,7 +387,7 @@ async fn catalog_matches_hello_and_digest_is_stable() {
 #[tokio::test]
 async fn catalog_carries_exact_browser_capability_tags() {
     let planes = planes(true);
-    bind(&planes, 9, "prefrontal-core").await;
+    bind(&planes, 9, "prefrontal").await;
     let full: CatalogAnswer =
         serde_json::from_slice(&catalog(&planes, json!({})).await.body).unwrap();
     let browser = full
@@ -475,7 +475,7 @@ fn user_browser_budgets_are_target_specific_and_exhaustive() {
 #[tokio::test]
 async fn catalog_refuses_unknown_inputs_and_omits_disabled_browser() {
     let configured = planes(true);
-    bind(&configured, 9, "prefrontal-core").await;
+    bind(&configured, 9, "prefrontal").await;
     for (arguments, field) in [
         (json!({"preset":"unknown"}), "preset"),
         (json!({"preset":null}), "preset"),
@@ -492,7 +492,7 @@ async fn catalog_refuses_unknown_inputs_and_omits_disabled_browser() {
         assert_eq!(body(&reply)["detail"]["field"], field);
     }
     let disabled = planes(false);
-    bind(&disabled, 9, "prefrontal-core").await;
+    bind(&disabled, 9, "prefrontal").await;
     let answer = catalog(&disabled, json!({})).await;
     assert!(!body(&answer)["tools"]
         .as_array()
@@ -513,7 +513,7 @@ async fn catalog_refuses_unknown_inputs_and_omits_disabled_browser() {
 #[tokio::test]
 async fn mismatched_schema_pins_are_refused_before_dispatch() {
     let planes = planes(true);
-    bind(&planes, 9, "prefrontal-core").await;
+    bind(&planes, 9, "prefrontal").await;
     let full: CatalogAnswer =
         serde_json::from_slice(&catalog(&planes, json!({})).await.body).unwrap();
     let tool = full
@@ -731,7 +731,7 @@ async fn withdrawal_checks_the_carriers_own_record_scope() {
     let planes = planes(true);
     let scope = subc_protocol::scope::ScopeStamp::new(
         Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         },
         "scope-one",
         1,
@@ -783,7 +783,7 @@ async fn withdrawal_checks_the_carriers_own_record_scope() {
 #[tokio::test]
 async fn withdrawal_validation_is_a_contract_route_error() {
     let planes = planes(true);
-    bind(&planes, 9, "prefrontal-core").await;
+    bind(&planes, 9, "prefrontal").await;
     for (request, field) in [
         (
             json!({"name":"tool.withdraw","arguments":{"call_key":""}}),
@@ -803,7 +803,7 @@ async fn withdrawal_validation_is_a_contract_route_error() {
         assert_eq!(body(&reply)["code"], "invalid_request");
         assert_eq!(body(&reply)["detail"]["field"], field);
     }
-    let named_scope = exchange(&planes, 9, json!({"name":"tool.withdraw","arguments":{"call_key":"key","scope":{"owner":"reserved:prefrontal-core","ref":"claim","scope_epoch":1}}})).await;
+    let named_scope = exchange(&planes, 9, json!({"name":"tool.withdraw","arguments":{"call_key":"key","scope":{"owner":"reserved:prefrontal","ref":"claim","scope_epoch":1}}})).await;
     assert_eq!(named_scope.header.ty, FrameType::Error);
     assert_eq!(body(&named_scope)["code"], "withdraw_scope_mismatch");
 }
@@ -824,7 +824,7 @@ fn mode_scope(
     Some(
         ScopeStamp::new(
             Principal::Reserved {
-                module_id: "prefrontal-core".into(),
+                module_id: "prefrontal".into(),
             },
             "head",
             1,
@@ -843,7 +843,7 @@ async fn served_modes_reach_status_on_the_production_handler() {
         let module = if mode == CallMode::Flow {
             "basal"
         } else {
-            "prefrontal-core"
+            "prefrontal"
         };
         bind_with_scope_mode(&planes, 9, module, mode_scope(&mode), Some(mode.clone())).await;
         let response = exchange(
@@ -876,7 +876,7 @@ async fn unknown_mode_refused_before_grants_and_argument_dispatch() {
     bind_with_scope_mode(
         &planes,
         9,
-        "prefrontal-core",
+        "prefrontal",
         None,
         Some(CallMode::Unknown("future-mode".into())),
     )
@@ -905,7 +905,7 @@ async fn codemode_never_elicits_a_consent_card() {
         },
         identity: BindIdentity::new("test", "test-session"),
         principal: Some(Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         }),
         consumer_capabilities: Some(vec![
             "elicitation".into(),
@@ -981,7 +981,7 @@ async fn classic_still_elicits_a_consent_card() {
         },
         identity: BindIdentity::new("test", "test-session"),
         principal: Some(Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         }),
         consumer_capabilities: Some(vec![
             "elicitation".into(),
@@ -1036,7 +1036,7 @@ async fn classic_still_elicits_a_consent_card() {
 #[tokio::test]
 async fn call_members_cannot_enable_a_result_reader() {
     let planes = planes(true);
-    bind_with_readers(&planes, 9, "prefrontal-core", None, None, None).await;
+    bind_with_readers(&planes, 9, "prefrontal", None, None, None).await;
     let response = exchange(
         &planes,
         9,
@@ -1074,7 +1074,7 @@ async fn keyed_replays_use_the_current_routes_result_reader() {
         bind_with_readers(
             &planes,
             9,
-            "prefrontal-core",
+            "prefrontal",
             None,
             None,
             declaration(first_reads),
@@ -1083,7 +1083,7 @@ async fn keyed_replays_use_the_current_routes_result_reader() {
         bind_with_readers(
             &planes,
             10,
-            "prefrontal-core",
+            "prefrontal",
             None,
             None,
             declaration(!first_reads),

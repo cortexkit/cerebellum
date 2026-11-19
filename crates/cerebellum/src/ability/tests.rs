@@ -34,20 +34,15 @@ fn facts(name: &str) -> AcceptedBindFacts {
 }
 
 fn stamp(kind: ScopeKind, attrs: ScopeAttributes) -> ScopeStamp {
-    ScopeStamp::new(
-        principal("prefrontal-core").unwrap(),
-        "ability-test",
-        1,
-        kind,
-    )
-    .with_owner_authorized(true)
-    .with_attributes(attrs)
+    ScopeStamp::new(principal("prefrontal").unwrap(), "ability-test", 1, kind)
+        .with_owner_authorized(true)
+        .with_attributes(attrs)
 }
 
 #[test]
-fn prefrontal_aliases_admit_only_core_ability_operations() {
+fn current_prefrontal_admits_only_core_ability_operations() {
     for (principal, expected) in [
-        (principal("prefrontal-core"), true),
+        (principal("prefrontal-core"), false),
         (principal("prefrontal"), true),
         (principal("prefrontal-corex"), false),
         (Some(Principal::Unverified), false),
@@ -180,7 +175,7 @@ fn request(body: Value) -> Frame {
 }
 
 async fn observed_exchange(planes: &Planes, body: Value) -> Frame {
-    planes.routes.insert(19, 1, facts("prefrontal-core"));
+    planes.routes.insert(19, 1, facts("prefrontal"));
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     crate::handle_frame_for_test(request(body), &tx, planes)
         .await
@@ -349,7 +344,7 @@ async fn refused_callers_have_identical_errors_no_source_access_and_no_journal()
     let planes = fixture(source.clone(), Platform::MacOs);
     let before = planes.browser.journal_export_for_test().await;
     let mut cases = vec![
-        (facts("prefrontal-core"), CALL),
+        (facts("prefrontal"), CALL),
         (flow(), SCOPE_CHOICES),
         (flow(), SETUP),
         (facts("basal"), DESCRIBE),
@@ -396,7 +391,7 @@ async fn refused_callers_have_identical_errors_no_source_access_and_no_journal()
 async fn each_broken_core_route_condition_refuses_before_source_access() {
     let source = Arc::new(FakeStatus::default());
     let planes = fixture(source.clone(), Platform::MacOs);
-    let core = facts("prefrontal-core");
+    let core = facts("prefrontal");
     let mut codemode = core.clone();
     codemode.call_mode = CallMode::Codemode;
     let mut head = core.clone();
@@ -413,7 +408,7 @@ async fn each_broken_core_route_condition_refuses_before_source_access() {
     )));
     let unstamped = AcceptedBindFacts::from_bind(
         &BindIdentity::new("test", "s"),
-        principal("prefrontal-core"),
+        principal("prefrontal"),
         Some(&json!({"agentProjectId":"agent"})),
         None,
         &RouteTarget::ManagementSurface {
@@ -442,7 +437,7 @@ async fn each_broken_core_route_condition_refuses_before_source_access() {
 async fn core_card_operations_require_own_route_and_reject_any_origin_value() {
     let source = Arc::new(FakeStatus::default());
     let planes = fixture(source.clone(), Platform::MacOs);
-    let core = facts("prefrontal-core");
+    let core = facts("prefrontal");
     let agent = core.clone().with_scope(Some(stamp(
         ScopeKind::Head,
         ScopeAttributes::new()
@@ -532,7 +527,7 @@ fn catalog_mapping_matches_entorhinal_resolver_token_vectors() {
 async fn describe_is_schema_complete_ordered_and_only_availability_changes() {
     let source = Arc::new(FakeStatus::default());
     let planes = fixture(source.clone(), Platform::MacOs);
-    for route in [facts("prefrontal-core"), flow()] {
+    for route in [facts("prefrontal"), flow()] {
         let reply = exchange(&planes, &route, json!({"method":DESCRIBE})).await;
         assert_eq!(reply.header.ty, FrameType::Response);
         let mut reply = body(&reply);
@@ -556,7 +551,7 @@ async fn describe_is_schema_complete_ordered_and_only_availability_changes() {
     );
     let reply = exchange(
         &failing,
-        &facts("prefrontal-core"),
+        &facts("prefrontal"),
         json!({"method":DESCRIBE,"params":{}}),
     )
     .await;
@@ -636,7 +631,7 @@ async fn describe_invalid_params_use_fixed_error_and_principal_precedes_shape() 
     ] {
         let reply = exchange(
             &planes,
-            &facts("prefrontal-core"),
+            &facts("prefrontal"),
             json!({"method":DESCRIBE,"params":params}),
         )
         .await;
@@ -705,16 +700,11 @@ async fn assert_pending(method: &str, route: AcceptedBindFacts, code: &str) {
 }
 #[tokio::test(start_paused = true)]
 async fn scope_choices_queue_expiry_refuses_without_source_or_journal() {
-    assert_pending(
-        SCOPE_CHOICES,
-        facts("prefrontal-core"),
-        "ability_source_timeout",
-    )
-    .await;
+    assert_pending(SCOPE_CHOICES, facts("prefrontal"), "ability_source_timeout").await;
 }
 #[tokio::test(start_paused = true)]
 async fn mac_setup_queue_expiry_refuses_without_source_or_journal() {
-    assert_pending(SETUP, facts("prefrontal-core"), "ability_source_timeout").await;
+    assert_pending(SETUP, facts("prefrontal"), "ability_source_timeout").await;
 }
 #[tokio::test(start_paused = true)]
 async fn call_pending_binding_refuses_without_touching_source_unit() {
@@ -775,7 +765,7 @@ async fn request_rows_precede_binding_and_the_busy_source_unit() {
         let route = if method == CALL {
             flow()
         } else {
-            facts("prefrontal-core")
+            facts("prefrontal")
         };
         assert_refusal(
             &exchange(&planes, &route, json!({"method":method,"params":params})).await,
@@ -833,12 +823,7 @@ async fn hung_or_quarantined_unit_describes_unresponsive_without_hiding_other_un
         .for_token(Token::Calendar)
         .unwrap()
         .quarantined());
-    let reply = exchange(
-        &planes,
-        &facts("prefrontal-core"),
-        json!({"method":DESCRIBE}),
-    )
-    .await;
+    let reply = exchange(&planes, &facts("prefrontal"), json!({"method":DESCRIBE})).await;
     assert_eq!(reply.header.ty, FrameType::Response);
     assert_eq!(
         body(&reply)["tokens"][0]["unavailable_reason"],

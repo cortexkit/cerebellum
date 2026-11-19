@@ -42,7 +42,7 @@ async fn closed_params_shapes_and_call_keys_refuse_before_binding() {
         let route = if method == CALL {
             flow()
         } else {
-            facts("prefrontal-core")
+            facts("prefrontal")
         };
         for params in invalid {
             assert_refusal(
@@ -148,7 +148,7 @@ async fn scope_and_argument_schemas_refuse_before_binding() {
         assert_refusal(
             &exchange(
                 &planes,
-                &facts("prefrontal-core"),
+                &facts("prefrontal"),
                 json!({"method":SCOPE_CHOICES,"params":p}),
             )
             .await,
@@ -178,7 +178,7 @@ async fn declared_token_sets_and_unknown_ops_precede_scope_and_schema_checks() {
                         &if method == CALL {
                             flow()
                         } else {
-                            facts("prefrontal-core")
+                            facts("prefrontal")
                         },
                         json!({"method":method,"params":p}),
                     )
@@ -283,7 +283,7 @@ async fn shared_cursors_are_checked_before_binding_with_the_same_default_and_sco
     assert_refusal(
         &exchange(
             &planes,
-            &facts("prefrontal-core"),
+            &facts("prefrontal"),
             json!({"method":SCOPE_CHOICES,"params":p}),
         )
         .await,
@@ -294,7 +294,7 @@ async fn shared_cursors_are_checked_before_binding_with_the_same_default_and_sco
     assert_refusal(
         &exchange(
             &planes,
-            &facts("prefrontal-core"),
+            &facts("prefrontal"),
             json!({"method":SCOPE_CHOICES,"params":p}),
         )
         .await,

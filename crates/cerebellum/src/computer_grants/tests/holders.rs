@@ -188,7 +188,7 @@ async fn revived_worker_reuses_its_grant_but_a_fresh_scope_ref_asks_again() {
     for request in requests.iter() {
         assert_eq!(
             request,
-            &json!({"op":"scope.describe", "owner":{"kind":"reserved","module_id":"prefrontal-core"}, "ref":"sc_head_alf"})
+            &json!({"op":"scope.describe", "owner":{"kind":"reserved","module_id":"prefrontal"}, "ref":"sc_head_alf"})
         );
     }
     let store = planes.management.agent_grants();
@@ -212,10 +212,7 @@ async fn a_head_ending_between_calls_refuses_even_an_existing_worker_grant() {
         assert_eq!(reply["reason"], "no_agent_session", "{reply}");
         assert_eq!(reply["detail"]["retryable"], false);
     }
-    // The live first call asks once. Each ended or not-live head also asks the
-    // other prefrontal registration name, which may carry the same session
-    // across the rename, before refusing.
-    assert_eq!(requests.lock().unwrap().len(), 5);
+    assert_eq!(requests.lock().unwrap().len(), 3, "one describe per call");
 }
 
 #[tokio::test]
@@ -245,15 +242,13 @@ async fn a_describe_failure_never_defaults_to_a_worker_holder() {
     let (_, requests) = crate::permission_scope::test_support::describe(&planes, answer);
     let (reply, planes) = dispatch(planes, facts, "allow_30m").await;
     assert_eq!(reply["reason"], "worker_head_unavailable", "{reply}");
-    // Both prefrontal registration names are asked; neither answer establishes
-    // an identity, so the call still refuses.
     let owners: Vec<_> = requests
         .lock()
         .unwrap()
         .iter()
         .map(|request| request["owner"]["module_id"].clone())
         .collect();
-    assert_eq!(owners, [json!("prefrontal-core"), json!("prefrontal")]);
+    assert_eq!(owners, [json!("prefrontal")]);
     let store = planes.management.agent_grants();
     assert!(store.live_rows(None, store.now_ms()).unwrap().is_empty());
 }

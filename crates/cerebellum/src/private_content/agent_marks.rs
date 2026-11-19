@@ -31,41 +31,39 @@ async fn resolve_agent(planes: &Planes, scope: &str) -> Option<String> {
             remaining.min(planes.scopes.describe_timeout)
         });
     let lookup = async {
-        for owner in cerebellum_core::principal::PREFRONTAL_MODULE_IDS {
-            let response = planes
-                .scopes
-                .control
-                .request_connected(
-                    &ModuleControlRequestFromModule::ScopeDescribe {
-                        owner: subc_protocol::Principal::Reserved {
-                            module_id: owner.to_string(),
-                        },
-                        scope_ref: scope.to_owned(),
+        let response = planes
+            .scopes
+            .control
+            .request_connected(
+                &ModuleControlRequestFromModule::ScopeDescribe {
+                    owner: subc_protocol::Principal::Reserved {
+                        module_id: cerebellum_core::principal::SESSION_CALLER_MODULE_ID.into(),
                     },
-                    timeout,
-                )
-                .await;
-            if let Some(crate::scope_watch::ControlAnswer::Response(body)) = response {
-                if let Ok(ModuleControlResponseToModule::ScopeDescribe {
-                    owner_synced: true,
-                    status: subc_protocol::scope::ScopeStatus::Live,
-                    scope_epoch: Some(epoch),
-                    scope: Some(stamp),
-                    ..
-                }) = serde_json::from_value(body)
-                {
-                    if stamp.scope_ref == scope
-                        && stamp.scope_epoch == epoch
-                        && matches!(&stamp.owner, subc_protocol::Principal::Reserved {module_id} if module_id == owner)
-                    {
-                        if let Some(agent) = stamp.attributes.agent_id.filter(|id| !id.is_empty()) {
-                            return Some(agent);
-                        }
-                    }
-                }
-            }
+                    scope_ref: scope.to_owned(),
+                },
+                timeout,
+            )
+            .await;
+        let Some(crate::scope_watch::ControlAnswer::Response(body)) = response else {
+            return None;
+        };
+        let ModuleControlResponseToModule::ScopeDescribe {
+            owner_synced: true,
+            status: subc_protocol::scope::ScopeStatus::Live,
+            scope_epoch: Some(epoch),
+            scope: Some(stamp),
+            ..
+        } = serde_json::from_value(body).ok()?
+        else {
+            return None;
+        };
+        if stamp.scope_ref != scope
+            || stamp.scope_epoch != epoch
+            || !cerebellum_core::principal::is_prefrontal(&stamp.owner)
+        {
+            return None;
         }
-        None
+        stamp.attributes.agent_id.filter(|id| !id.is_empty())
     };
     tokio::time::timeout(timeout, lookup).await.ok().flatten()
 }

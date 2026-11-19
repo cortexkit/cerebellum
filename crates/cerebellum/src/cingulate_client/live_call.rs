@@ -56,10 +56,11 @@ impl SessionKey {
     fn projection(&self) -> (String, &str, u64) {
         let owner = serde_json::from_str::<subc_protocol::Principal>(&self.owner)
             .ok()
-            .filter(cerebellum_core::principal::is_prefrontal)
             .and_then(|owner| {
-                serde_json::to_string(&cerebellum_core::principal::canonical_scope_owner(&owner))
-                    .ok()
+                let canonical = cerebellum_core::principal::read_legacy_scope_owner(&owner);
+                (canonical != owner || cerebellum_core::principal::is_prefrontal(&owner))
+                    .then(|| serde_json::to_string(&canonical).ok())
+                    .flatten()
             })
             .unwrap_or_else(|| self.owner.clone());
         (owner, &self.scope_ref, self.scope_epoch)

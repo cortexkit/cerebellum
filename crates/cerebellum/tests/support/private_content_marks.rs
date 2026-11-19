@@ -24,8 +24,8 @@ fn facts(module: &str) -> AcceptedBindFacts {
 }
 
 fn scoped(scope: &str, kind: ScopeKind) -> AcceptedBindFacts {
-    facts("prefrontal-core").with_scope(Some(
-        ScopeStamp::new(principal("prefrontal-core").unwrap(), scope, 1, kind)
+    facts("prefrontal").with_scope(Some(
+        ScopeStamp::new(principal("prefrontal").unwrap(), scope, 1, kind)
             .with_owner_authorized(true)
             .with_attributes(
                 ScopeAttributes::new()
@@ -39,7 +39,7 @@ fn run(planes: &Planes, scope: &str, channel: u16) -> AcceptedBindFacts {
     let head = scoped("head", ScopeKind::Head);
     planes.routes.insert(1, 1, head.clone());
     let stamp = ScopeStamp::new(
-        principal("prefrontal-core").unwrap(),
+        principal("prefrontal").unwrap(),
         scope,
         1,
         ScopeKind::Ephemeral,
@@ -51,7 +51,7 @@ fn run(planes: &Planes, scope: &str, channel: u16) -> AcceptedBindFacts {
             .with_run_id(Some(scope.into())),
     )
     .with_parent(Some(ScopeParent::new(
-        principal("prefrontal-core").unwrap(),
+        principal("prefrontal").unwrap(),
         "head",
         1,
     )))
@@ -771,17 +771,16 @@ async fn marks_survive_reload_and_raise_the_format_floor() {
 }
 
 #[tokio::test]
-async fn rename_private_marks_survive_disk_reload_and_broca_queries_from_resynced_refs() {
-    for (before, after) in [
-        ("prefrontal-core", "prefrontal"),
-        ("prefrontal", "prefrontal-core"),
-    ] {
+async fn legacy_private_content_mark_answers_for_the_current_prefrontal_session() {
+    {
         let scratch = Scratch::new();
         let mut planes = isolated_test_planes(&Arc::new(HealthState::new()));
         planes.private_content = Arc::new(durable_store(scratch.path()));
         let mut stamp = scoped("rename-head", ScopeKind::Head).scope.unwrap();
-        stamp.owner = principal(before).unwrap();
-        let old = facts(before).with_scope(Some(stamp.clone()));
+        // Marks are stored by opaque scope ref, without a module ID. Use the
+        // old stamp only to produce the legacy mark, never to bind a route.
+        stamp.owner = principal("prefrontal-core").unwrap();
+        let old = facts("prefrontal-core").with_scope(Some(stamp.clone()));
         reply(
             &planes,
             &old,
@@ -792,8 +791,9 @@ async fn rename_private_marks_survive_disk_reload_and_broca_queries_from_resynce
         let bytes = std::fs::read(scratch.path()).unwrap();
         planes.private_content.shut_down_cleanly();
         planes.private_content = Arc::new(durable_store(scratch.path()));
-        stamp.owner = principal(after).unwrap();
-        let new = facts(after).with_scope(Some(stamp));
+        stamp.owner = principal("prefrontal").unwrap();
+        let new = facts("prefrontal").with_scope(Some(stamp));
+        assert!(new.agent_project_id_attested);
         let scope_ref = private_content::capture_scope(&new).unwrap();
         planes.routes.insert(1, 1, new);
         assert_eq!(
@@ -1240,7 +1240,13 @@ async fn a_version_one_store_is_read_and_rewritten_only_by_a_write() {
 #[tokio::test]
 async fn only_broca_can_query_and_broca_has_no_other_authority() {
     let planes = isolated_test_planes(&Arc::new(HealthState::new()));
-    for module in ["prefrontal-core", "cingulate", "basal", "other"] {
+    for module in [
+        "prefrontal",
+        "prefrontal-core",
+        "cingulate",
+        "basal",
+        "other",
+    ] {
         let (ty, _) = wire(
             &planes,
             facts(module),
@@ -1351,7 +1357,7 @@ async fn flow_content_stays_in_the_flow_scope() {
     let planes = isolated_test_planes(&Arc::new(HealthState::new()));
     let flow = facts("basal").with_scope(Some(
         ScopeStamp::new(
-            principal("prefrontal-core").unwrap(),
+            principal("prefrontal").unwrap(),
             "flow",
             1,
             ScopeKind::Ephemeral,

@@ -2253,7 +2253,7 @@ async fn an_empty_attested_project_refuses_launch_with_a_typed_reason() {
     planes.launch_service = Some(launcher.clone());
     let mut stamp = admission_stamp();
     stamp.attributes.agent_id = Some(String::new());
-    let bound = bind_admission_stamp(&planes, stamp, reserved("prefrontal-core"), None).await;
+    let bound = bind_admission_stamp(&planes, stamp, reserved("prefrontal"), None).await;
     assert_eq!(bound.header.ty, FrameType::Response);
 
     let response = invoke_existing(&planes, 1, "browser.launch", json!({})).await;
@@ -6244,7 +6244,7 @@ async fn withdrawing_a_consent_pending_call_keeps_late_always_answer_without_nav
 #[tokio::test]
 async fn withdrawing_an_unknown_key_is_unknown_call() {
     let (planes, _launcher) = blocking_grant_fixture().await;
-    bind_route(&planes, 9, reserved("prefrontal-core"), None).await;
+    bind_route(&planes, 9, reserved("prefrontal"), None).await;
     let (tx, mut rx) = mpsc::channel(8);
     let answer = withdraw(&planes, &tx, &mut rx, 9, 817, "pf:never-sent").await;
     assert_eq!(answer.header.ty, FrameType::Response);
@@ -6320,7 +6320,7 @@ async fn malformed_keys_and_a_second_key_on_a_withdrawal_are_invalid_requests() 
         withdraw_on(
             9,
             823,
-            json!({"call_key": "a", "scope": {"owner": "reserved:prefrontal-core", "ref": "s-1", "scope_epoch": 4}}),
+            json!({"call_key": "a", "scope": {"owner": "reserved:prefrontal", "ref": "s-1", "scope_epoch": 4}}),
         ),
     )
     .await;
@@ -6400,13 +6400,13 @@ async fn typed_text_never_reaches_the_call_records() {
 // owner's withdraw, and what a scope's end takes with it
 // ---------------------------------------------------------------------------
 
-const SCOPE_OWNER: &str = "reserved:prefrontal-core";
+const SCOPE_OWNER: &str = "reserved:prefrontal";
 const SCOPE_CARRIER: &str = "reserved:striatum";
 
 fn scope_stamp(scope_epoch: u64, owner_authorized: bool) -> subc_protocol::scope::ScopeStamp {
     subc_protocol::scope::ScopeStamp::new(
         Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         },
         "s-1",
         scope_epoch,
@@ -6499,7 +6499,7 @@ async fn flow_id_scope_stamp_binds_but_session_calls_are_refused() {
     for (channel, flow_id) in [(10, None), (11, Some("flow-1".to_owned()))] {
         let mut scope = scope_stamp(1, true);
         scope.attributes.flow_id = flow_id;
-        bind_route(&planes, channel, reserved("prefrontal-core"), Some(scope)).await;
+        bind_route(&planes, channel, reserved("prefrontal"), Some(scope)).await;
         let (tx, mut rx) = mpsc::channel(8);
         let reply = exchange(
             &planes,
@@ -6956,7 +6956,7 @@ async fn an_unscoped_route_behaves_exactly_as_before_scopes() {
     let (mut planes, _launcher) = blocking_grant_fixture().await;
     let storage = with_readable_call_records(&mut planes);
     grant_browser(&planes, "https://example.com", Vec::new()).await;
-    bind_route(&planes, 9, reserved("prefrontal-core"), None).await;
+    bind_route(&planes, 9, reserved("prefrontal"), None).await;
     let (tx, mut rx) = mpsc::channel(8);
     let refused = exchange(
         &planes,
@@ -7002,7 +7002,7 @@ async fn a_scoped_call_records_the_stamps_identity_and_no_text() {
     bind_route(
         &planes,
         12,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         Some(scope_stamp(4, true)),
     )
     .await;
@@ -7026,9 +7026,7 @@ async fn a_scoped_call_records_the_stamps_identity_and_no_text() {
     }
     let stored = String::from_utf8(storage.contents().unwrap()).unwrap();
     assert!(
-        stored.contains(
-            r#""scope":{"owner":"reserved:prefrontal-core","ref":"s-1","scope_epoch":4}"#
-        ),
+        stored.contains(r#""scope":{"owner":"reserved:prefrontal","ref":"s-1","scope_epoch":4}"#),
         "{stored}"
     );
     assert!(
@@ -7071,7 +7069,7 @@ async fn the_authorized_owner_naming_the_carrier_gets_the_carriers_answer() {
     bind_route(
         &planes,
         11,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         Some(scope_stamp(4, true)),
     )
     .await;
@@ -7109,7 +7107,7 @@ async fn an_owner_withdraw_without_a_carrier_is_carrier_required() {
     bind_route(
         &planes,
         11,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         Some(scope_stamp(4, true)),
     )
     .await;
@@ -7157,7 +7155,7 @@ async fn an_owner_naming_a_carrier_that_raised_no_such_call_learns_nothing() {
     bind_route(
         &planes,
         11,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         Some(scope_stamp(4, true)),
     )
     .await;
@@ -7181,7 +7179,7 @@ async fn an_owner_the_daemon_does_not_authorize_may_not_withdraw() {
     bind_route(
         &planes,
         11,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         Some(scope_stamp(4, false)),
     )
     .await;
@@ -7205,7 +7203,7 @@ async fn an_owner_at_another_epoch_may_not_withdraw() {
     bind_route(
         &planes,
         11,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         Some(scope_stamp(5, true)),
     )
     .await;
@@ -7229,7 +7227,7 @@ async fn a_named_scope_that_differs_from_the_stamp_is_refused() {
     bind_route(
         &planes,
         11,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         Some(scope_stamp(4, true)),
     )
     .await;
@@ -7270,7 +7268,7 @@ async fn scoped_browser(planes: &Planes) -> String {
     bind_route(
         planes,
         12,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         Some(scope_stamp(4, true)),
     )
     .await;
@@ -7318,45 +7316,31 @@ async fn next_describe(rx: &mut mpsc::Receiver<Frame>) -> Frame {
     assert_eq!(question.header.channel, 0);
     assert_eq!(
         body(&question),
-        json!({"op": "scope.describe", "owner": {"kind": "reserved", "module_id": "prefrontal-core"}, "ref": "s-1"})
+        json!({"op": "scope.describe", "owner": {"kind": "reserved", "module_id": "prefrontal"}, "ref": "s-1"})
     );
     question
 }
 
-/// Answer both raw owner lookups for the logical scope as the daemon would.
 async fn answer_describe(
     planes: &Planes,
     tx: &mpsc::Sender<Frame>,
-    rx: &mut mpsc::Receiver<Frame>,
     question: &Frame,
     ty: FrameType,
     answer: Value,
 ) {
-    let mut current = question.clone();
-    for index in 0..2 {
-        let frame = Frame::build_with_version(
-            PROTOCOL_VERSION,
-            ty,
-            cerebellum::control_flags(),
-            0,
-            0,
-            current.header.corr,
-            serde_json::to_vec(&answer).unwrap(),
-        )
+    let frame = Frame::build_with_version(
+        PROTOCOL_VERSION,
+        ty,
+        cerebellum::control_flags(),
+        0,
+        0,
+        question.header.corr,
+        serde_json::to_vec(&answer).unwrap(),
+    )
+    .unwrap();
+    cerebellum::handle_frame_for_test(frame, tx, planes)
+        .await
         .unwrap();
-        cerebellum::handle_frame_for_test(frame, tx, planes)
-            .await
-            .unwrap();
-        if index == 0 {
-            current = tokio::time::timeout(HANG_GUARD, rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            let mut expected = body(question);
-            expected["owner"]["module_id"] = json!("prefrontal");
-            assert_eq!(body(&current), expected);
-        }
-    }
 }
 
 fn describe_answer(
@@ -7405,15 +7389,7 @@ async fn a_definitive_scope_end_closes_the_browser_and_question_but_keeps_agent_
         let ask_id = scoped_browser(&planes).await;
         let (tx, mut rx) = mpsc::channel(8);
         let question = close_scoped_route(&planes, &tx, &mut rx).await;
-        answer_describe(
-            &planes,
-            &tx,
-            &mut rx,
-            &question,
-            FrameType::Response,
-            answer.clone(),
-        )
-        .await;
+        answer_describe(&planes, &tx, &question, FrameType::Response, answer.clone()).await;
         wait_until_closed(&planes).await;
         assert_eq!(
             permission_support::count(&planes),
@@ -7449,7 +7425,7 @@ async fn a_definitive_scope_end_closes_the_browser_and_question_but_keeps_agent_
         // `browser.close` of the revoked session answers the outcome through
         // the same Withhold boundary. Asked on an unscoped route of the same
         // conversation that may close.
-        bind_route(&planes, 17, reserved("prefrontal-core"), None).await;
+        bind_route(&planes, 17, reserved("prefrontal"), None).await;
         let session_id = body(&status)["browser_session_id"].clone();
         assert!(session_id.is_string(), "{}", body(&status));
         let closed = exchange(
@@ -7504,7 +7480,7 @@ async fn bind_reply(
             module_id: "cerebellum".into(),
         },
         identity: BindIdentity::new("test", "test-session"),
-        principal: Some(reserved("prefrontal-core")),
+        principal: Some(reserved("prefrontal")),
         consumer_capabilities: Some(vec!["elicitation".into()]),
         admission_facts: Some(
             json!({"agentProjectId":"test-project", "sessionKind":"primary", "effectiveCapabilityScope":["*"], "browserControlOperations":["browser.launch", "browser.status", "browser.close"]}),
@@ -7535,7 +7511,7 @@ async fn an_agent_grant_remains_usable_after_its_head_scope_epoch_is_replaced() 
     bind_route(
         &planes,
         12,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         Some(scope_stamp(1, true)),
     )
     .await;
@@ -7601,7 +7577,7 @@ async fn scope_epoch_replacement_cancels_late_in_call_card() {
     bind_route(
         &planes,
         12,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         Some(scope_stamp(1, true)),
     )
     .await;
@@ -7644,7 +7620,7 @@ async fn an_open_epoch_1_question_answered_after_the_epoch_2_bind_grants_nothing
     bind_route(
         &planes,
         12,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         Some(scope_stamp(1, true)),
     )
     .await;
@@ -7681,7 +7657,7 @@ async fn an_epoch_2_bind_closes_the_epoch_1_browser_as_scope_revoked() {
     bind_route(
         &planes,
         12,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         Some(scope_stamp(1, true)),
     )
     .await;
@@ -7714,7 +7690,7 @@ async fn a_stale_lower_epoch_bind_is_refused() {
     bind_route(
         &planes,
         12,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         Some(scope_stamp(1, true)),
     )
     .await;
@@ -7783,7 +7759,7 @@ async fn a_non_definitive_answer_leaves_the_browser_the_grants_and_the_question(
         let ask_id = scoped_browser(&planes).await;
         let (tx, mut rx) = mpsc::channel(8);
         let question = close_scoped_route(&planes, &tx, &mut rx).await;
-        answer_describe(&planes, &tx, &mut rx, &question, ty, answer.clone()).await;
+        answer_describe(&planes, &tx, &question, ty, answer.clone()).await;
         // Asked again once the interval passes, because the browser is still
         // open and no route under the scope is bound.
         let again = next_describe(&mut rx).await;
@@ -7797,7 +7773,6 @@ async fn a_non_definitive_answer_leaves_the_browser_the_grants_and_the_question(
         answer_describe(
             &planes,
             &tx,
-            &mut rx,
             &again,
             FrameType::Response,
             describe_answer("ended", Some(4), true, true),
@@ -7824,7 +7799,6 @@ async fn an_unanswered_describe_leaves_everything_in_place() {
     answer_describe(
         &planes,
         &tx,
-        &mut rx,
         &question,
         FrameType::Response,
         describe_answer("ended", Some(4), true, true),
@@ -7850,7 +7824,7 @@ async fn a_scope_with_a_route_still_bound_is_not_polled() {
     bind_route(
         &planes,
         14,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         Some(scope_stamp(4, true)),
     )
     .await;
@@ -7859,7 +7833,6 @@ async fn a_scope_with_a_route_still_bound_is_not_polled() {
     answer_describe(
         &planes,
         &tx,
-        &mut rx,
         &question,
         FrameType::Response,
         describe_answer("live", Some(4), true, true),
@@ -7993,7 +7966,7 @@ async fn a_relayed_call_names_its_origin_on_its_journal_rows_and_its_call_record
     );
     // The record is still the route principal's: the origin names who it acted
     // for, never who acted.
-    assert_eq!(record["principal"], "reserved:prefrontal-core", "{record}");
+    assert_eq!(record["principal"], "reserved:prefrontal", "{record}");
 }
 
 #[tokio::test]
@@ -8040,7 +8013,7 @@ async fn an_invalid_origin_is_recorded_absent_with_its_marker_and_never_refuses_
     // And a call with no key whose origin is not even an object.
     let unkeyed = served(
         &planes,
-        relayed_navigation(9, 802, None, Some(json!("prefrontal-core"))),
+        relayed_navigation(9, 802, None, Some(json!("prefrontal"))),
     )
     .await;
     assert_eq!(body(&unkeyed)["outcome"], "ok", "{}", body(&unkeyed));
@@ -8688,13 +8661,13 @@ async fn assert_scope_unattested(stamp: subc_protocol::scope::ScopeStamp, princi
 async fn scope_admission_requires_owner_authorized() {
     let mut stamp = admission_stamp();
     stamp.owner_authorized = false;
-    assert_scope_unattested(stamp, reserved("prefrontal-core")).await;
+    assert_scope_unattested(stamp, reserved("prefrontal")).await;
 }
 #[tokio::test]
 async fn scope_admission_requires_core_owner() {
     let mut stamp = admission_stamp();
     stamp.owner = reserved("broca");
-    assert_scope_unattested(stamp, reserved("prefrontal-core")).await;
+    assert_scope_unattested(stamp, reserved("prefrontal")).await;
 }
 #[tokio::test]
 async fn scope_admission_requires_core_route_principal() {
@@ -8704,13 +8677,13 @@ async fn scope_admission_requires_core_route_principal() {
 async fn scope_admission_excludes_flow_scopes() {
     let mut stamp = admission_stamp();
     stamp.attributes.flow_id = Some("flow-1".into());
-    assert_scope_unattested(stamp, reserved("prefrontal-core")).await;
+    assert_scope_unattested(stamp, reserved("prefrontal")).await;
 }
 #[tokio::test]
 async fn scope_admission_requires_agent_id() {
     let mut stamp = admission_stamp();
     stamp.attributes.agent_id = None;
-    assert_scope_unattested(stamp, reserved("prefrontal-core")).await;
+    assert_scope_unattested(stamp, reserved("prefrontal")).await;
 }
 #[tokio::test]
 async fn scope_admission_current_worker_shape_attests_nothing() {
@@ -8718,9 +8691,9 @@ async fn scope_admission_current_worker_shape_attests_nothing() {
     stamp.kind = subc_protocol::scope::ScopeKind::Worker;
     stamp.attributes.agent_id = None;
     stamp.attributes.delegates = false;
-    assert_scope_unattested(stamp.clone(), reserved("prefrontal-core")).await;
+    assert_scope_unattested(stamp.clone(), reserved("prefrontal")).await;
     let (planes, _) = scope_admission_planes();
-    bind_admission_stamp(&planes, stamp, reserved("prefrontal-core"), None).await;
+    bind_admission_stamp(&planes, stamp, reserved("prefrontal"), None).await;
     let body = scoped_launch(&planes).await;
     assert_eq!(body["reason"], "admission_facts_absent");
     assert!(
@@ -8734,7 +8707,7 @@ async fn scope_admission_worker_with_agent_gets_controls_and_disposable_profile(
     let mut stamp = admission_stamp();
     stamp.kind = subc_protocol::scope::ScopeKind::Worker;
     assert_eq!(
-        bind_admission_stamp(&planes, stamp, reserved("prefrontal-core"), None)
+        bind_admission_stamp(&planes, stamp, reserved("prefrontal"), None)
             .await
             .header
             .ty,
@@ -8758,7 +8731,7 @@ async fn scope_admission_ephemeral_gets_no_controls() {
     let (planes, launcher) = scope_admission_planes();
     let mut stamp = admission_stamp();
     stamp.kind = subc_protocol::scope::ScopeKind::Ephemeral;
-    bind_admission_stamp(&planes, stamp, reserved("prefrontal-core"), None).await;
+    bind_admission_stamp(&planes, stamp, reserved("prefrontal"), None).await;
     let body = scoped_launch(&planes).await;
     assert_eq!(body["reason"], "operation_not_granted", "{body}");
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
@@ -8807,13 +8780,7 @@ async fn scope_admission_head_launches_for_agent_and_reads_standing_grants() {
     });
     planes.launch_service = Some(launcher.clone());
     seed_scope_standing_grant(&planes).await;
-    bind_admission_stamp(
-        &planes,
-        admission_stamp(),
-        reserved("prefrontal-core"),
-        None,
-    )
-    .await;
+    bind_admission_stamp(&planes, admission_stamp(), reserved("prefrontal"), None).await;
     let body = scoped_launch(&planes).await;
     assert_eq!(body["outcome"], "launched", "{body}");
     assert_eq!(body["profile_disposition"], "durable");
@@ -8867,14 +8834,14 @@ async fn scope_admission_nondelegating_head_has_no_durable_profile_or_standing_a
     seed_scope_standing_grant(&planes).await;
     let mut stamp = admission_stamp();
     stamp.attributes.delegates = false;
-    bind_admission_stamp(&planes, stamp.clone(), reserved("prefrontal-core"), None).await;
+    bind_admission_stamp(&planes, stamp.clone(), reserved("prefrontal"), None).await;
     let body = scoped_launch(&planes).await;
     assert_eq!(body["outcome"], "no_profile", "{body}");
     assert_eq!(body["profile_disposition"], "none", "{body}");
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
     let accepted = cerebellum_core::identity::AcceptedBindFacts::from_bind(
         &BindIdentity::new("test", "test-session"),
-        Some(reserved("prefrontal-core")),
+        Some(reserved("prefrontal")),
         None,
         None,
         &RouteTarget::ToolProvider {
@@ -8927,7 +8894,7 @@ async fn scope_admission_conflicting_facts_refuse_bind_and_agreeing_facts_bind()
         let reply = bind_admission_stamp(
             &planes,
             admission_stamp(),
-            reserved("prefrontal-core"),
+            reserved("prefrontal"),
             Some(facts),
         )
         .await;
@@ -8938,7 +8905,7 @@ async fn scope_admission_conflicting_facts_refuse_bind_and_agreeing_facts_bind()
         assert_eq!(scoped_launch(&planes).await["code"], "route_not_bound");
     }
     let (planes, _) = scope_admission_planes();
-    let reply = bind_admission_stamp(&planes, admission_stamp(), reserved("prefrontal-core"),
+    let reply = bind_admission_stamp(&planes, admission_stamp(), reserved("prefrontal"),
         Some(json!({"agentProjectId":"pj-scope-agent", "sessionKind":"primary", "effectiveCapabilityScope":["browser.status"]}))).await;
     assert_eq!(reply.header.ty, FrameType::Response);
 
@@ -8960,7 +8927,7 @@ async fn flow_scope_admission_refuses_flat_calls_before_dispatch_and_records_ref
         bind_admission_stamp(
             &planes,
             stamp.clone(),
-            reserved("prefrontal-core"),
+            reserved("prefrontal"),
             Some(facts.clone())
         )
         .await
@@ -9003,7 +8970,7 @@ async fn flow_scope_admission_refuses_flat_calls_before_dispatch_and_records_ref
     }
     stamp.attributes.flow_id = None;
     assert_eq!(
-        bind_admission_stamp(&planes, stamp, reserved("prefrontal-core"), Some(facts))
+        bind_admission_stamp(&planes, stamp, reserved("prefrontal"), Some(facts))
             .await
             .header
             .ty,
@@ -9232,8 +9199,8 @@ async fn flow_global_and_nondelegating_have_no_profile_or_standing_authority() {
 #[tokio::test]
 async fn flow_carrier_requires_exact_basal_authorized_core_stamp() {
     for (principal, owner, authorized) in [
-        ("prefrontal-core", "prefrontal-core", true),
-        ("striatum", "prefrontal-core", true),
+        ("prefrontal", "prefrontal", true),
+        ("striatum", "prefrontal", true),
     ] {
         let (planes, launcher) = flow_planes();
         let mut stamp = flow_stamp();

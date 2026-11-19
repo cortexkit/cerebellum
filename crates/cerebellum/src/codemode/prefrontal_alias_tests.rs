@@ -6,50 +6,49 @@ use subc_protocol::{
 };
 
 #[test]
-fn prefrontal_rename_run_head_and_browser_session_follow_alias() {
+fn a_legacy_tab_owner_matches_an_admitted_head_but_cannot_name_a_live_run_parent() {
     use subc_protocol::scope::{ParentState, ScopeParent};
-    for (before, after) in [
-        ("prefrontal-core", "prefrontal"),
-        ("prefrontal", "prefrontal-core"),
-    ] {
-        let owner = |name: &str| Principal::Reserved {
-            module_id: name.into(),
-        };
-        let routes = crate::RouteBindings::default();
-        let mut facts = AcceptedBindFacts::from_bind(
-            &BindIdentity::new("test", "conversation"),
-            Some(owner(before)),
-            None,
-            None,
-            &RouteTarget::ToolProvider {
-                module_id: "cerebellum".into(),
-            },
-        );
-        facts.identity.agent_project_id = "agent".into();
-        facts.agent_project_id_attested = true;
-        facts.session_kind_attested = true;
-        facts.scope = Some(
-            ScopeStamp::new(owner(before), "head", 7, ScopeKind::Head)
-                .with_owner_authorized(true)
-                .with_attributes(ScopeAttributes::new().with_agent_id(Some("agent".into()))),
-        );
-        routes.insert(1, 1, facts);
-        let mut run = ScopeStamp::new(owner(after), "run", 1, ScopeKind::Ephemeral)
-            .with_attributes(ScopeAttributes::new().with_agent_id(Some("agent".into())))
-            .with_parent(Some(ScopeParent::new(owner(after), "head", 7)))
-            .with_parent_state(Some(ParentState::Linked));
-        assert!(routes.run_head(&run).is_ok());
-        assert!(
-            routes.has_user_browser_session(&serde_json::to_string(&owner(after)).unwrap(), "head")
-        );
-        assert!(!routes
-            .has_user_browser_session(&serde_json::to_string(&owner(after)).unwrap(), "different"));
-        run.parent.as_mut().unwrap().scope_ref = "different".into();
-        assert!(routes.run_head(&run).is_err());
-        run.parent.as_mut().unwrap().scope_ref = "head".into();
-        run.parent.as_mut().unwrap().scope_epoch += 1;
-        assert!(routes.run_head(&run).is_err());
-    }
+    let current = Principal::Reserved {
+        module_id: "prefrontal".into(),
+    };
+    let legacy = Principal::Reserved {
+        module_id: "prefrontal-core".into(),
+    };
+    let routes = crate::RouteBindings::default();
+    let mut facts = AcceptedBindFacts::from_bind(
+        &BindIdentity::new("test", "conversation"),
+        Some(current.clone()),
+        None,
+        None,
+        &RouteTarget::ToolProvider {
+            module_id: "cerebellum".into(),
+        },
+    );
+    facts.identity.agent_project_id = "agent".into();
+    facts.agent_project_id_attested = true;
+    facts.session_kind_attested = true;
+    facts.scope = Some(
+        ScopeStamp::new(current.clone(), "head", 7, ScopeKind::Head)
+            .with_owner_authorized(true)
+            .with_attributes(ScopeAttributes::new().with_agent_id(Some("agent".into()))),
+    );
+    routes.insert(1, 1, facts);
+    let stored_owner = serde_json::to_string(&legacy).unwrap();
+    assert!(routes.has_user_browser_session(&stored_owner, "head"));
+    assert!(!routes.has_user_browser_session(&stored_owner, "different"));
+
+    let mut run = ScopeStamp::new(current.clone(), "run", 1, ScopeKind::Ephemeral)
+        .with_attributes(ScopeAttributes::new().with_agent_id(Some("agent".into())))
+        .with_parent(Some(ScopeParent::new(legacy, "head", 7)))
+        .with_parent_state(Some(ParentState::Linked));
+    assert!(routes.run_head(&run).is_err());
+    run.parent.as_mut().unwrap().owner = current;
+    assert!(routes.run_head(&run).is_ok());
+    run.parent.as_mut().unwrap().scope_ref = "different".into();
+    assert!(routes.run_head(&run).is_err());
+    run.parent.as_mut().unwrap().scope_ref = "head".into();
+    run.parent.as_mut().unwrap().scope_epoch += 1;
+    assert!(routes.run_head(&run).is_err());
 }
 
 #[test]
@@ -104,13 +103,13 @@ fn rename_run_cancellation_follows_scope_alias_but_not_another_ref_or_epoch() {
 }
 
 #[test]
-fn prefrontal_aliases_admit_head_owners_and_callers() {
+fn only_prefrontal_admits_head_owners_and_callers() {
     let cases = [
         (
             Principal::Reserved {
                 module_id: "prefrontal-core".into(),
             },
-            true,
+            false,
         ),
         (
             Principal::Reserved {

@@ -29,7 +29,7 @@ struct Route {
     channel: u16,
 }
 static NEXT: AtomicU64 = AtomicU64::new(1);
-const OWNER: &str = "reserved:prefrontal-core";
+const OWNER: &str = "reserved:prefrontal";
 const HEAD_REF: &str = "conformance-head";
 
 fn frame(channel: u16, body: Value) -> Frame {
@@ -159,9 +159,9 @@ impl Harness for Subject {
         ));
         let planes = Arc::new(planes);
         // The suite opens codemode routes as reserved:basal in a run owned by
-        // prefrontal-core. Production requires a live, delegating head route.
+        // prefrontal. Production requires a live, delegating head route.
         // Because the route's principal (basal) differs from the scope owner
-        // (prefrontal-core), the late-result cases can tell whether results
+        // (prefrontal), the late-result cases can tell whether results
         // are held and served per carrying principal, as the contract
         // requires, or wrongly per scope owner.
         let head = ScopeStamp::new(principal(OWNER), HEAD_REF, 1, ScopeKind::Head)

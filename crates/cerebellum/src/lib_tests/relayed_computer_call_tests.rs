@@ -716,7 +716,7 @@ async fn a_relayed_computer_call_names_its_origin_on_its_journal_row() {
         assert!(
             row["identity"]["principal"]
                 .as_str()
-                .is_some_and(|principal| principal.contains("prefrontal-core")),
+                .is_some_and(|principal| principal.contains("prefrontal")),
             "{row}"
         );
     }

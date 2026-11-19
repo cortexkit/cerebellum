@@ -39,7 +39,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-const OWNER: &str = "prefrontal-core";
+const OWNER: &str = "prefrontal";
 const DISPLAY: &str = "display-fake";
 const SCOPE_REF: &str = "registration-live";
 /// The agent the head scope attests, which is also its agent project id.

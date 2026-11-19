@@ -40,7 +40,7 @@ fn hex(bytes: &[u8]) -> String {
 fn head_stamp() -> ScopeStamp {
     ScopeStamp::new(
         Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         },
         CAPTURE_SCOPE,
         1,
@@ -646,7 +646,7 @@ async fn a_runs_handle_resolves_through_its_head() {
     output.recv().await.unwrap();
 
     let core = Principal::Reserved {
-        module_id: "prefrontal-core".into(),
+        module_id: "prefrontal".into(),
     };
     let admission = json!({
         "agentProjectId": "test-project",
@@ -684,7 +684,7 @@ async fn a_runs_handle_resolves_through_its_head() {
         )
         .with_parent(Some(subc_protocol::scope::ScopeParent::new(
             Principal::Reserved {
-                module_id: "prefrontal-core".into(),
+                module_id: "prefrontal".into(),
             },
             "head-scope",
             1,

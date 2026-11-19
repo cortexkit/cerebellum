@@ -13,7 +13,7 @@ fn head(scope: &str, agent: &str) -> AcceptedBindFacts {
     AcceptedBindFacts::from_bind(
         &subc_protocol::BindIdentity::new("test", scope),
         Some(Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         }),
         None,
         None,
@@ -24,7 +24,7 @@ fn head(scope: &str, agent: &str) -> AcceptedBindFacts {
     .with_scope(Some(
         ScopeStamp::new(
             Principal::Reserved {
-                module_id: "prefrontal-core".into(),
+                module_id: "prefrontal".into(),
             },
             scope,
             1,
@@ -99,10 +99,10 @@ async fn unknown_agent_fails_closed_only_when_agent_marks_exist() {
         result,
         json!({"private_content":true,"sources":["person_browser","desktop_app","signed_in_site"]})
     );
-    assert_eq!(
-        serde_json::from_slice::<Value>(&rx.recv().await.unwrap().body).unwrap()["op"],
-        "scope.describe"
-    );
+    let request = serde_json::from_slice::<Value>(&rx.recv().await.unwrap().body).unwrap();
+    assert_eq!(request["op"], "scope.describe");
+    assert_eq!(request["owner"]["module_id"], "prefrontal");
+    assert!(rx.try_recv().is_err());
     assert_eq!(planes.scopes.control.outstanding(), 0);
 }
 
@@ -118,6 +118,8 @@ async fn daemon_described_agent_and_named_parent_use_imported_marks() {
     let lookup = query(&planes, &["new-scope"]);
     let answer = async {
         let frame = rx.recv().await.unwrap();
+        let request: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(request["owner"]["module_id"], "prefrontal");
         let stamp = head("new-scope", "agent-x").scope.unwrap();
         planes.scopes.control.deliver(frame.header.corr, crate::scope_watch::ControlAnswer::Response(json!({"op":"scope.describe","status":"live","owner_synced":true,"owner_configured":true,"daemon_incarnation":"test-daemon","scope_epoch":1,"scope":stamp})));
     };

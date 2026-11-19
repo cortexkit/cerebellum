@@ -158,7 +158,7 @@ fn channel_route_body_keeps_target_identity_and_scope_without_a_nonce() {
     );
     let selector = subc_protocol::scope::ScopeSelector::new(
         subc_protocol::Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         },
         "session",
         Some(2),
@@ -177,7 +177,7 @@ fn channel_route_body_keeps_target_identity_and_scope_without_a_nonce() {
     );
     assert_eq!(
         body["scope"],
-        json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"session","scope_epoch":2})
+        json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"session","scope_epoch":2})
     );
     assert!(body.get("consumer_identity").is_none());
 }

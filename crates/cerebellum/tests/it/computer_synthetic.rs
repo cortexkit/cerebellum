@@ -2800,7 +2800,7 @@ use cerebellum::journal::call_records::{
 use cerebellum_core::dispatch_witness::DispatchWitness;
 use subc_protocol::{Flags, Frame, FrameType, Priority, PROTOCOL_VERSION};
 
-const CARRIER: &str = "reserved:prefrontal-core";
+const CARRIER: &str = "reserved:prefrontal";
 
 fn response(corr: u64, body: &Value) -> Frame {
     Frame::build_with_version(

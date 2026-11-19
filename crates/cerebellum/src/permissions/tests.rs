@@ -380,7 +380,7 @@ async fn provider_refuses_direct_and_every_non_aggregator_before_reading_or_muta
             module_id: "callosum".into(),
         }),
         facts(Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         }),
     ] {
         for method in [LIST, REVOKE] {

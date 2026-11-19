@@ -1,7 +1,7 @@
 # Session turn-ended v1 vectors
 
 **Interim contract.** `session.turn_ended` is a direct call from Prefrontal
-core (`reserved:prefrontal-core`) to cerebellum's management surface. It is to
+(`reserved:prefrontal`) to cerebellum's management surface. It is to
 be replaced by a harness module publishing its `turn_ended` event on the event
 plane, with cerebellum subscribing; core's direct call is then deleted. The
 parameters are exactly that event's fields, so the shape does not change when
@@ -21,7 +21,7 @@ required, and unknown fields are refused):
 ```json
 {"method": "session.turn_ended", "params": {
   "session_ref": "<32 lowercase hex>",
-  "scope": {"owner": {"kind": "reserved", "module_id": "prefrontal-core"}, "ref": "...", "epoch": 3},
+  "scope": {"owner": {"kind": "reserved", "module_id": "prefrontal"}, "ref": "...", "epoch": 3},
   "harness": "...", "turn_id": "...",
   "outcome": "completed" | "stopped" | "failed",
   "error_class": "provider_capacity" | "provider_quota" | "auth" | "transport" | "harness" | "unknown",
@@ -49,14 +49,14 @@ Replies:
   fields) and `detail.reason_code` one of `missing_field`, `wrong_type`,
   `unknown_field`, `invalid_value` (an `error_class` on a turn that did not
   fail is `invalid_value` naming `error_class`);
-- any principal other than exactly `reserved:prefrontal-core`: an Error frame
+- any principal other than exactly `reserved:prefrontal`: an Error frame
   with code `principal_denied`.
 
 ## Files
 
 Each case file records a request frame and its reply frame as observed at
 cerebellum's production `handle_frame` entry point, on a management route bound
-for `reserved:prefrontal-core`. They are not replies assembled from an expected
+for `reserved:prefrontal`. They are not replies assembled from an expected
 JSON object. The session and scope refs, harness, turn id, source and
 sequence number are synthetic.
 

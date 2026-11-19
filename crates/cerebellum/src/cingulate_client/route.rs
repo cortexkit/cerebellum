@@ -340,7 +340,7 @@ mod tests {
         );
         let scope = ScopeSelector::new(
             Principal::Reserved {
-                module_id: "prefrontal-core".into(),
+                module_id: "prefrontal".into(),
             },
             "sc_head_alf",
             Some(3),
@@ -358,7 +358,7 @@ mod tests {
         assert_eq!(
             body["scope"],
             serde_json::json!({
-                "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+                "owner": {"kind": "reserved", "module_id": "prefrontal"},
                 "ref": "sc_head_alf",
                 "scope_epoch": 3,
             })

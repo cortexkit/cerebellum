@@ -70,7 +70,7 @@ async fn program_page_reads_unfold_with_large_default_and_explicit_lower_cap() {
 
 fn core() -> subc_protocol::Principal {
     subc_protocol::Principal::Reserved {
-        module_id: "prefrontal-core".into(),
+        module_id: "prefrontal".into(),
     }
 }
 
@@ -220,18 +220,8 @@ async fn bind_direct_head_scope(
     scope_ref: &str,
     scope_epoch: u64,
 ) {
-    bind_direct_head_scope_owner(fixture, channel, scope_ref, scope_epoch, "prefrontal-core").await;
-}
-
-async fn bind_direct_head_scope_owner(
-    fixture: &Fixture,
-    channel: u16,
-    scope_ref: &str,
-    scope_epoch: u64,
-    owner: &str,
-) {
     let owner = subc_protocol::Principal::Reserved {
-        module_id: owner.into(),
+        module_id: "prefrontal".into(),
     };
     let stamp = ScopeStamp::new(owner.clone(), scope_ref, scope_epoch, ScopeKind::Head)
         .with_attributes(
@@ -346,25 +336,42 @@ async fn real_route_bind_direct_head_claim_survives_a_move_to_a_new_scope_epoch(
 }
 
 #[tokio::test]
-async fn rename_browser_claim_is_usable_on_resynced_routes_in_both_directions() {
-    for (before, after) in [
-        ("prefrontal-core", "prefrontal"),
-        ("prefrontal", "prefrontal-core"),
-    ] {
-        let fixture = Fixture::new();
-        bind_direct_head_scope_owner(&fixture, 20, "rename-head", 1, before).await;
-        let tab = fixture.claim(20).await;
-        bind_direct_head_scope_owner(&fixture, 21, "rename-head", 1, after).await;
-        goodbye(&fixture, 20).await;
-        let (reply, _) = fixture.snapshot(21, &tab, "allow_30m").await;
-        assert_eq!(reply["outcome"], "ok", "{reply}");
-        bind_direct_head_scope_owner(&fixture, 22, "rename-head", 2, after).await;
-        let (reply, _) = fixture.snapshot(22, &tab, "allow_30m").await;
-        assert_eq!(reply["outcome"], "ok", "{reply}");
-        bind_direct_head_scope_owner(&fixture, 23, "different-head", 2, after).await;
-        let (reply, _) = fixture.snapshot(23, &tab, "allow_30m").await;
-        assert_eq!(reply["reason"], "tab_not_claimed_by_route", "{reply}");
-    }
+async fn a_legacy_browser_claim_session_is_reused_by_current_routes() {
+    let fixture = Fixture::new();
+    bind_direct_head_scope(&fixture, 21, "rename-head", 1).await;
+    let mut stored_scope = fixture.planes.routes.get(21, 1).unwrap().scope.unwrap();
+    stored_scope.owner = subc_protocol::Principal::Reserved {
+        module_id: "prefrontal-core".into(),
+    };
+    let alias = Route {
+        channel: 20,
+        epoch: 1,
+    };
+    fixture
+        .planes
+        .user_browser
+        .target()
+        .session_route(&stored_scope, alias);
+
+    let tab = fixture.claim(21).await;
+    assert_eq!(
+        fixture
+            .planes
+            .user_browser
+            .target()
+            .state()
+            .claims
+            .get(&tab),
+        Some(&alias)
+    );
+    let (reply, _) = fixture.snapshot(21, &tab, "allow_30m").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    bind_direct_head_scope(&fixture, 22, "rename-head", 2).await;
+    let (reply, _) = fixture.snapshot(22, &tab, "allow_30m").await;
+    assert_eq!(reply["outcome"], "ok", "{reply}");
+    bind_direct_head_scope(&fixture, 23, "different-head", 2).await;
+    let (reply, _) = fixture.snapshot(23, &tab, "allow_30m").await;
+    assert_eq!(reply["reason"], "tab_not_claimed_by_route", "{reply}");
 }
 
 #[tokio::test]
@@ -415,27 +422,26 @@ async fn answer_last_head_close(fixture: &Fixture, tab: &str, status: &str, scop
     crate::handle_frame_for_test(close, &writer, &fixture.planes)
         .await
         .unwrap();
-    for _ in 0..2 {
-        let question = tokio::time::timeout(HANG_GUARD, replies.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let body: Value = serde_json::from_slice(&question.body).unwrap();
-        assert_eq!(body["op"], "scope.describe");
-        assert_eq!(body["ref"], "direct-head");
-        assert!(fixture
-            .planes
-            .user_browser
-            .target()
-            .state()
-            .claims
-            .contains_key(tab));
-        let response = Frame::build(FrameType::Response, crate::control_flags(), 0, 0, question.header.corr,
-         serde_json::to_vec(&json!({"op":"scope.describe","status":status,"scope_epoch":scope_epoch,"daemon_incarnation":"test","owner_synced":true,"owner_configured":true})).unwrap()).unwrap();
-        crate::handle_frame_for_test(response, &writer, &fixture.planes)
-            .await
-            .unwrap();
-    }
+    let question = tokio::time::timeout(HANG_GUARD, replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let body: Value = serde_json::from_slice(&question.body).unwrap();
+    assert_eq!(body["op"], "scope.describe");
+    assert_eq!(body["owner"]["module_id"], "prefrontal");
+    assert_eq!(body["ref"], "direct-head");
+    assert!(fixture
+        .planes
+        .user_browser
+        .target()
+        .state()
+        .claims
+        .contains_key(tab));
+    let response = Frame::build(FrameType::Response, crate::control_flags(), 0, 0, question.header.corr,
+     serde_json::to_vec(&json!({"op":"scope.describe","status":status,"scope_epoch":scope_epoch,"daemon_incarnation":"test","owner_synced":true,"owner_configured":true})).unwrap()).unwrap();
+    crate::handle_frame_for_test(response, &writer, &fixture.planes)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -732,41 +738,40 @@ async fn only_a_definitive_head_scope_end_releases_its_claims_and_refs() {
         crate::handle_frame_for_test(close, &writer, &fixture.planes)
             .await
             .unwrap();
-        for _ in 0..2 {
-            let question = tokio::time::timeout(HANG_GUARD, replies.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            let body: Value = serde_json::from_slice(&question.body).unwrap();
-            assert_eq!(body["op"], "scope.describe");
-            assert_eq!(body["ref"], "card-tests");
-            let (ty, answer) = match status {
-                "unreadable" => (
-                    FrameType::Error,
-                    json!({"code":"unavailable","message":"try again"}),
-                ),
-                "uncertain" => (
-                    FrameType::Response,
-                    json!({"op":"scope.describe","status":"not_live","daemon_incarnation":"test","owner_synced":false,"owner_configured":true}),
-                ),
-                _ => (
-                    FrameType::Response,
-                    json!({"op":"scope.describe","status":"ended","scope_epoch":1,"daemon_incarnation":"test","owner_synced":true,"owner_configured":true}),
-                ),
-            };
-            let response = Frame::build(
-                ty,
-                crate::control_flags(),
-                0,
-                0,
-                question.header.corr,
-                serde_json::to_vec(&answer).unwrap(),
-            )
+        let question = tokio::time::timeout(HANG_GUARD, replies.recv())
+            .await
+            .unwrap()
             .unwrap();
-            crate::handle_frame_for_test(response, &writer, &fixture.planes)
-                .await
-                .unwrap();
-        }
+        let body: Value = serde_json::from_slice(&question.body).unwrap();
+        assert_eq!(body["op"], "scope.describe");
+        assert_eq!(body["owner"]["module_id"], "prefrontal");
+        assert_eq!(body["ref"], "card-tests");
+        let (ty, answer) = match status {
+            "unreadable" => (
+                FrameType::Error,
+                json!({"code":"unavailable","message":"try again"}),
+            ),
+            "uncertain" => (
+                FrameType::Response,
+                json!({"op":"scope.describe","status":"not_live","daemon_incarnation":"test","owner_synced":false,"owner_configured":true}),
+            ),
+            _ => (
+                FrameType::Response,
+                json!({"op":"scope.describe","status":"ended","scope_epoch":1,"daemon_incarnation":"test","owner_synced":true,"owner_configured":true}),
+            ),
+        };
+        let response = Frame::build(
+            ty,
+            crate::control_flags(),
+            0,
+            0,
+            question.header.corr,
+            serde_json::to_vec(&answer).unwrap(),
+        )
+        .unwrap();
+        crate::handle_frame_for_test(response, &writer, &fixture.planes)
+            .await
+            .unwrap();
         until_frozen(|| fixture.planes.scopes.conversations(&key).is_empty()).await;
         {
             let state = fixture.planes.user_browser.target().state();

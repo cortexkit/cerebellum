@@ -263,7 +263,7 @@ mod tests {
     fn stamp() -> ScopeStamp {
         ScopeStamp::new(
             Principal::Reserved {
-                module_id: "prefrontal-core".into(),
+                module_id: "prefrontal".into(),
             },
             "head",
             3,
@@ -277,7 +277,7 @@ mod tests {
         AcceptedBindFacts::from_bind(
             &BindIdentity::new("test", "test-session"),
             Some(Principal::Reserved {
-                module_id: "prefrontal-core".into(),
+                module_id: "prefrontal".into(),
             }),
             Some(
                 &json!({"agentProjectId":"test-project", "sessionKind":"primary",

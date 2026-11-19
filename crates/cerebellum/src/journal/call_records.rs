@@ -167,7 +167,7 @@ impl ScopeIdentity {
         let owner = self.owner.strip_prefix("reserved:").map_or_else(
             || self.owner.clone(),
             |module_id| {
-                principal_label(Some(&cerebellum_core::principal::canonical_scope_owner(
+                principal_label(Some(&cerebellum_core::principal::read_legacy_scope_owner(
                     &Principal::Reserved {
                         module_id: module_id.into(),
                     },

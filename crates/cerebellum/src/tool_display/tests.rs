@@ -275,7 +275,7 @@ async fn relayed_prefrontal_status_sample_reports_no_schema_pin() {
     let planes = planes();
     let mut facts = install(&planes);
     facts.principal = Some(Principal::Reserved {
-        module_id: "prefrontal-core".into(),
+        module_id: "prefrontal".into(),
     });
     planes.routes.insert(7, 1, facts.clone());
     // Reconstructed relay body, including the original caller's slash-separated key.
@@ -843,7 +843,7 @@ async fn bind_display(planes: &Planes) -> Frame {
 #[tokio::test(start_paused = true)]
 async fn declarer_cache_one_catalog_read_for_100_binds_within_ttl() {
     let planes = planes();
-    let catalog = CatalogDouble::new(&["prefrontal-core"]);
+    let catalog = CatalogDouble::new(&["prefrontal"]);
     planes.routes.display.connect(catalog.clone());
     let stamp = subc_protocol::scope::ScopeStamp::new(
         Principal::Reserved {
@@ -857,7 +857,7 @@ async fn declarer_cache_one_catalog_read_for_100_binds_within_ttl() {
         let reply = bind_scope_carrier(
             &planes,
             Principal::Reserved {
-                module_id: "prefrontal-core".into(),
+                module_id: "prefrontal".into(),
             },
             subc_protocol::RouteTarget::ToolProvider {
                 module_id: "cerebellum".into(),
@@ -985,7 +985,7 @@ async fn declarer_cache_first_party_binds_never_reread_the_catalog() {
         let reply = bind_scope_carrier(
             &planes,
             Principal::Reserved {
-                module_id: "prefrontal-core".into(),
+                module_id: "prefrontal".into(),
             },
             subc_protocol::RouteTarget::ToolProvider {
                 module_id: "cerebellum".into(),
@@ -1081,10 +1081,10 @@ async fn declarer_cache_waiter_retries_when_refresh_owner_is_cancelled() {
 #[tokio::test]
 async fn a_display_scope_carrier_cannot_call_any_operation() {
     let planes = planes();
-    let display = DisplayDouble::new(&["prefrontal-core"]);
+    let display = DisplayDouble::new(&["prefrontal"]);
     planes.routes.display.connect(display);
     let principal = Principal::Reserved {
-        module_id: "prefrontal-core".into(),
+        module_id: "prefrontal".into(),
     };
     let stamp = subc_protocol::scope::ScopeStamp::new(
         Principal::Reserved {

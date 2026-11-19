@@ -35,7 +35,7 @@ use tokio::sync::mpsc;
 // owns the poll-cadence claim on a paused clock. These file-backed integration
 // waits only guard against a handoff or dispatcher that never settles.
 const ORIGIN: &str = "https://login.example";
-const OWNER: &str = "reserved:prefrontal-core";
+const OWNER: &str = "reserved:prefrontal";
 const LEAKS: [&str; 3] = [
     "PLANTED_PAGE_TITLE_709",
     "PLANTED_URL_PATH_709",
@@ -255,7 +255,7 @@ async fn bind_with_readers(
             json!({"agentProjectId":"pj-late-results","sessionKind":"primary","effectiveCapabilityScope":["*"],"browserControlOperations":["browser.present","browser.resume","browser.close"]}),
         ),
         scope: Some(
-            ScopeStamp::new(reserved("prefrontal-core"), "scope-7", 3, ScopeKind::Head)
+            ScopeStamp::new(reserved("prefrontal"), "scope-7", 3, ScopeKind::Head)
                 .with_attributes(ScopeAttributes::default())
                 .with_owner_authorized(true),
         ),
@@ -390,7 +390,7 @@ async fn present_for_watch(planes: &Planes, key: &str) -> Value {
 async fn handoff_watch_observes_login_before_first_tick_without_resume_or_journal() {
     let scratch = Scratch::new();
     let (planes, facts) = planes(&scratch, true);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     assert_eq!(
         present_for_watch(&planes, "pf:autonomous").await["expires_in_ms"],
         HANDOFF_DURATION_MS
@@ -435,7 +435,7 @@ async fn handoff_watch_observes_login_before_first_tick_without_resume_or_journa
 async fn handoff_watch_unreadable_opening_field_is_not_login_evidence() {
     let scratch = Scratch::new();
     let (planes, facts) = planes(&scratch, true);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     facts.credential_unreadable.store(true, Ordering::SeqCst);
     assert_eq!(
         present_for_watch(&planes, "pf:unreadable").await["outcome"],
@@ -468,7 +468,7 @@ async fn handoff_watch_unreadable_opening_field_is_not_login_evidence() {
 async fn handoff_watch_expiry_still_settles_without_resume() {
     let scratch = Scratch::new();
     let (planes, facts) = planes(&scratch, true);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     present_for_watch(&planes, "pf:expires").await;
     planes
         .sessions
@@ -494,7 +494,7 @@ async fn handoff_watch_expiry_still_settles_without_resume() {
 async fn handoff_watch_stops_after_close() {
     let scratch = Scratch::new();
     let (planes, facts) = planes(&scratch, true);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     let session = planes.sessions.status(
         "test-session",
         planes.lease_clock.as_ref(),
@@ -557,7 +557,7 @@ async fn seed_endings(planes: &Planes) {
 async fn late_results_undeclared_pull_preserves_legacy_bytes() {
     let scratch = Scratch::new();
     let (planes, _) = planes(&scratch, true);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     seed_endings(&planes).await;
     let expected = planes
         .calls
@@ -568,7 +568,7 @@ async fn late_results_undeclared_pull_preserves_legacy_bytes() {
         Some(json!({"outcome":"login_observed","origin":ORIGIN}))
     );
     for readers in [None, Some(vec!["unrelated/v1".to_owned()])] {
-        bind_with_readers(&planes, 10, reserved("prefrontal-core"), false, readers).await;
+        bind_with_readers(&planes, 10, reserved("prefrontal"), false, readers).await;
         let reply = exchange(
             &planes,
             frame(
@@ -589,14 +589,14 @@ async fn late_results_undeclared_pull_preserves_legacy_bytes() {
 async fn late_results_declared_pull_renders_each_ending_without_changing_storage() {
     let scratch = Scratch::new();
     let (planes, _) = planes(&scratch, true);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     seed_endings(&planes).await;
     let legacy = read(&planes, 9, None, None).await;
     let stored = std::fs::read(scratch.0.join("call_records.jsonl")).unwrap();
     bind_with_readers(
         &planes,
         10,
-        reserved("prefrontal-core"),
+        reserved("prefrontal"),
         false,
         Some(vec![
             cortexkit_role_tool_provider::TOOL_RESULT_V1_CAPABILITY.into(),
@@ -640,7 +640,7 @@ async fn first_keyed_present_upgrades_version_2_to_version_3() {
     let scratch = Scratch::new();
     seed_version_2(&scratch);
     let (planes, _) = planes(&scratch, true);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     assert_eq!(
         present(&planes, Some("pf:first-handoff")).await["outcome"],
         "login_pending"
@@ -681,7 +681,7 @@ async fn handoff_upgrade_raises_version_3_floor_before_writing() {
     let scratch = Scratch::new();
     seed_version_2(&scratch);
     let (planes, _) = planes(&scratch, true);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     let mut ordinary = json!({"name":"browser_use","arguments":{"action":"status"}});
     ordinary["call_key"] = json!("pf:ordinary-before-handoff");
     let response = exchange(&planes, frame(9, ordinary)).await;
@@ -754,7 +754,7 @@ async fn hello_manifest_declares_late_results_capability() {
 async fn catalog_and_role_ops_are_served() {
     let scratch = Scratch::new();
     let (planes, _) = planes(&scratch, false);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     for name in ["role.describe", "tool.catalog"] {
         let reply = exchange(&planes, frame(9, json!({"name":name,"arguments":{}}))).await;
         assert_eq!(reply.header.ty, FrameType::Response);
@@ -778,7 +778,7 @@ fn refusal_detail(reply: &Frame) -> Value {
 async fn role_op_refusals_are_error_frames_naming_the_field() {
     let scratch = Scratch::new();
     let (planes, _) = planes(&scratch, false);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     for name in ["role.describe", "tool.catalog"] {
         let preset = json!({"name":name,"arguments":{},"preset":"head"});
         assert_eq!(
@@ -805,7 +805,7 @@ async fn role_op_refusals_are_error_frames_naming_the_field() {
 async fn keyed_present_login_ack_and_custodian_isolation() {
     let scratch = Scratch::new();
     let (planes, logged_in) = planes(&scratch, true);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     bind(&planes, 10, reserved("striatum"), false).await;
     assert_eq!(
         present(&planes, Some("pf:login-1")).await,
@@ -876,7 +876,7 @@ async fn keyed_present_login_ack_and_custodian_isolation() {
 async fn late_results_cursor_round_trip() {
     let scratch = Scratch::new();
     let (planes, _) = planes(&scratch, true);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     for key in ["pf:first", "pf:second"] {
         assert_eq!(
             present(&planes, Some(key)).await["outcome"],
@@ -925,7 +925,7 @@ async fn late_results_cursor_round_trip() {
 async fn late_results_ack() {
     let scratch = Scratch::new();
     let (planes, _) = planes(&scratch, true);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     bind(&planes, 10, reserved("striatum"), false).await;
     for key in ["pf:one", "pf:two"] {
         present(&planes, Some(key)).await;
@@ -968,7 +968,7 @@ async fn late_results_ack() {
     )
     .await;
     let (next, _) = planes_after_restart(&scratch);
-    bind(&next, 9, reserved("prefrontal-core"), false).await;
+    bind(&next, 9, reserved("prefrontal"), false).await;
     assert!(
         read(&next, 9, None, None).await.entries.is_empty(),
         "acknowledgement was lost at restart"
@@ -983,10 +983,10 @@ fn planes_after_restart(scratch: &Scratch) -> (Planes, Arc<LoginFacts>) {
 async fn late_results_incarnation_change_refused() {
     let scratch = Scratch::new();
     let (first, _) = planes(&scratch, false);
-    bind(&first, 9, reserved("prefrontal-core"), false).await;
+    bind(&first, 9, reserved("prefrontal"), false).await;
     let old = read(&first, 9, None, None).await.cursor;
     let (next, _) = planes_after_restart(&scratch);
-    bind(&next, 9, reserved("prefrontal-core"), false).await;
+    bind(&next, 9, reserved("prefrontal"), false).await;
     let current = read(&next, 9, None, None).await.cursor;
     assert_ne!(old.provider_incarnation, current.provider_incarnation);
     for cursor in [old, Cursor { seq: 1, ..current }] {
@@ -1007,7 +1007,7 @@ async fn late_results_incarnation_change_refused() {
 async fn event_id_is_deterministic_across_pulls_and_restart() {
     let scratch = Scratch::new();
     let (first, _) = planes(&scratch, true);
-    bind(&first, 9, reserved("prefrontal-core"), false).await;
+    bind(&first, 9, reserved("prefrontal"), false).await;
     present(&first, Some("pf:stable")).await;
     call(&first, 9, "browser_use", json!({"action":"resume"})).await;
     let one = read(&first, 9, None, None).await;
@@ -1017,7 +1017,7 @@ async fn event_id_is_deterministic_across_pulls_and_restart() {
         "a re-read changed the settlement identity"
     );
     let (next, _) = planes_after_restart(&scratch);
-    bind(&next, 9, reserved("prefrontal-core"), false).await;
+    bind(&next, 9, reserved("prefrontal"), false).await;
     let three = read(&next, 9, None, None).await;
     assert_eq!(
         one.entries, three.entries,
@@ -1029,7 +1029,7 @@ async fn event_id_is_deterministic_across_pulls_and_restart() {
 async fn held_handoff_settles_as_interrupted_on_restart() {
     let scratch = Scratch::new();
     let (first, _) = planes(&scratch, true);
-    bind(&first, 9, reserved("prefrontal-core"), false).await;
+    bind(&first, 9, reserved("prefrontal"), false).await;
     assert_eq!(
         present(&first, Some("pf:interrupted")).await["outcome"],
         "login_pending"
@@ -1039,7 +1039,7 @@ async fn held_handoff_settles_as_interrupted_on_restart() {
     // a graceful resume or browser close. Startup alone must report
     // handoff_interrupted so the caller stops waiting after a process crash.
     let (next, _) = planes_after_restart(&scratch);
-    bind(&next, 9, reserved("prefrontal-core"), false).await;
+    bind(&next, 9, reserved("prefrontal"), false).await;
     let reply = read(&next, 9, None, None).await;
     assert_eq!(
         reply.entries.len(),
@@ -1052,7 +1052,7 @@ async fn held_handoff_settles_as_interrupted_on_restart() {
         Some(json!({"outcome":"handoff_interrupted","origin":ORIGIN}))
     );
     let (again, _) = planes_after_restart(&scratch);
-    bind(&again, 9, reserved("prefrontal-core"), false).await;
+    bind(&again, 9, reserved("prefrontal"), false).await;
     assert_eq!(
         read(&again, 9, None, None).await.entries,
         reply.entries,
@@ -1064,7 +1064,7 @@ async fn held_handoff_settles_as_interrupted_on_restart() {
 async fn unkeyed_present_is_not_held() {
     let scratch = Scratch::new();
     let (planes, _) = planes(&scratch, true);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     assert_eq!(
         present(&planes, None).await,
         json!({"outcome":"presented","expires_in_ms":600_000})
@@ -1090,7 +1090,7 @@ fn scan_leaks(bytes: &[u8]) -> Vec<&'static str> {
 async fn entries_and_store_are_text_free_scanner_finds_planted_control() {
     let scratch = Scratch::new();
     let (planes, logged_in) = planes(&scratch, true);
-    bind(&planes, 9, reserved("prefrontal-core"), false).await;
+    bind(&planes, 9, reserved("prefrontal"), false).await;
     let control = scratch.0.join("planted-control.json");
     std::fs::write(
         &control,
@@ -1126,7 +1126,7 @@ async fn entries_and_store_are_text_free_scanner_finds_planted_control() {
 async fn provider_ops_require_tool_route_and_verified_principal() {
     let scratch = Scratch::new();
     let (planes, _) = planes(&scratch, false);
-    bind(&planes, 9, reserved("prefrontal-core"), true).await;
+    bind(&planes, 9, reserved("prefrontal"), true).await;
     for op in ["late_results", "late_results.ack"] {
         let reply = exchange(
             &planes,

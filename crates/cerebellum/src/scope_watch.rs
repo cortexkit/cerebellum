@@ -322,7 +322,7 @@ impl std::hash::Hash for ScopeKey {
 
 impl ScopeKey {
     fn projection(&self) -> (String, &str, u64) {
-        let owner = cerebellum_core::principal::canonical_scope_owner(&self.owner);
+        let owner = cerebellum_core::principal::read_legacy_scope_owner(&self.owner);
         (
             crate::journal::call_records::principal_label(Some(&owner)),
             &self.scope_ref,
@@ -451,8 +451,8 @@ impl ScopeRevocation {
             let superseded: Vec<ScopeKey> = watched
                 .keys()
                 .filter(|key| {
-                    cerebellum_core::principal::canonical_scope_owner(&key.owner)
-                        == cerebellum_core::principal::canonical_scope_owner(&stamp.owner)
+                    cerebellum_core::principal::read_legacy_scope_owner(&key.owner)
+                        == cerebellum_core::principal::read_legacy_scope_owner(&stamp.owner)
                         && key.scope_ref == stamp.scope_ref
                         && key.scope_epoch < stamp.scope_epoch
                 })
@@ -541,49 +541,21 @@ impl ScopeRevocation {
         self.watched().contains_key(key)
     }
 
-    /// Ask about every raw owner of the logical scope. Either registration may
-    /// still carry the session, so an uncertain answer must retain its state.
+    /// Resolve a retained scope against the owner's current daemon registration.
     pub async fn describe(
         &self,
         writer: &mpsc::Sender<Frame>,
         key: &ScopeKey,
     ) -> Option<DescribeAnswer> {
-        let mut owners = vec![key.owner.clone()];
-        if cerebellum_core::principal::is_prefrontal(&key.owner) {
-            owners.extend(
-                cerebellum_core::principal::PREFRONTAL_MODULE_IDS
-                    .iter()
-                    .map(|id| Principal::Reserved {
-                        module_id: (*id).into(),
-                    })
-                    .filter(|owner| owner != &key.owner),
-            );
-        }
-        let mut answers = Vec::new();
-        for owner in owners {
-            let request = ModuleControlRequestFromModule::ScopeDescribe {
-                owner,
-                scope_ref: key.scope_ref.clone(),
-            };
-            answers.push(DescribeAnswer::from_control(
-                self.control
-                    .request(writer, &request, self.describe_timeout)
-                    .await,
-            ));
-        }
-        let answers = answers.into_iter().collect::<Option<Vec<_>>>()?;
-        // A live higher epoch ends the recorded epoch, but must keep the
-        // epoch-independent tab claim even if the other owner reports ended.
-        answers
-            .iter()
-            .find(|answer| classify(Some(answer), key.scope_epoch) == ScopeVerdict::Unresolved)
-            .or_else(|| {
-                answers
-                    .iter()
-                    .find(|answer| answer.status == ScopeStatus::Live)
-            })
-            .or_else(|| answers.first())
-            .cloned()
+        let request = ModuleControlRequestFromModule::ScopeDescribe {
+            owner: cerebellum_core::principal::read_legacy_scope_owner(&key.owner),
+            scope_ref: key.scope_ref.clone(),
+        };
+        DescribeAnswer::from_control(
+            self.control
+                .request(writer, &request, self.describe_timeout)
+                .await,
+        )
     }
 }
 
@@ -690,50 +662,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_followup_scope_end_checks_both_raw_owners() {
-        for (before, after) in [
-            ("prefrontal-core", "prefrontal"),
-            ("prefrontal", "prefrontal-core"),
-        ] {
-            for (status, synced, expected) in [
-                (ScopeStatus::Live, true, ScopeVerdict::Unresolved),
-                (ScopeStatus::NotLive, false, ScopeVerdict::Unresolved),
-                (ScopeStatus::Ended, true, ScopeVerdict::Ended),
-            ] {
-                let scopes = ScopeRevocation::default();
-                let key = ScopeKey {
-                    owner: Principal::Reserved {
-                        module_id: before.into(),
-                    },
-                    scope_ref: "head".into(),
-                    scope_epoch: 7,
-                };
-                let (writer, mut sent) = mpsc::channel::<Frame>(4);
-                let respond = async {
-                    let mut owners = Vec::new();
-                    for index in 0..2 {
-                        let Ok(Some(frame)) =
-                            tokio::time::timeout(Duration::from_secs(1), sent.recv()).await
-                        else {
-                            break;
-                        };
-                        let body: Value = serde_json::from_slice(&frame.body).unwrap();
-                        assert_eq!(body["ref"], "head");
-                        owners.push(body["owner"]["module_id"].as_str().unwrap().to_owned());
-                        let response = serde_json::json!({
-                            "op":"scope.describe", "status": if index == 0 { ScopeStatus::Ended } else { status },
-                            "scope_epoch":7, "daemon_incarnation":"test", "owner_synced": if index == 0 { true } else { synced }, "owner_configured":true,
-                        });
-                        assert!(scopes
-                            .control
-                            .deliver(frame.header.corr, ControlAnswer::Response(response)));
-                    }
-                    owners
-                };
-                let (result, owners) = tokio::join!(scopes.describe(&writer, &key), respond);
-                assert_eq!(classify(result.as_ref(), 7), expected);
-                assert_eq!(owners, [before, after]);
-            }
+    async fn a_retained_scope_is_described_once_under_the_current_owner() {
+        for stored in ["prefrontal-core", "prefrontal"] {
+            let scopes = ScopeRevocation::default();
+            let key = ScopeKey {
+                owner: Principal::Reserved {
+                    module_id: stored.into(),
+                },
+                scope_ref: "head".into(),
+                scope_epoch: 7,
+            };
+            let (writer, mut sent) = mpsc::channel::<Frame>(4);
+            let respond = async {
+                let frame = sent.recv().await.unwrap();
+                let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                assert_eq!(body["ref"], "head");
+                assert_eq!(body["owner"]["module_id"], "prefrontal");
+                assert!(scopes.control.deliver(
+                    frame.header.corr,
+                    ControlAnswer::Response(serde_json::json!({
+                        "op":"scope.describe", "status":"ended", "scope_epoch":7,
+                        "daemon_incarnation":"test", "owner_synced":true, "owner_configured":true,
+                    }))
+                ));
+            };
+            let (result, ()) = tokio::join!(scopes.describe(&writer, &key), respond);
+            assert_eq!(classify(result.as_ref(), 7), ScopeVerdict::Ended);
+            assert!(sent.try_recv().is_err());
         }
     }
 
@@ -790,7 +745,7 @@ mod tests {
                         &writer,
                         &ModuleControlRequestFromModule::ScopeDescribe {
                             owner: Principal::Reserved {
-                                module_id: "prefrontal-core".into(),
+                                module_id: "prefrontal".into(),
                             },
                             scope_ref: "s-1".into(),
                         },

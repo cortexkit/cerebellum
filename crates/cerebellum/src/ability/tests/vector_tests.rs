@@ -236,7 +236,7 @@ impl Case {
         let route = if request["method"] == CALL {
             flow()
         } else {
-            facts("prefrontal-core")
+            facts("prefrontal")
         };
         Self {
             name: name.into(),
@@ -268,7 +268,7 @@ fn refusal_case(row: Row) -> Case {
     );
     case.row = Some(row);
     match row {
-        Row::One => case.route = facts("prefrontal-core"),
+        Row::One => case.route = facts("prefrontal"),
         Row::Two => case.request["params"]["scope"] = json!([]),
         Row::Three => case.request["params"]["token"] = json!("cap/unknown.read@1"),
         Row::Four => case.request["params"]["op"] = json!("events.write"),
@@ -306,7 +306,7 @@ fn refusal_case(row: Row) -> Case {
                 .map(|&token| (token, reason))
                 .collect();
             case.request = json!({"method":SCOPE_CHOICES,"params":{"token":token.as_str(),"key":token.info().scope_key}});
-            case.route = facts("prefrontal-core");
+            case.route = facts("prefrontal");
         }
         Row::Eleven => case.source.stale = true,
         Row::Twelve => case.request = event_call("events.get", json!({"id":"unknown"})),
@@ -777,7 +777,7 @@ async fn refusal_row_precedence_and_request_only_boundaries() {
     // Wrong JSON types precede token lookup; value/range validation follows it.
     for (limit, row) in [(json!("wrong type"), Row::Two), (json!(0), Row::Three)] {
         let mut case = refusal_case(row);
-        case.route = facts("prefrontal-core");
+        case.route = facts("prefrontal");
         case.request = json!({"method":SCOPE_CHOICES,"params":{"token":"unknown","key":"calendar","limit":limit}});
         run(case).await;
     }

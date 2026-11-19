@@ -893,20 +893,20 @@ async fn authorized_owner_can_withdraw_basal_but_other_scopes_cannot() {
     let (_replies, cancel) = start_queued_run(&planes, "owner-key").await;
     let mut wrong = run_stamp();
     wrong.scope_ref = "different-run".into();
-    bind_carrier(&planes, "prefrontal-core", wrong).await;
+    bind_carrier(&planes, "prefrontal", wrong).await;
     let answer = withdraw(&planes, 10, "owner-key", Some("reserved:basal")).await;
     assert_eq!(answer["code"], "withdraw_not_permitted", "{answer}");
     assert!(!cancel.is_cancelled());
     bind_carrier(
         &planes,
-        "prefrontal-core",
+        "prefrontal",
         run_stamp().with_owner_authorized(false),
     )
     .await;
     let answer = withdraw(&planes, 10, "owner-key", Some("reserved:basal")).await;
     assert_eq!(answer["code"], "withdraw_not_permitted", "{answer}");
     assert!(!cancel.is_cancelled());
-    bind_carrier(&planes, "prefrontal-core", run_stamp()).await;
+    bind_carrier(&planes, "prefrontal", run_stamp()).await;
     let answer = withdraw(&planes, 10, "owner-key", Some("reserved:basal")).await;
     assert_eq!(answer["answer"], "already_started", "{answer}");
     assert!(cancel.is_cancelled());
@@ -915,10 +915,9 @@ async fn authorized_owner_can_withdraw_basal_but_other_scopes_cannot() {
 
 #[tokio::test]
 async fn rename_withdraw_preserves_raw_carrier_and_refuses_other_scope_identities() {
-    for (before, after) in [
-        ("prefrontal-core", "prefrontal"),
-        ("prefrontal", "prefrontal-core"),
-    ] {
+    {
+        let before = "prefrontal-core";
+        let after = "prefrontal";
         let planes = bound_run().await;
         let owner = |name: &str| subc_protocol::Principal::Reserved {
             module_id: name.into(),

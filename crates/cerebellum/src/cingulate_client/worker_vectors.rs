@@ -22,7 +22,7 @@ impl CallHold for Held {
 
 pub(crate) fn worker_stamp() -> ScopeStamp {
     let owner = Principal::Reserved {
-        module_id: "prefrontal-core".into(),
+        module_id: "prefrontal".into(),
     };
     let mut stamp = ScopeStamp::new(owner.clone(), "sc_worker", 3, ScopeKind::Worker)
         .with_owner_authorized(true);
