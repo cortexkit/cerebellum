@@ -579,34 +579,21 @@ where
                 return refusal;
             }
         }
-        // The conversation is shown this state now, so whatever the person
-        // did before it is no longer a change the agent has not seen.
-        let mut seen = seen;
         if let Some(hooks) = &image_hooks {
             let end = hooks.end();
-            let fronted = fronting::hooked_fronting(
+            image_fronting = Some(fronting::hooked_fronting(
                 fronting_admission.mode,
                 fronting::Purpose::NeedsFront,
                 &end,
-            );
-            if fronted.fronted {
-                // The front and the restore moved the target's focus and
-                // window; what the agent is shown is the state after both.
-                let source = self.app_state_source.clone();
-                let marks_grant = grant.clone();
-                seen = tokio::task::spawn_blocking(move || {
-                    SeenMarks::read(source.as_ref(), &marks_grant)
-                })
-                .await
-                .ok()
-                .or(seen);
-            }
-            image_fronting = Some(fronted);
+            ));
         }
         let fronting = image_fronting.or(foreground.map(|front| front.fronting));
         if let Some(fronting) = fronting {
             fronting.apply(&mut reply);
         }
+        // The bracket can confirm an app switch, not which accessibility focus
+        // or window changes it caused. Keep the marks from before the tree:
+        // newer marks could hide changes or input the reply never showed.
         if let Some(seen) = seen {
             sessions.remember_seen(&conversation_key, &grant, seen);
         }
