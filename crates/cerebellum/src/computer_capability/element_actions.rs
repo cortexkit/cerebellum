@@ -670,18 +670,71 @@ pub(crate) async fn admit_session_app(
 /// The role as the journal may record it: an accessibility role constant, or
 /// `AXUnknown`. A role is a string the application supplies, and the journal
 /// never records application text.
-fn journal_role(facts: Option<&ElementFacts>) -> String {
-    match facts.and_then(|facts| facts.role.as_deref()) {
-        Some(role)
-            if role.len() <= 48
-                && role.strip_prefix("AX").is_some_and(|rest| {
-                    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphabetic())
-                }) =>
-        {
-            role.to_string()
-        }
-        _ => "AXUnknown".to_string(),
-    }
+fn journal_role(facts: Option<&ElementFacts>) -> &'static str {
+    const KNOWN_ROLES: &[&str] = &[
+        "AXApplication",
+        "AXBrowser",
+        "AXBusyIndicator",
+        "AXButton",
+        "AXCell",
+        "AXCheckBox",
+        "AXColorWell",
+        "AXColumn",
+        "AXComboBox",
+        "AXDateField",
+        "AXDisclosureTriangle",
+        "AXDockItem",
+        "AXDrawer",
+        "AXGrid",
+        "AXGroup",
+        "AXGrowArea",
+        "AXHelpTag",
+        "AXImage",
+        "AXIncrementor",
+        "AXLayoutArea",
+        "AXLayoutItem",
+        "AXLevelIndicator",
+        "AXLink",
+        "AXList",
+        "AXMatte",
+        "AXMenu",
+        "AXMenuBar",
+        "AXMenuBarItem",
+        "AXMenuButton",
+        "AXMenuItem",
+        "AXOutline",
+        "AXPopUpButton",
+        "AXPopover",
+        "AXProgressIndicator",
+        "AXRadioButton",
+        "AXRadioGroup",
+        "AXRelevanceIndicator",
+        "AXRow",
+        "AXRuler",
+        "AXRulerMarker",
+        "AXScrollArea",
+        "AXScrollBar",
+        "AXSheet",
+        "AXSlider",
+        "AXSplitGroup",
+        "AXSplitter",
+        "AXStaticText",
+        "AXSystemWide",
+        "AXTabGroup",
+        "AXTable",
+        "AXTextArea",
+        "AXTextField",
+        "AXToolbar",
+        "AXValueIndicator",
+        "AXWebArea",
+        "AXWindow",
+    ];
+    let role = facts.and_then(|facts| facts.role.as_deref());
+    KNOWN_ROLES
+        .iter()
+        .copied()
+        .find(|known| Some(*known) == role)
+        .unwrap_or("AXUnknown")
 }
 
 fn descriptor(capability: ComputerCapability) -> ComputerPlaneDescriptor {
@@ -1013,7 +1066,7 @@ where
         Ok(action) => action,
         Err(reply) => {
             if journal
-                .refused(&role, reply["outcome"].as_str().expect("refusal outcome"))
+                .refused(role, reply["outcome"].as_str().expect("refusal outcome"))
                 .is_err()
             {
                 return audit_unavailable_reply(false);
@@ -1026,7 +1079,7 @@ where
     // better than a completed reply with no effect. An unreadable state is
     // unknown, not disabled, so dispatch is still allowed.
     if source.element_enabled(handle) == Some(false) {
-        if journal.refused(&role, "element_disabled").is_err() {
+        if journal.refused(role, "element_disabled").is_err() {
             return audit_unavailable_reply(false);
         }
         let background = source
@@ -1034,7 +1087,7 @@ where
             .is_some_and(|frontmost| frontmost != grant.pid);
         return element_disabled_reply(facts.title.as_deref(), element_id, background);
     }
-    let token = match journal.intent(grant, element_id, action, &role) {
+    let token = match journal.intent(grant, element_id, action, role) {
         Ok(token) => token,
         Err(refused) => return refused.reply(),
     };
@@ -1148,7 +1201,7 @@ where
     // Decided before anything is written: a secure field is refused whatever
     // else about it would allow the write.
     if facts.is_secure() {
-        if journal.refused(&role, "secure_field_refused").is_err() {
+        if journal.refused(role, "secure_field_refused").is_err() {
             return audit_unavailable_reply(false);
         }
         return json!({
@@ -1159,7 +1212,7 @@ where
     }
     match web_ancestry(source, grant, handle) {
         Some(true) => {
-            if journal.refused(&role, "web_content_needs_type").is_err() {
+            if journal.refused(role, "web_content_needs_type").is_err() {
                 return audit_unavailable_reply(false);
             }
             return json!({
@@ -1180,7 +1233,7 @@ where
         ),
     };
     if !settable {
-        if journal.refused(&role, "element_not_settable").is_err() {
+        if journal.refused(role, "element_not_settable").is_err() {
             return audit_unavailable_reply(false);
         }
         return json!({
@@ -1200,15 +1253,15 @@ where
                     match expected_after_insert(&before, selection, text) {
                         Some(expected) => expected,
                         None => {
-                            return caret_unknown(journal, &role);
+                            return caret_unknown(journal, role);
                         }
                     }
                 }
-                _ => return caret_unknown(journal, &role),
+                _ => return caret_unknown(journal, role),
             }
         }
     };
-    let token = match journal.intent(grant, element_id, action, &role) {
+    let token = match journal.intent(grant, element_id, action, role) {
         Ok(token) => token,
         Err(refused) => return refused.reply(),
     };
@@ -2637,7 +2690,7 @@ where
                                 let role = journal_role(Some(&facts));
                                 if journal
                                     .refused(
-                                        &role,
+                                        role,
                                         reply["outcome"].as_str().expect("refusal outcome"),
                                     )
                                     .is_err()

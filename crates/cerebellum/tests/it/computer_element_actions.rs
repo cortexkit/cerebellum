@@ -1977,6 +1977,58 @@ fn journal_contains(storage: &InMemoryJournalStorage, needle: &str) -> bool {
         .any(|text| text.contains(needle))
 }
 
+#[tokio::test]
+async fn application_supplied_roles_do_not_reach_the_pressed_or_refused_journal() {
+    const PRIVATE_ROLE: &str = "AXPrivateTextSentinel";
+    let desk = desk();
+    let storage = InMemoryJournalStorage::new();
+    let plane: Plane = ComputerPlane::with_result_schema_enforcement(
+        support::computer::audit_with_storage(storage.clone()),
+        ResultSchemaEnforcement::Withhold,
+    )
+    .with_permission_liveness(support::computer::live_permissions())
+    .with_app_state_source(desk.source());
+    let management = granted_management().await;
+    let read = serve(
+        &plane,
+        &management,
+        "computer.read_state",
+        json!({"target": TARGET_BUNDLE_ID}),
+    )
+    .await;
+    let send = id_of(read["state_text"].as_str().unwrap(), "Send");
+    let args = json!({"element_id": send});
+    let known = serve(&plane, &management, "computer.press_element", args.clone()).await;
+    assert_eq!(known["outcome"], "completed", "{known}");
+    assert!(journal_contains(&storage, "AXPress AXButton"));
+
+    let provisional = Arc::new(std::sync::Mutex::new(None));
+    {
+        let mut state = desk.state();
+        // The returned tree showed a button; only live action facts supply the role.
+        state.elements.get_mut(&10).unwrap().facts.role = Some(PRIVATE_ROLE.into());
+        let storage = storage.clone();
+        let provisional = provisional.clone();
+        state.on_press = Some(support::computer::DeskHook(Arc::new(move || {
+            *provisional.lock().unwrap() = Some((
+                journal_contains(&storage, "AXPress AXUnknown"),
+                journal_contains(&storage, PRIVATE_ROLE),
+            ));
+        })));
+    }
+    let pressed = serve(&plane, &management, "computer.press_element", args.clone()).await;
+    assert_eq!(pressed["outcome"], "completed", "{pressed}");
+
+    desk.state().elements.get_mut(&10).unwrap().enabled = Some(false);
+    let refused = serve(&plane, &management, "computer.press_element", args).await;
+    assert_eq!(refused["outcome"], "element_disabled", "{refused}");
+    assert_eq!(desk.state().presses, [10, 10]);
+    assert_eq!(*provisional.lock().unwrap(), Some((true, false)));
+    assert!(journal_contains(&storage, "AXPress AXUnknown"));
+    assert!(journal_contains(&storage, "\"role\":\"AXUnknown\""));
+    assert!(!journal_contains(&storage, PRIVATE_ROLE));
+}
+
 /// Written and typed text never reach the journal, and the scan that says so is
 /// first shown to find a planted positive in the same journal: the
 /// application's bundle identity carries a marker, and the journal records

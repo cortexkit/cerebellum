@@ -495,7 +495,7 @@ where
 {
     let facts = source.element_facts(handle).ok();
     let role = journal_role(facts.as_ref());
-    if journal.refused(&role, "element_disabled").is_err() {
+    if journal.refused(role, "element_disabled").is_err() {
         return audit_unavailable_reply(false);
     }
     element_disabled_reply(
