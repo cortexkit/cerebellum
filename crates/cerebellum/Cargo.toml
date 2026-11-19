@@ -53,8 +53,8 @@ cortexkit-role-agent-data = { workspace = true }
 cerebellum-ability = { path = "../cerebellum-ability" }
 base64 = "0.22"
 cortexkit-bus-naming = "=0.5.3"
-cortexkit-bus-client = "=0.1.5"
-cortexkit-bus-nats = "=0.5.2"
+cortexkit-bus-client = "=0.1.9"
+cortexkit-bus-nats = "=0.5.4"
 cortexkit-resource-busy = { workspace = true }
 cerebellum-bridge-protocol = { path = "../cerebellum-bridge-protocol" }
 cortexkit-paths = "=0.1.2"
