@@ -15,6 +15,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+# Only the separately reported desk commands may opt into live operations.
+# Never inherit that choice into the ordinary workspace or conformance tests.
+unset CEREBELLUM_DESK_TESTS
+source "$repo_root/scripts/lib/desk-test-report.sh"
+
 # Snapshot the tree before anything builds, so the final phase can attribute a
 # change to the build rather than to uncommitted work the author already had.
 tree_before_build="$(git status --porcelain)"
@@ -396,38 +401,38 @@ fi
 # that cannot check what it promises, for example because the screen is
 # locked, prints "test NAME ... SKIPPED...: reason" and exits 2, so a run
 # without a display never reads as a pass. Only for those suites does the gate
-# set CEREBELLUM_DESK_TEST_SKIP_OK=1, which turns that exit into 0; it reads
-# the reason back from the output and names it before the verdict, so a skip
-# never turns the gate red and is never silent either.
+# set CEREBELLUM_DESK_TEST_SKIP_OK=1, which turns that exit into 0. The same
+# commands set CEREBELLUM_DESK_TESTS=1 to enable live operations explicitly.
+# The gate reads the reason back from the output and names it before the
+# verdict, so a skip never turns the gate red and is never silent either.
 preview_hide_test=a_preview_is_a_click_through_panel_and_hiding_takes_it_off_the_screen
-run_phase "cargo test --locked --workspace --quiet -- --skip $preview_hide_test" \
-  "$repo_root/scripts/lib/gate-cargo-test.sh" --locked --workspace --quiet -- --skip "$preview_hide_test"
-
-desk_skip_reason() {
-  sed -n 's/^test [^ ]* \.\.\. SKIPPED[^:]*: //p' | head -n 1
-}
-# Run a command with its standard output also copied to a log, keeping the
-# command's own exit status.
-run_teed() {
-  local log="$1"
-  shift
-  "$@" | tee "$log"
-  return "${PIPESTATUS[0]}"
-}
+source_rect_test=a_source_rect_returns_the_region_rather_than_the_whole_window
+workspace_log="$parallel_phase_dir/workspace-tests.log"
+run_phase "cargo test --locked --workspace --quiet -- --skip $preview_hide_test --skip $source_rect_test" \
+  run_teed "$workspace_log" "$repo_root/scripts/lib/gate-cargo-test.sh" \
+  --locked --workspace --quiet -- --skip "$preview_hide_test" --skip "$source_rect_test"
 desk_skips=()
-desk_log="$parallel_phase_dir/desk-preview_hide.log"
-run_phase "CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p cerebellum-macos --test preview_hide" \
-  run_teed "$desk_log" env CEREBELLUM_DESK_TEST_SKIP_OK=1 "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p cerebellum-macos --test preview_hide
-if [ "$(uname -s)" != Darwin ]; then
-  # Off macOS the target builds to an empty program that prints nothing.
-  desk_reason="AppKit exists only on macOS, so no preview panel was shown"
-else
-  desk_reason="$(desk_skip_reason < "$desk_log")"
-fi
-if [ -n "$desk_reason" ]; then
-  desk_skips+=("preview_hide skipped ($desk_reason)")
-  not_verified="$not_verified; preview_hide skipped ($desk_reason)"
-fi
+while IFS= read -r skip_line; do
+  desk_skips+=("workspace $skip_line")
+  not_verified="$not_verified; workspace $skip_line"
+done < <(desk_skip_lines < "$workspace_log")
+
+for desk_target in preview_hide source_rect_pattern; do
+  desk_log="$parallel_phase_dir/desk-$desk_target.log"
+  run_phase "CEREBELLUM_DESK_TESTS=1 CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p cerebellum-macos --test $desk_target" \
+    run_teed "$desk_log" env CEREBELLUM_DESK_TESTS=1 CEREBELLUM_DESK_TEST_SKIP_OK=1 \
+    "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p cerebellum-macos --test "$desk_target"
+  if [ "$(uname -s)" != Darwin ]; then
+    # Off macOS the target builds to an empty program that prints nothing.
+    desk_reason="AppKit exists only on macOS, so no desk panel was shown"
+  else
+    desk_reason="$(desk_skip_reason < "$desk_log")"
+  fi
+  if [ -n "$desk_reason" ]; then
+    desk_skips+=("$desk_target skipped ($desk_reason)")
+    not_verified="$not_verified; $desk_target skipped ($desk_reason)"
+  fi
+done
 
 # Phase 5: the identity-resolution observer seam is feature-gated so production
 # builds emit no observer code. A plain `cargo test` therefore skips the

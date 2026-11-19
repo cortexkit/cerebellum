@@ -110,6 +110,25 @@ RUST
 expect "requesting API in an example test is detected" 1 \
   "crates/demo/examples/probe.rs:15: test code calls requesting API IOHIDRequestAccess(" "$tree"
 
+tree="$(fresh_tree remaining-apis)"
+cat >>"$tree/crates/demo/tests/wire.rs" <<'RUST'
+
+#[test]
+fn reaches_other_requesting_apis() {
+    CGEventTapCreate();
+    CGRequestPostEventAccess();
+    CGEventPost();
+    CGEventPostToPid();
+    getShareableContentWithCompletionHandler();
+    captureImageWithFilter_configuration_completionHandler();
+}
+RUST
+for api in CGEventTapCreate CGRequestPostEventAccess CGEventPost CGEventPostToPid \
+  getShareableContentWithCompletionHandler captureImageWithFilter_configuration_completionHandler; do
+  expect "requesting API $api in a test is detected" 1 \
+    "test code calls requesting API $api(" "$tree"
+done
+
 if [ "$failures" -ne 0 ]; then
   echo "mac-permission-request-scan.test.sh: $failures of $checks checks failed" >&2
   exit 1

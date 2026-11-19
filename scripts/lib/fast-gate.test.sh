@@ -423,6 +423,7 @@ mac_clippy_pipeline() {
   cp "$repo_root/scripts/fast-gate.sh" "$fixture/scripts/"
   cp "$repo_root/scripts/lib/fast-gate-phases.sh" \
     "$repo_root/scripts/lib/fast-gate-plan.sh" \
+    "$repo_root/scripts/lib/desk-test-report.sh" \
     "$repo_root/scripts/lib/gate-lock.sh" \
     "$repo_root/scripts/lib/fail-closed-exit.sh" \
     "$repo_root/scripts/lib/fail-closed-exit.test.sh" \
@@ -505,6 +506,7 @@ mac_vm_pipeline() {
   cp "$repo_root/scripts/fast-gate.sh" "$fixture/scripts/"
   cp "$repo_root/scripts/lib/fast-gate-phases.sh" \
     "$repo_root/scripts/lib/fast-gate-plan.sh" \
+    "$repo_root/scripts/lib/desk-test-report.sh" \
     "$repo_root/scripts/lib/gate-lock.sh" \
     "$repo_root/scripts/lib/fail-closed-exit.sh" \
     "$repo_root/scripts/lib/gate-cargo-test.sh" \

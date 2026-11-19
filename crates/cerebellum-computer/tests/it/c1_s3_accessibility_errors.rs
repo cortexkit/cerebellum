@@ -1,5 +1,15 @@
 use cerebellum_computer::platform::{AccessibilityReadFailure, DriverError};
 
+#[cfg(target_os = "macos")]
+fn announce_live_skip(reason: &str) {
+    use std::io::Write;
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(
+        stderr,
+        "test live_accessibility_tree_probe_runs_or_names_why_it_skipped ... SKIPPED: {reason}"
+    );
+}
+
 #[test]
 fn accessibility_read_failures_remain_typed_for_callers() {
     let cases = [
@@ -42,6 +52,21 @@ fn live_accessibility_tree_probe_runs_or_names_why_it_skipped() {
         native, AccessibilityTreeRequest, MacOs26PlatformDriver, PlatformDriver,
     };
     use std::time::Duration;
+
+    if let Some(reason) = cerebellum_macos::test_support::accessibility_skip_reason(
+        cerebellum_macos::accessibility_is_permitted,
+    ) {
+        announce_live_skip(reason);
+        return;
+    }
+    // Constructing the target grant enumerates ScreenCaptureKit windows, so
+    // this live Accessibility probe also needs the Screen Recording preflight.
+    if let Some(reason) = cerebellum_macos::test_support::screen_recording_skip_reason(
+        cerebellum_macos::screen_capture_is_permitted,
+    ) {
+        announce_live_skip(reason);
+        return;
+    }
 
     let Some(target) = native::grant_for_pid(std::process::id(), Duration::from_millis(500)) else {
         eprintln!(

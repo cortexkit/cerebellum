@@ -30,9 +30,15 @@ SPEC.loader.exec_module(SHARED)
 # and AXIsProcessTrusted.
 REQUESTING_APIS = {
     "AXIsProcessTrustedWithOptions",
+    "CGEventPost",
+    "CGEventPostToPid",
+    "CGEventTapCreate",
     "CGRequestListenEventAccess",
+    "CGRequestPostEventAccess",
     "CGRequestScreenCaptureAccess",
     "IOHIDRequestAccess",
+    "captureImageWithFilter_configuration_completionHandler",
+    "getShareableContentWithCompletionHandler",
 }
 
 

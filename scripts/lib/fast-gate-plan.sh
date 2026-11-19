@@ -164,6 +164,11 @@ if any(path in cursor_sources or path.startswith("crates/cerebellum-macos/src/cu
     selected_suites.add(("cerebellum-macos", "cursor_motion"))
     selected_suites.add(("cerebellum-macos", "cursor_hide"))
 
+# source_rect_pattern imports this helper by path, so a package-only plan would
+# compile its changed guard without ever running the integration target.
+if "crates/cerebellum-macos/src/test_support.rs" in files:
+    selected_suites.add(("cerebellum-macos", "source_rect_pattern"))
+
 # Each crate's consolidated `it` target holds the source scans over that crate's
 # shipped code. cerebellum's covers the single launch-secret reader, zero
 # runtime prints, declared launch-path outcome words, the one lease clock,
