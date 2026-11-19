@@ -237,42 +237,107 @@ pub enum VisibilityRule {
     NoLayerZeroOverlap,
 }
 
-/// Remove a rectangle from a region represented by disjoint rectangles.
-fn subtract(remaining: Vec<Rect>, cover: Rect) -> Vec<Rect> {
-    remaining
-        .into_iter()
-        .flat_map(|rect| {
-            let Some(overlap) = rect.intersection(cover) else {
-                return vec![rect];
-            };
-            [
-                Rect {
-                    height: overlap.y - rect.y,
-                    ..rect
-                },
-                Rect {
-                    y: overlap.y + overlap.height,
-                    height: rect.y + rect.height - overlap.y - overlap.height,
-                    ..rect
-                },
-                Rect {
-                    y: overlap.y,
-                    width: overlap.x - rect.x,
-                    height: overlap.height,
-                    ..rect
-                },
-                Rect {
-                    x: overlap.x + overlap.width,
-                    y: overlap.y,
-                    width: rect.x + rect.width - overlap.x - overlap.width,
-                    height: overlap.height,
-                },
-            ]
-            .into_iter()
-            .filter(|r| r.valid())
-            .collect()
-        })
-        .collect()
+#[cfg(test)]
+thread_local! {
+    static COVERAGE_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct Edge {
+    x: f64,
+    ymin: f64,
+    ymax: f64,
+    entering: bool,
+}
+
+#[derive(Clone, Default)]
+struct Coverage {
+    /// Active rectangles spanning this node's entire interval.
+    spanning: usize,
+    complete: bool,
+}
+
+fn update_coverage(
+    tree: &mut [Coverage],
+    node: usize,
+    lo: usize,
+    hi: usize,
+    range: &std::ops::Range<usize>,
+    entering: bool,
+) {
+    #[cfg(test)]
+    COVERAGE_STEPS.with(|steps| steps.set(steps.get() + 1));
+    if range.start <= lo && hi <= range.end {
+        if entering {
+            tree[node].spanning += 1;
+        } else {
+            tree[node].spanning -= 1;
+        }
+    } else {
+        let mid = lo + (hi - lo) / 2;
+        if range.start < mid {
+            update_coverage(tree, 2 * node, lo, mid, range, entering);
+        }
+        if mid < range.end {
+            update_coverage(tree, 2 * node + 1, mid, hi, range, entering);
+        }
+    }
+    tree[node].complete = tree[node].spanning > 0
+        || (hi - lo > 1 && tree[2 * node].complete && tree[2 * node + 1].complete);
+}
+
+/// Sweep the clipped rectangle edges from left to right. Between edges the
+/// covered y-intervals do not change. A tree over all y-endpoints remembers
+/// whether every interval is covered, with O(log n) work per edge and no
+/// accumulated fragments or rounded area comparisons.
+fn covers(bounds: Rect, rects: impl IntoIterator<Item = Rect>) -> bool {
+    let right = bounds.x + bounds.width;
+    let bottom = bounds.y + bounds.height;
+    if right <= bounds.x || bottom <= bounds.y {
+        return false;
+    }
+    let order = |a: &f64, b: &f64| a.partial_cmp(b).expect("bounds are finite");
+    let mut ys = vec![bounds.y, bottom];
+    let mut edges = Vec::new();
+    for rect in rects {
+        let left = bounds.x.max(rect.x);
+        let end = right.min(rect.x + rect.width);
+        let ymin = bounds.y.max(rect.y);
+        let ymax = bottom.min(rect.y + rect.height);
+        if left >= end || ymin >= ymax {
+            continue;
+        }
+        ys.extend([ymin, ymax]);
+        edges.extend([
+            Edge {
+                x: left,
+                ymin,
+                ymax,
+                entering: true,
+            },
+            Edge {
+                x: end,
+                ymin,
+                ymax,
+                entering: false,
+            },
+        ]);
+    }
+    ys.sort_unstable_by(order);
+    ys.dedup();
+    edges.sort_unstable_by(|a, b| order(&a.x, &b.x));
+    let intervals = ys.len() - 1;
+    let mut tree = vec![Coverage::default(); 4 * intervals];
+    let mut x = bounds.x;
+    for edge in edges {
+        if edge.x > x && !tree[1].complete {
+            return false;
+        }
+        let index = |y| ys.binary_search_by(|value| order(value, &y)).unwrap();
+        let range = index(edge.ymin)..index(edge.ymax);
+        update_coverage(&mut tree, 1, 0, intervals, &range, edge.entering);
+        x = edge.x;
+    }
+    x == right
 }
 
 /// Ordered front to back, including windows from the target's own process.
@@ -306,13 +371,9 @@ pub(crate) fn visibility_from_windows(
     if displays.is_empty() || displays.iter().any(|rect| !rect.valid()) {
         return (Unknown, MissingData);
     }
-    // Subtract the union of displays: a window spanning adjacent displays is
+    // Check the union of displays: a window spanning adjacent displays is
     // visible, but a strip off screen or in a gap between displays is not.
-    let mut remaining = vec![bounds];
-    for display in displays {
-        remaining = subtract(remaining, *display);
-    }
-    if !remaining.is_empty() {
+    if !covers(bounds, displays.iter().copied()) {
         return (Covered, OutsideDisplays);
     }
     let mut above_windows = Vec::new();
@@ -342,13 +403,12 @@ pub(crate) fn visibility_from_windows(
     // Occlusion, not global frontmost status, determines whether a normal window
     // keeps drawing. Floating bars only withhold its image when their union
     // covers the entire frame, even if another display has a normal window above.
-    let mut remaining = vec![bounds];
-    for (other, layer) in above_windows {
-        if layer != 0 {
-            remaining = subtract(remaining, other);
-        }
-    }
-    if remaining.is_empty() {
+    if covers(
+        bounds,
+        above_windows
+            .into_iter()
+            .filter_map(|(rect, layer)| (layer != 0).then_some(rect)),
+    ) {
         return (Covered, HigherLayerUnionCoverage);
     }
     (FullyVisible, NoLayerZeroOverlap)
@@ -814,6 +874,98 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn rectangle_sweep_matches_every_coverage_pattern_on_a_two_by_two_grid() {
+        let frame = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 2.0,
+            height: 2.0,
+        };
+        let intervals = [(0.0, 1.0), (1.0, 1.0), (0.0, 2.0)];
+        let rectangles: Vec<_> = intervals
+            .into_iter()
+            .flat_map(|(x, width)| {
+                intervals.into_iter().map(move |(y, height)| Rect {
+                    x,
+                    y,
+                    width,
+                    height,
+                })
+            })
+            .collect();
+        for selection in 0..(1 << rectangles.len()) {
+            let chosen: Vec<_> = rectangles
+                .iter()
+                .copied()
+                .enumerate()
+                .filter_map(|(i, rect)| (selection & (1 << i) != 0).then_some(rect))
+                .collect();
+            let every_cell = [(0.5, 0.5), (1.5, 0.5), (0.5, 1.5), (1.5, 1.5)]
+                .into_iter()
+                .all(|(x, y)| {
+                    chosen
+                        .iter()
+                        .any(|r| r.x < x && x < r.x + r.width && r.y < y && y < r.y + r.height)
+                });
+            assert_eq!(
+                covers(frame, chosen),
+                every_cell,
+                "rectangle set {selection:#b}"
+            );
+        }
+    }
+
+    #[test]
+    fn floating_strip_grid_has_bounded_coverage_work() {
+        const STRIPS: u32 = 64;
+        let frame = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: f64::from(STRIPS * 2),
+            height: f64::from(STRIPS * 2),
+        };
+        let mut windows = Vec::new();
+        for i in 0..STRIPS {
+            windows.push(layered(
+                i + 2,
+                1,
+                Rect {
+                    y: f64::from(i * 2),
+                    height: 1.0,
+                    ..frame
+                },
+            ));
+        }
+        for i in 0..STRIPS {
+            windows.push(layered(
+                i + STRIPS + 2,
+                1,
+                Rect {
+                    x: f64::from(i * 2),
+                    width: 1.0,
+                    ..frame
+                },
+            ));
+        }
+        let target = window(1, Some(frame));
+        let pid = target.pid.unwrap();
+        windows.push(target);
+        COVERAGE_STEPS.with(|steps| steps.set(0));
+        assert_eq!(
+            visibility_from_windows(pid, 1, &windows, &[frame]),
+            (
+                WindowVisibility::FullyVisible,
+                VisibilityRule::NoLayerZeroOverlap
+            ),
+        );
+        let steps = COVERAGE_STEPS.with(std::cell::Cell::get);
+        assert!(
+            steps > 0 && steps < 96 * windows.len(),
+            "coverage took {steps} steps"
+        );
     }
 
     #[test]
