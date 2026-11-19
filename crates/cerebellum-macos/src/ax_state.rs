@@ -38,6 +38,18 @@ extern "C" {
         attribute: CfTypeRef,
         value: *mut CfTypeRef,
     ) -> i32;
+    fn AXUIElementGetAttributeValueCount(
+        element: CfTypeRef,
+        attribute: CfTypeRef,
+        count: *mut isize,
+    ) -> i32;
+    fn AXUIElementCopyAttributeValues(
+        element: CfTypeRef,
+        attribute: CfTypeRef,
+        index: isize,
+        max_values: isize,
+        values: *mut CfTypeRef,
+    ) -> i32;
     fn AXUIElementCopyMultipleAttributeValues(
         element: CfTypeRef,
         attributes: CfTypeRef,
@@ -173,7 +185,7 @@ pub struct AxAppStateBounds {
 
 /// The attributes read per element, in one message to the application.
 /// Their positions are the indexes `Reader::read` takes them by.
-const ATTRIBUTES: [&str; 13] = [
+const ATTRIBUTES: [&str; 12] = [
     "AXRole",
     "AXSubrole",
     "AXTitle",
@@ -184,7 +196,6 @@ const ATTRIBUTES: [&str; 13] = [
     "AXEnabled",
     "AXFocused",
     "AXExpanded",
-    "AXChildren",
     "AXURL",
     "AXVisible",
 ];
@@ -259,6 +270,7 @@ struct Reader {
     value_name: CFRetained<CFString>,
     deadline: Instant,
     max_elements: usize,
+    child_slots_left: usize,
     max_depth: usize,
     visited: usize,
     unreadable: usize,
@@ -397,45 +409,51 @@ impl Reader {
             main: false,
             focused_window: false,
             expanded: bool_at(9),
-            menu_visible: bool_at(12).unwrap_or(false) || selected_menu,
+            menu_visible: bool_at(11).unwrap_or(false) || selected_menu,
             closed_menu_children: 0,
-            url: value_at(11).and_then(|value| url_string(&value)),
+            url: value_at(10).and_then(|value| url_string(&value)),
             children: Vec::new(),
             unreadable_children: 0,
             element,
         };
 
-        let children: Vec<AxRetainedElement> = value_at(10)
-            .and_then(|children| children.downcast::<CFArray>().ok())
-            .map(|children| {
-                // SAFETY: AXChildren is documented as an array of elements;
-                // each is type-checked below before use.
-                let children: &CFArray<CFType> = unsafe { children.cast_unchecked() };
-                children
-                    .iter()
-                    .filter(|child| is_ax_element(child))
-                    .map(AxRetainedElement)
-                    .collect()
-            })
-            .unwrap_or_default();
-        // Closed menus expose hundreds of dormant items in some applications.
-        // Read the title and child count, not every item's attributes. A zoom
-        // explicitly opts into that traversal; a selected title opens it too.
-        if read.role.as_deref() == Some("AXMenu") && !read.menu_visible && !self.expand_menus {
-            read.closed_menu_children = children.len();
-            return ElementRead::Read(Box::new(read));
-        }
-        if !children.is_empty() && depth >= self.max_depth {
+        if !set_timeout_until(&read.element, self.deadline) {
             self.bound_reached = true;
             return ElementRead::Read(Box::new(read));
         }
+        let name = CFString::from_static_str("AXChildren");
+        let count = attribute_value_count(&read.element, &name).unwrap_or(0);
+        // Read only the count for a closed menu, unless the caller requested
+        // expanded menus. A selected menu title also makes its items visible.
+        if read.role.as_deref() == Some("AXMenu") && !read.menu_visible && !self.expand_menus {
+            read.closed_menu_children = count;
+            return ElementRead::Read(Box::new(read));
+        }
+        if count == 0 {
+            return ElementRead::Read(Box::new(read));
+        }
+        if depth >= self.max_depth || !set_timeout_until(&read.element, self.deadline) {
+            self.bound_reached = true;
+            return ElementRead::Read(Box::new(read));
+        }
+        // Charge slots as well as visited nodes: repeated child references
+        // must not let a depth-first walk retain many overlapping arrays.
+        let requested = count
+            .min(self.child_slots_left)
+            .min(self.max_elements.saturating_sub(self.visited));
+        self.child_slots_left -= requested;
+        self.bound_reached |= requested < count;
+        let children = collect_element_list(requested, |limit| {
+            copy_attribute_prefix(&read.element, &name, limit)
+        })
+        .unwrap_or_default();
         for child in children {
-            if !self.first_visit(&child) {
-                continue;
-            }
-            if self.visited >= self.max_elements {
+            if self.visited >= self.max_elements || self.remaining_seconds().is_none() {
                 self.bound_reached = true;
                 break;
+            }
+            if !self.first_visit(&child) {
+                continue;
             }
             self.visited += 1;
             match self.read_menu(
@@ -513,7 +531,7 @@ fn mark_windows(roots: &mut [AxStateElement], application: Option<&AxRetainedEle
     }
 }
 
-fn elements_of(value: Option<CFRetained<CFType>>) -> Vec<AxRetainedElement> {
+fn elements_of(value: Option<CFRetained<CFType>>, limit: usize) -> Vec<AxRetainedElement> {
     value
         .and_then(|value| value.downcast::<CFArray>().ok())
         .map(|array| {
@@ -522,11 +540,101 @@ fn elements_of(value: Option<CFRetained<CFType>>) -> Vec<AxRetainedElement> {
             let array: &CFArray<CFType> = unsafe { array.cast_unchecked() };
             array
                 .iter()
+                .take(limit)
                 .filter(|item| is_ax_element(item))
                 .map(AxRetainedElement)
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn collect_element_list(
+    limit: usize,
+    copy: impl FnOnce(usize) -> Result<Option<CFRetained<CFType>>, i32>,
+) -> Result<Vec<AxRetainedElement>, i32> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    copy(limit).map(|value| elements_of(value, limit))
+}
+
+fn set_timeout_until(element: &AxRetainedElement, deadline: Instant) -> bool {
+    let now = Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    // SAFETY: the element is retained; setting a client timeout is not a write to the app.
+    unsafe {
+        AXUIElementSetMessagingTimeout(
+            element.as_ptr(),
+            crate::ax_budget::messaging_timeout_seconds((deadline - now).as_secs_f32()),
+        )
+    };
+    true
+}
+
+fn attribute_value_count(element: &AxRetainedElement, name: &CFString) -> Result<usize, i32> {
+    let mut count = 0isize;
+    // SAFETY: both references are retained and `count` is writable CFIndex storage.
+    let code = unsafe {
+        AXUIElementGetAttributeValueCount(
+            element.as_ptr(),
+            std::ptr::from_ref(name).cast(),
+            &mut count,
+        )
+    };
+    if code != AX_ERROR_SUCCESS {
+        return Err(code);
+    }
+    usize::try_from(count).map_err(|_| AX_ERROR_CANNOT_COMPLETE)
+}
+
+fn copy_attribute_prefix(
+    element: &AxRetainedElement,
+    name: &CFString,
+    limit: usize,
+) -> Result<Option<CFRetained<CFType>>, i32> {
+    let mut values = std::ptr::null();
+    let limit = isize::try_from(limit).unwrap_or(isize::MAX);
+    // SAFETY: both inputs are retained and `values` is writable storage for an array reference.
+    let code = unsafe {
+        AXUIElementCopyAttributeValues(
+            element.as_ptr(),
+            std::ptr::from_ref(name).cast(),
+            0,
+            limit,
+            &mut values,
+        )
+    };
+    if code != AX_ERROR_SUCCESS {
+        return Err(code);
+    }
+    // SAFETY: a successful Copy returns one owned reference.
+    Ok(unsafe { owned(values) })
+}
+
+fn read_root_list(
+    application: &AxRetainedElement,
+    name: &'static str,
+    max_elements: usize,
+    deadline: Instant,
+    bound_reached: &mut bool,
+) -> Result<Vec<AxRetainedElement>, i32> {
+    if !set_timeout_until(application, deadline) {
+        *bound_reached = true;
+        return Ok(Vec::new());
+    }
+    let name = CFString::from_static_str(name);
+    let count = attribute_value_count(application, &name)?;
+    let limit = count.min(max_elements);
+    *bound_reached |= limit < count;
+    if !set_timeout_until(application, deadline) {
+        *bound_reached = true;
+        return Ok(Vec::new());
+    }
+    collect_element_list(limit, |limit| {
+        copy_attribute_prefix(application, &name, limit)
+    })
 }
 
 /// Read the application `pid` runs: every window, with the sheets and dialogs
@@ -578,17 +686,15 @@ pub fn read_app_state_with_menus(
     // The whole read, not just each message, ends by the calling worker's
     // remaining work budget.
     let deadline = Instant::now() + crate::ax_budget::messaging_timeout(bounds.timeout);
-    // SAFETY: as in `Reader::read`: the timeout applies to this element's
-    // messages and changes nothing in the target.
-    unsafe {
-        AXUIElementSetMessagingTimeout(
-            application.as_ptr(),
-            crate::ax_budget::messaging_timeout(bounds.timeout).as_secs_f32(),
-        )
-    };
-
-    let mut tops = match copy_attribute(&application, "AXChildren") {
-        Ok(children) => elements_of(children),
+    let mut bound_reached = false;
+    let mut tops = match read_root_list(
+        &application,
+        "AXChildren",
+        bounds.max_elements,
+        deadline,
+        &mut bound_reached,
+    ) {
+        Ok(children) => children,
         Err(AX_ERROR_API_DISABLED) => return Err(AxAppStateError::NotPermitted),
         Err(code @ (AX_ERROR_INVALID_ELEMENT | AX_ERROR_CANNOT_COMPLETE)) => {
             if !process_exists(pid) {
@@ -598,13 +704,20 @@ pub fn read_app_state_with_menus(
         }
         Err(code) => return Err(AxAppStateError::Unreadable { ax_error: code }),
     };
-    for window in elements_of(copy_attribute(&application, "AXWindows").unwrap_or(None)) {
-        if !tops.iter().any(|top| top.same_element(&window)) {
-            tops.push(window);
-        }
-    }
-    let focused = copy_attribute(&application, "AXFocusedUIElement")
-        .ok()
+    // The reader's hashed visit set deduplicates roots and descendants together.
+    tops.extend(
+        read_root_list(
+            &application,
+            "AXWindows",
+            bounds.max_elements,
+            deadline,
+            &mut bound_reached,
+        )
+        .unwrap_or_default(),
+    );
+    let focused = set_timeout_until(&application, deadline)
+        .then(|| copy_attribute(&application, "AXFocusedUIElement"))
+        .and_then(Result::ok)
         .flatten()
         .filter(|value| is_ax_element(value))
         .map(AxRetainedElement);
@@ -620,20 +733,21 @@ pub fn read_app_state_with_menus(
         value_name: CFString::from_static_str("AXValue"),
         deadline,
         max_elements: bounds.max_elements,
+        child_slots_left: bounds.max_elements,
         max_depth: bounds.max_depth,
         visited: 0,
         unreadable: 0,
-        bound_reached: false,
+        bound_reached,
     };
     reader.first_visit(&application);
     let mut roots = Vec::new();
     for top in tops {
-        if !reader.first_visit(&top) {
-            continue;
-        }
-        if reader.visited >= reader.max_elements {
+        if reader.visited >= reader.max_elements || reader.remaining_seconds().is_none() {
             reader.bound_reached = true;
             break;
+        }
+        if !reader.first_visit(&top) {
+            continue;
         }
         reader.visited += 1;
         match reader.read(top, 0) {
@@ -697,6 +811,7 @@ pub fn read_element_state(
         value_name: CFString::from_static_str("AXValue"),
         deadline,
         max_elements: bounds.max_elements,
+        child_slots_left: bounds.max_elements,
         max_depth: bounds.max_depth,
         visited: 0,
         unreadable: 0,
@@ -731,4 +846,22 @@ pub fn read_element_state(
         unreadable_subtrees: reader.unreadable,
         bound_reached: reader.bound_reached,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_accessibility_array_requests_at_most_the_remaining_budget() {
+        const AVAILABLE: usize = 50_000;
+        let mut fetched = 0;
+        collect_element_list(3, |requested| {
+            fetched = AVAILABLE.min(requested);
+            Ok(None)
+        })
+        .unwrap();
+        assert_eq!(fetched, 3);
+        collect_element_list(0, |_| panic!("there is nothing left to fetch")).unwrap();
+    }
 }
