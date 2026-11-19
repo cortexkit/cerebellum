@@ -142,6 +142,14 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     // while the previous app is back in front and the JPEG is being encoded.
     after_fronting();
     let report = bracket.map_err(|_| ImageUnavailable::FrontingUnavailable)?;
+    #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+    crate::desk_probe::note_picture_bracket_probe(|probe| {
+        probe.bracket = Some(report.clone());
+        if let Some(gate) = hooks.cutoff() {
+            probe.cutoff = gate.reserve_start();
+            probe.deadline = gate.deadline();
+        }
+    });
     evidence.borrow_mut().fronting = Some(ImageFronting::from(&report));
     if let Some(hooks) = &plan.hooks {
         // The bracket ran the call's restore decision through the hooks, so
@@ -221,6 +229,16 @@ fn check_visibility(
 ) -> Result<(), ImageUnavailable> {
     let (repaints, visibility, decision) = freshness.inspect_decision(grant, window_id);
     evidence.borrow_mut().decision = Some(decision);
+    #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+    if !allow_covered_repainting {
+        crate::desk_probe::note_picture_bracket_probe(|probe| {
+            if window_id.is_some() {
+                probe.after_capture = Some(decision);
+            } else {
+                probe.before_capture = Some(decision);
+            }
+        });
+    }
     // Fronted reads never capture a still-covered window, even for a measured engine.
     image_freshness_decision(repaints && allow_covered_repainting, visibility)
 }

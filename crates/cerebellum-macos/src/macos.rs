@@ -860,6 +860,10 @@ pub fn enumerate_windows(timeout: Duration) -> Result<Vec<RawWindow>, String> {
         },
     );
 
+    #[cfg(feature = "desk-probe")]
+    let picture_attempt = crate::picture_probe_timing::enumeration_token();
+    #[cfg(feature = "desk-probe")]
+    crate::picture_probe_timing::stamp(picture_attempt, "picture_sck_enumeration_started");
     // SAFETY: the handler outlives the call through the block's own retain, and
     // the delivery it writes into is kept alive by this frame until the wait
     // below returns.
@@ -868,6 +872,8 @@ pub fn enumerate_windows(timeout: Duration) -> Result<Vec<RawWindow>, String> {
     let result = delivery
         .wait(timeout)
         .unwrap_or_else(|| Err(format!("the window list did not arrive within {timeout:?}")));
+    #[cfg(feature = "desk-probe")]
+    crate::picture_probe_timing::stamp(picture_attempt, "picture_sck_enumeration_returned");
     #[cfg(feature = "desk-probe")]
     if let Err(error) = &result {
         WINDOW_LIST_ERRORS_FOR_PROBE
@@ -1276,6 +1282,18 @@ pub fn capture_window_fenced(
     // module means the whole module dies rather than refusing one capture.
     establish_window_server_connection();
 
+    #[cfg(feature = "desk-probe")]
+    use crate::picture_probe_timing::{stamp, token};
+    #[cfg(feature = "desk-probe")]
+    let picture_attempt = token(window_id);
+    #[cfg(feature = "desk-probe")]
+    let window = {
+        stamp(picture_attempt, "picture_sck_lookup_started");
+        let window = find_window(window_id, timeout).map_err(CaptureError::Capture);
+        stamp(picture_attempt, "picture_sck_lookup_returned");
+        window?
+    };
+    #[cfg(not(feature = "desk-probe"))]
     let window = find_window(window_id, timeout).map_err(CaptureError::Capture)?;
     // SAFETY: the window is retained by this frame, so reading its properties
     // is valid for as long as it is held here.
@@ -1340,6 +1358,8 @@ pub fn capture_window_fenced(
     let completion_abandoned = Arc::clone(&abandoned);
     let completion_fence = Arc::clone(&may_acquire);
     let handler = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
+        #[cfg(feature = "desk-probe")]
+        stamp(picture_attempt, "picture_sck_completion_entered");
         let abandoned = completion_abandoned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1374,6 +1394,8 @@ pub fn capture_window_fenced(
              were requested"
         )));
     }
+    #[cfg(feature = "desk-probe")]
+    stamp(picture_attempt, "picture_sck_capture_started");
     // SAFETY: filter and configuration are owned by this frame and outlive the
     // call; the handler outlives it through the block's own retain.
     unsafe {
@@ -1390,6 +1412,8 @@ pub fn capture_window_fenced(
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         Err(format!("the capture did not arrive within {timeout:?}"))
     });
+    #[cfg(feature = "desk-probe")]
+    stamp(picture_attempt, "picture_sck_capture_returned");
 
     outcome.map_err(|reason| explain_capture_failure(reason, screen_is_locked()))
 }

@@ -74,6 +74,8 @@ const APPROVAL_FLAG: &str = "--approve-desk-probe";
 const HELPER_FLAG: &str = "--agent-cursor";
 /// Runs the baseline child: the same actions with the agent cursor off.
 const BASELINE_FLAG: &str = "--baseline";
+#[cfg(target_os = "macos")]
+const PICTURE_FLAG: &str = "--covered-picture";
 /// The line the baseline child reports its idle CPU time on.
 const BASELINE_LINE: &str = "BASELINE_MODULE_IDLE_CPU_NS=";
 /// The module binary that serves as the cursor helper, beside the
@@ -971,6 +973,14 @@ fn visible_previews(windows: &[ListedWindow], helper: i32) -> usize {
 }
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    if std::env::args().skip(1).any(|arg| arg == PICTURE_FLAG) {
+        let Some(data_home) = covered_picture_probe::open_log(approved(std::env::args().skip(1)))
+        else {
+            std::process::exit(2);
+        };
+        std::process::exit(desk_preflight(|| desk::run(false, Some(&data_home))));
+    }
     if !approved(std::env::args().skip(1)) {
         eprintln!(
             "REFUSED: this probe fronts a scratch application on the person's screen and \
@@ -985,6 +995,7 @@ fn main() {
             std::env::args()
                 .skip(1)
                 .any(|argument| argument == BASELINE_FLAG),
+            None,
         )
     }));
     #[cfg(not(target_os = "macos"))]
@@ -1003,6 +1014,10 @@ fn main() {
 mod allowing_cingulate;
 
 #[cfg(target_os = "macos")]
+#[path = "support/covered_picture_probe.rs"]
+mod covered_picture_probe;
+
+#[cfg(target_os = "macos")]
 mod desk {
     use super::*;
     use std::process::Command;
@@ -1018,10 +1033,10 @@ mod desk {
     use cerebellum::computer_grants::{
         AlwaysOpenRoute, ConsentContext, GrantCaller, QuestionCarrier,
     };
-    use cerebellum::management::{ManagementPlane, PlatformResolver};
+    use cerebellum::management::{ManagementPlane, PlatformResolver, TargetResolver};
     use cerebellum::{HealthState, JournalPersistence};
     use cerebellum_computer::platform::native::NativeCaptureBackend;
-    use cerebellum_computer::platform::{MacOs26PlatformDriver, TargetResolution};
+    use cerebellum_computer::platform::{MacOs26PlatformDriver, ProcessGrant, TargetResolution};
     use cerebellum_core::clock::SystemClock;
     use cerebellum_core::dispatch::{DispatchTimingState, InFlightGuard};
     use cerebellum_core::identity::SessionKind;
@@ -1071,16 +1086,19 @@ mod desk {
         directory: PathBuf,
         document: PathBuf,
         document_url: String,
+        picture_only: bool,
     }
 
     impl ScratchFiles {
-        fn create() -> Result<Self, String> {
+        fn create(picture_data: Option<&Path>) -> Result<Self, String> {
             use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
             let mut random = [0_u8; 16];
             getrandom::getrandom(&mut random).map_err(|error| error.to_string())?;
             let nonce: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-            let directory = Path::new("/tmp").join(format!("ck-desk-probe-{nonce}"));
+            let directory = picture_data
+                .unwrap_or(Path::new("/tmp"))
+                .join(format!("ck-desk-probe-{nonce}"));
             // Atomic creation refuses existing paths, including symlinks.
             std::fs::DirBuilder::new()
                 .mode(0o700)
@@ -1090,6 +1108,7 @@ mod desk {
                 directory,
                 document: PathBuf::new(),
                 document_url: String::new(),
+                picture_only: picture_data.is_some(),
             };
             // TextEdit reports the resolved path (/private/tmp on macOS).
             files.directory = files
@@ -1174,11 +1193,15 @@ mod desk {
         }
     }
 
-    fn left_running(pid: u32) {
-        eprintln!(
-            "LEFT RUNNING: pid {pid}, not provably the probe's; AX reads: {:?}",
-            sys::window_documents(pid)
-        );
+    fn left_running(pid: u32, picture_only: bool) {
+        if picture_only {
+            eprintln!("LEFT RUNNING: pid {pid}, not provably the probe's");
+        } else {
+            eprintln!(
+                "LEFT RUNNING: pid {pid}, not provably the probe's; AX reads: {:?}",
+                sys::window_documents(pid)
+            );
+        }
     }
 
     fn scratch_ownership(identity: &ScratchIdentity) -> Result<(), String> {
@@ -1207,10 +1230,14 @@ mod desk {
     fn kill(identity: &ScratchIdentity) -> bool {
         let process = identity.process;
         if let Err(evidence) = scratch_ownership(identity) {
-            eprintln!(
-                "LEFT RUNNING: pid {}, not provably the probe's; {evidence}",
-                process.pid
-            );
+            if identity.files.picture_only {
+                left_running(process.pid, true);
+            } else {
+                eprintln!(
+                    "LEFT RUNNING: pid {}, not provably the probe's; {evidence}",
+                    process.pid
+                );
+            }
             return false;
         }
         if !Command::new("/bin/kill")
@@ -1218,7 +1245,7 @@ mod desk {
             .status()
             .is_ok_and(|status| status.success())
         {
-            left_running(process.pid);
+            left_running(process.pid, identity.files.picture_only);
             return false;
         }
         // LaunchServices owns the child, so wait by identity rather than waitpid.
@@ -1235,7 +1262,7 @@ mod desk {
                 _ => std::thread::sleep(SAMPLE_EVERY),
             }
         }
-        left_running(process.pid);
+        left_running(process.pid, identity.files.picture_only);
         false
     }
 
@@ -1286,8 +1313,8 @@ mod desk {
             .collect())
     }
 
-    fn launch_scratch(before: &[u32]) -> Result<Scratch, String> {
-        let files = Arc::new(ScratchFiles::create()?);
+    fn launch_scratch(before: &[u32], picture_data: Option<&Path>) -> Result<Scratch, String> {
+        let files = Arc::new(ScratchFiles::create(picture_data)?);
         let status = scratch_launch_command(&files.document)
             .status()
             .map_err(|error| error.to_string())?;
@@ -1302,7 +1329,7 @@ mod desk {
                     let start_time = match cerebellum_macos::process_start_time(pid) {
                         cerebellum_macos::ProcessStartTime::Started(start) => start,
                         other => {
-                            left_running(pid);
+                            left_running(pid, picture_data.is_some());
                             return Err(format!("cannot identify scratch pid {pid}: {other:?}"));
                         }
                     };
@@ -1322,17 +1349,44 @@ mod desk {
                         }
                         std::thread::sleep(SAMPLE_EVERY);
                     }
-                    left_running(pid);
+                    left_running(pid, picture_data.is_some());
                     return Err("the new TextEdit did not open the scratch document".into());
                 }
                 Err(0) if Instant::now() < deadline => std::thread::sleep(SAMPLE_EVERY),
                 Err(count) => {
                     for pid in after.iter().filter(|pid| !before.contains(pid)) {
-                        left_running(*pid);
+                        left_running(*pid, picture_data.is_some());
                     }
                     return Err(format!("expected one new TextEdit pid, found {count}"));
                 }
             }
+        }
+    }
+
+    /// Even if TextEdit restarts between ownership proof and call admission,
+    /// the picture arm must never use a grant to that replacement process.
+    struct PictureTarget(PlatformResolver, ScratchProcess);
+
+    impl TargetResolver for PictureTarget {
+        fn resolve(&self, target: &str) -> TargetResolution {
+            match self.0.resolve(target) {
+                TargetResolution::Resolved(grant)
+                    if grant.bundle_identity == TEXTEDIT_BUNDLE
+                        && grant.pid == self.1.pid
+                        && grant.process_generation_evidence.parse() == Ok(self.1.start_time) =>
+                {
+                    TargetResolution::Resolved(grant)
+                }
+                _ => TargetResolution::NotRunning,
+            }
+        }
+
+        fn display_name(&self, grant: &ProcessGrant) -> Option<String> {
+            self.0.display_name(grant)
+        }
+
+        fn app_code(&self, grant: &ProcessGrant) -> Arc<dyn cerebellum::computer_grants::AppCode> {
+            self.0.app_code(grant)
         }
     }
 
@@ -2198,7 +2252,8 @@ mod desk {
         }
     }
 
-    pub fn run(baseline: bool) -> i32 {
+    pub fn run(baseline: bool, picture_data: Option<&Path>) -> i32 {
+        let picture_only = picture_data.is_some();
         // Both runs start the same way: AppKit first, then the capture warm-up,
         // with no ScreenCaptureKit use before AppKit. The baseline used to read
         // the window list before AppKit started, and only the baseline failed
@@ -2208,12 +2263,13 @@ mod desk {
         // session should report every check rather than stop at the first.
         let exclusion_failed = match desk_startup(
             cerebellum_macos::prepare_app_use_desk_probe,
-            || match cerebellum_macos::probe_overlay_capture_exclusion() {
-                Ok(report) => {
+            || match (!picture_only).then(cerebellum_macos::probe_overlay_capture_exclusion) {
+                None => false,
+                Some(Ok(report)) => {
                     println!("PASS overlay_single_window_capture_excludes_preview_and_badge_patterns: {report}");
                     false
                 }
-                Err(reason) => {
+                Some(Err(reason)) => {
                     eprintln!("FAIL overlay_single_window_capture_excludes_preview_and_badge_patterns: {reason}");
                     true
                 }
@@ -2244,23 +2300,25 @@ mod desk {
                 }
             }
         }
-        println!("{}", window_list_check("main_thread_after_appkit_startup"));
-        println!(
-            "TIME BUDGET: allow about {} s (launch {} s, covering the window up to {} s, \
+        if !picture_only {
+            println!("{}", window_list_check("main_thread_after_appkit_startup"));
+            println!(
+                "TIME BUDGET: allow about {} s (launch {} s, covering the window up to {} s, \
              {} needs-front attempts per run with {} ms cleanup spacing, \
              two idle windows of {} s, teardown)",
-            (2 * (LAUNCH_WAIT
-                + COVER_WAIT
-                + IDLE_WINDOW
-                + FRONT_CLEANUP_SPACING * NEEDS_FRONT_ATTEMPTS as u32)
-                + Duration::from_secs(30))
-            .as_secs(),
-            LAUNCH_WAIT.as_secs(),
-            COVER_WAIT.as_secs(),
-            NEEDS_FRONT_ATTEMPTS,
-            FRONT_CLEANUP_SPACING.as_millis(),
-            IDLE_WINDOW.as_secs()
-        );
+                (2 * (LAUNCH_WAIT
+                    + COVER_WAIT
+                    + IDLE_WINDOW
+                    + FRONT_CLEANUP_SPACING * NEEDS_FRONT_ATTEMPTS as u32)
+                    + Duration::from_secs(30))
+                .as_secs(),
+                LAUNCH_WAIT.as_secs(),
+                COVER_WAIT.as_secs(),
+                NEEDS_FRONT_ATTEMPTS,
+                FRONT_CLEANUP_SPACING.as_millis(),
+                IDLE_WINDOW.as_secs()
+            );
+        }
         if cerebellum_macos::screen_is_locked() != Some(false) {
             eprintln!("UNMEASURABLE: the screen is locked or its state is unknown");
             return 2;
@@ -2274,7 +2332,8 @@ mod desk {
             return 2;
         };
         let helper = helper_binary(&executable).filter(|helper| helper.is_file());
-        if !baseline && helper.is_none() {
+        let cursor_enabled = !baseline && !picture_only;
+        if cursor_enabled && helper.is_none() {
             eprintln!(
                 "UNMEASURABLE: no {HELPER_BINARY} beside this example's build directory; build it \
                  first with: cargo build -p cerebellum --bin {HELPER_BINARY} --example \
@@ -2282,7 +2341,7 @@ mod desk {
             );
             return 2;
         }
-        let _helper_pin = if let Some(helper) = helper.filter(|_| !baseline) {
+        let _helper_pin = if let Some(helper) = helper.filter(|_| cursor_enabled) {
             match cerebellum::computer_capability::cursor::pin_helper_for_probe(&helper) {
                 Ok(pin) => Some(pin),
                 Err(error) => {
@@ -2321,7 +2380,7 @@ mod desk {
                 return 2;
             }
         };
-        let mut scratch = match launch_scratch(&before) {
+        let mut scratch = match launch_scratch(&before, picture_data) {
             Ok(scratch) => scratch,
             Err(error) => {
                 eprintln!("UNMEASURABLE: cannot launch scratch TextEdit: {error}");
@@ -2346,13 +2405,18 @@ mod desk {
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             cerebellum_macos::with_app_use_desk_probe_run_loop(|| {
-                for repeat in 1..=WINDOW_LIST_CHECK_REPEATS {
-                    println!(
-                        "{}",
-                        window_list_check(&repeated_stage("std_thread_while_main_pumps", repeat))
-                    );
+                if !picture_only {
+                    for repeat in 1..=WINDOW_LIST_CHECK_REPEATS {
+                        println!(
+                            "{}",
+                            window_list_check(&repeated_stage(
+                                "std_thread_while_main_pumps",
+                                repeat
+                            ))
+                        );
+                    }
                 }
-                runtime.block_on(measure(&scratch, person, baseline))
+                runtime.block_on(measure(&scratch, person, baseline, picture_only))
             })
         }));
         let cleaned_up = scratch.finish();
@@ -2374,7 +2438,7 @@ mod desk {
                 1
             }
         };
-        if baseline || code == 2 {
+        if baseline || picture_only || code == 2 {
             return code;
         }
         // The baseline needs TextEdit to itself, so it runs after the
@@ -2459,9 +2523,101 @@ mod desk {
         idle_ns.ok_or_else(|| format!("no {BASELINE_LINE} line"))
     }
 
+    async fn measure_pictures<F: std::future::Future<Output = Value>>(
+        scratch: &Scratch,
+        person: i32,
+        serve: impl Fn() -> F,
+    ) -> i32 {
+        use cerebellum::desk_probe::{
+            begin_picture_bracket_probe, take_fronting_timings, take_picture_bracket_probe,
+        };
+        use cerebellum_macos::{begin_picture_timing_for_probe, take_picture_timing_for_probe};
+
+        for attempt in 1..=4 {
+            if scratch_ownership(&scratch.identity).is_err()
+                || cerebellum_macos::frontmost_process_id() != Some(person)
+            {
+                eprintln!("UNMEASURABLE: ownership or foreground application changed");
+                return 2;
+            }
+            let Some(window) = cerebellum_macos::frontmost_window_id(scratch.pid()) else {
+                eprintln!("UNMEASURABLE: no scratch window on screen");
+                return 2;
+            };
+            if cerebellum_macos::window_visibility(scratch.pid(), window)
+                != cerebellum_macos::WindowVisibility::Covered
+            {
+                eprintln!("UNMEASURABLE: scratch window is no longer covered");
+                return 2;
+            }
+            let _ = take_fronting_timings();
+            begin_picture_timing_for_probe(window);
+            begin_picture_bracket_probe();
+            let reply = serve().await;
+            let bracket = take_picture_bracket_probe().unwrap_or_default();
+            tokio::time::sleep(FRONT_CLEANUP_SPACING).await;
+            let stamps = take_picture_timing_for_probe();
+            let timings = take_fronting_timings();
+            let timing = timings
+                .iter()
+                .find(|timing| timing.target_pid == scratch.pid());
+            let start = timing.and_then(|timing| timing.front_requested_at);
+            let offset = |at: Instant| {
+                start.map(|start| {
+                    if let Some(elapsed) = at.checked_duration_since(start) {
+                        elapsed.as_secs_f64() * 1000.0
+                    } else {
+                        -start.duration_since(at).as_secs_f64() * 1000.0
+                    }
+                })
+            };
+            let restore_request = timing.and_then(|timing| timing.first_restore_request());
+            println!(
+                "{}",
+                json!({
+                    "picture_attempt": attempt,
+                    "bound_ms": cerebellum::budgets::FRONTING_BRACKET_MS,
+                    "outcome": reply["outcome"],
+                    "image_returned": reply.get("image").is_some(),
+                    "image_unavailable": reply["image_unavailable"]["reason"],
+                    "image_fronting": reply["image_fronting"],
+                "fronting_not_fronted_reason": reply["fronting"]["not_fronted_reason"],
+                    "bracket_stop": bracket.bracket.as_ref().and_then(|b| b.stop.as_ref().map(|s| format!("{s:?}"))),
+                    "waiting_out_slow_restore": bracket.bracket.as_ref().map(|b| b.waiting_out_slow_restore),
+                    "restore_calibrated": bracket.bracket.as_ref().map(|b| b.restore_calibrated),
+                    "restore_started_by_cutoff": bracket.bracket.as_ref().map(|b| b.restore_started_by_cutoff),
+                    "slowest_restore_ms": bracket.bracket.as_ref().map(|b| b.slowest_restore_ms),
+                    "before_capture": bracket.before_capture,
+                    "after_capture": bracket.after_capture,
+                    "front_confirmed_ms": timing.and_then(|t| t.confirmed_front_ms),
+                    "front_late_landing_ms": timing.and_then(|t| t.late_landing_ms),
+                    "restore_requested_ms": restore_request.map(|(ms, _, _)| ms),
+                    "restore_route": restore_request.map(|(_, route, _)| route),
+                    "first_restore_request_confirmed": restore_request.map(|(_, _, confirmed)| confirmed),
+                    "restore_confirmed_ms": timing.and_then(|t| t.restore_confirmed_ms),
+                    "pixel_cutoff_ms": bracket.cutoff.and_then(offset),
+                    "restore_request_deadline_ms": bracket.deadline.and_then(offset),
+                    "sck_phases": stamps.iter().map(|(phase, at)| json!({"phase": phase, "at_ms": offset(*at)})).collect::<Vec<_>>(),
+                })
+            );
+            if reply.get("image_fronting").is_none()
+                || cerebellum_macos::frontmost_process_id() != Some(person)
+            {
+                // No second attempt while a preceding call may still be
+                // cleaning up, or if the person's app was not put back.
+                break;
+            }
+        }
+        0
+    }
+
     /// Every phase against the scratch app. Returns the process exit code.
-    async fn measure(scratch: &Scratch, person: i32, baseline: bool) -> i32 {
-        for repeat in 1..=WINDOW_LIST_CHECK_REPEATS {
+    async fn measure(scratch: &Scratch, person: i32, baseline: bool, picture_only: bool) -> i32 {
+        for repeat in 1..=if picture_only {
+            0
+        } else {
+            WINDOW_LIST_CHECK_REPEATS
+        } {
             let stage = repeated_stage("tokio_worker_at_measure_start", repeat);
             // Each repeat is its own task, so repeats may land on different
             // workers.
@@ -2500,10 +2656,18 @@ mod desk {
         // `agent_cursor: true` for the measured run, `false` for the
         // baseline; a plane's cursor starts disabled.
         let cursor = plane.cursor();
-        if !baseline {
+        if !baseline && !picture_only {
             cursor.enable(true);
         }
-        let management = Arc::new(ManagementPlane::new(Arc::new(PlatformResolver::new())));
+        let resolver: Arc<dyn TargetResolver> = if picture_only {
+            Arc::new(PictureTarget(
+                PlatformResolver::new(),
+                scratch.identity.process,
+            ))
+        } else {
+            Arc::new(PlatformResolver::new())
+        };
+        let management = Arc::new(ManagementPlane::new(resolver));
         let clock = Arc::new(SystemClock::new());
         // A temporary front must hand its restore to a terminal arbiter. The
         // direct plane call alone has no owner for that obligation and refuses.
@@ -2544,6 +2708,12 @@ mod desk {
         let _ = cerebellum_macos::take_window_list_errors_for_probe();
         let started = Instant::now();
         let read = loop {
+            if picture_only && scratch_ownership(&scratch.identity).is_err() {
+                eprintln!(
+                    "UNMEASURABLE: the scratch document is no longer the only TextEdit window"
+                );
+                return 2;
+            }
             let read = serve("computer.read_state", json!({"target": TEXTEDIT_BUNDLE})).await;
             for error in cerebellum_macos::take_window_list_errors_for_probe() {
                 eprintln!("RECORD probe-only ScreenCaptureKit window-list error: {error}");
@@ -2552,6 +2722,10 @@ mod desk {
                 break read;
             }
             if started.elapsed() > LAUNCH_WAIT {
+                if picture_only {
+                    eprintln!("UNMEASURABLE: the scratch window never answered a read");
+                    return 2;
+                }
                 eprintln!(
                     "UNMEASURABLE: the scratch window never answered a read: {}",
                     read
@@ -2562,6 +2736,10 @@ mod desk {
         };
         // A freshly launched app may have taken the front; give it back.
         if cerebellum_macos::frontmost_process_id() != Some(person) {
+            if picture_only {
+                eprintln!("UNMEASURABLE: the original foreground application is not in front");
+                return 2;
+            }
             let _ = cerebellum_macos::request_frontmost(person as u32);
         }
         if !baseline {
@@ -2595,6 +2773,15 @@ mod desk {
         // Moving a window is the person's input; the fronting idle gate
         // wants a quiet second before it fronts anything.
         tokio::time::sleep(Duration::from_secs(2)).await;
+        if picture_only {
+            return measure_pictures(scratch, person, || {
+                serve(
+                    "computer.read_state",
+                    json!({"target": TEXTEDIT_BUNDLE, "include_image": true, "bring_to_front": true}),
+                )
+            })
+            .await;
+        }
         let mut report = Report { failed: false };
 
         // Active phase, in background mode.
