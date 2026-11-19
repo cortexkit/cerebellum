@@ -1,7 +1,7 @@
 use super::*;
 use crate::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 
 #[allow(dead_code)]
 mod computer_support {
@@ -10,54 +10,6 @@ mod computer_support {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/it/support/computer.rs"
     ));
-}
-
-struct DisplayDouble {
-    modules: Vec<String>,
-    writes: Mutex<Vec<DisplayWrite>>,
-    wrote: Notify,
-    stall: bool,
-    fail: bool,
-}
-
-impl DisplayDouble {
-    fn new(modules: &[&str]) -> Arc<Self> {
-        Arc::new(Self {
-            modules: modules.iter().map(|s| (*s).into()).collect(),
-            writes: Mutex::new(vec![]),
-            wrote: Notify::new(),
-            stall: false,
-            fail: false,
-        })
-    }
-    async fn count(&self, expected: usize) {
-        tokio::time::timeout(crate::test_support::HANG_GUARD, async {
-            loop {
-                let notified = self.wrote.notified();
-                if self.writes.lock().unwrap().len() >= expected {
-                    break;
-                }
-                notified.await;
-            }
-        })
-        .await
-        .expect("display received writes");
-    }
-}
-impl Backend for DisplayDouble {
-    fn declarers(&self) -> Future<'_, Option<Vec<String>>> {
-        Box::pin(async { Some(self.modules.clone()) })
-    }
-    fn write<'a>(&'a self, _module: &'a str, write: DisplayWrite) -> Future<'a, bool> {
-        Box::pin(async move {
-            self.writes.lock().unwrap().push(write);
-            self.wrote.notify_one();
-            if self.stall {
-                std::future::pending::<()>().await;
-            }
-            !self.fail
-        })
-    }
 }
 
 struct CatalogDouble {
@@ -89,10 +41,6 @@ impl Backend for CatalogDouble {
             }
             self.answer.lock().unwrap().clone()
         })
-    }
-
-    fn write<'a>(&'a self, _module: &'a str, _write: DisplayWrite) -> Future<'a, bool> {
-        Box::pin(async { false })
     }
 }
 
@@ -349,19 +297,16 @@ async fn deliver(planes: &Planes, body: Value) {
 #[tokio::test]
 async fn relayed_record_uses_origin_and_is_written_once_after_flush() {
     let planes = planes();
-    let display = DisplayDouble::new(&["arbitrary-display-name"]);
-    planes.routes.display.connect(display.clone());
     let facts = install(&planes);
     let mut call = request();
     call["schema_pin"] = json!("provider-local-pin");
     let req = frame(call);
     planes.routes.display.arm(&req, &facts).unwrap();
-    assert!(display.writes.lock().unwrap().is_empty());
+    assert!(planes.routes.display.recorded().is_empty());
     deliver(&planes, json!({"outcome":"ok"})).await;
-    display.count(1).await;
     assert!(planes.routes.display.arm(&req, &facts).is_none());
     deliver(&planes, json!({"outcome":"ok"})).await;
-    let writes = display.writes.lock().unwrap();
+    let writes = planes.routes.display.recorded();
     assert_eq!(writes.len(), 1);
     assert_eq!(
         writes[0].runner,
@@ -378,7 +323,7 @@ async fn relayed_record_uses_origin_and_is_written_once_after_flush() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn bus_notice_waits_for_flush_and_failure_leaves_reply_and_direct_display_untouched() {
+async fn bus_notice_waits_for_flush_and_failure_leaves_reply_and_stored_record_untouched() {
     use std::{
         pin::Pin,
         sync::atomic::{AtomicBool, Ordering::Relaxed},
@@ -419,8 +364,6 @@ async fn bus_notice_waits_for_flush_and_failure_leaves_reply_and_direct_display_
     for tool in ["browser_use", "computer_use"] {
         for stall in [false, true] {
             let planes = planes();
-            let display = DisplayDouble::new(&["display"]);
-            planes.routes.display.connect(display.clone());
             let fake = Arc::new(crate::event_publish::tests::Fake::default());
             fake.fail_publish.store(true, Relaxed);
             fake.hang_publish.store(stall, Relaxed);
@@ -450,7 +393,7 @@ async fn bus_notice_waits_for_flush_and_failure_leaves_reply_and_direct_display_
                 fake.writes.lock().unwrap().is_empty(),
                 "bus publish before reply flush"
             );
-            assert!(display.writes.lock().unwrap().is_empty());
+            assert!(planes.routes.display.recorded().is_empty());
             gate.released.store(true, Relaxed);
             gate.waker.lock().unwrap().take().unwrap().wake();
             let at_flush = tokio::time::Instant::now();
@@ -460,7 +403,6 @@ async fn bus_notice_waits_for_flush_and_failure_leaves_reply_and_direct_display_
                 Duration::ZERO,
                 "bus must not hold egress"
             );
-            display.count(1).await;
             crate::event_publish::tests::settle().await;
             let bytes = gate.bytes.lock().unwrap().clone();
             let emitted = subc_transport::read_frame(&mut bytes.as_slice())
@@ -472,9 +414,9 @@ async fn bus_notice_waits_for_flush_and_failure_leaves_reply_and_direct_display_
                 body
             );
             {
-                let direct = display.writes.lock().unwrap().clone();
+                let stored = planes.routes.display.recorded().clone();
                 let bus = fake.writes.lock().unwrap().clone();
-                assert_eq!(direct.len(), 1);
+                assert_eq!(stored.len(), 1);
                 assert_eq!(bus.len(), 1);
                 assert_eq!(
                     serde_json::from_slice::<Value>(&bus[0].bytes).unwrap(),
@@ -488,19 +430,19 @@ async fn bus_notice_waits_for_flush_and_failure_leaves_reply_and_direct_display_
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(retained, serde_json::to_vec(&direct[0]).unwrap());
+                assert_eq!(retained, serde_json::to_vec(&stored[0]).unwrap());
                 assert!(!String::from_utf8_lossy(&retained).contains("planted-screen-text"));
                 assert!(!String::from_utf8_lossy(&bus[0].bytes).contains("planted-screen-text"));
             }
             tokio::time::advance(Duration::from_secs(4)).await;
             crate::event_publish::tests::settle().await;
-            assert_eq!(display.writes.lock().unwrap().len(), 1);
+            assert_eq!(planes.routes.display.recorded().len(), 1);
         }
     }
 }
 
 #[tokio::test]
-async fn display_disk_write_failure_drops_wake_but_preserves_reply_and_direct_write() {
+async fn display_disk_write_failure_drops_the_record_and_wake_but_preserves_reply() {
     let scratch = cortexkit_test_support::ScratchDir::new("display-write-failure");
     let path = scratch.path().join("display-records");
     let gauges = Arc::new(crate::event_publish::Gauges::default());
@@ -513,8 +455,6 @@ async fn display_disk_write_failure_drops_wake_but_preserves_reply_and_direct_wr
     let bus = Arc::new(crate::event_publish::tests::Fake::default());
     events.connect(Arc::new(bus.clone()));
     let records = Arc::new(Records::with_events(events.clone()));
-    let display = DisplayDouble::new(&["display"]);
-    records.connect(display.clone());
     let deadlines = Arc::new(crate::egress::ConnectionDeadlines::default());
     deadlines.install_display(records.clone());
     records.arm(&frame(request()), &install(&planes())).unwrap();
@@ -537,7 +477,7 @@ async fn display_disk_write_failure_drops_wake_but_preserves_reply_and_direct_wr
         serde_json::from_slice::<Value>(&emitted.body).unwrap(),
         body
     );
-    display.count(1).await;
+    assert_eq!(records.recorded().len(), 1);
     // Reads share the worker queue, so this resolves after the failed write.
     assert!(events
         .display_read(&"0".repeat(64))
@@ -570,25 +510,32 @@ async fn no_identity_and_codemode_without_origin_or_pin_do_not_write() {
 #[tokio::test]
 async fn direct_identity_is_the_attested_principal_and_own_pin() {
     let planes = planes();
-    let display = DisplayDouble::new(&["display"]);
-    planes.routes.display.connect(display.clone());
     let facts = install(&planes);
     let mut req = request();
     req.as_object_mut().unwrap().remove("origin");
     planes.routes.display.arm(&frame(req), &facts).unwrap();
     deliver(&planes, json!({"outcome":"ok"})).await;
-    display.count(1).await;
-    let writes = display.writes.lock().unwrap();
+    let writes = planes.routes.display.recorded();
     assert_eq!(Some(&writes[0].runner), facts.principal.as_ref());
     assert_eq!(writes[0].call_key, "pf:local");
 }
 
+/// The display module pulls each record with `display.read` after its bus
+/// announcement, so a finished call must never consult the display module's
+/// catalog entry or send it the record. Whatever the catalog says, the record
+/// is stored and announced.
 #[tokio::test]
-async fn missing_or_ambiguous_display_drops_writes_without_changing_reply() {
-    for modules in [vec![], vec!["one", "two"]] {
+async fn a_finished_call_makes_no_outbound_display_write() {
+    assert!(
+        !include_str!("transport.rs").contains("display.write"),
+        "the daemon transport must not carry a display.write call"
+    );
+    for modules in [vec!["occipital"], vec![], vec!["one", "two"]] {
         let planes = planes();
-        let display = DisplayDouble::new(&modules);
-        planes.routes.display.connect(display.clone());
+        let catalog = CatalogDouble::new(&modules);
+        planes.routes.display.connect(catalog.clone());
+        let bus = Arc::new(crate::event_publish::tests::Fake::default());
+        planes.routes.display.events.connect(Arc::new(bus.clone()));
         let facts = install(&planes);
         planes
             .routes
@@ -596,36 +543,25 @@ async fn missing_or_ambiguous_display_drops_writes_without_changing_reply() {
             .arm(&frame(request()), &facts)
             .unwrap();
         deliver(&planes, json!({"outcome":"ok"})).await;
-        tokio::task::yield_now().await;
-        assert!(display.writes.lock().unwrap().is_empty());
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn slow_or_failed_display_never_holds_the_reply() {
-    for stall in [false, true] {
-        let planes = planes();
-        let display = Arc::new(DisplayDouble {
-            modules: vec!["display".into()],
-            writes: Mutex::new(vec![]),
-            wrote: Notify::new(),
-            stall,
-            fail: true,
-        });
-        planes.routes.display.connect(display.clone());
-        let facts = install(&planes);
-        planes
+        crate::event_publish::tests::settle().await;
+        assert_eq!(
+            catalog.reads.load(Ordering::SeqCst),
+            0,
+            "{modules:?}: a finished call reached for the display module"
+        );
+        let published = bus.writes.lock().unwrap().clone();
+        assert_eq!(published.len(), 1, "{modules:?}");
+        let stored = planes
             .routes
             .display
-            .arm(&frame(request()), &facts)
-            .unwrap();
-        let now = tokio::time::Instant::now();
-        deliver(&planes, json!({"outcome":"ok"})).await;
-        assert_eq!(now.elapsed(), Duration::ZERO);
-        tokio::task::yield_now().await;
-        assert_eq!(display.writes.lock().unwrap().len(), 1);
-        tokio::time::advance(WRITE_WINDOW + Duration::from_secs(1)).await;
-        assert_eq!(display.writes.lock().unwrap().len(), 1);
+            .events
+            .display_read(&published[0].id)
+            .await
+            .unwrap()
+            .expect("the announced record is readable");
+        let stored: DisplayWrite = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(stored.kind, DisplayKind::Record);
+        assert_eq!(stored.call_key, "runner:call");
     }
 }
 
@@ -634,8 +570,6 @@ async fn held_consent_decline_completes_once_even_if_settlement_races_flush() {
     use crate::journal::call_records::{Begin, ConsentEnding, ScopeIdentity};
     for settle_first in [false, true] {
         let planes = planes();
-        let display = DisplayDouble::new(&["display"]);
-        planes.routes.display.connect(display.clone());
         let facts = install(&planes);
         planes
             .routes
@@ -677,8 +611,7 @@ async fn held_consent_decline_completes_once_even_if_settlement_races_flush() {
             .calls
             .finish_consent("ask", ConsentEnding::Approved, 4)
             .unwrap();
-        display.count(2).await;
-        let writes = display.writes.lock().unwrap();
+        let writes = planes.routes.display.recorded();
         assert_eq!(writes.len(), 2);
         let record = writes
             .iter()
@@ -701,8 +634,6 @@ async fn held_consent_decline_completes_once_even_if_settlement_races_flush() {
 #[tokio::test(start_paused = true)]
 async fn durations_exclude_queue_and_person_waits() {
     let planes = planes();
-    let display = DisplayDouble::new(&["display"]);
-    planes.routes.display.connect(display.clone());
     let facts = install(&planes);
     let timing = planes.routes.display.arm(&frame(request()), &facts);
     tokio::time::advance(Duration::from_millis(50)).await;
@@ -722,7 +653,7 @@ async fn durations_exclude_queue_and_person_waits() {
         })
         .await;
     tokio::task::yield_now().await;
-    let writes = display.writes.lock().unwrap();
+    let writes = planes.routes.display.recorded();
     assert_eq!(writes[0].body["durationMs"], 20);
     assert_eq!(writes[0].body["heldMs"], 100);
     assert_eq!(writes[0].body["queuedMs"], 80);
@@ -749,16 +680,13 @@ async fn planted_fixture_scanner_catches_secrets_then_excludes_them_from_records
         );
     }
     let planes = planes();
-    let display = DisplayDouble::new(&["display"]);
-    planes.routes.display.connect(display.clone());
     let facts = install(&planes);
     let mut req = request();
     req["arguments"] = input;
     planes.routes.display.arm(&frame(req), &facts).unwrap();
     deliver(&planes, json!({"outcome":"ok","state_text":planted[1],"element_label":planted[2],"posts_returned":3,
         "url":"https://example.com/private/path?query=ck-planted-cookie#fragment","image":{"data":planted[4]}})).await;
-    display.count(1).await;
-    let writes = display.writes.lock().unwrap();
+    let writes = planes.routes.display.recorded();
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].body["site"], "https://example.com");
     assert_eq!(writes[0].body["postsReturned"], 3);
@@ -775,8 +703,6 @@ async fn planted_fixture_scanner_catches_secrets_then_excludes_them_from_records
 #[tokio::test]
 async fn real_relayed_status_call_flushes_its_reply_before_display_work() {
     let planes = planes();
-    let display = DisplayDouble::new(&["not-a-hardcoded-server-name"]);
-    planes.routes.display.connect(display.clone());
     install(&planes);
     let (writer, receiver) = mpsc::channel(32);
     let (sink, mut client) = tokio::io::duplex(64 * 1024);
@@ -801,8 +727,7 @@ async fn real_relayed_status_call_flushes_its_reply_before_display_work() {
     assert_eq!(response.header.ty, FrameType::Response);
     let body: Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(body["outcome"], "no_session", "{body}");
-    display.count(1).await;
-    let writes = display.writes.lock().unwrap();
+    let writes = planes.routes.display.recorded();
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0].call_key, "runner:call");
     drop(writes);
@@ -1034,7 +959,7 @@ async fn declarer_cache_concurrent_refresh_shares_success_failure_and_timeout() 
         .await;
         assert_eq!(catalog.reads.load(Ordering::SeqCst), 2, "{outcome}");
         if outcome == "timeout" {
-            tokio::time::advance(WRITE_WINDOW).await;
+            tokio::time::advance(CATALOG_WINDOW).await;
         } else {
             catalog.release.add_permits(100);
         }
@@ -1081,8 +1006,10 @@ async fn declarer_cache_waiter_retries_when_refresh_owner_is_cancelled() {
 #[tokio::test]
 async fn a_display_scope_carrier_cannot_call_any_operation() {
     let planes = planes();
-    let display = DisplayDouble::new(&["prefrontal"]);
-    planes.routes.display.connect(display);
+    planes
+        .routes
+        .display
+        .connect(CatalogDouble::new(&["prefrontal"]));
     let principal = Principal::Reserved {
         module_id: "prefrontal".into(),
     };
@@ -1137,7 +1064,7 @@ async fn only_the_single_attested_display_can_read_catalog_and_views() {
     ] {
         for caller in ["display-vendor", "occipital", "unrelated"] {
             let planes = planes();
-            planes.routes.display.connect(DisplayDouble::new(&modules));
+            planes.routes.display.connect(CatalogDouble::new(&modules));
             let bind = bind_scope_carrier(
                 &planes,
                 Principal::Reserved {
@@ -1216,7 +1143,7 @@ async fn only_the_single_attested_display_can_read_catalog_and_views() {
     planes
         .routes
         .display
-        .connect(DisplayDouble::new(&["display-vendor"]));
+        .connect(CatalogDouble::new(&["display-vendor"]));
     let reserved = Principal::Reserved {
         module_id: "display-vendor".into(),
     };
@@ -1267,8 +1194,6 @@ async fn consent_endings_do_not_turn_approval_into_a_failure() {
                 (ConsentEnding::Withdrawn, Some("consent_withdrawn")),
             ] {
                 let planes = planes();
-                let display = DisplayDouble::new(&["display"]);
-                planes.routes.display.connect(display.clone());
                 let facts = install(&planes);
                 planes
                     .routes
@@ -1303,9 +1228,8 @@ async fn consent_endings_do_not_turn_approval_into_a_failure() {
                 if !settle_first {
                     planes.calls.finish_consent("ask", ending, 3).unwrap();
                 }
-                display.count(if reason.is_some() { 2 } else { 1 }).await;
                 tokio::task::yield_now().await;
-                let writes = display.writes.lock().unwrap();
+                let writes = planes.routes.display.recorded();
                 assert_eq!(
                     writes.len(),
                     if reason.is_some() { 2 } else { 1 },
@@ -1334,8 +1258,6 @@ async fn consent_endings_do_not_turn_approval_into_a_failure() {
 #[tokio::test]
 async fn legacy_login_handoff_has_one_completion_without_changing_durable_state() {
     let planes = planes();
-    let display = DisplayDouble::new(&["display"]);
-    planes.routes.display.connect(display.clone());
     let facts = install(&planes);
     let timing = planes.routes.display.arm(&frame(request()), &facts);
     let settle = ACTIVE
@@ -1344,8 +1266,7 @@ async fn legacy_login_handoff_has_one_completion_without_changing_durable_state(
     deliver(&planes, json!({"outcome":"presented"})).await;
     assert!(settle(journal::call_records::HandoffEnding::LoginObserved));
     assert!(settle(journal::call_records::HandoffEnding::ClosedByCaller));
-    display.count(2).await;
-    let writes = display.writes.lock().unwrap();
+    let writes = planes.routes.display.recorded();
     assert_eq!(writes.len(), 2);
     let record = writes
         .iter()
@@ -1361,12 +1282,10 @@ async fn legacy_login_handoff_has_one_completion_without_changing_durable_state(
 }
 
 #[tokio::test]
-async fn failed_reply_flush_never_starts_a_display_write() {
+async fn failed_reply_flush_never_stores_a_display_record() {
     let planes = planes();
     let bus = Arc::new(crate::event_publish::tests::Fake::default());
     planes.routes.display.events.connect(Arc::new(bus.clone()));
-    let display = DisplayDouble::new(&["display"]);
-    planes.routes.display.connect(display.clone());
     let facts = install(&planes);
     planes
         .routes
@@ -1386,7 +1305,7 @@ async fn failed_reply_flush_never_starts_a_display_write() {
             .is_err()
     );
     tokio::task::yield_now().await;
-    assert!(display.writes.lock().unwrap().is_empty());
+    assert!(planes.routes.display.recorded().is_empty());
     assert!(bus.writes.lock().unwrap().is_empty());
 }
 
@@ -1401,16 +1320,13 @@ async fn computer_record_uses_resolved_app_id_and_never_the_human_target_or_text
     let input = serde_json::to_vec(&request).unwrap();
     assert!(scan(&input), "positive scanner control");
     let planes = planes();
-    let display = DisplayDouble::new(&["display"]);
-    planes.routes.display.connect(display.clone());
     let facts = install(&planes);
     let timing = planes.routes.display.arm(&frame(request), &facts);
     ACTIVE.scope(timing, async {
         app("com.example.Editor");
         deliver(&planes, json!({"outcome":"completed","label":SECRET,"value":SECRET,"state_text":SECRET,"posts_returned":2})).await;
     }).await;
-    display.count(1).await;
-    let writes = display.writes.lock().unwrap();
+    let writes = planes.routes.display.recorded();
     assert_eq!(writes[0].body["app"], "com.example.Editor");
     assert_eq!(writes[0].body["postsReturned"], 2);
     assert_eq!(writes[0].body["plane"], "computer");
@@ -1420,10 +1336,8 @@ async fn computer_record_uses_resolved_app_id_and_never_the_human_target_or_text
 }
 
 #[tokio::test]
-async fn an_empty_array_drops_the_whole_record_or_completion_before_writing() {
+async fn an_empty_array_drops_the_whole_record_or_completion_before_storing() {
     let records = Arc::new(Records::default());
-    let display = DisplayDouble::new(&["display"]);
-    records.connect(display.clone());
     for kind in [DisplayKind::Record, DisplayKind::Completion] {
         let body = json!({"durationMs":1,"outcome":"success","plane":"computer","app":[]})
             .as_object()
@@ -1433,7 +1347,7 @@ async fn an_empty_array_drops_the_whole_record_or_completion_before_writing() {
             cortexkit_role_tool_display::schema::validate_record(&body, &schema()).is_err(),
             "positive empty-array control"
         );
-        records.spawn(DisplayWrite::new(
+        records.record(DisplayWrite::new(
             Principal::Direct,
             "empty",
             kind,
@@ -1441,9 +1355,8 @@ async fn an_empty_array_drops_the_whole_record_or_completion_before_writing() {
             body,
         ));
     }
-    tokio::task::yield_now().await;
-    assert!(display.writes.lock().unwrap().is_empty());
-    records.spawn(DisplayWrite::new(
+    assert!(records.recorded().is_empty());
+    records.record(DisplayWrite::new(
         Principal::Direct,
         "scalar",
         DisplayKind::Record,
@@ -1453,8 +1366,7 @@ async fn an_empty_array_drops_the_whole_record_or_completion_before_writing() {
             .unwrap()
             .clone(),
     ));
-    display.count(1).await;
-    let writes = display.writes.lock().unwrap();
+    let writes = records.recorded();
     assert_eq!(writes.len(), 1);
     assert!(writes[0].body.values().all(|field| !field.is_array()));
 }
@@ -1462,8 +1374,6 @@ async fn an_empty_array_drops_the_whole_record_or_completion_before_writing() {
 #[tokio::test]
 async fn seventy_thousand_ordinary_calls_write_records_with_bounded_tombstones() {
     let planes = planes();
-    let display = DisplayDouble::new(&["display"]);
-    planes.routes.display.connect(display.clone());
     let facts = install(&planes);
     let mut request = request();
     for index in 0..70_000 {
@@ -1488,8 +1398,7 @@ async fn seventy_thousand_ordinary_calls_write_records_with_bounded_tombstones()
             "local tombstones grew at call {index}"
         );
     }
-    display.count(70_000).await;
-    assert_eq!(display.writes.lock().unwrap().len(), 70_000);
+    assert_eq!(planes.routes.display.recorded().len(), 70_000);
     let state = planes.routes.display.state.lock().unwrap();
     assert!(state.calls.is_empty());
     let principal = journal::call_records::principal_label(facts.principal.as_ref());
@@ -1618,8 +1527,6 @@ async fn finder_target_records_its_resolved_bundle_id_not_its_display_name() {
     )
     .with_app_state_source(desk.source());
     let planes = planes();
-    let display = DisplayDouble::new(&["display"]);
-    planes.routes.display.connect(display.clone());
     let facts = install(&planes);
     let mut request = request();
     request["name"] = json!("computer_use");
@@ -1635,8 +1542,7 @@ async fn finder_target_records_its_resolved_bundle_id_not_its_display_name() {
             deliver(&planes, json!({"outcome":"completed"})).await;
         })
         .await;
-    display.count(1).await;
-    let writes = display.writes.lock().unwrap();
+    let writes = planes.routes.display.recorded();
     assert_eq!(writes[0].body["app"], "com.apple.finder");
     assert!(!serde_json::to_string(&writes[0].body)
         .unwrap()
@@ -1661,8 +1567,6 @@ async fn handoff_completions_report_the_true_ending_through_durable_and_legacy_p
                 ),
             ] {
                 let planes = planes();
-                let display = DisplayDouble::new(&["display"]);
-                planes.routes.display.connect(display.clone());
                 let facts = install(&planes);
                 let timing = planes.routes.display.arm(&frame(request()), &facts);
                 let principal = journal::call_records::principal_label(facts.principal.as_ref());
@@ -1714,8 +1618,7 @@ async fn handoff_completions_report_the_true_ending_through_durable_and_legacy_p
                     finish();
                 }
                 finish();
-                display.count(2).await;
-                let writes = display.writes.lock().unwrap();
+                let writes = planes.routes.display.recorded();
                 assert_eq!(writes.len(), 2);
                 let completion = writes
                     .iter()
@@ -1741,8 +1644,6 @@ async fn handoff_completions_report_the_true_ending_through_durable_and_legacy_p
 async fn scope_ended_completion_is_an_error_written_once_before_or_after_flush() {
     for settle_first in [false, true] {
         let planes = planes();
-        let display = DisplayDouble::new(&["display"]);
-        planes.routes.display.connect(display.clone());
         let facts = install(&planes);
         planes.routes.display.arm(&frame(request()), &facts);
         let principal = journal::call_records::principal_label(facts.principal.as_ref());
@@ -1761,8 +1662,7 @@ async fn scope_ended_completion_is_an_error_written_once_before_or_after_flush()
             finish();
         }
         finish();
-        display.count(2).await;
-        let writes = display.writes.lock().unwrap();
+        let writes = planes.routes.display.recorded();
         assert_eq!(writes.len(), 2);
         let completion = writes
             .iter()
@@ -1776,8 +1676,6 @@ async fn scope_ended_completion_is_an_error_written_once_before_or_after_flush()
 #[tokio::test]
 async fn unconfirmed_fronting_restore_is_an_error_in_the_delivered_display_record() {
     let planes = planes();
-    let display = DisplayDouble::new(&["display"]);
-    planes.routes.display.connect(display.clone());
     let facts = install(&planes);
     let mut call = request();
     call["name"] = json!("computer_use");
@@ -1790,8 +1688,7 @@ async fn unconfirmed_fronting_restore_is_an_error_in_the_delivered_display_recor
     }))
     .into_value();
     deliver(&planes, reply).await;
-    display.count(1).await;
-    let writes = display.writes.lock().unwrap();
+    let writes = planes.routes.display.recorded();
     assert_eq!(writes[0].body["outcome"], "error");
     assert_eq!(writes[0].body["reason"], "restore_failed");
     assert!(!serde_json::to_string(&writes[0].body)
@@ -1851,7 +1748,7 @@ async fn display_read_wire_vector_round_trips_through_management_and_fails_close
             Principal::Unverified,
         ] {
             let planes = planes();
-            planes.routes.display.connect(DisplayDouble::new(&modules));
+            planes.routes.display.connect(CatalogDouble::new(&modules));
             let write: DisplayWrite = serde_json::from_value(vector["reply"].clone()).unwrap();
             planes
                 .routes
@@ -1881,7 +1778,7 @@ async fn display_read_wire_vector_round_trips_through_management_and_fails_close
     planes
         .routes
         .display
-        .connect(DisplayDouble::new(&["reader"]));
+        .connect(CatalogDouble::new(&["reader"]));
     for (params, refusal) in [
         (json!({"record_id":"unknown"}), 1),
         (json!({"record_id":"bad id"}), 2),
@@ -1907,7 +1804,7 @@ async fn display_read_also_answers_cerebellum_management_envelope() {
     planes
         .routes
         .display
-        .connect(DisplayDouble::new(&["reader"]));
+        .connect(CatalogDouble::new(&["reader"]));
     let write: DisplayWrite = serde_json::from_value(vector["reply"].clone()).unwrap();
     planes
         .routes
@@ -1947,23 +1844,46 @@ async fn display_read_catalog_failure_never_admits_by_default() {
     );
 }
 
+/// When the store is full, the new record is dropped and counted; the reply is
+/// already flushed, and nothing else tries to deliver the record.
 #[tokio::test]
-async fn full_display_map_drops_the_wake_but_keeps_direct_write() {
-    let planes = planes();
-    let display = DisplayDouble::new(&["display"]);
-    planes.routes.display.connect(display.clone());
+async fn full_display_store_drops_and_counts_the_record_without_touching_the_reply() {
+    let gauges = Arc::new(crate::event_publish::Gauges::default());
+    let events = Arc::new(crate::event_publish::Publisher::in_memory(gauges.clone()));
     let bus = Arc::new(crate::event_publish::tests::Fake::default());
-    planes.routes.display.events.connect(Arc::new(bus.clone()));
-    planes.routes.display.events.limit_display(0, 0);
-    let facts = install(&planes);
-    planes
-        .routes
-        .display
-        .arm(&frame(request()), &facts)
+    events.connect(Arc::new(bus.clone()));
+    events.limit_display(0, 0);
+    let records = Arc::new(Records::with_events(events.clone()));
+    let catalog = CatalogDouble::new(&["occipital"]);
+    records.connect(catalog.clone());
+    let deadlines = Arc::new(crate::egress::ConnectionDeadlines::default());
+    deadlines.install_display(records.clone());
+    records.arm(&frame(request()), &install(&planes())).unwrap();
+
+    let body = json!({"outcome":"ok"});
+    let mut reply = frame(body.clone());
+    reply.header.ty = FrameType::Response;
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(reply).await.unwrap();
+    drop(tx);
+    let (sink, mut client) = tokio::io::duplex(4096);
+    crate::egress::drain_writer(sink, rx, deadlines)
+        .await
         .unwrap();
-    deliver(&planes, json!({"outcome":"ok"})).await;
-    display.count(1).await;
+    let emitted = subc_transport::read_frame(&mut client)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&emitted.body).unwrap(),
+        body
+    );
     crate::event_publish::tests::settle().await;
+    assert_eq!(records.recorded().len(), 1);
     assert!(bus.writes.lock().unwrap().is_empty());
-    assert_eq!(display.writes.lock().unwrap().len(), 1);
+    assert_eq!(catalog.reads.load(Ordering::SeqCst), 0);
+    let mut metrics = serde_json::Map::new();
+    gauges.insert_into(&mut metrics);
+    assert_eq!(metrics["displayRecordsDroppedStoreFull"], 1);
+    assert_eq!(metrics["displayRecordsHeld"], 0);
 }

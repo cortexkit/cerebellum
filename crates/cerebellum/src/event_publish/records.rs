@@ -27,9 +27,10 @@ const MAX_BYTES: usize = 32 * 1024 * 1024;
 // Each file holds two little-endian u64 millisecond timestamps (zero for no
 // confirmation), then the DisplayWrite JSON. Confirming does not grow the file.
 // At capacity we reject new records rather than shorten an existing promise.
-// The separate display.write RPC still delivers rejected records. Removing
-// it means a full store loses rows, so size both bounds for a 24-hour outage
-// at the fleet's call rate before removing that fallback.
+// Nothing else delivers a rejected record, so the display module never shows
+// that call; the displayRecordsDroppedStoreFull health counter counts them.
+// Both bounds are meant to hold a 24-hour outage at the call rate measured
+// in the comment on MAX_RECORDS.
 const HEADER_BYTES: usize = 16;
 
 struct Entry {
@@ -121,6 +122,21 @@ impl Records {
             max_count,
             max_bytes,
             ..Default::default()
+        }
+    }
+
+    /// A disk store under `directory` with small limits, so a test can fill it.
+    #[cfg(test)]
+    pub(super) fn open_with_limits(
+        directory: PathBuf,
+        gauges: &Gauges,
+        max_count: usize,
+        max_bytes: usize,
+    ) -> Self {
+        Self {
+            max_count,
+            max_bytes,
+            ..Self::open(directory, gauges)
         }
     }
 

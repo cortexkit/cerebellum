@@ -97,7 +97,7 @@ async fn run(
                             false
                         }
                         Ok(false) => {
-                            metrics.failed(Failure::RecordCapacity);
+                            metrics.display_dropped_full();
                             false
                         }
                         Err(_) => {

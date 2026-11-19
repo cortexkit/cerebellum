@@ -34,14 +34,6 @@ impl tool_display::Backend for AskingDisplay {
             Some(vec!["display-reader".into()])
         })
     }
-
-    fn write<'a>(
-        &'a self,
-        _: &'a str,
-        _: cortexkit_role_tool_display::DisplayWrite,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
-        Box::pin(async { false })
-    }
 }
 
 fn control_frame(ty: FrameType, corr: u64, body: Value) -> Frame {

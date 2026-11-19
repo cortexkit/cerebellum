@@ -417,7 +417,8 @@ fn bus_notice_health_is_counts_and_reason_words_only() {
     gauges.failed(Failure::Unavailable);
     gauges.insert_into(&mut metrics);
     assert_eq!(metrics, json!({"busEventsPublished":0, "busEventsFailed":1, "busEventsLastFailureReason":"unavailable",
-        "displayRecordsHeld":0, "displayRecordDiskWriteFailures":0, "displayRecordsLoadedAtStartup":0, "displayRecordDamagedFilesSkipped":0
+        "displayRecordsHeld":0, "displayRecordDiskWriteFailures":0, "displayRecordsLoadedAtStartup":0, "displayRecordDamagedFilesSkipped":0,
+        "displayRecordsDroppedStoreFull":0
     }).as_object().unwrap().clone());
 }
 
@@ -433,4 +434,50 @@ async fn record_capacity_drops_only_the_new_pointer_and_counts_its_reason() {
     publisher.gauges.insert_into(&mut metrics);
     assert_eq!(metrics["busEventsLastFailureReason"], "record_capacity");
     assert_eq!(metrics["busEventsFailed"], 1);
+    assert_eq!(metrics["displayRecordsDroppedStoreFull"], 1);
+}
+
+#[tokio::test]
+async fn full_disk_store_drops_and_counts_the_new_record_and_keeps_the_held_one() {
+    let directory = cortexkit_test_support::ScratchDir::new("cerebellum-display-full");
+    let path = directory.path().join("display-records");
+    let gauges = Arc::new(Gauges::default());
+    let records = records::Records::open_with_limits(path.clone(), &gauges, 1, 32 * 1024);
+    let publisher = Arc::new(Publisher::with_store(
+        gauges.clone(),
+        DisplayStore::Disk(records::DiskWorker::new(records)),
+    ));
+    let bus = Arc::new(Fake::default());
+    publisher.connect(Arc::new(bus.clone()));
+    let held = write(DisplayKind::Record);
+    let dropped = write(DisplayKind::Completion);
+    publisher.tool_display(&held);
+    publisher.tool_display(&dropped);
+    // Reads share the disk worker's queue, so these answer after both stores.
+    let held_id = display_identity(&held).unwrap();
+    let dropped_id = display_identity(&dropped).unwrap();
+    assert_eq!(
+        publisher.display_read(&held_id).await.unwrap(),
+        Some(serde_json::to_vec(&held).unwrap())
+    );
+    assert_eq!(publisher.display_read(&dropped_id).await.unwrap(), None);
+    tokio::time::timeout(crate::test_support::HANG_GUARD, async {
+        while bus.writes.lock().unwrap().is_empty() {
+            bus.wrote.notified().await;
+        }
+    })
+    .await
+    .expect("the held record's pointer was published");
+    settle().await;
+    let published = bus.writes.lock().unwrap().clone();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].id, held_id);
+    let mut metrics = Map::new();
+    gauges.insert_into(&mut metrics);
+    assert_eq!(metrics["displayRecordsDroppedStoreFull"], 1);
+    assert_eq!(metrics["displayRecordsHeld"], 1);
+    assert_eq!(metrics["displayRecordDiskWriteFailures"], 0);
+    assert_eq!(metrics["busEventsLastFailureReason"], "record_capacity");
+    let files = std::fs::read_dir(&path).unwrap().count();
+    assert_eq!(files, 1, "the dropped record never reaches disk");
 }

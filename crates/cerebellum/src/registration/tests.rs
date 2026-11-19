@@ -136,7 +136,6 @@ fn channel_routes_never_name_consumer_identity_source_check() {
     for source in [
         include_str!("../cingulate_client/route.rs"),
         include_str!("../login_capture/vault.rs"),
-        include_str!("../tool_display/transport.rs"),
     ] {
         assert!(source.contains("crate::channel_route::open("));
         assert!(source.contains("crate::registration::bind_consumer("));

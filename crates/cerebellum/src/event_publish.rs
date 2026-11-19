@@ -1,5 +1,6 @@
-//! Best-effort bus notices and startup view publication. Call records, direct
-//! display writes and tool.views remain authoritative when the bus is unavailable.
+//! Best-effort bus notices and startup view publication. Call records, stored
+//! display records (served by `display.read`) and tool.views remain
+//! authoritative when the bus is unavailable.
 
 use std::{
     future::Future,
@@ -112,15 +113,28 @@ pub(crate) trait Connection: Send {
     ) -> BoxFuture<'a, Result<(), Failure>>;
 }
 
+/// Health counters reported under the module's health metrics.
 #[derive(Default)]
 pub(crate) struct Gauges {
+    /// `busEventsPublished`: notices the bus acknowledged.
     published: AtomicU64,
+    /// `busEventsFailed`: notices that were not published, for any reason,
+    /// including a display record the full store refused (so no pointer exists).
     failed: AtomicU64,
+    /// `busEventsLastFailureReason`: the reason word of the latest failure.
     last_failure: AtomicU8,
+    /// `displayRecordsHeld`: display records the store holds right now.
     display_held: AtomicU64,
+    /// `displayRecordDiskWriteFailures`: display store disk operations that failed.
     display_disk_failures: AtomicU64,
+    /// `displayRecordsLoadedAtStartup`: records reloaded from disk at startup.
     display_loaded: AtomicU64,
+    /// `displayRecordDamagedFilesSkipped`: unreadable record files discarded.
     display_damaged: AtomicU64,
+    /// `displayRecordsDroppedStoreFull`: new display records dropped because
+    /// the store was at its record-count or byte limit. Nothing else delivers
+    /// a dropped record, so the display module never sees that call.
+    display_dropped_full: AtomicU64,
 }
 
 static GAUGES: OnceLock<Arc<Gauges>> = OnceLock::new();
@@ -133,6 +147,13 @@ impl Gauges {
     fn failed(&self, reason: Failure) {
         self.last_failure.store(reason as u8, Relaxed);
         self.failed.fetch_add(1, Relaxed);
+    }
+
+    /// A new display record the full store refused: it is dropped, and its
+    /// bus pointer is never queued.
+    fn display_dropped_full(&self) {
+        self.display_dropped_full.fetch_add(1, Relaxed);
+        self.failed(Failure::RecordCapacity);
     }
 
     pub(crate) fn insert_into(&self, metrics: &mut Map<String, Value>) {
@@ -158,6 +179,7 @@ impl Gauges {
             ),
             ("displayRecordsLoadedAtStartup", &self.display_loaded),
             ("displayRecordDamagedFilesSkipped", &self.display_damaged),
+            ("displayRecordsDroppedStoreFull", &self.display_dropped_full),
         ] {
             metrics.insert(name.into(), json!(count.load(Relaxed)));
         }
@@ -295,7 +317,7 @@ impl Publisher {
                         self.enqueue(Kind::DisplayRecordReady, id, pointer);
                     }
                 } else {
-                    self.gauges.failed(Failure::RecordCapacity);
+                    self.gauges.display_dropped_full();
                 }
             }
             DisplayStore::Disk(records) => {
@@ -324,6 +346,12 @@ impl Publisher {
             }
             DisplayStore::Unavailable => Err(()),
         }
+    }
+
+    /// A publisher with its own counters and an in-memory display store.
+    #[cfg(test)]
+    pub(crate) fn in_memory(gauges: Arc<Gauges>) -> Self {
+        Self::new(gauges)
     }
 
     #[cfg(test)]
