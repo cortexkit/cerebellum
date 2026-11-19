@@ -35,6 +35,7 @@ fn main() {
 #[cfg(target_os = "macos")]
 fn main() {
     const TEST_NAME: &str = "cursor_glides_with_unthrottled_frames_and_rests_with_no_activity";
+    const IDLE_TEST_NAME: &str = "idle_cursor_services_the_main_run_loop_bursts_and_eof";
     let mut filters = Vec::new();
     let mut skips = Vec::new();
     let mut arguments = std::env::args().skip(1);
@@ -48,12 +49,14 @@ fn main() {
             _ => filters.push(argument),
         }
     }
-    if skips.iter().any(|skip| TEST_NAME.contains(skip.as_str()))
-        || (!filters.is_empty()
-            && !filters
-                .iter()
-                .any(|filter| TEST_NAME.contains(filter.as_str())))
-    {
+    let selected = |name: &str| {
+        !skips.iter().any(|skip| name.contains(skip.as_str()))
+            && (filters.is_empty() || filters.iter().any(|filter| name.contains(filter.as_str())))
+    };
+    if selected(IDLE_TEST_NAME) {
+        check_idle_loop(IDLE_TEST_NAME);
+    }
+    if !selected(TEST_NAME) {
         return;
     }
     if cerebellum_macos::screen_is_locked() == Some(true) {
@@ -93,6 +96,34 @@ fn main() {
     } else {
         println!("test {TEST_NAME} ... FAILED\n\n{}\n", failures.join("\n"));
         std::process::exit(101);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn check_idle_loop(name: &str) {
+    let (finished, completion) = std::sync::mpsc::sync_channel(1);
+    let name = name.to_owned();
+    let watchdog = std::thread::spawn({
+        let name = name.clone();
+        move || {
+            if completion
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err()
+            {
+                eprintln!("test {name} ... FAILED: cursor loop did not exit on EOF");
+                std::process::exit(101);
+            }
+        }
+    });
+    let result = cerebellum_macos::probe_cursor_run_loop(motion());
+    let _ = finished.send(());
+    watchdog.join().expect("the watchdog did not panic");
+    match result {
+        Ok((ping, eof)) => println!("test {name} ... ok (idle ping {ping:?}, EOF {eof:?})"),
+        Err(reason) => {
+            eprintln!("test {name} ... FAILED: {reason}");
+            std::process::exit(101);
+        }
     }
 }
 
