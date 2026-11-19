@@ -98,6 +98,15 @@ impl ManagementPlane {
             };
         };
         let now = store.now_ms();
+        let window = if always {
+            None
+        } else {
+            match crate::cingulate_client::answer_time::thirty_minute_window(now) {
+                Some(window) => Some(window),
+                // The answer's 30 minutes ran out before it was applied.
+                None => return BrowserGrantSettlement::NotGranted,
+            }
+        };
         for subject in subjects {
             let hazards = if subject == GrantSubject::AllSites {
                 vec![]
@@ -112,8 +121,8 @@ impl ManagementPlane {
                         subject,
                         browser_target: Some(BrowserTarget::AgentProfile),
                         machine_uuid: machine.into(),
-                        granted_at_ms: now,
-                        expires_at_ms: (!always).then_some(now.saturating_add(30 * 60 * 1000)),
+                        granted_at_ms: window.map_or(now, |(start, _)| start),
+                        expires_at_ms: window.map(|(_, end)| end),
                         card_ref: Some(card_ref.into()),
                         max_level: pending.severity.tier,
                         hazards,

@@ -37,6 +37,16 @@ impl ComputerGrants {
         }
         let subject = super::cards::subject(open, whole)?;
         let now = self.agent_grants.now_ms();
+        let window = if always {
+            None
+        } else {
+            match crate::cingulate_client::answer_time::thirty_minute_window(now) {
+                Some(window) => Some(window),
+                // The answer's 30 minutes ran out before it was applied: it
+                // settles, and grants nothing.
+                None => return Ok(()),
+            }
+        };
         self.agent_grants.upsert(
             AgentGrant {
                 id: String::new(),
@@ -48,8 +58,8 @@ impl ComputerGrants {
                     .machine_uuid()
                     .ok_or(AgentGrantStoreError::NoMachineIdentity)?
                     .into(),
-                granted_at_ms: now,
-                expires_at_ms: (!always).then_some(now.saturating_add(30 * 60 * 1000)),
+                granted_at_ms: window.map_or(now, |(start, _)| start),
+                expires_at_ms: window.map(|(_, end)| end),
                 card_ref: Some(open.card_ref.clone()),
                 max_level: 4,
                 hazards: vec![],

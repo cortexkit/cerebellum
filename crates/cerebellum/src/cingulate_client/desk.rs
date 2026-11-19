@@ -26,6 +26,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::answer_time::{applying, AnswerTime};
 use super::card::{CardKind, CardRequest};
 use super::live_call::{LiveCall, NotLive, SessionKey};
 use super::route::{CallError, CingulateOpener, CingulateRoute};
@@ -356,6 +357,11 @@ pub struct CardLifecycle {
     /// even when that call requests a different action or the process restarted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_browser_grant: Option<UserBrowserGrant>,
+    /// When the card was raised, by the desk's clock. An answer to it came no
+    /// earlier, which bounds a 30-minute choice whose record carries no answer
+    /// time. Absent from cards raised by older builds, which ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raised_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1170,6 +1176,7 @@ impl DeskSession<'_> {
                 lifecycle: CardLifecycle {
                     agent_id: self.live.agent_id().map(str::to_string),
                     deferred_use: card.kind.single_use() || card.kind == CardKind::UserBrowserSite,
+                    raised_at_ms: Some((self.desk.clock)()),
                     ..Default::default()
                 },
             },
@@ -1636,7 +1643,16 @@ impl DeskSession<'_> {
                 let Some(ending) = Ending::of_record(record, &card) else {
                     continue;
                 };
-                let applied = match apply(&card, record, &ending) {
+                // A 30-minute choice runs from the person's answer, not from
+                // this later drain (see `answer_time`).
+                let answered = match record.raw.get("answered_at_ms").and_then(Value::as_u64) {
+                    Some(at) => AnswerTime::Answered(at),
+                    None => card
+                        .lifecycle
+                        .raised_at_ms
+                        .map_or(AnswerTime::Unknown, AnswerTime::RaisedNoEarlierThan),
+                };
+                let applied = match applying(answered, || apply(&card, record, &ending)) {
                     Ok(applied) => applied,
                     // Not acknowledged: the next call reads it again.
                     Err(ApplyFailed(_)) => return Ok(report),

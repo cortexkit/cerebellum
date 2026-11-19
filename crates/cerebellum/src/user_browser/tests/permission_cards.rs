@@ -337,6 +337,66 @@ async fn a_cancelled_site_card_never_grants_whatever_the_withdrawal_says() {
     }
 }
 
+/// A late 30-minute answer keeps the 30 minutes the person was offered: they
+/// run from the answer, not from the later call that drains it, and an answer
+/// whose 30 minutes have already passed settles without granting.
+#[tokio::test]
+async fn a_late_thirty_minute_answer_keeps_its_original_deadline() {
+    const MINUTE: u64 = 60 * 1000;
+    let now = 10_000_000 * MINUTE;
+    for (answered_ago, expires) in [(20, Some(now + 10 * MINUTE)), (31, None)] {
+        let clock = Arc::new(ManualWallClock::at(now));
+        let store = Arc::new(AgentGrants::in_memory(Some("test-machine".into())).with_clock(clock));
+        let script = ScriptedCingulate::new().accept_execution_reports();
+        let fixture = Fixture::with_agent_grants(Some(Arc::new(Arc::clone(&script))), Some(store));
+        let tab = fixture.claim(1).await;
+        script
+            .then(
+                wire::CONSENT_REQUEST,
+                Reply::Result(json!({"elicitation_id":"el_late_site"})),
+            )
+            .then(
+                wire::CONSENT_AWAIT,
+                Reply::Result(json!({"elicitation_id":"el_late_site","state":"pending"})),
+            )
+            .then(
+                wire::CONSENT_DETACH,
+                Reply::Result(
+                    json!({"elicitation_id":"el_late_site","state":"pending","detached":true}),
+                ),
+            );
+        let reply = fixture
+            .finish(fixture.start_arbitrated(snapshot_args(&tab)))
+            .await;
+        assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+        script
+            .then(
+                wire::CONSENT_ANSWERS,
+                Reply::Result(json!({"records":[{"elicitation_id":"el_late_site",
+                    "state":"answered","answered_choice_id":"allow_30m",
+                    "answered_at_ms": now - answered_ago * MINUTE}],"cursor":1})),
+            )
+            .then(wire::CONSENT_ACK, Reply::Result(json!({"cursor":1})));
+        let status = fixture
+            .finish(fixture.start_arbitrated(json!({"browser":"user","action":"status"})))
+            .await;
+        assert_eq!(status["outcome"], "ok", "{status}");
+        assert!(
+            script.methods().iter().any(|m| m == wire::CONSENT_ACK),
+            "answered {answered_ago} minutes ago: the answer is acknowledged"
+        );
+        let granted = rows(&fixture);
+        assert_eq!(
+            granted
+                .iter()
+                .map(|row| row.expires_at_ms)
+                .collect::<Vec<_>>(),
+            expires.map(Some).into_iter().collect::<Vec<_>>(),
+            "answered {answered_ago} minutes ago"
+        );
+    }
+}
+
 async fn late_site_answer(choice: &str, tier: u8) -> Fixture {
     late_site_answer_with_hazards(choice, tier, json!([]))
         .await
