@@ -25,7 +25,10 @@ use hang_guard::HANG_GUARD;
 use cortexkit_test_support::{fenced_subc_env_dir, ScratchDir};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity};
 use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeRecord, ScopeSelector};
 use subc_protocol::{BindIdentity, Frame, FrameType, Principal, RouteTarget, PROTOCOL_VERSION};
@@ -284,6 +287,11 @@ struct Fixture {
     ckbus: Registered,
 }
 
+struct ManagedSettingsFixture<'a> {
+    homes: &'a Path,
+    queue_age_stale_ms: u64,
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.daemon.abort();
@@ -306,25 +314,34 @@ async fn read_nonce(directory: &std::path::Path, id: &str) -> String {
 }
 
 impl Fixture {
-    async fn start(registration_channel: bool) -> Self {
+    async fn start(
+        registration_channel: bool,
+        managed: Option<ManagedSettingsFixture<'_>>,
+    ) -> Self {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let directory = ScratchDir::new("cerebellum-registration-live");
-        let module_env = support::fenced_module_env(directory.path());
-        let data = fenced_subc_env_dir(directory.path(), "XDG_DATA_HOME");
-        let config = fenced_subc_env_dir(directory.path(), "XDG_CONFIG_HOME");
+        let homes = managed
+            .as_ref()
+            .map_or(directory.path(), |managed| managed.homes);
+        let module_env = support::fenced_module_env(homes);
+        let data = fenced_subc_env_dir(homes, "XDG_DATA_HOME");
+        let config = fenced_subc_env_dir(homes, "XDG_CONFIG_HOME");
         let run = data.join("cortexkit/run");
         // A browser is configured so browser_use is advertised, but its
         // executable does not exist: nothing here may start a real browser.
         fs::create_dir_all(config.join("cortexkit")).unwrap();
-        fs::write(
-            config.join("cortexkit/cerebellum.jsonc"),
-            serde_json::to_vec(&json!({"browser": {
+        let mut module_settings = json!({"browser": {
                 "executable_path": directory.join("no-browser"), "expected_identity":"test.browser",
                 "launch_handshake_deadline_ms":1000, "termination_grace_period_ms":200,
                 "browser_idle_timeout_ms":60000, "browser_exit_observation_deadline_ms":1000,
                 "navigation_settle_deadline_ms":1000
-            }}))
-            .unwrap(),
+        }});
+        if let Some(managed) = &managed {
+            module_settings["health"] = json!({"queue_age_stale_ms": managed.queue_age_stale_ms});
+        }
+        fs::write(
+            config.join("cortexkit/cerebellum.jsonc"),
+            serde_json::to_vec(&module_settings).unwrap(),
         )
         .unwrap();
         let connection_path = directory.join("subc-connection.json");
@@ -387,6 +404,14 @@ impl Fixture {
             .with_live_children_record(run.join("live-children.json"))
             .with_machine_id_path(data.join("cortexkit/machine-id"))
             .with_scope_authority_owners(vec![OWNER.into()]);
+        let daemon_config = if managed.is_some() {
+            fs::create_dir_all(data.join("cortexkit")).unwrap();
+            daemon_config
+                .with_config_store_root(data.join("cortexkit/config-store"))
+                .unwrap()
+        } else {
+            daemon_config
+        };
         let daemon = tokio::spawn(subc_daemon::bootstrap::run_with_config(daemon_config));
         let connection = timeout(HANG_GUARD, async {
             loop {
@@ -587,7 +612,7 @@ impl Fixture {
 
 /// Binds, health and an outbound route, all answered promptly.
 async fn serves_binds_health_and_outbound_routes(registration_channel: bool) {
-    let fixture = std::sync::Arc::new(Fixture::start(registration_channel).await);
+    let fixture = std::sync::Arc::new(Fixture::start(registration_channel, None).await);
     let path = if registration_channel {
         "channel"
     } else {
@@ -642,42 +667,7 @@ async fn serves_binds_health_and_outbound_routes(registration_channel: bool) {
     // cerebellum: with a self claim on the channel path, with its launch nonce
     // on the nonce path.
     let (client, channel, epoch) = routes.first_mut().expect("a head route");
-    let catalog = route_call(
-        client,
-        *channel,
-        *epoch,
-        100,
-        json!({"name":"tool.catalog", "arguments":{}}),
-    )
-    .await;
-    let catalog: cortexkit_role_tool_provider::catalog::CatalogAnswer =
-        serde_json::from_slice(&catalog.body).expect("tool.catalog answers a catalog");
-    let browser = catalog
-        .tools
-        .iter()
-        .find(|tool| tool.name == "browser_use")
-        .expect("browser_use is advertised");
-    let pin = cortexkit_role_tool_provider::call::SchemaPin::new(
-        &browser.name,
-        &browser.schema_digest,
-        browser.semantics,
-    )
-    .encode()
-    .unwrap();
-    let started = Instant::now();
-    let reply = route_call(
-        client,
-        *channel,
-        *epoch,
-        101,
-        json!({
-            "name": "browser_use",
-            "arguments": {"action": "status"},
-            "call_key": "registration-live-status",
-            "schema_pin": pin,
-        }),
-    )
-    .await;
+    let (reply, elapsed) = browser_status(client, *channel, *epoch).await;
     assert_eq!(
         reply.header.ty,
         FrameType::Response,
@@ -685,9 +675,8 @@ async fn serves_binds_health_and_outbound_routes(registration_channel: bool) {
         String::from_utf8_lossy(&reply.body)
     );
     assert!(
-        started.elapsed() < ANSWER_BUDGET,
-        "browser_use status answered only after {:?}",
-        started.elapsed()
+        elapsed < ANSWER_BUDGET,
+        "browser_use status answered only after {elapsed:?}"
     );
     let bind = timeout(HANG_GUARD, async {
         fixture.display.binds.lock().await.recv().await
@@ -716,6 +705,46 @@ async fn serves_binds_health_and_outbound_routes(registration_channel: bool) {
     }
 }
 
+async fn browser_status(client: &mut TcpStream, channel: u16, epoch: u32) -> (Frame, Duration) {
+    let catalog = route_call(
+        client,
+        channel,
+        epoch,
+        100,
+        json!({"name":"tool.catalog", "arguments":{}}),
+    )
+    .await;
+    let catalog: cortexkit_role_tool_provider::catalog::CatalogAnswer =
+        serde_json::from_slice(&catalog.body).expect("tool.catalog answers a catalog");
+    let browser = catalog
+        .tools
+        .iter()
+        .find(|tool| tool.name == "browser_use")
+        .expect("browser_use is advertised");
+    let pin = cortexkit_role_tool_provider::call::SchemaPin::new(
+        &browser.name,
+        &browser.schema_digest,
+        browser.semantics,
+    )
+    .encode()
+    .unwrap();
+    let started = Instant::now();
+    let reply = route_call(
+        client,
+        channel,
+        epoch,
+        101,
+        json!({
+            "name": "browser_use",
+            "arguments": {"action": "status"},
+            "call_key": "registration-live-status",
+            "schema_pin": pin,
+        }),
+    )
+    .await;
+    (reply, started.elapsed())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn channel_launch_answers_binds_health_and_opens_claimed_routes() {
     serves_binds_health_and_outbound_routes(true).await;
@@ -724,6 +753,98 @@ async fn channel_launch_answers_binds_health_and_opens_claimed_routes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nonce_launch_answers_binds_health_and_opens_attested_routes() {
     serves_binds_health_and_outbound_routes(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_settings_view_applies_before_serving_tools() {
+    check_managed_settings(
+        "managed_settings_view_applies_before_serving_tools",
+        4_321,
+        None,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_settings_capture_refusal_serves_tools_with_legacy_settings() {
+    // The legacy parser accepts this threshold, but the managed schema caps it at a day.
+    check_managed_settings(
+        "managed_settings_capture_refusal_serves_tools_with_legacy_settings",
+        86_400_001,
+        Some("settings_declaration_refused: value_invalid"),
+    )
+    .await;
+}
+
+// Relaunch in a separate process because the embedded daemon resolves its config home from the process environment.
+async fn check_managed_settings(test: &str, queue_age_stale_ms: u64, refusal: Option<&str>) {
+    const FIXTURE_HOME: &str = "CEREBELLUM_MANAGED_SETTINGS_FIXTURE_HOME";
+    let Some(homes) = std::env::var_os(FIXTURE_HOME) else {
+        let homes = ScratchDir::new("cerebellum-managed-settings");
+        let exe = support::daemon_binary(
+            "ckdev-cerebellum-settings",
+            std::env::current_exe().unwrap(),
+        );
+        let output = timeout(
+            HANG_GUARD,
+            tokio::process::Command::new(exe)
+                .args(["--exact", test, "--nocapture"])
+                .envs(cortexkit_test_support::fenced_subc_daemon_env(homes.path()))
+                .env(FIXTURE_HOME, homes.path())
+                // Use a file-backed test anchor, not the operator's keychain.
+                .env("SUBC_TEST_CONFIG_GATE", "1")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("fenced settings test finished within the hang guard")
+        .expect("run the fenced settings test");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+
+    let fixture = Fixture::start(
+        false,
+        Some(ManagedSettingsFixture {
+            homes: Path::new(&homes),
+            queue_age_stale_ms,
+        }),
+    )
+    .await;
+    let (_, route) = fixture.open_head(0).await;
+    let (mut client, channel, epoch) = route.expect("startup must reach tool serving");
+    let (_, health) = fixture.health().await;
+    assert_eq!(health["frame"], "Response", "{health}");
+    assert_eq!(
+        health["status"],
+        if refusal.is_some() { "degraded" } else { "ok" },
+        "{health}"
+    );
+    if let Some(refusal) = refusal {
+        assert!(
+            health["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains(refusal)),
+            "{health}"
+        );
+    }
+    // This non-default threshold is reported by the running module, not read
+    // back from the file. Combined with health status, it distinguishes a
+    // delivered view from the legacy fallback.
+    assert_eq!(
+        health["metrics"]["queueAgeThresholdSecs"],
+        queue_age_stale_ms / 1_000,
+        "{health}"
+    );
+    let (reply, _) = browser_status(&mut client, channel, epoch).await;
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(reply.header.ty, FrameType::Response, "{body}");
+    assert_eq!(body["outcome"], "no_session", "{body}");
 }
 
 /// This exact test is also the daemon-launched, process-isolated SDK probe.

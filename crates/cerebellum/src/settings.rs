@@ -24,6 +24,8 @@ pub(crate) use session::Session;
 const PATH: &str = "/browser/executable_path";
 const IDENTITY: &str = "/browser/expected_identity";
 const APP_USE: &str = "/computer_use/app_use";
+// After a day, a stale queue or idle browser should already have expired.
+const MAX_STALE_OR_IDLE_MS: u64 = 24 * 60 * 60 * 1_000;
 
 static SCHEMA: LazyLock<(Value, Schema)> = LazyLock::new(|| {
     let declaration = schema_declaration();
@@ -55,8 +57,8 @@ fn schema_declaration() -> Value {
         "type": "object", "unevaluatedProperties": false,
         "properties": {
             "health": {"type": "object", "unevaluatedProperties": false, "properties": {
-                "dispatch_heartbeat_stale_ms": integer("Milliseconds before an unresponsive dispatch heartbeat is reported stale.", config::DEFAULT_DISPATCH_HEARTBEAT_STALE_MS, 1, u64::MAX),
-                "queue_age_stale_ms": integer("Milliseconds before the oldest queued action is reported stale.", config::DEFAULT_QUEUE_AGE_STALE_MS, 1, u64::MAX)
+                "dispatch_heartbeat_stale_ms": integer("Milliseconds before an unresponsive dispatch heartbeat is reported stale.", config::DEFAULT_DISPATCH_HEARTBEAT_STALE_MS, 1, MAX_STALE_OR_IDLE_MS),
+                "queue_age_stale_ms": integer("Milliseconds before the oldest queued action is reported stale.", config::DEFAULT_QUEUE_AGE_STALE_MS, 1, MAX_STALE_OR_IDLE_MS)
             }},
             "computer_use": {"type": "object", "unevaluatedProperties": false, "properties": {
                 "agent_cursor": field("boolean", "Show the agent cursor while computer use acts on screen.", json!(true), ModuleRestart),
@@ -67,7 +69,7 @@ fn schema_declaration() -> Value {
                 "expected_identity": field("string", "Expected executable identity used to verify the configured browser. Omit when no browser path is configured.", json!(""), ModuleRestart),
                 "launch_handshake_deadline_ms": integer("Milliseconds allowed for the initial browser handshake, including cold-start macOS code signature validation.", 10_000, 1, MAX_LAUNCH_DEADLINE_MS),
                 "termination_grace_period_ms": integer("Milliseconds for the browser to exit gracefully. Shortening this can force-kill the browser before it saves profile writes.", 5_000, 1, MAX_TERMINATION_DEADLINE_MS),
-                "browser_idle_timeout_ms": integer("Milliseconds of inactivity after which to close an idle browser session.", 600_000, 1, u64::MAX),
+                "browser_idle_timeout_ms": integer("Milliseconds of inactivity after which to close an idle browser session.", 600_000, 1, MAX_STALE_OR_IDLE_MS),
                 "browser_exit_observation_deadline_ms": integer("Milliseconds allowed to observe the browser exit after termination, separate from the grace period.", 5_000, 1, MAX_TERMINATION_DEADLINE_MS),
                 "navigation_settle_deadline_ms": integer("Milliseconds allowed for navigation to settle. Must exceed the network-quiet window or a navigation can never settle.", 10_000, crate::browser::QUIET_MS + 1, MAX_ACTION_DEADLINE_MS)
             }}

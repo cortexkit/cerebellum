@@ -2766,11 +2766,15 @@ where
         let planes = handler_planes.clone();
         async move {
             if let Some(settings) = settings {
-                if settings.take(&frame) {
-                    return Ok(true);
-                }
-                if settings.is_review(&frame) {
-                    settings.review(&writer, frame, &config.module_id).await?;
+                if module_runtime::offer_settings_control(
+                    settings,
+                    &frame,
+                    &writer,
+                    &config.module_id,
+                    &planes,
+                )
+                .await?
+                {
                     return Ok(true);
                 }
             }
