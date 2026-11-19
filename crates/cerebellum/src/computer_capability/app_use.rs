@@ -104,27 +104,51 @@ struct Reading {
 /// Defaults to background without reading a file. Only the legacy daemon
 /// path can install a file source; managed settings replace that source.
 pub(crate) struct LiveAppUse {
-    /// Held across the `stat` and any re-read, so two calls arriving together
-    /// parse a changed file once rather than twice.
     state: StdMutex<State>,
+    /// Only one caller reloads at a time, even if the awaiting call is cancelled.
+    reload: Arc<tokio::sync::Semaphore>,
     approval: super::app_use_approval::Approval,
 }
 
 struct State {
-    path: Option<PathBuf>,
-    files: Arc<dyn ConfigFiles>,
-    last: Option<Reading>,
+    legacy: Option<Arc<LegacyFile>>,
     managed: LiveSettings,
+}
+
+struct LegacyFile {
+    path: PathBuf,
+    files: Arc<dyn ConfigFiles>,
+    last: StdMutex<Option<Reading>>,
+}
+
+impl LegacyFile {
+    fn new(path: PathBuf, files: Arc<dyn ConfigFiles>) -> Self {
+        Self {
+            path,
+            files,
+            last: StdMutex::new(None),
+        }
+    }
+
+    fn settings(&self) -> Result<LiveSettings, ConfigInvalid> {
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        read(&self.path, self.files.as_ref(), &mut last).map(|app_use| LiveSettings {
+            app_use,
+            approved: false,
+        })
+    }
 }
 
 impl LiveAppUse {
     pub(crate) fn new(path: Option<PathBuf>, files: Arc<dyn ConfigFiles>) -> Self {
         Self {
             approval: super::app_use_approval::Approval::default(),
+            reload: Arc::new(tokio::sync::Semaphore::new(1)),
             state: StdMutex::new(State {
-                path,
-                files,
-                last: None,
+                legacy: path.map(|path| Arc::new(LegacyFile::new(path, files))),
                 managed: LiveSettings::default(),
             }),
         }
@@ -149,17 +173,14 @@ impl LiveAppUse {
     #[cfg(any(test, target_os = "macos", target_os = "windows"))]
     pub(crate) fn read_config_file(&self, path: PathBuf) {
         let mut state = self.lock();
-        state.path = Some(path);
-        state.files = Arc::new(NativeConfigFiles);
-        state.last = None;
+        state.legacy = Some(Arc::new(LegacyFile::new(path, Arc::new(NativeConfigFiles))));
         self.approval.observe(None);
     }
 
     #[cfg(any(test, target_os = "macos", target_os = "windows"))]
     pub(crate) fn apply(&self, settings: LiveSettings) {
         let mut state = self.lock();
-        state.path = None;
-        state.last = None;
+        state.legacy = None;
         state.managed = settings;
         self.approval
             .observe((!settings.approved).then_some(settings.app_use));
@@ -168,7 +189,7 @@ impl LiveAppUse {
     /// The file calls are read from, if any.
     #[cfg(test)]
     pub(crate) fn path(&self) -> Option<PathBuf> {
-        self.lock().path.clone()
+        self.lock().legacy.as_ref().map(|file| file.path.clone())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -183,16 +204,68 @@ impl LiveAppUse {
         self.current_settings().map(|settings| settings.app_use)
     }
 
+    #[cfg(test)]
     pub(crate) fn current_settings(&self) -> Result<LiveSettings, ConfigInvalid> {
-        let mut state = self.lock();
-        let outcome = if state.path.is_some() {
-            Self::read(&mut state).map(|app_use| LiveSettings {
-                app_use,
-                approved: false,
-            })
-        } else {
-            Ok(state.managed)
-        };
+        let state = self.lock();
+        self.observe(
+            state
+                .legacy
+                .as_ref()
+                .map_or(Ok(state.managed), |file| file.settings()),
+        )
+    }
+
+    pub(crate) async fn settings_for_call(&self) -> Result<LiveSettings, ConfigInvalid> {
+        loop {
+            if let Some(settings) = self.managed_settings() {
+                return settings;
+            }
+            let permit = self
+                .reload
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("reload gate is never closed");
+            let file = {
+                let state = self.lock();
+                let Some(file) = &state.legacy else {
+                    return self.observe(Ok(state.managed));
+                };
+                file.clone()
+            };
+            let reading = file.clone();
+            let result = tokio::task::spawn_blocking(move || (permit, reading.settings())).await;
+            let state = self.lock();
+            if state
+                .legacy
+                .as_ref()
+                .is_none_or(|current| !Arc::ptr_eq(current, &file))
+            {
+                // The daemon replaced the legacy source during the reload.
+                continue;
+            }
+            return match result {
+                Ok((_permit, outcome)) => self.observe(outcome),
+                Err(error) => self.observe(Err(ConfigInvalid {
+                    path: file.path.clone(),
+                    error: format!("its settings reload did not complete: {error}"),
+                })),
+            };
+        }
+    }
+
+    fn managed_settings(&self) -> Option<Result<LiveSettings, ConfigInvalid>> {
+        let state = self.lock();
+        state
+            .legacy
+            .is_none()
+            .then(|| self.observe(Ok(state.managed)))
+    }
+
+    fn observe(
+        &self,
+        outcome: Result<LiveSettings, ConfigInvalid>,
+    ) -> Result<LiveSettings, ConfigInvalid> {
         self.approval.observe(
             outcome
                 .as_ref()
@@ -220,63 +293,61 @@ impl LiveAppUse {
         let _ = self.current();
         self.approval.approve_fixture();
     }
+}
 
-    fn read(state: &mut State) -> Result<AppUse, ConfigInvalid> {
-        let State {
-            path, files, last, ..
-        } = state;
-        let Some(path) = path.as_deref() else {
-            return Ok(AppUse::Background);
-        };
-        let stamp = match files.modified(path) {
-            Ok(modified) => Stamp::Modified(modified),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Stamp::Absent,
+fn read(
+    path: &Path,
+    files: &dyn ConfigFiles,
+    last: &mut Option<Reading>,
+) -> Result<AppUse, ConfigInvalid> {
+    let stamp = match files.modified(path) {
+        Ok(modified) => Stamp::Modified(modified),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Stamp::Absent,
+        Err(error) => {
+            // Nothing is kept: the next call stats again and, once the
+            // file can be read, parses it whatever its time says.
+            *last = None;
+            return Err(ConfigInvalid {
+                path: path.to_path_buf(),
+                error: format!("reading its metadata failed: {error}"),
+            });
+        }
+    };
+    if let Some(reading) = last.as_ref().filter(|reading| reading.stamp == stamp) {
+        return reading.outcome.clone();
+    }
+    let (stamp, outcome) = match stamp {
+        Stamp::Absent => (Stamp::Absent, Ok(AppUse::Background)),
+        Stamp::Modified(_) => match files.read_to_string(path) {
+            Ok(text) => (
+                stamp,
+                parse_config(&text)
+                    .map(|config| config.computer_use.app_use)
+                    .map_err(|error| ConfigInvalid {
+                        path: path.to_path_buf(),
+                        error: error.to_string(),
+                    }),
+            ),
+            // Removed between the stat and the read: the same as
+            // absent, and kept as absent so a file created later is
+            // parsed when it appears.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                (Stamp::Absent, Ok(AppUse::Background))
+            }
             Err(error) => {
-                // Nothing is kept: the next call stats again and, once the
-                // file can be read, parses it whatever its time says.
                 *last = None;
                 return Err(ConfigInvalid {
                     path: path.to_path_buf(),
-                    error: format!("reading its metadata failed: {error}"),
+                    error: format!("reading it failed: {error}"),
                 });
             }
-        };
-        if let Some(reading) = last.as_ref().filter(|reading| reading.stamp == stamp) {
-            return reading.outcome.clone();
-        }
-        let (stamp, outcome) = match stamp {
-            Stamp::Absent => (Stamp::Absent, Ok(AppUse::Background)),
-            Stamp::Modified(_) => match files.read_to_string(path) {
-                Ok(text) => (
-                    stamp,
-                    parse_config(&text)
-                        .map(|config| config.computer_use.app_use)
-                        .map_err(|error| ConfigInvalid {
-                            path: path.to_path_buf(),
-                            error: error.to_string(),
-                        }),
-                ),
-                // Removed between the stat and the read: the same as
-                // absent, and kept as absent so a file created later is
-                // parsed when it appears.
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    (Stamp::Absent, Ok(AppUse::Background))
-                }
-                Err(error) => {
-                    *last = None;
-                    return Err(ConfigInvalid {
-                        path: path.to_path_buf(),
-                        error: format!("reading it failed: {error}"),
-                    });
-                }
-            },
-        };
-        *last = Some(Reading {
-            stamp,
-            outcome: outcome.clone(),
-        });
-        outcome
-    }
+        },
+    };
+    *last = Some(Reading {
+        stamp,
+        outcome: outcome.clone(),
+    });
+    outcome
 }
 
 tokio::task_local! {
@@ -708,6 +779,60 @@ mod serve_tests {
             "predicate": "element_enabled_is true Role:Title=AXButton:Save",
             "timeout_ms": 0,
         })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stalled_legacy_stat_does_not_block_other_async_work() {
+        struct StalledStat {
+            entered: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: StdMutex<std::sync::mpsc::Receiver<()>>,
+            released_by_task: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl ConfigFiles for StalledStat {
+            fn modified(&self, _path: &Path) -> io::Result<SystemTime> {
+                self.entered
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+                let result = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(crate::test_support::HANG_GUARD);
+                self.released_by_task
+                    .store(result.is_ok(), Ordering::SeqCst);
+                Err(io::ErrorKind::NotFound.into())
+            }
+
+            fn read_to_string(&self, _path: &Path) -> io::Result<String> {
+                panic!("the absent file is not read")
+            }
+        }
+
+        let (entered, wait_for_stat) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let released_by_task = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let files = Arc::new(StalledStat {
+            entered: StdMutex::new(Some(entered)),
+            release: StdMutex::new(released),
+            released_by_task: released_by_task.clone(),
+        });
+        let plane = plane(LiveAppUse::new(Some(PathBuf::from(PATH)), files));
+        let (management, _) = management();
+        let other_task = tokio::spawn(async move {
+            wait_for_stat.await.unwrap();
+            release.send(()).unwrap();
+        });
+        serve(&plane, &management, "computer.wait", wait_arguments()).await;
+        other_task.await.unwrap();
+        assert!(
+            released_by_task.load(Ordering::SeqCst),
+            "the stat had to time out before the executor could advance"
+        );
     }
 
     #[tokio::test]

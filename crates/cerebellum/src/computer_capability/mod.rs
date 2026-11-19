@@ -1029,7 +1029,21 @@ where
         // action of any kind may run under a guess. A missing file is not
         // this case; it means background. Nothing has been looked up or
         // dispatched yet.
-        let app_use = match self.app_use.current_settings() {
+        let settings = tokio::select! {
+            biased;
+            settings = self.app_use.settings_for_call() => settings,
+            _ = context.cancel.cancelled() => {
+                return self.finish_reply(
+                    capability.capability(),
+                    serialize::queued_refusal(
+                        capability,
+                        arguments,
+                        crate::computer_grants::ConsentRefusal::Cancelled,
+                    ),
+                );
+            }
+        };
+        let app_use = match settings {
             Ok(mode) => mode,
             Err(invalid) => {
                 let reply = match capability.0 {
