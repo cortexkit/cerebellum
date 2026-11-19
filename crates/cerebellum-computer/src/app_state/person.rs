@@ -55,6 +55,10 @@ pub struct SeenMarks {
     pub focused: Reading<Option<ElementHandle>>,
     pub window: Reading<Option<WindowMark>>,
     pub windows: Reading<Vec<u32>>,
+    /// A complete press reply can show windows before the on-screen list
+    /// names them. This is the exact inventory the reply established, kept
+    /// separately so unrelated inventory changes still use the original marks.
+    pub press_reply_windows: Option<Vec<u32>>,
     /// These marks came from an action reply after the agent dispatched input,
     /// rather than from an explicit read.
     pub after_agent_input: bool,
@@ -81,6 +85,7 @@ impl SeenMarks {
                     Reading::Read(windows)
                 },
             ),
+            press_reply_windows: None,
             after_agent_input: false,
             at,
         }

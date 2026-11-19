@@ -934,6 +934,7 @@ fn a_new_process_generation_starts_a_new_session() {
             focused: super::person::Reading::Read(None),
             window: super::person::Reading::Read(None),
             windows: super::person::Reading::Read(Vec::new()),
+            press_reply_windows: None,
             after_agent_input: false,
             at: std::time::Instant::now(),
         },
