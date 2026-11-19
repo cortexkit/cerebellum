@@ -1635,7 +1635,8 @@ mod tests {
     #[test]
     fn a_denied_fake_permission_source_stops_before_the_protected_operation() {
         let reached_protected_operation = std::cell::Cell::new(false);
-        let denied = crate::test_support::run_after_permission_preflight(
+        let denied = crate::test_support::run_after_permission_preflight_with_opt_in(
+            true,
             crate::test_support::Permission::ScreenRecording,
             || false,
             || reached_protected_operation.set(true),

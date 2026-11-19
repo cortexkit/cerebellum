@@ -49,7 +49,12 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# Live desk operations are enabled only by the explicit desk commands below.
+# In particular, an inherited shell variable must not enable them in lib tests.
+unset CEREBELLUM_DESK_TESTS
+
 source "$repo_root/scripts/lib/fast-gate-phases.sh"
+source "$repo_root/scripts/lib/desk-test-report.sh"
 if [ "$self_test" -eq 0 ]; then
   # --remote and --vm select the macOS-VM form of --part mac: --remote sends
   # it to the VM from here, --vm executes it inside the VM. Anything else with
@@ -99,13 +104,23 @@ source "$repo_root/scripts/lib/fast-gate-plan.sh"
 # A harness-less desk test (one that opens AppKit windows on the main thread)
 # prints "test NAME ... SKIPPED: reason", or "SKIPPED (what it did check):
 # reason", when this host could not check what it promises, for example
-# because the screen is locked. With CEREBELLUM_DESK_TEST_SKIP_OK=1 it then
-# exits 0 instead of 2, so a locked screen does not turn this gate red; the
-# gate reads the reason back from the output and names it in the summary, so a
-# skip is never silent.
-desk_suites=("cerebellum-macos:preview_hide" "cerebellum-macos:cursor_motion" "cerebellum-macos:cursor_hide")
-desk_skip_reason() {
-  sed -n 's/^test [^ ]* \.\.\. SKIPPED[^:]*: //p' | head -n 1
+# because the screen is locked. CEREBELLUM_DESK_TESTS=1 explicitly enables its
+# live operation. With CEREBELLUM_DESK_TEST_SKIP_OK=1 it then exits 0 instead
+# of 2, so a locked screen does not turn this gate red; the gate reads the
+# reason back from the output and names it in the summary, so a skip is never
+# silent.
+desk_suites=(
+  "cerebellum-macos:preview_hide"
+  "cerebellum-macos:cursor_motion"
+  "cerebellum-macos:cursor_hide"
+  "cerebellum-macos:source_rect_pattern"
+)
+
+record_skipped_tests() {
+  local log="$1" scope="$2" line
+  while IFS= read -r line; do
+    not_verified+=("$scope: $line")
+  done < <(desk_skip_lines < "$log")
 }
 
 if [ "$self_test" -eq 1 ]; then
@@ -124,6 +139,16 @@ if [ "$self_test" -eq 1 ]; then
   fi
   echo "SELF-TEST PASSED: a desk-test skip yields its reason and a pass yields none"
 
+  skip_lines="$(printf '%s\n' \
+    'test one ... SKIPPED: desk test not enabled' \
+    'test two ... ok' \
+    'test three ... SKIPPED: no display' | desk_skip_lines)"
+  if [ "$skip_lines" != $'test one ... SKIPPED: desk test not enabled\ntest three ... SKIPPED: no display' ]; then
+    echo "SELF-TEST FAILED: the skip reporter did not preserve every and only the skipped tests" >&2
+    exit 1
+  fi
+  echo "SELF-TEST PASSED: every skipped test is retained for NOT VERIFIED reporting"
+
   suite_plan="$(plan_for_files 'crates/cerebellum/tests/it/tool_catalog.rs' "$metadata")"
   if ! printf '%s\n' "$suite_plan" | grep -Fxq 'T|cerebellum|it'; then
     echo "SELF-TEST FAILED: a planted tests/it source path did not select suite it" >&2
@@ -138,6 +163,13 @@ if [ "$self_test" -eq 1 ]; then
     exit 1
   fi
   echo "SELF-TEST PASSED: a planted cursor source path selects the cursor desk tests"
+
+  permission_plan="$(plan_for_files 'crates/cerebellum-macos/src/test_support.rs' "$metadata")"
+  if ! printf '%s\n' "$permission_plan" | grep -Fxq 'T|cerebellum-macos|source_rect_pattern'; then
+    echo "SELF-TEST FAILED: the shared permission gate did not select its source-rect desk test" >&2
+    exit 1
+  fi
+  echo "SELF-TEST PASSED: the shared permission gate selects the source-rect desk test"
 
   flat_plan="$(plan_for_files 'crates/cerebellum/src/flat_tools.rs' "$metadata")"
   if ! printf '%s\n' "$flat_plan" | grep -Fxq 'P|cerebellum' || \
@@ -315,7 +347,10 @@ if [ "${#lib_packages[@]}" -gt 0 ]; then
   test_args=(--locked)
   for package in "${lib_packages[@]}"; do test_args+=(-p "$package"); done
   test_args+=(--lib "${lib_test_options[@]+${lib_test_options[@]}}")
-  run_serial_phase "cargo test --locked ${lib_packages[*]} --lib" "$repo_root/scripts/lib/gate-cargo-test.sh" "${test_args[@]}"
+  lib_log="$static_dir/lib-tests.log"
+  run_serial_phase "cargo test --locked ${lib_packages[*]} --lib" \
+    run_teed "$lib_log" "$repo_root/scripts/lib/gate-cargo-test.sh" "${test_args[@]}"
+  record_skipped_tests "$lib_log" "library tests"
 else
   echo "==> SKIP: touched-package --lib tests (no changed package with a library target)"
 fi
@@ -417,8 +452,8 @@ if [ "${#suites[@]}" -gt 0 ]; then
     fi
     if is_desk_suite "$suite"; then
       log="$static_dir/desk-$package-$target.log"
-      run_serial_phase "CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p $package --test $target" \
-        run_teed "$log" env CEREBELLUM_DESK_TEST_SKIP_OK=1 "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p "$package" --test "$target"
+      run_serial_phase "CEREBELLUM_DESK_TESTS=1 CEREBELLUM_DESK_TEST_SKIP_OK=1 cargo test --locked -p $package --test $target" \
+        run_teed "$log" env CEREBELLUM_DESK_TESTS=1 CEREBELLUM_DESK_TEST_SKIP_OK=1 "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p "$package" --test "$target"
       reason="$(desk_skip_reason < "$log")"
       if [ "$(uname -s)" != Darwin ]; then
         # Off macOS the target builds to an empty program that prints nothing.
@@ -428,7 +463,10 @@ if [ "${#suites[@]}" -gt 0 ]; then
         not_verified+=("$target skipped ($reason)")
       fi
     else
-      run_serial_phase "cargo test --locked -p $package --test $target" "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p "$package" --test "$target"
+      log="$static_dir/test-$package-$target.log"
+      run_serial_phase "cargo test --locked -p $package --test $target" \
+        run_teed "$log" "$repo_root/scripts/lib/gate-cargo-test.sh" --locked -p "$package" --test "$target"
+      record_skipped_tests "$log" "$package:$target"
     fi
   done
 fi

@@ -144,12 +144,23 @@ mod pattern {
             Outcome::Passed => println!("test {TEST_NAME} ... ok"),
             // A skip is printed as one, never as "ok": a precondition that is
             // missing means nothing was measured.
-            Outcome::Skipped(reason) => println!("test {TEST_NAME} ... SKIPPED: {reason}"),
+            Outcome::Skipped(reason) => {
+                println!("test {TEST_NAME} ... SKIPPED: {reason}");
+                exit_skipped();
+            }
             Outcome::Failed(reason) => {
                 println!("test {TEST_NAME} ... FAILED\n\n{reason}\n");
                 std::process::exit(101);
             }
         }
+    }
+
+    /// A skip is not a pass. The gate may accept this exit only because it
+    /// reads the SKIPPED line and reports the measurement as NOT VERIFIED.
+    fn exit_skipped() -> ! {
+        let accepted =
+            std::env::var_os("CEREBELLUM_DESK_TEST_SKIP_OK").is_some_and(|value| value == "1");
+        std::process::exit(if accepted { 0 } else { 2 });
     }
 
     /// Ends the helper however the measurement ends, including by panic, so no
