@@ -129,6 +129,31 @@ pub fn take_fronting_timings() -> Vec<FrontingTiming> {
     crate::terminal_arbiter::probe_timing::take_timings()
 }
 
+#[derive(Default)]
+pub struct PictureBracketProbe {
+    pub before_capture: Option<cerebellum_computer::app_state::image::ImageDecision>,
+    pub after_capture: Option<cerebellum_computer::app_state::image::ImageDecision>,
+    pub bracket: Option<cerebellum_computer::dispatch::BracketReport>,
+    pub cutoff: Option<std::time::Instant>,
+    pub deadline: Option<std::time::Instant>,
+}
+
+static PICTURE_BRACKET: std::sync::Mutex<Option<PictureBracketProbe>> = std::sync::Mutex::new(None);
+
+pub fn begin_picture_bracket_probe() {
+    *PICTURE_BRACKET.lock().unwrap() = Some(PictureBracketProbe::default());
+}
+
+pub fn take_picture_bracket_probe() -> Option<PictureBracketProbe> {
+    PICTURE_BRACKET.lock().unwrap().take()
+}
+
+pub(crate) fn note_picture_bracket_probe(update: impl FnOnce(&mut PictureBracketProbe)) {
+    if let Some(probe) = PICTURE_BRACKET.lock().unwrap().as_mut() {
+        update(probe);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -49,6 +49,7 @@ use serde_json::{json, Value};
 
 use super::action_effects::{append_lines, ActionEffects};
 use super::cursor::{Arrival, BadgeWatch, Landing};
+use super::press_reply_windows::{certify_press_reply_windows, quiet_reply_window_change};
 use crate::computer_grants::{ConsentContext, ConsentRefusal, GrantAdmission};
 use crate::management::ManagementPlane;
 use crate::CancelHandle;
@@ -217,6 +218,9 @@ pub(crate) fn person_change_since_seen(
         return Ok(None);
     };
     let now = SeenMarks::read(source, grant);
+    if quiet_reply_window_change(source, grant, &seen, &now) {
+        return Ok(None);
+    }
     if let Some(change) = person_change(&seen, &now, false, None) {
         return Ok(Some(change));
     }
@@ -264,6 +268,9 @@ pub(crate) fn person_check_before_action(
         return Ok(PersonCheck::Unchanged);
     };
     let now = SeenMarks::read(source, grant);
+    if quiet_reply_window_change(source, grant, &seen, &now) {
+        return Ok(PersonCheck::Unchanged);
+    }
     // Autosave can retitle the same window after our input returns. A title
     // alone is not evidence of a person when the input watcher covered the
     // entire interval and saw no hardware input. Keep window identity, window
@@ -2796,12 +2803,13 @@ where
             if let Some(record) = fronting.row_record() {
                 journal.set_fronting(record);
             }
+            let press_at = Instant::now();
             let mut reply =
                 press_blocking(source.as_ref(), &mut journal, &grant, &element_id, &handle);
             if gate.refused_for_end() {
                 reply = cancelled_before_dispatch_reply();
             }
-            if reply["outcome"] == "completed" {
+            let observed = if reply["outcome"] == "completed" {
                 let observed = settle_and_observe_view(
                     source.as_ref(),
                     &sessions,
@@ -2821,9 +2829,24 @@ where
                     Some(&mut journal.effects),
                 );
                 add_diff_view(&mut reply, observed.as_ref(), &view);
-            }
+                observed
+            } else {
+                None
+            };
             if journal.finish().is_err() {
                 reply = audit_unavailable_reply(true);
+            } else if view.zoom.is_none() && view.roles.is_empty() && view.text.is_none() {
+                if let Some(observed) = &observed {
+                    certify_press_reply_windows(
+                        source.as_ref(),
+                        &sessions,
+                        &grant,
+                        &identity.conversation_key,
+                        &observed.read,
+                        &reply,
+                        press_at,
+                    );
+                }
             }
             (reply, journal.effects.lines)
         })

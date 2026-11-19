@@ -14,7 +14,7 @@ use cerebellum::computer_capability::{
     servable, ComputerPlane, ResultSchemaEnforcement, ServeContext,
 };
 use cerebellum::management::ManagementPlane;
-use cerebellum_computer::app_state::source::RawElement;
+use cerebellum_computer::app_state::source::{ElementFacts, RawElement};
 use cerebellum_computer::capture::InMemoryCaptureBackend;
 use cerebellum_computer::platform::{
     AccessibilityTreeRequest, AccessibilityTreeResult, AttendancePreconditionRequest,
@@ -29,7 +29,7 @@ use cerebellum_core::journal::{InMemoryJournalStorage, ValidatedSeverityTaxonomy
 use serde_json::{json, Value};
 use support::computer::{
     audit, facts, grant, granted_management, identity, no_relay, Desk, DeskElement, DeskFocus,
-    TestRedactor, GRANTEE, TARGET_BUNDLE_ID,
+    DeskHook, TestRedactor, GRANTEE, TARGET_BUNDLE_ID,
 };
 
 /// The pid the desk's input count gives this module's own posts.
@@ -417,6 +417,101 @@ async fn a_press_after_this_module_s_own_press_moved_focus_is_allowed() {
 
     assert_eq!(second["outcome"], "completed", "{second}");
     assert_eq!(rig.presses(), vec![SEND, SEND]);
+}
+
+/// The accessibility reply can show a new window before the window server's
+/// on-screen list catches up.
+async fn press_to_open_document(rig: &Rig) -> String {
+    const DOCUMENT: u64 = 2;
+    const EDITOR: u64 = 20;
+    let desk = rig.desk.clone().with_element(
+        EDITOR,
+        DeskElement {
+            facts: ElementFacts {
+                value_settable: true,
+                ..facts("AXTextArea", &[])
+            },
+            value: Some(String::new()),
+            applies_writes: true,
+            ..DeskElement::default()
+        },
+    );
+    rig.desk.state().visible_windows = Some(vec![1]);
+    let send = rig.read().await;
+    rig.desk.state().on_press = Some(DeskHook(Arc::new(move || {
+        let mut desk = desk.state();
+        let mut editor = RawElement::fixture(EDITOR, "AXTextArea").titled("Editor");
+        editor.value_settable = true;
+        let mut window = RawElement::fixture(DOCUMENT, "AXWindow")
+            .titled("Untitled 2")
+            .with_children(vec![editor]);
+        window.main_window = true;
+        window.focused_window = true;
+        desk.roots.insert(0, window);
+        desk.focus = DeskFocus::Element(EDITOR);
+        desk.focused_in_tree = Some(EDITOR);
+        desk.window = Some((DOCUMENT, Some("Untitled 2".into())));
+        desk.element_windows
+            .extend([(1, 1), (DOCUMENT, 2), (EDITOR, 2)]);
+    })));
+    let reply = rig.press(&send).await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    let text = reply["state_text"].as_str().expect("the press shows state");
+    assert!(text.contains("Untitled 2"), "{reply}");
+    assert_eq!(rig.presses(), vec![SEND]);
+    reply["focused_element_id"]
+        .as_str()
+        .filter(|_| text.contains("Editor"))
+        .expect("the new editor is focused and shown in the reply")
+        .to_owned()
+}
+
+async fn write_document(rig: &Rig, editor: &str) -> Value {
+    rig.serve(
+        "computer.write_text",
+        json!({"element_id": editor, "text": "hi", "write_mode": "replace_value"}),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn write_can_follow_a_press_that_shows_its_new_window() {
+    let rig = rig().await;
+    let editor = press_to_open_document(&rig).await;
+    rig.desk.state().visible_windows = Some(vec![2, 1]);
+
+    let reply = write_document(&rig, &editor).await;
+
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(rig.desk.state().writes.len(), 1);
+}
+
+#[tokio::test]
+async fn a_dialog_not_shown_by_the_press_reply_still_refuses_the_write() {
+    let rig = rig().await;
+    let editor = press_to_open_document(&rig).await;
+    rig.desk.state().visible_windows = Some(vec![3, 2, 1]);
+
+    let reply = write_document(&rig, &editor).await;
+
+    assert_person_refusal(&reply, "window_changed");
+    assert!(rig.desk.state().writes.is_empty());
+}
+
+#[tokio::test]
+async fn hardware_input_after_the_press_reply_still_refuses_the_write() {
+    let rig = rig().await;
+    let editor = press_to_open_document(&rig).await;
+    {
+        let mut state = rig.desk.state();
+        state.visible_windows = Some(vec![2, 1]);
+        state.input.push((0, Instant::now()));
+    }
+
+    let reply = write_document(&rig, &editor).await;
+
+    assert_person_refusal(&reply, "window_changed");
+    assert!(rig.desk.state().writes.is_empty());
 }
 
 #[tokio::test]

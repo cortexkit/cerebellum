@@ -154,7 +154,11 @@ mod window_follow;
 #[cfg(target_os = "macos")]
 pub use window_follow::{watch_window, AxWindowChange, AxWindowWatch};
 #[cfg(all(target_os = "macos", feature = "desk-probe"))]
+mod picture_probe_timing;
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
 mod pointer_probe;
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
+pub use picture_probe_timing::{begin_picture_timing_for_probe, take_picture_timing_for_probe};
 // The fail-closed rule is pure Rust, so its tests run on every host; off
 // macOS only those tests use it.
 #[cfg(any(target_os = "macos", test))]
