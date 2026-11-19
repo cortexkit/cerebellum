@@ -86,6 +86,11 @@ fn fixture_binding(path: &str, before: &[Token], name: &str) -> bool {
         // Offline CLI inspection launches the module fixture, never a browser.
         || (path == "cerebellum/tests/manifest_flag.rs"
             && expression.starts_with(&["support", "::", "daemon_binary", "(", "ckdev-cerebellum-manifest"]))
+        // The managed-settings cases relaunch a ckdev- copy of this test
+        // binary in a fenced process, never a browser.
+        || (path == "cerebellum/tests/registration_live.rs"
+            && name == "exe"
+            && expression.starts_with(&["support", "::", "daemon_binary", "(", "ckdev-cerebellum-settings"]))
         // The live registration suite's launcher runs the module the test
         // names in NONCE_LAUNCH_PROGRAM (the test-built ck-cerebellum), never
         // a browser; any other source for its program is refused.

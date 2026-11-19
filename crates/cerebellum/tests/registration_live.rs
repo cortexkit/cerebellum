@@ -791,7 +791,10 @@ async fn check_managed_settings(test: &str, queue_age_stale_ms: u64, refusal: Op
                 .args(["--exact", test, "--nocapture"])
                 .envs(cortexkit_test_support::fenced_subc_daemon_env(homes.path()))
                 .env(FIXTURE_HOME, homes.path())
-                // Use a file-backed test anchor, not the operator's keychain.
+                // The daemon's settings store needs a trust anchor for its
+                // integrity seal. This makes the test daemon keep it in a
+                // file under the fenced home instead of the operator's
+                // keychain.
                 .env("SUBC_TEST_CONFIG_GATE", "1")
                 .kill_on_drop(true)
                 .output(),
