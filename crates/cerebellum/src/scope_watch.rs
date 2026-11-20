@@ -536,6 +536,33 @@ impl ScopeRevocation {
             .unwrap_or_default()
     }
 
+    /// After `key`'s session ended definitively and its conversations were
+    /// revoked, forget the conversations its epoch noted: they protect nothing
+    /// more. The epoch itself stays, so a late bind of that or a lower epoch
+    /// is still refused as stale and cannot revive the ended session.
+    pub fn forget_ended(&self, key: &ScopeKey) {
+        let (owner, scope_ref, _) = key.projection();
+        let mut epochs = self.epochs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(seen) = epochs
+            .get_mut(&(owner, scope_ref.to_owned()))
+            .filter(|seen| seen.epoch == key.scope_epoch)
+        {
+            seen.conversations.clear();
+        }
+    }
+
+    /// The conversations the highest epoch of `stamp`'s `(owner, ref)` noted.
+    #[cfg(test)]
+    pub(crate) fn epoch_conversations(&self, stamp: &ScopeStamp) -> BTreeSet<String> {
+        let owner = ScopeKey::from_stamp(stamp).projection().0;
+        self.epochs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(owner, stamp.scope_ref.clone()))
+            .map(|seen| seen.conversations.clone())
+            .unwrap_or_default()
+    }
+
     /// Whether anything watches `key`.
     pub fn is_watching(&self, key: &ScopeKey) -> bool {
         self.watched().contains_key(key)
@@ -625,6 +652,43 @@ mod tests {
             };
             assert_ne!(old, ScopeKey::from_stamp(&stamp));
         }
+    }
+
+    /// A definitive end drops the conversations its epoch noted, so many
+    /// sequential sessions on distinct refs hold no conversation strings once
+    /// they end. The epoch stays: a late bind of a lower epoch still refuses.
+    #[test]
+    fn an_ended_scope_forgets_its_conversations_but_still_refuses_stale_binds() {
+        let scopes = ScopeRevocation::default();
+        let mut stamp = crate::computer_grants::tests::stamp("ended-scope");
+        stamp.scope_epoch = 2;
+        assert_eq!(scopes.note_bind(&stamp, "first"), BindEpoch::Current);
+        assert_eq!(scopes.note_bind(&stamp, "second"), BindEpoch::Current);
+        let older = ScopeKey {
+            scope_epoch: 1,
+            ..ScopeKey::from_stamp(&stamp)
+        };
+        scopes.forget_ended(&older);
+        assert_eq!(
+            scopes.epoch_conversations(&stamp).len(),
+            2,
+            "an older epoch's end leaves the current epoch's conversations"
+        );
+        scopes.forget_ended(&ScopeKey::from_stamp(&stamp));
+        assert!(scopes.epoch_conversations(&stamp).is_empty());
+        let mut late = stamp.clone();
+        late.scope_epoch = 1;
+        assert_eq!(
+            scopes.note_bind(&late, "late"),
+            BindEpoch::Stale { current: 2 }
+        );
+        stamp.scope_epoch = 3;
+        assert_eq!(
+            scopes.note_bind(&stamp, "next"),
+            BindEpoch::Advanced {
+                ended_conversations: BTreeSet::new()
+            }
+        );
     }
 
     #[test]

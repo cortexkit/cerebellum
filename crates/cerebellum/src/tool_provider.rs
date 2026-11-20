@@ -467,21 +467,10 @@ pub(crate) async fn serve(
     };
     match result {
         Ok(result) => {
-            let delivered: Vec<String> = if name == ops::LATE_RESULTS {
-                result["entries"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|entry| entry["call_key"].as_str().map(str::to_owned))
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            // A resumed browser reply stays in the bounded memory cache until
+            // late_results.ack names it: the consumer may lose this response
+            // and pull the same cursor again.
             send_tool_response(writer, ver, channel, epoch, corr, result).await?;
-            planes.calls.browser_results_delivered(
-                &journal::call_records::principal_label(facts.principal.as_ref()),
-                &delivered,
-            );
             Ok(())
         }
         Err(error) => {

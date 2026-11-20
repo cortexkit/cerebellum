@@ -169,9 +169,11 @@ use subc_protocol::{
     PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
+use tokio::io::AsyncRead;
+#[cfg(test)]
+use tokio::io::AsyncWrite;
 #[cfg(test)]
 use tokio::io::AsyncWriteExt;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -214,7 +216,7 @@ use cerebellum_core::principal::{
     principal_label, SESSION_CALLER_NOT_ADMITTED, SESSION_CALLER_NOT_ADMITTED_REMEDY,
 };
 pub use cerebellum_core::principal::{trust_for_principal, PrincipalTrust};
-use egress::{drain_writer, request_id, ConnectionDeadlines};
+use egress::{drive_connection, request_id, ConnectionDeadlines};
 use terminal_arbiter::run_arbitrated_route;
 pub use terminal_arbiter::{
     CallStep, DispatchGate, HeldState, TerminalArbiter, TerminalCause, CALL_TERMINAL,
@@ -1488,6 +1490,8 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
         let answer = planes.scopes.describe(&writer, &key).await;
         if held_scope_end(answer.as_ref(), &key) {
             settle_scope_holds(&planes, &key);
+            // Revocation below must find the holds already settled as ended.
+            call_record_supervisor::settled_in_order(&planes).await;
         }
         if scope_watch::classify(answer.as_ref(), key.scope_epoch)
             == scope_watch::ScopeVerdict::Ended
@@ -1521,6 +1525,7 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
             conversations.extend(planes.routes.conversations_under_scope(&key));
             let _ = planes.consent.forget_session(&session);
             revoke_scope(&planes, &conversations).await;
+            planes.scopes.forget_ended(&key);
             return;
         }
         let browser_open = planes
@@ -1578,12 +1583,20 @@ fn held_scope_end(
 /// its cancellation predicate; the persistent browser keeps its normal handoff
 /// and teardown policy.
 fn settle_scope_holds(planes: &Planes, key: &scope_watch::ScopeKey) {
-    planes
-        .browser_resumes
-        .cancel_scope(&held_scope_identity(key));
-    let _ = planes
-        .calls
-        .end_held_scope(&held_scope_identity(key), wall_clock_ms());
+    let scope = held_scope_identity(key);
+    planes.browser_resumes.cancel_scope(&scope);
+    planes.calls.latch_scope(&scope);
+    call_record_supervisor::settle_in_order(planes, move |calls| {
+        let _ = calls.end_held_scope(&scope, wall_clock_ms());
+    });
+}
+
+/// After the route's held browser requests are settled, in the same order.
+fn end_call_conversation(planes: &Planes, conversation_key: &str) {
+    let conversation_key = conversation_key.to_owned();
+    call_record_supervisor::settle_in_order(planes, move |calls| {
+        calls.end_conversation(&conversation_key)
+    });
 }
 
 /// A codemode run borrows its parent agent conversation's browser and grants.
@@ -2623,49 +2636,6 @@ where
     .await
 }
 
-async fn drive_connection<W, F, Fut>(
-    write_half: W,
-    deadlines: Arc<ConnectionDeadlines>,
-    run_loop: F,
-) -> Result<(), ModuleError>
-where
-    W: AsyncWrite + Unpin + Send + 'static,
-    F: FnOnce(mpsc::Sender<Frame>) -> Fut,
-    Fut: std::future::Future<Output = Result<(), ModuleError>>,
-{
-    let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
-    let mut writer = tokio::spawn(drain_writer(write_half, rx, Arc::clone(&deadlines)));
-    let mut loop_task = Box::pin(run_loop(tx.clone()));
-
-    let loop_result = tokio::select! {
-        // Preserve the existing diagnostic precedence when both sides become
-        // ready together: a concrete loop error is more specific than the
-        // writer shutdown it can induce.
-        biased;
-        loop_result = &mut loop_task => loop_result,
-        writer_result = &mut writer => {
-            return report_writer_first(normalize_writer_task_result(writer_result));
-        }
-        _ = deadlines.expired() => {
-            writer.abort();
-            let _ = writer.await;
-            return Err(ModuleError::Message("terminal delivery deadline exceeded".into()));
-        }
-    };
-
-    drop(loop_task);
-    drop(tx);
-    let writer_result = tokio::select! {
-        result = &mut writer => normalize_writer_task_result(result),
-        _ = deadlines.expired() => {
-            writer.abort();
-            let _ = writer.await;
-            Err(ModuleError::Message("terminal delivery deadline exceeded".into()))
-        }
-    };
-    reconcile_connection_results(loop_result, writer_result)
-}
-
 /// Derive the bounded idle-wake cadence from the configured heartbeat stale
 /// threshold. The wake fires at half the threshold (floored at 1 ms) so the
 /// idle loop always re-stamps the heartbeat at least once well inside the
@@ -3497,11 +3467,10 @@ async fn handle_frame(
             planes
                 .cancellations
                 .cancel_route(frame.header.channel, frame.header.epoch);
-            planes.calls.abandon_browser_route(
-                frame.header.channel,
-                frame.header.epoch,
-                wall_clock_ms(),
-            );
+            let (channel, epoch) = (frame.header.channel, frame.header.epoch);
+            call_record_supervisor::settle_in_order(planes, move |calls| {
+                calls.abandon_browser_route(channel, epoch, wall_clock_ms())
+            });
             planes
                 .browser_resumes
                 .cancel_route(frame.header.channel, frame.header.epoch);
@@ -3531,7 +3500,7 @@ async fn handle_frame(
                         // conversation.
                         if last_route {
                             planes.management.end_conversation(conversation_key);
-                            planes.calls.end_conversation(conversation_key);
+                            end_call_conversation(planes, conversation_key);
                             planes.image_handles.end_conversation(conversation_key);
                         }
                         if let Some(config) = planes.browser_config.as_ref() {
@@ -3551,7 +3520,7 @@ async fn handle_frame(
                         if last_route {
                             // Held reply bodies are a memory bound, not a
                             // permission: they go with the last route as always.
-                            planes.calls.end_conversation(conversation_key);
+                            end_call_conversation(planes, conversation_key);
                             planes.image_handles.end_conversation(conversation_key);
                         }
                         let key = scope_watch::ScopeKey::from_stamp(stamp);
@@ -3564,29 +3533,16 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Cancel => {
-            planes.browser_resumes.cancel_correlation((
-                frame.header.channel,
-                frame.header.epoch,
-                frame.header.corr,
-            ));
-            planes.calls.abandon_browser_correlation(
-                frame.header.channel,
-                frame.header.epoch,
-                frame.header.corr,
-                wall_clock_ms(),
-            );
+            let address = (frame.header.channel, frame.header.epoch, frame.header.corr);
+            planes.browser_resumes.cancel_correlation(address);
+            // Signal cancellation without touching call-record storage; its
+            // journal settlement runs after, off this loop, behind the latch.
+            planes.calls.latch_correlation(address);
             terminal_arbiter::cancel_late_fronting_request(
                 planes.cancellations.namespace(),
-                (frame.header.channel, frame.header.epoch, frame.header.corr),
+                address,
             );
-            match (
-                frame.header.channel,
-                planes.cancellations.get((
-                    frame.header.channel,
-                    frame.header.epoch,
-                    frame.header.corr,
-                )),
-            ) {
+            match (frame.header.channel, planes.cancellations.get(address)) {
                 (0, _) => {}
                 (_, Some(handle)) => {
                     handle.cancel();
@@ -3603,6 +3559,9 @@ async fn handle_frame(
                 // are explicitly ignored without a reply, error, or log.
                 (_, None) => {}
             }
+            call_record_supervisor::settle_in_order(planes, move |calls| {
+                calls.abandon_browser_correlation(address.0, address.1, address.2, wall_clock_ms())
+            });
             Ok(true)
         }
         FrameType::Request if frame.header.channel == 0 => {
@@ -3630,9 +3589,13 @@ async fn handle_frame(
             };
             let (envelope_ms, reply_ms) = route_limits(&frame, planes);
             let connection_end = arrived + Duration::from_millis(reply_ms);
-            planes
-                .egress_deadlines
-                .arm(request_id(&frame), connection_end);
+            // A resumed held call replies on a private channel, never this
+            // connection's writer, so nothing would clear its deadline here.
+            if !browser_held::resuming() {
+                planes
+                    .egress_deadlines
+                    .arm(request_id(&frame), connection_end);
+            }
             if planes.draining.load(std::sync::atomic::Ordering::Acquire) {
                 let (reason, deadline_ms) =
                     planes.drain_notice.get().expect("drain notice published");
@@ -4722,12 +4685,16 @@ pub fn browser_plane_with_shared_grants_for_test(
     BrowserPlane::new().with_shared_grants(grants)
 }
 
+/// One frame through the wire loop's handler, then the call-record work it
+/// handed off, so a test observes the journal the frame settled.
 pub async fn handle_frame_for_test(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     planes: &Planes,
 ) -> Result<bool, ModuleError> {
-    handle_frame(frame, writer, planes).await
+    let handled = handle_frame(frame, writer, planes).await;
+    call_record_supervisor::settled_in_order(planes).await;
+    handled
 }
 
 /// The tool path with a route stamped `scope_ref`, for fixtures whose captures

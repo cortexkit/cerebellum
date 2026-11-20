@@ -368,6 +368,40 @@ fn wire_entry(record: &CallRecord) -> Option<LateEntry> {
     Some(entry)
 }
 
+/// Forget exact scope ends that no record still names. An end matters only
+/// to a hold, claim or capture deposit, and each of those has a record naming
+/// its scope (or its head's, while held); the daemon closes a scope's routes
+/// when it ends, so no new call can arrive under it afterwards. Keeping the
+/// tombstone while any such record remains keeps every refusal it makes, and
+/// bounds the set by the record count rather than by history.
+pub(super) fn retire_ended_scopes(inner: &mut Inner) {
+    if inner.ended_scopes.is_empty() {
+        return;
+    }
+    let named: std::collections::HashSet<&ScopeIdentity> = inner
+        .entries
+        .values()
+        .flat_map(|entry| {
+            [
+                entry.record.scope.as_ref(),
+                entry.record.handoff.as_ref().map(|held| &held.scope),
+                entry
+                    .browser_hold
+                    .as_ref()
+                    .and_then(|hold| hold.head_scope.as_ref()),
+            ]
+        })
+        .flatten()
+        .collect();
+    let kept: std::collections::HashSet<ScopeIdentity> = inner
+        .ended_scopes
+        .iter()
+        .filter(|scope| named.contains(scope))
+        .cloned()
+        .collect();
+    inner.ended_scopes = kept;
+}
+
 pub(super) fn settled_result(record: &CallRecord) -> Option<Value> {
     let handoff = record.handoff.as_ref()?;
     if matches!(handoff.phase, Phase::Pending) {
@@ -474,6 +508,9 @@ impl CallRecords {
     ) -> Result<(), CallRecordError> {
         let mut inner = self.lock();
         inner.ended_scopes.insert(scope.clone());
+        // The scope is now recorded as ended, which every claim checks, so
+        // the latch set when the end was announced is no longer needed.
+        self.latch.end_scope(scope);
         for entry in inner.entries.values_mut().filter(|entry| {
             entry
                 .browser_hold
@@ -506,7 +543,7 @@ impl CallRecords {
     }
 
     pub(crate) fn held_scope_ended(&self, scope: &ScopeIdentity) -> bool {
-        self.lock().ended_scopes.contains(scope)
+        self.latch.scope(scope) || self.lock().ended_scopes.contains(scope)
     }
 
     /// Serialize the deposit boundary with scope end. After this returns true,
@@ -523,6 +560,7 @@ impl CallRecords {
         if !held.capture
             || !matches!(held.phase, Phase::Pending)
             || inner.ended_scopes.contains(&held.scope)
+            || self.latch.scope(&held.scope)
         {
             return false;
         }
@@ -904,6 +942,7 @@ impl CallRecords {
         let entry = inner.entries.get_mut(key).expect("acked record exists");
         entry.record = record;
         entry.late_seq = None;
+        Self::release_resumed_reply(inner, key);
         Ok(())
     }
 
@@ -1225,6 +1264,62 @@ mod tests {
             .unwrap()
             .entries
             .is_empty());
+    }
+
+    /// An acknowledgement whose append reaches the compaction threshold must
+    /// be part of the rewritten file, or a restart would deliver the acked
+    /// result again.
+    #[test]
+    fn an_ack_that_triggers_compaction_stays_acked_after_restart() {
+        let storage = InMemoryCallRecordStorage::new();
+        let calls = CallRecords::open(Box::new(storage.clone()), 100);
+        settled(&calls, "pf:acked", "s1", 100);
+        let pulled = calls
+            .late_results(OWNER, &LateResultsRequest::new(), 100)
+            .unwrap();
+        assert_eq!(pulled.entries.len(), 1);
+        calls.lock().appended_since_compaction = MAX_RECORDS - 1;
+        calls
+            .ack_late_results(
+                OWNER,
+                &AckRequest {
+                    through: pulled.cursor,
+                },
+                101,
+            )
+            .unwrap();
+        assert_eq!(
+            calls.lock().appended_since_compaction,
+            0,
+            "the acknowledgement must have triggered compaction"
+        );
+        drop(calls);
+        let reopened = CallRecords::open(Box::new(storage), 102);
+        assert!(reopened
+            .late_results(OWNER, &LateResultsRequest::new(), 102)
+            .unwrap()
+            .entries
+            .is_empty());
+    }
+
+    /// Exact scope ends are kept only while a record still names the scope,
+    /// so they do not pile up with session history, and every refusal a kept
+    /// one makes still holds.
+    #[test]
+    fn ended_scope_tombstones_last_only_while_a_record_names_the_scope() {
+        let calls = CallRecords::in_memory();
+        hold(&calls, "pf:held", "named", 10);
+        calls.end_held_scope(&scope("named"), 11).unwrap();
+        calls.end_held_scope(&scope("unnamed"), 11).unwrap();
+        assert!(calls.held_scope_ended(&scope("unnamed")));
+        CallRecords::apply_retention(&mut calls.lock(), 12, None);
+        assert!(calls.held_scope_ended(&scope("named")));
+        assert!(!calls.held_scope_ended(&scope("unnamed")));
+        assert_eq!(calls.lock().ended_scopes.len(), 1);
+        let reply = calls
+            .late_results(OWNER, &LateResultsRequest::new(), 12)
+            .unwrap();
+        assert_eq!(reply.entries[0].reason.as_deref(), Some("scope_ended"));
     }
 
     #[test]

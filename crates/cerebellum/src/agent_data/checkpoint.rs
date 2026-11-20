@@ -1,4 +1,11 @@
 //! Per-cut replay records are separate from permanent privacy marks.
+//!
+//! Finished cuts are kept for good, holding only their step and saved
+//! replies, so a repeated request keeps getting its first reply. Retiring
+//! them would need two things first: a replay-retention window stated by the
+//! agent-data role contract, since a retired cut answers as unknown, and a
+//! new checkpoint format version behind the format floor to record when
+//! each cut finished.
 
 use super::*;
 use cerebellum_core::format_floor::{FormatFloor, FORMAT_FLOOR_FILE};
@@ -77,19 +84,25 @@ impl Participant {
         .map_err(unavailable)?
     }
 
+    /// Persist `document`, then hand it back with the lock. Serializing and
+    /// writing the whole document both run on a blocking thread, so a large
+    /// checkpoint never occupies an async worker. A durable participant reads
+    /// its state from the file on every request, so only the in-memory one
+    /// keeps a copy under the lock.
     pub(super) async fn save(
         &self,
-        document: &Document,
-        guard: tokio::sync::OwnedMutexGuard<Document>,
-    ) -> Result<tokio::sync::OwnedMutexGuard<Document>, ErrorBody> {
+        document: Document,
+        mut guard: tokio::sync::OwnedMutexGuard<Document>,
+    ) -> Result<(tokio::sync::OwnedMutexGuard<Document>, Document), ErrorBody> {
         let Some(path) = self.path.clone() else {
-            return Ok(guard);
+            *guard = document.clone();
+            return Ok((guard, document));
         };
-        let bytes = serde_json::to_vec(document).map_err(unavailable)?;
-        if bytes.len() > 16 * 1024 * 1024 {
-            return Err(unavailable("checkpoint file exceeds size limit"));
-        }
         tokio::task::spawn_blocking(move || {
+            let bytes = serde_json::to_vec(&document).map_err(unavailable)?;
+            if bytes.len() > 16 * 1024 * 1024 {
+                return Err(unavailable("checkpoint file exceeds size limit"));
+            }
             // Keep the checkpoint lock held until the actual disk write ends,
             // even when the request waiting for this thread is cancelled.
             let floor = FormatFloor::at(
@@ -99,7 +112,7 @@ impl Participant {
             );
             floor.raise(CHECKPOINT_FORMAT).map_err(unavailable)?;
             crate::private_content::write_atomically(&path, &bytes).map_err(unavailable)?;
-            Ok(guard)
+            Ok((guard, document))
         })
         .await
         .map_err(unavailable)?

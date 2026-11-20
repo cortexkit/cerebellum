@@ -222,8 +222,7 @@ impl Participant {
                         );
                     }
                     document.cuts.insert(id.to_owned(), cut.clone());
-                    memory = self.save(&document, memory).await?;
-                    *memory = document.clone();
+                    (memory, document) = self.save(document, memory).await?;
                 } else if cut.refs.as_ref().is_some_and(|saved| !saved.same_set(refs)) {
                     return Err(detailed(
                         RefusalCode::InvalidState,
@@ -289,6 +288,13 @@ impl Participant {
             _ => unreachable!("reads returned above"),
         };
         cut.step = next;
+        // No op after a finished step reads the snapshot or the ref set: the
+        // saved replies below answer every repeat. Dropping them keeps a
+        // finished cut small; see the checkpoint module for retiring it.
+        if matches!(next, Step::Activated | Step::Released | Step::Aborted) {
+            cut.payloads.clear();
+            cut.refs = None;
+        }
         cut.replies.insert(
             op.method().into(),
             checkpoint::Reply {
@@ -297,8 +303,7 @@ impl Participant {
             },
         );
         document.cuts.insert(id.to_owned(), cut);
-        memory = self.save(&document, memory).await?;
-        *memory = document;
+        self.save(document, memory).await?;
         Ok(reply)
     }
 }

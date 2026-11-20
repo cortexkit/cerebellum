@@ -120,6 +120,9 @@ struct State {
 
 struct Tracked {
     order: u64,
+    /// The wire request this call was armed for, so its index entry goes
+    /// with the call directly instead of by scanning every tracked request.
+    request: RequestId,
     runner: Principal,
     key: String,
     pin: String,
@@ -146,7 +149,15 @@ impl State {
     fn remove_call(&mut self, key: &Key) {
         if let Some(call) = self.calls.remove(key) {
             self.waiting_order.remove(&call.order);
-            self.requests.retain(|_, local| local != key);
+            self.forget_request(call.request, key);
+        }
+    }
+
+    /// Drop `request`'s index entry if it still names `key`; a reused
+    /// correlation may already name a newer call.
+    fn forget_request(&mut self, request: RequestId, key: &Key) {
+        if self.requests.get(&request) == Some(key) {
+            self.requests.remove(&request);
         }
     }
 }
@@ -530,6 +541,7 @@ impl Records {
             local,
             Tracked {
                 order,
+                request: request_id(frame),
                 runner,
                 key,
                 pin,
@@ -560,6 +572,7 @@ impl Records {
         let (outcome, reason) = outcome(body, frame.header.ty == FrameType::Error);
         Some(Prepared {
             key,
+            request: request_id(frame),
             outcome,
             reason: reason.map(str::to_owned),
             posts: body
@@ -584,7 +597,7 @@ impl Records {
         let writes = {
             let mut state = self.state.lock().unwrap();
             let key = prepared.key;
-            state.requests.retain(|_, local| local != &key);
+            state.forget_request(prepared.request, &key);
             let consent_result = prepared
                 .ask
                 .as_ref()
@@ -717,6 +730,7 @@ impl Records {
 
 pub(crate) struct Prepared {
     key: Key,
+    request: RequestId,
     outcome: &'static str,
     reason: Option<String>,
     posts: Option<i64>,

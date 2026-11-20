@@ -13,6 +13,7 @@ pub(crate) struct CallRecordWorkers {
     permits: Arc<tokio::sync::Semaphore>,
     detached: std::sync::atomic::AtomicUsize,
     settlements: Mutex<HashMap<(String, String), PendingRecordSettlement>>,
+    ordered: OrderedSettlements,
     #[cfg(test)]
     pub(crate) lookup_observations: Mutex<Vec<LookupObservation>>,
     // A per-Planes barrier seam keeps concurrent fixture commits deterministic.
@@ -56,6 +57,7 @@ impl Default for CallRecordWorkers {
             )),
             detached: std::sync::atomic::AtomicUsize::new(0),
             settlements: Mutex::new(HashMap::new()),
+            ordered: OrderedSettlements::default(),
             #[cfg(test)]
             lookup_observations: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -394,6 +396,65 @@ pub(crate) async fn begin_call_record(
     }
 }
 
+type OrderedJob = Box<dyn FnOnce() + Send>;
+
+/// Call-record work handed off by the wire loop: withdrawing a cancelled
+/// held call, settling a closed route's or ended scope's holds. A record write
+/// syncs to disk under the call-record mutex, so doing it on the wire loop
+/// would stall every other frame behind a slow disk, including the CANCEL
+/// that should stop an action. One task runs the jobs one at a time, in the
+/// order the frames arrived, on a blocking thread. Each job is a few words of
+/// captured state; the daemon's frame rate bounds how many can wait.
+struct OrderedSettlements {
+    sender: tokio::sync::mpsc::UnboundedSender<OrderedJob>,
+    /// Taken by the first job, which starts the one runner inside the runtime.
+    receiver: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<OrderedJob>>>,
+}
+
+impl Default for OrderedSettlements {
+    fn default() -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            sender,
+            receiver: Mutex::new(Some(receiver)),
+        }
+    }
+}
+
+/// Run `job` on the call records after every job handed off before it,
+/// without waiting for it. Callers signal live cancellation first and latch
+/// anything a consent claim could still take.
+pub(crate) fn settle_in_order(
+    planes: &Planes,
+    job: impl FnOnce(&journal::call_records::CallRecords) + Send + 'static,
+) {
+    let ordered = &planes.call_record_workers.ordered;
+    let taken = ordered
+        .receiver
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    if let Some(mut receiver) = taken {
+        tokio::spawn(async move {
+            while let Some(job) = receiver.recv().await {
+                let _ = tokio::task::spawn_blocking(job).await;
+            }
+        });
+    }
+    let calls = Arc::clone(&planes.calls);
+    let _ = ordered.sender.send(Box::new(move || job(&calls)));
+}
+
+/// Wait until every job handed to [`settle_in_order`] so far has run. Test
+/// drivers that model the wire loop use it to observe the settled journal.
+pub(crate) async fn settled_in_order(planes: &Planes) {
+    let (done, finished) = tokio::sync::oneshot::channel();
+    settle_in_order(planes, move |_| {
+        let _ = done.send(());
+    });
+    let _ = finished.await;
+}
+
 pub(crate) async fn settle_call_record(planes: &Planes, settle: impl FnOnce() + Send + 'static) {
     let task = CallRecordTask::new(&planes.call_record_workers);
     let _wait = CallRecordWait(Arc::clone(&task));
@@ -542,6 +603,51 @@ mod call_record_deadline_tests {
 
     fn body(frame: &Frame) -> Value {
         serde_json::from_slice(&frame.body).unwrap()
+    }
+
+    /// Another call's record write can sit in a slow disk sync while holding
+    /// the call-record mutex. A CANCEL must still reach its live request and
+    /// the wire loop must keep answering, without waiting for that write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_and_ping_do_not_wait_for_a_stuck_record_write() {
+        // Write 1 creates the file; write 2 is an unrelated admission.
+        let (planes, _memory, _writes, release) = fixture(2);
+        assert!(matches!(
+            planes.calls.begin("direct", "first", "c", 1),
+            Begin::Execute(_)
+        ));
+        let calls = Arc::clone(&planes.calls);
+        let stuck = std::thread::spawn(move || drop(calls.begin("direct", "stuck", "c", 2)));
+        tokio::time::timeout(
+            crate::test_support::HANG_GUARD,
+            release.0.entered.notified(),
+        )
+        .await
+        .expect("the unrelated write reaches the barrier");
+
+        let active = planes.cancellations.register((2, 1, 7));
+        let (tx, mut rx) = mpsc::channel(4);
+        let flags = Flags::new(false, Priority::Interactive, false);
+        for frame in [
+            Frame::build(FrameType::Cancel, flags, 2, 1, 7, Vec::new()).unwrap(),
+            Frame::build(FrameType::Ping, flags, 0, 0, 9, Vec::new()).unwrap(),
+        ] {
+            // A handler blocked on the record mutex blocks its worker thread,
+            // so run it as its own task and time it from this one.
+            let (tx, planes) = (tx.clone(), planes.clone());
+            let handled =
+                tokio::spawn(async move { crate::handle_frame(frame, &tx, &planes).await });
+            tokio::time::timeout(Duration::from_secs(5), handled)
+                .await
+                .expect("the wire loop waited for another call's record write")
+                .unwrap()
+                .unwrap();
+        }
+        assert!(active.handle.is_cancelled());
+        assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Pong);
+        drop(release);
+        stuck.join().unwrap();
+        settled_in_order(&planes).await;
     }
 
     fn principal(planes: &Planes) -> String {

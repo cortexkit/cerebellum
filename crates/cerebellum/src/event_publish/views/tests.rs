@@ -316,6 +316,28 @@ async fn startup_reconcile_reuses_connection_for_already_queued_notices() {
     assert_eq!(transport.closed.load(Relaxed), 1);
 }
 
+/// A snapshot that takes a while must not hold back a notice the open
+/// connection can publish now. Real time: a paused clock would advance
+/// through the snapshot's window while the test only yields.
+#[tokio::test]
+async fn a_slow_startup_reconcile_does_not_delay_notices() {
+    let transport = startup_transport(FakeBucket {
+        watch_hangs: true,
+        ..FakeBucket::default()
+    });
+    let publisher = Publisher::new(Arc::new(Gauges::default()));
+    publisher.connect_and_reconcile(transport.clone());
+    publisher.late_result("reserved:reader", "call", "settlement:1", "ok");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while transport.published.load(Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the notice waited for view reconciliation");
+    assert_eq!(transport.opened.load(Relaxed), 1);
+}
+
 #[tokio::test(start_paused = true)]
 async fn bus_failure_does_not_block_startup_or_retry() {
     let mut transport = startup_transport(FakeBucket::default());
