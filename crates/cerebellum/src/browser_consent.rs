@@ -945,8 +945,26 @@ mod tests {
                 assert!(card.unwrap().applied);
             }
             let writes = fixture.writes();
+            let mut expected = methods.clone();
+            if !acknowledged {
+                // The failed acknowledgement is retried by the next call, which
+                // reads the feed again but neither re-applies the answer nor
+                // raises a second card.
+                fixture.service.then(
+                    "consent.answers",
+                    Reply::Result(json!({"records":[{
+                        "elicitation_id":"el_late_always",
+                        "state":"answered",
+                        "answered_choice_id":crate::management::BrowserGrantChoice::OriginAlways.option_id(),
+                    }],"cursor":1})),
+                );
+                fixture
+                    .service
+                    .then("consent.ack", Reply::Result(json!({"cursor":1})));
+                expected.extend(["consent.answers".to_string(), "consent.ack".to_string()]);
+            }
             assert_eq!(fixture.open().await["outcome"], "granted");
-            assert_eq!(fixture.service.methods(), methods);
+            assert_eq!(fixture.service.methods(), expected);
             assert_eq!(fixture.writes(), writes);
             let store = fixture.planes.management.agent_grants();
             let rows = store.live_rows(None, store.now_ms()).unwrap();

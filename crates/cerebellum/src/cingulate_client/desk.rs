@@ -362,6 +362,11 @@ pub struct CardLifecycle {
     /// time. Absent from cards raised by older builds, which ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raised_at_ms: Option<u64>,
+    /// The answers feed applied this card's answer but has not acknowledged
+    /// it yet, so the session's next call reads the feed again to do so.
+    /// Absent unless owed; older builds ignore it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ack_owed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -832,6 +837,15 @@ impl ConsentDesk {
             .filter(|card| !card.applied && card.session == *session)
             .cloned()
             .collect()
+    }
+
+    /// Whether this session owes Cingulate an acknowledgement for an answer
+    /// the drain already applied: its acknowledgement failed, so the next call
+    /// reads the feed again even with nothing left to apply.
+    pub fn owes_ack(&self, live: &LiveCall) -> bool {
+        lock(&self.registry)
+            .values()
+            .any(|card| card.lifecycle.ack_owed && may_apply_from(card, live))
     }
 
     pub fn unapplied_for(&self, live: &LiveCall) -> Vec<RaisedCard> {
@@ -1672,6 +1686,11 @@ impl DeskSession<'_> {
                         }
                     }
                 }
+                // Owed until the feed is acknowledged; the applied mark's save
+                // below stores this too.
+                if let Some(current) = lock(&self.desk.registry).get_mut(&card.elicitation_id) {
+                    current.lifecycle.ack_owed = true;
+                }
                 if self.desk.mark_applied(&card.elicitation_id).is_err() {
                     return Ok(report);
                 }
@@ -1733,6 +1752,7 @@ impl DeskSession<'_> {
             for id in seen {
                 if let Some(card) = lock(&self.desk.registry).get_mut(&id) {
                     card.lifecycle.acked = true;
+                    card.lifecycle.ack_owed = false;
                 }
             }
             let _ = self.desk.save();
