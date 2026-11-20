@@ -397,6 +397,54 @@ async fn settings_live_hint_fetches_and_applies_a_new_view_without_restart() {
     .unwrap();
 }
 
+/// One hint is enough: when the refresh it asked for gets no reply in time,
+/// the refresh is retried without waiting for another hint, so the older
+/// approved mode does not stay in effect.
+#[tokio::test(start_paused = true)]
+async fn settings_live_retries_a_refresh_whose_reply_never_came() {
+    let (writer, mut sent) = mpsc::channel(8);
+    let session = Session::new(PROTOCOL_VERSION);
+    session.mark_applied();
+    let (installed, mut updates) = tokio::sync::watch::channel(LiveSettings::default());
+    let driver = session.live(&writer, None, move |settings| {
+        installed.send_replace(settings);
+    });
+    let daemon = async {
+        assert!(session.take(&frame(
+            FrameType::Push,
+            0,
+            0,
+            0,
+            json!({"op":"config.changed","generation":1,"fields":["/computer_use/app_use"]})
+        )));
+        let lost = sent.recv().await.unwrap();
+        assert_eq!(body(&lost)["op"], "config.get");
+        // Never answered. No second hint is sent either.
+        let get = sent.recv().await.unwrap();
+        assert_eq!(body(&get)["op"], "config.get");
+        assert_ne!(get.header.corr, lost.header.corr);
+        let view = ConfigView::new(
+            1,
+            json!({"computer_use":{"app_use":"foreground"}}),
+            Default::default(),
+            vec![],
+            ConfigStatus::Unstamped,
+        );
+        let reply = serde_json::to_value(ConfigGetReply::new(Some(view), None)).unwrap();
+        assert!(session.take(&frame(FrameType::Response, 0, 0, get.header.corr, reply)));
+        updates.changed().await.unwrap();
+        assert_eq!(
+            updates.borrow().app_use,
+            cerebellum_core::config::AppUse::Foreground
+        );
+    };
+    tokio::time::timeout(Duration::from_secs(120), async {
+        tokio::select! { () = daemon => {}, () = driver => panic!("live watcher exited") }
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 #[cfg(unix)]
 async fn settings_hello_manifest_matches_old_configured_hello_except_for_review_opt_in() {
