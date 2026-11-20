@@ -22,5 +22,3 @@ export const held = view.completion.heldMs ?? view.record.heldMs ?? 0
 {input.action == "type" ? <CardHeader title="Typed text" /> : null}
 {input.action == "type" ? <CodeBlock codeString={input.text ?? ""} /> : null}
 {input.action == "fill_login" ? <TextContent text={"Fields: " + (input.username_ref == null ? "" : "Username · ") + "Password" + (input.otp_ref == null ? "" : " · One-time code")} size="small" /> : null}
-
-<TextContent text={view.output ?? "No output was kept."} />

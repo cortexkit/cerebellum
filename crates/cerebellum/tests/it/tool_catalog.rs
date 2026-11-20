@@ -285,14 +285,14 @@ async fn tool_views_are_advertised_and_match_catalog_pins() {
         };
         assert_eq!(view.record_schema.name, "cerebellum_call");
         // The revision tracks the catalog digest so readers can replace retained views.
-        assert_eq!(view.template_revision, 4);
+        assert_eq!(view.template_revision, 5);
         assert!(view.reads.is_empty());
         assert_eq!(view.template["row"]["profile"], "tool_row");
         assert_eq!(view.template["page"]["profile"], "tool_page");
         for profile in ["row", "page"] {
             assert_eq!(
                 view.template[profile]["catalog"]["digest"],
-                "sha256:af4559652b832b8908f4dc39364874eea6950ab708567e70f17d304e8c0f9a32"
+                "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
             );
         }
         // The view carries the definition behind its pin, so the display server

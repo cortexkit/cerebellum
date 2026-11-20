@@ -279,6 +279,13 @@ fn views_embed_exact_template_bytes_and_checked_inputs() {
 }
 
 #[test]
+fn tool_pages_do_not_show_raw_replies() {
+    for page in [BROWSER_PAGE, COMPUTER_PAGE] {
+        assert!(!page.contains("view.output"));
+    }
+}
+
+#[test]
 fn row_badges_fit_short_slots_at_phone_width() {
     // occipital-check uses eight units per character. Occipital's catalog gives a
     // short Slot twelve digit widths and a badge six units of padding per side.
@@ -445,6 +452,9 @@ fn export_checker_inputs() {
             samples.push(json!({"input":{"action":"read_state","target":"Notes.app for Work"},"record":{"outcome":"success","durationMs":10}}));
             samples.push(json!({"input":{"action":"write_text","target":"Notes","text":"Text kept only on the page"},"record":{"outcome":"success","durationMs":10}}));
             samples.push(json!({"input":{"action":"wait","app":"Notes"},"record":{"outcome":"success","durationMs":10}}));
+            samples.push(json!({"input":{"action":"read_state","target":"com.apple.TextEdit","bring_to_front":true},"record":{"outcome":"success","durationMs":20,"app":"com.apple.TextEdit"}}));
+            samples.push(json!({"input":{"action":"write_text","element_id":"elem-1","text":"Text kept only on the page","write_mode":"replace_value"},"record":{"outcome":"error","reason":"state_changed_by_person","durationMs":20,"app":"com.apple.TextEdit"}}));
+            samples.push(json!({"input":{"action":"press_element","element_id":"elem-1"},"record":{"outcome":"success","durationMs":20,"app":"com.apple.TextEdit"}}));
         }
         let check = json!({"input_schema":tool.input_schema,"view":view,"samples":samples});
         std::fs::write(

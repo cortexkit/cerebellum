@@ -1,7 +1,7 @@
 export const action = input.action == "read_state" ? "Read app" : input.action == "press_element" || input.action == "press_point" ? "Press" : input.action == "write_text" || input.action == "type" ? "Type" : input.action == "keys" ? "Press keys" : input.action == "takeover_move" ? "Move pointer" : input.action == "takeover_drag" ? "Drag" : input.action == "takeover_scroll" ? "Scroll" : input.action == "wait" ? "Wait" : input.action == "list_apps" ? "List apps" : input.action == "open_app" ? "Open app" : Replace(input.action, "_", " ")
 export const outcome = view.completion.outcome ?? view.record.outcome
 export const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason
-export const target = input.target ?? input.app ?? ""
+export const target = input.target ?? input.app ?? view.completion.app ?? view.record.app ?? ""
 export const appName = !Contains(target, " ") && Contains(target, ".") ? Last(Split(target, ".")) : target
 
 <Card appearance="clear" direction="row" gap="s" align="center">

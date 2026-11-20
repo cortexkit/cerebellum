@@ -7,8 +7,10 @@ export const duration = view.completion.durationMs ?? view.record.durationMs
 export const queued = view.completion.queuedMs ?? view.record.queuedMs ?? 0
 export const held = view.completion.heldMs ?? view.record.heldMs ?? 0
 export const posts = view.completion.postsReturned ?? view.record.postsReturned
+export const target = input.target ?? input.app ?? view.completion.app ?? view.record.app ?? ""
+export const appName = !Contains(target, " ") && Contains(target, ".") ? Last(Split(target, ".")) : target
 
-<CardHeader title={action} subtitle={input.target ?? input.app ?? ""} />
+<CardHeader title={action} subtitle={appName} />
 <Card appearance="clear" gap="xs">
 <TextContent text={"Outcome: " + status} size="small" />
 {reason == null ? null : <TextContent text={"Reason: " + reasonText} size="small" />}
@@ -17,9 +19,8 @@ export const posts = view.completion.postsReturned ?? view.record.postsReturned
 {queued > 0 ? <TextContent text={"Waited in line: " + FormatDuration(queued)} size="small" /> : null}
 {held > 0 ? <TextContent text={"Waited for you: " + FormatDuration(held)} size="small" /> : null}
 {posts == null ? null : <TextContent text={"Input events sent: " + Text(posts)} size="small" />}
+{input.action == "read_state" && input.bring_to_front == true ? <TextContent text="Brought to the front for a picture" size="small" /> : null}
 </Card>
 
 {input.action == "type" || input.action == "write_text" ? <CardHeader title="Typed text" /> : null}
 {input.action == "type" || input.action == "write_text" ? <CodeBlock codeString={input.text ?? ""} /> : null}
-
-<TextContent text={view.output ?? "No output was kept."} />
