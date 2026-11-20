@@ -213,8 +213,7 @@ impl Participant {
                         );
                     }
                     document.cuts.insert(id.to_owned(), cut.clone());
-                    memory = self.save(&document, memory).await?;
-                    *memory = document.clone();
+                    (memory, document) = self.save(document, memory).await?;
                 } else if cut.refs.as_ref().is_some_and(|saved| !saved.same_set(refs)) {
                     return Err(detailed(
                         RefusalCode::InvalidState,
@@ -288,8 +287,7 @@ impl Participant {
             },
         );
         document.cuts.insert(id.to_owned(), cut);
-        memory = self.save(&document, memory).await?;
-        *memory = document;
+        self.save(document, memory).await?;
         Ok(reply)
     }
 }
