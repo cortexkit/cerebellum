@@ -3315,12 +3315,16 @@ fn late_snapshot_results_cannot_restore_goodbye_handles_or_cross_connection_refs
         refs: BTreeMap::new(),
         image: None,
     };
+    // The late result belongs to work still in flight when its route ends,
+    // as every published snapshot comes from inside its own call.
+    let work = target.begin_work(route);
     target.end_route(route);
     target.retain("late".into(), snapshot.clone());
     assert!(target.state().snapshots.is_empty());
     target.synchronize(8);
     target.retain("old-connection".into(), snapshot);
     assert!(target.state().snapshots.is_empty());
+    drop(work);
 }
 
 #[test]
@@ -5012,6 +5016,9 @@ async fn status_reports_an_outdated_or_newer_extension_before_any_action() {
     let (reply, _) = fixture.call(1, status, "allow_30m").await;
     assert_eq!(reply["outcome"], "ok", "{reply}");
     assert_eq!(reply["connected"], true);
+    // Status names the revision of the extension copy Chrome is running.
+    assert_eq!(reply["extension_revision"], EXTENSION_REVISION, "{reply}");
+    assert!(crate::browser::validate_user_browser_result("status", &reply).is_ok());
 }
 
 #[tokio::test]

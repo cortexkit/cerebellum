@@ -735,6 +735,7 @@ pub(crate) const BROWSER_METADATA_FIELDS: &[&str] = &[
     "origin",
     "connection_epoch",
     "interaction_epoch",
+    "extension_revision",
     "tabs.[].tab",
     "tabs.[].claim",
     "tabs.[].interaction_epoch",

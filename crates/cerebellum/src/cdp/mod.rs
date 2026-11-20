@@ -223,6 +223,8 @@ pub struct CdpEvent {
     pub method: String,
     pub params: Option<Map<String, Value>>,
     pub session_id: Option<String>,
+    /// The message's other top-level members. `params` is moved out into
+    /// [`Self::params`] rather than copied, so it is not repeated here.
     pub raw: Value,
 }
 
@@ -555,11 +557,25 @@ impl CdpTransport {
         self.take_response_inner(bytes)
     }
 
+    /// [`Self::take_response`] for a message the caller has already parsed
+    /// with [`parse_json_message`], so a frame is never parsed twice. Its
+    /// result or error moves into the response without a copy.
+    pub fn take_response_value(&mut self, value: Value) -> Result<CdpResponse, CdpError> {
+        let result = self.response_from_value(value);
+        if result.is_err() {
+            self.closed = true;
+        }
+        result
+    }
+
     fn take_response_inner(&mut self, bytes: &[u8]) -> Result<CdpResponse, CdpError> {
-        let value = parse_json_message(bytes)?;
-        let object = value
-            .as_object()
-            .ok_or(CdpError::ProtocolFailure("cdp message is not an object"))?;
+        self.response_from_value(parse_json_message(bytes)?)
+    }
+
+    fn response_from_value(&mut self, value: Value) -> Result<CdpResponse, CdpError> {
+        let Value::Object(mut object) = value else {
+            return Err(CdpError::ProtocolFailure("cdp message is not an object"));
+        };
         let id = object
             .get("id")
             .and_then(Value::as_u64)
@@ -586,13 +602,13 @@ impl CdpTransport {
         if &session_id != expected_session {
             return Err(CdpError::SessionMismatch);
         }
-        let result = match object.get("result") {
-            Some(Value::Object(map)) => Some(map.clone()),
+        let result = match object.remove("result") {
+            Some(Value::Object(map)) => Some(map),
             Some(_) => return Err(CdpError::ProtocolFailure("cdp result is not an object")),
             None => None,
         };
-        let error = match object.get("error") {
-            Some(Value::Object(map)) => Some(map.clone()),
+        let error = match object.remove("error") {
+            Some(Value::Object(map)) => Some(map),
             Some(_) => return Err(CdpError::ProtocolFailure("cdp error is not an object")),
             None => None,
         };
@@ -627,39 +643,25 @@ impl CdpTransport {
     }
 
     fn accept_event_inner(&mut self, bytes: &[u8]) -> Result<CdpEvent, CdpError> {
-        let value = parse_json_message(bytes)?;
-        let object = value
-            .as_object()
-            .ok_or(CdpError::ProtocolFailure("cdp event is not an object"))?;
-        if object.contains_key("id") {
-            return Err(CdpError::ProtocolFailure("response supplied as event"));
-        }
-        let method = object
-            .get("method")
-            .and_then(Value::as_str)
-            .filter(|method| !method.is_empty())
-            .ok_or(CdpError::ProtocolFailure("cdp event has no method"))?;
-        let params = match object.get("params") {
-            None => None,
-            Some(Value::Object(map)) => Some(map.clone()),
-            Some(_) => {
-                return Err(CdpError::ProtocolFailure(
-                    "cdp event params is not an object",
-                ))
-            }
-        };
-        let session_id = parse_optional_string(object.get("sessionId"))?;
+        let event = event_from_value(parse_json_message(bytes)?)?;
         if self.events.len() >= self.event_limit.min(MAX_QUEUED_EVENTS) {
             return Err(CdpError::ProtocolFailure("cdp event queue overflow"));
         }
-        let event = CdpEvent {
-            method: method.to_string(),
-            params,
-            session_id,
-            raw: value,
-        };
         self.events.push_back(event.clone());
         Ok(event)
+    }
+
+    /// Validate an event the caller has already parsed with
+    /// [`parse_json_message`] and hand it back without queuing it: an
+    /// established driver applies each event as it reads it, so a queued copy
+    /// would only be dropped again. A malformed event closes the transport,
+    /// as [`Self::accept_event`] does.
+    pub fn take_event(&mut self, value: Value) -> Result<CdpEvent, CdpError> {
+        let result = event_from_value(value);
+        if result.is_err() {
+            self.closed = true;
+        }
+        result
     }
 
     pub fn pop_event(&mut self) -> Option<CdpEvent> {
@@ -671,6 +673,43 @@ impl CdpTransport {
         self.pending.clear();
         self.events.clear();
     }
+}
+
+fn event_from_value(value: Value) -> Result<CdpEvent, CdpError> {
+    let Value::Object(mut object) = value else {
+        return Err(CdpError::ProtocolFailure("cdp event is not an object"));
+    };
+    if object.contains_key("id") {
+        return Err(CdpError::ProtocolFailure("response supplied as event"));
+    }
+    let method = object
+        .get("method")
+        .and_then(Value::as_str)
+        .filter(|method| !method.is_empty())
+        .ok_or(CdpError::ProtocolFailure("cdp event has no method"))?
+        .to_owned();
+    let params = match object.remove("params") {
+        None => None,
+        Some(Value::Object(map)) => Some(map),
+        Some(_) => {
+            return Err(CdpError::ProtocolFailure(
+                "cdp event params is not an object",
+            ))
+        }
+    };
+    let session_id = parse_optional_string(object.get("sessionId"))?;
+    Ok(CdpEvent {
+        method,
+        params,
+        session_id,
+        raw: Value::Object(object),
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many messages [`parse_json_message`] parsed on this thread.
+    pub(crate) static PARSED_MESSAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn parse_optional_string(value: Option<&Value>) -> Result<Option<String>, CdpError> {
@@ -691,6 +730,8 @@ pub fn parse_json_message(bytes: &[u8]) -> Result<Value, CdpError> {
             bound: MAX_MESSAGE_BYTES,
         });
     }
+    #[cfg(test)]
+    PARSED_MESSAGES.with(|parsed| parsed.set(parsed.get() + 1));
     let bytes = replace_lone_surrogate_escapes(bytes);
     let text = std::str::from_utf8(&bytes).map_err(|_| CdpError::InvalidUtf8)?;
     let mut stream = serde_json::Deserializer::from_str(text).into_iter::<Value>();

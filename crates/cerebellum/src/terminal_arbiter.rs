@@ -1202,6 +1202,8 @@ pub(crate) struct TerminalState {
     /// the one small cell it closes (a posting interval in the own-input
     /// ledger).
     on_terminal: Vec<TerminalHook>,
+    /// Told, when the terminal is chosen, whether a stop chose it.
+    reply_watchers: Vec<tokio::sync::oneshot::Sender<bool>>,
 }
 
 type TerminalHook = Box<dyn FnOnce() + Send>;
@@ -1260,6 +1262,7 @@ impl TerminalArbiter {
                 restore: None,
                 settlement: None,
                 on_terminal: Vec::new(),
+                reply_watchers: Vec::new(),
             }),
             request,
             changed: tokio::sync::Notify::new(),
@@ -1532,6 +1535,9 @@ impl TerminalArbiter {
             hook();
         }
         state.cause = result.is_none().then_some(cause);
+        for watcher in std::mem::take(&mut state.reply_watchers) {
+            let _ = watcher.send(result.is_none());
+        }
         state.possibly_dispatched = dispatched || committed;
         state.chosen = Some(result.unwrap_or_else(|| {
             let possible = dispatched || committed;
@@ -1625,6 +1631,21 @@ impl TerminalArbiter {
             self.state.lock().unwrap().cause,
             Some(TerminalCause::Cancelled)
         )
+    }
+
+    /// Resolves to whether a stop (Cancel, deadline, route close or drain)
+    /// chose this call's reply, rather than a reply the call's own work sent;
+    /// at once when the reply is already chosen. Errs when the call ends with
+    /// no reply chosen at all.
+    pub(crate) fn watch_reply(&self) -> tokio::sync::oneshot::Receiver<bool> {
+        let (watcher, chosen) = tokio::sync::oneshot::channel();
+        let mut state = self.state.lock().unwrap();
+        if state.chosen.is_some() {
+            let _ = watcher.send(state.cause.is_some());
+        } else {
+            state.reply_watchers.push(watcher);
+        }
+        chosen
     }
 
     fn preserve_stop_refusal(&self, reply: Frame) {

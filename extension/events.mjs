@@ -183,8 +183,22 @@ export class BrowserEvents {
       return;
     }
     await this.tabs.adoptPopup(tabId);
+    // Grouping and the observer install wait on Chrome, and the opener's
+    // route can end meanwhile, releasing its claims. A pop-up of a
+    // route that has ended stays an unclaimed agent-opened tab, and nothing
+    // is focused for it.
+    const ownerStillHoldsOpener = () => this.agent.claims.get(popup.openerTabId) === popup.owner;
+    if (!ownerStillHoldsOpener()) {
+      this.tabs.adoptionDecision(tabId, "popup", "opener_claim_changed");
+      return;
+    }
     this.agent.claims.set(tabId, popup.owner);
     await this.epochs.install(tabId);
+    if (!ownerStillHoldsOpener()) {
+      if (this.agent.claims.get(tabId) === popup.owner) this.agent.claims.delete(tabId);
+      this.tabs.adoptionDecision(tabId, "popup", "opener_claim_changed");
+      return;
+    }
     if (popup.activated) {
       this.agent.popupFlags.add(popup.openerTabId);
       // This is the only foregrounding path. It restores remembered ids after

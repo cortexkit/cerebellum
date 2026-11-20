@@ -6183,7 +6183,7 @@ pub(crate) fn user_browser_result_schema(action: &str) -> Value {
             "settled":boolean_schema(), "settlement_reason":string_schema(),
                 "input_dispatched":{"anyOf":[boolean_schema(),{"type":"null"}]},
                 "tab":string_schema(), "connected":boolean_schema(), "origin":string_schema(),
-                "connection_epoch":integer_schema(), "interaction_epoch":integer_schema(),
+                "connection_epoch":integer_schema(), "interaction_epoch":integer_schema(), "extension_revision":integer_schema(),
                 "tabs":{"type":"array","items":closed_object(json!({"tab":string_schema(),"claim":enum_schema(&["claimed_by_this_route","unclaimed_handed"]),"interaction_epoch":integer_schema()}), &["tab","claim","interaction_epoch"])},
                 "snapshot_id":string_schema(), "state_text":string_schema(),
                 "wait":enum_schema(&["matched", "timed_out"]),

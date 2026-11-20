@@ -256,6 +256,8 @@ pub(crate) struct FakeExclusion {
     pub(crate) added: std::sync::atomic::AtomicBool,
     pub(crate) add_fails: Mutex<Option<ToolError>>,
     pub(crate) events: Events,
+    /// When set, each `is_excluded` waits here before it answers.
+    pub(crate) probe_gate: Mutex<Option<Arc<BlockingGate>>>,
 }
 
 impl BackupExclusion for FakeExclusion {
@@ -276,6 +278,10 @@ impl BackupExclusion for FakeExclusion {
 
     fn is_excluded(&self, _path: &Path) -> Result<bool, ToolError> {
         self.events.push("tmutil_isexcluded");
+        let gate = self.probe_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.pass();
+        }
         if self.added.load(Ordering::SeqCst) {
             if let Some(answer) = *self.answer_after_add.lock().unwrap() {
                 return answer;
@@ -452,6 +458,47 @@ pub(crate) struct FakeLauncher {
     pub(crate) launches: AtomicUsize,
     pub(crate) placements: Mutex<Vec<CapturePlacement>>,
     pub(crate) verifications: Verifications,
+    /// When set, each launch waits here before it returns.
+    pub(crate) launch_gate: Mutex<Option<Arc<BlockingGate>>>,
+}
+
+/// Holds a fake's blocking call until the test opens it, so the test can act
+/// while that call is in progress. A gate never opened lets the call go after
+/// thirty seconds, so a failing test cannot hang the runtime's shutdown.
+#[derive(Default)]
+pub(crate) struct BlockingGate {
+    /// Whether a call has reached the gate, and whether the gate is open.
+    state: Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+
+impl BlockingGate {
+    pub(crate) fn pass(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        self.changed.notify_all();
+        let give_up = Instant::now() + Duration::from_secs(30);
+        while !state.1 {
+            let left = give_up.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            state = self.changed.wait_timeout(state, left).unwrap().0;
+        }
+    }
+
+    pub(crate) fn open(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn entered(&self) -> bool {
+        self.state.lock().unwrap().0
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.state.lock().unwrap().1
+    }
 }
 
 impl CaptureLauncher for FakeLauncher {
@@ -461,6 +508,10 @@ impl CaptureLauncher for FakeLauncher {
         _launch_attempt_id: &str,
         placement: &CapturePlacement,
     ) -> Result<Box<dyn CaptureBrowser>, CaptureLaunchRefusal> {
+        let gate = self.launch_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.pass();
+        }
         self.launches.fetch_add(1, Ordering::SeqCst);
         self.placements.lock().unwrap().push(placement.clone());
         let script = self.script.lock().unwrap().clone();
@@ -660,6 +711,7 @@ fn fixture_configuring_launcher(
         added: std::sync::atomic::AtomicBool::new(false),
         add_fails: Mutex::new(None),
         events: events.clone(),
+        probe_gate: Mutex::new(None),
     });
     let launcher = Arc::new(FakeLauncher {
         script: Mutex::new(BrowserScript::default()),
@@ -667,6 +719,7 @@ fn fixture_configuring_launcher(
         launches: AtomicUsize::new(0),
         placements: Mutex::new(Vec::new()),
         verifications: Verifications::default(),
+        launch_gate: Mutex::new(None),
     });
     let vault = Arc::new(FakeVault {
         open_fails: Mutex::new(None),

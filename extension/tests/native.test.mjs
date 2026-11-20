@@ -324,7 +324,7 @@ test("completed, chunked and refused replies all carry the contract revision", a
 });
 
 test("the extension's contract revision matches the one cerebellum requires", async () => {
-  const rust = readFileSync(new URL("../../crates/cerebellum/src/user_browser.rs", import.meta.url), "utf8");
+  const rust = readFileSync(new URL("../../crates/cerebellum/src/user_browser/revision.rs", import.meta.url), "utf8");
   const required = rust.match(/^pub\(crate\) const EXTENSION_REVISION: u64 = (\d+);$/m);
   assert.ok(required, "cerebellum must declare EXTENSION_REVISION");
   assert.equal(Number(required[1]), EXTENSION_REVISION);

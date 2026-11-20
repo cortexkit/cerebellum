@@ -87,6 +87,44 @@ test("a failed cleanup release still detaches and reports unconfirmed input", as
   assert.equal(f.chrome.calls.filter(call => call[0] === "detach").length, 2);
 });
 
+test("a release Chrome rejects stays owed and cleanup sends only that release", async () => {
+  const f = await setup();
+  const epoch = (await f.fresh()).interaction_epoch;
+  const send = f.chrome.debugger.sendCommand;
+  let releases = 0;
+  f.chrome.debugger.sendCommand = async (...args) => {
+    // Chrome refuses the planned release before delivering it.
+    if (args[2].type === "mouseReleased" && releases++ === 0) throw new Error("release rejected");
+    return send(...args);
+  };
+  await f.run(f.input(epoch));
+  assert.deepEqual(inputs(f.chrome).map(call => call[3]), [press.params, release.params]);
+  assert.equal(releases, 2);
+});
+
+test("a key-down refused before its key-up is released before detach and nothing is typed", async () => {
+  const f = await setup();
+  const epoch = (await f.fresh()).interaction_epoch;
+  const keyDown = { method: "Input.dispatchKeyEvent", params: { type: "keyDown", key: "End", code: "End", windowsVirtualKeyCode: 35 } };
+  const keyUp = { method: "Input.dispatchKeyEvent", params: { type: "keyUp", key: "End", code: "End", windowsVirtualKeyCode: 35 } };
+  const insert = { method: "Input.insertText", params: { text: "42" } };
+  const send = f.chrome.debugger.sendCommand;
+  f.chrome.debugger.sendCommand = async (...args) => {
+    const result = await send(...args);
+    // The person touches the page between the key-down and its key-up.
+    if (args[2]?.type === "keyDown") f.epochs.bump(2);
+    return result;
+  };
+  const start = f.chrome.calls.length;
+  await assert.rejects(
+    f.run({ ...f.cdp([keyDown, keyUp, insert]), interaction_epoch: epoch }),
+    error => error.detail.input_dispatched === true,
+  );
+  const sent = f.chrome.calls.slice(start).filter(call => call[0] === "detach" || call[0] === "cdp" && call[2].startsWith("Input."));
+  assert.deepEqual(sent.map(call => call[0] === "detach" ? "detach" : call[3].type ?? call[2]), ["keyDown", "keyUp", "detach"]);
+  assert.deepEqual(sent[1][3], keyUp.params);
+});
+
 test("group membership is rechecked before attachment", async () => {
   const f = await setup();
   f.chrome.calls.length = 0;
@@ -110,6 +148,23 @@ test("claims and status remain route bound", async () => {
   assert.deepEqual((await f.run({ version: 2, action: "status" }, other)).tabs, []);
   await assert.rejects(f.run({ version: 2, action: "claim_tab", tab: f.record.handle }, other), { reason: "tab_claimed_by_other_route" });
   await assert.rejects(f.run(f.cdp([read]), other), { reason: "tab_not_claimed" });
+});
+
+test("status checks each tab's membership once and still withholds other routes' claims", async () => {
+  const f = await setup();
+  const handles = {};
+  for (const id of [3, 4, 5]) {
+    f.chrome.tabData.set(id, { id, windowId: 3, groupId: -1, active: false });
+    handles[id] = (await f.tabs.join(id, "handed")).handle;
+  }
+  f.agent.claims.set(3, "9:4");
+  f.chrome.calls.length = 0;
+  const status = await f.run({ version: 2, action: "status" });
+  const gets = f.chrome.calls.filter(call => call[0] === "get").map(call => call[1]);
+  assert.deepEqual(gets.sort(), [2, 3, 4, 5], "one membership read per tab");
+  assert.deepEqual(status.tabs.map(tab => tab.tab), [f.record.handle, handles[4], handles[5]]);
+  assert.equal(status.tabs.some(tab => tab.tab === handles[3]), false);
+  assert.equal(status.tabs.some(tab => "tabId" in tab), false, "Chrome tab ids stay inside the extension");
 });
 
 test("group withdrawal after a press sends only its matching cleanup release", async () => {

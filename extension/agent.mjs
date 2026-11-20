@@ -16,6 +16,29 @@ const closed = (value, fields) => value && typeof value === "object" && !Array.i
 // failed and why. Chrome's optional `data` field is dropped, and any other
 // rejection, or a message that is long or multi-line, keeps the generic text.
 const MAX_CDP_ERROR_MESSAGE = 200;
+
+// The release a press or key-down owes, keyed by the button or key it holds,
+// or null for any other command.
+function releaseOwed({ method, params }) {
+  if (method === "Input.dispatchMouseEvent" && params?.type === "mousePressed") {
+    return { key: `mouse:${params.button}`, release: { method, params: { ...params, type: "mouseReleased" } } };
+  }
+  if (method === "Input.dispatchKeyEvent" && (params?.type === "keyDown" || params?.type === "rawKeyDown")) {
+    // A key-up types nothing, so it carries the key's identity only.
+    const { text: _text, unmodifiedText: _unmodifiedText, autoRepeat: _autoRepeat, ...identity } = params;
+    return { key: heldKey(params), release: { method, params: { ...identity, type: "keyUp" } } };
+  }
+  return null;
+}
+
+// The button or key whose release this command is, or null.
+function releaseDischarged({ method, params }) {
+  if (method === "Input.dispatchMouseEvent" && params?.type === "mouseReleased") return `mouse:${params.button}`;
+  if (method === "Input.dispatchKeyEvent" && params?.type === "keyUp") return heldKey(params);
+  return null;
+}
+
+const heldKey = params => `key:${params.code ?? params.key ?? params.windowsVirtualKeyCode}`;
 export function debuggerError(error) {
   try {
     const cdp = JSON.parse(error?.message);
@@ -243,7 +266,7 @@ export class Agent {
     if (!state.attached) return;
     if (state.detaching) return state.detaching;
     state.detaching = Promise.resolve().then(async () => {
-      try { await this.releaseMouse(state); } finally {
+      try { await this.releaseHeld(state); } finally {
         // Keep the window open until Chrome actually detaches, even if the
         // caller's deadline expires before the detach promise settles.
         probeReadDiagnostic("debugger_timing", { tabId: state.tabId, phase: "detach_start" });
@@ -260,16 +283,28 @@ export class Agent {
     return state.detaching;
   }
 
-  async releaseMouse(state) {
+  // Release-only cleanup for presses and key-downs this plan dispatched on this
+  // attachment whose release Chrome has not acknowledged. A refusal (the tab
+  // left the Agent group, or the person used the page) must not leave a button
+  // or key held. Only the matching release is sent, to the target its press
+  // went to; the plan is never resumed and no other input is dispatched. A release Chrome did not
+  // acknowledge, or one that can no longer be sent because the debugger is
+  // gone, is reported as unconfirmed.
+  async releaseHeld(state) {
     if (state.releasing) return state.releasing;
-    if (!state.heldMouse || !state.attached) return;
-    const { target, params } = state.heldMouse;
-    state.heldMouse = null;
-    // This is release-only cleanup for a press we dispatched on this attachment.
-    // A refusal may revoke membership or freshness, but must not leave that
-    // button held. Never resume the plan or dispatch another press during cleanup.
-    state.releasing = bounded(this.chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", params), "reply")
-      .catch(() => { throw new Refusal("input_release_unconfirmed", "read again", { input_dispatched: true }); });
+    if (!state.held?.size) return;
+    state.releasing = (async () => {
+      let unconfirmed = !state.attached;
+      if (state.attached) {
+        for (const [key, { target, method, params }] of [...state.held]) {
+          try {
+            await bounded(this.chrome.debugger.sendCommand(target, method, params), "reply");
+            state.held.delete(key);
+          } catch { unconfirmed = true; }
+        }
+      }
+      if (unconfirmed) throw new Refusal("input_release_unconfirmed", "read again", { input_dispatched: true });
+    })();
     return state.releasing;
   }
 
@@ -307,11 +342,12 @@ export class Agent {
     await this.guard(state);
     if (p.action === "status") {
       const visible = [];
+      // list() has just checked each member's membership; checking it again
+      // per tab would double the Chrome calls for nothing.
       for (const tab of await this.tabs.list()) {
-        const record = await this.tabs.resolve(tab.tab);
-        const owner = this.claims.get(record.tabId);
-        if (owner && owner !== state.route || !owner && record.kind !== "handed") continue;
-        visible.push({ tab: tab.tab, claimed: owner === state.route, handed: record.kind === "handed", interaction_epoch: this.epochs.record(record.tabId).epoch });
+        const owner = this.claims.get(tab.tabId);
+        if (owner && owner !== state.route || !owner && tab.kind !== "handed") continue;
+        visible.push({ tab: tab.tab, claimed: owner === state.route, handed: tab.kind === "handed", interaction_epoch: this.epochs.record(tab.tabId).epoch });
       }
       return { tabs: visible, connection_epoch: state.epoch };
     }
@@ -355,7 +391,7 @@ export class Agent {
       if (error instanceof Refusal && state.input) error.detail.input_dispatched = true;
       throw error;
     } finally {
-      await this.releaseMouse(state);
+      await this.releaseHeld(state);
     }
   }
 
@@ -425,10 +461,11 @@ export class Agent {
           this.navigation.set(state.tabId, { state, frameId, started: false, url: command.params.url, deadline: Date.now() + 30000 });
         }
         if (kind === "input") state.input = true;
-        if (command.method === "Input.dispatchMouseEvent") {
-          if (command.params.type === "mousePressed") state.heldMouse = { target, params: { ...command.params, type: "mouseReleased" } };
-          if (command.params.type === "mouseReleased") state.heldMouse = null;
-        }
+        // A press or key-down owes its release from before it is sent until
+        // Chrome acknowledges that release (see releaseHeld).
+        const owed = releaseOwed(command);
+        if (owed) (state.held ??= new Map()).set(owed.key, { target, ...owed.release });
+        const discharged = releaseDischarged(command);
         let result;
         if (kind === "wait") {
           result = await this.wait(state, command.params.ms);
@@ -440,6 +477,7 @@ export class Agent {
           const { mappings } = await state.frames.read();
           result = await new FrameGeometry(state.frames, mappings).hit({ x: command.params.x, y: command.params.y }, scope?.frame, command.params);
         } else result = await bounded(this.chrome.debugger.sendCommand(target, command.method, command.params), "reply");
+        if (discharged) state.held?.delete(discharged);
         if (scope) await state.frames.resolve(command, kind === "read" && !hasInput);
         results.push({ result });
       } catch (error) {

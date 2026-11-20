@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { BrowserEvents } from "../events.mjs";
-import { setup, turn } from "./harness.mjs";
+import { route, setup, turn } from "./harness.mjs";
 import { start } from "../service-worker.mjs";
 import { deferred, fakeChrome } from "./fake-chrome.mjs";
 
@@ -66,6 +66,34 @@ test("script popup joins opener group and restores remembered ids with a disclos
   assert.equal(reply.popup_activated_briefly, true);
   assert.equal((await f.fresh()).popup_activated_briefly, undefined);
   assert.equal(f.chrome.calls.some(call => call[0] === "get" && call[1] === 1), false);
+});
+
+test("a popup grouped only after its opener's route said goodbye gets no claim and no focus change", async () => {
+  const f = await setup();
+  const events = listen(f);
+  f.chrome.allowPopupRecovery = true;
+  f.chrome.tabData.set(30, { id: 30, groupId: -1, windowId: 99, active: true });
+  const group = f.chrome.tabs.group;
+  const grouping = deferred();
+  const released = deferred();
+  f.chrome.tabs.group = async options => {
+    if (options.tabIds.includes(30)) {
+      grouping.resolve();
+      await released.promise;
+    }
+    return group(options);
+  };
+  await agentClick(f, () => {
+    f.chrome.tabs.onCreated.emit({ id: 30, openerTabId: 2, windowId: 99, active: true });
+    f.chrome.tabs.onActivated.emit({ tabId: 30, windowId: 99 });
+  });
+  await grouping.promise;
+  await f.agent.goodbye(route);
+  assert.equal(f.agent.claims.has(2), false);
+  released.resolve();
+  await Promise.all(events.popupTasks.values());
+  assert.equal(f.agent.claims.has(30), false, "the ended route's claim came back on its popup");
+  assert.equal(f.chrome.calls.some(call => call[0] === "restoreTab" || call[0] === "restoreWindow"), false);
 });
 
 test("popup activation before creation retains the preceding focus ids", async () => {

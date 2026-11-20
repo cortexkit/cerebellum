@@ -21,12 +21,14 @@ pub(super) async fn capture_browser_login(
         return json!({"outcome":"consent_unavailable","detail":{"reason":why.reason(),"remedy":why.remedy()}});
     }
     // Before the sign-in window is handed to the person, cancellation of the
-    // request also cancels consent. Once replied, the capture belongs to its
-    // custodian, so closing the request must not stop sign-in. Module shutdown
-    // still interrupts the capture and disposes its throwaway profile.
+    // request also cancels consent. Once the caller has been told the window
+    // was handed over, its result is owed to the caller as a late result, so
+    // closing the request must not stop sign-in. Module shutdown still
+    // interrupts the capture and disposes its throwaway profile.
     let cancel = planes.cancellations.get((channel, epoch, corr));
     let draining = Arc::clone(&planes.draining);
     let cancel_for_capture = cancel.clone();
+    let cancel_for_handover = cancel.clone();
     let held_calls = Arc::clone(&planes.calls);
     let held_scope = facts
         .scope
@@ -92,6 +94,15 @@ pub(super) async fn capture_browser_login(
     let Some(handoff) = handoff else {
         return journal_capture_outcome(&planes.browser, &facts.identity, running.await).await;
     };
+    // A Cancel that came in while the window was being shown is honoured
+    // before any settlement obligation is saved.
+    if cancel_for_handover
+        .as_ref()
+        .is_some_and(CancelHandle::is_cancelled)
+    {
+        let _ = handoff.proceed.send(false);
+        return journal_capture_outcome(&planes.browser, &facts.identity, running.await).await;
+    }
     let principal = journal::call_records::principal_label(facts.principal.as_ref());
     let scope = facts
         .scope
@@ -115,14 +126,29 @@ pub(super) async fn capture_browser_login(
         let _ = journal_capture_outcome(&planes.browser, &facts.identity, running.await).await;
         return json!({"outcome":"internal_failure","reason":"call_record_unavailable"});
     }
-    detached.store(true, std::sync::atomic::Ordering::Release);
-    let _ = handoff.proceed.send(true);
+    // The capture is handed over only once `capture_pending` is this call's
+    // reply. Until then a Cancel (or another stop) can still choose the
+    // reply, and the capture must then end even though its hold is saved.
+    let reply_chosen = capture_pending_chosen(TerminalArbiter::current(), cancel_for_handover);
     let browser = Arc::clone(&planes.browser);
     let identity = facts.identity.clone();
     let calls = Arc::clone(&planes.calls);
     #[cfg(test)]
     let journal_finalization = planes.capture.take_journal_finalization();
+    #[cfg(test)]
+    let module = Arc::clone(&planes.capture);
     tokio::spawn(async move {
+        let handed_over = reply_chosen.await;
+        // Set before the capture may proceed, so a Cancel arriving after the
+        // pending reply was chosen can no longer stop the sign-in.
+        detached.store(handed_over, std::sync::atomic::Ordering::Release);
+        let _ = handoff.proceed.send(handed_over);
+        #[cfg(test)]
+        if handed_over {
+            module.note_detached();
+        }
+        // A capture stopped here ends as cancelled, which settles the saved
+        // hold as interrupted.
         let outcome = running.await;
         let ending = if outcome.deposit_unknown {
             journal::call_records::HandoffEnding::Unknown
@@ -140,13 +166,32 @@ pub(super) async fn capture_browser_login(
             let _ = finalized.send(());
         }
     });
-    #[cfg(test)]
-    planes.capture.note_detached();
     json!({
         "outcome":"capture_pending", "origin":handoff.origin,
         "expires_in_ms":handoff.expires_in_ms,
         "message":"The capture result will arrive later as a notice; do not poll for it."
     })
+}
+
+/// Resolves to whether this call's reply is the `capture_pending` the caller
+/// is about to send, rather than a reply a stop chose first.
+///
+/// Watched before that reply is sent: the call's terminal arbiter decides
+/// under its lock which reply wins, so a Cancel is ordered either before the
+/// handover (and stops the capture) or after it (and is ignored). Without an
+/// arbiter only the cancel flag can say.
+fn capture_pending_chosen(
+    terminal: Option<Arc<TerminalArbiter>>,
+    cancel: Option<CancelHandle>,
+) -> impl std::future::Future<Output = bool> + Send + 'static {
+    let watched = terminal.map(|terminal| terminal.watch_reply());
+    async move {
+        match watched {
+            // A call that ends with no reply chosen never handed it over.
+            Some(watched) => watched.await == Ok(false),
+            None => !cancel.as_ref().is_some_and(CancelHandle::is_cancelled),
+        }
+    }
 }
 
 fn capture_ending(reply: &Value) -> journal::call_records::HandoffEnding {

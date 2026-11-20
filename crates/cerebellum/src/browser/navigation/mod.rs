@@ -3472,16 +3472,16 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
 
         let mut matched = None;
         for frame in self.decoder.push(&self.read_buffer[..bytes]) {
-            // The transport's own parser, so a frame is read here exactly as
-            // the transport reads it below; it accepts the unpaired
-            // surrogates Chrome sends for page text that serde_json alone
-            // refuses.
+            // Parsed once, by the transport's own parser (it accepts the
+            // unpaired surrogates Chrome sends for page text that serde_json
+            // alone refuses); the transport validates and moves this value
+            // rather than parsing the frame again.
             let value = crate::cdp::parse_json_message(&frame)
                 .map_err(|_| NavigationDriveError::CdpFailure)?;
             if value.get("id").is_some() {
                 let response = self
                     .transport
-                    .take_response(&frame)
+                    .take_response_value(value)
                     .map_err(|_| NavigationDriveError::CdpFailure)?;
                 if response.abandoned {
                     continue;
@@ -3496,9 +3496,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
 
             let event = self
                 .transport
-                .accept_event(&frame)
+                .take_event(value)
                 .map_err(|_| NavigationDriveError::CdpFailure)?;
-            let _ = self.transport.pop_event();
             self.observe_frame_session(&event);
             self.observe_document_peer(&event);
             // Events from the session-verification tab update only that tab's
