@@ -415,31 +415,34 @@ async fn run(
 ) {
     let mut connection: Option<Box<dyn Connection>> = None;
     let mut idle_close = None;
+    let mut reconciling = None;
     if reconcile_views {
         match tokio::time::timeout(OPEN_WINDOW, transport.open()).await {
             Ok(Ok(opened)) => {
                 let bucket = opened.views_bucket();
                 connection = Some(opened);
-                let reconcile = async {
-                    let bucket = bucket?;
-                    views::reconcile(
-                        bucket.as_ref(),
-                        crate::tool_provider::view_replies(),
-                        &gauges,
-                    )
-                    .await;
-                    Ok(())
-                };
-                match tokio::time::timeout(views::RECONCILE_WINDOW, reconcile).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(reason)) => gauges.failed(reason),
-                    Err(_) => gauges.failed(Failure::Timeout),
-                }
-                // With no notices queued, close now so the bus client's credential
-                // renewal task and the publisher's idle timer need not stay alive.
-                if events.is_empty() {
-                    connection = None;
-                }
+                // Repair runs beside the notice loop, never in front of it: a
+                // slow snapshot or KV round trip must not hold back a notice
+                // the open connection could publish now. It runs once, within
+                // its window; nothing retries it while idle.
+                let gauges = Arc::clone(&gauges);
+                reconciling = Some(tokio::spawn(async move {
+                    let reconcile = async {
+                        let bucket = bucket?;
+                        views::reconcile(
+                            bucket.as_ref(),
+                            crate::tool_provider::view_replies(),
+                            &gauges,
+                        )
+                        .await;
+                        Ok(())
+                    };
+                    match tokio::time::timeout(views::RECONCILE_WINDOW, reconcile).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(reason)) => gauges.failed(reason),
+                        Err(_) => gauges.failed(Failure::Timeout),
+                    }
+                }));
             }
             Ok(Err(reason)) => gauges.failed(reason),
             Err(_) => gauges.failed(Failure::Timeout),
@@ -451,6 +454,16 @@ async fn run(
     loop {
         let event = tokio::select! {
             event = events.recv() => match event { Some(event) => event, None => break },
+            _ = async { reconciling.as_mut().expect("guarded").await }, if reconciling.is_some() => {
+                reconciling = None;
+                // With no notice published meanwhile, close now so the bus
+                // client's credential renewal task and the publisher's idle
+                // timer need not stay alive.
+                if idle_close.is_none() {
+                    connection = None;
+                }
+                continue;
+            }
             _ = async {
                 match idle_close {
                     Some(until) => tokio::time::sleep_until(until).await,
@@ -508,5 +521,8 @@ async fn run(
                 idle_close = None;
             }
         }
+    }
+    if let Some(reconciling) = reconciling {
+        reconciling.abort();
     }
 }
