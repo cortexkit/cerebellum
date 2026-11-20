@@ -914,6 +914,7 @@ impl ConsentDesk {
 
     fn save(&self) -> Result<(), String> {
         let _saving = lock(&self.saving);
+        prune_finished(&mut lock(&self.registry));
         if !self.readable {
             // Never save over a registry this build could not read.
             return Err("the stored registry could not be read; it is not overwritten".into());
@@ -1097,6 +1098,39 @@ impl ConsentDesk {
             }
         }
         let _ = self.save();
+    }
+}
+
+/// How many finished cards the registry keeps, newest first, so a record the
+/// feed repeats is still recognised as this desk's. Older finished cards are
+/// dropped, which keeps the registry, and every save of it, bounded.
+const FINISHED_CARDS_KEPT: usize = 32;
+
+/// A card nothing will read, apply, acknowledge or report again: its answer
+/// was applied and acknowledged (or its session ended), its execution report
+/// was delivered or can never be, and it holds no unused single-use approval
+/// or lost-answer notice.
+fn finished(card: &RaisedCard) -> bool {
+    let lifecycle = &card.lifecycle;
+    let consumed = (card.applied && lifecycle.acked && !lifecycle.ack_owed) || lifecycle.ended;
+    let reported = !lifecycle.answered || lifecycle.reported || lifecycle.report_undeliverable;
+    consumed && reported && lifecycle.approval.is_none() && !lifecycle.answer_lost
+}
+
+/// Drop all but the newest `FINISHED_CARDS_KEPT` finished cards. Cards raised
+/// by older builds carry no raise time and count as the oldest.
+fn prune_finished(registry: &mut HashMap<String, RaisedCard>) {
+    let mut done: Vec<(Option<u64>, String)> = registry
+        .values()
+        .filter(|card| finished(card))
+        .map(|card| (card.lifecycle.raised_at_ms, card.elicitation_id.clone()))
+        .collect();
+    if done.len() <= FINISHED_CARDS_KEPT {
+        return;
+    }
+    done.sort();
+    for (_, id) in &done[..done.len() - FINISHED_CARDS_KEPT] {
+        registry.remove(id);
     }
 }
 

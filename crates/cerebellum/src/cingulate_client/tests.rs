@@ -2006,6 +2006,96 @@ async fn the_registry_file_is_versioned_and_survives_a_restart() {
     assert_eq!(card.subject, "login");
 }
 
+/// Finished cards are pruned to a bounded window when the registry is saved,
+/// while a card holding an unused single-use approval, one whose execution
+/// report is still owed, and an open card survive unchanged.
+#[tokio::test]
+async fn finished_cards_are_pruned_and_live_ones_survive() {
+    use crate::cingulate_client::desk::{CardLifecycle, ExecutionReport, RaisedCard};
+    let scratch = Scratch::new("prune");
+    let (live, _) = live_call("sc_head_alf");
+    let card = |id: &str, applied: bool, lifecycle: CardLifecycle| RaisedCard {
+        elicitation_id: id.into(),
+        session: live.session().clone(),
+        kind: CardKind::LoginCapture,
+        subject: format!("subject-{id}"),
+        grant_ids: vec!["allow".into()],
+        decline_id: "deny".into(),
+        next_steps: Default::default(),
+        applied,
+        lifecycle,
+    };
+    let report = Some(ExecutionReport {
+        execution: wire::Execution::Executed,
+        reason: None,
+    });
+    let mut cards: Vec<_> = (0..200u64)
+        .map(|n| {
+            card(
+                &format!("el_done_{n}"),
+                true,
+                CardLifecycle {
+                    answered: true,
+                    acked: true,
+                    final_report: report,
+                    reported: n % 2 == 0,
+                    report_undeliverable: n % 2 == 1,
+                    raised_at_ms: Some(1_000 + n),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    let approval = card(
+        "el_approval",
+        true,
+        CardLifecycle {
+            answered: true,
+            acked: true,
+            approval: Some("allow".into()),
+            raised_at_ms: Some(1),
+            ..Default::default()
+        },
+    );
+    let owed = card(
+        "el_owed",
+        true,
+        CardLifecycle {
+            answered: true,
+            acked: true,
+            final_report: report,
+            raised_at_ms: Some(2),
+            ..Default::default()
+        },
+    );
+    let open = card("el_open", false, CardLifecycle::default());
+    cards.extend([approval.clone(), owed.clone(), open.clone()]);
+    scratch.store().save(&cards).unwrap();
+
+    let cingulate = ScriptedCingulate::new();
+    let desk = ConsentDesk::with_store(Arc::new(cingulate.clone()), Arc::new(scratch.store()));
+    // Any transition saves the registry.
+    desk.finish_execution("el_unknown", wire::Execution::Executed, None)
+        .unwrap();
+    let stored = scratch.store().load().unwrap();
+    assert_eq!(stored.len(), 32 + 3, "finished cards were not pruned");
+    for survivor in [&approval, &owed, &open] {
+        assert!(
+            stored.contains(survivor),
+            "{} changed",
+            survivor.elicitation_id
+        );
+    }
+    // The newest finished cards are the ones kept.
+    assert!(stored
+        .iter()
+        .any(|card| card.elicitation_id == "el_done_199"));
+    assert!(!stored.iter().any(|card| card.elicitation_id == "el_done_0"));
+    let reopened = ConsentDesk::with_store(Arc::new(cingulate.clone()), Arc::new(scratch.store()));
+    assert_eq!(reopened.raised("el_approval"), Some(approval));
+    assert!(reopened.raised("el_done_0").is_none());
+}
+
 /// A registry file this build cannot read (a newer version, damaged, or
 /// unversioned) is never overwritten, and while it stands no route is
 /// opened and no card is raised: every call ends
