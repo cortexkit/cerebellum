@@ -169,9 +169,11 @@ use subc_protocol::{
     PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
+use tokio::io::AsyncRead;
+#[cfg(test)]
+use tokio::io::AsyncWrite;
 #[cfg(test)]
 use tokio::io::AsyncWriteExt;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -214,7 +216,7 @@ use cerebellum_core::principal::{
     principal_label, SESSION_CALLER_NOT_ADMITTED, SESSION_CALLER_NOT_ADMITTED_REMEDY,
 };
 pub use cerebellum_core::principal::{trust_for_principal, PrincipalTrust};
-use egress::{drain_writer, request_id, ConnectionDeadlines};
+use egress::{drive_connection, request_id, ConnectionDeadlines};
 use terminal_arbiter::run_arbitrated_route;
 pub use terminal_arbiter::{
     CallStep, DispatchGate, HeldState, TerminalArbiter, TerminalCause, CALL_TERMINAL,
@@ -2632,49 +2634,6 @@ where
         module_loop(read_half, tx, config, planes)
     })
     .await
-}
-
-async fn drive_connection<W, F, Fut>(
-    write_half: W,
-    deadlines: Arc<ConnectionDeadlines>,
-    run_loop: F,
-) -> Result<(), ModuleError>
-where
-    W: AsyncWrite + Unpin + Send + 'static,
-    F: FnOnce(mpsc::Sender<Frame>) -> Fut,
-    Fut: std::future::Future<Output = Result<(), ModuleError>>,
-{
-    let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
-    let mut writer = tokio::spawn(drain_writer(write_half, rx, Arc::clone(&deadlines)));
-    let mut loop_task = Box::pin(run_loop(tx.clone()));
-
-    let loop_result = tokio::select! {
-        // Preserve the existing diagnostic precedence when both sides become
-        // ready together: a concrete loop error is more specific than the
-        // writer shutdown it can induce.
-        biased;
-        loop_result = &mut loop_task => loop_result,
-        writer_result = &mut writer => {
-            return report_writer_first(normalize_writer_task_result(writer_result));
-        }
-        _ = deadlines.expired() => {
-            writer.abort();
-            let _ = writer.await;
-            return Err(ModuleError::Message("terminal delivery deadline exceeded".into()));
-        }
-    };
-
-    drop(loop_task);
-    drop(tx);
-    let writer_result = tokio::select! {
-        result = &mut writer => normalize_writer_task_result(result),
-        _ = deadlines.expired() => {
-            writer.abort();
-            let _ = writer.await;
-            Err(ModuleError::Message("terminal delivery deadline exceeded".into()))
-        }
-    };
-    reconcile_connection_results(loop_result, writer_result)
 }
 
 /// Derive the bounded idle-wake cadence from the configured heartbeat stale
