@@ -1525,6 +1525,7 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
             conversations.extend(planes.routes.conversations_under_scope(&key));
             let _ = planes.consent.forget_session(&session);
             revoke_scope(&planes, &conversations).await;
+            planes.scopes.forget_ended(&key);
             return;
         }
         let browser_open = planes

@@ -1115,6 +1115,7 @@ impl CallRecords {
             inner.cached.retain(|key| entries.contains_key(key));
             inner.cached_bytes = entries.values().map(|entry| entry.reply_bytes).sum();
         }
+        late::retire_ended_scopes(inner);
         dropped
     }
 
