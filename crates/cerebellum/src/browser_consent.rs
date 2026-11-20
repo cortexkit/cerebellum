@@ -440,6 +440,8 @@ mod tests {
     struct GrantStorage {
         inner: InMemoryAgentGrantStorage,
         writes: std::sync::atomic::AtomicUsize,
+        /// Refuse any write that would store a row for this subject.
+        refuse: std::sync::Mutex<Option<GrantSubject>>,
     }
     impl AgentGrantStorage for GrantStorage {
         fn load(&self) -> Result<Option<AgentGrantStoreState>, AgentGrantStoreError> {
@@ -448,6 +450,13 @@ mod tests {
         fn save(&self, state: &AgentGrantStoreState) -> Result<(), AgentGrantStoreError> {
             self.writes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let refused = self.refuse.lock().unwrap().clone();
+            if refused.is_some_and(|subject| state.grants.iter().any(|row| row.subject == subject))
+            {
+                return Err(AgentGrantStoreError::WriteFailed {
+                    detail: "refused by the test".into(),
+                });
+            }
             self.inner.save(state)
         }
     }
@@ -968,6 +977,62 @@ mod tests {
             .management
             .consent_subject(CardKind::WebsiteAccessInAdvance, "el_browser_1")
             .is_some());
+    }
+
+    /// One answer covering several sites changes all of their grants or none:
+    /// a failed write of the second site's row leaves the first unwritten too.
+    #[tokio::test]
+    async fn a_multi_site_answer_grants_every_site_or_none() {
+        for refuse in [true, false] {
+            let fixture = Fixture::new(false);
+            let second = GrantSubject::Origin("https://second.example.net".into());
+            if refuse {
+                *fixture.grant_storage.refuse.lock().unwrap() = Some(second.clone());
+            }
+            fixture.raised("el_two_sites");
+            let reply = fixture
+                .call(
+                    crate::management::OPEN_GRANT,
+                    json!({"origins":["https://first.example.org","https://second.example.net"],
+                        "hazards":[]}),
+                )
+                .await;
+            assert_eq!(reply["outcome"], "consent_pending", "{reply}");
+            fixture.service.then(
+                "consent.answers",
+                Reply::Result(json!({"records":[{"elicitation_id":"el_two_sites",
+                    "state":"answered","answered_choice_id":"allow_30m"}],"cursor":1})),
+            );
+            fixture
+                .service
+                .then("consent.ack", Reply::Result(json!({"cursor":1})));
+            fixture.call("test.drain", json!({})).await;
+            let store = fixture.planes.management.agent_grants();
+            let mut visible: Vec<_> = store
+                .live_rows(None, store.now_ms())
+                .unwrap()
+                .into_iter()
+                .map(|row| row.subject)
+                .collect();
+            visible.sort_by_key(|subject| format!("{subject:?}"));
+            let durable: Vec<_> = AgentGrantStorage::load(&fixture.grant_storage.inner)
+                .unwrap()
+                .map(|state| state.grants)
+                .unwrap_or_default();
+            if refuse {
+                assert!(visible.is_empty(), "{visible:?}");
+                assert!(durable.is_empty(), "{durable:?}");
+            } else {
+                assert_eq!(
+                    visible,
+                    [
+                        GrantSubject::Origin("https://first.example.org".into()),
+                        second
+                    ]
+                );
+                assert_eq!(durable.len(), 2);
+            }
+        }
     }
 
     #[tokio::test]

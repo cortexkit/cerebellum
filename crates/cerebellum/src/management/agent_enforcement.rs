@@ -107,36 +107,33 @@ impl ManagementPlane {
                 None => return BrowserGrantSettlement::NotGranted,
             }
         };
-        for subject in subjects {
-            let hazards = if subject == GrantSubject::AllSites {
-                vec![]
-            } else {
-                pending.disclosed_hazards.iter().copied().collect()
+        let rows = subjects
+            .into_iter()
+            .map(|subject| AgentGrant {
+                id: String::new(),
+                holder: holder.clone(),
+                hazards: if subject == GrantSubject::AllSites {
+                    vec![]
+                } else {
+                    pending.disclosed_hazards.iter().copied().collect()
+                },
+                subject,
+                browser_target: Some(BrowserTarget::AgentProfile),
+                machine_uuid: machine.into(),
+                granted_at_ms: window.map_or(now, |(start, _)| start),
+                expires_at_ms: window.map(|(_, end)| end),
+                card_ref: Some(card_ref.into()),
+                max_level: pending.severity.tier,
+                team_id: None,
+                designated_requirement: None,
+            })
+            .collect();
+        // One write for every site the answer covers, so a failed save leaves
+        // none of them granted rather than some.
+        if store.upsert_all(rows, now).is_err() {
+            return BrowserGrantSettlement::NotRecorded {
+                reason: "grant_storage_unavailable",
             };
-            if store
-                .upsert(
-                    AgentGrant {
-                        id: String::new(),
-                        holder: holder.clone(),
-                        subject,
-                        browser_target: Some(BrowserTarget::AgentProfile),
-                        machine_uuid: machine.into(),
-                        granted_at_ms: window.map_or(now, |(start, _)| start),
-                        expires_at_ms: window.map(|(_, end)| end),
-                        card_ref: Some(card_ref.into()),
-                        max_level: pending.severity.tier,
-                        hazards,
-                        team_id: None,
-                        designated_requirement: None,
-                    },
-                    now,
-                )
-                .is_err()
-            {
-                return BrowserGrantSettlement::NotRecorded {
-                    reason: "grant_storage_unavailable",
-                };
-            }
         }
         BrowserGrantSettlement::Granted(choice)
     }
