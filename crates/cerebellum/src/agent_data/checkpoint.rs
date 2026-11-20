@@ -1,4 +1,11 @@
 //! Per-cut replay records are separate from permanent privacy marks.
+//!
+//! Finished cuts are kept for good, holding only their step and saved
+//! replies, so a repeated request keeps getting its first reply. Retiring
+//! them would need two things first: a replay-retention window stated by the
+//! agent-data role contract, since a retired cut answers as unknown, and a
+//! new checkpoint format version behind the format floor to record when
+//! each cut finished.
 
 use super::*;
 use cerebellum_core::format_floor::{FormatFloor, FORMAT_FLOOR_FILE};

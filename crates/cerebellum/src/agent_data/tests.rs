@@ -297,6 +297,21 @@ async fn round_trip_through_engram_preserves_marks_and_release_keeps_source_copy
     .await;
     assert_eq!(ty, FrameType::Error);
     assert_eq!(e["code"], "id_reused");
+    // A finished cut keeps only its step and saved replies: no later op reads
+    // its snapshot or ref set, and repeats still get their first replies.
+    for participant in [&source, &receiver] {
+        let state = participant.agent_data.state.lock().await;
+        let cut = &state.cuts[CUT];
+        assert!(cut.payloads.is_empty() && cut.refs.is_none());
+    }
+    assert_eq!(
+        call(&source, "agent_data.prepare", params()).await,
+        prepared
+    );
+    assert_eq!(
+        call(&receiver, "agent_data.import", params()).await,
+        imported
+    );
 }
 
 #[tokio::test]

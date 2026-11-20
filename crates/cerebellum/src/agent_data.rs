@@ -279,6 +279,13 @@ impl Participant {
             _ => unreachable!("reads returned above"),
         };
         cut.step = next;
+        // No op after a finished step reads the snapshot or the ref set: the
+        // saved replies below answer every repeat. Dropping them keeps a
+        // finished cut small; see the checkpoint module for retiring it.
+        if matches!(next, Step::Activated | Step::Released | Step::Aborted) {
+            cut.payloads.clear();
+            cut.refs = None;
+        }
         cut.replies.insert(
             op.method().into(),
             checkpoint::Reply {
