@@ -446,9 +446,117 @@ pub struct ReleasedChild {
     reaped: bool,
 }
 
+/// A kernel exit observation for an owned child. Waiting does not reap it.
+pub struct ChildExitWatch(Option<OwnedFd>);
+
+impl ChildExitWatch {
+    fn new(pid: u32) -> io::Result<Self> {
+        use crate::kqueue::{
+            kevent, kqueue, KernelEvent, EVFILT_PROC, EV_ADD, EV_ONESHOT, NOTE_EXIT,
+        };
+        // SAFETY: no inputs; on success the caller owns the returned descriptor.
+        let queue = unsafe { kqueue() };
+        if queue < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: kqueue handed this descriptor to us and it is open.
+        let queue = unsafe { OwnedFd::from_raw_fd(queue) };
+        // SAFETY: fcntl only changes descriptor inheritance on our own queue.
+        if unsafe { fcntl(queue.as_raw_fd(), F_SETFD, FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let event = KernelEvent {
+            ident: pid as usize,
+            filter: EVFILT_PROC,
+            flags: EV_ADD | EV_ONESHOT,
+            fflags: NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: one readable change, no output events, and no wait.
+        if unsafe {
+            kevent(
+                queue.as_raw_fd(),
+                &event,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        } < 0
+        {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(3) {
+                // ESRCH: the child already exited.
+                return Ok(Self(None));
+            }
+            return Err(error);
+        }
+        Ok(Self(Some(queue)))
+    }
+
+    /// Wait at most `timeout`. A timeout is not a process-exit event.
+    pub fn wait(&self, timeout: std::time::Duration) -> io::Result<bool> {
+        use crate::kqueue::{kevent, KernelEvent, Timespec, EVFILT_PROC, NOTE_EXIT};
+        let Some(queue) = &self.0 else {
+            return Ok(true);
+        };
+        let timeout = Timespec {
+            seconds: isize::try_from(timeout.as_secs()).unwrap_or(isize::MAX),
+            nanoseconds: timeout.subsec_nanos() as isize,
+        };
+        let mut event = std::mem::MaybeUninit::<KernelEvent>::uninit();
+        // SAFETY: no changes; the event slot and timeout are valid for the call.
+        match unsafe {
+            kevent(
+                queue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                event.as_mut_ptr(),
+                1,
+                &timeout,
+            )
+        } {
+            -1 => Err(io::Error::last_os_error()),
+            0 => Ok(false),
+            _ => {
+                // SAFETY: kevent returned an event and initialized the slot.
+                let event = unsafe { event.assume_init() };
+                Ok(event.filter == EVFILT_PROC && event.fflags & NOTE_EXIT != 0)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn child_exit_watch_times_out_then_observes_exit_without_reaping() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "read -r line; exit 7"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let watch = ChildExitWatch::new(child.id()).unwrap();
+    assert!(!watch.wait(Duration::ZERO).unwrap());
+    drop(child.stdin.take());
+    assert!(watch.wait(Duration::from_secs(2)).unwrap());
+    assert_eq!(child.wait().unwrap().code(), Some(7));
+}
+
 impl ReleasedChild {
     pub fn generation(&self) -> ProcessGeneration {
         self.generation
+    }
+
+    /// Observe the owned child independently of any pipes it inherited.
+    pub fn watch_exit(&self) -> io::Result<ChildExitWatch> {
+        if self.reaped {
+            return Ok(ChildExitWatch(None));
+        }
+        ChildExitWatch::new(self.generation.pid)
     }
 
     /// Reap an exited child without waiting; the returned value is its raw

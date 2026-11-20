@@ -32,6 +32,9 @@ trait Helper: Send + 'static {
     fn try_wait_status(&mut self) -> Option<i32> {
         None
     }
+    fn watch_exit(&mut self, _exited: ExitNotice) -> Result<(), &'static str> {
+        Ok(())
+    }
     fn generation(&self) -> ProcessGeneration;
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<()>;
     fn wait_ready(&mut self, deadline: Instant) -> Result<(), &'static str>;
@@ -79,19 +82,25 @@ enum Command {
         deadline: Instant,
         reply: pipe::SyncSender<Result<Option<u32>, &'static str>>,
     },
+    ChildExited(ProcessGeneration),
+    #[cfg(test)]
     ReplyReaderEnded(ProcessGeneration),
     Stop,
 }
 
 #[derive(Clone)]
 pub(super) struct Service {
-    tx: pipe::SyncSender<Command>,
+    tx: Arc<pipe::SyncSender<Command>>,
     stopped: Arc<AtomicBool>,
 }
+
+type ExitNotice = Box<dyn FnOnce() + Send>;
 
 impl Service {
     fn start<L: Launcher>(launcher: L, gauges: &'static HelperGauges) -> Self {
         let (tx, rx) = pipe::sync_channel(CAPACITY);
+        let tx = Arc::new(tx);
+        let exit_tx = Arc::downgrade(&tx);
         let stopped = Arc::new(AtomicBool::new(false));
         let ending = stopped.clone();
         if std::thread::Builder::new()
@@ -102,6 +111,7 @@ impl Service {
                     helper: None,
                     restarts: RestartLimit::default(),
                     gauges,
+                    exit_tx,
                 };
                 while let Ok(command) = rx.recv() {
                     if ending.load(Ordering::Acquire) {
@@ -147,6 +157,16 @@ impl Service {
                             let written = worker.write_visual(&owner, &bytes, launches);
                             let _ = reply.try_send(written);
                         }
+                        Command::ChildExited(generation) => {
+                            if worker
+                                .helper
+                                .as_ref()
+                                .is_some_and(|helper| helper.generation() == generation)
+                            {
+                                worker.reap_after_exit();
+                            }
+                        }
+                        #[cfg(test)]
                         Command::ReplyReaderEnded(generation) => {
                             if worker
                                 .helper
@@ -248,6 +268,7 @@ struct Worker<L: Launcher> {
     helper: Option<L::Helper>,
     restarts: RestartLimit,
     gauges: &'static HelperGauges,
+    exit_tx: std::sync::Weak<pipe::SyncSender<Command>>,
 }
 
 impl<L: Launcher> Worker<L> {
@@ -262,6 +283,19 @@ impl<L: Launcher> Worker<L> {
         if let Some(status) = self.helper.as_mut().and_then(Helper::try_wait_status) {
             self.gauges.exit(ExitReason::ChildExited, Some(status));
             self.helper.take();
+        }
+    }
+
+    fn reap_after_exit(&mut self) {
+        // Allow the kernel to make wait status available after its exit event,
+        // without holding the transport indefinitely if it cannot be collected.
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while self.helper.is_some() {
+            self.reap_exited();
+            if self.helper.is_none() || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -324,9 +358,20 @@ impl<L: Launcher> Worker<L> {
                     .start_failed("mouse-down recipient helper restart limit reached");
                 return Err("mouse-down recipient helper restart limit reached");
             }
-            let helper = self
+            let mut helper = self
                 .launcher
                 .launch(deadline)
+                .inspect_err(|error| self.gauges.start_failed(error))?;
+            let generation = helper.generation();
+            let tx = self.exit_tx.clone();
+            helper
+                .watch_exit(Box::new(move || {
+                    if let Some(tx) = tx.upgrade() {
+                        // Only the exit observer waits for space. An already-full
+                        // command queue cannot discard a child's exit.
+                        let _ = tx.send(Command::ChildExited(generation));
+                    }
+                }))
                 .inspect_err(|error| self.gauges.start_failed(error))?;
             // A slow spawn may finish after its caller has already refused.
             // Drop that child rather than retain a late startup as readiness.
@@ -347,10 +392,12 @@ struct NativeHelper {
     child: cerebellum_macos::ReleasedChild,
     pipe: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
     client: pointer_query::Client,
+    stop_exit_watch: Arc<AtomicBool>,
 }
 
 impl Drop for NativeHelper {
     fn drop(&mut self) {
+        self.stop_exit_watch.store(true, Ordering::Release);
         cerebellum_macos::register_cursor_generation(None);
     }
 }
@@ -366,6 +413,30 @@ impl Helper for NativeHelper {
     }
     fn try_wait_status(&mut self) -> Option<i32> {
         self.child.try_wait_status()
+    }
+    fn watch_exit(&mut self, exited: ExitNotice) -> Result<(), &'static str> {
+        let watch = self
+            .child
+            .watch_exit()
+            .map_err(|_| "mouse-down recipient helper exit watch unavailable")?;
+        let stopped = self.stop_exit_watch.clone();
+        std::thread::Builder::new()
+            .name("cursor-child-exit".into())
+            .spawn(move || {
+                while !stopped.load(Ordering::Acquire) {
+                    match watch.wait(Duration::from_secs(30)) {
+                        Ok(true) => {
+                            exited();
+                            return;
+                        }
+                        Ok(false) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => return,
+                    }
+                }
+            })
+            .map(|_| ())
+            .map_err(|_| "mouse-down recipient helper exit watch start failed")
     }
     fn wait_ready(&mut self, deadline: Instant) -> Result<(), &'static str> {
         if Instant::now() >= deadline {
@@ -430,7 +501,6 @@ impl Launcher for NativeLauncher {
         let pipe: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>> =
             Arc::new(std::sync::Mutex::new(Box::new(std::fs::File::from(pipe))));
         let (tx, rx) = pipe::sync_channel(32);
-        let generation = child.generation();
         std::thread::Builder::new()
             .name("cursor-pointer-replies".into())
             .spawn(move || {
@@ -457,9 +527,6 @@ impl Launcher for NativeLauncher {
                     }
                 }
                 HELPER_GAUGES.reply_reader_disconnected();
-                if let Some(service) = SHARED.get() {
-                    let _ = service.tx.try_send(Command::ReplyReaderEnded(generation));
-                }
             })
             .map_err(|_| "mouse-down recipient helper reply reader start failed")?;
         cerebellum_macos::register_cursor_generation(Some(child.generation()));
@@ -467,6 +534,7 @@ impl Launcher for NativeLauncher {
             child,
             client: Client::new(pipe.clone(), rx),
             pipe,
+            stop_exit_watch: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -485,6 +553,8 @@ mod tests {
         alive: bool,
         now: Instant,
         wait_status: Option<i32>,
+        first_wait: Option<pipe::Sender<()>>,
+        exited: Option<ExitNotice>,
         write_error: Option<std::io::ErrorKind>,
         screen_locked: Option<bool>,
         launch_fails: bool,
@@ -498,7 +568,15 @@ mod tests {
             self.0.lock().unwrap().alive
         }
         fn try_wait_status(&mut self) -> Option<i32> {
-            self.0.lock().unwrap().wait_status.take()
+            let mut stats = self.0.lock().unwrap();
+            if let Some(first_wait) = stats.first_wait.take() {
+                let _ = first_wait.send(());
+            }
+            stats.wait_status.take()
+        }
+        fn watch_exit(&mut self, notice: ExitNotice) -> Result<(), &'static str> {
+            self.0.lock().unwrap().exited = Some(notice);
+            Ok(())
         }
         fn generation(&self) -> ProcessGeneration {
             ProcessGeneration {
@@ -555,6 +633,8 @@ mod tests {
             alive: false,
             now: Instant::now(),
             wait_status: None,
+            first_wait: None,
+            exited: None,
             write_error: None,
             screen_locked: screen,
             launch_fails: fail,
@@ -571,6 +651,37 @@ mod tests {
     }
     fn deadline() -> Instant {
         Instant::now() + Duration::from_millis(50)
+    }
+
+    #[test]
+    fn the_child_is_reaped_when_it_exits_after_reply_reader_eof() {
+        static GAUGES: HelperGauges = HelperGauges::new();
+        let (service, stats) = fixture_counting(Some(false), false, &GAUGES);
+        assert_eq!(service.prewarm(deadline()), Ok(()));
+        let generation = FakeHelper(stats.clone()).generation();
+        let (seen, seen_wait) = pipe::channel();
+        stats.lock().unwrap().first_wait = Some(seen);
+        service
+            .tx
+            .send(Command::ReplyReaderEnded(generation))
+            .unwrap();
+        seen_wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        let exited = {
+            let mut stats = stats.lock().unwrap();
+            stats.wait_status = Some(7 << 8);
+            stats.exited.take().unwrap()
+        };
+        exited();
+        let start = Instant::now();
+        while GAUGES.report()["cursorHelperExitReasons"]["child_exited"] != 1 {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "exited child stayed registered"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(GAUGES.report()["cursorHelperLastWaitStatus"], 7 << 8);
+        service.stop();
     }
 
     #[test]

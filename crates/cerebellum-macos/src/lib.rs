@@ -66,6 +66,8 @@ mod event_tap;
 #[cfg(any(target_os = "macos", test))]
 mod input;
 #[cfg(target_os = "macos")]
+mod kqueue;
+#[cfg(target_os = "macos")]
 mod launch;
 #[cfg(all(target_os = "macos", feature = "desk-probe"))]
 pub mod peer_identity_probe;
