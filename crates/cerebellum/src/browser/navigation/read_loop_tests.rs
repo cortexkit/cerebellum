@@ -56,6 +56,72 @@ use crate::browser_session::{DriveScope, DriverWatch};
 use std::io;
 use std::sync::{Arc, Mutex};
 
+/// The established driver parses each frame once, moves a large reply's
+/// result into the response, and applies events without queuing a copy: a
+/// transport whose event queue holds nothing still serves them. Abandoned
+/// replies are still discarded, and a malformed event still fails closed.
+#[test]
+fn each_frame_is_parsed_once_and_events_are_not_queued() {
+    let tree = "n".repeat(4 * 1024 * 1024);
+    let pipe = FakePipe::with_frames([
+        json!({"method":"Page.navigatedWithinDocument","sessionId":"session",
+            "params":{"frameId":"frame","url":"https://example.test/"}}),
+        json!({"id":1,"result":{"late":true}}),
+        json!({"id":2,"result":{"nodes":tree}}),
+        json!({"method":"Page.navigatedWithinDocument","params":"not an object"}),
+    ]);
+    let mut driver = CdpNavigationDriver::new(
+        pipe,
+        CdpTransport::with_event_limit(0),
+        CdpFrameDecoder::default(),
+    );
+    driver
+        .frame_sessions
+        .insert("frame".into(), "session".into());
+    let mut clock = FakeClock::new();
+    let start = clock.now();
+    let abandoned = driver
+        .transport
+        .issue_command("Page.getFrameTree", None, None, start)
+        .unwrap();
+    driver.transport.abandon_command(abandoned.id);
+    // command_response issues the AX tree read itself, as id 2.
+    let parsed_before = crate::cdp::PARSED_MESSAGES.with(std::cell::Cell::get);
+    let response = driver
+        .command_response(
+            "Accessibility.getFullAXTree",
+            None,
+            None,
+            start + Duration::from_secs(2),
+            None,
+            None,
+            &mut clock,
+        )
+        .unwrap();
+    assert_eq!(
+        crate::cdp::PARSED_MESSAGES.with(std::cell::Cell::get) - parsed_before,
+        3,
+        "each frame up to the reply is parsed exactly once"
+    );
+    assert_eq!(
+        response.result.unwrap()["nodes"].as_str().unwrap().len(),
+        tree.len()
+    );
+    assert_eq!(driver.frame_revisions["frame"], 1, "the event was applied");
+    assert!(
+        driver.pending_responses.is_empty(),
+        "the abandoned reply was kept"
+    );
+    assert_eq!(driver.transport.queued_event_len(), 0);
+
+    let malformed = driver.service_connection();
+    assert!(matches!(malformed, Err(NavigationDriveError::CdpFailure)));
+    assert!(
+        driver.transport.is_closed(),
+        "a malformed event must fail closed"
+    );
+}
+
 struct Clock {
     now: Arc<Mutex<Instant>>,
     sleeps: usize,
