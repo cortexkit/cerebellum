@@ -26,6 +26,10 @@ const CONTROL_DEADLINE: Duration = Duration::from_secs(5);
 /// than leaving the module on an older view until the daemon hints again.
 const RETRY_FIRST: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
+/// How long a startup exchange may wait for its reply. Generous, since a slow
+/// daemon is not refusing, but bounded, so one lost reply cannot leave the
+/// module answering `not_ready` for good.
+const STARTUP_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The wait before the next attempt after `previous`.
 fn next_retry(previous: Option<Duration>) -> Duration {
@@ -201,10 +205,10 @@ impl Session {
         writer: &mpsc::Sender<Frame>,
         declaration: ConfigDeclareRequest,
     ) -> Result<(StartupSettings, Option<ConfigAppliedRequest>), ()> {
-        // Keep the original correlation until the daemon replies or the
-        // connection ends; a slow response is not a refusal.
+        // A slow or missing reply is not a refusal: go on to read the view,
+        // which says whether the declaration took effect.
         match self
-            .call::<serde_json::Value>(writer, &declaration, None)
+            .call::<serde_json::Value>(writer, &declaration, Some(STARTUP_DEADLINE))
             .await
         {
             Ok(_) => {}
@@ -212,11 +216,15 @@ impl Session {
                 self.set_health(SettingsHealth::Refused(code));
                 return Err(());
             }
-            Err(None) => self.changed.notified().await,
+            Err(None) => self.changed_or_retry(Some(RETRY_FIRST)).await,
         }
+        // Set after a GET that failed or went unanswered, so the next one is
+        // tried without waiting for a hint the daemon may never send.
+        let mut retry = None;
         loop {
-            match self.get(writer, None).await {
+            match self.get(writer, Some(STARTUP_DEADLINE)).await {
                 Ok(reply) => {
+                    retry = None;
                     self.set_health(SettingsHealth::Waiting(None));
                     let mut view = reply.pending.or_else(|| reply.active.clone());
                     while let Some(candidate) = view {
@@ -250,9 +258,12 @@ impl Session {
                     self.set_health(SettingsHealth::Refused(code));
                     return Err(());
                 }
-                Err(code) => self.set_health(SettingsHealth::Waiting(code)),
+                Err(code) => {
+                    retry = Some(next_retry(retry));
+                    self.set_health(SettingsHealth::Waiting(code));
+                }
             }
-            self.changed.notified().await;
+            self.changed_or_retry(retry).await;
         }
     }
 
