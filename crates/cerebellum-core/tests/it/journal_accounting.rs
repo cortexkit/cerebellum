@@ -277,3 +277,53 @@ fn terminal_accounting_matches_serialized_record_not_payload() {
     assert_eq!(compact_transition_bytes(&path), transition_bytes);
     assert_eq!(journal.retained_bytes(), transition_bytes);
 }
+
+/// Finalize one small record, then hold a large reservation. Returns the bytes
+/// the finalized record retains and the held reservation's charge.
+fn finalized_record_then_held_reservation<S: cerebellum_core::journal::JournalStorage>(
+    journal: &mut JournalStore<AccountingCodec, (), (), S>,
+) -> (u64, u64) {
+    let handle = journal.reserve(identity(), b"invoke-1".to_vec()).unwrap();
+    journal
+        .finalize_rejected(
+            handle,
+            RejectionMaterial {
+                rejection_material: b"denied".to_vec(),
+            },
+        )
+        .unwrap();
+    let finalized = journal.retained_bytes();
+    journal.reserve(identity(), vec![0; 2_000]).unwrap();
+    (finalized, journal.active_reserved_bytes())
+}
+
+/// A reservation that could not fit even with every finalized record evicted
+/// is refused without evicting any of them: a refused action must not erase
+/// retained history.
+#[test]
+fn an_impossible_reservation_keeps_retained_history() {
+    let (finalized, held) = finalized_record_then_held_reservation(&mut store(1_000_000));
+    assert!(
+        held > finalized,
+        "the scenario needs a held charge above the finalized record"
+    );
+    let directory = TemporaryDirectory::new("impossible");
+    let path = directory.journal_path();
+    let budget = finalized + held;
+    let mut journal = filesystem_store(budget, &path);
+    assert_eq!(
+        finalized_record_then_held_reservation(&mut journal),
+        (finalized, held)
+    );
+    // Another reservation of the held one's size needs 2 * held > budget even
+    // with the finalized record gone.
+    assert_eq!(
+        journal.reserve(identity(), vec![0; 2_000]),
+        Err(JournalError::ReservationFailed)
+    );
+    assert_eq!(journal.status().entry_count, 1);
+    drop(journal);
+    let reopened = filesystem_store(budget, &path);
+    assert_eq!(reopened.status().entry_count, 1);
+    assert_eq!(reopened.retained_bytes(), finalized + held);
+}

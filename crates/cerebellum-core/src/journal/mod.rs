@@ -518,7 +518,7 @@ where
         // Older writers did not charge the terminal feed. Apply the same
         // retention policy on reopen before copying that history on each write.
         let before = state.clone();
-        make_room(&mut state, 0, config);
+        trim(&mut state, 0, config);
         if state != before {
             storage.save(&state).map_err(BindingError::Storage)?;
         }
@@ -1556,7 +1556,28 @@ fn retained_bytes(state: &DurableState) -> u64 {
         + state.transitions.iter().map(transition_charge).sum::<u64>()
 }
 
+/// Bytes held by active reservations, which eviction cannot remove.
+fn reserved_bytes(state: &DurableState) -> u64 {
+    state
+        .reservations
+        .values()
+        .map(|record| record.charge)
+        .sum()
+}
+
 fn make_room(state: &mut DurableState, needed: u64, config: JournalConfig) -> bool {
+    // Refuse before evicting anything when the charge could not fit even with
+    // every finalized record gone: a refused action must not erase history.
+    if reserved_bytes(state).saturating_add(needed) > config.journal_retention_bytes {
+        return false;
+    }
+    trim(state, needed, config)
+}
+
+/// Evict the oldest finalized records until `needed` more bytes fit, as far as
+/// eviction can go. Reopening a journal trims this way even when active
+/// reservations alone exceed the budget.
+fn trim(state: &mut DurableState, needed: u64, config: JournalConfig) -> bool {
     while retained_bytes(state).saturating_add(needed) > config.journal_retention_bytes {
         if !evict_oldest_terminal(state) {
             return false;
@@ -1571,6 +1592,15 @@ fn make_room_delta(
     new_charge: u64,
     config: JournalConfig,
 ) -> bool {
+    // As in `make_room`: `old_charge` is an active reservation's charge being
+    // replaced, so it is part of the reserved bytes that eviction cannot free.
+    if reserved_bytes(state)
+        .saturating_sub(old_charge)
+        .saturating_add(new_charge)
+        > config.journal_retention_bytes
+    {
+        return false;
+    }
     while retained_bytes(state)
         .saturating_sub(old_charge)
         .saturating_add(new_charge)
