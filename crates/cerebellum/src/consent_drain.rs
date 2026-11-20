@@ -105,7 +105,8 @@ impl ConsentDrain {
         let lock = desk.settlement_lock(live.session());
         let _pass = lock.lock().await;
         let cards = desk.unapplied_for(live);
-        let owed = cards.is_empty() && calls.is_some_and(|calls| calls.has_pending_consents());
+        let owed = cards.is_empty()
+            && (desk.owes_ack(live) || calls.is_some_and(|calls| calls.has_pending_consents()));
         if cards.is_empty() && !desk.has_pending_reports() && !owed {
             return Ok(DrainReport::default());
         }
@@ -715,6 +716,48 @@ mod tests {
                 self.route.call(method, params).await
             })
         }
+    }
+
+    /// A failed acknowledgement of an applied answer is retried by the
+    /// session's next ordinary call, without applying the answer again.
+    #[tokio::test]
+    async fn a_failed_ack_is_retried_by_the_next_call() {
+        let cingulate = ScriptedCingulate::new();
+        cingulate
+            .then(
+                wire::CONSENT_ANSWERS,
+                Reply::Result(json!({"records":[record("answered")], "cursor":1})),
+            )
+            .then(wire::CONSENT_ACK, Reply::Transport);
+        feed(&cingulate);
+        let (planes, _dir, store) =
+            planes(&[card(CardKind::AppControl)], Arc::new(cingulate.clone()));
+        let effects = Effects::new(true);
+        planes
+            .consent_drain
+            .register(CardKind::AppControl, effects.clone());
+        ordinary_reply(&invoke(&planes, 1).await);
+        let card = planes.consent.raised("el_1").unwrap();
+        assert!(card.applied && !card.lifecycle.acked);
+        ordinary_reply(&invoke(&planes, 1).await);
+        assert_eq!(
+            cingulate.methods(),
+            [
+                wire::CONSENT_ANSWERS,
+                wire::CONSENT_ACK,
+                wire::CONSENT_ANSWERS,
+                wire::CONSENT_ACK
+            ]
+        );
+        assert_eq!(effects.applied.load(Ordering::SeqCst), 1);
+        assert!(store
+            .load()
+            .unwrap()
+            .iter()
+            .all(|card| card.applied && card.lifecycle.acked && !card.lifecycle.ack_owed));
+        // Nothing is owed any more, so a third call opens no route.
+        ordinary_reply(&invoke(&planes, 1).await);
+        assert_eq!(cingulate.opens(), 2);
     }
 
     #[tokio::test]

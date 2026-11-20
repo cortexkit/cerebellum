@@ -135,12 +135,15 @@ impl FilesystemJournalStorage {
             source: io_diagnostic(source),
         })?;
 
+        reclaim_abandoned_siblings(&storage.path);
         let probe = unique_sibling_path(&storage.path, "probe");
         let mut file =
             private_fs::create_new_file(&probe).map_err(|source| StorageError::ProbeWrite {
                 path: probe.clone(),
                 source: io_diagnostic(source),
             })?;
+        // Removed by `cleanup` if writing or syncing the probe fails.
+        let cleanup = RemoveUnlessKept::new(&probe);
         file.write_all(b"journal storage probe")
             .map_err(|source| StorageError::ProbeWrite {
                 path: probe.clone(),
@@ -151,6 +154,7 @@ impl FilesystemJournalStorage {
             source: io_diagnostic(source),
         })?;
         drop(file);
+        cleanup.keep();
         fs::remove_file(&probe).map_err(|source| StorageError::ProbeCleanup {
             path: probe,
             source: io_diagnostic(source),
@@ -445,6 +449,12 @@ impl JournalStorage for FilesystemJournalStorage {
                 source: io_diagnostic(source),
             }
         })?;
+        // From here every failure removes the snapshot: its name is unique to
+        // this write, so nothing else would ever replace or read it.
+        let cleanup = RemoveUnlessKept::new(&temporary);
+        // Held while the snapshot is written, so a later startup never
+        // reclaims the file of a live write (see `reclaim_abandoned_siblings`).
+        let _ = file.try_lock();
         file.write_all(&bytes)
             .map_err(|source| StorageError::TemporaryWrite {
                 path: temporary.clone(),
@@ -456,11 +466,90 @@ impl JournalStorage for FilesystemJournalStorage {
         })?;
         drop(file);
         fs::rename(&temporary, &self.path).map_err(|source| StorageError::Rename {
-            from: temporary,
+            from: temporary.clone(),
             to: self.path.clone(),
             source: io_diagnostic(source),
         })?;
+        cleanup.keep();
         sync_directory(&directory)
+    }
+}
+
+/// Removes a file this module created when the work it was created for fails
+/// before [`RemoveUnlessKept::keep`] is called.
+struct RemoveUnlessKept<'a> {
+    path: &'a Path,
+    keep: bool,
+}
+
+impl<'a> RemoveUnlessKept<'a> {
+    fn new(path: &'a Path) -> Self {
+        Self { path, keep: false }
+    }
+
+    fn keep(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for RemoveUnlessKept<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_file(self.path);
+        }
+    }
+}
+
+/// A write's snapshot or probe left this long ago belongs to no live write.
+/// Builds that do not lock their snapshots finish a write in moments, so the
+/// age alone protects them.
+const ABANDONED_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Remove snapshots and probes beside `target` that an earlier process left
+/// when it exited mid-write: named for this journal by `unique_sibling_path`,
+/// not locked by a live writer, and untouched for `ABANDONED_AFTER`. Best
+/// effort: anything that cannot be checked is left alone.
+fn reclaim_abandoned_siblings(target: &Path) {
+    let (Some(directory), Some(name)) = (
+        target.parent(),
+        target.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(rest) = file_name
+            .to_str()
+            .and_then(|file_name| file_name.strip_prefix(&format!(".{name}.")))
+        else {
+            continue;
+        };
+        let Some((role, numbers)) = rest.split_once('.') else {
+            continue;
+        };
+        let named = matches!(role, "tmp" | "probe")
+            && numbers.split_once('.').is_some_and(|(pid, sequence)| {
+                [pid, sequence]
+                    .iter()
+                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+            });
+        let path = entry.path();
+        let abandoned = named
+            && fs::symlink_metadata(&path).is_ok_and(|metadata| {
+                metadata.is_file()
+                    && metadata
+                        .modified()
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age >= ABANDONED_AFTER)
+            })
+            && File::open(&path).is_ok_and(|file| file.try_lock().is_ok());
+        if abandoned {
+            let _ = fs::remove_file(&path);
+        }
     }
 }
 
@@ -629,6 +718,79 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// The names of the files beside the journal that a save or probe left.
+    fn leftovers(directory: &TemporaryDirectory) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(&directory.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with(".journal.json."))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A save that fails after writing its snapshot (here, the rename onto a
+    /// directory) removes the snapshot, so repeated failures leave nothing.
+    #[test]
+    fn a_failed_save_leaves_no_snapshot_behind() {
+        let directory = TemporaryDirectory::new("failed-save");
+        let path = directory.join("journal.json");
+        fs::create_dir_all(path.join("occupied")).unwrap();
+        let storage = FilesystemJournalStorage::new(&path);
+        for _ in 0..3 {
+            assert!(matches!(
+                storage.save(&state(2)),
+                Err(StorageError::Rename { .. })
+            ));
+        }
+        assert_eq!(leftovers(&directory), Vec::<String>::new());
+    }
+
+    /// Startup removes a snapshot an exited writer abandoned, but never the
+    /// committed journal, a snapshot a live writer holds locked, a snapshot
+    /// too recent to be abandoned, or another file's snapshot.
+    #[test]
+    fn startup_reclaims_only_abandoned_snapshots() {
+        let directory = TemporaryDirectory::new("reclaim");
+        let path = directory.join("journal.json");
+        FilesystemJournalStorage::new(&path)
+            .save(&state(2))
+            .unwrap();
+        let committed = fs::read(&path).unwrap();
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let snapshot = |name: &str, old: bool| {
+            let file = directory.join(name);
+            fs::write(&file, b"partial").unwrap();
+            if old {
+                fs::File::options()
+                    .write(true)
+                    .open(&file)
+                    .unwrap()
+                    .set_modified(an_hour_ago)
+                    .unwrap();
+            }
+            file
+        };
+        snapshot(".journal.json.tmp.4000000000.1", true);
+        snapshot(".journal.json.probe.4000000000.2", true);
+        let live = snapshot(".journal.json.tmp.4000000001.3", true);
+        let live = fs::File::open(live).unwrap();
+        live.lock().unwrap();
+        snapshot(".journal.json.tmp.4000000002.4", false);
+        snapshot(".other.json.tmp.4000000000.5", true);
+        FilesystemJournalStorage::prepare(&path).unwrap();
+        assert_eq!(
+            leftovers(&directory),
+            [
+                ".journal.json.tmp.4000000001.3",
+                ".journal.json.tmp.4000000002.4"
+            ]
+        );
+        assert!(directory.join(".other.json.tmp.4000000000.5").exists());
+        assert_eq!(fs::read(&path).unwrap(), committed);
+        drop(live);
     }
 
     #[test]

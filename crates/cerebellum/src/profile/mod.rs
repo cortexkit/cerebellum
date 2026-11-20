@@ -43,7 +43,20 @@ const REGISTRY_FILE: &str = ".ck-browser-profile-registry-v1.json";
 /// thing it describes. One JSON object per line, fsynced before the registry
 /// starts trusting the new identity.
 pub const PROFILE_ROOT_REBINDS_FILE: &str = ".ck-browser-profile-root-rebinds.jsonl";
+/// The registry slot's sentinel, the only lock older builds know: they take
+/// the slot by creating it exclusively and give it back by removing it.
 const DURABLE_LOCK_FILE: &str = ".ck-browser-profile-durable-slot.lock";
+/// A stable file this build holds an exclusive kernel lock on while it holds
+/// the slot. It is never removed, and the kernel releases the lock when its
+/// holder exits, however abruptly.
+const DURABLE_KERNEL_LOCK_FILE: &str = ".ck-browser-profile-durable-slot.flock";
+/// Where this build writes its sentinel before linking it into place, so the
+/// sentinel never exists without its marker.
+const DURABLE_LOCK_STAGING_FILE: &str = ".ck-browser-profile-durable-slot.lock.staged";
+/// The contents of a sentinel created by a build that also holds the kernel
+/// lock. An older build's sentinel is empty.
+const DURABLE_LOCK_MARKER: &[u8] =
+    b"held under the kernel lock on .ck-browser-profile-durable-slot.flock\n";
 static UUID_COUNTER: AtomicU64 = AtomicU64::new(0);
 const IMPLEMENTATION_MAGIC: &[u8] = b"ck-browser-profile-registry-implementation-bundle/v1\n";
 const IMPLEMENTATION_SOURCE: &[u8] = include_bytes!("mod.rs");
@@ -1572,14 +1585,17 @@ fn document_payload(document: &RegistryDocument) -> Value {
     serde_json::json!({"schema":document.schema,"managed_root_identity":document.managed_root_identity,"generation":document.generation,"records":document.records})
 }
 
+/// The managed root's registry slot, held until dropped. The sentinel is
+/// removed first, so an older build can take the slot again; the kernel lock
+/// is released last, when the file field is dropped.
 #[derive(Debug)]
 pub struct RegistryLock {
-    path: PathBuf,
-    _file: File,
+    sentinel: PathBuf,
+    _kernel_lock: File,
 }
 impl Drop for RegistryLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(&self.sentinel);
     }
 }
 
@@ -1787,19 +1803,65 @@ impl ProfileRegistry {
         Ok(self.root.target_path(Path::new(DURABLE_LOCK_FILE), true)?)
     }
 
+    /// Take the registry slot. Holders of this build exclude each other with
+    /// an exclusive kernel lock, which an abrupt exit releases, so a crashed
+    /// holder never leaves the slot stuck for them. Older builds still take
+    /// the slot by creating the sentinel exclusively, so this build also
+    /// creates it, marked as its own, and refuses while an unmarked one
+    /// exists: that is a live older holder, or one that crashed, and nothing
+    /// proves which. A marked sentinel found while the kernel lock is held
+    /// was left by a holder of this build that has exited, and is taken over.
     fn acquire_slot_lock(&self) -> Result<RegistryLock, RegistryError> {
+        let contention = || {
+            RegistryError::Untrustworthy(
+                UntrustworthyRegistryReason::LockContentionWithoutOwnerProof,
+            )
+        };
         self.root.revalidate()?;
-        let path = self.lock_path()?;
-        let file = OpenOptions::new().write(true).create_new(true).open(&path);
-        match file {
-            Ok(file) => Ok(RegistryLock { path, _file: file }),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                Err(RegistryError::Untrustworthy(
-                    UntrustworthyRegistryReason::LockContentionWithoutOwnerProof,
-                ))
-            }
-            Err(error) => Err(error.into()),
+        let kernel_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(
+                self.root
+                    .target_path(Path::new(DURABLE_KERNEL_LOCK_FILE), true)?,
+            )?;
+        match kernel_lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => return Err(contention()),
+            Err(fs::TryLockError::Error(error)) => return Err(error.into()),
         }
+        let sentinel = self.lock_path()?;
+        let staged = self
+            .root
+            .target_path(Path::new(DURABLE_LOCK_STAGING_FILE), true)?;
+        // Only a holder of the kernel lock writes the staging file, so one
+        // left over is from a holder that exited.
+        match fs::remove_file(&staged) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+        let linked = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .and_then(|mut file| file.write_all(DURABLE_LOCK_MARKER))
+            .and_then(|()| fs::hard_link(&staged, &sentinel));
+        let _ = fs::remove_file(&staged);
+        match linked {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if !fs::read(&sentinel).is_ok_and(|bytes| bytes == DURABLE_LOCK_MARKER) {
+                    return Err(contention());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(RegistryLock {
+            sentinel,
+            _kernel_lock: kernel_lock,
+        })
     }
 
     fn acquire_rebind_slot_lock(&self) -> Result<RegistryLock, RebindRefusal> {
@@ -4272,744 +4334,4 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn root() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "ck-s8-{}-{}-{}",
-            std::process::id(),
-            ROOT_COUNTER.fetch_add(1, Ordering::Relaxed),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
-    fn context(kind: &str, disposition: &str, conversation: &str) -> StampedBindContext {
-        stamped_bind_context(BindFacts {
-            principal: "direct:agent".into(),
-            conversation_key: conversation.into(),
-            agent_project_id: "project-1".into(),
-            session_kind: Some(kind.into()),
-            session_kind_attested: true,
-            profile_disposition: Some(disposition.into()),
-            effective_capability_scope: Some(vec!["browser.navigate".into()]),
-            provenance: "daemon_attested_spec_a".into(),
-        })
-        .unwrap()
-    }
-    fn tokens(
-        id: &str,
-    ) -> (
-        InvocationToken,
-        JournalReservationHandle,
-        DispatchCommitmentToken,
-    ) {
-        let invocation = InvocationToken::for_test(id);
-        let reservation =
-            JournalReservationHandle::for_test(&invocation, format!("reservation-{id}"));
-        let token = DispatchCommitmentToken::for_test(
-            &invocation,
-            &reservation,
-            format!("commitment-{id}"),
-        );
-        (invocation, reservation, token)
-    }
-
-    struct AttachmentFixture {
-        path: PathBuf,
-        lifecycle: ProfileLifecycle,
-        config: RegistryConfig,
-    }
-
-    impl AttachmentFixture {
-        fn new(owner: crate::profile_custody::SupervisorGeneration) -> Self {
-            use crate::profile_custody::{
-                FilesystemProfileCustodyJournal, HolderId, ProfileCustodyEvent,
-                ProfileCustodyEventKind, ProfileCustodyJournal,
-            };
-            let path = root();
-            let config = RegistryConfig {
-                grant_verifier_available: true,
-                sealing_available: true,
-                uuid_protocol_compatible: true,
-                ..RegistryConfig::default()
-            };
-            let mut lifecycle = ProfileLifecycle::open_with_config(&path, config.clone()).unwrap();
-            let (invocation, reservation, commitment) = tokens("old-attachment");
-            let PrepareResult::Prepared(prepared) = lifecycle.prepare_context_open(
-                &invocation,
-                &reservation,
-                &context("primary", "durable", "old-conversation"),
-            ) else {
-                panic!("prepare attachment");
-            };
-            let directory = lifecycle
-                .prepared_profile_attempt(&prepared)
-                .unwrap()
-                .directory()
-                .to_path_buf();
-            assert!(matches!(
-                lifecycle.launch_prepared_context(prepared, &commitment),
-                LaunchResult::Opened(_)
-            ));
-            lifecycle
-                .registry
-                .update_record("project-1", |record| {
-                    record.process.as_mut().unwrap().pid = owner.pid;
-                    Ok(())
-                })
-                .unwrap();
-            let mut journal =
-                FilesystemProfileCustodyJournal::open(path.join(".ck-browser-profile-custody"))
-                    .unwrap();
-            journal
-                .record(&ProfileCustodyEvent {
-                    format_version: "ck-browser-profile-custody-event/v1".into(),
-                    kind: ProfileCustodyEventKind::ProfileDirectoryBind,
-                    holder_id: HolderId::from_recorded("old-holder"),
-                    supervisor: owner,
-                    profile_directory: Some(directory),
-                    evidence: None,
-                })
-                .unwrap();
-            Self {
-                path,
-                lifecycle,
-                config,
-            }
-        }
-
-        fn record(&self) -> RegistryRecord {
-            match self
-                .lifecycle
-                .registry
-                .resolve_durable("project-1")
-                .unwrap()
-            {
-                DurableResolution::TrustworthyExisting(record) => record,
-                other => panic!("{other:?}"),
-            }
-        }
-
-        fn prepare(&mut self) -> PrepareResult {
-            let (invocation, reservation, _) = tokens("new-attachment");
-            self.lifecycle.prepare_context_open(
-                &invocation,
-                &reservation,
-                &context("primary", "durable", "new-conversation"),
-            )
-        }
-    }
-
-    impl Drop for AttachmentFixture {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
-    fn dead_attachment_owner() -> crate::profile_custody::SupervisorGeneration {
-        crate::profile_custody::SupervisorGeneration {
-            pid: u32::MAX,
-            start_time: 1,
-            boot_id: None,
-        }
-    }
-
-    #[test]
-    fn attached_dead_supervisor_is_released_at_startup() {
-        let mut fixture = AttachmentFixture::new(dead_attachment_owner());
-        fixture.lifecycle =
-            ProfileLifecycle::open_with_config(&fixture.path, fixture.config.clone()).unwrap();
-        let record = fixture.record();
-        assert_eq!(record.state, ProfileState::Released);
-        assert_eq!(record.seal_state, SealState::Sealed);
-        assert!(
-            record.process.is_none()
-                && record.session_id.is_none()
-                && record.attachment_id.is_none()
-        );
-    }
-
-    #[test]
-    fn attached_dead_supervisor_allows_a_later_launch() {
-        let mut fixture = AttachmentFixture::new(dead_attachment_owner());
-        use crate::profile_custody::{ProfileCustodyKey, ProfileCustodyLocks};
-        let mut locks = ProfileCustodyLocks::open_filesystem(&fixture.path).unwrap();
-        let (invocation, reservation, commitment) = tokens("retry-launch");
-        let mut launch =
-            crate::browser_launch::ProfileBoundLaunch::new(&mut fixture.lifecycle, &mut locks);
-        let held = launch
-            .acquire_and_prepare(
-                ProfileCustodyKey::durable("project-1"),
-                &invocation,
-                &reservation,
-                &context("primary", "durable", "new-conversation"),
-            )
-            .expect("launch recovers the dead attachment");
-        let opened = launch
-            .launch_prepared(held, &commitment)
-            .expect("launch opens the recovered profile");
-        launch.rollback_opened(opened).unwrap();
-    }
-
-    #[test]
-    fn attached_live_supervisor_stays_busy() {
-        let mut fixture = AttachmentFixture::new(
-            crate::profile_custody::current_supervisor_generation().unwrap(),
-        );
-        assert_eq!(fixture.lifecycle.recover_startup().unwrap(), 0);
-        assert!(matches!(
-            fixture.prepare(),
-            PrepareResult::Closed(ProfileOutcome::ProfileBusy { .. })
-        ));
-        assert_eq!(fixture.record().state, ProfileState::Attached);
-        assert_eq!(fixture.record().seal_state, SealState::Available);
-    }
-
-    struct UnreadableAttachmentOwner;
-    impl crate::profile_custody::SupervisorLivenessProbe for UnreadableAttachmentOwner {
-        fn observe(
-            &self,
-            _: crate::profile_custody::SupervisorGeneration,
-        ) -> crate::profile_custody::SupervisorLiveness {
-            crate::profile_custody::SupervisorLiveness::Unavailable
-        }
-    }
-
-    #[test]
-    fn attached_unreadable_supervisor_stays_busy() {
-        let mut fixture = AttachmentFixture::new(dead_attachment_owner());
-        fixture.lifecycle.attachment_liveness =
-            AttachmentLiveness(std::sync::Arc::new(UnreadableAttachmentOwner));
-        assert_eq!(fixture.lifecycle.recover_startup().unwrap(), 0);
-        assert!(matches!(
-            fixture.prepare(),
-            PrepareResult::Closed(ProfileOutcome::ProfileBusy { .. })
-        ));
-        assert_eq!(fixture.record().state, ProfileState::Attached);
-    }
-
-    #[test]
-    fn attached_missing_generation_evidence_stays_busy() {
-        let mut fixture = AttachmentFixture::new(dead_attachment_owner());
-        fs::remove_file(
-            fixture
-                .path
-                .join(".ck-browser-profile-custody/custody-events.jsonl"),
-        )
-        .unwrap();
-        assert_eq!(fixture.lifecycle.recover_startup().unwrap(), 0);
-        assert!(matches!(
-            fixture.prepare(),
-            PrepareResult::Closed(ProfileOutcome::ProfileBusy { .. })
-        ));
-    }
-
-    #[test]
-    fn artifact_is_machine_readable_and_digest_bound() {
-        let report = verify_implementation_digest(REGISTRY_ARTIFACT).unwrap();
-        assert_eq!(report.artifact_id, REGISTRY_ARTIFACT_ID);
-        assert_eq!(report.revision, REGISTRY_ARTIFACT_REVISION);
-        assert_eq!(report.provider_ids.len(), 5);
-        assert!(report.fixture_count >= 20);
-        assert_eq!(
-            report.implementation_digest,
-            implementation_digest_for(REGISTRY_ARTIFACT).unwrap()
-        );
-    }
-
-    #[test]
-    fn strict_matrix_accepts_three_pairs_and_rejects_cross_pairs() {
-        for (kind, disposition) in [
-            ("primary", "durable"),
-            ("subagent", "disposable"),
-            ("ephemeral", "none"),
-        ] {
-            assert!(context(kind, disposition, "c")
-                .session_kind()
-                .as_str()
-                .starts_with(kind));
-        }
-        for (kind, disposition) in [
-            ("primary", "disposable"),
-            ("primary", "none"),
-            ("subagent", "durable"),
-            ("subagent", "none"),
-            ("ephemeral", "durable"),
-            ("ephemeral", "disposable"),
-        ] {
-            let error = StampedBindContext::validate(BindFacts {
-                principal: "p".into(),
-                conversation_key: "c".into(),
-                agent_project_id: "a".into(),
-                session_kind: Some(kind.into()),
-                session_kind_attested: true,
-                profile_disposition: Some(disposition.into()),
-                effective_capability_scope: Some(vec![]),
-                provenance: "daemon_attested_spec_a".into(),
-            })
-            .unwrap_err();
-            assert_eq!(error, BindValidationError::IncompatibleKindDisposition);
-        }
-    }
-
-    #[test]
-    fn root_is_held_and_target_containment_is_revalidated() {
-        let path = root();
-        let root = HeldManagedRoot::open(&path).unwrap();
-        assert_eq!(root.canonical_path(), fs::canonicalize(&path).unwrap());
-        assert!(root.target_path(Path::new("../outside"), false).is_err());
-        fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn root_identity_decision_is_platform_neutral_and_ignores_the_device() {
-        let birth_time = BirthTime {
-            unix_seconds: 1_723_600_000,
-            nanoseconds: 5,
-        };
-        let facts = |device, inode, birth_time| RootMetadataFacts {
-            device,
-            inode,
-            birth_time,
-        };
-        let path = Path::new("/profiles/root");
-        let stored = ManagedRootIdentity::Facts(
-            RootIdentityFacts::observe(path, &facts(16_777_230, 839_348_454, Some(birth_time)))
-                .unwrap(),
-        );
-        let after_reboot =
-            RootIdentityFacts::observe(path, &facts(16_777_233, 839_348_454, Some(birth_time)))
-                .unwrap();
-        assert_eq!(verify_root_identity(&stored, &after_reboot), Ok(()));
-
-        let replaced =
-            RootIdentityFacts::observe(path, &facts(16_777_233, 1, Some(birth_time))).unwrap();
-        assert_eq!(
-            verify_root_identity(&stored, &replaced),
-            Err(UntrustworthyRegistryReason::ManagedRootInodeChanged)
-        );
-        assert_eq!(
-            RootIdentityFacts::observe(path, &facts(16_777_233, 839_348_454, None)),
-            Err(UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable)
-        );
-        assert_eq!(
-            verify_root_identity(&ManagedRootIdentity::HashOnly("00".into()), &after_reboot),
-            Err(UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts)
-        );
-
-        // Times before 1970 keep a non-negative nanosecond part.
-        let before_epoch = UNIX_EPOCH - std::time::Duration::new(1, 250_000_000);
-        assert_eq!(
-            BirthTime::from_system_time(before_epoch),
-            Some(BirthTime {
-                unix_seconds: -2,
-                nanoseconds: 750_000_000,
-            })
-        );
-    }
-
-    #[test]
-    fn untrustworthy_registry_reasons_map_to_refusals_by_value() {
-        let path = root();
-        let lifecycle = ProfileLifecycle::open(&path).unwrap();
-        for (reason, reason_code) in [
-            (
-                UntrustworthyRegistryReason::ManagedRootInodeChanged,
-                PROFILE_REGISTRY_ROOT_INODE_CHANGED,
-            ),
-            (
-                UntrustworthyRegistryReason::ManagedRootBirthTimeChanged,
-                PROFILE_REGISTRY_ROOT_BIRTH_TIME_CHANGED,
-            ),
-            (
-                UntrustworthyRegistryReason::ManagedRootPathChanged,
-                PROFILE_REGISTRY_ROOT_PATH_CHANGED,
-            ),
-            (
-                UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts,
-                PROFILE_REGISTRY_ROOT_IDENTITY_PREDATES_FACTS,
-            ),
-            (
-                UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable,
-                PROFILE_REGISTRY_ROOT_BIRTH_TIME_UNAVAILABLE,
-            ),
-            (
-                UntrustworthyRegistryReason::PossiblyManagedPath,
-                PROFILE_REGISTRY_POSSIBLY_MANAGED_PATH,
-            ),
-            (
-                UntrustworthyRegistryReason::LockContentionWithoutOwnerProof,
-                "profile_registry_lock_owner_unproven",
-            ),
-            (
-                UntrustworthyRegistryReason::MalformedRegistry,
-                "profile_registry_malformed",
-            ),
-            (
-                UntrustworthyRegistryReason::UnsupportedRegistrySchema,
-                "profile_registry_schema_unsupported",
-            ),
-            (
-                UntrustworthyRegistryReason::IntegrityMismatch,
-                "profile_registry_integrity_mismatch",
-            ),
-            (
-                UntrustworthyRegistryReason::InvalidRegistryIdentity,
-                "profile_registry_identity_invalid",
-            ),
-            (
-                UntrustworthyRegistryReason::NonCanonicalTarget,
-                "profile_target_non_canonical",
-            ),
-            (
-                UntrustworthyRegistryReason::MissingRegistry,
-                "profile_registry_missing",
-            ),
-            (
-                UntrustworthyRegistryReason::MissingRecord,
-                "profile_registry_record_missing",
-            ),
-            (
-                UntrustworthyRegistryReason::MissingProfileUuid,
-                "profile_registry_profile_uuid_missing",
-            ),
-            (
-                UntrustworthyRegistryReason::DurableKindConflict,
-                "profile_durable_kind_conflict",
-            ),
-            (
-                UntrustworthyRegistryReason::DurableDeletionState,
-                "profile_durable_deletion_state",
-            ),
-            (
-                UntrustworthyRegistryReason::RecordTargetMissing,
-                "profile_registry_record_target_missing",
-            ),
-        ] {
-            let expected = match reason {
-                UntrustworthyRegistryReason::ManagedRootInodeChanged
-                | UntrustworthyRegistryReason::ManagedRootBirthTimeChanged
-                | UntrustworthyRegistryReason::ManagedRootPathChanged
-                | UntrustworthyRegistryReason::ManagedRootIdentityPredatesFacts
-                | UntrustworthyRegistryReason::ManagedRootBirthTimeUnavailable
-                | UntrustworthyRegistryReason::PossiblyManagedPath => {
-                    ProfileOutcome::UntrustworthyRegistry { reason }
-                }
-                UntrustworthyRegistryReason::LockContentionWithoutOwnerProof
-                | UntrustworthyRegistryReason::MalformedRegistry
-                | UntrustworthyRegistryReason::UnsupportedRegistrySchema
-                | UntrustworthyRegistryReason::IntegrityMismatch
-                | UntrustworthyRegistryReason::InvalidRegistryIdentity
-                | UntrustworthyRegistryReason::NonCanonicalTarget
-                | UntrustworthyRegistryReason::MissingRegistry
-                | UntrustworthyRegistryReason::MissingRecord
-                | UntrustworthyRegistryReason::MissingProfileUuid
-                | UntrustworthyRegistryReason::DurableKindConflict
-                | UntrustworthyRegistryReason::DurableDeletionState
-                | UntrustworthyRegistryReason::RecordTargetMissing => {
-                    ProfileOutcome::StorageUnavailable {
-                        reason_code,
-                        origin: FailureOrigin::RegistryOrStorage,
-                    }
-                }
-            };
-            assert_eq!(expected.reason_code(), reason_code);
-            assert_eq!(
-                lifecycle.closed_untrusted_root(reason),
-                PrepareResult::Closed(expected)
-            );
-        }
-        fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn disabled_gate_does_not_create_or_inspect_registry_state() {
-        let path = root();
-        let mut lifecycle = ProfileLifecycle::disabled(&path).unwrap();
-        let (invocation, reservation, _) = tokens("disabled");
-        let result = lifecycle.prepare_context_open(
-            &invocation,
-            &reservation,
-            &context("subagent", "disposable", "c"),
-        );
-        assert_eq!(
-            result,
-            PrepareResult::Closed(ProfileOutcome::StorageUnavailable {
-                reason_code: "profile_registry_artifact_unavailable",
-                origin: FailureOrigin::RegistryOrStorage
-            })
-        );
-        assert!(!path.join(REGISTRY_FILE).exists());
-        assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
-        fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn disposable_is_lazy_reusable_and_released_once() {
-        let path = root();
-        let mut lifecycle = ProfileLifecycle::open(&path).unwrap();
-        let (invocation, reservation, token) = tokens("disposable");
-        let prepared = match lifecycle.prepare_context_open(
-            &invocation,
-            &reservation,
-            &context("subagent", "disposable", "conversation"),
-        ) {
-            PrepareResult::Prepared(value) => value,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(lifecycle.current_open("conversation").epoch, 0);
-        let opened = match lifecycle.launch_prepared_context(prepared, &token) {
-            LaunchResult::Opened(value) => value,
-            other => panic!("{other:?}"),
-        };
-        let snapshot = lifecycle.current_open("conversation");
-        assert_eq!(snapshot.open_state, OpenState::Open);
-        assert_eq!(snapshot.epoch, 1);
-        let (invocation2, reservation2, token2) = tokens("reuse");
-        let prepared2 = match lifecycle.prepare_context_open(
-            &invocation2,
-            &reservation2,
-            &context("subagent", "disposable", "conversation"),
-        ) {
-            PrepareResult::Prepared(value) => value,
-            other => panic!("{other:?}"),
-        };
-        let reused = match lifecycle.launch_prepared_context(prepared2, &token2) {
-            LaunchResult::Opened(value) => value,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(opened, reused);
-        assert_eq!(lifecycle.current_open("conversation").epoch, 1);
-        assert_eq!(
-            lifecycle.release_context(opened.clone(), ReleaseCause::SessionEnd),
-            ReleaseResult::Released
-        );
-        assert_eq!(
-            lifecycle.release_context(opened, ReleaseCause::SessionEnd),
-            ReleaseResult::Released
-        );
-        assert_eq!(lifecycle.current_open("conversation").epoch, 2);
-        fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn abort_is_terminal_and_conflicting_retry_cannot_launch() {
-        let path = root();
-        let mut lifecycle = ProfileLifecycle::open(&path).unwrap();
-        let (invocation, reservation, token) = tokens("abort");
-        let prepared = match lifecycle.prepare_context_open(
-            &invocation,
-            &reservation,
-            &context("subagent", "disposable", "conversation"),
-        ) {
-            PrepareResult::Prepared(value) => value,
-            other => panic!("{other:?}"),
-        };
-        assert!(matches!(
-            lifecycle.abort_prepared_context(prepared.clone(), AbortCause::Teardown),
-            AbortResult::Aborted(_)
-        ));
-        assert!(matches!(
-            lifecycle.abort_prepared_context(prepared.clone(), AbortCause::Teardown),
-            AbortResult::Aborted(_)
-        ));
-        assert!(matches!(
-            lifecycle.abort_prepared_context(prepared.clone(), AbortCause::InvocationCancelled),
-            AbortResult::Closed(ProfileOutcome::InternalFailure { .. })
-        ));
-        assert!(matches!(
-            lifecycle.launch_prepared_context(prepared, &token),
-            LaunchResult::Closed(ProfileOutcome::InternalFailure { .. })
-        ));
-        fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn durable_first_creation_is_disabled_without_uuid_protocol() {
-        let path = root();
-        let mut config = RegistryConfig {
-            grant_verifier_available: true,
-            sealing_available: true,
-            ..RegistryConfig::default()
-        };
-        config.uuid_protocol_compatible = false;
-        let mut lifecycle = ProfileLifecycle::open_with_config(&path, config).unwrap();
-        let (invocation, reservation, _) = tokens("durable");
-        let result = lifecycle.prepare_context_open(
-            &invocation,
-            &reservation,
-            &context("primary", "durable", "conversation"),
-        );
-        assert_eq!(
-            result,
-            PrepareResult::Closed(ProfileOutcome::NoSession {
-                reason_code: "no_session"
-            })
-        );
-        assert!(!path.join(REGISTRY_FILE).exists());
-        fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn durable_creation_uses_exact_uuid_and_authority_tuple() {
-        let path = root();
-        let config = RegistryConfig {
-            grant_verifier_available: true,
-            grant_accepted: true,
-            sealing_available: true,
-            uuid_protocol_compatible: true,
-            ..RegistryConfig::default()
-        };
-        let mut lifecycle = ProfileLifecycle::open_with_config(&path, config).unwrap();
-        let (invocation, reservation, token) = tokens("durable-create");
-        let prepared = match lifecycle.prepare_context_open(
-            &invocation,
-            &reservation,
-            &context("primary", "durable", "conversation"),
-        ) {
-            PrepareResult::Prepared(value) => value,
-            other => panic!("{other:?}"),
-        };
-        let opened = match lifecycle.launch_prepared_context(prepared, &token) {
-            LaunchResult::Opened(value) => value,
-            other => panic!("{other:?}"),
-        };
-        let snapshot = lifecycle.current_open("conversation");
-        assert_eq!(snapshot.open_state, OpenState::Open);
-        assert_eq!(snapshot.profile_name.as_deref(), Some("default"));
-        assert!(snapshot.profile_uuid.is_some());
-        let authority = lifecycle.registry().authority_projection(
-            &context("primary", "durable", "conversation"),
-            snapshot.profile_uuid.as_deref().unwrap(),
-        );
-        assert_eq!(authority.project_id, "project-1");
-        assert_eq!(authority.session_kind, SessionKind::Primary);
-        assert_eq!(
-            lifecycle.release_context(opened, ReleaseCause::SessionEnd),
-            ReleaseResult::Released
-        );
-        fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn rejected_durable_grant_hides_owner_specific_state() {
-        let path = root();
-        let create_config = RegistryConfig {
-            grant_verifier_available: true,
-            grant_accepted: true,
-            sealing_available: true,
-            uuid_protocol_compatible: true,
-            ..RegistryConfig::default()
-        };
-        let mut creator = ProfileLifecycle::open_with_config(&path, create_config).unwrap();
-        let (invocation, reservation, token) = tokens("grant-owner");
-        let prepared = match creator.prepare_context_open(
-            &invocation,
-            &reservation,
-            &context("primary", "durable", "conversation"),
-        ) {
-            PrepareResult::Prepared(value) => value,
-            other => panic!("{other:?}"),
-        };
-        let _opened = match creator.launch_prepared_context(prepared, &token) {
-            LaunchResult::Opened(value) => value,
-            other => panic!("{other:?}"),
-        };
-        drop(creator);
-        let denied_config = RegistryConfig {
-            grant_verifier_available: true,
-            grant_accepted: false,
-            sealing_available: true,
-            uuid_protocol_compatible: true,
-            ..RegistryConfig::default()
-        };
-        let mut denied = ProfileLifecycle::open_with_config(&path, denied_config).unwrap();
-        let (invocation, reservation, _) = tokens("grant-denied");
-        assert_eq!(
-            denied.prepare_context_open(
-                &invocation,
-                &reservation,
-                &context("primary", "durable", "other-conversation")
-            ),
-            PrepareResult::Closed(ProfileOutcome::ProfileGrantRequired {
-                reason_code: "durable_profile_grant_unavailable"
-            })
-        );
-        fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn deletion_failure_is_disposable_only_and_keeps_exclusion() {
-        let path = root();
-        let config = RegistryConfig {
-            deletion_failure_after_start: true,
-            ..RegistryConfig::default()
-        };
-        let mut lifecycle = ProfileLifecycle::open_with_config(&path, config).unwrap();
-        let (invocation, reservation, token) = tokens("delete-failure");
-        let prepared = match lifecycle.prepare_context_open(
-            &invocation,
-            &reservation,
-            &context("subagent", "disposable", "conversation"),
-        ) {
-            PrepareResult::Prepared(value) => value,
-            other => panic!("{other:?}"),
-        };
-        let opened = match lifecycle.launch_prepared_context(prepared, &token) {
-            LaunchResult::Opened(value) => value,
-            other => panic!("{other:?}"),
-        };
-        let uuid = lifecycle.current_open("conversation").profile_uuid.unwrap();
-        assert!(matches!(
-            lifecycle.release_context(opened.clone(), ReleaseCause::SessionEnd),
-            ReleaseResult::Closed(ProfileOutcome::StorageUnavailable { .. })
-        ));
-        assert!(lifecycle.is_effectively_excluded(&uuid));
-        assert!(matches!(
-            lifecycle.release_context(opened, ReleaseCause::SessionEnd),
-            ReleaseResult::Closed(ProfileOutcome::StorageUnavailable { .. })
-        ));
-        fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn deletion_requires_complete_fresh_fenced_absence() {
-        let path = root();
-        let mut lifecycle = ProfileLifecycle::open(&path).unwrap();
-        let (invocation, reservation, token) = tokens("delete");
-        let prepared = match lifecycle.prepare_context_open(
-            &invocation,
-            &reservation,
-            &context("subagent", "disposable", "conversation"),
-        ) {
-            PrepareResult::Prepared(value) => value,
-            other => panic!("{other:?}"),
-        };
-        let opened = match lifecycle.launch_prepared_context(prepared, &token) {
-            LaunchResult::Opened(value) => value,
-            other => panic!("{other:?}"),
-        };
-        let uuid = lifecycle.current_open("conversation").profile_uuid.unwrap();
-        let bad = LivenessObservation {
-            complete: false,
-            ..LivenessObservation::all_absent(2, 2)
-        };
-        assert!(lifecycle
-            .delete_disposable_with_proof(&uuid, bad, DeletionFence::held(2))
-            .is_err());
-        assert!(matches!(
-            lifecycle.release_context(opened, ReleaseCause::SessionEnd),
-            ReleaseResult::Released
-        ));
-        fs::remove_dir_all(path).unwrap();
-    }
-}
+mod tests;

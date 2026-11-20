@@ -26,6 +26,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::answer_time::{applying, AnswerTime};
 use super::card::{CardKind, CardRequest};
 use super::live_call::{LiveCall, NotLive, SessionKey};
 use super::route::{CallError, CingulateOpener, CingulateRoute};
@@ -356,6 +357,16 @@ pub struct CardLifecycle {
     /// even when that call requests a different action or the process restarted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_browser_grant: Option<UserBrowserGrant>,
+    /// When the card was raised, by the desk's clock. An answer to it came no
+    /// earlier, which bounds a 30-minute choice whose record carries no answer
+    /// time. Absent from cards raised by older builds, which ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raised_at_ms: Option<u64>,
+    /// The answers feed applied this card's answer but has not acknowledged
+    /// it yet, so the session's next call reads the feed again to do so.
+    /// Absent unless owed; older builds ignore it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ack_owed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -779,12 +790,41 @@ impl ConsentDesk {
         self.save()
     }
 
+    /// End a person's-Chrome site card's ability to grant, whatever the
+    /// consent service later says about it: its call stopped holding it
+    /// (turn-stop, or the route closed), and the card's answer belongs only to
+    /// that call. The card stays in the registry while it may still be open
+    /// remotely, so a later drain withdraws it, or acknowledges an answer
+    /// that was already given, without storing a grant: with no deferred use
+    /// and no retained grant, the site adapter has nothing pending to apply.
+    pub(crate) fn void_grant_intent(&self, id: &str) {
+        let voided = match lock(&self.registry).get_mut(id) {
+            Some(card) if card.kind == CardKind::UserBrowserSite => {
+                card.lifecycle.deferred_use = false;
+                card.lifecycle.user_browser_grant = None;
+                true
+            }
+            _ => false,
+        };
+        if voided {
+            // A failed save leaves the voided card in memory for this run;
+            // nothing better can be done without the registry file.
+            let _ = self.save();
+        }
+    }
+
     /// The open card this session raised about `subject`, for a call that
-    /// should wait on it rather than raise a second one.
+    /// should wait on it rather than raise a second one. A site card whose
+    /// grant intent was voided is never joined: its answer must not grant.
     pub fn open_card_for(&self, session: &SessionKey, subject: &str) -> Option<RaisedCard> {
         lock(&self.registry)
             .values()
-            .find(|card| !card.applied && card.session == *session && card.subject == subject)
+            .find(|card| {
+                !card.applied
+                    && card.session == *session
+                    && card.subject == subject
+                    && !(card.kind == CardKind::UserBrowserSite && !card.lifecycle.deferred_use)
+            })
             .cloned()
     }
 
@@ -797,6 +837,15 @@ impl ConsentDesk {
             .filter(|card| !card.applied && card.session == *session)
             .cloned()
             .collect()
+    }
+
+    /// Whether this session owes Cingulate an acknowledgement for an answer
+    /// the drain already applied: its acknowledgement failed, so the next call
+    /// reads the feed again even with nothing left to apply.
+    pub fn owes_ack(&self, live: &LiveCall) -> bool {
+        lock(&self.registry)
+            .values()
+            .any(|card| card.lifecycle.ack_owed && may_apply_from(card, live))
     }
 
     pub fn unapplied_for(&self, live: &LiveCall) -> Vec<RaisedCard> {
@@ -865,6 +914,7 @@ impl ConsentDesk {
 
     fn save(&self) -> Result<(), String> {
         let _saving = lock(&self.saving);
+        prune_finished(&mut lock(&self.registry));
         if !self.readable {
             // Never save over a registry this build could not read.
             return Err("the stored registry could not be read; it is not overwritten".into());
@@ -1051,6 +1101,39 @@ impl ConsentDesk {
     }
 }
 
+/// How many finished cards the registry keeps, newest first, so a record the
+/// feed repeats is still recognised as this desk's. Older finished cards are
+/// dropped, which keeps the registry, and every save of it, bounded.
+const FINISHED_CARDS_KEPT: usize = 32;
+
+/// A card nothing will read, apply, acknowledge or report again: its answer
+/// was applied and acknowledged (or its session ended), its execution report
+/// was delivered or can never be, and it holds no unused single-use approval
+/// or lost-answer notice.
+fn finished(card: &RaisedCard) -> bool {
+    let lifecycle = &card.lifecycle;
+    let consumed = (card.applied && lifecycle.acked && !lifecycle.ack_owed) || lifecycle.ended;
+    let reported = !lifecycle.answered || lifecycle.reported || lifecycle.report_undeliverable;
+    consumed && reported && lifecycle.approval.is_none() && !lifecycle.answer_lost
+}
+
+/// Drop all but the newest `FINISHED_CARDS_KEPT` finished cards. Cards raised
+/// by older builds carry no raise time and count as the oldest.
+fn prune_finished(registry: &mut HashMap<String, RaisedCard>) {
+    let mut done: Vec<(Option<u64>, String)> = registry
+        .values()
+        .filter(|card| finished(card))
+        .map(|card| (card.lifecycle.raised_at_ms, card.elicitation_id.clone()))
+        .collect();
+    if done.len() <= FINISHED_CARDS_KEPT {
+        return;
+    }
+    done.sort();
+    for (_, id) in &done[..done.len() - FINISHED_CARDS_KEPT] {
+        registry.remove(id);
+    }
+}
+
 /// One open route to Cingulate, for the life of one held call.
 pub struct DeskSession<'a> {
     desk: &'a ConsentDesk,
@@ -1141,6 +1224,7 @@ impl DeskSession<'_> {
                 lifecycle: CardLifecycle {
                     agent_id: self.live.agent_id().map(str::to_string),
                     deferred_use: card.kind.single_use() || card.kind == CardKind::UserBrowserSite,
+                    raised_at_ms: Some((self.desk.clock)()),
                     ..Default::default()
                 },
             },
@@ -1282,17 +1366,32 @@ impl DeskSession<'_> {
         wait: Duration,
         cancelled: impl Future<Output = ()>,
     ) -> InCall {
+        let desk = self.desk;
         let result = self
             .park(elicitation_id, wait, async {
                 cancelled.await;
+                // Void the card's grant intent before the withdrawal is even
+                // sent, so neither a failed withdrawal nor a crash during it
+                // leaves a cancelled card able to grant.
+                desk.void_grant_intent(elicitation_id);
                 LetGo::Withdraw
             })
             .await;
-        if matches!(
-            result,
-            InCall::Settled(Ending::NoAnswer | Ending::Withdrawn)
-        ) {
-            self.desk.forget(&[elicitation_id.to_string()]);
+        match result {
+            InCall::Settled(Ending::NoAnswer | Ending::Withdrawn) => {
+                self.desk.forget(&[elicitation_id.to_string()]);
+            }
+            InCall::Cancelled | InCall::RouteClosed => {
+                // This call still counts as the card's holder here, so a drain
+                // pass cannot store the answer yet. Waiting for the session's
+                // settlement lock lets a pass that read the card before it was
+                // voided finish first; every later pass sees the voided card
+                // and acknowledges its answer without granting.
+                let settlement = self.desk.settlement_lock(self.live.session());
+                let _pass = settlement.lock().await;
+                self.desk.void_grant_intent(elicitation_id);
+            }
+            _ => {}
         }
         result
     }
@@ -1592,7 +1691,16 @@ impl DeskSession<'_> {
                 let Some(ending) = Ending::of_record(record, &card) else {
                     continue;
                 };
-                let applied = match apply(&card, record, &ending) {
+                // A 30-minute choice runs from the person's answer, not from
+                // this later drain (see `answer_time`).
+                let answered = match record.raw.get("answered_at_ms").and_then(Value::as_u64) {
+                    Some(at) => AnswerTime::Answered(at),
+                    None => card
+                        .lifecycle
+                        .raised_at_ms
+                        .map_or(AnswerTime::Unknown, AnswerTime::RaisedNoEarlierThan),
+                };
+                let applied = match applying(answered, || apply(&card, record, &ending)) {
                     Ok(applied) => applied,
                     // Not acknowledged: the next call reads it again.
                     Err(ApplyFailed(_)) => return Ok(report),
@@ -1611,6 +1719,11 @@ impl DeskSession<'_> {
                             self.desk.record_single_use_approval(&card, choice_id);
                         }
                     }
+                }
+                // Owed until the feed is acknowledged; the applied mark's save
+                // below stores this too.
+                if let Some(current) = lock(&self.desk.registry).get_mut(&card.elicitation_id) {
+                    current.lifecycle.ack_owed = true;
                 }
                 if self.desk.mark_applied(&card.elicitation_id).is_err() {
                     return Ok(report);
@@ -1673,6 +1786,7 @@ impl DeskSession<'_> {
             for id in seen {
                 if let Some(card) = lock(&self.desk.registry).get_mut(&id) {
                     card.lifecycle.acked = true;
+                    card.lifecycle.ack_owed = false;
                 }
             }
             let _ = self.desk.save();

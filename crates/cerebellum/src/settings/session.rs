@@ -21,6 +21,20 @@ use crate::{control_flags, ModuleError};
 // Separate from scope queries, registration claims, and operator confirmation.
 const FIRST_CONFIG_CORR: u64 = 1 << 56;
 const CONTROL_DEADLINE: Duration = Duration::from_secs(5);
+/// The first wait before repeating a settings exchange that got no usable
+/// reply, doubling up to `RETRY_MAX`, so a lost reply delays a refresh rather
+/// than leaving the module on an older view until the daemon hints again.
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(30);
+/// How long a startup exchange may wait for its reply. Generous, since a slow
+/// daemon is not refusing, but bounded, so one lost reply cannot leave the
+/// module answering `not_ready` for good.
+const STARTUP_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The wait before the next attempt after `previous`.
+fn next_retry(previous: Option<Duration>) -> Duration {
+    previous.map_or(RETRY_FIRST, |delay| (delay * 2).min(RETRY_MAX))
+}
 
 pub(crate) struct Session {
     requests: ControlRequests,
@@ -56,6 +70,21 @@ impl Session {
 
     pub(crate) fn mark_applied(&self) {
         self.set_health(SettingsHealth::Applied);
+    }
+
+    /// Wait for a change hint, or, when the last exchange failed, for at most
+    /// `retry` before trying it again. A hint that arrived meanwhile is kept
+    /// by `Notify` and ends the wait at once.
+    async fn changed_or_retry(&self, retry: Option<Duration>) {
+        match retry {
+            None => self.changed.notified().await,
+            Some(delay) => {
+                tokio::select! {
+                    () = self.changed.notified() => {}
+                    () = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
     }
 
     pub(crate) fn annotate_health(&self, response: &mut ModuleControlResponse) {
@@ -176,10 +205,10 @@ impl Session {
         writer: &mpsc::Sender<Frame>,
         declaration: ConfigDeclareRequest,
     ) -> Result<(StartupSettings, Option<ConfigAppliedRequest>), ()> {
-        // Keep the original correlation until the daemon replies or the
-        // connection ends; a slow response is not a refusal.
+        // A slow or missing reply is not a refusal: go on to read the view,
+        // which says whether the declaration took effect.
         match self
-            .call::<serde_json::Value>(writer, &declaration, None)
+            .call::<serde_json::Value>(writer, &declaration, Some(STARTUP_DEADLINE))
             .await
         {
             Ok(_) => {}
@@ -187,11 +216,15 @@ impl Session {
                 self.set_health(SettingsHealth::Refused(code));
                 return Err(());
             }
-            Err(None) => self.changed.notified().await,
+            Err(None) => self.changed_or_retry(Some(RETRY_FIRST)).await,
         }
+        // Set after a GET that failed or went unanswered, so the next one is
+        // tried without waiting for a hint the daemon may never send.
+        let mut retry = None;
         loop {
-            match self.get(writer, None).await {
+            match self.get(writer, Some(STARTUP_DEADLINE)).await {
                 Ok(reply) => {
+                    retry = None;
                     self.set_health(SettingsHealth::Waiting(None));
                     let mut view = reply.pending.or_else(|| reply.active.clone());
                     while let Some(candidate) = view {
@@ -225,9 +258,12 @@ impl Session {
                     self.set_health(SettingsHealth::Refused(code));
                     return Err(());
                 }
-                Err(code) => self.set_health(SettingsHealth::Waiting(code)),
+                Err(code) => {
+                    retry = Some(next_retry(retry));
+                    self.set_health(SettingsHealth::Waiting(code));
+                }
             }
-            self.changed.notified().await;
+            self.changed_or_retry(retry).await;
         }
     }
 
@@ -237,6 +273,10 @@ impl Session {
         mut pending_report: Option<ConfigAppliedRequest>,
         apply: impl Fn(LiveSettings) + Clone + Send + 'static,
     ) {
+        // Set while a refresh is owed: the hint that asked for it was consumed
+        // by a GET that timed out or failed, so the next attempt must not wait
+        // for another hint.
+        let mut retry = None;
         loop {
             let mut changed_while_reporting = false;
             if let Some(report) = pending_report.take() {
@@ -247,14 +287,18 @@ impl Session {
                 }
             }
             if !changed_while_reporting {
-                self.changed.notified().await;
+                self.changed_or_retry(retry).await;
             }
-            let deadline = self.health.try_lock().ok().and_then(|health| {
-                matches!(*health, SettingsHealth::Applied).then_some(CONTROL_DEADLINE)
-            });
-            let Ok(reply) = self.get(writer, deadline).await else {
-                continue;
+            let reply = match self.get(writer, Some(CONTROL_DEADLINE)).await {
+                Ok(reply) => reply,
+                // No usable reply (timed out, lost, or malformed): retry. A
+                // refusal is an answer; the daemon hints when that changes.
+                Err(code) => {
+                    retry = code.is_none().then(|| next_retry(retry));
+                    continue;
+                }
             };
+            retry = None;
             let Some(view) = reply.pending.or(reply.active) else {
                 continue;
             };

@@ -280,31 +280,26 @@ impl AgentGrants {
 
     /// Called only after a granting answer has been validated by the dispatcher.
     /// Replacement keeps the id even if the previous lifetime already expired.
-    pub fn upsert(&self, mut row: AgentGrant, now_ms: u64) -> Result<String, AgentGrantStoreError> {
-        if self.machine_uuid.as_deref() != Some(row.machine_uuid.as_str()) {
+    pub fn upsert(&self, row: AgentGrant, now_ms: u64) -> Result<String, AgentGrantStoreError> {
+        let mut ids = self.upsert_all(vec![row], now_ms)?;
+        Ok(ids.remove(0))
+    }
+
+    /// Upsert every row of one answer in a single durable write: either all of
+    /// them are stored and published together, or none is.
+    pub fn upsert_all(
+        &self,
+        rows: Vec<AgentGrant>,
+        now_ms: u64,
+    ) -> Result<Vec<String>, AgentGrantStoreError> {
+        if rows
+            .iter()
+            .any(|row| self.machine_uuid.as_deref() != Some(row.machine_uuid.as_str()))
+        {
             return Err(AgentGrantStoreError::NoMachineIdentity);
         }
         self.mutate(now_ms, |state| {
-            if let Some(existing) = state
-                .grants
-                .iter_mut()
-                .find(|existing| existing.same_identity(&row))
-            {
-                row.id = existing.id.clone();
-                row.check()?;
-                *existing = row.clone();
-            } else {
-                let mut bytes = [0u8; 16];
-                getrandom::getrandom(&mut bytes).map_err(|error| {
-                    AgentGrantStoreError::WriteFailed {
-                        detail: error.to_string(),
-                    }
-                })?;
-                row.id = format!("grt_{}", hex(&bytes));
-                row.check()?;
-                state.grants.push(row.clone());
-            }
-            Ok(row.id)
+            rows.into_iter().map(|row| upsert_row(state, row)).collect()
         })
     }
 
@@ -350,6 +345,32 @@ impl AgentGrants {
             .send_modify(|version| *version = version.wrapping_add(1));
         Ok(result)
     }
+}
+
+/// Replace the row with `row`'s identity, keeping its id even if its previous
+/// lifetime already expired, or add `row` under a new id.
+fn upsert_row(
+    state: &mut AgentGrantStoreState,
+    mut row: AgentGrant,
+) -> Result<String, AgentGrantStoreError> {
+    if let Some(existing) = state
+        .grants
+        .iter_mut()
+        .find(|existing| existing.same_identity(&row))
+    {
+        row.id = existing.id.clone();
+        row.check()?;
+        *existing = row.clone();
+    } else {
+        let mut bytes = [0u8; 16];
+        getrandom::getrandom(&mut bytes).map_err(|error| AgentGrantStoreError::WriteFailed {
+            detail: error.to_string(),
+        })?;
+        row.id = format!("grt_{}", hex(&bytes));
+        row.check()?;
+        state.grants.push(row.clone());
+    }
+    Ok(row.id)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

@@ -156,6 +156,17 @@ async fn settings_startup_serves_review_and_waits_for_the_effective_view() {
     assert!(report.result.is_ack());
 }
 
+/// The next frame the module sends other than a config.get, which it repeats
+/// while a startup view is owed.
+async fn next_skipping_gets(sent: &mut mpsc::Receiver<Frame>) -> Frame {
+    loop {
+        let frame = sent.recv().await.unwrap();
+        if frame.header.ty != FrameType::Request || body(&frame)["op"] != "config.get" {
+            return frame;
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn settings_startup_times_out_early_calls_without_falling_back() {
     let (mut reader, mut daemon) = tokio::io::duplex(4096);
@@ -207,7 +218,7 @@ async fn settings_startup_times_out_early_calls_without_falling_back() {
         )
         .await
         .unwrap();
-        let health = sent.recv().await.unwrap();
+        let health = next_skipping_gets(&mut sent).await;
         assert_eq!(health.header.corr, 21);
         assert_eq!(health.header.ty, FrameType::Response);
         assert_eq!(body(&health)["status"], "degraded");
@@ -230,13 +241,14 @@ async fn settings_startup_times_out_early_calls_without_falling_back() {
         .unwrap();
         let get = sent.recv().await.unwrap();
         assert_eq!(body(&get)["op"], "config.get");
-        // Keep the original correlation even after queued calls time out and
-        // the module has waited a full minute without a view.
+        // Still no fallback after queued calls time out and the module has
+        // waited a full minute without a view: it keeps asking for the managed
+        // view, each unanswered config.get replaced by a new one.
         tokio::time::advance(Duration::from_secs(61)).await;
         write_frame(&mut daemon, &frame(FrameType::Request, 4, 1, 22, json!({})))
             .await
             .unwrap();
-        let response = sent.recv().await.unwrap();
+        let response = next_skipping_gets(&mut sent).await;
         assert_eq!(response.header.corr, 22);
         assert_eq!(response.header.ty, FrameType::Error);
         assert_eq!(body(&response)["code"], "not_ready");
@@ -246,7 +258,7 @@ async fn settings_startup_times_out_early_calls_without_falling_back() {
         )
         .await
         .unwrap();
-        let health = sent.recv().await.unwrap();
+        let health = next_skipping_gets(&mut sent).await;
         assert_eq!(health.header.corr, 23);
         assert_eq!(health.header.ty, FrameType::Response);
         assert_eq!(body(&health)["status"], "degraded");
@@ -259,6 +271,13 @@ async fn settings_startup_times_out_early_calls_without_falling_back() {
             ConfigStatus::Unstamped,
         );
         let reply = serde_json::to_value(ConfigGetReply::new(Some(view), None)).unwrap();
+        // Answer the config.get outstanding now; earlier ones have timed out.
+        let get = loop {
+            let frame = sent.recv().await.unwrap();
+            if body(&frame)["op"] == "config.get" {
+                break frame;
+            }
+        };
         write_frame(
             &mut daemon,
             &frame(FrameType::Response, 0, 0, get.header.corr, reply),
@@ -279,6 +298,48 @@ async fn settings_startup_times_out_early_calls_without_falling_back() {
     assert_eq!(startup.health.queue_age_stale_ms, 4321);
     assert!(startup.legacy_file.is_none());
     assert!(waiting.is_empty());
+}
+
+/// A connected daemon that drops the reply to the first startup config.get
+/// does not leave startup waiting for good: the read is retried, without a
+/// hint or a disconnect, and the managed view it returns is installed.
+#[tokio::test(start_paused = true)]
+async fn settings_startup_retries_a_config_get_whose_reply_never_came() {
+    let (writer, mut sent) = mpsc::channel(8);
+    let session = Session::new(PROTOCOL_VERSION);
+    let driver = session.initial(&writer, declaration());
+    let daemon = async {
+        let declare = sent.recv().await.unwrap();
+        assert_eq!(body(&declare)["op"], "config.declare");
+        assert!(session.take(&frame(
+            FrameType::Response,
+            0,
+            0,
+            declare.header.corr,
+            json!({"op":"config.declare"})
+        )));
+        let lost = sent.recv().await.unwrap();
+        assert_eq!(body(&lost)["op"], "config.get");
+        let get = sent.recv().await.unwrap();
+        assert_eq!(body(&get)["op"], "config.get");
+        assert_ne!(get.header.corr, lost.header.corr);
+        let view = ConfigView::new(
+            0,
+            json!({"health":{"queue_age_stale_ms":4321}}),
+            Default::default(),
+            vec![],
+            ConfigStatus::Unstamped,
+        );
+        let reply = serde_json::to_value(ConfigGetReply::new(Some(view), None)).unwrap();
+        assert!(session.take(&frame(FrameType::Response, 0, 0, get.header.corr, reply)));
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(300), async {
+        tokio::join!(driver, daemon)
+    })
+    .await
+    .unwrap();
+    let (startup, _) = result.expect("the managed view, not the legacy file");
+    assert_eq!(startup.health.queue_age_stale_ms, 4321);
 }
 
 #[tokio::test]
@@ -391,6 +452,54 @@ async fn settings_live_hint_fetches_and_applies_a_new_view_without_restart() {
         );
     };
     tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! { () = daemon => {}, () = driver => panic!("live watcher exited") }
+    })
+    .await
+    .unwrap();
+}
+
+/// One hint is enough: when the refresh it asked for gets no reply in time,
+/// the refresh is retried without waiting for another hint, so the older
+/// approved mode does not stay in effect.
+#[tokio::test(start_paused = true)]
+async fn settings_live_retries_a_refresh_whose_reply_never_came() {
+    let (writer, mut sent) = mpsc::channel(8);
+    let session = Session::new(PROTOCOL_VERSION);
+    session.mark_applied();
+    let (installed, mut updates) = tokio::sync::watch::channel(LiveSettings::default());
+    let driver = session.live(&writer, None, move |settings| {
+        installed.send_replace(settings);
+    });
+    let daemon = async {
+        assert!(session.take(&frame(
+            FrameType::Push,
+            0,
+            0,
+            0,
+            json!({"op":"config.changed","generation":1,"fields":["/computer_use/app_use"]})
+        )));
+        let lost = sent.recv().await.unwrap();
+        assert_eq!(body(&lost)["op"], "config.get");
+        // Never answered. No second hint is sent either.
+        let get = sent.recv().await.unwrap();
+        assert_eq!(body(&get)["op"], "config.get");
+        assert_ne!(get.header.corr, lost.header.corr);
+        let view = ConfigView::new(
+            1,
+            json!({"computer_use":{"app_use":"foreground"}}),
+            Default::default(),
+            vec![],
+            ConfigStatus::Unstamped,
+        );
+        let reply = serde_json::to_value(ConfigGetReply::new(Some(view), None)).unwrap();
+        assert!(session.take(&frame(FrameType::Response, 0, 0, get.header.corr, reply)));
+        updates.changed().await.unwrap();
+        assert_eq!(
+            updates.borrow().app_use,
+            cerebellum_core::config::AppUse::Foreground
+        );
+    };
+    tokio::time::timeout(Duration::from_secs(120), async {
         tokio::select! { () = daemon => {}, () = driver => panic!("live watcher exited") }
     })
     .await

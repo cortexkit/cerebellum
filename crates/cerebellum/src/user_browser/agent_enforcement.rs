@@ -29,6 +29,16 @@ pub(super) fn store_answer(
         GrantSubject::Origin(intent.origin.clone())
     };
     let now = store.now_ms();
+    let window = if always {
+        None
+    } else {
+        match crate::cingulate_client::answer_time::thirty_minute_window(now) {
+            Some(window) => Some(window),
+            // The answer's 30 minutes ran out before it was applied: it
+            // settles, and grants nothing.
+            None => return Ok(()),
+        }
+    };
     store
         .upsert(
             AgentGrant {
@@ -40,8 +50,8 @@ pub(super) fn store_answer(
                     .machine_uuid()
                     .ok_or_else(|| refusal("grant_storage_unavailable"))?
                     .into(),
-                granted_at_ms: now,
-                expires_at_ms: (!always).then_some(now.saturating_add(30 * 60 * 1000)),
+                granted_at_ms: window.map_or(now, |(start, _)| start),
+                expires_at_ms: window.map(|(_, end)| end),
                 card_ref: Some(card_ref.into()),
                 max_level: super::site_grant_tier(intent.severity.tier),
                 hazards: intent.hazards.iter().copied().collect(),

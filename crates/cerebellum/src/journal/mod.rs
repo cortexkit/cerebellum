@@ -622,9 +622,60 @@ impl JournalConfig {
     }
 }
 
+/// Run a journal transition's synchronous durable write without holding up
+/// the async runtime: on a multi-threaded runtime the calling worker hands its
+/// other tasks to another thread while `work` waits on the disk. The caller
+/// still waits for `work` to finish, so a transition stays durable before the
+/// effect it guards and transitions keep their order. Elsewhere (no runtime,
+/// or a single-threaded one, which cannot hand its tasks on) it runs inline.
+pub(crate) fn off_worker<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|runtime| runtime.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A journal transition waiting on a slow disk does not stop an unrelated
+    /// task on the runtime's only worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_slow_journal_write_does_not_stall_the_runtime_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut store = store::JournalStore::slow_in_memory_for_test(
+            JournalConfig {
+                journal_retention_bytes: 1_000_000,
+                journal_max_entry_bytes: 100_000,
+            },
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap();
+        let beats = std::sync::Arc::new(AtomicUsize::new(0));
+        let heartbeat = tokio::spawn({
+            let beats = beats.clone();
+            async move {
+                loop {
+                    beats.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let before = beats.load(Ordering::SeqCst);
+        // On the worker, like a request handler; the test body itself is
+        // polled on a separate thread.
+        tokio::spawn(async move { store.reserve(identity(), Capability::Navigate).unwrap() })
+            .await
+            .unwrap();
+        let during = beats.load(Ordering::SeqCst) - before;
+        heartbeat.abort();
+        assert!(
+            during >= 10,
+            "the heartbeat ran {during} times during a 500ms write"
+        );
+    }
 
     fn identity() -> JournalIdentity {
         JournalIdentity {

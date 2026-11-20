@@ -4,7 +4,7 @@
 //! material. Codecs, redactors, and severity tables remain policy bindings; the
 //! types in this module do not interpret their bytes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::PathBuf;
 
@@ -518,7 +518,7 @@ where
         // Older writers did not charge the terminal feed. Apply the same
         // retention policy on reopen before copying that history on each write.
         let before = state.clone();
-        make_room(&mut state, 0, config);
+        trim(&mut state, 0, config);
         if state != before {
             storage.save(&state).map_err(BindingError::Storage)?;
         }
@@ -1556,13 +1556,31 @@ fn retained_bytes(state: &DurableState) -> u64 {
         + state.transitions.iter().map(transition_charge).sum::<u64>()
 }
 
+/// Bytes held by active reservations, which eviction cannot remove.
+fn reserved_bytes(state: &DurableState) -> u64 {
+    state
+        .reservations
+        .values()
+        .map(|record| record.charge)
+        .sum()
+}
+
 fn make_room(state: &mut DurableState, needed: u64, config: JournalConfig) -> bool {
-    while retained_bytes(state).saturating_add(needed) > config.journal_retention_bytes {
-        if !evict_oldest_terminal(state) {
-            return false;
-        }
+    // Refuse before evicting anything when the charge could not fit even with
+    // every finalized record gone: a refused action must not erase history.
+    if reserved_bytes(state).saturating_add(needed) > config.journal_retention_bytes {
+        return false;
     }
-    true
+    trim(state, needed, config)
+}
+
+/// Evict the oldest finalized records until `needed` more bytes fit, as far as
+/// eviction can go. Reopening a journal trims this way even when active
+/// reservations alone exceed the budget.
+fn trim(state: &mut DurableState, needed: u64, config: JournalConfig) -> bool {
+    evict_oldest_while(state, |retained| {
+        retained.saturating_add(needed) > config.journal_retention_bytes
+    })
 }
 
 fn make_room_delta(
@@ -1571,43 +1589,112 @@ fn make_room_delta(
     new_charge: u64,
     config: JournalConfig,
 ) -> bool {
-    while retained_bytes(state)
+    // As in `make_room`: `old_charge` is an active reservation's charge being
+    // replaced, so it is part of the reserved bytes that eviction cannot free.
+    if reserved_bytes(state)
         .saturating_sub(old_charge)
         .saturating_add(new_charge)
         > config.journal_retention_bytes
     {
-        if !evict_oldest_terminal(state) {
-            return false;
-        }
+        return false;
     }
-    true
+    evict_oldest_while(state, |retained| {
+        retained
+            .saturating_sub(old_charge)
+            .saturating_add(new_charge)
+            > config.journal_retention_bytes
+    })
 }
 
-fn evict_oldest_terminal(state: &mut DurableState) -> bool {
-    let entry = state.entries.keys().next().copied();
-    let transition = state
-        .transitions
-        .first()
-        .map(|item| item.action_obligation_id);
-    match (entry, transition) {
-        (Some(sequence), Some(id)) if id < sequence => {
-            state.transitions.remove(0);
-        }
-        (Some(sequence), _) => {
-            state.entries.remove(&sequence);
-            state
-                .transitions
-                .retain(|item| item.action_obligation_id != sequence);
-        }
-        (None, Some(_)) => {
-            state.transitions.remove(0);
-        }
-        (None, None) => return false,
+/// Evict the oldest finalized history while `over` says the retained bytes
+/// are over budget, oldest first: a transition older than the oldest entry,
+/// otherwise that entry with all of its transitions. Returns false when
+/// nothing evictable is left and `over` still holds.
+///
+/// Each record is measured once and subtracted when it goes, and evicted
+/// transitions are removed in one pass at the end, so trimming a long feed
+/// costs time linear in its length rather than remeasuring and shifting the
+/// remaining feed for every eviction.
+fn evict_oldest_while(state: &mut DurableState, over: impl Fn(u64) -> bool) -> bool {
+    let charges: Vec<u64> = state.transitions.iter().map(transition_charge).collect();
+    let mut retained = state
+        .entries
+        .values()
+        .map(|entry| entry.accounted_size)
+        .sum::<u64>()
+        + reserved_bytes(state)
+        + charges.iter().sum::<u64>();
+    // The charge of each obligation's transitions not yet evicted.
+    let mut by_obligation: HashMap<u64, u64> = HashMap::new();
+    for (transition, charge) in state.transitions.iter().zip(&charges) {
+        *by_obligation
+            .entry(transition.action_obligation_id)
+            .or_default() += charge;
     }
-    true
+    let mut evicted_entries = BTreeSet::new();
+    // Transitions before `front` are evicted.
+    let mut front = 0;
+    let mut fits = true;
+    while over(retained) {
+        while state
+            .transitions
+            .get(front)
+            .is_some_and(|transition| evicted_entries.contains(&transition.action_obligation_id))
+        {
+            front += 1;
+        }
+        let entry = state.entries.keys().next().copied();
+        let transition = state
+            .transitions
+            .get(front)
+            .map(|item| item.action_obligation_id);
+        match (entry, transition) {
+            (Some(sequence), Some(id)) if id >= sequence => {
+                let entry = state.entries.remove(&sequence).expect("the oldest entry");
+                retained = retained
+                    .saturating_sub(entry.accounted_size)
+                    .saturating_sub(by_obligation.remove(&sequence).unwrap_or(0));
+                evicted_entries.insert(sequence);
+            }
+            (Some(sequence), None) => {
+                let entry = state.entries.remove(&sequence).expect("the oldest entry");
+                retained = retained.saturating_sub(entry.accounted_size);
+                evicted_entries.insert(sequence);
+            }
+            (_, Some(id)) => {
+                retained = retained.saturating_sub(charges[front]);
+                if let Some(remaining) = by_obligation.get_mut(&id) {
+                    *remaining = remaining.saturating_sub(charges[front]);
+                }
+                front += 1;
+            }
+            (None, None) => {
+                fits = false;
+                break;
+            }
+        }
+    }
+    if front > 0 || !evicted_entries.is_empty() {
+        let mut index = 0;
+        state.transitions.retain(|transition| {
+            let keep =
+                index >= front && !evicted_entries.contains(&transition.action_obligation_id);
+            index += 1;
+            keep
+        });
+    }
+    fits
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times `transition_charge` measured a transition on this thread.
+    static TRANSITION_MEASUREMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn transition_charge(transition: &TerminalTransition) -> u64 {
+    #[cfg(test)]
+    TRANSITION_MEASUREMENTS.with(|count| count.set(count.get() + 1));
     serde_json::to_vec(transition)
         .expect("terminal transition serializes")
         .len() as u64
@@ -1762,6 +1849,94 @@ mod tests {
             origin: CallOriginRecord::Absent,
             computer_order: None,
         }
+    }
+
+    /// The eviction loop as it was before it became linear: remeasure the
+    /// retained bytes and evict one record per pass. The reference result.
+    fn trim_one_at_a_time(state: &mut DurableState, budget: u64) {
+        while retained_bytes(state) > budget {
+            let entry = state.entries.keys().next().copied();
+            let transition = state
+                .transitions
+                .first()
+                .map(|item| item.action_obligation_id);
+            match (entry, transition) {
+                (Some(sequence), Some(id)) if id < sequence => {
+                    state.transitions.remove(0);
+                }
+                (Some(sequence), _) => {
+                    state.entries.remove(&sequence);
+                    state
+                        .transitions
+                        .retain(|item| item.action_obligation_id != sequence);
+                }
+                (None, Some(_)) => {
+                    state.transitions.remove(0);
+                }
+                (None, None) => return,
+            }
+        }
+    }
+
+    /// A journal with `feed` terminal transitions, the first ones uncharged
+    /// feed records only and every third later one also a retained entry.
+    fn long_history(feed: u64) -> DurableState {
+        let mut state = DurableState::fresh();
+        for id in 1..=feed {
+            if id > feed / 2 && id % 3 == 0 {
+                state.entries.insert(
+                    id,
+                    TerminalRecord {
+                        identity: identity(),
+                        invocation_descriptor: b"invoke".to_vec(),
+                        bytes: b"done".to_vec(),
+                        accounted_size: 120,
+                        codec_id: "fixture-v1".into(),
+                        kind: TerminalKind::FinalizedCommitted,
+                        reason: None,
+                        severity_inputs: None,
+                        severity: None,
+                        attachments: BTreeMap::new(),
+                        recovered: false,
+                    },
+                );
+            }
+            state.transitions.push(TerminalTransition {
+                cursor: id,
+                action_obligation_id: id,
+                kind: TerminalKind::FinalizedCommitted,
+            });
+        }
+        state
+    }
+
+    /// Trimming a long feed to a much smaller budget measures each transition
+    /// a bounded number of times, and keeps exactly what evicting one record
+    /// at a time keeps.
+    #[test]
+    fn bulk_trimming_is_linear_and_keeps_the_newest_history() {
+        let feed = 3_000;
+        let budget = 20_000;
+        let mut state = long_history(feed);
+        let mut expected = state.clone();
+        trim_one_at_a_time(&mut expected, budget);
+        TRANSITION_MEASUREMENTS.with(|count| count.set(0));
+        assert!(trim(
+            &mut state,
+            0,
+            JournalConfig {
+                journal_retention_bytes: budget,
+                journal_max_entry_bytes: budget,
+            },
+        ));
+        let measured = TRANSITION_MEASUREMENTS.with(std::cell::Cell::get);
+        assert!(
+            measured <= 2 * feed as usize,
+            "{measured} transition measurements to trim a feed of {feed}"
+        );
+        assert_eq!(state, expected);
+        assert!(retained_bytes(&state) <= budget);
+        assert!(!state.entries.is_empty() && !state.transitions.is_empty());
     }
 
     fn binding() -> JournalBinding<FixtureCodec, (), (), InMemoryJournalStorage> {

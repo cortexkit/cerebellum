@@ -25,6 +25,7 @@
 //! - [`subject`]: the one subject string per card kind that a card is filed
 //!   under, so a second call asking the same thing joins the open card.
 
+pub(crate) mod answer_time;
 pub mod card;
 pub mod desk;
 pub mod features;

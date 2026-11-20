@@ -48,6 +48,9 @@ impl FaultInjector {
 pub enum BrowserJournalStorage {
     Filesystem(FilesystemJournalStorage),
     Memory(InMemoryJournalStorage),
+    /// In memory, with every save taking this long, as on a slow disk.
+    #[cfg(test)]
+    Slow(InMemoryJournalStorage, std::time::Duration),
 }
 
 impl JournalStorage for BrowserJournalStorage {
@@ -55,6 +58,8 @@ impl JournalStorage for BrowserJournalStorage {
         match self {
             Self::Filesystem(storage) => storage.load(),
             Self::Memory(storage) => storage.load(),
+            #[cfg(test)]
+            Self::Slow(storage, _) => storage.load(),
         }
     }
 
@@ -62,6 +67,11 @@ impl JournalStorage for BrowserJournalStorage {
         match self {
             Self::Filesystem(storage) => storage.save(state),
             Self::Memory(storage) => storage.save(state),
+            #[cfg(test)]
+            Self::Slow(storage, delay) => {
+                std::thread::sleep(*delay);
+                storage.save(state)
+            }
         }
     }
 
@@ -72,6 +82,8 @@ impl JournalStorage for BrowserJournalStorage {
         match self {
             Self::Filesystem(storage) => storage.raise_format(format),
             Self::Memory(storage) => storage.raise_format(format),
+            #[cfg(test)]
+            Self::Slow(storage, _) => storage.raise_format(format),
         }
     }
 }
@@ -118,6 +130,23 @@ impl JournalStore {
             config,
             core_config,
             BrowserJournalStorage::Memory(InMemoryJournalStorage::new()),
+        )
+    }
+
+    /// An in-memory binding whose every save takes `delay`.
+    #[cfg(test)]
+    pub(crate) fn slow_in_memory_for_test(
+        config: JournalConfig,
+        delay: std::time::Duration,
+    ) -> Result<Self, JournalError> {
+        let core_config = CoreJournalConfig {
+            journal_retention_bytes: config.journal_retention_bytes,
+            journal_max_entry_bytes: config.journal_max_entry_bytes,
+        };
+        Self::open(
+            config,
+            core_config,
+            BrowserJournalStorage::Slow(InMemoryJournalStorage::new(), delay),
         )
     }
 

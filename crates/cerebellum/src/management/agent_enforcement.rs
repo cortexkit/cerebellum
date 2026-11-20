@@ -98,36 +98,42 @@ impl ManagementPlane {
             };
         };
         let now = store.now_ms();
-        for subject in subjects {
-            let hazards = if subject == GrantSubject::AllSites {
-                vec![]
-            } else {
-                pending.disclosed_hazards.iter().copied().collect()
-            };
-            if store
-                .upsert(
-                    AgentGrant {
-                        id: String::new(),
-                        holder: holder.clone(),
-                        subject,
-                        browser_target: Some(BrowserTarget::AgentProfile),
-                        machine_uuid: machine.into(),
-                        granted_at_ms: now,
-                        expires_at_ms: (!always).then_some(now.saturating_add(30 * 60 * 1000)),
-                        card_ref: Some(card_ref.into()),
-                        max_level: pending.severity.tier,
-                        hazards,
-                        team_id: None,
-                        designated_requirement: None,
-                    },
-                    now,
-                )
-                .is_err()
-            {
-                return BrowserGrantSettlement::NotRecorded {
-                    reason: "grant_storage_unavailable",
-                };
+        let window = if always {
+            None
+        } else {
+            match crate::cingulate_client::answer_time::thirty_minute_window(now) {
+                Some(window) => Some(window),
+                // The answer's 30 minutes ran out before it was applied.
+                None => return BrowserGrantSettlement::NotGranted,
             }
+        };
+        let rows = subjects
+            .into_iter()
+            .map(|subject| AgentGrant {
+                id: String::new(),
+                holder: holder.clone(),
+                hazards: if subject == GrantSubject::AllSites {
+                    vec![]
+                } else {
+                    pending.disclosed_hazards.iter().copied().collect()
+                },
+                subject,
+                browser_target: Some(BrowserTarget::AgentProfile),
+                machine_uuid: machine.into(),
+                granted_at_ms: window.map_or(now, |(start, _)| start),
+                expires_at_ms: window.map(|(_, end)| end),
+                card_ref: Some(card_ref.into()),
+                max_level: pending.severity.tier,
+                team_id: None,
+                designated_requirement: None,
+            })
+            .collect();
+        // One write for every site the answer covers, so a failed save leaves
+        // none of them granted rather than some.
+        if store.upsert_all(rows, now).is_err() {
+            return BrowserGrantSettlement::NotRecorded {
+                reason: "grant_storage_unavailable",
+            };
         }
         BrowserGrantSettlement::Granted(choice)
     }
