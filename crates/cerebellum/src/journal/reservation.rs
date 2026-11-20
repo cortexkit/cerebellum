@@ -190,7 +190,8 @@ impl JournalStore {
         identity: JournalIdentity,
         capability: Capability,
     ) -> Result<ReservationHandle, JournalError> {
-        let handle = self.reserve_core(&identity, self.max_entry_bytes().to_le_bytes().to_vec())?;
+        let descriptor = self.max_entry_bytes().to_le_bytes().to_vec();
+        let handle = super::off_worker(|| self.reserve_core(&identity, descriptor))?;
         self.metadata
             .insert(handle.sequence(), (identity, capability));
         Ok(handle)
@@ -208,13 +209,10 @@ impl JournalStore {
             .ok_or_else(JournalError::internal_failure)?;
         let entry = rejection_entry(handle.sequence(), &identity, capability, material);
         self.sync_faults_for_transition();
-        self.core
-            .finalize_rejected(
-                handle.core,
-                core_journal::RejectionMaterial {
-                    rejection_material: entry.export_line().into_bytes(),
-                },
-            )
+        let material = core_journal::RejectionMaterial {
+            rejection_material: entry.export_line().into_bytes(),
+        };
+        super::off_worker(|| self.core.finalize_rejected(handle.core, material))
             .map(|_| Committed)
             .map_err(JournalStore::map_error)
     }
@@ -231,17 +229,13 @@ impl JournalStore {
             .ok_or_else(JournalError::internal_failure)?;
         let entry = provisional_entry(handle.sequence(), &identity, capability, material);
         self.sync_faults_for_transition();
-        let token = self
-            .core
-            .commit_dispatched(
-                handle.core,
-                core_journal::DispatchMaterial {
-                    dispatch_material: entry.export_line().into_bytes(),
-                    severity_inputs: None,
-                    grant_decision: Vec::new(),
-                    governing_observation: None,
-                },
-            )
+        let material = core_journal::DispatchMaterial {
+            dispatch_material: entry.export_line().into_bytes(),
+            severity_inputs: None,
+            grant_decision: Vec::new(),
+            governing_observation: None,
+        };
+        let token = super::off_worker(|| self.core.commit_dispatched(handle.core, material))
             .map_err(JournalStore::map_error)?;
         self.provisional.insert(handle.sequence(), entry);
         Ok(DispatchCommitmentToken { core: token })
@@ -264,17 +258,17 @@ impl JournalStore {
         entry.identity.profile_uuid = final_context.profile_uuid.clone();
         entry.identity.profile_name = final_context.profile_name.clone();
         self.sync_faults_for_transition();
-        self.core
-            .finalize_dispatched(
-                token.core,
-                core_journal::CompletedResult {
-                    completed_result: entry.export_line().into_bytes(),
-                },
-                core_journal::FinalContextAssociation {
-                    final_context: Vec::new(),
-                },
-            )
-            .map(|_| Committed)
-            .map_err(JournalStore::map_error)
+        let completed = core_journal::CompletedResult {
+            completed_result: entry.export_line().into_bytes(),
+        };
+        let context = core_journal::FinalContextAssociation {
+            final_context: Vec::new(),
+        };
+        super::off_worker(|| {
+            self.core
+                .finalize_dispatched(token.core, completed, context)
+        })
+        .map(|_| Committed)
+        .map_err(JournalStore::map_error)
     }
 }
