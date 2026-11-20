@@ -1526,6 +1526,48 @@ async fn an_active_call_remains_deduplicated_when_its_recent_tombstone_expires()
     assert_eq!(planes.routes.display.state.lock().unwrap().calls.len(), 1);
 }
 
+/// Each tracked call keeps its own request address, so delivery and eviction
+/// drop exactly that index entry, never another live call's, even when a
+/// correlation is reused.
+#[tokio::test]
+async fn delivery_drops_only_its_own_request_index_entry() {
+    let planes = planes();
+    let facts = install(&planes);
+    let principal = journal::call_records::principal_label(facts.principal.as_ref());
+    let display = &planes.routes.display;
+    let mut body = request();
+    for index in 0..3 {
+        body["call_key"] = json!(format!("local:{index}"));
+        body["origin"]["call_key"] = json!(format!("runner:{index}"));
+        let mut call = frame(body.clone());
+        call.header.corr = index;
+        assert!(display.arm(&call, &facts).is_some());
+    }
+    let mut reply = frame(json!({"outcome":"ok"}));
+    reply.header.ty = FrameType::Response;
+    reply.header.corr = 1;
+    display.delivered(display.prepare(&reply).unwrap());
+    {
+        let state = display.state.lock().unwrap();
+        let indexed: Vec<_> = state.requests.keys().map(|request| request.2).collect();
+        assert_eq!(indexed.len(), 2, "{indexed:?}");
+        assert!(!indexed.contains(&1));
+    }
+    // Correlation 0 reused by a new call while the old one is still tracked:
+    // removing the old call must leave the new call's entry.
+    body["call_key"] = json!("local:reused");
+    body["origin"]["call_key"] = json!("runner:reused");
+    let mut reused = frame(body);
+    reused.header.corr = 0;
+    assert!(display.arm(&reused, &facts).is_some());
+    let mut state = display.state.lock().unwrap();
+    state.remove_call(&(principal.clone(), "local:0".into()));
+    assert_eq!(
+        state.requests.get(&(7, 1, 0)),
+        Some(&(principal, "local:reused".into()))
+    );
+}
+
 #[tokio::test]
 async fn waiting_capacity_evicts_the_oldest_not_all_future_calls() {
     let planes = planes();
