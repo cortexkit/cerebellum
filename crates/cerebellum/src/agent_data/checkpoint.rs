@@ -2,10 +2,13 @@
 //!
 //! Finished cuts are kept for good, holding only their step and saved
 //! replies, so a repeated request keeps getting its first reply. Retiring
-//! them would need two things first: a replay-retention window stated by the
-//! agent-data role contract, since a retired cut answers as unknown, and a
-//! new checkpoint format version behind the format floor to record when
-//! each cut finished.
+//! them would need two things first. The agent-data move contract
+//! (`cortexkit-role-agent-data`) would have to state how long a repeated
+//! request must keep its first answer, since a retired cut answers as
+//! unknown; it states no such window today. And the checkpoint would need a
+//! new format version recording when each cut finished, declared in the
+//! format floor (the file that stops an older build from opening data it
+//! can't read).
 
 use super::*;
 use cerebellum_core::format_floor::{FormatFloor, FORMAT_FLOOR_FILE};

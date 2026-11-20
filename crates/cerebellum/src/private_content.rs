@@ -250,7 +250,9 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// reached the file. A marker left by a running process means it stopped
 /// without a clean shutdown, however long ago it started, so the successor
 /// answers marked for at least 24 hours from when it found the marker. An
-/// unreadable marker counts the same way, so the marker needs no format floor.
+/// unreadable marker counts the same way. So an older build that can't parse
+/// a newer marker still fails closed, and the marker needs no format floor
+/// (the file that stops an older build from opening data it can't read).
 #[derive(Serialize, Deserialize)]
 struct Marker {
     started_ms: u64,

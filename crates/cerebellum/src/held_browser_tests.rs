@@ -332,7 +332,8 @@ async fn explicit_close_is_not_blocked_by_held_consent() {
 /// request's address, but its reply goes to the late-result store, not to
 /// the live connection. It must not leave a delivery deadline on that
 /// connection, or the connection is torn down long after the call succeeded.
-/// Every request here, late pulls included, travels the real egress drain.
+/// Every request here, late-result pulls included, goes through the
+/// connection's real reply writer, which is what clears delivery deadlines.
 #[tokio::test]
 async fn a_resumed_continuation_leaves_no_delivery_deadline_on_the_live_connection() {
     let (planes, consent, page, _) = fixture().await;
