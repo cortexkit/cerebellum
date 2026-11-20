@@ -456,7 +456,7 @@ fn an_element_press_after_the_stop_is_never_sent_and_is_journaled_as_stopped() {
         cerebellum_computer::app_state::source::FixtureElementToken(1),
     );
     let reply =
-        super::element_actions::press_blocking(&source, &mut journal, &target, "e1", &handle);
+        super::element_actions::press_blocking(&source, &mut journal, &target, "e1", &handle, None);
     assert_eq!(reply["outcome"], "action_deadline_exceeded", "{reply}");
     assert_eq!(
         source.0.load(Ordering::SeqCst),

@@ -670,18 +670,71 @@ pub(crate) async fn admit_session_app(
 /// The role as the journal may record it: an accessibility role constant, or
 /// `AXUnknown`. A role is a string the application supplies, and the journal
 /// never records application text.
-fn journal_role(facts: Option<&ElementFacts>) -> String {
-    match facts.and_then(|facts| facts.role.as_deref()) {
-        Some(role)
-            if role.len() <= 48
-                && role.strip_prefix("AX").is_some_and(|rest| {
-                    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphabetic())
-                }) =>
-        {
-            role.to_string()
-        }
-        _ => "AXUnknown".to_string(),
-    }
+fn journal_role(facts: Option<&ElementFacts>) -> &'static str {
+    const KNOWN_ROLES: &[&str] = &[
+        "AXApplication",
+        "AXBrowser",
+        "AXBusyIndicator",
+        "AXButton",
+        "AXCell",
+        "AXCheckBox",
+        "AXColorWell",
+        "AXColumn",
+        "AXComboBox",
+        "AXDateField",
+        "AXDisclosureTriangle",
+        "AXDockItem",
+        "AXDrawer",
+        "AXGrid",
+        "AXGroup",
+        "AXGrowArea",
+        "AXHelpTag",
+        "AXImage",
+        "AXIncrementor",
+        "AXLayoutArea",
+        "AXLayoutItem",
+        "AXLevelIndicator",
+        "AXLink",
+        "AXList",
+        "AXMatte",
+        "AXMenu",
+        "AXMenuBar",
+        "AXMenuBarItem",
+        "AXMenuButton",
+        "AXMenuItem",
+        "AXOutline",
+        "AXPopUpButton",
+        "AXPopover",
+        "AXProgressIndicator",
+        "AXRadioButton",
+        "AXRadioGroup",
+        "AXRelevanceIndicator",
+        "AXRow",
+        "AXRuler",
+        "AXRulerMarker",
+        "AXScrollArea",
+        "AXScrollBar",
+        "AXSheet",
+        "AXSlider",
+        "AXSplitGroup",
+        "AXSplitter",
+        "AXStaticText",
+        "AXSystemWide",
+        "AXTabGroup",
+        "AXTable",
+        "AXTextArea",
+        "AXTextField",
+        "AXToolbar",
+        "AXValueIndicator",
+        "AXWebArea",
+        "AXWindow",
+    ];
+    let role = facts.and_then(|facts| facts.role.as_deref());
+    KNOWN_ROLES
+        .iter()
+        .copied()
+        .find(|known| Some(*known) == role)
+        .unwrap_or("AXUnknown")
 }
 
 fn descriptor(capability: ComputerCapability) -> ComputerPlaneDescriptor {
@@ -998,6 +1051,7 @@ pub(crate) fn press_blocking<R, T, S>(
     grant: &ProcessGrant,
     element_id: &str,
     handle: &ElementHandle,
+    imaged_window: Option<ImagedWindow>,
 ) -> Value
 where
     R: Redactor,
@@ -1013,7 +1067,7 @@ where
         Ok(action) => action,
         Err(reply) => {
             if journal
-                .refused(&role, reply["outcome"].as_str().expect("refusal outcome"))
+                .refused(role, reply["outcome"].as_str().expect("refusal outcome"))
                 .is_err()
             {
                 return audit_unavailable_reply(false);
@@ -1026,7 +1080,7 @@ where
     // better than a completed reply with no effect. An unreadable state is
     // unknown, not disabled, so dispatch is still allowed.
     if source.element_enabled(handle) == Some(false) {
-        if journal.refused(&role, "element_disabled").is_err() {
+        if journal.refused(role, "element_disabled").is_err() {
             return audit_unavailable_reply(false);
         }
         let background = source
@@ -1034,7 +1088,17 @@ where
             .is_some_and(|frontmost| frontmost != grant.pid);
         return element_disabled_reply(facts.title.as_deref(), element_id, background);
     }
-    let token = match journal.intent(grant, element_id, action, &role) {
+    // The cursor animation and app activation can delay the press after the hit.
+    if imaged_window.is_some_and(|window| {
+        !hit_is_in_imaged_window(source, handle, Some(window.number))
+            || !window.matches_current(source, grant)
+    }) {
+        if journal.refused(role, "state_changed_by_person").is_err() {
+            return audit_unavailable_reply(false);
+        }
+        return imaged_window_changed_reply();
+    }
+    let token = match journal.intent(grant, element_id, action, role) {
         Ok(token) => token,
         Err(refused) => return refused.reply(),
     };
@@ -1148,7 +1212,7 @@ where
     // Decided before anything is written: a secure field is refused whatever
     // else about it would allow the write.
     if facts.is_secure() {
-        if journal.refused(&role, "secure_field_refused").is_err() {
+        if journal.refused(role, "secure_field_refused").is_err() {
             return audit_unavailable_reply(false);
         }
         return json!({
@@ -1159,7 +1223,7 @@ where
     }
     match web_ancestry(source, grant, handle) {
         Some(true) => {
-            if journal.refused(&role, "web_content_needs_type").is_err() {
+            if journal.refused(role, "web_content_needs_type").is_err() {
                 return audit_unavailable_reply(false);
             }
             return json!({
@@ -1180,7 +1244,7 @@ where
         ),
     };
     if !settable {
-        if journal.refused(&role, "element_not_settable").is_err() {
+        if journal.refused(role, "element_not_settable").is_err() {
             return audit_unavailable_reply(false);
         }
         return json!({
@@ -1200,15 +1264,15 @@ where
                     match expected_after_insert(&before, selection, text) {
                         Some(expected) => expected,
                         None => {
-                            return caret_unknown(journal, &role);
+                            return caret_unknown(journal, role);
                         }
                     }
                 }
-                _ => return caret_unknown(journal, &role),
+                _ => return caret_unknown(journal, role),
             }
         }
     };
-    let token = match journal.intent(grant, element_id, action, &role) {
+    let token = match journal.intent(grant, element_id, action, role) {
         Ok(token) => token,
         Err(refused) => return refused.reply(),
     };
@@ -1767,9 +1831,33 @@ enum PressTarget {
         /// The window-server number of the window the image shows; `None`
         /// when the image was registered without one.
         window_number: Option<u32>,
+        imaged_window: Option<ImagedWindow>,
         /// The application's name, for the refusal's remedy.
         application_name: String,
     },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ImagedWindow {
+    number: u32,
+    frame: [f64; 4],
+}
+
+impl ImagedWindow {
+    fn matches_current(self, source: &dyn AppStateSource, grant: &ProcessGrant) -> bool {
+        self.frame.iter().all(|value| value.is_finite())
+            && self.frame[2] > 0.0
+            && self.frame[3] > 0.0
+            && source.window_frame(grant, self.number) == Some(self.frame)
+    }
+}
+
+fn imaged_window_changed_reply() -> Value {
+    json!({
+        "outcome": "state_changed_by_person",
+        "reason": "window_changed",
+        "remedy": "The window moved, resized, or its position could not be verified. Nothing was pressed. Call read_state again with include_image and choose a point on the new image.",
+    })
 }
 
 /// Whether the element a point hit sits in the window the image shows.
@@ -2147,7 +2235,10 @@ where
         let point = image
             .mapping
             .pixel_to_desktop(parsed.x as f64, parsed.y as f64);
-        let window_number = sessions.image_window(&conversation_key, &parsed.image_id);
+        let geometry = sessions.image_window_geometry(&conversation_key, &parsed.image_id);
+        let window_number = geometry.map(|(number, _)| number);
+        let imaged_window =
+            geometry.and_then(|(number, frame)| frame.map(|frame| ImagedWindow { number, frame }));
         let application_name = management.application_name(&grant);
         let mut reply = self
             .press_and_diff(
@@ -2163,6 +2254,7 @@ where
                 PressTarget::Point {
                     point,
                     window_number,
+                    imaged_window,
                     application_name,
                 },
                 view,
@@ -2556,11 +2648,12 @@ where
         // A point names no element, so the element under it is found first.
         // `reads` carries what that hit test's accessibility reads found on to
         // the press's own journal row.
-        let (element_id, handle, point, reads) = match target {
-            PressTarget::Element { element_id, handle } => (element_id, handle, None, None),
+        let (element_id, handle, point, reads, imaged_window) = match target {
+            PressTarget::Element { element_id, handle } => (element_id, handle, None, None, None),
             PressTarget::Point {
                 point,
                 window_number,
+                imaged_window,
                 application_name,
             } => {
                 let mut audit = AuditToken::new(self.audit.clone(), work.gate());
@@ -2574,30 +2667,46 @@ where
                 let found = tokio::task::spawn_blocking(move || {
                     let _ax = work.bound_ax();
                     let _scope = AccessibilityReadScope::new(grant.pid, None);
-                    let hit = hit_test(source.as_ref(), &grant, point);
-                    let found = match hit {
-                        // Checked before the element is given an id, so an
-                        // element of a window the image does not show is
-                        // neither numbered nor pressed.
-                        PointHit::Element(handle)
-                            if !hit_is_in_imaged_window(source.as_ref(), &handle, window_number) =>
-                        {
-                            Err(point_in_another_window_reply(
-                                &application_name,
-                                "nothing was pressed and the pointer was not used",
-                            ))
-                        }
-                        PointHit::Element(handle) => adopt(&sessions, &identity.conversation_key, &grant, &handle)
-                            .map(|id| (id, handle)),
-                        PointHit::Nothing => Err(json!({
-                            "outcome": "no_element_at_point",
-                            "remedy": "nothing of this application is at that point; nothing was pressed and the pointer was not used. Read the state again and choose an element",
-                        })),
+                    let another_window = || {
+                        point_in_another_window_reply(
+                            &application_name,
+                            "nothing was pressed and the pointer was not used",
+                        )
                     };
-                    match found {
+                    let resolve = || {
+                        if window_number.is_none() {
+                            return Err(another_window());
+                        }
+                        if !imaged_window
+                            .is_some_and(|window| window.matches_current(source.as_ref(), &grant))
+                        {
+                            return Err(imaged_window_changed_reply());
+                        }
+                        match hit_test(source.as_ref(), &grant, point) {
+                            // A window the image does not show gets no new element id.
+                            PointHit::Element(handle)
+                                if !hit_is_in_imaged_window(source.as_ref(), &handle, window_number) =>
+                            {
+                                Err(another_window())
+                            }
+                            PointHit::Element(handle) => {
+                                adopt(&sessions, &identity.conversation_key, &grant, &handle)
+                                    .map(|id| (id, handle))
+                            }
+                            PointHit::Nothing => Err(json!({
+                                "outcome": "no_element_at_point",
+                                "remedy": "nothing of this application is at that point; nothing was pressed \
+                                           and the pointer was not used. Read the state again and choose an element",
+                            })),
+                        }
+                    };
+                    match resolve() {
                         Ok((id, handle)) => Ok((id, handle, AccessibilityReadScope::current())),
                         Err(reply) => {
-                            if audit.record_accessibility_read(identity, capability, &grant, || ()).is_err() {
+                            if audit
+                                .record_accessibility_read(identity, capability, &grant, || ())
+                                .is_err()
+                            {
                                 return Err(audit_unavailable_reply(false));
                             }
                             Err(reply)
@@ -2607,7 +2716,9 @@ where
                 .await
                 .unwrap_or_else(|_| Err(audit_unavailable_reply(false)));
                 match found {
-                    Ok((id, handle, reads)) => (id, handle, Some([point.0, point.1]), reads),
+                    Ok((id, handle, reads)) => {
+                        (id, handle, Some([point.0, point.1]), reads, imaged_window)
+                    }
                     Err(reply) => {
                         super::fronting::action_row_started();
                         return PressDone::alone(reply);
@@ -2637,7 +2748,7 @@ where
                                 let role = journal_role(Some(&facts));
                                 if journal
                                     .refused(
-                                        &role,
+                                        role,
                                         reply["outcome"].as_str().expect("refusal outcome"),
                                     )
                                     .is_err()
@@ -2782,6 +2893,7 @@ where
                     grant,
                     element_id,
                     handle,
+                    imaged_window,
                     reads,
                     gate,
                     work,
@@ -2804,8 +2916,14 @@ where
                 journal.set_fronting(record);
             }
             let press_at = Instant::now();
-            let mut reply =
-                press_blocking(source.as_ref(), &mut journal, &grant, &element_id, &handle);
+            let mut reply = press_blocking(
+                source.as_ref(),
+                &mut journal,
+                &grant,
+                &element_id,
+                &handle,
+                imaged_window,
+            );
             if gate.refused_for_end() {
                 reply = cancelled_before_dispatch_reply();
             }
@@ -3053,7 +3171,7 @@ mod tests {
         let mut journal =
             ElementJournal::new(token, identity, ComputerCapability::PressElement, &grant);
         let handle: ElementHandle = Arc::new(FixtureElementToken(1));
-        let reply = press_blocking(source, &mut journal, &grant, "e1", &handle);
+        let reply = press_blocking(source, &mut journal, &grant, "e1", &handle, None);
         journal.finish().unwrap();
         reply
     }

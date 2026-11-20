@@ -66,6 +66,8 @@ mod event_tap;
 #[cfg(any(target_os = "macos", test))]
 mod input;
 #[cfg(target_os = "macos")]
+mod kqueue;
+#[cfg(target_os = "macos")]
 mod launch;
 #[cfg(all(target_os = "macos", feature = "desk-probe"))]
 pub mod peer_identity_probe;
@@ -176,7 +178,9 @@ pub use window_image::{
     pointer_probe_own_window_count, pointer_probe_posting_permitted, prepare_pointer_hit_tests,
 };
 #[cfg(target_os = "macos")]
-pub use window_image::{cursor_position, display_frames, pointer_window_at, visible_window_ids};
+pub use window_image::{
+    cursor_position, display_frames, pointer_window_at, visible_window_frame, visible_window_ids,
+};
 #[cfg(any(target_os = "macos", test))]
 mod window_visibility;
 #[cfg(any(target_os = "macos", test))]

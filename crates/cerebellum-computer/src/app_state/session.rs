@@ -353,6 +353,7 @@ struct HeldImage {
     /// registered without one, which no coordinate action may act on: its
     /// pixels cannot be tied to the window they show.
     window_number: Option<u32>,
+    window_frame: Option<[f64; 4]>,
 }
 
 #[derive(Debug, Default)]
@@ -884,7 +885,7 @@ impl AppStateSessions {
     /// window it shows. Such an image can still be resolved, but a coordinate
     /// action refuses it, because nothing ties its pixels to a window.
     pub fn register_image(&self, conversation_key: &str, image: RegisteredImage) -> String {
-        self.register(conversation_key, image, None)
+        self.register(conversation_key, image, None, None)
     }
 
     /// Remember an image handed to a conversation together with the
@@ -895,7 +896,23 @@ impl AppStateSessions {
         image: RegisteredImage,
         window_number: u32,
     ) -> String {
-        self.register(conversation_key, image, Some(window_number))
+        self.register(conversation_key, image, Some(window_number), None)
+    }
+
+    /// Remember the desktop frame the image's coordinate mapping used.
+    pub fn register_framed_window_image(
+        &self,
+        conversation_key: &str,
+        image: RegisteredImage,
+        window_number: u32,
+        window_frame: [f64; 4],
+    ) -> String {
+        self.register(
+            conversation_key,
+            image,
+            Some(window_number),
+            Some(window_frame),
+        )
     }
 
     fn register(
@@ -903,6 +920,7 @@ impl AppStateSessions {
         conversation_key: &str,
         image: RegisteredImage,
         window_number: Option<u32>,
+        window_frame: Option<[f64; 4]>,
     ) -> String {
         let mut state = self.lock();
         state.next_image += 1;
@@ -913,6 +931,7 @@ impl AppStateSessions {
                 conversation_key: conversation_key.to_string(),
                 image,
                 window_number,
+                window_frame,
             },
         );
         let mut held: Vec<(u64, String)> = state
@@ -953,6 +972,20 @@ impl AppStateSessions {
             return None;
         }
         held.window_number
+    }
+
+    /// Resolve the exact window number and, if retained, its frame in the image.
+    pub fn image_window_geometry(
+        &self,
+        conversation_key: &str,
+        image_id: &str,
+    ) -> Option<(u32, Option<[f64; 4]>)> {
+        let state = self.lock();
+        let held = state.images.get(image_id)?;
+        if held.conversation_key != conversation_key {
+            return None;
+        }
+        Some((held.window_number?, held.window_frame))
     }
 
     /// Forget everything held for a conversation that has ended.

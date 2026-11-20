@@ -464,6 +464,7 @@ struct ScreenState {
     idle_ms: u64,
     observer: bool,
     comes_forward: bool,
+    replacement_during_foreground_resolution: bool,
     front_delay_ms: Option<u64>,
     pending_front_at: Option<u64>,
     late_watch_gate: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -471,6 +472,7 @@ struct ScreenState {
     coverage_start_ms: u64,
     restore_started: Option<Arc<tokio::sync::Notify>>,
     restore_until: Option<Arc<std::sync::atomic::AtomicBool>>,
+    after_picture_bracket: Option<support::DeskHook>,
     /// Isolated predictor evidence; ordinary scenarios start with a known
     /// zero-cost fake restore, while cold-start tests clear it explicitly.
     measured_restore_ms: Option<u64>,
@@ -566,6 +568,7 @@ impl Screen {
                 idle_ms: OBSERVED_DISPATCH_IDLE_MS + 500,
                 observer: true,
                 comes_forward: true,
+                replacement_during_foreground_resolution: false,
                 front_delay_ms: None,
                 pending_front_at: None,
                 late_watch_gate: None,
@@ -582,6 +585,7 @@ impl Screen {
                 front_ignores_cap: false,
                 target_wait_until: None,
                 last_input_ms: None,
+                after_picture_bracket: None,
                 post_unknown: false,
                 post_cost_ms: 0,
                 post_blocks_ms: 0,
@@ -794,6 +798,14 @@ impl FrontingSession for FakeSession {
     }
     fn request_front(&mut self, pid: u32) -> bool {
         self.0.front("front", pid)
+    }
+    fn request_granted_front(&mut self, grant: &ProcessGrant) -> bool {
+        let expected = support::grant();
+        if self.0.state().replacement_during_foreground_resolution {
+            self.0.state().log.push("resolved replacement".into());
+            return false;
+        }
+        *grant == expected && self.0.front("front", grant.pid)
     }
     fn our_pid(&self) -> i64 {
         OUR_PID
@@ -1164,7 +1176,7 @@ impl PlatformDriver for FakeDriver {
         };
         let mut host = FakeBracket(self.screen.clone());
         let mut estimator = UserIdleEstimator::new();
-        Ok(match self.hooks.take() {
+        let report = match self.hooks.take() {
             Some(mut hooks) => {
                 cerebellum_computer::platform::run_hooked_fronted(
                     &mut host,
@@ -1183,7 +1195,12 @@ impl PlatformDriver for FakeDriver {
                 cancelled,
                 &mut logged_read,
             ),
-        })
+        };
+        let after = screen.state().after_picture_bracket.take();
+        if let Some(after) = after {
+            (after.0)();
+        }
+        Ok(report)
     }
     fn fronting_session(&mut self) -> Result<Box<dyn FrontingSession>, DriverError> {
         Ok(Box::new(FakeSession(self.screen.clone())))
@@ -1600,6 +1617,21 @@ async fn a_foreground_read_fronts_its_application_one_way() {
     let reply = rig.read().await;
     assert_eq!(reply["fronting"]["fronted"], false, "{reply}");
     assert_eq!(rig.screen.log(), ["front:4242"]);
+}
+
+#[tokio::test]
+async fn one_way_front_refuses_a_pid_reused_during_application_lookup() {
+    let rig = rig(AppUse::Foreground, mail_desk()).await;
+    rig.screen.state().replacement_during_foreground_resolution = true;
+    let reply = rig.read().await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["fronting"]["fronted"], false, "{reply}");
+    assert_eq!(
+        reply["fronting"]["not_fronted_reason"], "front_failed",
+        "{reply}"
+    );
+    assert_eq!(rig.screen.log(), ["resolved replacement"]);
+    assert_eq!(rig.screen.frontmost(), Some(PREVIOUS));
 }
 
 /// The idle gate refusing a foreground read's front leaves the read
@@ -2629,6 +2661,49 @@ async fn a_bring_to_front_read_fronts_reads_and_restores_once() {
         "{reply}"
     );
     assert!(!rig.lock.held());
+}
+
+#[tokio::test]
+async fn input_after_a_picture_restore_is_not_hidden_by_the_read() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    let desk = rig.desk.clone();
+    rig.screen.state().after_picture_bracket = Some(support::DeskHook(Arc::new(move || {
+        let mut state = desk.state();
+        assert_eq!(state.frontmost, Some(PREVIOUS));
+        // The person returns and types without changing the focused element.
+        state.frontmost = Some(TARGET);
+        state.input.push((0, std::time::Instant::now()));
+    })));
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.read_state",
+            json!({"target": support::TARGET_BUNDLE_ID, "include_image": true,
+                "bring_to_front": true}),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(reply["fronting"]["fronted"], true, "{reply}");
+    assert_eq!(reply["fronting"]["restore"], "restored", "{reply}");
+    assert!(reply.get("image_unavailable").is_some(), "{reply}");
+    assert!(reply.get("image").is_none(), "{reply}");
+    let send = reply["state_text"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .find(|line| line.contains("Send"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap();
+    let press = rig
+        .call_under(
+            &under_terminal(),
+            "computer.press_element",
+            json!({"element_id": send}),
+        )
+        .await;
+    assert_eq!(press["outcome"], "state_changed_by_person", "{press}");
+    assert_eq!(press["reason"], "input_seen", "{press}");
+    assert!(rig.desk.state().presses.is_empty());
 }
 
 // ---------------------------------------------------------------------------

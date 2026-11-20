@@ -960,6 +960,23 @@ impl FrontingSession for MacFrontingSession {
         cerebellum_macos::request_frontmost(pid).is_ok()
     }
 
+    fn request_granted_front(&mut self, grant: &ProcessGrant) -> bool {
+        use super::process_event::mac_process_generation;
+        let Ok(start_time_micros) = grant.process_generation_evidence.parse() else {
+            return false;
+        };
+        let pid = grant.pid;
+        pointer::request_verified_front(
+            Some(ProcessEventTarget {
+                pid,
+                start_time_micros,
+            }),
+            pid,
+            || mac_process_generation(pid),
+            |still_ours| cerebellum_macos::request_frontmost_while(pid, still_ours).is_ok(),
+        )
+    }
+
     fn our_pid(&self) -> i64 {
         i64::from(std::process::id())
     }

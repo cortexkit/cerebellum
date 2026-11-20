@@ -424,6 +424,15 @@ fn cursor_window_list() -> Option<Vec<crate::window_visibility::Window>> {
     Some(entries)
 }
 
+/// Read the exact on-screen window's frame without reading its pixels or title.
+pub fn visible_window_frame(pid: u32, id: u32) -> Option<[f64; 4]> {
+    let bounds = cursor_window_list()?
+        .into_iter()
+        .find(|window| window.id == Some(id) && window.pid == Some(pid))?
+        .bounds?;
+    Some([bounds.x, bounds.y, bounds.width, bounds.height])
+}
+
 /// Uses the same front-to-back list as the image visibility reading. `frame`
 /// is the acted-on element's frame, used only when there is no exact point.
 pub fn visible_cursor_point(

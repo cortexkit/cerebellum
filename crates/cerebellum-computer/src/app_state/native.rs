@@ -163,6 +163,13 @@ impl AppStateSource for MacAppStateSource {
         cerebellum_macos::visible_window_ids(target.pid)
     }
 
+    fn window_frame(&self, target: &ProcessGrant, window_number: u32) -> Option<[f64; 4]> {
+        if verify_grant(target.pid, target) != GrantVerification::Current {
+            return None;
+        }
+        cerebellum_macos::visible_window_frame(target.pid, window_number)
+    }
+
     fn visible_cursor_point(
         &self,
         target: &ProcessGrant,

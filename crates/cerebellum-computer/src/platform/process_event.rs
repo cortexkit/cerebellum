@@ -770,7 +770,7 @@ impl MacOsPerProcessEventTransport {
 }
 
 #[cfg(target_os = "macos")]
-fn mac_process_generation(pid: u32) -> ProcessGenerationReading {
+pub(super) fn mac_process_generation(pid: u32) -> ProcessGenerationReading {
     match cerebellum_macos::process_start_time(pid) {
         cerebellum_macos::ProcessStartTime::Started(micros) => {
             ProcessGenerationReading::Started(micros)

@@ -282,6 +282,16 @@ impl Tip {
     fn place(&self) -> [f64; 2] {
         [self.to[0] + self.offset[0], self.to[1] + self.offset[1]]
     }
+
+    fn expires(&self) -> tokio::time::Instant {
+        self.sent + Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS)
+    }
+
+    fn follows(&self, serial: u64) -> bool {
+        self.space == Space::Screen
+            && self.serial == serial
+            && tokio::time::Instant::now() < self.expires()
+    }
 }
 
 /// Where a badge is about to be sent, for choosing its motion.
@@ -301,11 +311,10 @@ struct Aim<'a> {
 
 impl Drawn {
     fn shown(&self, agent: &str, space: Space, now: tokio::time::Instant) -> Option<[f64; 2]> {
-        let gone_after = Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS);
         self.tips
             .get(agent)
             .filter(|tip| tip.space == space)
-            .filter(|tip| now.saturating_duration_since(tip.sent) < gone_after)
+            .filter(|tip| now < tip.expires())
             .map(Tip::place)
     }
 
@@ -431,13 +440,14 @@ struct Follow {
     /// Dropping it removes the observer: on a hide, a new target, or the
     /// window closing. Absent only while the observer is being installed.
     _watch: Option<Box<dyn CursorWindowWatch>>,
-    poll: Option<VisibilityPoll>,
+    poll: Option<FollowTask>,
+    _idle: Option<FollowTask>,
 }
 
 /// A hidden or replaced badge must not leave a visibility timer running.
-struct VisibilityPoll(tokio::task::AbortHandle);
+struct FollowTask(tokio::task::AbortHandle);
 
-impl Drop for VisibilityPoll {
+impl Drop for FollowTask {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -830,6 +840,14 @@ impl Coordinator {
         element: Option<ElementHandle>,
     ) {
         let agent = &event.agent;
+        if !self
+            .drawn()
+            .tips
+            .get(agent)
+            .is_some_and(|tip| tip.follows(event.serial))
+        {
+            return;
+        }
         #[cfg(target_os = "macos")]
         let _ax = cerebellum_macos::ax_budget::bound_messages_until(
             std::time::Instant::now() + READ_BUDGET,
@@ -903,6 +921,7 @@ impl Coordinator {
             base_element: event.target,
             _watch: None,
             poll: None,
+            _idle: None,
         };
         {
             // Publish before installing the observer: it can report as soon
@@ -939,6 +958,7 @@ impl Coordinator {
             }
             follows.insert(agent.clone(), follow);
         }
+        self.start_follow_expiry(agent, id);
         // No locks across the platform call: it may call back synchronously.
         let watch = source.watch_cursor_window(
             &window,
@@ -976,15 +996,54 @@ impl Coordinator {
         // installation, the returned watch is dropped rather than revived.
     }
 
+    fn start_follow_expiry(&self, agent: &str, id: u64) {
+        let state = Arc::downgrade(&self.0);
+        let name = agent.to_owned();
+        let task = tokio::spawn(async move {
+            loop {
+                let expires = {
+                    let Some(state) = state.upgrade() else { return };
+                    let cursor = Coordinator(state);
+                    let drawn = cursor.drawn();
+                    let mut follows = cursor.follows();
+                    let Some(follow) = follows.get(&name).filter(|follow| follow.id == id) else {
+                        return;
+                    };
+                    let live = drawn.tips.get(&name).filter(|tip| {
+                        tip.space == Space::Screen
+                            && tip.serial >= follow.serial
+                            && tokio::time::Instant::now() < tip.expires()
+                    });
+                    // A read that leaves the badge in place can reuse the
+                    // watch. Consult the latest picture's deadline on waking.
+                    let Some(tip) = live else {
+                        follows.remove(&name);
+                        return;
+                    };
+                    tip.expires()
+                };
+                tokio::time::sleep_until(expires).await;
+            }
+        });
+        let mut follows = self.follows();
+        if let Some(follow) = follows.get_mut(agent).filter(|follow| follow.id == id) {
+            follow._idle = Some(FollowTask(task.abort_handle()));
+        } else {
+            task.abort();
+        }
+    }
+
     fn start_visibility_poll(&self, agent: &str, id: u64, grant: ProcessGrant) {
         let state = Arc::downgrade(&self.0);
         let polled = agent.to_owned();
         let task = tokio::spawn(async move {
             loop {
                 let expires = state.upgrade().and_then(|state| {
-                    Coordinator(state).drawn().tips.get(&polled).map(|tip| {
-                        tip.sent + Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS)
-                    })
+                    Coordinator(state)
+                        .drawn()
+                        .tips
+                        .get(&polled)
+                        .map(Tip::expires)
                 });
                 let Some(expires) = expires else { return };
                 // The last wake is exactly the helper's idle-removal deadline,
@@ -1016,16 +1075,17 @@ impl Coordinator {
                 if !minimized && !hidden {
                     return;
                 }
-                let showing = cursor.drawn().tips.get(&polled).is_some_and(|tip| {
-                    tokio::time::Instant::now().saturating_duration_since(tip.sent)
-                        < Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS)
-                });
-                if !showing {
-                    let mut follows = cursor.follows();
-                    if follows.get(&polled).is_some_and(|follow| follow.id == id) {
-                        follows.remove(&polled);
+                {
+                    let drawn = cursor.drawn();
+                    let Some(tip) = drawn.tips.get(&polled) else {
+                        return;
+                    };
+                    if tip.space != Space::Screen || tokio::time::Instant::now() >= tip.expires() {
+                        return;
                     }
-                    return;
+                    if tip.serial != serial {
+                        continue;
+                    }
                 }
                 let checked = grant.clone();
                 let visible = tokio::task::spawn_blocking(move || {
@@ -1045,7 +1105,7 @@ impl Coordinator {
         });
         let mut follows = self.follows();
         if let Some(follow) = follows.get_mut(agent).filter(|follow| follow.id == id) {
-            follow.poll = Some(VisibilityPoll(task.abort_handle()));
+            follow.poll = Some(FollowTask(task.abort_handle()));
         } else {
             task.abort();
         }
@@ -1103,11 +1163,7 @@ impl Coordinator {
             };
             let serial = follow.serial;
             follows.remove(agent);
-            if drawn
-                .tips
-                .get(agent)
-                .is_some_and(|tip| tip.serial == serial)
-            {
+            if drawn.tips.get(agent).is_some_and(|tip| tip.follows(serial)) {
                 // Include reads already in flight, even when their picture has
                 // not replaced this tip yet. Only a later action may redraw.
                 let through = self
@@ -1122,11 +1178,19 @@ impl Coordinator {
             return;
         }
         let current = {
+            let drawn = self.drawn();
             let follows = self.follows();
             let Some(follow) = follows.get(agent).filter(|follow| follow.id == id) else {
                 // A watch already replaced or removed; its report is stale.
                 return;
             };
+            if !drawn
+                .tips
+                .get(agent)
+                .is_some_and(|tip| tip.follows(follow.serial))
+            {
+                return;
+            }
             (
                 follow.serial,
                 follow.source.clone(),
@@ -1151,10 +1215,14 @@ impl Coordinator {
         else {
             return;
         };
+        let mut drawn = self.drawn();
         let follows = self.follows();
         // Sent only if the badge still rests on the same event, so a report
         // computed against an older event never moves a newer picture.
-        let moved = follows
+        let Some(tip) = drawn.tips.get_mut(agent).filter(|tip| tip.follows(serial)) else {
+            return;
+        };
+        if follows
             .get(agent)
             .is_some_and(|follow| follow.id == id && follow.serial == serial)
             && self.send_line(CursorLine::Follow(CursorFollow {
@@ -1162,20 +1230,9 @@ impl Coordinator {
                 serial,
                 offset,
                 window: Some(now_window),
-            }));
-        // Released first: the record's lock is always taken before this one.
-        drop(follows);
-        if moved {
-            // The helper moves the badge with the window, so the next glide
-            // starts from there.
-            if let Some(tip) = self
-                .drawn()
-                .tips
-                .get_mut(agent)
-                .filter(|tip| tip.serial == serial)
-            {
-                tip.offset = offset;
-            }
+            }))
+        {
+            tip.offset = offset;
         }
     }
 
@@ -2820,6 +2877,7 @@ mod tests {
     struct FollowGeometry {
         window: ElementHandle,
         window_frame: std::sync::Mutex<[f64; 4]>,
+        frame_reads: std::sync::atomic::AtomicUsize,
         element_frame: std::sync::Mutex<[f64; 4]>,
         caret: std::sync::Mutex<Option<[f64; 4]>>,
         /// Every watch's report callback, in the order they were created.
@@ -2854,6 +2912,7 @@ mod tests {
                 )
                 .handle,
                 window_frame: std::sync::Mutex::new([100.0, 80.0, 800.0, 600.0]),
+                frame_reads: std::sync::atomic::AtomicUsize::new(0),
                 element_frame: std::sync::Mutex::new([400.0, 120.0, 90.0, 22.0]),
                 caret: std::sync::Mutex::new(None),
                 watches: std::sync::Mutex::new(Vec::new()),
@@ -2916,6 +2975,8 @@ mod tests {
             *self.caret.lock().unwrap()
         }
         fn cursor_frame(&self, element: &ElementHandle) -> Option<[f64; 4]> {
+            self.frame_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Some(if element.same_element(self.window.as_ref()) {
                 if !self
                     .window_readable
@@ -3509,6 +3570,47 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_faded_badge_retires_its_healthy_watch_and_ignores_movement() {
+        use std::sync::atomic::Ordering;
+        let (cursor, mut receiver) = Coordinator::channel();
+        let geometry = FollowGeometry::new();
+        schedule_on(&cursor, &geometry, CursorKind::Type);
+        next_line(&mut receiver).await.picture().unwrap();
+        until("installed healthy watch", || {
+            cursor
+                .follows()
+                .get(AGENT)
+                .is_some_and(|follow| follow._watch.is_some())
+        })
+        .await;
+        let reads = geometry.frame_reads.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(
+            IDLE_FADE_AFTER_MS + IDLE_FADE_MS + 100,
+        ))
+        .await;
+        assert_eq!(
+            geometry.live(),
+            0,
+            "a faded badge must not own a window watch"
+        );
+        FollowGeometry::shift(&geometry.window_frame, [40.0, 0.0, 0.0, 0.0]);
+        geometry.fire(0, WindowChange::Moved);
+        assert_eq!(geometry.frame_reads.load(Ordering::SeqCst), reads);
+        no_line(
+            &mut receiver,
+            "a queued move for a faded badge reached the helper",
+        );
+
+        schedule_on(&cursor, &geometry, CursorKind::Type);
+        next_line(&mut receiver).await.picture().unwrap();
+        until("installed a new watch for the new badge", || {
+            geometry.live() == 1
+        })
+        .await;
+        assert_eq!(geometry.created(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn visibility_polling_keeps_visible_badges_and_stops_on_hide_or_idle() {
         for idle in [false, true] {
             let (cursor, mut receiver) = Coordinator::channel();
@@ -3538,7 +3640,7 @@ mod tests {
                 cursor.hide_picture(AGENT, 0);
             }
             until("no visibility poll survives its badge", || {
-                poll.is_finished()
+                poll.is_finished() && cursor.follows().is_empty()
             })
             .await;
             assert!(cursor.follows().is_empty());

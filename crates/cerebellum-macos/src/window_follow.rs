@@ -100,41 +100,9 @@ extern "C" {
     fn AXUIElementCreateApplication(pid: c_int) -> CfTypeRef;
 }
 
-/// `struct kevent` as the macOS kernel defines it.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct KernelEvent {
-    ident: usize,
-    filter: i16,
-    flags: u16,
-    fflags: u32,
-    data: isize,
-    udata: *mut c_void,
-}
-
-#[repr(C)]
-struct Timespec {
-    seconds: isize,
-    nanoseconds: isize,
-}
-
-const EVFILT_PROC: i16 = -5;
-const EV_ADD: u16 = 0x0001;
-const EV_DELETE: u16 = 0x0002;
-const EV_ONESHOT: u16 = 0x0010;
-const NOTE_EXIT: u32 = 0x8000_0000;
-
-extern "C" {
-    fn kqueue() -> c_int;
-    fn kevent(
-        queue: c_int,
-        changes: *const KernelEvent,
-        change_count: c_int,
-        events: *mut KernelEvent,
-        event_count: c_int,
-        timeout: *const Timespec,
-    ) -> c_int;
-}
+use crate::kqueue::{
+    kevent, kqueue, KernelEvent, Timespec, EVFILT_PROC, EV_ADD, EV_DELETE, EV_ONESHOT, NOTE_EXIT,
+};
 
 /// What happened to a watched window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

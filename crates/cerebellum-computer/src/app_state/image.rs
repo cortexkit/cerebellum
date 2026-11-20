@@ -239,6 +239,8 @@ pub struct ReleasedImage {
     /// The captured window's identity as the capture backend named it; on
     /// macOS its window-server number.
     pub window_id: String,
+    /// The same desktop origin and size that the pixel mapping used.
+    pub window_frame: [f64; 4],
     pub jpeg: Vec<u8>,
     pub width_px: u32,
     pub height_px: u32,
@@ -345,6 +347,12 @@ pub fn release_through_custody<C: ImageCustody>(
         .map_err(|CustodyStepFailed| ImageUnavailable::AuditUnavailable)?;
     Ok(ReleasedImage {
         window_id: captured.window_id,
+        window_frame: [
+            captured.window_origin.0,
+            captured.window_origin.1,
+            captured.window_points.0,
+            captured.window_points.1,
+        ],
         jpeg: captured.jpeg,
         width_px,
         height_px,
