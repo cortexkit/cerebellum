@@ -3315,12 +3315,16 @@ fn late_snapshot_results_cannot_restore_goodbye_handles_or_cross_connection_refs
         refs: BTreeMap::new(),
         image: None,
     };
+    // The late result belongs to work still in flight when its route ends,
+    // as every published snapshot comes from inside its own call.
+    let work = target.begin_work(route);
     target.end_route(route);
     target.retain("late".into(), snapshot.clone());
     assert!(target.state().snapshots.is_empty());
     target.synchronize(8);
     target.retain("old-connection".into(), snapshot);
     assert!(target.state().snapshots.is_empty());
+    drop(work);
 }
 
 #[test]

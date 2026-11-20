@@ -370,7 +370,9 @@ struct Snapshot {
 #[derive(Default)]
 struct State {
     connection: Option<u64>,
+    /// Ended routes whose work was in flight when they ended (see `route_work`).
     ended_routes: BTreeSet<Route>,
+    in_flight: BTreeMap<Route, usize>,
     claims: BTreeMap<String, Route>,
     unobserved_blank: BTreeSet<String>,
     /// Tabs that have had a reply reporting `settled: false` since they were
@@ -426,16 +428,18 @@ impl UserBrowser {
     }
 
     pub(crate) fn end_route(&self, route: Route) {
-        self.state().ended_routes.insert(route);
+        self.mark_ended(route);
         self.release(route);
     }
 
     pub(crate) fn disconnect(&self) {
         let mut state = self.state();
         let ended_routes = std::mem::take(&mut state.ended_routes);
+        let in_flight = std::mem::take(&mut state.in_flight);
         let executions = std::mem::take(&mut state.executions);
         *state = State {
             ended_routes,
+            in_flight,
             executions,
             ..State::default()
         };
@@ -518,9 +522,11 @@ impl UserBrowser {
         let mut state = self.state();
         if state.connection != Some(connection) {
             let ended_routes = std::mem::take(&mut state.ended_routes);
+            let in_flight = std::mem::take(&mut state.in_flight);
             *state = State {
                 connection: Some(connection),
                 ended_routes,
+                in_flight,
                 ..State::default()
             };
         }
@@ -1632,6 +1638,7 @@ pub(crate) async fn serve(
     let Some(budget) = crate::budgets::user_browser_call(action, args) else {
         return invalid("action", "unsupported_value");
     };
+    let _work = planes.user_browser.target().begin_work(route);
     let Some(permits) = planes.user_browser.target().workers.try_call() else {
         return json!({"browser":"user","outcome":"blocking_capacity_exhausted",
             "detail":{"dispatched":false,"step":"queue"}});
@@ -4891,6 +4898,7 @@ use revision::{
     extension_revision_mismatch, MINIMUM_EXTENSION_REVISION, NATIVE_SELECT_MIN_REVISION,
 };
 mod revision;
+mod route_work;
 mod session_claims;
 use session_claims::SessionClaims;
 mod typing;
