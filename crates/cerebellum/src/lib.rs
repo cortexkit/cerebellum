@@ -1488,6 +1488,8 @@ async fn watch_scope(planes: Planes, writer: mpsc::Sender<Frame>, key: scope_wat
         let answer = planes.scopes.describe(&writer, &key).await;
         if held_scope_end(answer.as_ref(), &key) {
             settle_scope_holds(&planes, &key);
+            // Revocation below must find the holds already settled as ended.
+            call_record_supervisor::settled_in_order(&planes).await;
         }
         if scope_watch::classify(answer.as_ref(), key.scope_epoch)
             == scope_watch::ScopeVerdict::Ended
@@ -1578,12 +1580,20 @@ fn held_scope_end(
 /// its cancellation predicate; the persistent browser keeps its normal handoff
 /// and teardown policy.
 fn settle_scope_holds(planes: &Planes, key: &scope_watch::ScopeKey) {
-    planes
-        .browser_resumes
-        .cancel_scope(&held_scope_identity(key));
-    let _ = planes
-        .calls
-        .end_held_scope(&held_scope_identity(key), wall_clock_ms());
+    let scope = held_scope_identity(key);
+    planes.browser_resumes.cancel_scope(&scope);
+    planes.calls.latch_scope(&scope);
+    call_record_supervisor::settle_in_order(planes, move |calls| {
+        let _ = calls.end_held_scope(&scope, wall_clock_ms());
+    });
+}
+
+/// After the route's held browser requests are settled, in the same order.
+fn end_call_conversation(planes: &Planes, conversation_key: &str) {
+    let conversation_key = conversation_key.to_owned();
+    call_record_supervisor::settle_in_order(planes, move |calls| {
+        calls.end_conversation(&conversation_key)
+    });
 }
 
 /// A codemode run borrows its parent agent conversation's browser and grants.
@@ -3498,11 +3508,10 @@ async fn handle_frame(
             planes
                 .cancellations
                 .cancel_route(frame.header.channel, frame.header.epoch);
-            planes.calls.abandon_browser_route(
-                frame.header.channel,
-                frame.header.epoch,
-                wall_clock_ms(),
-            );
+            let (channel, epoch) = (frame.header.channel, frame.header.epoch);
+            call_record_supervisor::settle_in_order(planes, move |calls| {
+                calls.abandon_browser_route(channel, epoch, wall_clock_ms())
+            });
             planes
                 .browser_resumes
                 .cancel_route(frame.header.channel, frame.header.epoch);
@@ -3532,7 +3541,7 @@ async fn handle_frame(
                         // conversation.
                         if last_route {
                             planes.management.end_conversation(conversation_key);
-                            planes.calls.end_conversation(conversation_key);
+                            end_call_conversation(planes, conversation_key);
                             planes.image_handles.end_conversation(conversation_key);
                         }
                         if let Some(config) = planes.browser_config.as_ref() {
@@ -3552,7 +3561,7 @@ async fn handle_frame(
                         if last_route {
                             // Held reply bodies are a memory bound, not a
                             // permission: they go with the last route as always.
-                            planes.calls.end_conversation(conversation_key);
+                            end_call_conversation(planes, conversation_key);
                             planes.image_handles.end_conversation(conversation_key);
                         }
                         let key = scope_watch::ScopeKey::from_stamp(stamp);
@@ -3565,29 +3574,16 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Cancel => {
-            planes.browser_resumes.cancel_correlation((
-                frame.header.channel,
-                frame.header.epoch,
-                frame.header.corr,
-            ));
-            planes.calls.abandon_browser_correlation(
-                frame.header.channel,
-                frame.header.epoch,
-                frame.header.corr,
-                wall_clock_ms(),
-            );
+            let address = (frame.header.channel, frame.header.epoch, frame.header.corr);
+            planes.browser_resumes.cancel_correlation(address);
+            // Signal cancellation without touching call-record storage; its
+            // journal settlement runs after, off this loop, behind the latch.
+            planes.calls.latch_correlation(address);
             terminal_arbiter::cancel_late_fronting_request(
                 planes.cancellations.namespace(),
-                (frame.header.channel, frame.header.epoch, frame.header.corr),
+                address,
             );
-            match (
-                frame.header.channel,
-                planes.cancellations.get((
-                    frame.header.channel,
-                    frame.header.epoch,
-                    frame.header.corr,
-                )),
-            ) {
+            match (frame.header.channel, planes.cancellations.get(address)) {
                 (0, _) => {}
                 (_, Some(handle)) => {
                     handle.cancel();
@@ -3604,6 +3600,9 @@ async fn handle_frame(
                 // are explicitly ignored without a reply, error, or log.
                 (_, None) => {}
             }
+            call_record_supervisor::settle_in_order(planes, move |calls| {
+                calls.abandon_browser_correlation(address.0, address.1, address.2, wall_clock_ms())
+            });
             Ok(true)
         }
         FrameType::Request if frame.header.channel == 0 => {
@@ -4727,12 +4726,16 @@ pub fn browser_plane_with_shared_grants_for_test(
     BrowserPlane::new().with_shared_grants(grants)
 }
 
+/// One frame through the wire loop's handler, then the call-record work it
+/// handed off, so a test observes the journal the frame settled.
 pub async fn handle_frame_for_test(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     planes: &Planes,
 ) -> Result<bool, ModuleError> {
-    handle_frame(frame, writer, planes).await
+    let handled = handle_frame(frame, writer, planes).await;
+    call_record_supervisor::settled_in_order(planes).await;
+    handled
 }
 
 /// The tool path with a route stamped `scope_ref`, for fixtures whose captures

@@ -628,6 +628,28 @@ async fn cancel_after_first_held_reply_removes_the_original_request() {
     assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
 }
 
+/// A CANCEL's journal settlement runs after the wire loop moves on, so an
+/// approval can land before it. The latch the wire loop sets first must keep
+/// that approval from running the cancelled call.
+#[tokio::test]
+async fn an_approval_before_a_cancel_settles_cannot_run_the_cancelled_call() {
+    let (planes, consent, page, _) = fixture().await;
+    start_navigation(&planes).await;
+    planes.calls.latch_correlation((9, 3, 3));
+    consent.feed(json!([answered("browser-card", "allow_30m")]));
+    // One pull drains the approval; give a wrongly claimed call time to run.
+    late(&planes, 9).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
+    planes
+        .calls
+        .abandon_browser_correlation(9, 3, 3, wall_clock_ms());
+    let reply = late(&planes, 9).await;
+    assert_eq!(reply["entries"][0]["kind"], "not_started", "{reply}");
+    assert_eq!(reply["entries"][0]["detail"]["consent"], "withdrawn");
+    assert_eq!(page.navigations.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn deny_and_card_expiry_remove_the_original_request() {
     for record in [
@@ -693,6 +715,7 @@ async fn head_scope_end_releases_the_session_for_idle_expiry() {
         .unwrap();
     assert_ne!(Some(head_scope), facts.scope.as_ref());
     settle_scope_holds(&planes, &scope_watch::ScopeKey::from_stamp(head_scope));
+    crate::call_record_supervisor::settled_in_order(&planes).await;
     assert_idles_after_full_timeout(&planes);
 }
 
@@ -1133,6 +1156,7 @@ async fn route_scope_and_session_end_cancel_queued_owned_resumptions() {
                     planes.routes.get(9, 3).unwrap().scope.as_ref().unwrap(),
                 );
                 settle_scope_holds(&planes, &scope);
+                crate::call_record_supervisor::settled_in_order(&planes).await;
             }
             "session" => forget_conversation_cards(&planes, "head-conversation"),
             _ => {

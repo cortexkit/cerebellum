@@ -837,6 +837,7 @@ pub struct CallRecords {
     pub(crate) events: Arc<crate::event_publish::Publisher>,
     storage: Box<dyn CallRecordStorage>,
     inner: Mutex<Inner>,
+    latch: browser_resume::WithdrawLatch,
 }
 
 impl std::fmt::Debug for CallRecords {
@@ -948,6 +949,7 @@ impl CallRecords {
                 handoffs: HashMap::new(),
                 ended_scopes: Default::default(),
             }),
+            latch: Default::default(),
         }
     }
 
@@ -1034,6 +1036,7 @@ impl CallRecords {
             events,
             storage,
             inner: Mutex::new(inner),
+            latch: Default::default(),
         };
         {
             let mut inner = records.lock();

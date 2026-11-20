@@ -33,6 +33,45 @@ impl Entry {
     }
 }
 
+/// Withdrawals the wire loop has signalled whose journal settlement has not
+/// run yet. The settlement waits its turn off the wire loop, so without this
+/// a consent approval arriving in between could still claim and run a call
+/// its caller already cancelled, or one whose scope already ended. Its own
+/// small lock is never held across the call-record mutex or a disk write.
+#[derive(Debug, Default)]
+pub(super) struct WithdrawLatch {
+    pending: std::sync::Mutex<Latched>,
+}
+
+/// Cancelled request addresses, and scopes whose end was announced.
+type Latched = (
+    std::collections::HashSet<(u16, u32, u64)>,
+    std::collections::HashSet<ScopeIdentity>,
+);
+
+impl WithdrawLatch {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Latched> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(super) fn scope(&self, scope: &ScopeIdentity) -> bool {
+        self.lock().1.contains(scope)
+    }
+
+    pub(super) fn end_scope(&self, scope: &ScopeIdentity) {
+        self.lock().1.remove(scope);
+    }
+
+    fn holds(&self, resume: &BrowserResume, scope: &ScopeIdentity) -> bool {
+        let header = &resume.frame.header;
+        let latched = self.lock();
+        latched
+            .0
+            .contains(&(header.channel, header.epoch, header.corr))
+            || latched.1.contains(scope)
+    }
+}
+
 impl std::fmt::Debug for BrowserResume {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Arguments can contain typed text and must not enter diagnostics.
@@ -124,6 +163,9 @@ impl CallRecords {
                 .browser_resume
                 .as_ref()
                 .is_some_and(|resume| resume.approved)
+            || self
+                .latch
+                .holds(entry.browser_resume.as_ref().unwrap(), &held.scope)
         {
             return Ok(None);
         }
@@ -233,6 +275,17 @@ impl CallRecords {
         }
     }
 
+    /// Mark a cancelled request before its settlement is handed off, so no
+    /// consent claim can take it in the meantime. Touches no call record.
+    pub(crate) fn latch_correlation(&self, address: (u16, u32, u64)) {
+        self.latch.lock().0.insert(address);
+    }
+
+    /// [`Self::latch_correlation`] for a scope whose end the daemon announced.
+    pub(crate) fn latch_scope(&self, scope: &ScopeIdentity) {
+        self.latch.lock().1.insert(scope.clone());
+    }
+
     pub(crate) fn abandon_browser_correlation(
         &self,
         channel: u16,
@@ -259,6 +312,7 @@ impl CallRecords {
         for (principal, key) in keys {
             let _ = self.abandon_browser_request(&principal, &key, now);
         }
+        self.latch.lock().0.remove(&(channel, epoch, corr));
     }
 
     pub(crate) fn finish_browser_request(

@@ -474,6 +474,9 @@ impl CallRecords {
     ) -> Result<(), CallRecordError> {
         let mut inner = self.lock();
         inner.ended_scopes.insert(scope.clone());
+        // The scope is now recorded as ended, which every claim checks, so
+        // the latch set when the end was announced is no longer needed.
+        self.latch.end_scope(scope);
         for entry in inner.entries.values_mut().filter(|entry| {
             entry
                 .browser_hold
@@ -506,7 +509,7 @@ impl CallRecords {
     }
 
     pub(crate) fn held_scope_ended(&self, scope: &ScopeIdentity) -> bool {
-        self.lock().ended_scopes.contains(scope)
+        self.latch.scope(scope) || self.lock().ended_scopes.contains(scope)
     }
 
     /// Serialize the deposit boundary with scope end. After this returns true,
@@ -523,6 +526,7 @@ impl CallRecords {
         if !held.capture
             || !matches!(held.phase, Phase::Pending)
             || inner.ended_scopes.contains(&held.scope)
+            || self.latch.scope(&held.scope)
         {
             return false;
         }
