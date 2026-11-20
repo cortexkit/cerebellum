@@ -22,9 +22,9 @@ pub(super) async fn capture_browser_login(
     }
     // Before the sign-in window is handed to the person, cancellation of the
     // request also cancels consent. Once the caller has been told the window
-    // was handed over, the capture belongs to its custodian, so closing the
-    // request must not stop sign-in. Module shutdown still interrupts the
-    // capture and disposes its throwaway profile.
+    // was handed over, its result is owed to the caller as a late result, so
+    // closing the request must not stop sign-in. Module shutdown still
+    // interrupts the capture and disposes its throwaway profile.
     let cancel = planes.cancellations.get((channel, epoch, corr));
     let draining = Arc::clone(&planes.draining);
     let cancel_for_capture = cancel.clone();

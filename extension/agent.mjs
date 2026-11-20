@@ -284,10 +284,10 @@ export class Agent {
   }
 
   // Release-only cleanup for presses and key-downs this plan dispatched on this
-  // attachment whose release Chrome has not acknowledged. A refusal may revoke
-  // membership or freshness, but must not leave a button or key held. Only the
-  // matching release is sent, to the target its press went to; the plan is
-  // never resumed and no other input is dispatched. A release Chrome did not
+  // attachment whose release Chrome has not acknowledged. A refusal (the tab
+  // left the Agent group, or the person used the page) must not leave a button
+  // or key held. Only the matching release is sent, to the target its press
+  // went to; the plan is never resumed and no other input is dispatched. A release Chrome did not
   // acknowledge, or one that can no longer be sent because the debugger is
   // gone, is reported as unconfirmed.
   async releaseHeld(state) {

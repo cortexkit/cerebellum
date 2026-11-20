@@ -883,8 +883,8 @@ impl UserBrowserBridge {
                     // The extension may have finished the action before it
                     // saw the Cancel: it then ignores the Cancel, and the
                     // detached terminal it already sent is the proof that it
-                    // let go. Its content is discarded; only its input
-                    // witness is kept.
+                    // let go. Its content is discarded; only its
+                    // `input_dispatched` value is kept.
                     Some(
                         MessageBody::Completed {
                             input_dispatched,

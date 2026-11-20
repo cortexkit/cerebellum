@@ -184,7 +184,7 @@ export class BrowserEvents {
     }
     await this.tabs.adoptPopup(tabId);
     // Grouping and the observer install wait on Chrome, and the opener's
-    // route can end meanwhile (a Goodbye releases its claims). A pop-up of a
+    // route can end meanwhile, releasing its claims. A pop-up of a
     // route that has ended stays an unclaimed agent-opened tab, and nothing
     // is focused for it.
     const ownerStillHoldsOpener = () => this.agent.claims.get(popup.openerTabId) === popup.owner;
