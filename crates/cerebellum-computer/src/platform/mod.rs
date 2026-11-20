@@ -1822,8 +1822,9 @@ pub trait FrontingSession {
     fn pause_ms(&mut self, milliseconds: u64);
     fn frontmost_pid(&mut self) -> Option<u32>;
     fn request_front(&mut self, pid: u32) -> bool;
-    /// Request a one-way front only while the original process holds this PID.
-    /// Refuse unless the platform checks that ownership at the activation write.
+    /// Request a one-way front only while the granted process (PID plus start
+    /// time) still holds this PID. A platform that cannot recheck that, right
+    /// before the native call that makes the app frontmost, refuses.
     fn request_granted_front(&mut self, _grant: &ProcessGrant) -> bool {
         false
     }

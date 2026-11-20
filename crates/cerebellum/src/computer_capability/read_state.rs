@@ -595,9 +595,11 @@ where
         if let Some(fronting) = fronting {
             fronting.apply(&mut reply);
         }
-        // The bracket can confirm an app switch, not which accessibility focus
-        // or window changes it caused. Keep the marks from before the tree:
-        // newer marks could hide changes or input the reply never showed.
+        // Bringing the app forward for the picture proves only that the app
+        // switched, not which focus or window changes that switch caused. So
+        // keep the person-activity baseline (focus, window and input time)
+        // sampled before the tree was read: a baseline sampled after the
+        // picture would hide changes or input this reply never showed.
         if let Some(seen) = seen {
             sessions.remember_seen(&conversation_key, &grant, seen);
         }

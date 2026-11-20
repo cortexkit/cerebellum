@@ -1014,8 +1014,9 @@ impl Coordinator {
                             && tip.serial >= follow.serial
                             && tokio::time::Instant::now() < tip.expires()
                     });
-                    // A read that leaves the badge in place can reuse the
-                    // watch. Consult the latest picture's deadline on waking.
+                    // A read that leaves the cursor badge's screen tip in
+                    // place can reuse the watch. Consult the latest picture's
+                    // deadline on waking.
                     let Some(tip) = live else {
                         follows.remove(&name);
                         return;
