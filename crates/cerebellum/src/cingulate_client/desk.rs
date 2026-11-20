@@ -1101,8 +1101,9 @@ impl ConsentDesk {
     }
 }
 
-/// How many finished cards the registry keeps, newest first, so a record the
-/// feed repeats is still recognised as this desk's. Older finished cards are
+/// How many finished cards the registry keeps, newest first, so an answer
+/// record the approval service's answer feed sends again is still recognised
+/// as this desk's. Older finished cards are
 /// dropped, which keeps the registry, and every save of it, bounded.
 const FINISHED_CARDS_KEPT: usize = 32;
 

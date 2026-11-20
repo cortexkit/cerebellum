@@ -1878,8 +1878,9 @@ mod tests {
         }
     }
 
-    /// A journal with `feed` terminal transitions, the first ones uncharged
-    /// feed records only and every third later one also a retained entry.
+    /// A journal with `feed` terminal transitions. The first half carry no
+    /// retained entry; after the halfway point, every third transition also
+    /// has one.
     fn long_history(feed: u64) -> DurableState {
         let mut state = DurableState::fresh();
         for id in 1..=feed {

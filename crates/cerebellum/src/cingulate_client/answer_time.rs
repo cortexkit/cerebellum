@@ -22,8 +22,9 @@ pub(crate) enum AnswerTime {
     /// answer came no earlier, so its 30 minutes end no later than 30 minutes
     /// after this.
     RaisedNoEarlierThan(u64),
-    /// Neither time is known (a card raised by an older build, answered by a
-    /// peer that does not stamp answers). No 30-minute window can be bounded,
+    /// Neither time is known (a card raised by an older cerebellum build, and
+    /// an answer record from the approval service, Cingulate, that carries no
+    /// answer time). No 30-minute window can be bounded,
     /// so such an answer grants nothing.
     Unknown,
 }
