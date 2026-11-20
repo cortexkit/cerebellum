@@ -342,11 +342,12 @@ export class Agent {
     await this.guard(state);
     if (p.action === "status") {
       const visible = [];
+      // list() has just checked each member's membership; checking it again
+      // per tab would double the Chrome calls for nothing.
       for (const tab of await this.tabs.list()) {
-        const record = await this.tabs.resolve(tab.tab);
-        const owner = this.claims.get(record.tabId);
-        if (owner && owner !== state.route || !owner && record.kind !== "handed") continue;
-        visible.push({ tab: tab.tab, claimed: owner === state.route, handed: record.kind === "handed", interaction_epoch: this.epochs.record(record.tabId).epoch });
+        const owner = this.claims.get(tab.tabId);
+        if (owner && owner !== state.route || !owner && tab.kind !== "handed") continue;
+        visible.push({ tab: tab.tab, claimed: owner === state.route, handed: tab.kind === "handed", interaction_epoch: this.epochs.record(tab.tabId).epoch });
       }
       return { tabs: visible, connection_epoch: state.epoch };
     }

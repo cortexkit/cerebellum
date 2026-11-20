@@ -289,6 +289,9 @@ export class AgentTabs {
     return { tabId: pair[0], ...pair[1] };
   }
 
+  // Each eligible member, checked once here: its handle, its kind and, for
+  // this extension's own use only, its Chrome tab id. The id never leaves the
+  // extension; a later action that names a handle checks membership again.
   async list() {
     await this.ready;
     await this.reconcile();
@@ -296,7 +299,7 @@ export class AgentTabs {
     for (const [tabId, record] of this.tabs) {
       try {
         await this.eligible(tabId);
-        result.push({ tab: record.handle, kind: record.kind });
+        result.push({ tab: record.handle, kind: record.kind, tabId });
       } catch { /* Withdrawn tabs must not contribute even a handle. */ }
     }
     return result;

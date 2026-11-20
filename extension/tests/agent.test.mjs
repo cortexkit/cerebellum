@@ -150,6 +150,23 @@ test("claims and status remain route bound", async () => {
   await assert.rejects(f.run(f.cdp([read]), other), { reason: "tab_not_claimed" });
 });
 
+test("status checks each tab's membership once and still withholds other routes' claims", async () => {
+  const f = await setup();
+  const handles = {};
+  for (const id of [3, 4, 5]) {
+    f.chrome.tabData.set(id, { id, windowId: 3, groupId: -1, active: false });
+    handles[id] = (await f.tabs.join(id, "handed")).handle;
+  }
+  f.agent.claims.set(3, "9:4");
+  f.chrome.calls.length = 0;
+  const status = await f.run({ version: 2, action: "status" });
+  const gets = f.chrome.calls.filter(call => call[0] === "get").map(call => call[1]);
+  assert.deepEqual(gets.sort(), [2, 3, 4, 5], "one membership read per tab");
+  assert.deepEqual(status.tabs.map(tab => tab.tab), [f.record.handle, handles[4], handles[5]]);
+  assert.equal(status.tabs.some(tab => tab.tab === handles[3]), false);
+  assert.equal(status.tabs.some(tab => "tabId" in tab), false, "Chrome tab ids stay inside the extension");
+});
+
 test("group withdrawal after a press sends only its matching cleanup release", async () => {
   const f = await setup();
   const epoch = (await f.fresh()).interaction_epoch;
