@@ -412,6 +412,40 @@ async fn a_resumed_continuation_leaves_no_delivery_deadline_on_the_live_connecti
     reader.abort();
 }
 
+/// A consumer may lose a late_results response or restart before it commits
+/// its cursor. Until it acknowledges, pulling again must return the same
+/// observed result, not the conservative outcome_unknown left on disk.
+#[tokio::test]
+async fn a_resumed_result_is_pulled_again_until_acknowledged() {
+    let (planes, consent, _page, _) = fixture().await;
+    start_navigation(&planes).await;
+    consent.feed(json!([answered("browser-card", "allow_30m")]));
+    let first = late_key(&planes, 9, "held-navigation").await;
+    let observed = &first["entries"][0]["result"];
+    assert_eq!(observed["structuredContent"]["outcome"], "ok", "{first}");
+    let again = late(&planes, 9).await;
+    assert_eq!(again["entries"][0]["result"], *observed, "{again}");
+    let acked = decode(
+        exchange(
+            &planes,
+            9,
+            51,
+            json!({"name":"late_results.ack","arguments":{"through":again["cursor"]}}),
+        )
+        .await,
+    );
+    assert_eq!(acked, json!({}), "{acked}");
+    let after = late(&planes, 9).await;
+    assert!(
+        !after["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["call_key"] == "held-navigation"),
+        "{after}"
+    );
+}
+
 #[tokio::test]
 async fn approval_while_held_runs_navigate_and_returns_its_page_without_persisting_text() {
     let (planes, consent, page, storage) = fixture().await;

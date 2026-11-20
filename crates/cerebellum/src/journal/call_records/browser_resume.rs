@@ -372,18 +372,18 @@ impl CallRecords {
         }
     }
 
-    pub(crate) fn browser_results_delivered(&self, principal: &str, keys: &[String]) {
-        let mut inner = self.lock();
-        for key in keys {
-            if let Some(entry) = inner
-                .entries
-                .get_mut(&(principal.into(), key.clone()))
-                .filter(|entry| entry.resumed_result)
-            {
-                entry.reply = None;
-                entry.cached_at = None;
-                inner.cached_bytes -= std::mem::take(&mut entry.reply_bytes);
-            }
+    /// Drop a resumed browser reply once its late result is acknowledged.
+    /// Until then a consumer that lost a late_results response can pull the
+    /// same observed result again, within the cache's memory bounds.
+    pub(super) fn release_resumed_reply(inner: &mut Inner, key: &Key) {
+        if let Some(entry) = inner
+            .entries
+            .get_mut(key)
+            .filter(|entry| entry.resumed_result)
+        {
+            entry.reply = None;
+            entry.cached_at = None;
+            inner.cached_bytes -= std::mem::take(&mut entry.reply_bytes);
         }
     }
 

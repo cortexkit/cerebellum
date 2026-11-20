@@ -403,7 +403,7 @@ async fn declared_terminal_refusals_never_hold() {
 }
 
 #[tokio::test]
-async fn approved_consent_resumes_basal_call_and_delivers_cached_result_once() {
+async fn approved_consent_resumes_basal_call_and_keeps_cached_result_until_acknowledged() {
     let consent = tests::ScriptedConsent::new();
     detach(&consent, "approved-site");
     let planes = attach_consent(
@@ -427,9 +427,27 @@ async fn approved_consent_resumes_basal_call_and_delivers_cached_result_once() {
     );
     assert_eq!(planes.calls.browser_request_count(), 0);
     let after_delivery = late(&planes, 9).await;
+    // A pull is not an acknowledgement: the consumer may have lost it.
     assert_eq!(
-        after_delivery["entries"][0]["result"]["structuredContent"]["outcome"],
-        "outcome_unknown"
+        after_delivery["entries"][0]["result"]["structuredContent"]["outcome"], "granted",
+        "{after_delivery}"
+    );
+    let acked = decode(
+        exchange(
+            &planes,
+            9,
+            51,
+            json!({"name":"late_results.ack","arguments":{"through":after_delivery["cursor"]}}),
+        )
+        .await,
+    );
+    assert_eq!(acked, json!({}), "{acked}");
+    assert!(
+        late(&planes, 9).await["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "an acknowledged result is not pulled again"
     );
     assert!(
         late(&planes, 8).await["entries"]

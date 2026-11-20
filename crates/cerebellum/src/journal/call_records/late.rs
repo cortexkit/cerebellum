@@ -904,6 +904,7 @@ impl CallRecords {
         let entry = inner.entries.get_mut(key).expect("acked record exists");
         entry.record = record;
         entry.late_seq = None;
+        Self::release_resumed_reply(inner, key);
         Ok(())
     }
 
