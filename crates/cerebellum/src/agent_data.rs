@@ -165,7 +165,7 @@ impl Participant {
                 if local.is_empty() {
                     answers.push(json!({"state":"at_cut"}));
                 } else {
-                    let (_, incoming) = self.download(&r.r#ref, id).await?;
+                    let (_, incoming) = self.download(op, &r.r#ref, id).await?;
                     answers.push(json!({"state":if local.is_subset(&incoming.sources) {"at_cut"} else {"advanced"}}));
                 }
             }
@@ -262,7 +262,7 @@ impl Participant {
                 let mut items = Vec::new();
                 let mut payloads = BTreeMap::new();
                 for r in refs.as_slice() {
-                    let (item, payload) = self.download(&r.r#ref, id).await?;
+                    let (item, payload) = self.download(op, &r.r#ref, id).await?;
                     payloads.insert(r.r#ref.clone(), payload);
                     if let Some(item) = item {
                         items.push(json!({"sessionRef":item.session_ref,"endOffset":item.end_offset,"digest":item.digest}));
