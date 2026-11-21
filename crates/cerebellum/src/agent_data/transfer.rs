@@ -29,8 +29,9 @@ fn cut_not_ready() -> ErrorBody {
 }
 
 fn read_refusal(op: Op, refusal: ErrorBody) -> ErrorBody {
-    // The agent-data contract lets diverged retry an unreadable cut, but it
-    // cannot return participant_failed or digest_mismatch.
+    // Only the import operation may abort a move over an unreadable cut. The
+    // agent-data contract allows the diverged check to answer cut_not_ready
+    // (retry) but not participant_failed or digest_mismatch.
     if op != Op::Import {
         return cut_not_ready();
     }
@@ -54,7 +55,10 @@ fn read_refusal(op: Op, refusal: ErrorBody) -> ErrorBody {
             ParticipantFailedDetail::new(format!("session_door:{code}")),
             "session door cannot serve the marks cut",
         ),
-        // Retry known temporary refusals, legacy not_found, and unknown codes.
+        // Everything else retries: the door's temporary refusals (unavailable,
+        // lease_unavailable, cut_import_pending), the not_found an older
+        // session door still returns for a missing cut, and codes newer than
+        // this list.
         _ => cut_not_ready(),
     }
 }
