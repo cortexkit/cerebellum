@@ -1,9 +1,13 @@
 //! Engram's authenticated cut metadata bounds and identifies the marks bytes.
 
 use super::*;
+use cortexkit_role_agent_data::errors::{DigestMismatchDetail, ParticipantFailedDetail};
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Serialize, Deserialize)]
+const READ_PAGE_BYTES: u64 = 32 * 1024;
+const MAX_MARKS_BYTES: u64 = 256 * 1024;
+
+#[derive(Clone, Serialize)]
 pub(super) struct Item {
     #[serde(rename = "sessionRef")]
     pub session_ref: String,
@@ -18,6 +22,50 @@ fn session_ref(agent: &str, cut: &str) -> String {
         format!("cerebellum-marks:{agent}:{cut}").as_bytes(),
     ))[..32]
         .into()
+}
+
+fn cut_not_ready() -> ErrorBody {
+    error(RefusalCode::CutNotReady, "marks cut bytes are not readable")
+}
+
+fn read_refusal(op: Op, refusal: ErrorBody) -> ErrorBody {
+    // The agent-data contract lets diverged retry an unreadable cut, but it
+    // cannot return participant_failed or digest_mismatch.
+    if op != Op::Import {
+        return cut_not_ready();
+    }
+    let code = refusal.code.as_str();
+    match code {
+        "verify_failed" => ErrorBody::with_digest_mismatch_detail(
+            DigestMismatchDetail::new("session_door:verify_failed"),
+            "session door could not verify the marks cut",
+        ),
+        "invalid_request"
+        | "caller_forbidden"
+        | "stream_label_too_long"
+        | "record_too_large"
+        | "response_too_large"
+        | "offset_out_of_range"
+        | "below_floor"
+        | "cut_not_published"
+        | "cut_takeover_closed"
+        | "cut_range_not_local"
+        | "cut_item_missing" => ErrorBody::with_participant_failed_detail(
+            ParticipantFailedDetail::new(format!("session_door:{code}")),
+            "session door cannot serve the marks cut",
+        ),
+        // Retry known temporary refusals, legacy not_found, and unknown codes.
+        _ => cut_not_ready(),
+    }
+}
+
+fn integrity_refusal(op: Op, message: impl Into<String>) -> ErrorBody {
+    let code = if op == Op::Import {
+        RefusalCode::DigestMismatch
+    } else {
+        RefusalCode::CutNotReady
+    };
+    error(code, message)
 }
 
 impl Participant {
@@ -64,70 +112,73 @@ impl Participant {
 
     pub(super) async fn download(
         &self,
+        op: Op,
         agent: &str,
         cut: &str,
     ) -> Result<(Option<Item>, Payload), ErrorBody> {
-        let door = self.door()?;
-        let metadata = door
-            .call("cut.read", json!({"cutId":cut}))
-            .await
-            .map_err(|_| error(RefusalCode::CutNotReady, "marks cut is not readable"))?;
-        #[derive(Deserialize)]
-        struct Cut {
-            items: Vec<Item>,
-        }
-        let metadata: Cut = serde_json::from_value(metadata).map_err(unavailable)?;
-        let mut matching = metadata
-            .items
-            .into_iter()
-            .filter(|i| i.session_ref == session_ref(agent, cut) && i.stream == STREAM);
-        // The source writes no record for an agent with nothing marked, so
-        // that a computer without cerebellum can still receive that agent.
-        // A sealed cut with no record therefore means an empty mark set.
-        let Some(item) = matching.next() else {
-            return Ok((
-                None,
-                Payload {
-                    v: 1,
-                    agent_id: agent.to_owned(),
-                    sources: Default::default(),
-                },
-            ));
+        let door = self.door().map_err(|_| cut_not_ready())?;
+        let session = session_ref(agent, cut);
+        let read_page = |offset, limit| {
+            door.call(
+                "session.read",
+                json!({"sessionRef":session,"fromOffset":offset,"limit":limit,"cutId":cut}),
+            )
         };
-        if matching.next().is_some() || item.end_offset > 256 * 1024 || item.end_offset == 0 {
-            return Err(error(
-                RefusalCode::DigestMismatch,
-                "invalid marks cut metadata",
-            ));
-        }
-        let mut bytes = Vec::new();
-        let mut offset = 0;
-        while offset < item.end_offset {
-            let limit = (item.end_offset - offset).min(32 * 1024);
-            let reply = door.call("session.read", json!({"sessionRef":item.session_ref,"fromOffset":offset,"limit":limit,"cutId":cut})).await.map_err(|_| error(RefusalCode::CutNotReady, "marks cut bytes are not readable"))?;
-            if reply["fromOffset"].as_u64() != Some(offset)
-                || reply["endOffset"].as_u64() != Some(offset + limit)
-                || reply["streamEnd"].as_u64() != Some(item.end_offset)
-                || reply["digest"].as_str() != Some(item.digest.as_str())
-            {
-                return Err(error(
-                    RefusalCode::DigestMismatch,
-                    "cut read metadata differs",
+        let mut reply = match read_page(0, READ_PAGE_BYTES).await {
+            Ok(reply) => reply,
+            // The source writes no item for an unmarked agent. Once the first
+            // page has identified an item, a later missing item is a refusal.
+            Err(e) if e.code.as_str() == "cut_item_missing" => {
+                return Ok((
+                    None,
+                    Payload {
+                        v: 1,
+                        agent_id: agent.to_owned(),
+                        sources: Default::default(),
+                    },
                 ));
+            }
+            Err(e) => return Err(read_refusal(op, e)),
+        };
+        let end_offset = reply["streamEnd"]
+            .as_u64()
+            .filter(|end| (1..=MAX_MARKS_BYTES).contains(end))
+            .ok_or_else(|| integrity_refusal(op, "invalid marks cut length"))?;
+        let digest = reply["digest"]
+            .as_str()
+            .ok_or_else(|| integrity_refusal(op, "marks cut has no digest"))?
+            .to_owned();
+        let mut bytes = Vec::with_capacity(end_offset as usize);
+        let mut offset = 0;
+        loop {
+            let page_len = (end_offset - offset).min(READ_PAGE_BYTES);
+            if reply["fromOffset"].as_u64() != Some(offset)
+                || reply["endOffset"].as_u64() != Some(offset + page_len)
+                || reply["streamEnd"].as_u64() != Some(end_offset)
+                || reply["digest"].as_str() != Some(digest.as_str())
+            {
+                return Err(integrity_refusal(op, "cut read metadata differs"));
             }
             let chunk = door::unhex(
                 reply["bytes"]
                     .as_str()
-                    .ok_or_else(|| error(RefusalCode::DigestMismatch, "cut read has no bytes"))?,
-            )?;
-            if chunk.len() as u64 != limit {
-                return Err(error(RefusalCode::DigestMismatch, "short marks read"));
+                    .ok_or_else(|| integrity_refusal(op, "cut read has no bytes"))?,
+            )
+            .map_err(|e| integrity_refusal(op, e.message))?;
+            if chunk.len() as u64 != page_len {
+                return Err(integrity_refusal(op, "marks read length differs"));
             }
             bytes.extend(chunk);
-            offset += limit;
+            offset += page_len;
+            if offset == end_offset {
+                break;
+            }
+            reply = read_page(offset, (end_offset - offset).min(READ_PAGE_BYTES))
+                .await
+                .map_err(|e| read_refusal(op, e))?;
         }
-        if door::hex(&Sha256::digest(&bytes)) != item.digest {
-            return Err(error(RefusalCode::DigestMismatch, "marks cut hash differs"));
+        if door::hex(&Sha256::digest(&bytes)) != digest {
+            return Err(integrity_refusal(op, "marks cut hash differs"));
         }
         let payload: Payload = serde_json::from_slice(&bytes).map_err(|_| {
             detailed(
@@ -144,11 +195,17 @@ impl Participant {
             ));
         }
         if payload.agent_id != agent {
-            return Err(error(
-                RefusalCode::DigestMismatch,
+            return Err(integrity_refusal(
+                op,
                 "marks payload belongs to another agent",
             ));
         }
+        let item = Item {
+            session_ref: session,
+            stream: STREAM.into(),
+            end_offset,
+            digest,
+        };
         Ok((Some(item), payload))
     }
 }

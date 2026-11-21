@@ -90,6 +90,7 @@ struct FakeDoor {
     streams: Mutex<BTreeMap<String, Vec<u8>>>,
     sealed: Mutex<BTreeMap<String, Value>>,
     calls: Mutex<Vec<(String, Value)>>,
+    cut_pages: Mutex<BTreeMap<usize, Result<Value, ErrorBody>>>,
     fail_cover: std::sync::atomic::AtomicBool,
 }
 
@@ -104,14 +105,11 @@ impl door::Door for FakeDoor {
                 .lock()
                 .unwrap()
                 .push((method.into(), params.clone()));
-            if method == "cut.read" {
-                return self
-                    .sealed
-                    .lock()
-                    .unwrap()
-                    .get(params["cutId"].as_str().unwrap())
-                    .cloned()
-                    .ok_or_else(|| unavailable("cut not sealed"));
+            if method.starts_with("cut.") {
+                return Err(error(
+                    RefusalCode::CallerForbidden,
+                    "only entorhinal may call cut.*",
+                ));
             }
             let session = params["sessionRef"].as_str().unwrap();
             let mut streams = self.streams.lock().unwrap();
@@ -141,15 +139,32 @@ impl door::Door for FakeDoor {
                 "session.read" => {
                     let offset = params["fromOffset"].as_u64().unwrap() as usize;
                     let limit = params["limit"].as_u64().unwrap() as usize;
-                    if let Some(cut) = params["cutId"].as_str() {
-                        assert!(
-                            self.sealed.lock().unwrap().contains_key(cut),
-                            "receiver must name the sealed cut"
-                        );
-                    }
-                    Ok(
-                        json!({"fromOffset":offset,"endOffset":offset+limit,"streamEnd":bytes.len(),"digest":door::hex(&Sha256::digest(&*bytes)),"bytes":door::hex(&bytes[offset..offset+limit])}),
-                    )
+                    let (stream_end, digest) = if let Some(cut) = params["cutId"].as_str() {
+                        if let Some(page) = self.cut_pages.lock().unwrap().get(&offset) {
+                            return page.clone();
+                        }
+                        let sealed = self.sealed.lock().unwrap();
+                        let items = sealed
+                            .get(cut)
+                            .ok_or_else(|| refusal("cut_not_published"))?;
+                        let item = items
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|item| item["sessionRef"] == session && item["stream"] == STREAM)
+                            .ok_or_else(|| refusal("cut_item_missing"))?;
+                        (
+                            item["endOffset"].as_u64().unwrap() as usize,
+                            item["digest"].clone(),
+                        )
+                    } else {
+                        (bytes.len(), json!(door::hex(&Sha256::digest(&*bytes))))
+                    };
+                    let end = (offset + limit).min(stream_end);
+                    Ok(json!({
+                        "fromOffset": offset, "endOffset": end, "streamEnd": stream_end,
+                        "digest": digest, "bytes": door::hex(&bytes[offset..end]),
+                    }))
                 }
                 _ => panic!("unexpected door operation {method}"),
             }
@@ -238,11 +253,336 @@ async fn call(planes: &Planes, method: &str, params: Value) -> Value {
 }
 
 fn seal(door: &FakeDoor, id: &str, prepared: &Value) {
-    let items: Vec<_>=prepared["items"].as_array().unwrap().iter().map(|i|json!({"sessionRef":i["sessionRef"],"stream":i["stream"],"endOffset":i["endOffset"],"digest":i["digest"]})).collect();
     door.sealed
         .lock()
         .unwrap()
-        .insert(id.into(), json!({"items":items}));
+        .insert(id.into(), prepared["items"].clone());
+}
+
+fn refusal(code: &str) -> ErrorBody {
+    serde_json::from_value(json!({"code":code,"message":"test door refusal"})).unwrap()
+}
+
+async fn op_refusal(planes: &Planes, op: Op) -> ErrorBody {
+    let (ty, body) = wire(
+        planes,
+        facts("entorhinal"),
+        json!({"method":op.method(),"params":params()}),
+    )
+    .await;
+    assert_eq!(ty, FrameType::Error, "{}: {body}", op.method());
+    let refusal: ErrorBody = serde_json::from_value(body).unwrap();
+    assert!(
+        cortexkit_role_agent_data::errors::allowed_refusals(op).contains(&refusal.code),
+        "{} cannot refuse with {}",
+        op.method(),
+        refusal.code,
+    );
+    refusal
+}
+
+mod session_door_refusals {
+    use super::*;
+    use RefusalCode::{CutNotReady, DigestMismatch, ParticipantFailed};
+
+    async fn check(op: Op, door_error: ErrorBody, expected: Option<RefusalCode>) {
+        let door = Arc::new(FakeDoor::default());
+        let receiver = planes(&door);
+        let code = door_error.code.clone();
+        door.cut_pages.lock().unwrap().insert(0, Err(door_error));
+        if op == Op::Diverged {
+            assert!(
+                receiver
+                    .private_content
+                    .import_agent(AGENT, &BTreeSet::from([Source::DesktopApp]))
+                    .await
+            );
+        }
+
+        if let Some(expected) = expected {
+            let refusal = op_refusal(&receiver, op).await;
+            assert_eq!(refusal.code, expected, "door refused with {code}");
+            if matches!(expected, ParticipantFailed | DigestMismatch) {
+                assert_eq!(
+                    refusal.detail.unwrap()["reason"],
+                    format!("session_door:{code}"),
+                );
+            }
+        } else {
+            let reply = call(&receiver, op.method(), params()).await;
+            let expected_reply = if op == Op::Import {
+                json!({"items":[]})
+            } else {
+                json!({"refs":[{"state":"advanced"}]})
+            };
+            assert_eq!(reply, expected_reply);
+        }
+        let calls = door.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{}: {code}", op.method());
+        assert_eq!(calls[0].0, "session.read", "{}: {code}", op.method());
+        assert_eq!(calls[0].1["cutId"], CUT);
+        assert_eq!(calls[0].1["fromOffset"], 0);
+    }
+
+    macro_rules! case {
+        ($code:ident, $import:expr, $diverged:expr) => {
+            mod $code {
+                use super::*;
+
+                #[tokio::test]
+                async fn import() {
+                    check(Op::Import, refusal(stringify!($code)), $import).await;
+                }
+
+                #[tokio::test]
+                async fn diverged() {
+                    check(Op::Diverged, refusal(stringify!($code)), $diverged).await;
+                }
+            }
+        };
+        ($code:ident, $import:ident) => {
+            case!($code, Some($import), Some(CutNotReady));
+        };
+    }
+
+    case!(invalid_request, ParticipantFailed);
+    case!(caller_forbidden, ParticipantFailed);
+    case!(stream_label_too_long, ParticipantFailed);
+    case!(record_too_large, ParticipantFailed);
+    case!(response_too_large, ParticipantFailed);
+    case!(offset_out_of_range, ParticipantFailed);
+    case!(below_floor, ParticipantFailed);
+    case!(cut_not_published, ParticipantFailed);
+    case!(cut_takeover_closed, ParticipantFailed);
+    case!(cut_range_not_local, ParticipantFailed);
+    case!(verify_failed, DigestMismatch);
+    case!(cut_item_missing, None, None);
+    case!(unavailable, CutNotReady);
+    case!(lease_unavailable, CutNotReady);
+    case!(cut_import_pending, CutNotReady);
+    case!(not_found, CutNotReady);
+    case!(unexpected_door_code, CutNotReady);
+
+    #[tokio::test]
+    async fn import_transport_failure() {
+        check(
+            Op::Import,
+            unavailable("door connection closed"),
+            Some(CutNotReady),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn diverged_transport_failure() {
+        check(
+            Op::Diverged,
+            unavailable("door connection closed"),
+            Some(CutNotReady),
+        )
+        .await;
+    }
+}
+
+async fn prepare_paged_cut(door: &Arc<FakeDoor>) -> (String, usize, String) {
+    let source = planes(door);
+    assert!(
+        source
+            .private_content
+            .import_agent(AGENT, &BTreeSet::from([Source::DesktopApp]))
+            .await
+    );
+    let mut prepared = call(&source, Op::Prepare.method(), params()).await;
+    let session = prepared["items"][0]["sessionRef"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let stream_end = 32 * 1024 + 17;
+    let digest = {
+        let mut streams = door.streams.lock().unwrap();
+        let bytes = streams.get_mut(&session).unwrap();
+        // Trailing JSON whitespace forces a second page without changing the marks.
+        bytes.resize(stream_end, b' ');
+        door::hex(&Sha256::digest(bytes))
+    };
+    prepared["items"][0]["endOffset"] = json!(stream_end);
+    prepared["items"][0]["digest"] = json!(digest);
+    seal(door, CUT, &prepared);
+    door.calls.lock().unwrap().clear();
+    (session, stream_end, digest)
+}
+
+#[tokio::test]
+async fn receivers_read_multipage_cut_only_through_session_door() {
+    let door = Arc::new(FakeDoor::default());
+    let (session, stream_end, digest) = prepare_paged_cut(&door).await;
+    let receiver = planes(&door);
+    assert!(
+        receiver
+            .private_content
+            .import_agent(AGENT, &BTreeSet::from([Source::DesktopApp]))
+            .await
+    );
+    let (ty, reply) = wire(
+        &receiver,
+        facts("entorhinal"),
+        json!({"method":Op::Diverged.method(),"params":params()}),
+    )
+    .await;
+    let calls = vec![
+        (
+            "session.read".into(),
+            json!({"sessionRef":session,"fromOffset":0,"limit":32768,"cutId":CUT}),
+        ),
+        (
+            "session.read".into(),
+            json!({"sessionRef":session,"fromOffset":32768,"limit":17,"cutId":CUT}),
+        ),
+    ];
+    assert_eq!(
+        *door.calls.lock().unwrap(),
+        calls,
+        "unexpected divergence calls"
+    );
+    assert_eq!(ty, FrameType::Response, "{reply}");
+    assert_eq!(reply["result"], json!({"refs":[{"state":"at_cut"}]}));
+
+    door.calls.lock().unwrap().clear();
+    assert_eq!(
+        call(&receiver, Op::Import.method(), params()).await,
+        json!({"items":[{"sessionRef":session,"endOffset":stream_end,"digest":digest}]}),
+    );
+    assert_eq!(
+        *door.calls.lock().unwrap(),
+        calls,
+        "unexpected import calls"
+    );
+}
+
+#[tokio::test]
+async fn late_missing_cut_item_is_not_an_empty_mark_set() {
+    let door = Arc::new(FakeDoor::default());
+    prepare_paged_cut(&door).await;
+    door.cut_pages
+        .lock()
+        .unwrap()
+        .insert(32 * 1024, Err(refusal("cut_item_missing")));
+    let receiver = planes(&door);
+    let refusal = op_refusal(&receiver, Op::Import).await;
+    assert_eq!(refusal.code, RefusalCode::ParticipantFailed);
+    assert_eq!(
+        refusal.detail.unwrap()["reason"],
+        "session_door:cut_item_missing"
+    );
+    assert!(receiver.private_content.export_agent(AGENT).is_empty());
+
+    assert!(
+        receiver
+            .private_content
+            .import_agent(AGENT, &BTreeSet::from([Source::DesktopApp]))
+            .await
+    );
+    assert_eq!(
+        op_refusal(&receiver, Op::Diverged).await.code,
+        RefusalCode::CutNotReady
+    );
+    let calls = door.calls.lock().unwrap();
+    assert_eq!(calls.len(), 4);
+    assert_eq!(calls[1].1["fromOffset"], 32768);
+    assert_eq!(calls[3].1["fromOffset"], 32768);
+}
+
+#[tokio::test]
+async fn receivers_refuse_invalid_cut_pages_without_accepting_marks() {
+    let door = Arc::new(FakeDoor::default());
+    let (session, stream_end, digest) = prepare_paged_cut(&door).await;
+    let receiver = planes(&door);
+    assert!(
+        receiver
+            .private_content
+            .import_agent(AGENT, &BTreeSet::from([Source::PersonBrowser]))
+            .await
+    );
+    let first_page_bytes = door::hex(&door.streams.lock().unwrap()[&session][..32768]);
+    for invalid_page in [
+        json!({"fromOffset":0,"endOffset":0,"streamEnd":0,
+            "digest":door::hex(&Sha256::digest([])),"bytes":""}),
+        json!({"fromOffset":0,"endOffset":32768,"streamEnd":256 * 1024 + 1,
+            "digest":digest,"bytes":first_page_bytes}),
+    ] {
+        door.calls.lock().unwrap().clear();
+        door.cut_pages.lock().unwrap().insert(0, Ok(invalid_page));
+        assert_eq!(
+            op_refusal(&receiver, Op::Import).await.code,
+            RefusalCode::DigestMismatch
+        );
+        assert_eq!(
+            op_refusal(&receiver, Op::Diverged).await.code,
+            RefusalCode::CutNotReady
+        );
+        let calls = door.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|(_, params)| params["fromOffset"] == 0));
+    }
+    let good_page = json!({
+        "fromOffset":32768,"endOffset":stream_end,"streamEnd":stream_end,
+        "digest":digest,"bytes":"20".repeat(17),
+    });
+    for (field, wrong) in [
+        ("fromOffset", json!(32769)),
+        ("endOffset", json!(stream_end - 1)),
+        ("streamEnd", json!(stream_end + 1)),
+        ("digest", json!("different")),
+        ("bytes", json!("00".repeat(17))),
+    ] {
+        let mut page = good_page.clone();
+        page[field] = wrong;
+        {
+            let mut pages = door.cut_pages.lock().unwrap();
+            pages.clear();
+            pages.insert(32 * 1024, Ok(page));
+        }
+        assert_eq!(
+            op_refusal(&receiver, Op::Import).await.code,
+            RefusalCode::DigestMismatch,
+            "{field}"
+        );
+        assert_eq!(
+            op_refusal(&receiver, Op::Diverged).await.code,
+            RefusalCode::CutNotReady,
+            "{field}"
+        );
+    }
+    assert_eq!(
+        receiver.private_content.export_agent(AGENT),
+        BTreeSet::from([Source::PersonBrowser])
+    );
+}
+
+#[tokio::test]
+async fn receivers_refuse_unreadable_marks_with_incompatible_version() {
+    let door = Arc::new(FakeDoor::default());
+    let receiver = planes(&door);
+    assert!(
+        receiver
+            .private_content
+            .import_agent(AGENT, &BTreeSet::from([Source::DesktopApp]))
+            .await
+    );
+    let bytes = b"not json";
+    door.cut_pages.lock().unwrap().insert(
+        0,
+        Ok(json!({
+            "fromOffset":0,"endOffset":bytes.len(),"streamEnd":bytes.len(),
+            "digest":door::hex(&Sha256::digest(bytes)),"bytes":door::hex(bytes),
+        })),
+    );
+    for op in [Op::Import, Op::Diverged] {
+        assert_eq!(
+            op_refusal(&receiver, op).await.code,
+            RefusalCode::IncompatibleVersion
+        );
+    }
 }
 
 #[tokio::test]
