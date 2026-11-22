@@ -50,6 +50,16 @@
 //!    (`agent_cursor: false`). The module's idle CPU time in phase 2 must be
 //!    no more than 10% above the baseline's.
 //!
+//! The `--covered-picture` arm instead calls the fronted picture read until
+//! three calls confirm fronting and reach the callback's first visibility
+//! check, or twelve calls have run. If the initial idle check cannot establish
+//! that the person has been idle for one second, the probe waits 2 s. Other
+//! calls wait 5.1 s so cleanup can catch a switch to TextEdit that lands late.
+//! A front used only to measure restoration, or a callback that never checks
+//! window visibility, does not count toward the three. The attempt log records
+//! timing stamps and whether an image was returned. The summary counts each
+//! kind even if a safety check ends the run early.
+//!
 //! On normal return, a failed check, a panic, and Ctrl-C, the probe kills the
 //! scratch TextEdit only while it is the unique new pid, its start time is
 //! unchanged, and its main window's AXDocument identifies the private scratch
@@ -2532,35 +2542,48 @@ mod desk {
             begin_picture_bracket_probe, take_fronting_timings, take_picture_bracket_probe,
         };
         use cerebellum_macos::{begin_picture_timing_for_probe, take_picture_timing_for_probe};
+        use covered_picture_probe::{attempt_kind, idle_gate_refused, AttemptTally};
 
-        for attempt in 1..=4 {
+        let mut attempts = AttemptTally::default();
+        let status = loop {
+            let Some(attempt) = attempts.next_attempt() else {
+                break 0;
+            };
             if scratch_ownership(&scratch.identity).is_err()
                 || cerebellum_macos::frontmost_process_id() != Some(person)
             {
                 eprintln!("UNMEASURABLE: ownership or foreground application changed");
-                return 2;
+                break 2;
             }
             let Some(window) = cerebellum_macos::frontmost_window_id(scratch.pid()) else {
                 eprintln!("UNMEASURABLE: no scratch window on screen");
-                return 2;
+                break 2;
             };
             if cerebellum_macos::window_visibility(scratch.pid(), window)
                 != cerebellum_macos::WindowVisibility::Covered
             {
                 eprintln!("UNMEASURABLE: scratch window is no longer covered");
-                return 2;
+                break 2;
             }
             let _ = take_fronting_timings();
             begin_picture_timing_for_probe(window);
             begin_picture_bracket_probe();
             let reply = serve().await;
             let bracket = take_picture_bracket_probe().unwrap_or_default();
-            tokio::time::sleep(FRONT_CLEANUP_SPACING).await;
+            let spacing = if idle_gate_refused(&bracket) {
+                Duration::from_secs(2)
+            } else {
+                FRONT_CLEANUP_SPACING
+            };
+            tokio::time::sleep(spacing).await;
             let stamps = take_picture_timing_for_probe();
             let timings = take_fronting_timings();
             let timing = timings
                 .iter()
                 .find(|timing| timing.target_pid == scratch.pid());
+            let front_confirmed_ms = timing.and_then(|t| t.confirmed_front_ms);
+            let kind = attempt_kind(&bracket, front_confirmed_ms.is_some());
+            attempts.record(kind);
             let start = timing.and_then(|timing| timing.front_requested_at);
             let offset = |at: Instant| {
                 start.map(|start| {
@@ -2571,17 +2594,24 @@ mod desk {
                     }
                 })
             };
+            let phase_offset = |name| {
+                stamps
+                    .iter()
+                    .find(|(phase, _)| *phase == name)
+                    .and_then(|(_, at)| offset(*at))
+            };
             let restore_request = timing.and_then(|timing| timing.first_restore_request());
             println!(
                 "{}",
                 json!({
                     "picture_attempt": attempt,
+                    "kind": kind.as_str(),
                     "bound_ms": cerebellum::budgets::FRONTING_BRACKET_MS,
                     "outcome": reply["outcome"],
                     "image_returned": reply.get("image").is_some(),
                     "image_unavailable": reply["image_unavailable"]["reason"],
                     "image_fronting": reply["image_fronting"],
-                "fronting_not_fronted_reason": reply["fronting"]["not_fronted_reason"],
+                    "fronting_not_fronted_reason": reply["fronting"]["not_fronted_reason"],
                     "bracket_stop": bracket.bracket.as_ref().and_then(|b| b.stop.as_ref().map(|s| format!("{s:?}"))),
                     "waiting_out_slow_restore": bracket.bracket.as_ref().map(|b| b.waiting_out_slow_restore),
                     "restore_calibrated": bracket.bracket.as_ref().map(|b| b.restore_calibrated),
@@ -2589,7 +2619,9 @@ mod desk {
                     "slowest_restore_ms": bracket.bracket.as_ref().map(|b| b.slowest_restore_ms),
                     "before_capture": bracket.before_capture,
                     "after_capture": bracket.after_capture,
-                    "front_confirmed_ms": timing.and_then(|t| t.confirmed_front_ms),
+                    "sck_capture_started_ms": phase_offset("picture_sck_capture_started"),
+                    "sck_capture_returned_ms": phase_offset("picture_sck_capture_returned"),
+                    "front_confirmed_ms": front_confirmed_ms,
                     "front_late_landing_ms": timing.and_then(|t| t.late_landing_ms),
                     "restore_requested_ms": restore_request.map(|(ms, _, _)| ms),
                     "restore_route": restore_request.map(|(_, route, _)| route),
@@ -2605,10 +2637,11 @@ mod desk {
             {
                 // No second attempt while a preceding call may still be
                 // cleaning up, or if the person's app was not put back.
-                break;
+                break 0;
             }
-        }
-        0
+        };
+        println!("{}", attempts.summary());
+        status
     }
 
     /// Every phase against the scratch app. Returns the process exit code.
