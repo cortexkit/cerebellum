@@ -22,7 +22,7 @@ pub(super) const SCREEN_LOCKED: &str = "mouse-down recipient helper screen locke
 pub(super) enum ExitReason {
     SenderDisconnect,
     PipeWriteFailure,
-    PipeWouldBlock,
+    PipeStalled,
     ChildExited,
     ChildUnverified,
     ReplyMalformed,
@@ -32,7 +32,7 @@ pub(super) enum ExitReason {
 const EXIT_REASONS: &[&str] = &[
     "sender_disconnect",
     "pipe_write_failure",
-    "pipe_would_block",
+    "pipe_stalled",
     "child_exited",
     "child_unverified",
     "reply_malformed",
@@ -112,10 +112,13 @@ impl HelperGauges {
             && cerebellum_macos::process_start_time_micros(pid)
                 == Some(self.start_micros.load(Ordering::Relaxed)))
         .then_some(pid);
+        let mut exits = counts(EXIT_REASONS, &self.exits);
+        // Kept for health consumers that still read the previous key.
+        exits.insert("pipe_would_block".into(), 0.into());
         serde_json::json!({
             "cursorHelperStartOutcomes": counts(START_REASONS, &self.start),
             "cursorHelperLastStartFailure": (failure != STARTED).then(|| START_REASONS[failure]),
-            "cursorHelperExitReasons": counts(EXIT_REASONS, &self.exits),
+            "cursorHelperExitReasons": exits,
             "cursorHelperLastWaitStatus": (status >= 0).then_some(status),
             "cursorHelperReplyReaderDisconnects": self.reply_disconnects.load(Ordering::Relaxed),
             "cursorHelperPid": pid,

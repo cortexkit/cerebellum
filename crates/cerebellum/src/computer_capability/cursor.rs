@@ -2351,6 +2351,7 @@ fn write_lines(
     state: &State,
     rx: &mut mpsc::Receiver<CursorLine>,
     mut deliver: impl FnMut(&CursorLine) -> Result<(), NoFrameReason>,
+    #[cfg(test)] mut before_frame_selection: impl FnMut(),
 ) {
     let mut waiting: VecDeque<CursorLine> = VecDeque::new();
     // A frame on the channel is only a wake for one in the record.
@@ -2363,21 +2364,28 @@ fn write_lines(
         if state.stopped.load(std::sync::atomic::Ordering::Acquire) {
             break;
         }
-        // Taken from the channel only once the last batch is written, so
-        // what waits here stays within the channel's own bound.
-        if waiting.is_empty() {
-            while let Ok(line) = rx.try_recv() {
-                keep(&mut waiting, line);
-            }
-        }
-        let next = waiting.pop_front().or_else(|| {
-            state
+        let next = if waiting.is_empty() {
+            #[cfg(test)]
+            before_frame_selection();
+            // Producers add a frame to `state.frames` after queuing its
+            // preview line. Lock the frame queue before checking the channel
+            // so a newly queued frame cannot overtake its preview.
+            let mut frames = state
                 .frames
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Concurrent senders can refill the channel as we drain it.
+            // Take at most one channel's worth in a batch.
+            for _ in 0..CAPACITY {
+                let Ok(line) = rx.try_recv() else { break };
+                keep(&mut waiting, line);
+            }
+            waiting
                 .pop_front()
-                .map(CursorLine::Frame)
-        });
+                .or_else(|| frames.pop_front().map(CursorLine::Frame))
+        } else {
+            waiting.pop_front()
+        };
         let Some(line) = next else {
             match rx.blocking_recv() {
                 Some(line) => {
@@ -2480,7 +2488,7 @@ impl State {
 #[cfg(target_os = "macos")]
 fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
     let helper = helper_transport::shared();
-    write_lines(&state, &mut rx, |event| {
+    let deliver = |event: &CursorLine| {
         let written = helper.write(&state, event);
         *state
             .generation
@@ -2491,7 +2499,14 @@ fn transport(state: Arc<State>, mut rx: mpsc::Receiver<CursorLine>) {
             std::sync::atomic::Ordering::Release,
         );
         written.written.then_some(()).ok_or(written.failure)
-    });
+    };
+    write_lines(
+        &state,
+        &mut rx,
+        deliver,
+        #[cfg(test)]
+        || {},
+    );
 }
 
 impl Coordinator {
@@ -2514,9 +2529,12 @@ impl Coordinator {
         let runtime = tokio::runtime::Handle::current();
         std::thread::spawn(move || {
             let _entered = runtime.enter();
-            write_lines(&state, &mut rx, |line| {
-                deliver(line).then_some(()).ok_or(NoFrameReason::PipeWrite)
-            });
+            write_lines(
+                &state,
+                &mut rx,
+                |line| deliver(line).then_some(()).ok_or(NoFrameReason::PipeWrite),
+                || {},
+            );
         });
         result
     }
@@ -4203,6 +4221,55 @@ mod tests {
                 "frame:agent-a:2",
                 "frame:agent-b:1"
             ]
+        );
+    }
+
+    #[test]
+    fn a_preview_and_frame_arriving_during_selection_are_written_in_order() {
+        let cursor = Coordinator::default();
+        let (tx, mut rx) = mpsc::channel(CAPACITY);
+        assert!(cursor.0.sender.set(tx).is_ok());
+        cursor
+            .0
+            .writes_confirmed
+            .store(true, std::sync::atomic::Ordering::Release);
+        static GAUGES: PreviewGauges = PreviewGauges::new();
+        let cursor = cursor.counting_frames_in(&GAUGES);
+        let mut enqueue = Some(|| {
+            assert!(cursor.send_preview(CursorPreview {
+                preview_agent: "agent-a".into(),
+                preview_generation: 1,
+                preview_slot: 0,
+                preview_window: 77,
+                preview_app: "Mail".into(),
+                preview_aspect: [1200.0, 800.0],
+                preview_label: None,
+                preview_fallback: None,
+                preview_icon_path: None,
+            }));
+            assert!(cursor.send_frame(frame("agent-a", 1, 100)));
+        });
+        let mut written = Vec::new();
+        write_lines(
+            &cursor.0,
+            &mut rx,
+            |line| {
+                written.push(matches!(line, CursorLine::Preview(_)));
+                if written.len() == 2 {
+                    cursor.shutdown();
+                }
+                Ok(())
+            },
+            || {
+                if let Some(enqueue) = enqueue.take() {
+                    enqueue();
+                }
+            },
+        );
+        assert_eq!(
+            written,
+            [true, false],
+            "the preview must open before its frame"
         );
     }
 

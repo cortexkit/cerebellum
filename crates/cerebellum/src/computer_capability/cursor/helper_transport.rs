@@ -320,9 +320,9 @@ impl<L: Launcher> Worker<L> {
                 generation: Some(helper.generation()),
                 failure: NoFrameReason::Transport,
             },
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                self.drop_helper(ExitReason::PipeWouldBlock);
-                Written::refused(NoFrameReason::PipeWouldBlock)
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                self.drop_helper(ExitReason::PipeStalled);
+                Written::refused(NoFrameReason::PipeStalled)
             }
             Err(_) => {
                 self.drop_helper(ExitReason::PipeWriteFailure);
@@ -446,11 +446,11 @@ impl Helper for NativeHelper {
             .wait_ready(deadline.saturating_duration_since(Instant::now()))
     }
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        use std::io::Write;
-        self.pipe
+        let mut pipe = self
+            .pipe
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .write_all(bytes)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        write_visual_line(pipe.as_mut(), bytes)
     }
     fn query(&mut self, point: [f64; 2], deadline: Instant) -> Result<Option<u32>, &'static str> {
         if Instant::now() >= deadline {
@@ -463,6 +463,46 @@ impl Helper for NativeHelper {
                 .min(pointer_query::QUERY_TIMEOUT),
         )
     }
+}
+
+fn write_visual_line(writer: &mut dyn std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+    write_visual_until(
+        writer,
+        bytes,
+        Instant::now() + pointer_query::PREPARE_TIMEOUT,
+    )
+}
+
+fn write_visual_until(
+    writer: &mut dyn std::io::Write,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+
+    // The transport worker keeps the pipe for the whole line. A frame can
+    // exceed the pipe buffer even when the helper is healthy; resume from
+    // the exact offset so no query or other line can split its JSON.
+    while !bytes.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(ErrorKind::TimedOut.into());
+        }
+        match writer.write(bytes) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                // Only the transport thread waits for pipe space. Actions
+                // keep their separate limits for badge arrival and queries.
+                std::thread::sleep(
+                    Duration::from_millis(1)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 impl Launcher for NativeLauncher {
@@ -542,8 +582,59 @@ impl Launcher for NativeLauncher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::computer_capability::preview::{
+        CaptureJob, PreviewCapturer, PreviewJpeg, PreviewWorker,
+    };
+    use crate::test_support::HANG_GUARD;
     use std::sync::Mutex;
     static TEST_GAUGES: HelperGauges = HelperGauges::new();
+
+    const PIPE_CAPACITY: usize = 4096;
+
+    struct ShortPipe {
+        free: usize,
+        drains: bool,
+        received: Vec<u8>,
+        on_first_block: Option<Box<dyn FnOnce() + Send>>,
+    }
+
+    impl std::io::Write for ShortPipe {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.free == 0 {
+                if let Some(on_first_block) = self.on_first_block.take() {
+                    on_first_block();
+                }
+                // The reader makes room between this attempt and the next.
+                if self.drains {
+                    self.free = PIPE_CAPACITY;
+                }
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let n = self.free.min(bytes.len());
+            self.received.extend_from_slice(&bytes[..n]);
+            self.free -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn large_jpeg() -> Vec<u8> {
+        (0..PIPE_CAPACITY * 4).map(|i| i as u8).collect()
+    }
+
+    struct LargeCapture;
+
+    impl PreviewCapturer for LargeCapture {
+        fn capture(&self, _: &CaptureJob) -> Result<PreviewJpeg, NoFrameReason> {
+            Ok(PreviewJpeg {
+                size: [280, 187],
+                jpeg: large_jpeg(),
+            })
+        }
+    }
 
     struct Stats {
         launches: usize,
@@ -556,6 +647,7 @@ mod tests {
         first_wait: Option<pipe::Sender<()>>,
         exited: Option<ExitNotice>,
         write_error: Option<std::io::ErrorKind>,
+        short_pipe: Option<ShortPipe>,
         screen_locked: Option<bool>,
         launch_fails: bool,
     }
@@ -588,13 +680,24 @@ mod tests {
             self.0.lock().unwrap().preparations += 1;
             Ok(())
         }
-        fn write(&mut self, _: &[u8]) -> std::io::Result<()> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
             let mut stats = self.0.lock().unwrap();
             stats.writes += 1;
+            if let Some(pipe) = stats.short_pipe.as_mut() {
+                return write_visual_line(pipe, bytes);
+            }
             stats.write_error.map_or(Ok(()), |kind| Err(kind.into()))
         }
         fn query(&mut self, _: [f64; 2], _: Instant) -> Result<Option<u32>, &'static str> {
-            self.0.lock().unwrap().queries += 1;
+            let mut stats = self.0.lock().unwrap();
+            stats.queries += 1;
+            if stats
+                .short_pipe
+                .as_ref()
+                .is_some_and(|pipe| !pipe.received.ends_with(b"\n"))
+            {
+                return Err("query interleaved with a visual line");
+            }
             Ok(Some(77))
         }
     }
@@ -636,6 +739,7 @@ mod tests {
             first_wait: None,
             exited: None,
             write_error: None,
+            short_pipe: None,
             screen_locked: screen,
             launch_fails: fail,
         }));
@@ -651,6 +755,133 @@ mod tests {
     }
     fn deadline() -> Instant {
         Instant::now() + Duration::from_millis(50)
+    }
+
+    #[test]
+    fn one_cold_preview_writes_a_frame_larger_than_the_pipe() {
+        static HELPER: HelperGauges = HelperGauges::new();
+        static PREVIEW: PreviewGauges = PreviewGauges::new();
+        let (service, stats) = fixture_counting(Some(false), false, &HELPER);
+        let (reply, answer) = pipe::sync_channel(1);
+        let tx = service.tx.clone();
+        stats.lock().unwrap().short_pipe = Some(ShortPipe {
+            free: PIPE_CAPACITY,
+            drains: true,
+            received: Vec::new(),
+            on_first_block: Some(Box::new(move || {
+                assert!(tx
+                    .try_send(Command::Query {
+                        point: [10.0, 20.0],
+                        deadline: Instant::now() + HANG_GUARD,
+                        reply,
+                    })
+                    .is_ok());
+            })),
+        });
+
+        let cursor = Coordinator::default().counting_frames_in(&PREVIEW);
+        let (sender, mut receiver) = mpsc::channel(CAPACITY);
+        assert!(cursor.0.sender.set(sender).is_ok());
+        cursor.0.writes_confirmed.store(true, Ordering::Release);
+        let worker = PreviewWorker::spawn_counting(
+            Arc::new(cursor.clone()),
+            Arc::new(LargeCapture),
+            true,
+            &PREVIEW,
+        );
+        worker.show(PreviewRequest {
+            agent: "agent-a".into(),
+            target: ProcessGrant {
+                bundle_identity: "test.app".into(),
+                pid: 7,
+                process_generation_evidence: "generation".into(),
+            },
+            window: PreviewWindow::new(77, [0.0, 0.0, 560.0, 374.0]).unwrap(),
+            app: "Test app".into(),
+            icon_path: None,
+            label: None,
+            backing_scale: 2.0,
+        });
+        let give_up = Instant::now() + HANG_GUARD;
+        while cursor.frames().is_empty() {
+            assert!(Instant::now() < give_up, "the capture never queued a frame");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        write_lines(
+            &cursor.0,
+            &mut receiver,
+            |line| {
+                let written = service.write(&cursor.0, line);
+                if matches!(line, CursorLine::Frame(_)) {
+                    cursor.shutdown();
+                }
+                written.written.then_some(()).ok_or(written.failure)
+            },
+            || {},
+        );
+        let report = PREVIEW.report();
+        assert_eq!(PREVIEW.capture_requests(), 1);
+        assert_eq!(PREVIEW.frames_written(), 1, "{report}");
+        assert_eq!(report["previewNoFrameReasons"]["helper_unavailable"], 0);
+        assert_eq!(report["previewNoFrameReasons"]["pipe_would_block"], 0);
+        assert_eq!(answer.recv_timeout(HANG_GUARD).unwrap(), Ok(Some(77)));
+
+        let stats = stats.lock().unwrap();
+        assert_eq!((stats.launches, stats.writes, stats.queries), (1, 2, 1));
+        let received = &stats.short_pipe.as_ref().unwrap().received;
+        let mut lines = received.split_inclusive(|byte| *byte == b'\n');
+        let preview: CursorLine = serde_json::from_slice(lines.next().unwrap()).unwrap();
+        let frame: CursorLine = serde_json::from_slice(lines.next().unwrap()).unwrap();
+        let mut gate = cerebellum_computer::cursor::PreviewGate::default();
+        assert!(matches!(preview, CursorLine::Preview(_)));
+        assert!(gate.admit(&preview, Instant::now()));
+        assert!(gate.admit(&frame, Instant::now()));
+        assert_eq!(
+            frame,
+            CursorLine::Frame(CursorFrame::new(
+                "agent-a",
+                1,
+                77,
+                [280, 187],
+                &large_jpeg()
+            ))
+        );
+        assert!(lines.next().is_none());
+    }
+
+    #[test]
+    fn a_pipe_that_never_drains_is_reported_as_stalled() {
+        static GAUGES: HelperGauges = HelperGauges::new();
+        let (service, stats) = fixture_counting(Some(false), false, &GAUGES);
+        assert_eq!(service.prewarm(Instant::now() + HANG_GUARD), Ok(()));
+        stats.lock().unwrap().short_pipe = Some(ShortPipe {
+            free: PIPE_CAPACITY,
+            drains: false,
+            received: Vec::new(),
+            on_first_block: None,
+        });
+        let line = CursorLine::Frame(CursorFrame::new(
+            "agent-a",
+            1,
+            77,
+            [280, 187],
+            &large_jpeg(),
+        ));
+        let owner = Arc::new(State::default());
+        let start = Instant::now();
+        let written = service.write(&owner, &line);
+        assert!(start.elapsed() >= pointer_query::PREPARE_TIMEOUT);
+        assert!(!written.written);
+        assert_eq!(written.failure, NoFrameReason::PipeStalled);
+        let report = GAUGES.report();
+        assert_eq!(report["cursorHelperExitReasons"]["pipe_stalled"], 1);
+        assert_eq!(report["cursorHelperExitReasons"]["pipe_would_block"], 0);
+        assert_eq!(
+            service.prewarm(Instant::now() + HANG_GUARD),
+            Err("mouse-down recipient helper restart limit reached")
+        );
+        assert_eq!(stats.lock().unwrap().launches, 1);
     }
 
     #[test]
