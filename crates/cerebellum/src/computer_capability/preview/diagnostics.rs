@@ -27,7 +27,9 @@ pub(crate) enum NoFrameReason {
     ScreenLockedOrUnreadable,
     HelperUnavailable,
     PipeWrite,
+    // Kept in the health report; transient backpressure no longer drops frames.
     PipeWouldBlock,
+    PipeStalled,
 }
 
 const REASONS: &[(NoFrameReason, &str)] = {
@@ -57,6 +59,7 @@ const REASONS: &[(NoFrameReason, &str)] = {
         (HelperUnavailable, "helper_unavailable"),
         (PipeWrite, "pipe_write"),
         (PipeWouldBlock, "pipe_would_block"),
+        (PipeStalled, "pipe_stalled"),
     ]
 };
 
