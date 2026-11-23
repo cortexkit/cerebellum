@@ -2542,7 +2542,9 @@ mod desk {
             begin_picture_bracket_probe, take_fronting_timings, take_picture_bracket_probe,
         };
         use cerebellum_macos::{begin_picture_timing_for_probe, take_picture_timing_for_probe};
-        use covered_picture_probe::{attempt_kind, idle_gate_refused, AttemptTally};
+        use covered_picture_probe::{
+            attempt_kind, idle_gate_refused, overlap_sample_json, sample_overlap, AttemptTally,
+        };
 
         let mut attempts = AttemptTally::default();
         let status = loop {
@@ -2567,7 +2569,11 @@ mod desk {
             }
             let _ = take_fronting_timings();
             begin_picture_timing_for_probe(window);
-            begin_picture_bracket_probe();
+            let pid = scratch.pid();
+            let generation = scratch.identity.process.start_time;
+            begin_picture_bracket_probe(Box::new(move |from, cutoff, fence, send| {
+                sample_overlap(pid, generation, window, from, cutoff, fence, send);
+            }));
             let reply = serve().await;
             let bracket = take_picture_bracket_probe().unwrap_or_default();
             let spacing = if idle_gate_refused(&bracket) {
@@ -2619,6 +2625,10 @@ mod desk {
                     "slowest_restore_ms": bracket.bracket.as_ref().map(|b| b.slowest_restore_ms),
                     "before_capture": bracket.before_capture,
                     "after_capture": bracket.after_capture,
+                    "scratch_window_number": window,
+                    "before_capture_overlap": bracket.overlap_initial.as_ref().map(|sample| overlap_sample_json(sample, offset)),
+                    "overlap_samples": bracket.overlap_samples.iter().map(|sample| overlap_sample_json(sample, offset)).collect::<Vec<_>>(),
+                    "overlap_wait_ms": bracket.overlap_wait.map(|wait| wait.as_secs_f64() * 1000.0),
                     "sck_capture_started_ms": phase_offset("picture_sck_capture_started"),
                     "sck_capture_returned_ms": phase_offset("picture_sck_capture_returned"),
                     "front_confirmed_ms": front_confirmed_ms,

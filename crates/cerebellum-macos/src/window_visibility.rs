@@ -347,6 +347,34 @@ pub(crate) fn visibility_from_windows(
     windows: &[Window],
     displays: &[Rect],
 ) -> (WindowVisibility, VisibilityRule) {
+    classify_visibility(
+        pid,
+        id,
+        windows,
+        displays,
+        #[cfg(feature = "desk-probe")]
+        None,
+    )
+}
+
+#[cfg(feature = "desk-probe")]
+pub(crate) fn visibility_from_windows_for_probe(
+    pid: u32,
+    id: u32,
+    windows: &[Window],
+    displays: &[Rect],
+    cover: &mut Vec<usize>,
+) -> (WindowVisibility, VisibilityRule) {
+    classify_visibility(pid, id, windows, displays, Some(cover))
+}
+
+fn classify_visibility(
+    pid: u32,
+    id: u32,
+    windows: &[Window],
+    displays: &[Rect],
+    #[cfg(feature = "desk-probe")] cover: Option<&mut Vec<usize>>,
+) -> (WindowVisibility, VisibilityRule) {
     use VisibilityRule::*;
     use WindowVisibility::*;
     let Some(index) = windows.iter().position(|window| window.id == Some(id)) else {
@@ -377,7 +405,11 @@ pub(crate) fn visibility_from_windows(
         return (Covered, OutsideDisplays);
     }
     let mut above_windows = Vec::new();
-    for above in &windows[..index] {
+    #[cfg(feature = "desk-probe")]
+    let mut candidates = Vec::new();
+    for (slot, above) in windows[..index].iter().enumerate() {
+        #[cfg(not(feature = "desk-probe"))]
+        let _ = slot;
         if above.cursor_picture {
             continue;
         }
@@ -394,6 +426,10 @@ pub(crate) fn visibility_from_windows(
             return (Unknown, MissingData);
         }
         above_windows.push((other, other_layer));
+        #[cfg(feature = "desk-probe")]
+        if cover.is_some() && other_layer != 0 && bounds.intersection(other).is_some() {
+            candidates.push(slot);
+        }
     }
     for (other, layer) in &above_windows {
         if *layer == 0 && bounds.intersection(*other).is_some() {
@@ -409,6 +445,10 @@ pub(crate) fn visibility_from_windows(
             .into_iter()
             .filter_map(|(rect, layer)| (layer != 0).then_some(rect)),
     ) {
+        #[cfg(feature = "desk-probe")]
+        if let Some(cover) = cover {
+            *cover = candidates;
+        }
         return (Covered, HigherLayerUnionCoverage);
     }
     (FullyVisible, NoLayerZeroOverlap)
@@ -874,6 +914,41 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[cfg(feature = "desk-probe")]
+    #[test]
+    fn overlap_witness_matches_the_rectangles_used_for_full_cover() {
+        let windows = [
+            Window {
+                alpha: Some(0.0),
+                ..layered(2, 20, rect(0.0, 100.0))
+            },
+            layered(3, 20, rect(0.0, 50.0)),
+            Window {
+                cursor_picture: true,
+                ..layered(4, 20, rect(0.0, 100.0))
+            },
+            layered(5, 7, rect(100.0, 10.0)),
+            Window {
+                alpha: Some(0.25),
+                ..layered(6, 20, rect(50.0, 50.0))
+            },
+            window(1, Some(rect(0.0, 100.0))),
+            layered(8, 20, rect(0.0, 100.0)),
+        ];
+        let displays = [rect(0.0, 150.0)];
+        let mut cover = Vec::new();
+        let expected = (
+            WindowVisibility::Covered,
+            VisibilityRule::HigherLayerUnionCoverage,
+        );
+        assert_eq!(
+            visibility_from_windows_for_probe(7, 1, &windows, &displays, &mut cover),
+            expected
+        );
+        assert_eq!(visibility_from_windows(7, 1, &windows, &displays), expected);
+        assert_eq!(cover, [1, 4]);
     }
 
     #[test]

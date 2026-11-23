@@ -293,3 +293,7 @@ pub use window_image::{
     topmost_window_at, visible_cursor_point, window_visibility, window_visibility_decision,
     ProcessWindowCounts,
 };
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
+pub use window_image::{
+    observe_window_overlap_for_probe, sample_window_overlap_for_probe, WindowOverlapSample,
+};
