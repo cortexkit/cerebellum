@@ -1280,32 +1280,6 @@ type Plane = ComputerPlane<
     FakeDriver,
 >;
 
-/// A config file holding one `app_use`, never changing.
-struct FixedConfig(&'static str);
-
-impl super::app_use::ConfigFiles for FixedConfig {
-    fn modified(&self, _path: &std::path::Path) -> std::io::Result<std::time::SystemTime> {
-        Ok(std::time::SystemTime::UNIX_EPOCH)
-    }
-    fn read_to_string(&self, _path: &std::path::Path) -> std::io::Result<String> {
-        Ok(self.0.to_owned())
-    }
-}
-
-fn app_use_file(mode: AppUse) -> super::app_use::LiveAppUse {
-    let live = super::app_use::LiveAppUse::new(
-        Some(PathBuf::from(
-            "/fixture/home/.config/cortexkit/cerebellum.jsonc",
-        )),
-        Arc::new(FixedConfig(match mode {
-            AppUse::Foreground => r#"{"computer_use":{"app_use":"foreground"}}"#,
-            AppUse::Background => r#"{"computer_use":{"app_use":"background"}}"#,
-        })),
-    );
-    live.approve_fixture();
-    live
-}
-
 /// A window with a Send button.
 fn mail_desk() -> support::Desk {
     support::Desk::new(vec![RawElement::fixture(1, "AXWindow")
@@ -1368,7 +1342,7 @@ fn rig_admitting(
     )
     .with_permission_liveness(support::live_permissions())
     .with_app_state_source(desk.source())
-    .with_app_use(app_use_file(mode))
+    .with_app_use(super::app_use::LiveAppUse::approved_for_test(mode))
     .with_app_use_fronting_admitted(app_use)
     .with_fronting_bracket_admitted(bracket)
     .with_fronting_lock(lock.clone());
@@ -1478,7 +1452,7 @@ impl Rig {
         let plane = Arc::try_unwrap(self.plane)
             .ok()
             .expect("no other handle on the plane")
-            .with_app_use(app_use_file(mode));
+            .with_app_use(super::app_use::LiveAppUse::approved_for_test(mode));
         Self {
             plane: Arc::new(plane),
             ..self
@@ -1786,7 +1760,9 @@ async fn frame_loop_takeover_chord_registers_cleanup_and_posts_through_the_brack
         .with_permission_liveness(support::live_permissions())
         .with_session_lock_for_test(Some(false))
         .with_app_state_source(desk.source())
-        .with_app_use(app_use_file(AppUse::Background))
+        .with_app_use(super::app_use::LiveAppUse::approved_for_test(
+            AppUse::Background,
+        ))
         .with_fronting_lock(FrontingLock::isolated())
         .with_fronting_bracket_admitted(true),
     ));

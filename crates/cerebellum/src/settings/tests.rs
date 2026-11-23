@@ -41,7 +41,6 @@ fn schema_and_defaults_are_accepted() {
     assert!(startup.agent_cursor);
     assert!(matches!(startup.browser, BrowserSurface::NotConfigured));
     assert_eq!(startup.live, LiveSettings::default());
-    assert!(startup.legacy_file.is_none());
 }
 
 #[test]
@@ -279,33 +278,4 @@ fn invalid_browser_pairing_refuses_the_whole_unstamped_view() {
     assert!(config_apply(&view)
         .unwrap_err()
         .contains("required when browser.executable_path is set"));
-}
-
-#[test]
-fn legacy_jsonc_is_loaded_as_unstamped_only_from_the_supplied_path() {
-    let path = std::env::temp_dir().join(format!(
-        "cerebellum-legacy-settings-{}.jsonc",
-        std::process::id()
-    ));
-    std::fs::write(
-        &path,
-        r#"{ "computer_use": { "app_use": "foreground", "agent_cursor": false, }, }"#,
-    )
-    .unwrap();
-    let settings = config_files(Some(&path));
-    std::fs::remove_file(&path).unwrap();
-    let settings = settings.unwrap();
-    assert_eq!(
-        settings.live,
-        LiveSettings {
-            app_use: AppUse::Foreground,
-            approved: false
-        }
-    );
-    assert!(!settings.agent_cursor);
-    assert_eq!(settings.legacy_file.as_deref(), Some(path.as_path()));
-    assert_eq!(
-        config_files(Some(&path)).unwrap().live,
-        LiveSettings::default()
-    );
 }

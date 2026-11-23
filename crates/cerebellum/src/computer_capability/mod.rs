@@ -623,13 +623,9 @@ where
     /// The background-mode preview: how its frames are captured, whether
     /// this build may capture them, and its worker once one is needed.
     preview: Arc<preview::PreviewPlane>,
-    /// The config file's `computer_use.app_use`, checked as each call
-    /// arrives. The only setting whose edits are acted on while the module
-    /// runs. No file is read until module startup calls
-    /// [`Self::read_app_use_from_config_file`].
+    /// The latest `computer_use.app_use` delivered by the daemon.
     app_use: app_use::LiveAppUse,
-    /// The mode each call's work saw, in order, for tests that check an edit
-    /// to the config file reaches the very next call.
+    /// The mode each call's work saw, in order, for tests of live delivery.
     #[cfg(test)]
     app_use_seen_for_test: StdMutex<Vec<Option<cerebellum_core::config::AppUse>>>,
     /// The screen-lock reading this crate's own tests serve under, in place of
@@ -740,7 +736,7 @@ where
             own_input: Arc::new(OwnInputLedger::new()),
             cursor: cursor::Coordinator::default(),
             preview: Arc::new(preview::PreviewPlane::without_capture()),
-            app_use: app_use::LiveAppUse::without_file(),
+            app_use: app_use::LiveAppUse::default(),
             #[cfg(test)]
             app_use_seen_for_test: StdMutex::new(Vec::new()),
             #[cfg(test)]
@@ -884,21 +880,9 @@ where
         self
     }
 
-    /// Enable per-call reading only for the legacy daemon path.
-    #[cfg(any(test, target_os = "macos", target_os = "windows"))]
-    pub(crate) fn read_app_use_from_config_file(&self, path: PathBuf) {
-        self.app_use.read_config_file(path);
-    }
-
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(crate) fn apply_live_settings(&self, settings: crate::settings::LiveSettings) {
         self.app_use.apply(settings);
-    }
-
-    /// The config file this plane's calls read `app_use` from, if any.
-    #[cfg(test)]
-    pub(crate) fn app_use_config_path_for_test(&self) -> Option<PathBuf> {
-        self.app_use.path()
     }
 
     /// Read `computer_use.app_use` through `live` instead of the plane's
@@ -913,7 +897,7 @@ where
         self.cursor.clone()
     }
 
-    /// Serve every call in foreground mode, whatever the config file says.
+    /// Serve every call in foreground mode.
     /// For tests of the on-screen badge, which background mode (the default)
     /// never draws.
     #[doc(hidden)]
@@ -1024,38 +1008,8 @@ where
         // served row that returns pixels.
         make_backend: impl FnOnce(&cerebellum_computer::platform::ProcessGrant) -> B,
     ) -> Result<Value, CapabilityResultValidationError> {
-        // First of all: while an existing config file cannot be read or does
-        // not parse, the person's chosen way of using apps is unknown, so no
-        // action of any kind may run under a guess. A missing file is not
-        // this case; it means background. Nothing has been looked up or
-        // dispatched yet.
-        let settings = tokio::select! {
-            biased;
-            settings = self.app_use.settings_for_call() => settings,
-            _ = context.cancel.cancelled() => {
-                return self.finish_reply(
-                    capability.capability(),
-                    serialize::queued_refusal(
-                        capability,
-                        arguments,
-                        crate::computer_grants::ConsentRefusal::Cancelled,
-                    ),
-                );
-            }
-        };
-        let app_use = match settings {
-            Ok(mode) => mode,
-            Err(invalid) => {
-                let reply = match capability.0 {
-                    Served::Type | Served::Keys => {
-                        synthetic_wire_envelope(keystrokes::refused_before_posting(invalid.reply()))
-                    }
-                    _ => invalid.reply(),
-                };
-                return self.finish_reply(capability.capability(), reply);
-            }
-        };
-        let app_use = self.app_use.approved_mode(app_use, &context.cancel).await;
+        let settings = self.app_use.settings_for_call();
+        let app_use = self.app_use.approved_mode(settings, &context.cancel).await;
         // Before target lookup, consent or any platform work: offering a tool
         // does not imply the startup permission readings allow it to execute.
         if let Some(reply) = permissions::refusal(capability.capability(), &self.permissions) {

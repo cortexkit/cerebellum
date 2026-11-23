@@ -4390,7 +4390,6 @@ fn parse_subc_arg(args: impl IntoIterator<Item = OsString>) -> Result<PathBuf, M
 pub enum ModuleError {
     Message(String),
     Json(serde_json::Error),
-    Config(ConfigError),
 }
 
 impl std::fmt::Display for ModuleError {
@@ -4398,7 +4397,6 @@ impl std::fmt::Display for ModuleError {
         match self {
             Self::Message(m) => write!(f, "{m}"),
             Self::Json(e) => write!(f, "json: {e}"),
-            Self::Config(e) => write!(f, "config: {e}"),
         }
     }
 }

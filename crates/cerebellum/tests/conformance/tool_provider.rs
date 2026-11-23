@@ -379,7 +379,15 @@ async fn export_served_flat_tools() {
 
 #[tokio::test]
 async fn live_daemon_catalog_preserves_registered_flat_definition() {
-    let (mut daemon, connection) = start_live_daemon_with_browser(true).await;
+    let Some(home) = managed_settings::fenced_home(
+        "tool_provider::live_daemon_catalog_preserves_registered_flat_definition",
+        HANG_GUARD,
+    )
+    .await
+    else {
+        return;
+    };
+    let (mut daemon, connection) = start_live_daemon_with_browser(true, Some(home)).await;
     let mut client = connect_client(&connection).await;
     let registered = wait_for_cerebellum_catalog(&mut client).await;
     let ClientControlResponse::CatalogList { modules, .. } = registered else {

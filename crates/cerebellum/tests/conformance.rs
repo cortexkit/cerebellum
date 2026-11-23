@@ -17,6 +17,8 @@
 
 #[path = "it/support/hang_guard.rs"]
 mod hang_guard;
+#[path = "support/managed_settings.rs"]
+mod managed_settings;
 mod support;
 use hang_guard::HANG_GUARD;
 #[path = "conformance/tool_provider.rs"]
@@ -858,7 +860,15 @@ async fn accepted_effective_scope_is_not_widened_by_request_body() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn live_daemon_declares_browser_controls_without_an_executable() {
-    let (mut daemon, connection) = start_live_daemon().await;
+    let Some(home) = managed_settings::fenced_home(
+        "live_daemon_declares_browser_controls_without_an_executable",
+        HANG_GUARD,
+    )
+    .await
+    else {
+        return;
+    };
+    let (mut daemon, connection) = start_live_daemon_with_browser(false, Some(home)).await;
     let mut client = connect_client(&connection).await;
 
     let catalog = wait_for_cerebellum_catalog(&mut client).await;
@@ -1093,7 +1103,7 @@ fn module_output_report(path: &Path, wait: Duration) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured() {
-    let (mut daemon, connection) = start_live_daemon_with_browser(true).await;
+    let (mut daemon, connection) = start_live_daemon_with_browser(true, None).await;
     let mut client = connect_client(&connection).await;
 
     let catalog = wait_for_cerebellum_catalog(&mut client).await;
@@ -1153,7 +1163,7 @@ async fn live_daemon_registers_the_browser_surface_when_a_browser_is_configured(
 }
 
 async fn start_live_daemon() -> (LiveDaemonGuard, subc_transport::ConnectionInfo) {
-    start_live_daemon_with_browser(false).await
+    start_live_daemon_with_browser(false, None).await
 }
 
 /// Give the in-process daemon somewhere to say what it saw.
@@ -1182,16 +1192,19 @@ fn install_daemon_trace_subscriber() {
 /// is configured on the machine running the test.
 async fn start_live_daemon_with_browser(
     browser: bool,
+    managed_home: Option<PathBuf>,
 ) -> (LiveDaemonGuard, subc_transport::ConnectionInfo) {
     install_daemon_trace_subscriber();
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock must be after the Unix epoch")
         .as_nanos();
-    let directory = live_daemon_directory(nonce);
-    // `create_dir`, not `create_dir_all`: a directory that already exists
-    // belongs to another test's daemon, and is refused rather than shared.
-    fs::create_dir(&directory).expect("create a live-daemon directory no other test holds");
+    let managed = managed_home.is_some();
+    let directory = managed_home.unwrap_or_else(|| {
+        let directory = live_daemon_directory(nonce);
+        fs::create_dir(&directory).expect("create a live-daemon directory no other test holds");
+        directory
+    });
     let module_env = support::fenced_module_env(&directory);
     let config_home = cortexkit_test_support::fenced_subc_env_dir(&directory, "XDG_CONFIG_HOME");
     let data_home = cortexkit_test_support::fenced_subc_env_dir(&directory, "XDG_DATA_HOME");
@@ -1284,6 +1297,14 @@ async fn start_live_daemon_with_browser(
         // module exit and `ck module terminals` reads them. A fixture module
         // that exits abnormally here must not land beside the real ones.
         .with_terminal_journal_path(run.join("terminals.jsonl"));
+    let daemon_config = if managed {
+        fs::create_dir_all(data_home.join("cortexkit")).unwrap();
+        daemon_config
+            .with_config_store_root(data_home.join("cortexkit/config-store"))
+            .unwrap()
+    } else {
+        daemon_config
+    };
     let task = tokio::spawn(subc_daemon::bootstrap::run_with_config(daemon_config));
     let module_output = capture_logs_dir.join(format!("{MODULE_ID}.stderr.log"));
 
