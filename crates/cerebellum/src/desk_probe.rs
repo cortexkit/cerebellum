@@ -210,7 +210,8 @@ pub(crate) fn observe_picture_overlap<T, E>(
             let began = Instant::now();
             let (send, receive) = mpsc::channel();
             let worker_fence = Arc::clone(fence);
-            // A slow native query must not keep the bracket thread from restoring focus.
+            // A slow native query must not block this thread, which still has to
+            // put the person's app back in front.
             if std::thread::Builder::new()
                 .name("ck-desk-picture-overlap-sampler".into())
                 .spawn(move || sampler(from, cutoff, worker_fence, send))

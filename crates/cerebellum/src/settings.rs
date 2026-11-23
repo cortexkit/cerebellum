@@ -36,7 +36,13 @@ static SCHEMA: LazyLock<(Value, Schema)> = LazyLock::new(|| {
 fn schema_declaration() -> Value {
     // Every title is the label a person reads in the apps' Settings page; the
     // description is the one-line help under it.
-    fn field(kind: &str, title: &str, description: &str, default: Value, apply: ApplyKind) -> Value {
+    fn field(
+        kind: &str,
+        title: &str,
+        description: &str,
+        default: Value,
+        apply: ApplyKind,
+    ) -> Value {
         json!({"type": kind, "title": title, "description": description, "default": default,
             "x-ck-apply": apply, "x-ck-layers": ["user"]})
     }
