@@ -474,6 +474,45 @@ fn cursor_window_list() -> Option<Vec<crate::window_visibility::Window>> {
     cursor_windows_from(&dictionaries)
 }
 
+/// Find the Dock's on-screen layer-20 window filling the display that contains
+/// the entire scratch rectangle. CG window alpha is metadata, not the witness.
+#[cfg(feature = "desk-probe")]
+pub(super) fn dock_overlay_window(
+    dock_pid: u32,
+    scratch_rect: [f64; 4],
+) -> Result<(u32, [f64; 4]), String> {
+    let [x, y, w, h] = scratch_rect;
+    let displays = display_frames().ok_or("active display bounds unavailable")?;
+    let mut displays = displays.into_iter().filter(|&[dx, dy, dw, dh]| {
+        w > 0.0 && h > 0.0 && x >= dx && y >= dy && x + w <= dx + dw && y + h <= dy + dh
+    });
+    let display = displays
+        .next()
+        .ok_or("scratch is not wholly on one display")?;
+    if displays.next().is_some() {
+        return Err("scratch lies on more than one display".into());
+    }
+    let mut overlays = cursor_window_list()
+        .ok_or("CoreGraphics window list unavailable")?
+        .into_iter()
+        .filter_map(|window| {
+            let bounds = window.bounds?;
+            (window.pid == Some(dock_pid)
+                && window.layer == Some(20)
+                && window.alpha == Some(1.0)
+                && [bounds.x, bounds.y, bounds.width, bounds.height] == display)
+                .then_some(window.id)
+                .flatten()
+        });
+    let id = overlays
+        .next()
+        .ok_or("CoreGraphics does not list a full-display Dock layer-20 overlay over scratch")?;
+    if overlays.next().is_some() {
+        return Err("CoreGraphics lists multiple matching Dock overlays".into());
+    }
+    Ok((id, display))
+}
+
 fn cursor_windows_from(
     windows: &WindowDictionaries,
 ) -> Option<Vec<crate::window_visibility::Window>> {

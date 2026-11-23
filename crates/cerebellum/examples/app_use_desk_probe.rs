@@ -86,6 +86,15 @@ const HELPER_FLAG: &str = "--agent-cursor";
 const BASELINE_FLAG: &str = "--baseline";
 #[cfg(target_os = "macos")]
 const PICTURE_FLAG: &str = "--covered-picture";
+#[cfg(target_os = "macos")]
+const DOCK_OVERLAY_FLAG: &str = "--dock-overlay";
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum DeskImageArm {
+    CoveredPicture,
+    DockOverlay,
+}
 /// The line the baseline child reports its idle CPU time on.
 const BASELINE_LINE: &str = "BASELINE_MODULE_IDLE_CPU_NS=";
 /// The module binary that serves as the cursor helper, beside the
@@ -984,12 +993,26 @@ fn visible_previews(windows: &[ListedWindow], helper: i32) -> usize {
 
 fn main() {
     #[cfg(target_os = "macos")]
-    if std::env::args().skip(1).any(|arg| arg == PICTURE_FLAG) {
-        let Some(data_home) = covered_picture_probe::open_log(approved(std::env::args().skip(1)))
-        else {
-            std::process::exit(2);
-        };
-        std::process::exit(desk_preflight(|| desk::run(false, Some(&data_home))));
+    {
+        let arguments: Vec<_> = std::env::args().skip(1).collect();
+        let dock = arguments.iter().any(|arg| arg == DOCK_OVERLAY_FLAG);
+        let covered = arguments.iter().any(|arg| arg == PICTURE_FLAG);
+        if dock || covered {
+            let (arm, log_name) = if dock {
+                (DeskImageArm::DockOverlay, "run-dock-overlay.log")
+            } else {
+                (DeskImageArm::CoveredPicture, "run-covered-picture.log")
+            };
+            let Some(data_home) = covered_picture_probe::open_log(approved(arguments), log_name)
+            else {
+                std::process::exit(2);
+            };
+            if dock && covered {
+                eprintln!("REFUSED: choose only one picture probe arm");
+                std::process::exit(2);
+            }
+            std::process::exit(desk_preflight(|| desk::run(false, Some((arm, &data_home)))));
+        }
     }
     if !approved(std::env::args().skip(1)) {
         eprintln!(
@@ -1026,6 +1049,10 @@ mod allowing_cingulate;
 #[cfg(target_os = "macos")]
 #[path = "support/covered_picture_probe.rs"]
 mod covered_picture_probe;
+
+#[cfg(target_os = "macos")]
+#[path = "support/dock_overlay_probe.rs"]
+mod dock_overlay_probe;
 
 #[cfg(target_os = "macos")]
 mod desk {
@@ -2262,8 +2289,8 @@ mod desk {
         }
     }
 
-    pub fn run(baseline: bool, picture_data: Option<&Path>) -> i32 {
-        let picture_only = picture_data.is_some();
+    pub fn run(baseline: bool, image: Option<(DeskImageArm, &Path)>) -> i32 {
+        let picture_only = image.is_some();
         // Both runs start the same way: AppKit first, then the capture warm-up,
         // with no ScreenCaptureKit use before AppKit. The baseline used to read
         // the window list before AppKit started, and only the baseline failed
@@ -2390,7 +2417,7 @@ mod desk {
                 return 2;
             }
         };
-        let mut scratch = match launch_scratch(&before, picture_data) {
+        let mut scratch = match launch_scratch(&before, image.map(|(_, data)| data)) {
             Ok(scratch) => scratch,
             Err(error) => {
                 eprintln!("UNMEASURABLE: cannot launch scratch TextEdit: {error}");
@@ -2426,7 +2453,12 @@ mod desk {
                         );
                     }
                 }
-                runtime.block_on(measure(&scratch, person, baseline, picture_only))
+                runtime.block_on(measure(
+                    &scratch,
+                    person,
+                    baseline,
+                    image.map(|(arm, _)| arm),
+                ))
             })
         }));
         let cleaned_up = scratch.finish();
@@ -2655,7 +2687,13 @@ mod desk {
     }
 
     /// Every phase against the scratch app. Returns the process exit code.
-    async fn measure(scratch: &Scratch, person: i32, baseline: bool, picture_only: bool) -> i32 {
+    async fn measure(
+        scratch: &Scratch,
+        person: i32,
+        baseline: bool,
+        image_arm: Option<DeskImageArm>,
+    ) -> i32 {
+        let picture_only = image_arm.is_some();
         for repeat in 1..=if picture_only {
             0
         } else {
@@ -2785,6 +2823,21 @@ mod desk {
             }
             let _ = cerebellum_macos::request_frontmost(person as u32);
         }
+        let fronted_read = || {
+            serve(
+                "computer.read_state",
+                json!({"target": TEXTEDIT_BUNDLE, "include_image": true, "bring_to_front": true}),
+            )
+        };
+        if matches!(image_arm, Some(DeskImageArm::DockOverlay)) {
+            return dock_overlay_probe::run(
+                target_pid,
+                person,
+                || scratch_ownership(&scratch.identity).is_ok(),
+                fronted_read,
+            )
+            .await;
+        }
         if !baseline {
             println!(
                 "WAITING up to {} s for the person's front app to cover the scratch TextEdit \
@@ -2817,13 +2870,7 @@ mod desk {
         // wants a quiet second before it fronts anything.
         tokio::time::sleep(Duration::from_secs(2)).await;
         if picture_only {
-            return measure_pictures(scratch, person, || {
-                serve(
-                    "computer.read_state",
-                    json!({"target": TEXTEDIT_BUNDLE, "include_image": true, "bring_to_front": true}),
-                )
-            })
-            .await;
+            return measure_pictures(scratch, person, fronted_read).await;
         }
         let mut report = Report { failed: false };
 

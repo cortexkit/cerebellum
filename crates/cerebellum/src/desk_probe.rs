@@ -150,17 +150,36 @@ type OverlapSampler = Box<
         ) + Send,
 >;
 
+type FrontWitness = Box<
+    dyn FnOnce(Option<std::time::Instant>, &cerebellum_computer::capture::AcquisitionFence) + Send,
+>;
+
+enum PictureMeasurement {
+    Overlap(OverlapSampler),
+    DockOverlay(FrontWitness),
+}
+
 struct ArmedPictureProbe {
     report: PictureBracketProbe,
-    overlap_sampler: Option<OverlapSampler>,
+    measurement: Option<PictureMeasurement>,
 }
 
 static PICTURE_BRACKET: std::sync::Mutex<Option<ArmedPictureProbe>> = std::sync::Mutex::new(None);
 
 pub fn begin_picture_bracket_probe(overlap_sampler: OverlapSampler) {
+    arm_picture_measurement(PictureMeasurement::Overlap(overlap_sampler));
+}
+
+/// Sample the Dock in the picture bracket's fronted read callback, before a
+/// visibility query can delay the witness. This arm never captures TextEdit.
+pub fn begin_dock_overlay_bracket_probe(witness: FrontWitness) {
+    arm_picture_measurement(PictureMeasurement::DockOverlay(witness));
+}
+
+fn arm_picture_measurement(measurement: PictureMeasurement) {
     *PICTURE_BRACKET.lock().unwrap() = Some(ArmedPictureProbe {
         report: PictureBracketProbe::default(),
-        overlap_sampler: Some(overlap_sampler),
+        measurement: Some(measurement),
     });
 }
 
@@ -180,21 +199,28 @@ pub(crate) fn note_picture_bracket_probe(update: impl FnOnce(&mut PictureBracket
 
 /// Observe the initial native query. Only a refused read may wait for more
 /// observations, and it still refuses if the window later becomes uncovered.
-pub(crate) fn observe_picture_overlap<T, E>(
-    check: impl FnOnce() -> Result<T, E>,
+pub(crate) fn observe_picture_overlap<T>(
+    check: impl FnOnce() -> Result<T, cerebellum_computer::app_state::image::ImageUnavailable>,
     cutoff: Option<std::time::Instant>,
     fence: &cerebellum_computer::capture::AcquisitionFence,
-) -> Result<T, E> {
+) -> Result<T, cerebellum_computer::app_state::image::ImageUnavailable> {
     use std::sync::mpsc;
     use std::time::Instant;
 
-    let Some(sampler) = PICTURE_BRACKET
+    let measurement = PICTURE_BRACKET
         .lock()
         .unwrap()
         .as_mut()
-        .and_then(|probe| probe.overlap_sampler.take())
-    else {
-        return check();
+        .and_then(|probe| probe.measurement.take());
+    let sampler = match measurement {
+        None => return check(),
+        Some(PictureMeasurement::Overlap(sampler)) => sampler,
+        Some(PictureMeasurement::DockOverlay(witness)) => {
+            witness(cutoff, fence);
+            return Err(
+                cerebellum_computer::app_state::image::ImageUnavailable::CaptureUnavailable,
+            );
+        }
     };
     let (result, first) = cerebellum_macos::observe_window_overlap_for_probe(check);
     if result.is_ok() {

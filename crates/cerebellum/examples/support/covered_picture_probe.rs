@@ -213,7 +213,7 @@ fn private_data_home(root: &Path, path: &Path, uid: u32) -> bool {
 
 /// Redirect output before any permission or desktop check. Never reuse an
 /// existing file at the log path, even if it is a normal file.
-pub(super) fn open_log(approved: bool) -> Option<PathBuf> {
+pub(super) fn open_log(approved: bool, log_name: &str) -> Option<PathBuf> {
     let root = Path::new(ROOT);
     // SAFETY: geteuid has no arguments or memory preconditions.
     let uid = unsafe { geteuid() };
@@ -224,7 +224,7 @@ pub(super) fn open_log(approved: bool) -> Option<PathBuf> {
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(root.join("run-covered-picture.log"))
+        .open(root.join(log_name))
         .ok()?;
     // SAFETY: file owns a live descriptor; dup2 keeps its own references for
     // stdout and stderr. The probe does no further work if either fails.

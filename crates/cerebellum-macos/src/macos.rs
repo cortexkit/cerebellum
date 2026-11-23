@@ -23,6 +23,10 @@ use objc2_screen_capture_kit::{
     SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration, SCWindow,
 };
 
+#[cfg(feature = "desk-probe")]
+#[path = "dock_overlay_probe.rs"]
+pub mod dock_overlay_probe;
+
 /// The prefix of `struct proc_bsdinfo` from `<sys/proc_info.h>`, up to and
 /// including the two fields this reads.
 ///

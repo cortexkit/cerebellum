@@ -134,6 +134,8 @@ pub use cursor_overlay::{
     AVATAR_PIXELS,
 };
 #[cfg(all(target_os = "macos", feature = "desk-probe"))]
+pub use macos::dock_overlay_probe;
+#[cfg(all(target_os = "macos", feature = "desk-probe"))]
 pub use macos::{
     application_is_active_for_probe, take_posts_for_probe, take_window_list_errors_for_probe,
 };
