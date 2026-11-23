@@ -34,13 +34,16 @@ static SCHEMA: LazyLock<(Value, Schema)> = LazyLock::new(|| {
 });
 
 fn schema_declaration() -> Value {
-    fn field(kind: &str, description: &str, default: Value, apply: ApplyKind) -> Value {
-        json!({"type": kind, "description": description, "default": default,
+    // Every title is the label a person reads in the apps' Settings page; the
+    // description is the one-line help under it.
+    fn field(kind: &str, title: &str, description: &str, default: Value, apply: ApplyKind) -> Value {
+        json!({"type": kind, "title": title, "description": description, "default": default,
             "x-ck-apply": apply, "x-ck-layers": ["user"]})
     }
-    fn integer(description: &str, default: u64, minimum: u64, maximum: u64) -> Value {
+    fn integer(title: &str, description: &str, default: u64, minimum: u64, maximum: u64) -> Value {
         let mut value = field(
             "integer",
+            title,
             description,
             json!(default),
             ApplyKind::ModuleRestart,
@@ -49,30 +52,34 @@ fn schema_declaration() -> Value {
         value["maximum"] = json!(maximum);
         value
     }
+    fn group(title: &str, properties: Value) -> Value {
+        json!({"type": "object", "title": title, "unevaluatedProperties": false, "properties": properties})
+    }
     use ApplyKind::{Live, ModuleRestart};
-    let mut app_use = field("string", "Whether computer use acts in the background or brings the application to the front. Foreground use of unapproved settings requires operator confirmation.", json!("background"), Live);
+    let mut app_use = field("string", "How the agent uses apps", "Whether the agent works in apps from the background or brings them to the front. Bringing apps to the front needs your confirmation on this computer.", json!("background"), Live);
     app_use["enum"] = json!(AppUse::ALLOWED);
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "Browser and desktop control",
         "type": "object", "unevaluatedProperties": false,
         "properties": {
-            "health": {"type": "object", "unevaluatedProperties": false, "properties": {
-                "dispatch_heartbeat_stale_ms": integer("Milliseconds before an unresponsive dispatch heartbeat is reported stale.", config::DEFAULT_DISPATCH_HEARTBEAT_STALE_MS, 1, MAX_STALE_OR_IDLE_MS),
-                "queue_age_stale_ms": integer("Milliseconds before the oldest queued action is reported stale.", config::DEFAULT_QUEUE_AGE_STALE_MS, 1, MAX_STALE_OR_IDLE_MS)
-            }},
-            "computer_use": {"type": "object", "unevaluatedProperties": false, "properties": {
-                "agent_cursor": field("boolean", "Show the agent cursor while computer use acts on screen.", json!(true), ModuleRestart),
+            "health": group("Health checks", json!({
+                "dispatch_heartbeat_stale_ms": integer("Report a stuck action after", "Milliseconds an action may go without progress before health reports it stuck.", config::DEFAULT_DISPATCH_HEARTBEAT_STALE_MS, 1, MAX_STALE_OR_IDLE_MS),
+                "queue_age_stale_ms": integer("Report a waiting action after", "Milliseconds an action may wait in line before health reports it stuck.", config::DEFAULT_QUEUE_AGE_STALE_MS, 1, MAX_STALE_OR_IDLE_MS)
+            })),
+            "computer_use": group("Desktop control", json!({
+                "agent_cursor": field("boolean", "Show the agent's cursor", "Show the agent's cursor and preview while it works in an app.", json!(true), ModuleRestart),
                 "app_use": app_use
-            }},
-            "browser": {"type": "object", "unevaluatedProperties": false, "properties": {
-                "executable_path": field("string", "Absolute path to the browser executable. Omit to leave the browser unconfigured; a path requires an expected identity.", json!(""), ModuleRestart),
-                "expected_identity": field("string", "Expected executable identity used to verify the configured browser. Omit when no browser path is configured.", json!(""), ModuleRestart),
-                "launch_handshake_deadline_ms": integer("Milliseconds allowed for the initial browser handshake, including cold-start macOS code signature validation.", 10_000, 1, MAX_LAUNCH_DEADLINE_MS),
-                "termination_grace_period_ms": integer("Milliseconds for the browser to exit gracefully. Shortening this can force-kill the browser before it saves profile writes.", 5_000, 1, MAX_TERMINATION_DEADLINE_MS),
-                "browser_idle_timeout_ms": integer("Milliseconds of inactivity after which to close an idle browser session.", 600_000, 1, MAX_STALE_OR_IDLE_MS),
-                "browser_exit_observation_deadline_ms": integer("Milliseconds allowed to observe the browser exit after termination, separate from the grace period.", 5_000, 1, MAX_TERMINATION_DEADLINE_MS),
-                "navigation_settle_deadline_ms": integer("Milliseconds allowed for navigation to settle. Must exceed the network-quiet window or a navigation can never settle.", 10_000, crate::browser::QUIET_MS + 1, MAX_ACTION_DEADLINE_MS)
-            }}
+            })),
+            "browser": group("Agent browser", json!({
+                "executable_path": field("string", "Browser program", "Full path to the browser program the agent uses. Leave empty to turn the agent browser off; a path also needs the expected identity.", json!(""), ModuleRestart),
+                "expected_identity": field("string", "Expected browser identity", "The signature the browser program must carry before the agent starts it. Leave empty when no browser program is set.", json!(""), ModuleRestart),
+                "launch_handshake_deadline_ms": integer("Browser start time limit", "Milliseconds the browser may take to start, including the system's first check of its signature.", 10_000, 1, MAX_LAUNCH_DEADLINE_MS),
+                "termination_grace_period_ms": integer("Browser close time limit", "Milliseconds the browser gets to close by itself. A shorter time can force it closed before it saves its profile.", 5_000, 1, MAX_TERMINATION_DEADLINE_MS),
+                "browser_idle_timeout_ms": integer("Close an unused browser after", "Milliseconds without agent activity before the agent browser closes.", 600_000, 1, MAX_STALE_OR_IDLE_MS),
+                "browser_exit_observation_deadline_ms": integer("Browser exit check time limit", "Milliseconds to confirm the browser has exited after it is told to close, apart from the close time limit.", 5_000, 1, MAX_TERMINATION_DEADLINE_MS),
+                "navigation_settle_deadline_ms": integer("Page load time limit", "Milliseconds a page may take to finish loading. It must be longer than the page's quiet period, or no page counts as loaded.", 10_000, crate::browser::QUIET_MS + 1, MAX_ACTION_DEADLINE_MS)
+            }))
         }
     })
 }
