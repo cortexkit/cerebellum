@@ -1,4 +1,6 @@
-//! Measure whether a picture bracket's own front dismisses a Dock overlay.
+//! Measure whether cerebellum bringing an app to the front, as it does for a
+//! picture of a covered window, closes Mission Control, App Exposé or Show
+//! Desktop, which the Dock draws in its full-screen overlay window.
 
 use std::future::Future;
 use std::sync::{mpsc, Arc};
@@ -166,7 +168,7 @@ impl Desk<'_> {
         if visible_window_frame(self.pid, self.window) != Some(self.rect) {
             return Err("scratch window or its frame changed".into());
         }
-        self.witness.verify_window(self.rect)
+        self.witness.compare_window(self.rect)
     }
 
     async fn wait_for(&self, wanted: Alpha, quiet: bool) -> Result<AlphaSample, String> {

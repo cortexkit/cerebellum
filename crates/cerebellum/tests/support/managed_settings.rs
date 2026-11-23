@@ -18,8 +18,8 @@ pub async fn fenced_home(test: &str, hang_guard: Duration) -> Option<PathBuf> {
             .args(["--exact", test, "--nocapture"])
             .envs(cortexkit_test_support::fenced_subc_daemon_env(home.path()))
             .env(FIXTURE_HOME, home.path())
-            // Keep the integrity-seal trust anchor in the fenced home instead
-            // of using the operator's keychain.
+            // Make the daemon keep the key that signs settings views in the
+            // fenced home instead of the operator's keychain.
             .env("SUBC_TEST_CONFIG_GATE", "1")
             .kill_on_drop(true)
             .output(),

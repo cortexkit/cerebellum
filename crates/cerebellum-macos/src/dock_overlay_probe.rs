@@ -59,8 +59,9 @@ impl DockOverlayWitness {
             crate::window_image::dock_overlay_window(dock_pid, scratch_rect)?;
         let (send, requests) = mpsc::channel::<SampleRequest>();
         let (ready, setup) = mpsc::channel();
-        // Keep the Objective-C capture objects on one worker. The fronted
-        // callback need not enumerate windows or construct a filter.
+        // Keep the Objective-C capture objects on one worker, prepared here, so
+        // the sample taken while the target app is held in front doesn't have
+        // to list windows or build a capture filter.
         std::thread::Builder::new()
             .name("ck-desk-dock-overlay-witness".into())
             .spawn(move || {
@@ -101,7 +102,7 @@ impl DockOverlayWitness {
     }
 
     /// Stop rather than sample a moved or replaced overlay on another display.
-    pub fn verify_window(&self, scratch_rect: [f64; 4]) -> Result<(), String> {
+    pub fn compare_window(&self, scratch_rect: [f64; 4]) -> Result<(), String> {
         if crate::process_start_time_micros(self.dock_pid) != Some(self.dock_generation)
             || crate::window_image::dock_overlay_window(self.dock_pid, scratch_rect)?
                 != (self.window_id, self.window_rect)

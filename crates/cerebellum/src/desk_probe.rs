@@ -170,8 +170,10 @@ pub fn begin_picture_bracket_probe(overlap_sampler: OverlapSampler) {
     arm_picture_measurement(PictureMeasurement::Overlap(overlap_sampler));
 }
 
-/// Sample the Dock in the picture bracket's fronted read callback, before a
-/// visibility query can delay the witness. This arm never captures TextEdit.
+/// Sample the Dock while a covered-window picture holds the target app in
+/// front: the read that runs just after the app is confirmed frontmost, before
+/// the window-visibility check could delay the sample. This arm never captures
+/// TextEdit itself.
 pub fn begin_dock_overlay_bracket_probe(witness: FrontWitness) {
     arm_picture_measurement(PictureMeasurement::DockOverlay(witness));
 }
