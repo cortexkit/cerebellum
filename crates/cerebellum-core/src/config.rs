@@ -452,24 +452,6 @@ fn parse_positive_ms(value: &serde_json::Value, field: &'static str) -> Result<u
     }
 }
 
-/// Load and parse the config file at [`config_path`]. If the file is absent,
-/// returns the default config (no file = defaults). If the file is present but
-/// malformed or has an invalid `health` value, returns a [`ConfigError`] so
-/// registration fails deterministically rather than silently falling back.
-pub fn load_config_file() -> Result<Config, ConfigError> {
-    let Some(path) = config_path() else {
-        return Ok(Config::default());
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => parse_config(&text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-        Err(e) => Err(ConfigError {
-            field: "config",
-            reason: ConfigReason::Malformed(format!("reading {}: {e}", path.display())),
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

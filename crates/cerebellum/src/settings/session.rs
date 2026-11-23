@@ -68,6 +68,17 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = health;
     }
 
+    fn set_waiting_health(&self, code: Option<String>) {
+        let mut health = self
+            .health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // An unsuccessful retry must not hide the original refusal.
+        if matches!(*health, SettingsHealth::Waiting(_)) {
+            *health = SettingsHealth::Waiting(code);
+        }
+    }
+
     pub(crate) fn mark_applied(&self) {
         self.set_health(SettingsHealth::Applied);
     }
@@ -99,6 +110,7 @@ impl Session {
             Some(code) => format!("{reason}: {code}"),
             None => reason.to_owned(),
         };
+        let reason = format!("{reason}; check `ck config status`.");
         if let ModuleControlResponse::HealthCheck { status, detail, .. } = response {
             *status = HealthStatus::Degraded;
             *detail = Some(match detail.take() {
@@ -204,7 +216,7 @@ impl Session {
         &self,
         writer: &mpsc::Sender<Frame>,
         declaration: ConfigDeclareRequest,
-    ) -> Result<(StartupSettings, Option<ConfigAppliedRequest>), ()> {
+    ) -> (StartupSettings, Option<ConfigAppliedRequest>) {
         // A slow or missing reply is not a refusal: go on to read the view,
         // which says whether the declaration took effect.
         match self
@@ -214,7 +226,7 @@ impl Session {
             Ok(_) => {}
             Err(Some(code)) => {
                 self.set_health(SettingsHealth::Refused(code));
-                return Err(());
+                self.changed_or_retry(None).await;
             }
             Err(None) => self.changed_or_retry(Some(RETRY_FIRST)).await,
         }
@@ -225,7 +237,7 @@ impl Session {
             match self.get(writer, Some(STARTUP_DEADLINE)).await {
                 Ok(reply) => {
                     retry = None;
-                    self.set_health(SettingsHealth::Waiting(None));
+                    self.set_waiting_health(None);
                     let mut view = reply.pending.or_else(|| reply.active.clone());
                     while let Some(candidate) = view {
                         let startup = StartupSettings::from_view(&candidate);
@@ -234,7 +246,7 @@ impl Session {
                             startup.as_ref().map(|_| ()).map_err(Clone::clone),
                         );
                         if let Ok(startup) = startup {
-                            return Ok((startup, report));
+                            return (startup, report);
                         }
                         if let Some(report) = report {
                             let _ = self
@@ -256,11 +268,11 @@ impl Session {
                 // such as config_gated do not permit bypassing managed settings.
                 Err(Some(code)) if code == "value_invalid" => {
                     self.set_health(SettingsHealth::Refused(code));
-                    return Err(());
+                    retry = None;
                 }
                 Err(code) => {
                     retry = Some(next_retry(retry));
-                    self.set_health(SettingsHealth::Waiting(code));
+                    self.set_waiting_health(code);
                 }
             }
             self.changed_or_retry(retry).await;
@@ -271,7 +283,7 @@ impl Session {
         &self,
         writer: &mpsc::Sender<Frame>,
         mut pending_report: Option<ConfigAppliedRequest>,
-        apply: impl Fn(LiveSettings) + Clone + Send + 'static,
+        apply: impl Fn(LiveSettings),
     ) {
         // Set while a refresh is owed: the hint that asked for it was consumed
         // by a GET that timed out or failed, so the next attempt must not wait
@@ -302,17 +314,7 @@ impl Session {
             let Some(view) = reply.pending.or(reply.active) else {
                 continue;
             };
-            let result = match config_apply(&view) {
-                Ok(settings) => {
-                    // Replacing the legacy source can wait for an in-flight file
-                    // read. Do not make the connection wait on that lock.
-                    let apply = apply.clone();
-                    tokio::task::spawn_blocking(move || apply(settings))
-                        .await
-                        .map_err(|error| error.to_string())
-                }
-                Err(error) => Err(error),
-            };
+            let result = config_apply(&view).map(&apply);
             if result.is_ok() {
                 self.mark_applied();
             }

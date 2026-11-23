@@ -145,7 +145,7 @@ async fn settings_startup_serves_review_and_waits_for_the_effective_view() {
     })
     .await
     .unwrap();
-    let (startup, report) = result.unwrap().unwrap().unwrap();
+    let (startup, report) = result.unwrap().unwrap();
     assert_eq!(waiting.pop_front().unwrap().header.corr, 21);
     assert_eq!(startup.health.queue_age_stale_ms, 1234);
     assert!(!startup.agent_cursor);
@@ -224,7 +224,7 @@ async fn settings_startup_times_out_early_calls_without_falling_back() {
         assert_eq!(body(&health)["status"], "degraded");
         assert_eq!(
             body(&health)["detail"],
-            "settings_view_missing: config_gated"
+            "settings_view_missing: config_gated; check `ck config status`."
         );
 
         write_frame(
@@ -252,6 +252,10 @@ async fn settings_startup_times_out_early_calls_without_falling_back() {
         assert_eq!(response.header.corr, 22);
         assert_eq!(response.header.ty, FrameType::Error);
         assert_eq!(body(&response)["code"], "not_ready");
+        assert!(body(&response)["message"]
+            .as_str()
+            .unwrap()
+            .contains("ck config status"));
         write_frame(
             &mut daemon,
             &frame(FrameType::Request, 0, 0, 23, json!({"op":"health.check"})),
@@ -291,12 +295,8 @@ async fn settings_startup_times_out_early_calls_without_falling_back() {
     })
     .await
     .unwrap();
-    let (startup, _) = result
-        .unwrap()
-        .unwrap()
-        .expect("wait for the managed view, not the legacy file");
+    let (startup, _) = result.unwrap().expect("wait for the managed view");
     assert_eq!(startup.health.queue_age_stale_ms, 4321);
-    assert!(startup.legacy_file.is_none());
     assert!(waiting.is_empty());
 }
 
@@ -338,24 +338,18 @@ async fn settings_startup_retries_a_config_get_whose_reply_never_came() {
     })
     .await
     .unwrap();
-    let (startup, _) = result.expect("the managed view, not the legacy file");
+    let (startup, _) = result;
     assert_eq!(startup.health.queue_age_stale_ms, 4321);
 }
 
 #[tokio::test]
-async fn settings_declare_refusal_selects_fallback_and_a_later_view_clears_degradation() {
+async fn settings_declare_refusal_waits_for_a_complete_view() {
     let (writer, mut sent) = mpsc::channel(8);
     let session = Session::new(PROTOCOL_VERSION);
-    let (applied, mut live) = tokio::sync::watch::channel(LiveSettings::default());
-    let (refused, ready) = tokio::sync::oneshot::channel();
     let driver = async {
-        assert!(session.initial(&writer, declaration()).await.is_err());
-        refused.send(()).unwrap();
-        session
-            .live(&writer, None, move |settings| {
-                applied.send_replace(settings);
-            })
-            .await;
+        let delivery = session.initial(&writer, declaration()).await;
+        session.mark_applied();
+        delivery
     };
     let daemon = async {
         let declare = sent.recv().await.unwrap();
@@ -367,13 +361,6 @@ async fn settings_declare_refusal_selects_fallback_and_a_later_view_clears_degra
             declare.header.corr,
             json!({"code":"schema_invalid","message":"invalid schema"})
         )));
-        ready.await.unwrap();
-        let mut health = HealthState::new().report();
-        session.annotate_health(&mut health);
-        assert_eq!(
-            serde_json::to_value(health).unwrap()["detail"],
-            "settings_declaration_refused: schema_invalid"
-        );
         assert!(session.take(&frame(
             FrameType::Push,
             0,
@@ -383,9 +370,17 @@ async fn settings_declare_refusal_selects_fallback_and_a_later_view_clears_degra
         )));
         let get = sent.recv().await.unwrap();
         assert_eq!(body(&get)["op"], "config.get");
+        let mut health = HealthState::new().report();
+        session.annotate_health(&mut health);
+        let health = serde_json::to_value(health).unwrap();
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(
+            health["detail"],
+            "settings_declaration_refused: schema_invalid; check `ck config status`."
+        );
         let mut view = ConfigView::new(
             1,
-            json!({"computer_use":{"app_use":"foreground"}}),
+            json!({"computer_use":{"app_use":"foreground","agent_cursor":false}}),
             Default::default(),
             vec![],
             ConfigStatus::Pending,
@@ -393,26 +388,27 @@ async fn settings_declare_refusal_selects_fallback_and_a_later_view_clears_degra
         view.attempt = Some(2);
         let reply = serde_json::to_value(ConfigGetReply::new(None, Some(view))).unwrap();
         assert!(session.take(&frame(FrameType::Response, 0, 0, get.header.corr, reply)));
-        live.changed().await.unwrap();
-        assert_eq!(
-            *live.borrow(),
-            LiveSettings {
-                app_use: cerebellum_core::config::AppUse::Foreground,
-                approved: true
-            }
-        );
-        let report = sent.recv().await.unwrap();
-        let applied: ConfigAppliedRequest = serde_json::from_slice(&report.body).unwrap();
-        assert!(applied.result.is_ack());
-        let mut health = HealthState::new().report();
-        session.annotate_health(&mut health);
-        assert_eq!(serde_json::to_value(health).unwrap()["status"], "ok");
     };
-    tokio::time::timeout(Duration::from_secs(2), async {
-        tokio::select! { () = daemon => {}, () = driver => panic!("live watcher exited") }
+    let ((startup, report), ()) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(driver, daemon)
     })
     .await
     .unwrap();
+    assert!(
+        !startup.agent_cursor,
+        "restart-only settings must also be applied"
+    );
+    assert_eq!(
+        startup.live,
+        LiveSettings {
+            app_use: cerebellum_core::config::AppUse::Foreground,
+            approved: true
+        }
+    );
+    assert!(report.unwrap().result.is_ack());
+    let mut health = HealthState::new().report();
+    session.annotate_health(&mut health);
+    assert_eq!(serde_json::to_value(health).unwrap()["status"], "ok");
 }
 
 #[tokio::test]

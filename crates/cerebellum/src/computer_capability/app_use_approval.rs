@@ -62,12 +62,6 @@ impl Approval {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn approve_fixture(&self) {
-        let mut state = self.lock();
-        state.approved = state.observed;
-    }
-
     pub(super) async fn resolve(&self, mode: AppUse, cancel: &crate::CancelHandle) -> AppUse {
         if mode == AppUse::Background {
             return mode;

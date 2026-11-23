@@ -135,32 +135,6 @@ impl PreviewCapturer for CountingCapture {
     }
 }
 
-/// A config file holding one `app_use`, never changing.
-struct FixedConfig(&'static str);
-
-impl super::app_use::ConfigFiles for FixedConfig {
-    fn modified(&self, _path: &std::path::Path) -> std::io::Result<std::time::SystemTime> {
-        Ok(std::time::SystemTime::UNIX_EPOCH)
-    }
-    fn read_to_string(&self, _path: &std::path::Path) -> std::io::Result<String> {
-        Ok(self.0.to_owned())
-    }
-}
-
-fn app_use_file(mode: AppUse) -> super::app_use::LiveAppUse {
-    let live = super::app_use::LiveAppUse::new(
-        Some(PathBuf::from(
-            "/fixture/home/.config/cortexkit/cerebellum.jsonc",
-        )),
-        Arc::new(FixedConfig(match mode {
-            AppUse::Foreground => r#"{"computer_use":{"app_use":"foreground"}}"#,
-            AppUse::Background => r#"{"computer_use":{"app_use":"background"}}"#,
-        })),
-    );
-    live.approve_fixture();
-    live
-}
-
 struct Rig {
     plane: Plane,
     desk: support::Desk,
@@ -271,7 +245,7 @@ async fn rig_with_app_use_admission(
     )
     .with_permission_liveness(support::live_permissions())
     .with_app_state_source(desk.source())
-    .with_app_use(app_use_file(mode))
+    .with_app_use(super::app_use::LiveAppUse::approved_for_test(mode))
     .with_app_use_fronting_admitted(app_use_fronting_admitted)
     .with_preview(PreviewPlane::new(
         captures.clone(),
@@ -300,7 +274,9 @@ async fn rig_with_app_use_admission(
 impl Rig {
     fn with_mode(self, mode: AppUse) -> Self {
         Self {
-            plane: self.plane.with_app_use(app_use_file(mode)),
+            plane: self
+                .plane
+                .with_app_use(super::app_use::LiveAppUse::approved_for_test(mode)),
             ..self
         }
     }

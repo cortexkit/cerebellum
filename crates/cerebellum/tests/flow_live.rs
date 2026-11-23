@@ -3,12 +3,19 @@
 
 #[path = "it/support/hang_guard.rs"]
 mod hang_guard;
+#[path = "support/managed_settings.rs"]
+mod managed_settings;
 mod support;
 use hang_guard::HANG_GUARD;
 
-use cortexkit_test_support::{fenced_subc_env_dir, ScratchDir};
+use cortexkit_test_support::fenced_subc_env_dir;
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity};
 use subc_protocol::scope::{ScopeAttributes, ScopeCarrier, ScopeKind, ScopeRecord, ScopeSelector};
 use subc_protocol::session::{ModuleControlRequestFromModule, ModuleControlResponseToModule};
@@ -208,7 +215,7 @@ fn module_binary() -> PathBuf {
 }
 
 struct Fixture {
-    directory: ScratchDir,
+    directory: PathBuf,
     computer_tools: Vec<String>,
     daemon: tokio::task::JoinHandle<Result<(), subc_daemon::bootstrap::BootstrapError>>,
     connection: subc_transport::ConnectionInfo,
@@ -224,12 +231,11 @@ impl Drop for Fixture {
 }
 
 impl Fixture {
-    async fn start(carrier: &str, standing: bool) -> Self {
+    async fn start(directory: PathBuf, carrier: &str, standing: bool) -> Self {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-        let directory = ScratchDir::new("cerebellum-flow-live");
-        let module_env = support::fenced_module_env(directory.path());
-        let data = fenced_subc_env_dir(directory.path(), "XDG_DATA_HOME");
-        let config = fenced_subc_env_dir(directory.path(), "XDG_CONFIG_HOME");
+        let module_env = support::fenced_module_env(&directory);
+        let data = fenced_subc_env_dir(&directory, "XDG_DATA_HOME");
+        let config = fenced_subc_env_dir(&directory, "XDG_CONFIG_HOME");
         let run = data.join("cortexkit/run");
         let browser_marker = directory.join("browser-launched");
         // An invalid executable is intentional: even the standing-grant control
@@ -271,6 +277,7 @@ impl Fixture {
             serde_json::to_vec(&json!({"version":1,"modules":modules})).unwrap(),
         )
         .unwrap();
+        fs::create_dir_all(data.join("cortexkit")).unwrap();
         let daemon_config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_path, 0)
             .with_privacy_trampoline(support::privacy_trampoline())
             .with_daemon_config_path(&daemon_path)
@@ -279,7 +286,9 @@ impl Fixture {
             .with_terminal_journal_path(run.join("terminals.jsonl"))
             .with_live_children_record(run.join("live-children.json"))
             .with_machine_id_path(data.join("cortexkit/machine-id"))
-            .with_scope_authority_owners(vec![OWNER.into()]);
+            .with_scope_authority_owners(vec![OWNER.into()])
+            .with_config_store_root(data.join("cortexkit/config-store"))
+            .unwrap();
         // Seed consent before the supervised module can read its grant store.
         if standing {
             use cerebellum::browser_standing_grants::{
@@ -404,12 +413,12 @@ impl Fixture {
     }
 
     fn journal(&self) -> PathBuf {
-        fenced_subc_env_dir(self.directory.path(), "XDG_DATA_HOME")
+        fenced_subc_env_dir(&self.directory, "XDG_DATA_HOME")
             .join("cortexkit/cerebellum/journal/call_records.jsonl")
     }
 }
 
-async fn read_nonce(directory: &std::path::Path, id: &str) -> String {
+async fn read_nonce(directory: &Path, id: &str) -> String {
     timeout(STARTUP, async {
         loop {
             if let Ok(n) = fs::read_to_string(directory.join(format!("{id}-nonce"))) {
@@ -488,13 +497,25 @@ fn navigation() -> Value {
 
 #[tokio::test]
 async fn basal_flow_admission_binds() {
-    let fixture = Fixture::start("basal", false).await;
+    let Some(home) = managed_settings::fenced_home("basal_flow_admission_binds", HANG_GUARD).await
+    else {
+        return;
+    };
+    let fixture = Fixture::start(home, "basal", false).await;
     let _ = route(&fixture, "basal").await;
 }
 
 #[tokio::test]
 async fn browser_flow_missing_grant_never_asks_or_launches() {
-    let fixture = Fixture::start("basal", false).await;
+    let Some(home) = managed_settings::fenced_home(
+        "browser_flow_missing_grant_never_asks_or_launches",
+        HANG_GUARD,
+    )
+    .await
+    else {
+        return;
+    };
+    let fixture = Fixture::start(home, "basal", false).await;
     let (mut client, channel, epoch) = route(&fixture, "basal").await;
     let body = call(&mut client, channel, epoch, "browser_use", navigation()).await;
     assert_eq!(body["outcome"], "consent_unavailable", "{body}");
@@ -508,7 +529,12 @@ async fn browser_flow_missing_grant_never_asks_or_launches() {
 
 #[tokio::test]
 async fn computer_flow_missing_grant_never_asks() {
-    let fixture = Fixture::start("basal", false).await;
+    let Some(home) =
+        managed_settings::fenced_home("computer_flow_missing_grant_never_asks", HANG_GUARD).await
+    else {
+        return;
+    };
+    let fixture = Fixture::start(home, "basal", false).await;
     if fixture.computer_tools.is_empty() {
         eprintln!("computer never-ask not exercised: the binary has no admitted computer capabilities; set CEREBELLUM_FLOW_E2E_BINARY to a release-attested build");
         return;
@@ -543,7 +569,15 @@ async fn computer_flow_missing_grant_never_asks() {
     ignore = "production hardware identity for standing grants is only available on macOS"
 )]
 async fn standing_owner_grant_gets_past_consent_without_asking() {
-    let fixture = Fixture::start("basal", true).await;
+    let Some(home) = managed_settings::fenced_home(
+        "standing_owner_grant_gets_past_consent_without_asking",
+        HANG_GUARD,
+    )
+    .await
+    else {
+        return;
+    };
+    let fixture = Fixture::start(home, "basal", true).await;
     let (mut client, channel, epoch) = route(&fixture, "basal").await;
     let body = call(&mut client, channel, epoch, "browser_use", navigation()).await;
     assert_ne!(body["outcome"], "consent_unavailable", "{body}");
@@ -559,7 +593,13 @@ async fn standing_owner_grant_gets_past_consent_without_asking() {
 
 #[tokio::test]
 async fn wrong_carrier_broca_is_refused_by_cerebellum() {
-    let fixture = Fixture::start("broca", false).await;
+    let Some(home) =
+        managed_settings::fenced_home("wrong_carrier_broca_is_refused_by_cerebellum", HANG_GUARD)
+            .await
+    else {
+        return;
+    };
+    let fixture = Fixture::start(home, "broca", false).await;
     let (_, reply) = fixture.open("broca", true).await;
     assert_eq!(reply.header.ty, FrameType::Error);
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
@@ -568,7 +608,13 @@ async fn wrong_carrier_broca_is_refused_by_cerebellum() {
 
 #[tokio::test]
 async fn plain_basal_route_is_principal_denied_at_bind() {
-    let fixture = Fixture::start("basal", false).await;
+    let Some(home) =
+        managed_settings::fenced_home("plain_basal_route_is_principal_denied_at_bind", HANG_GUARD)
+            .await
+    else {
+        return;
+    };
+    let fixture = Fixture::start(home, "basal", false).await;
     let (_, reply) = fixture.open("basal", false).await;
     assert_eq!(reply.header.ty, FrameType::Error);
     let body: Value = serde_json::from_slice(&reply.body).unwrap();

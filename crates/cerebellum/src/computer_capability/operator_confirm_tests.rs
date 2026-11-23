@@ -102,14 +102,11 @@ async fn dropping_a_sent_request_withdraws_even_when_the_egress_queue_is_full() 
 #[cfg(unix)]
 mod daemon {
     use super::*;
-    use crate::computer_capability::app_use::{ConfigFiles, LiveAppUse};
+    use crate::computer_capability::app_use::LiveAppUse;
+    use crate::settings::LiveSettings;
     use cerebellum_core::config::AppUse;
     use cortexkit_test_support::ScratchDir;
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-        time::Duration,
-    };
+    use std::{fs, path::Path, time::Duration};
     use subc_control::ClientControlRequest;
     use subc_daemon::router::{FrameSink, OutboundFrame};
     use subc_daemon::{
@@ -177,14 +174,13 @@ mod daemon {
         assert!(script_executable(Path::new("ckdev-cerebellum-tests")));
     }
 
-    struct Files;
-    impl ConfigFiles for Files {
-        fn modified(&self, path: &Path) -> std::io::Result<std::time::SystemTime> {
-            fs::metadata(path)?.modified()
-        }
-        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
-            fs::read_to_string(path)
-        }
+    fn unstamped_foreground() -> LiveAppUse {
+        let live = LiveAppUse::default();
+        live.apply(LiveSettings {
+            app_use: AppUse::Foreground,
+            approved: false,
+        });
+        live
     }
 
     struct Fixture {
@@ -195,7 +191,6 @@ mod daemon {
         handler: Arc<ControlHandler>,
         client: RouteCtx,
         client_route: (u16, u32),
-        config: PathBuf,
         module_egress: mpsc::Sender<OutboundFrame>,
         responses: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         reply_received: tokio::sync::watch::Sender<u64>,
@@ -370,12 +365,6 @@ mod daemon {
                     }
                 })
             };
-            let config = std::env::var_os("CEREBELLUM_OPERATOR_CONFIG")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| root.join("cerebellum.jsonc"));
-            if !config.exists() {
-                fs::write(&config, r#"{"computer_use":{"app_use":"foreground"}}"#).unwrap();
-            }
             Self {
                 root,
                 call: Call {
@@ -388,15 +377,10 @@ mod daemon {
                 handler,
                 client,
                 client_route,
-                config,
                 module_egress,
                 responses,
                 reply_received,
             }
-        }
-
-        fn live(&self) -> LiveAppUse {
-            LiveAppUse::new(Some(self.config.clone()), Arc::new(Files))
         }
 
         async fn mode(
@@ -408,7 +392,7 @@ mod daemon {
                 .scope(
                     std::cell::RefCell::new(None),
                     CALL.scope(self.call.clone(), async {
-                        let mode = live.current_settings().unwrap();
+                        let mode = live.settings_for_call();
                         let mode = live.approved_mode(mode, cancel).await;
                         (
                             mode,
@@ -465,52 +449,35 @@ mod daemon {
     }
 
     async fn approvals_and_changes() {
-        let f = Fixture::start("approve\napprove\napprove\n").await;
-        let live = f.live();
+        let f = Fixture::start("approve\napprove\n").await;
+        let live = unstamped_foreground();
         let cancel = crate::CancelHandle::pending();
         assert_eq!(f.mode(&live, &cancel).await, (AppUse::Foreground, None));
         assert_eq!(f.mode(&live, &cancel).await, (AppUse::Foreground, None));
         assert_eq!(f.prompts(), 1, "approval is reused by the second call");
-        let set = |mode: &str, tick| {
-            fs::write(
-                &f.config,
-                format!(r#"{{"computer_use":{{"app_use":"{mode}"}}}}"#),
-            )
-            .unwrap();
-            fs::File::open(&f.config)
-                .unwrap()
-                .set_times(
-                    std::fs::FileTimes::new()
-                        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(tick)),
-                )
-                .unwrap();
+        let deliver = |app_use| {
+            live.apply(LiveSettings {
+                app_use,
+                approved: false,
+            })
         };
-        set("foreground", 1);
+        deliver(AppUse::Foreground);
         assert_eq!(f.mode(&live, &cancel).await.0, AppUse::Foreground);
-        assert_eq!(
-            f.prompts(),
-            1,
-            "approval keys the parsed value, not the file's bytes or timestamp"
-        );
-        set("background", 2);
+        assert_eq!(f.prompts(), 1, "redelivering the same mode keeps approval");
+        deliver(AppUse::Background);
         assert_eq!(f.mode(&live, &cancel).await, (AppUse::Background, None));
         assert_eq!(f.prompts(), 1, "narrowing never asks");
-        set("foreground", 3);
+        deliver(AppUse::Foreground);
         assert_eq!(f.mode(&live, &cancel).await.0, AppUse::Foreground);
         assert_eq!(f.prompts(), 2, "switching back needs fresh approval");
-        fs::write(&f.config, "not JSON").unwrap();
-        assert!(live.current().is_err());
-        set("foreground", 4);
-        assert_eq!(f.mode(&live, &cancel).await.0, AppUse::Foreground);
-        assert_eq!(f.prompts(), 3, "an unknown setting also ends approval");
     }
 
     async fn managed_settings_only_skip_confirmation_for_stamped_modes() {
-        use crate::settings::{config_apply, LiveSettings};
+        use crate::settings::config_apply;
         use subc_protocol::config::{ConfigStatus, ConfigView};
 
         let f = Fixture::start("approve\napprove\n").await;
-        let live = LiveAppUse::without_file();
+        let live = LiveAppUse::default();
         let cancel = crate::CancelHandle::pending();
         let foreground = |status| {
             config_apply(&ConfigView::new(
@@ -535,7 +502,7 @@ mod daemon {
         assert_eq!(f.mode(&live, &cancel).await, (AppUse::Foreground, None));
         assert_eq!(f.prompts(), 1);
 
-        let restarted = LiveAppUse::without_file();
+        let restarted = LiveAppUse::default();
         restarted.apply(foreground(ConfigStatus::Unstamped));
         assert_eq!(
             f.mode(&restarted, &cancel).await,
@@ -544,7 +511,7 @@ mod daemon {
         assert_eq!(f.prompts(), 2);
 
         let f = Fixture::start("decline\n").await;
-        let live = LiveAppUse::without_file();
+        let live = LiveAppUse::default();
         live.apply(foreground(ConfigStatus::Unstamped));
         let (mode, note) = f.mode(&live, &cancel).await;
         assert_eq!(mode, AppUse::Background);
@@ -558,7 +525,7 @@ mod daemon {
     async fn failures_and_deadlines() {
         let cancel = crate::CancelHandle::pending();
         let f = Fixture::start("decline\napprove\n").await;
-        let live = f.live();
+        let live = unstamped_foreground();
         let (mode, note) = f.mode(&live, &cancel).await;
         assert_eq!(mode, AppUse::Background);
         assert!(note.unwrap().contains("declined"));
@@ -572,13 +539,13 @@ mod daemon {
         assert_eq!(f.prompts(), 1, "the decline hold does not re-prompt");
 
         let f = Fixture::start("unavailable\n").await;
-        let (mode, note) = f.mode(&f.live(), &cancel).await;
+        let (mode, note) = f.mode(&unstamped_foreground(), &cancel).await;
         assert_eq!(mode, AppUse::Background);
         assert!(note.unwrap().contains("presence is unavailable"));
         assert_eq!(f.prompts(), 1);
 
         let f = Fixture::start("approve\n").await;
-        let live = f.live();
+        let live = unstamped_foreground();
         let (mode, note) = crate::call_context::CALL_DEADLINE
             .scope(
                 tokio::time::Instant::now() + Duration::from_secs(20),
@@ -599,7 +566,7 @@ mod daemon {
 
     async fn concurrent_calls_share_one_prompt() {
         let f = Fixture::start("approve when $RELEASE\n").await;
-        let live = f.live();
+        let live = unstamped_foreground();
         let first = crate::CancelHandle::pending();
         let second = crate::CancelHandle::pending();
         let calls = async { tokio::join!(f.mode(&live, &first), f.mode(&live, &second)) };
@@ -617,7 +584,7 @@ mod daemon {
 
     async fn cancel_and_goodbye_withdraw() {
         let f = Fixture::start("hang\napprove\n").await;
-        let live = f.live();
+        let live = unstamped_foreground();
         let cancel = crate::CancelHandle::pending();
         let waiting = f.mode(&live, &cancel);
         tokio::pin!(waiting);
@@ -666,7 +633,7 @@ mod daemon {
         assert_eq!(f.prompts(), 2);
 
         let f = Fixture::start("hang\n").await;
-        let live = f.live();
+        let live = unstamped_foreground();
         let cancel = crate::CancelHandle::pending();
         let waiting = f.mode(&live, &cancel);
         tokio::pin!(waiting);
@@ -698,18 +665,12 @@ mod daemon {
     fn operator_confirm_daemon_scenarios() {
         if std::env::var_os("CEREBELLUM_OPERATOR_CHILD").is_none() {
             let binary = cortexkit_test_support::ckdev_binary(std::env::current_exe().unwrap());
-            let restart = ScratchDir::new("cerebellum-operator-restart");
-            let config = restart.join("cerebellum.jsonc");
-            fs::write(&config, r#"{"computer_use":{"app_use":"foreground"}}"#).unwrap();
             for scenario in ["all", "restart", "restart"] {
-                let mut command = std::process::Command::new(&binary);
-                command
+                let status = std::process::Command::new(&binary)
                     .args(["--exact", TEST_NAME, "--nocapture"])
-                    .env("CEREBELLUM_OPERATOR_CHILD", scenario);
-                if scenario == "restart" {
-                    command.env("CEREBELLUM_OPERATOR_CONFIG", &config);
-                }
-                let status = command.status().unwrap();
+                    .env("CEREBELLUM_OPERATOR_CHILD", scenario)
+                    .status()
+                    .unwrap();
                 assert!(status.success(), "operator scenario {scenario} failed");
             }
             return;
@@ -725,7 +686,9 @@ mod daemon {
                 if std::env::var("CEREBELLUM_OPERATOR_CHILD").unwrap() == "restart" {
                     let f = Fixture::start("approve\n").await;
                     assert_eq!(
-                        f.mode(&f.live(), &crate::CancelHandle::pending()).await.0,
+                        f.mode(&unstamped_foreground(), &crate::CancelHandle::pending())
+                            .await
+                            .0,
                         AppUse::Foreground
                     );
                     assert_eq!(

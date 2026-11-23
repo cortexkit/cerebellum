@@ -40,17 +40,16 @@ pub(super) async fn run(
     };
     let (mut read_half, write_half) = tokio::io::split(stream);
     let deadlines = Arc::new(ConnectionDeadlines::default());
-    let mut preparing: Option<JoinHandle<Result<Preparation, ModuleError>>> = None;
+    let mut preparing: Option<JoinHandle<Preparation>> = None;
     let mut ready: Option<Prepared> = None;
     let preparing_slot = &mut preparing;
     let ready_slot = &mut ready;
     let serving = drive_connection(write_half, deadlines.clone(), |writer| async move {
-        let path = if real_module {
-            cerebellum_core::config::config_path()
-        } else {
-            None
-        };
-        let declaration = path.as_deref().and_then(settings::config_declaration);
+        let declaration = real_module
+            .then(cerebellum_core::config::config_path)
+            .flatten()
+            .as_deref()
+            .and_then(settings::config_declaration);
         let can_declare = declaration.is_some();
         send_hello(&writer, &config, real_module, can_declare).await?;
         let ack = expect_hello_ack(&mut read_half).await?;
@@ -59,34 +58,23 @@ pub(super) async fn run(
                 .subc_capabilities
                 .iter()
                 .any(|cap| cap == CONFIG_GATE_CAPABILITY);
-        let session = managed.then(|| Session::new(ack.negotiated_ver));
+        let session = real_module.then(|| Session::new(ack.negotiated_ver));
         let mut incoming = Incoming::new(&mut read_half, read_one);
         let mut waiting = VecDeque::new();
         let module_id = config.module_id.clone();
         let startup = async {
-            let delivery = if let (Some(session), Some(declaration)) = (&session, declaration) {
-                Some(session.initial(&writer, declaration).await)
-            } else {
-                None
+            let (startup, report) = match (&session, declaration.filter(|_| managed)) {
+                (Some(session), Some(declaration)) => {
+                    let (settings, report) = session.initial(&writer, declaration).await;
+                    (Some(settings), report)
+                }
+                (Some(_), None) => std::future::pending().await,
+                (None, _) => (None, None),
             };
-            let managed_delivery = matches!(delivery, Some(Ok(_)));
-            let old_daemon = !ack
-                .subc_capabilities
-                .iter()
-                .any(|cap| cap == CONFIG_GATE_CAPABILITY);
             let output = preparing_slot
                 .insert(tokio::task::spawn_blocking(move || {
-                    let (startup, report) = match delivery {
-                        Some(Ok((settings, report))) => (Some(settings), report),
-                        Some(Err(())) => (Some(settings::config_files(path.as_deref())?), None),
-                        None if real_module && old_daemon => {
-                            (Some(settings::config_files(path.as_deref())?), None)
-                        }
-                        None => (None, None),
-                    };
                     let mut config = config;
                     let mut live = LiveSettings::default();
-                    let mut legacy = None;
                     if let Some(mut startup) = startup {
                         startup.validate_browser();
                         let StartupSettings {
@@ -94,13 +82,11 @@ pub(super) async fn run(
                             agent_cursor,
                             browser,
                             live: effective,
-                            legacy_file,
                         } = startup;
                         config.health = health;
                         config.agent_cursor = agent_cursor;
                         config.browser = browser;
                         live = effective;
-                        legacy = legacy_file;
                     }
                     let mut prepared = prepare_module(&config, prepare, real_module);
                     deadlines.install_display(Arc::clone(&prepared.planes.routes.display));
@@ -108,20 +94,16 @@ pub(super) async fn run(
                     if real_module {
                         prepared.planes.runtime_browser = Some(config.browser.clone());
                         apply_live(&prepared.planes, live);
-                        install_legacy_source(&prepared.planes, legacy);
                     }
-                    Ok((config, prepared, report))
+                    (config, prepared, report)
                 }))
                 .await;
             preparing_slot.take();
             let output = output.map_err(|error| ModuleError::Message(error.to_string()))?;
-            if let Some(session) = session
-                .as_ref()
-                .filter(|_| managed_delivery && output.is_ok())
-            {
+            if let Some(session) = &session {
                 session.mark_applied();
             }
-            output
+            Ok(output)
         };
         let result = wait_for_startup(
             &mut incoming,
@@ -164,7 +146,7 @@ pub(super) async fn run(
     // the connection ended or SIGTERM arrived before it could publish planes.
     let cleanup = async {
         if let Some(worker) = preparing.take() {
-            if let Ok(Ok((_, prepared, _))) = worker.await {
+            if let Ok((_, prepared, _)) = worker.await {
                 ready = Some(prepared);
             }
         }
@@ -214,7 +196,7 @@ where
             () = &mut timeout, if !expired => {
                 expired = true;
                 for frame in waiting.drain(..) {
-                    refuse_early(frame, writer).await?;
+                    refuse_early(frame, writer, session.is_some()).await?;
                 }
             }
             incoming = incoming.read() => {
@@ -249,11 +231,11 @@ where
                     // later cancels and route-close messages in arrival order.
                     expired = true;
                     for queued in waiting.drain(..) {
-                        refuse_early(queued, writer).await?;
+                        refuse_early(queued, writer, session.is_some()).await?;
                     }
                 }
                 if expired {
-                    refuse_early(frame, writer).await?;
+                    refuse_early(frame, writer, session.is_some()).await?;
                 } else {
                     waiting.push_back(frame);
                 }
@@ -270,7 +252,11 @@ fn is_draining(frame: &Frame) -> bool {
         )
 }
 
-async fn refuse_early(frame: Frame, writer: &mpsc::Sender<Frame>) -> Result<(), ModuleError> {
+async fn refuse_early(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    waiting_for_settings: bool,
+) -> Result<(), ModuleError> {
     if frame.header.ty != FrameType::Request {
         return Ok(());
     }
@@ -282,7 +268,11 @@ async fn refuse_early(frame: Frame, writer: &mpsc::Sender<Frame>) -> Result<(), 
         header.epoch,
         header.corr,
         "not_ready",
-        "Cerebellum is still initializing; retry this request later.",
+        if waiting_for_settings {
+            "Cerebellum is waiting for managed settings; check `ck config status` before retrying."
+        } else {
+            "Cerebellum is still initializing; retry this request later."
+        },
     )
     .await
 }
@@ -322,15 +312,6 @@ fn apply_live(planes: &Planes, settings: LiveSettings) {
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = (planes, settings);
-}
-
-fn install_legacy_source(planes: &Planes, path: Option<PathBuf>) {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    if let (Ok(computer), Some(path)) = (&planes.computer, path) {
-        computer.read_app_use_from_config_file(path);
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let _ = (planes, path);
 }
 
 #[cfg(test)]

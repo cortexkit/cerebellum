@@ -1,7 +1,7 @@
 //! Cerebellum's user-only managed settings. Reviews use immutable snapshots;
 //! only the delivery path can touch runtime state or probe the browser binary.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::LazyLock;
 
 use cerebellum_core::config::{self, AppUse, ConfigReason, HealthConfig};
@@ -16,7 +16,7 @@ use crate::browser_config::{
     self, BrowserConfigReason, MAX_ACTION_DEADLINE_MS, MAX_LAUNCH_DEADLINE_MS,
     MAX_TERMINATION_DEADLINE_MS,
 };
-use crate::{BrowserSurface, ModuleError};
+use crate::BrowserSurface;
 
 mod session;
 pub(crate) use session::Session;
@@ -90,6 +90,8 @@ fn schema_declaration() -> Value {
     })
 }
 
+/// Tell the daemon where to find the user's configuration file. Cerebellum
+/// consumes the resolved settings sent by the daemon.
 pub(crate) fn config_declaration(path: &Path) -> Option<ConfigDeclareRequest> {
     Some(ConfigDeclareRequest::new(
         SCHEMA.0.clone(),
@@ -254,7 +256,6 @@ pub(crate) struct StartupSettings {
     pub(crate) agent_cursor: bool,
     pub(crate) browser: BrowserSurface,
     pub(crate) live: LiveSettings,
-    pub(crate) legacy_file: Option<PathBuf>,
 }
 
 fn validate_view(view: &ConfigView) -> Result<(), &'static str> {
@@ -307,7 +308,6 @@ impl StartupSettings {
                 app_use: core.computer_use.app_use,
                 approved: matches!(view.status, ConfigStatus::Active | ConfigStatus::Pending),
             },
-            legacy_file: None,
         })
     }
 
@@ -318,49 +318,6 @@ impl StartupSettings {
             }
         }
     }
-}
-
-/// The pre-managed daemon leaves the original JSONC file in the module's care.
-/// The supplied path is explicit so fixtures never need the operator's file.
-pub(crate) fn config_files(path: Option<&Path>) -> Result<StartupSettings, ModuleError> {
-    let text = match path.map(std::fs::read_to_string).transpose() {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(ModuleError::Config(config::ConfigError {
-                field: "config",
-                reason: ConfigReason::Malformed(format!(
-                    "reading {}: {error}",
-                    path.expect("file was read").display()
-                )),
-            }))
-        }
-    };
-    let core = text
-        .as_deref()
-        .map(config::parse_config)
-        .transpose()
-        .map_err(ModuleError::Config)?
-        .unwrap_or_default();
-    let browser = match text
-        .as_deref()
-        .map(browser_config::parse_browser_config)
-        .transpose()
-    {
-        Ok(Some(Some(browser))) => BrowserSurface::Available(browser),
-        Ok(_) => BrowserSurface::NotConfigured,
-        Err(error) => BrowserSurface::Refused(error),
-    };
-    Ok(StartupSettings {
-        health: core.health,
-        agent_cursor: core.computer_use.agent_cursor,
-        browser,
-        live: LiveSettings {
-            app_use: core.computer_use.app_use,
-            approved: false,
-        },
-        legacy_file: path.map(Path::to_path_buf),
-    })
 }
 
 #[cfg(test)]

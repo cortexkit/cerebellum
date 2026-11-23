@@ -169,20 +169,6 @@ impl std::fmt::Display for BrowserConfigError {
 
 impl std::error::Error for BrowserConfigError {}
 
-pub fn load_browser_config_file() -> Result<Option<BrowserConfig>, BrowserConfigError> {
-    let Some(path) = cerebellum_core::config::config_path() else {
-        return Ok(None);
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => parse_browser_config(&text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(BrowserConfigError {
-            field: "config".to_string(),
-            reason: BrowserConfigReason::Malformed(format!("reading {}: {error}", path.display())),
-        }),
-    }
-}
-
 pub fn validate_browser_config_at_load(config: &BrowserConfig) -> Result<(), BrowserConfigError> {
     #[cfg(target_os = "linux")]
     {

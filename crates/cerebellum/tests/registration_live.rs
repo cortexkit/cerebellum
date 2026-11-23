@@ -19,6 +19,8 @@
 
 #[path = "it/support/hang_guard.rs"]
 mod hang_guard;
+#[path = "support/managed_settings.rs"]
+mod managed_settings;
 mod support;
 use hang_guard::HANG_GUARD;
 
@@ -297,11 +299,6 @@ struct Fixture {
     ckbus: Registered,
 }
 
-struct ManagedSettingsFixture<'a> {
-    homes: &'a Path,
-    queue_age_stale_ms: u64,
-}
-
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.daemon.abort();
@@ -326,13 +323,11 @@ async fn read_nonce(directory: &std::path::Path, id: &str) -> String {
 impl Fixture {
     async fn start(
         registration_channel: bool,
-        managed: Option<ManagedSettingsFixture<'_>>,
+        homes: &Path,
+        queue_age_stale_ms: Option<u64>,
     ) -> Self {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         let directory = ScratchDir::new("cerebellum-registration-live");
-        let homes = managed
-            .as_ref()
-            .map_or(directory.path(), |managed| managed.homes);
         let module_env = support::fenced_module_env(homes);
         let data = fenced_subc_env_dir(homes, "XDG_DATA_HOME");
         let config = fenced_subc_env_dir(homes, "XDG_CONFIG_HOME");
@@ -346,8 +341,8 @@ impl Fixture {
                 "browser_idle_timeout_ms":60000, "browser_exit_observation_deadline_ms":1000,
                 "navigation_settle_deadline_ms":1000
         }});
-        if let Some(managed) = &managed {
-            module_settings["health"] = json!({"queue_age_stale_ms": managed.queue_age_stale_ms});
+        if let Some(queue_age_stale_ms) = queue_age_stale_ms {
+            module_settings["health"] = json!({"queue_age_stale_ms": queue_age_stale_ms});
         }
         fs::write(
             config.join("cortexkit/cerebellum.jsonc"),
@@ -405,6 +400,7 @@ impl Fixture {
             .unwrap(),
         )
         .unwrap();
+        fs::create_dir_all(data.join("cortexkit")).unwrap();
         let daemon_config = subc_daemon::bootstrap::BootstrapConfig::new(&connection_path, 0)
             .with_privacy_trampoline(support::privacy_trampoline())
             .with_daemon_config_path(&daemon_path)
@@ -413,15 +409,9 @@ impl Fixture {
             .with_terminal_journal_path(run.join("terminals.jsonl"))
             .with_live_children_record(run.join("live-children.json"))
             .with_machine_id_path(data.join("cortexkit/machine-id"))
-            .with_scope_authority_owners(vec![OWNER.into()]);
-        let daemon_config = if managed.is_some() {
-            fs::create_dir_all(data.join("cortexkit")).unwrap();
-            daemon_config
-                .with_config_store_root(data.join("cortexkit/config-store"))
-                .unwrap()
-        } else {
-            daemon_config
-        };
+            .with_scope_authority_owners(vec![OWNER.into()])
+            .with_config_store_root(data.join("cortexkit/config-store"))
+            .unwrap();
         let daemon = tokio::spawn(subc_daemon::bootstrap::run_with_config(daemon_config));
         let connection = timeout(HANG_GUARD, async {
             loop {
@@ -621,8 +611,11 @@ impl Fixture {
 }
 
 /// Binds, health and an outbound route, all answered promptly.
-async fn serves_binds_health_and_outbound_routes(registration_channel: bool) {
-    let fixture = std::sync::Arc::new(Fixture::start(registration_channel, None).await);
+async fn serves_binds_health_and_outbound_routes(test: &str, registration_channel: bool) {
+    let Some(homes) = managed_settings::fenced_home(test, HANG_GUARD).await else {
+        return;
+    };
+    let fixture = std::sync::Arc::new(Fixture::start(registration_channel, &homes, None).await);
     let path = if registration_channel {
         "channel"
     } else {
@@ -760,12 +753,20 @@ async fn browser_status(client: &mut TcpStream, channel: u16, epoch: u32) -> (Fr
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn channel_launch_answers_binds_health_and_opens_claimed_routes() {
-    serves_binds_health_and_outbound_routes(true).await;
+    serves_binds_health_and_outbound_routes(
+        "channel_launch_answers_binds_health_and_opens_claimed_routes",
+        true,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nonce_launch_answers_binds_health_and_opens_attested_routes() {
-    serves_binds_health_and_outbound_routes(false).await;
+    serves_binds_health_and_outbound_routes(
+        "nonce_launch_answers_binds_health_and_opens_attested_routes",
+        false,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -779,61 +780,23 @@ async fn managed_settings_view_applies_before_serving_tools() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn managed_settings_capture_refusal_serves_tools_with_legacy_settings() {
+async fn managed_settings_capture_refusal_does_not_apply_legacy_settings() {
     // The legacy parser accepts this threshold, but the managed schema caps it at a day.
     check_managed_settings(
-        "managed_settings_capture_refusal_serves_tools_with_legacy_settings",
+        "managed_settings_capture_refusal_does_not_apply_legacy_settings",
         86_400_001,
         Some("settings_declaration_refused: value_invalid"),
     )
     .await;
 }
 
-// Relaunch in a separate process because the embedded daemon resolves its config home from the process environment.
 async fn check_managed_settings(test: &str, queue_age_stale_ms: u64, refusal: Option<&str>) {
-    const FIXTURE_HOME: &str = "CEREBELLUM_MANAGED_SETTINGS_FIXTURE_HOME";
-    let Some(homes) = std::env::var_os(FIXTURE_HOME) else {
-        let homes = ScratchDir::new("cerebellum-managed-settings");
-        let exe = support::daemon_binary(
-            "ckdev-cerebellum-settings",
-            std::env::current_exe().unwrap(),
-        );
-        let output = timeout(
-            HANG_GUARD,
-            tokio::process::Command::new(exe)
-                .args(["--exact", test, "--nocapture"])
-                .envs(cortexkit_test_support::fenced_subc_daemon_env(homes.path()))
-                .env(FIXTURE_HOME, homes.path())
-                // The daemon's settings store needs a trust anchor for its
-                // integrity seal. This makes the test daemon keep it in a
-                // file under the fenced home instead of the operator's
-                // keychain.
-                .env("SUBC_TEST_CONFIG_GATE", "1")
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .expect("fenced settings test finished within the hang guard")
-        .expect("run the fenced settings test");
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let Some(homes) = managed_settings::fenced_home(test, HANG_GUARD).await else {
         return;
     };
 
-    let fixture = Fixture::start(
-        false,
-        Some(ManagedSettingsFixture {
-            homes: Path::new(&homes),
-            queue_age_stale_ms,
-        }),
-    )
-    .await;
+    let fixture = Fixture::start(false, &homes, Some(queue_age_stale_ms)).await;
     let (_, route) = fixture.open_head(0).await;
-    let (mut client, channel, epoch) = route.expect("startup must reach tool serving");
     let (_, health) = fixture.health().await;
     assert_eq!(health["frame"], "Response", "{health}");
     assert_eq!(
@@ -843,20 +806,27 @@ async fn check_managed_settings(test: &str, queue_age_stale_ms: u64, refusal: Op
     );
     if let Some(refusal) = refusal {
         assert!(
-            health["detail"]
-                .as_str()
-                .is_some_and(|detail| detail.contains(refusal)),
+            health["detail"].as_str().is_some_and(
+                |detail| detail.contains(refusal) && detail.contains("ck config status")
+            ),
             "{health}"
         );
     }
-    // This non-default threshold is reported by the running module, not read
-    // back from the file. Combined with health status, it distinguishes a
-    // delivered view from the legacy fallback.
-    assert_eq!(
-        health["metrics"]["queueAgeThresholdSecs"],
-        queue_age_stale_ms / 1_000,
-        "{health}"
-    );
+    // Health reports the module's effective threshold, not the file's value.
+    let threshold = &health["metrics"]["queueAgeThresholdSecs"];
+    if refusal.is_some() {
+        assert_ne!(
+            threshold,
+            &(queue_age_stale_ms / 1_000),
+            "a refused declaration must not apply the legacy threshold: {health}"
+        );
+        let refusal = route.expect_err("no route may bind without accepted settings");
+        assert!(refusal.contains("not_ready"), "{refusal}");
+        return;
+    } else {
+        assert_eq!(threshold, &(queue_age_stale_ms / 1_000), "{health}");
+    }
+    let (mut client, channel, epoch) = route.expect("startup must reach tool serving");
     let (reply, _) = browser_status(&mut client, channel, epoch).await;
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
     assert_eq!(reply.header.ty, FrameType::Response, "{body}");
