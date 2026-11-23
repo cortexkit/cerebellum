@@ -104,6 +104,13 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
             }
             // Even a backend panic must return through the bracket's restore.
             captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(all(feature = "desk-probe", target_os = "macos"))]
+                crate::desk_probe::observe_picture_overlap(
+                    || check_visibility(freshness, grant, evidence, None, false),
+                    hooks.cutoff().and_then(|gate| gate.reserve_start()),
+                    &fence,
+                )?;
+                #[cfg(not(all(feature = "desk-probe", target_os = "macos")))]
                 check_visibility(freshness, grant, evidence, None, false)?;
                 // The visibility check and the window lookup can block. The
                 // fence is asked again immediately before the pixels are

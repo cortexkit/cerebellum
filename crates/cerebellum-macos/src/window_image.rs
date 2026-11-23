@@ -327,13 +327,123 @@ pub fn window_visibility_decision(
     pid: u32,
     id: u32,
 ) -> (crate::WindowVisibility, crate::VisibilityRule) {
+    #[cfg(feature = "desk-probe")]
+    if OVERLAP_WITNESS.with_borrow(Option::is_some) {
+        let sample = sample_window_overlap_for_probe(pid, id);
+        let decision = (sample.visibility, sample.rule);
+        OVERLAP_WITNESS.with_borrow_mut(|slot| *slot = Some(Some(sample)));
+        return decision;
+    }
     let Some(entries) = cursor_window_list() else {
         return (
             crate::WindowVisibility::Unknown,
             crate::VisibilityRule::MissingData,
         );
     };
-    window_visibility_with_entries(pid, id, &entries)
+    window_visibility_with_entries(
+        pid,
+        id,
+        &entries,
+        #[cfg(feature = "desk-probe")]
+        None,
+    )
+}
+
+#[cfg(feature = "desk-probe")]
+pub struct WindowOverlapSample {
+    pub pid: u32,
+    pub window_number: u32,
+    pub frontmost_normal_pid: Option<i32>,
+    pub started_at: std::time::Instant,
+    pub returned_at: std::time::Instant,
+    pub visibility: crate::WindowVisibility,
+    pub rule: crate::VisibilityRule,
+    pub rectangles: Vec<WindowOverlapRectangle>,
+}
+
+#[cfg(feature = "desk-probe")]
+pub struct WindowOverlapRectangle {
+    pub owner_pid: Option<u32>,
+    pub owner_name: Option<String>,
+    pub window_number: Option<u32>,
+    pub layer: i64,
+    pub bounds: [f64; 4],
+    pub alpha: f64,
+    pub sharing_state: Option<i64>,
+}
+
+#[cfg(feature = "desk-probe")]
+thread_local! {
+    // The outer option arms a witness capture on this thread; the inner one
+    // is empty if the picture read never queried CoreGraphics for a window ID.
+    static OVERLAP_WITNESS: std::cell::RefCell<Option<Option<WindowOverlapSample>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Collect the native visibility query's own evidence, not a second window list.
+#[cfg(feature = "desk-probe")]
+pub fn observe_window_overlap_for_probe<T>(
+    inspect: impl FnOnce() -> T,
+) -> (T, Option<WindowOverlapSample>) {
+    struct RestoreWitness(Option<Option<WindowOverlapSample>>);
+    impl Drop for RestoreWitness {
+        fn drop(&mut self) {
+            OVERLAP_WITNESS.with_borrow_mut(|slot| *slot = self.0.take());
+        }
+    }
+    let _restore = RestoreWitness(OVERLAP_WITNESS.replace(Some(None)));
+    let result = inspect();
+    (result, OVERLAP_WITNESS.take().flatten())
+}
+
+/// Read visibility and the nonzero-layer cover rectangles from one snapshot.
+/// No window title or pixels are fetched.
+#[cfg(feature = "desk-probe")]
+pub fn sample_window_overlap_for_probe(pid: u32, id: u32) -> WindowOverlapSample {
+    let started_at = std::time::Instant::now();
+    let mut frontmost_normal_pid = None;
+    let mut rectangles = Vec::new();
+    let (visibility, rule) = (|| {
+        let dictionaries = on_screen_window_dictionaries()?;
+        let entries = cursor_windows_from(&dictionaries)?;
+        frontmost_normal_pid = crate::window_visibility::frontmost_from_windows(&entries);
+        let mut cover = Vec::new();
+        let decision = window_visibility_with_entries(pid, id, &entries, Some(&mut cover));
+        rectangles.extend(cover.into_iter().filter_map(|slot| {
+            let entry = &entries[slot];
+            let dictionary = dictionaries.get(slot)?;
+            let bounds = entry.bounds?;
+            Some(WindowOverlapRectangle {
+                owner_pid: entry.pid,
+                owner_name: dictionary
+                    .get(&CFString::from_static_str("kCGWindowOwnerName"))
+                    .and_then(|name| name.downcast::<CFString>().ok())
+                    .map(|name| name.to_string()),
+                window_number: entry.id,
+                layer: entry.layer?,
+                bounds: [bounds.x, bounds.y, bounds.width, bounds.height],
+                alpha: entry.alpha?,
+                sharing_state: dictionary
+                    .get(&CFString::from_static_str("kCGWindowSharingState"))
+                    .and_then(|state| state.downcast::<CFNumber>().ok())
+                    .and_then(|state| state.as_i64()),
+            })
+        }));
+        Some(decision)
+    })()
+    .unwrap_or((
+        crate::WindowVisibility::Unknown,
+        crate::VisibilityRule::MissingData,
+    ));
+    WindowOverlapSample {
+        pid,
+        window_number: id,
+        frontmost_normal_pid,
+        started_at,
+        returned_at: std::time::Instant::now(),
+        visibility,
+        rule,
+        rectangles,
+    }
 }
 
 static CURSOR_GENERATION: std::sync::Mutex<Option<crate::ProcessGeneration>> =
@@ -348,14 +458,26 @@ pub fn register_cursor_generation(generation: Option<crate::ProcessGeneration>) 
         .unwrap_or_else(std::sync::PoisonError::into_inner) = generation;
 }
 
-fn cursor_window_list() -> Option<Vec<crate::window_visibility::Window>> {
-    use crate::window_visibility::{Rect, Window};
+type WindowDictionaries = CFArray<CFDictionary<CFString, CFType>>;
+
+fn on_screen_window_dictionaries() -> Option<CFRetained<WindowDictionaries>> {
     let windows = CGWindowListCopyWindowInfo(
         CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
         0,
     )?;
     // SAFETY: CoreGraphics documents this result as an array of string-keyed dictionaries.
-    let windows: &CFArray<CFDictionary<CFString, CFType>> = unsafe { windows.cast_unchecked() };
+    Some(unsafe { CFRetained::cast_unchecked(windows) })
+}
+
+fn cursor_window_list() -> Option<Vec<crate::window_visibility::Window>> {
+    let dictionaries = on_screen_window_dictionaries()?;
+    cursor_windows_from(&dictionaries)
+}
+
+fn cursor_windows_from(
+    windows: &WindowDictionaries,
+) -> Option<Vec<crate::window_visibility::Window>> {
+    use crate::window_visibility::{Rect, Window};
     let mut entries = Vec::new();
     let cursor = *CURSOR_GENERATION
         .lock()
@@ -592,6 +714,7 @@ fn window_visibility_with_entries(
     pid: u32,
     id: u32,
     entries: &[crate::window_visibility::Window],
+    #[cfg(feature = "desk-probe")] cover: Option<&mut Vec<usize>>,
 ) -> (crate::WindowVisibility, crate::VisibilityRule) {
     use crate::window_visibility::{visibility_from_windows, Rect};
     use crate::WindowVisibility;
@@ -618,6 +741,12 @@ fn window_visibility_with_entries(
             }
         })
         .collect::<Vec<_>>();
+    #[cfg(feature = "desk-probe")]
+    if let Some(cover) = cover {
+        return crate::window_visibility::visibility_from_windows_for_probe(
+            pid, id, entries, &displays, cover,
+        );
+    }
     visibility_from_windows(pid, id, entries, &displays)
 }
 

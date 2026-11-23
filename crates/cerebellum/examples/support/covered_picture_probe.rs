@@ -5,14 +5,95 @@ use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 use cerebellum::desk_probe::PictureBracketProbe;
+use cerebellum_computer::capture::AcquisitionFence;
 use cerebellum_computer::dispatch::{AbortReason, BracketStop};
+use cerebellum_macos::{WindowOverlapSample, WindowVisibility};
 use serde_json::{json, Value};
 
 const ROOT: &str = "/tmp/cereb-desk";
 const MAX_CALLS: usize = 12;
 const PICTURE_TARGET: usize = 3;
+const OVERLAP_INTERVAL: Duration = Duration::from_millis(5);
+
+pub(super) fn sample_overlap(
+    pid: u32,
+    generation: u64,
+    window: u32,
+    from: Instant,
+    cutoff: Instant,
+    fence: AcquisitionFence,
+    send: Sender<WindowOverlapSample>,
+) {
+    let Ok(normal_pid) = i32::try_from(pid) else {
+        return;
+    };
+    let still_target =
+        || cerebellum_macos::process_start_time_micros(pid) == Some(generation) && fence();
+    sample_overlap_until(
+        from,
+        cutoff,
+        |next| {
+            if !fence() {
+                return None;
+            }
+            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            if !still_target() || Instant::now() >= cutoff {
+                return None;
+            }
+            let sample = cerebellum_macos::sample_window_overlap_for_probe(pid, window);
+            (sample.frontmost_normal_pid == Some(normal_pid) && still_target()).then_some(sample)
+        },
+        |sample| send.send(sample).is_ok(),
+    );
+}
+
+fn sample_overlap_until(
+    from: Instant,
+    cutoff: Instant,
+    mut read_at: impl FnMut(Instant) -> Option<WindowOverlapSample>,
+    mut record: impl FnMut(WindowOverlapSample) -> bool,
+) {
+    let mut next = from + OVERLAP_INTERVAL;
+    while next < cutoff {
+        let Some(sample) = read_at(next) else { return };
+        if sample.returned_at >= cutoff {
+            return;
+        }
+        next = sample.started_at + OVERLAP_INTERVAL;
+        let uncovered = sample.visibility == WindowVisibility::FullyVisible;
+        if !record(sample) || uncovered {
+            return;
+        }
+    }
+}
+
+pub(super) fn overlap_sample_json(
+    sample: &WindowOverlapSample,
+    offset: impl Fn(Instant) -> Option<f64>,
+) -> Value {
+    json!({
+        "at_ms": offset(sample.started_at),
+        "read_ms": (sample.returned_at - sample.started_at).as_secs_f64() * 1000.0,
+        "target_pid": sample.pid,
+        "window_number": sample.window_number,
+        "frontmost_normal_pid": sample.frontmost_normal_pid,
+        "state": format!("{:?}", sample.visibility),
+        "rule": format!("{:?}", sample.rule),
+        "rectangles": sample.rectangles.iter().map(|rectangle| json!({
+            "owner_pid": rectangle.owner_pid,
+            "owner_name": rectangle.owner_name,
+            "window_number": rectangle.window_number,
+            "layer": rectangle.layer,
+            "bounds": rectangle.bounds,
+            "alpha": rectangle.alpha,
+            "sharing_state": rectangle.sharing_state,
+        })).collect::<Vec<_>>(),
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AttemptKind {
@@ -167,6 +248,76 @@ mod tests {
     use cerebellum_computer::dispatch::{
         AbortDecision, BracketReport, IdleGateRefusal, RestoreStatus,
     };
+
+    fn overlap_at(at: Instant, visibility: WindowVisibility) -> WindowOverlapSample {
+        WindowOverlapSample {
+            pid: 2,
+            window_number: 3,
+            frontmost_normal_pid: Some(2),
+            started_at: at,
+            returned_at: at + Duration::from_millis(1),
+            visibility,
+            rule: match visibility {
+                WindowVisibility::FullyVisible => {
+                    cerebellum_macos::VisibilityRule::NoLayerZeroOverlap
+                }
+                _ => cerebellum_macos::VisibilityRule::HigherLayerUnionCoverage,
+            },
+            rectangles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn overlap_sampling_records_first_uncovered_sample_and_stops() {
+        let start = Instant::now();
+        let mut reads = Vec::new();
+        let mut recorded = Vec::new();
+        sample_overlap_until(
+            start,
+            start + Duration::from_millis(50),
+            |at| {
+                reads.push((at - start).as_millis());
+                Some(overlap_at(
+                    at,
+                    if reads.len() == 2 {
+                        WindowVisibility::FullyVisible
+                    } else {
+                        WindowVisibility::Covered
+                    },
+                ))
+            },
+            |sample| {
+                recorded.push(sample.visibility);
+                true
+            },
+        );
+        assert_eq!(reads, [5, 10]);
+        assert_eq!(
+            recorded,
+            [WindowVisibility::Covered, WindowVisibility::FullyVisible]
+        );
+    }
+
+    #[test]
+    fn overlap_sampling_excludes_queries_returned_at_cutoff() {
+        let start = Instant::now();
+        let mut reads = Vec::new();
+        let mut recorded = Vec::new();
+        sample_overlap_until(
+            start,
+            start + Duration::from_millis(11),
+            |at| {
+                reads.push((at - start).as_millis());
+                Some(overlap_at(at, WindowVisibility::Covered))
+            },
+            |sample| {
+                recorded.push((sample.started_at - start).as_millis());
+                true
+            },
+        );
+        assert_eq!(reads, [5, 10]);
+        assert_eq!(recorded, [5]);
+    }
 
     fn bracket() -> BracketReport {
         BracketReport {

@@ -136,22 +136,106 @@ pub struct PictureBracketProbe {
     pub bracket: Option<cerebellum_computer::dispatch::BracketReport>,
     pub cutoff: Option<std::time::Instant>,
     pub deadline: Option<std::time::Instant>,
+    pub overlap_initial: Option<cerebellum_macos::WindowOverlapSample>,
+    pub overlap_samples: Vec<cerebellum_macos::WindowOverlapSample>,
+    pub overlap_wait: Option<Duration>,
 }
 
-static PICTURE_BRACKET: std::sync::Mutex<Option<PictureBracketProbe>> = std::sync::Mutex::new(None);
+type OverlapSampler = Box<
+    dyn FnOnce(
+            std::time::Instant,
+            std::time::Instant,
+            cerebellum_computer::capture::AcquisitionFence,
+            std::sync::mpsc::Sender<cerebellum_macos::WindowOverlapSample>,
+        ) + Send,
+>;
 
-pub fn begin_picture_bracket_probe() {
-    *PICTURE_BRACKET.lock().unwrap() = Some(PictureBracketProbe::default());
+struct ArmedPictureProbe {
+    report: PictureBracketProbe,
+    overlap_sampler: Option<OverlapSampler>,
+}
+
+static PICTURE_BRACKET: std::sync::Mutex<Option<ArmedPictureProbe>> = std::sync::Mutex::new(None);
+
+pub fn begin_picture_bracket_probe(overlap_sampler: OverlapSampler) {
+    *PICTURE_BRACKET.lock().unwrap() = Some(ArmedPictureProbe {
+        report: PictureBracketProbe::default(),
+        overlap_sampler: Some(overlap_sampler),
+    });
 }
 
 pub fn take_picture_bracket_probe() -> Option<PictureBracketProbe> {
-    PICTURE_BRACKET.lock().unwrap().take()
+    PICTURE_BRACKET
+        .lock()
+        .unwrap()
+        .take()
+        .map(|probe| probe.report)
 }
 
 pub(crate) fn note_picture_bracket_probe(update: impl FnOnce(&mut PictureBracketProbe)) {
     if let Some(probe) = PICTURE_BRACKET.lock().unwrap().as_mut() {
-        update(probe);
+        update(&mut probe.report);
     }
+}
+
+/// Observe the initial native query. Only a refused read may wait for more
+/// observations, and it still refuses if the window later becomes uncovered.
+pub(crate) fn observe_picture_overlap<T, E>(
+    check: impl FnOnce() -> Result<T, E>,
+    cutoff: Option<std::time::Instant>,
+    fence: &cerebellum_computer::capture::AcquisitionFence,
+) -> Result<T, E> {
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    let Some(sampler) = PICTURE_BRACKET
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(|probe| probe.overlap_sampler.take())
+    else {
+        return check();
+    };
+    let (result, first) = cerebellum_macos::observe_window_overlap_for_probe(check);
+    if result.is_ok() {
+        return result;
+    }
+    let from = first
+        .as_ref()
+        .map_or_else(Instant::now, |sample| sample.started_at);
+    let mut samples = Vec::new();
+    let wait = cutoff
+        .filter(|&cutoff| Instant::now() < cutoff && fence())
+        .map(|cutoff| {
+            let began = Instant::now();
+            let (send, receive) = mpsc::channel();
+            let worker_fence = Arc::clone(fence);
+            // A slow native query must not keep the bracket thread from restoring focus.
+            if std::thread::Builder::new()
+                .name("ck-desk-picture-overlap-sampler".into())
+                .spawn(move || sampler(from, cutoff, worker_fence, send))
+                .is_ok()
+            {
+                while fence() {
+                    let remaining = cutoff.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match receive.recv_timeout(remaining.min(Duration::from_millis(5))) {
+                        Ok(sample) if sample.returned_at < cutoff => samples.push(sample),
+                        Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            }
+            began.elapsed()
+        });
+    note_picture_bracket_probe(|probe| {
+        probe.overlap_initial = first;
+        probe.overlap_samples = samples;
+        probe.overlap_wait = wait;
+    });
+    result
 }
 
 #[cfg(test)]
