@@ -470,7 +470,7 @@
     "template": {
       "page": {
         "catalog": {
-          "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0",
+          "digest": "sha256:f144092fdccf4813f84f84f034356532bc6770e7ae63dce3bf0fc2f7600f20d3",
           "version": "1.1"
         },
         "executionDialect": "1.0",
@@ -481,7 +481,7 @@
       },
       "row": {
         "catalog": {
-          "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0",
+          "digest": "sha256:f144092fdccf4813f84f84f034356532bc6770e7ae63dce3bf0fc2f7600f20d3",
           "version": "1.1"
         },
         "executionDialect": "1.0",
@@ -491,7 +491,7 @@
         "source": "export const action = input.action == \"read_state\" ? \"Read app\" : input.action == \"press_element\" || input.action == \"press_point\" ? \"Press\" : input.action == \"write_text\" || input.action == \"type\" ? \"Type\" : input.action == \"keys\" ? \"Press keys\" : input.action == \"takeover_move\" ? \"Move pointer\" : input.action == \"takeover_drag\" ? \"Drag\" : input.action == \"takeover_scroll\" ? \"Scroll\" : input.action == \"wait\" ? \"Wait\" : input.action == \"list_apps\" ? \"List apps\" : input.action == \"open_app\" ? \"Open app\" : Replace(input.action, \"_\", \" \")\nexport const outcome = view.completion.outcome ?? view.record.outcome\nexport const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason\nexport const target = input.target ?? input.app ?? view.completion.app ?? view.record.app ?? \"\"\nexport const appName = !Contains(target, \" \") && Contains(target, \".\") ? Last(Split(target, \".\")) : target\n\n<Card appearance=\"clear\" direction=\"row\" gap=\"s\" align=\"center\">\n<TextContent text={action} maxLines={1} />\n<Slot width=\"fill\">\n<TextContent text={appName} size=\"small\" maxLines={1} />\n</Slot>\n<Slot width=\"short\">\n{outcome == \"held\" ? <Badge text={reason == \"login_handoff\" ? \"Signed out\" : \"Asked you\"} tone=\"neutral\" /> : outcome == \"error\" ? <Badge text=\"Refused\" tone=\"danger\" /> : outcome == \"partial\" ? <Badge text=\"Unknown\" tone=\"warning\" /> : outcome == \"success\" ? <Badge text=\"Done\" tone=\"neutral\" /> : null}\n</Slot>\n<Slot width=\"short\">\n{outcome == null && view.call.phase == \"running\" ? <Elapsed start={view.call.startedAtMs ?? now} /> : view.completion.durationMs == null && view.record.durationMs == null ? null : <TextContent text={FormatDuration(view.completion.durationMs ?? view.record.durationMs ?? 0)} size=\"small\" maxLines={1} />}\n</Slot>\n</Card>\n"
       }
     },
-    "template_revision": 5,
+    "template_revision": 6,
     "tool": {
       "input_schema": {
         "additionalProperties": false,

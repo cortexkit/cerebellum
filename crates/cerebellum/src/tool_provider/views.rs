@@ -29,11 +29,11 @@ const COMPUTER_PAGE: &str = include_str!("../../resources/tool-views/computer-pa
 /// (only additions, so templates check and draw the same), and the display
 /// server refuses a template naming a retired one.
 const TOOL_CATALOG_DIGEST: &str =
-    "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0";
+    "sha256:f144092fdccf4813f84f84f034356532bc6770e7ae63dce3bf0fc2f7600f20d3";
 
 /// Raised whenever a template changes. A pin's record schema and reads never
 /// change; the display server replaces a kept view only at a higher revision.
-pub(crate) const TEMPLATE_REVISION: u64 = 5;
+pub(crate) const TEMPLATE_REVISION: u64 = 6;
 
 fn template(profile: &str, source: &str) -> Value {
     json!({
