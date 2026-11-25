@@ -15,7 +15,7 @@ use super::{
 };
 use crate::capture::{
     BackendError, BackendTeardownProgress, BroadDisplayCaptureRequest, CaptureArtifact,
-    CaptureBackend, EnumeratedWindow, PendingVisionWindowFrame, PreparedVisionCapture,
+    CaptureBackend, EnumeratedWindow, FrontedVisionPreparer, PendingVisionWindowFrame,
     VisionWindowFrame, WindowCaptureFrame, WindowCaptureRequest, WindowChange, WindowChangeKind,
     WindowFrame,
 };
@@ -625,30 +625,31 @@ impl CaptureBackend for NativeCaptureBackend {
         pending_vision_frame(request, capture)
     }
 
-    fn prepare_fronted_vision(
-        &mut self,
-        request: &WindowCaptureRequest,
-    ) -> Result<Option<PreparedVisionCapture>, BackendError> {
-        let window_id = fronted_window_id(request)?;
-        let prepared =
-            cerebellum_macos::prepare_window_capture(window_id, self.timeout, None, &mut |owner| {
-                verify_grant(owner, &request.target).is_current()
-            })
-            .map_err(map_macos_capture_error)?;
-        let request = request.clone();
-        Ok(Some(Box::new(move |until, may_acquire| {
-            let until = until
-                .ok_or_else(|| BackendError::Capture("the front has no capture cutoff".into()))?;
-            let capture = capture_granted_window(window_id, &request.target, |accept_owner| {
-                prepared.capture_fronted(
-                    window_id,
-                    until,
-                    accept_owner,
-                    std::sync::Arc::clone(may_acquire),
-                )
-            })?;
-            pending_vision_frame(&request, capture)
-        })))
+    fn fronted_vision_preparer(&self) -> Option<FrontedVisionPreparer> {
+        let timeout = self.timeout;
+        Some(Box::new(move |request| {
+            let window_id = fronted_window_id(request)?;
+            let prepared =
+                cerebellum_macos::prepare_window_capture(window_id, timeout, None, &mut |owner| {
+                    verify_grant(owner, &request.target).is_current()
+                })
+                .map_err(map_macos_capture_error)?;
+            let request = request.clone();
+            Ok(Box::new(move |until, may_acquire| {
+                let until = until.ok_or_else(|| {
+                    BackendError::Capture("the front has no capture cutoff".into())
+                })?;
+                let capture = capture_granted_window(window_id, &request.target, |accept_owner| {
+                    prepared.capture_fronted(
+                        window_id,
+                        until,
+                        accept_owner,
+                        std::sync::Arc::clone(may_acquire),
+                    )
+                })?;
+                pending_vision_frame(&request, capture)
+            }))
+        }))
     }
 
     fn encode_window_for_vision(

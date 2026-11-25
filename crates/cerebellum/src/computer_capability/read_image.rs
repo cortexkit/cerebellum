@@ -58,12 +58,14 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
         .map_err(|_| ImageUnavailable::CaptureUnavailable)?;
     // Resolve ScreenCaptureKit resources before taking the person's focus.
     // Inside the bracket only current window facts and pixels are needed.
-    let prepared = controller
+    let mut prepared = controller
         .prepare_fronted_vision(now_ms)
         .map_err(image_capture_error)?;
     #[cfg(target_os = "macos")]
-    let mut prepared_visibility = freshness.prepare_fronted(grant, prepared.window_id())?;
-    let mut prepared = Some(prepared);
+    let mut prepared_visibility = match &prepared {
+        Some(window) => freshness.prepare_fronted(grant, window.window_id())?,
+        None => None,
+    };
     let mut captured = Err(ImageUnavailable::FrontingUnavailable);
     // Bringing the target forward changes which application has the person's
     // focus, so it is a mutation: the call's gate must still be open.
@@ -74,10 +76,12 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     if !driver.accept_fronted_dispatch_hooks(super::fronting::boxed_hooks(hooks)) {
         return Err(ImageUnavailable::FrontingUnavailable);
     }
-    // Whether this read may still acquire pixels: the cutoff has not fired
-    // and its absolute deadline has not passed, no cleanup has taken over
-    // restoring the person's application, and the call has not been stopped. Shared with the
-    // platform's capture completion, which may run after the request.
+    // Whether this read may still acquire pixels: the fronting bracket's picture
+    // cutoff (the point after which nothing new may be captured before the
+    // person's app is put back) has not fired and its absolute deadline has not
+    // passed, no cleanup has taken over restoring the person's application, and
+    // the call has not been stopped. Shared with the platform's capture
+    // completion, which may run after the request.
     let fence: cerebellum_computer::capture::AcquisitionFence = {
         let hooks = hooks.clone();
         let cancel = plan.cancel.clone();
@@ -142,10 +146,13 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
                 // once it has closed, no pixels are requested, and none are
                 // copied or returned even if ScreenCaptureKit completes a
                 // request already made.
-                let prepared = prepared
-                    .take()
-                    .ok_or(ImageUnavailable::CaptureUnavailable)?;
-                let pending = controller.capture_prepared_fronted_vision(prepared, cutoff, &fence);
+                let pending = match &mut prepared {
+                    Some(window) => {
+                        controller.capture_prepared_fronted_vision(window, cutoff, &fence)
+                    }
+                    None => controller
+                        .capture_frontmost_window_unencoded_for_vision_fenced(now_ms, &fence),
+                };
                 let pending = match pending {
                     Ok(pending) => pending,
                     Err(_) if !fence() => return Err(ImageUnavailable::FrontingBoundExceeded),
