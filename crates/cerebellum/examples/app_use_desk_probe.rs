@@ -57,8 +57,10 @@
 //! calls wait 5.1 s so cleanup can catch a switch to TextEdit that lands late.
 //! A front used only to measure restoration, or a callback that never checks
 //! window visibility, does not count toward the three. The attempt log records
-//! timing stamps and whether an image was returned. The summary counts each
-//! kind even if a safety check ends the run early.
+//! timing stamps and whether an image was returned. Timing is passive by
+//! default. `--covered-picture-overlap` additionally samples changing cover on
+//! refused attempts, which can consume the remaining time before the cutoff.
+//! The summary counts each kind even if a safety check ends the run early.
 //!
 //! On normal return, a failed check, a panic, and Ctrl-C, the probe kills the
 //! scratch TextEdit only while it is the unique new pid, its start time is
@@ -87,12 +89,14 @@ const BASELINE_FLAG: &str = "--baseline";
 #[cfg(target_os = "macos")]
 const PICTURE_FLAG: &str = "--covered-picture";
 #[cfg(target_os = "macos")]
+const PICTURE_OVERLAP_FLAG: &str = "--covered-picture-overlap";
+#[cfg(target_os = "macos")]
 const DOCK_OVERLAY_FLAG: &str = "--dock-overlay";
 
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 enum DeskImageArm {
-    CoveredPicture,
+    CoveredPicture { sample_overlap: bool },
     DockOverlay,
 }
 /// The line the baseline child reports its idle CPU time on.
@@ -997,17 +1001,23 @@ fn main() {
         let arguments: Vec<_> = std::env::args().skip(1).collect();
         let dock = arguments.iter().any(|arg| arg == DOCK_OVERLAY_FLAG);
         let covered = arguments.iter().any(|arg| arg == PICTURE_FLAG);
-        if dock || covered {
+        let overlap = arguments.iter().any(|arg| arg == PICTURE_OVERLAP_FLAG);
+        if dock || covered || overlap {
             let (arm, log_name) = if dock {
                 (DeskImageArm::DockOverlay, "run-dock-overlay.log")
             } else {
-                (DeskImageArm::CoveredPicture, "run-covered-picture.log")
+                (
+                    DeskImageArm::CoveredPicture {
+                        sample_overlap: overlap,
+                    },
+                    "run-covered-picture.log",
+                )
             };
             let Some(data_home) = covered_picture_probe::open_log(approved(arguments), log_name)
             else {
                 std::process::exit(2);
             };
-            if dock && covered {
+            if (dock && (covered || overlap)) || (covered && overlap) {
                 eprintln!("REFUSED: choose only one picture probe arm");
                 std::process::exit(2);
             }
@@ -2568,10 +2578,12 @@ mod desk {
     async fn measure_pictures<F: std::future::Future<Output = Value>>(
         scratch: &Scratch,
         person: i32,
+        measure_overlap: bool,
         serve: impl Fn() -> F,
     ) -> i32 {
         use cerebellum::desk_probe::{
-            begin_picture_bracket_probe, take_fronting_timings, take_picture_bracket_probe,
+            begin_passive_picture_bracket_probe, begin_picture_bracket_probe,
+            take_fronting_timings, take_picture_bracket_probe,
         };
         use cerebellum_macos::{begin_picture_timing_for_probe, take_picture_timing_for_probe};
         use covered_picture_probe::{
@@ -2601,11 +2613,15 @@ mod desk {
             }
             let _ = take_fronting_timings();
             begin_picture_timing_for_probe(window);
-            let pid = scratch.pid();
-            let generation = scratch.identity.process.start_time;
-            begin_picture_bracket_probe(Box::new(move |from, cutoff, fence, send| {
-                sample_overlap(pid, generation, window, from, cutoff, fence, send);
-            }));
+            if measure_overlap {
+                let pid = scratch.pid();
+                let generation = scratch.identity.process.start_time;
+                begin_picture_bracket_probe(Box::new(move |from, cutoff, fence, send| {
+                    sample_overlap(pid, generation, window, from, cutoff, fence, send);
+                }));
+            } else {
+                begin_passive_picture_bracket_probe();
+            }
             let reply = serve().await;
             let bracket = take_picture_bracket_probe().unwrap_or_default();
             let spacing = if idle_gate_refused(&bracket) {
@@ -2614,7 +2630,8 @@ mod desk {
                 FRONT_CLEANUP_SPACING
             };
             tokio::time::sleep(spacing).await;
-            let stamps = take_picture_timing_for_probe();
+            let mut stamps = take_picture_timing_for_probe();
+            stamps.sort_by_key(|&(_, at)| at);
             let timings = take_fronting_timings();
             let timing = timings
                 .iter()
@@ -2643,6 +2660,7 @@ mod desk {
                 "{}",
                 json!({
                     "picture_attempt": attempt,
+                    "overlap_sampling": measure_overlap,
                     "kind": kind.as_str(),
                     "bound_ms": cerebellum::budgets::FRONTING_BRACKET_MS,
                     "outcome": reply["outcome"],
@@ -2662,6 +2680,7 @@ mod desk {
                     "overlap_samples": bracket.overlap_samples.iter().map(|sample| overlap_sample_json(sample, offset)).collect::<Vec<_>>(),
                     "overlap_wait_ms": bracket.overlap_wait.map(|wait| wait.as_secs_f64() * 1000.0),
                     "sck_capture_started_ms": phase_offset("picture_sck_capture_started"),
+                    "sck_capture_completion_ms": phase_offset("picture_sck_completion_entered"),
                     "sck_capture_returned_ms": phase_offset("picture_sck_capture_returned"),
                     "front_confirmed_ms": front_confirmed_ms,
                     "front_late_landing_ms": timing.and_then(|t| t.late_landing_ms),
@@ -2671,7 +2690,9 @@ mod desk {
                     "restore_confirmed_ms": timing.and_then(|t| t.restore_confirmed_ms),
                     "pixel_cutoff_ms": bracket.cutoff.and_then(offset),
                     "restore_request_deadline_ms": bracket.deadline.and_then(offset),
-                    "sck_phases": stamps.iter().map(|(phase, at)| json!({"phase": phase, "at_ms": offset(*at)})).collect::<Vec<_>>(),
+                    "sck_phases": stamps.iter().filter(|(phase, _)| phase.starts_with("picture_sck_")).map(|(phase, at)| json!({"phase": phase, "at_ms": offset(*at)})).collect::<Vec<_>>(),
+                    "picture_phases": stamps.iter().map(|(phase, at)| json!({"phase": phase, "at_ms": offset(*at)})).collect::<Vec<_>>(),
+                    "fronting_steps": timing.map(|timing| timing.record_lines(attempt)),
                 })
             );
             if reply.get("image_fronting").is_none()
@@ -2869,8 +2890,8 @@ mod desk {
         // Moving a window is the person's input; the fronting idle gate
         // wants a quiet second before it fronts anything.
         tokio::time::sleep(Duration::from_secs(2)).await;
-        if picture_only {
-            return measure_pictures(scratch, person, fronted_read).await;
+        if let Some(DeskImageArm::CoveredPicture { sample_overlap }) = image_arm {
+            return measure_pictures(scratch, person, sample_overlap, fronted_read).await;
         }
         let mut report = Report { failed: false };
 

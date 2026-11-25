@@ -131,6 +131,12 @@ impl PreparedFrontedVisibility {
     }
 
     fn snapshot(&self) -> Option<(Vec<Window>, Vec<Rect>)> {
+        #[cfg(feature = "desk-probe")]
+        let _step = crate::picture_probe_timing::Step::new(
+            crate::picture_probe_timing::token(self.target.id),
+            "visibility_snapshot_started",
+            "visibility_snapshot_returned",
+        );
         if crate::process_start_time_micros(self.target.pid) != Some(self.generation) {
             return None;
         }
@@ -161,6 +167,12 @@ impl PreparedFrontedVisibility {
         let (verdict, exemption) =
             self.target
                 .before(&windows, &displays, self.current_dock(), || {
+                    #[cfg(feature = "desk-probe")]
+                    let _step = crate::picture_probe_timing::Step::new(
+                        crate::picture_probe_timing::token(self.target.id),
+                        "dock_witness_started",
+                        "dock_witness_returned",
+                    );
                     let sample = self.dock.as_ref()?.sample(until?, fence.clone()).ok()?;
                     Some((sample.total, sample.nonzero))
                 });
@@ -175,6 +187,12 @@ impl PreparedFrontedVisibility {
     }
 
     pub fn check_after(&self) -> VisibilityDecision {
+        #[cfg(feature = "desk-probe")]
+        let _step = crate::picture_probe_timing::Step::new(
+            crate::picture_probe_timing::token(self.target.id),
+            "visibility_recheck_started",
+            "visibility_recheck_returned",
+        );
         let Some((windows, displays)) = self.snapshot() else {
             return UNKNOWN;
         };

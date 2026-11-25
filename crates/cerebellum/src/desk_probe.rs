@@ -167,7 +167,13 @@ struct ArmedPictureProbe {
 static PICTURE_BRACKET: std::sync::Mutex<Option<ArmedPictureProbe>> = std::sync::Mutex::new(None);
 
 pub fn begin_picture_bracket_probe(overlap_sampler: OverlapSampler) {
-    arm_picture_measurement(PictureMeasurement::Overlap(overlap_sampler));
+    arm_picture_measurement(Some(PictureMeasurement::Overlap(overlap_sampler)));
+}
+
+/// Collect picture timing evidence without running the overlap sampler or waiting
+/// for any additional window observations.
+pub fn begin_passive_picture_bracket_probe() {
+    arm_picture_measurement(None);
 }
 
 /// Sample the Dock while a covered-window picture holds the target app in
@@ -175,13 +181,13 @@ pub fn begin_picture_bracket_probe(overlap_sampler: OverlapSampler) {
 /// the window-visibility check could delay the sample. This arm never captures
 /// TextEdit itself.
 pub fn begin_dock_overlay_bracket_probe(witness: FrontWitness) {
-    arm_picture_measurement(PictureMeasurement::DockOverlay(witness));
+    arm_picture_measurement(Some(PictureMeasurement::DockOverlay(witness)));
 }
 
-fn arm_picture_measurement(measurement: PictureMeasurement) {
+fn arm_picture_measurement(measurement: Option<PictureMeasurement>) {
     *PICTURE_BRACKET.lock().unwrap() = Some(ArmedPictureProbe {
         report: PictureBracketProbe::default(),
-        measurement: Some(measurement),
+        measurement,
     });
 }
 

@@ -128,6 +128,12 @@ pub fn frontmost_window_id(pid: u32) -> Option<u32> {
 /// The on-screen ordinary windows a process owns, in front-to-back order.
 /// Reads window numbers only, without titles, images or accessibility content.
 pub fn visible_window_ids(pid: u32) -> Option<Vec<u32>> {
+    #[cfg(feature = "desk-probe")]
+    let _step = crate::picture_probe_timing::Step::new(
+        crate::picture_probe_timing::enumeration_token(),
+        "target_window_ids_started",
+        "target_window_ids_returned",
+    );
     let windows = CGWindowListCopyWindowInfo(
         CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
         0,
@@ -506,6 +512,12 @@ pub fn register_cursor_generation(generation: Option<crate::ProcessGeneration>) 
 type WindowDictionaries = CFArray<CFDictionary<CFString, CFType>>;
 
 fn on_screen_window_dictionaries() -> Option<CFRetained<WindowDictionaries>> {
+    #[cfg(feature = "desk-probe")]
+    let _step = crate::picture_probe_timing::Step::new(
+        crate::picture_probe_timing::enumeration_token(),
+        "quartz_window_list_started",
+        "quartz_window_list_returned",
+    );
     let windows = CGWindowListCopyWindowInfo(
         CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
         0,
@@ -639,6 +651,12 @@ pub fn visible_window_frame(pid: u32, id: u32) -> Option<[f64; 4]> {
 }
 
 pub(super) fn fronted_frame_matches(pid: u32, id: u32, frame: [f64; 4]) -> bool {
+    #[cfg(feature = "desk-probe")]
+    let _step = crate::picture_probe_timing::Step::new(
+        crate::picture_probe_timing::token(id),
+        "prepared_frame_snapshot_started",
+        "prepared_frame_snapshot_returned",
+    );
     use crate::window_visibility::{fronted_frame_matches, Rect};
     cursor_window_list()
         .is_some_and(|windows| fronted_frame_matches(&windows, pid, id, Rect::from_frame(frame)))
@@ -655,6 +673,12 @@ pub fn visible_cursor_point(
 }
 
 pub(crate) fn normal_frontmost_process_id() -> Option<i32> {
+    #[cfg(feature = "desk-probe")]
+    let _step = crate::picture_probe_timing::Step::new(
+        crate::picture_probe_timing::enumeration_token(),
+        "frontmost_pid_snapshot_started",
+        "frontmost_pid_snapshot_returned",
+    );
     crate::window_visibility::frontmost_from_windows(&cursor_window_list()?)
 }
 
