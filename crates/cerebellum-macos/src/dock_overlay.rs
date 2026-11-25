@@ -1,4 +1,4 @@
-//! Alpha-only, single-window witness for the manually operated Dock probe.
+//! Alpha-only witness from a single, prepared Dock window.
 
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -18,15 +18,25 @@ use super::{find_window, Delivery};
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const DOCK_BUNDLE: &str = "com.apple.dock";
 
+pub(super) fn is_dock_bundle(bundle: &str) -> bool {
+    bundle == DOCK_BUNDLE
+}
+
 pub type WitnessFence = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[derive(Debug)]
 pub struct AlphaSample {
+    #[cfg(feature = "desk-probe")]
     pub requested_at: Instant,
+    #[cfg(feature = "desk-probe")]
     pub frame_arrived_at: Instant,
+    #[cfg(feature = "desk-probe")]
     pub returned_at: Instant,
     pub total: usize,
+    pub nonzero: usize,
+    #[cfg(feature = "desk-probe")]
     pub near_opaque: usize,
+    #[cfg(feature = "desk-probe")]
     pub near_transparent: usize,
 }
 
@@ -46,28 +56,43 @@ struct SampleRequest {
 }
 
 impl DockOverlayWitness {
+    #[cfg(feature = "desk-probe")]
     pub fn prepare(scratch_rect: [f64; 4]) -> Result<Self, String> {
+        Self::prepare_for_rect(scratch_rect, false)?
+            .ok_or_else(|| "no matching Dock overlay".into())
+    }
+
+    pub(super) fn prepare_for_rect(
+        target_rect: [f64; 4],
+        cover_edges: bool,
+    ) -> Result<Option<Self>, String> {
         let mut docks = crate::workspace_running_applications()?
             .into_iter()
-            .filter(|app| app.bundle_identifier == DOCK_BUNDLE);
-        let dock_pid = docks.next().ok_or("no running com.apple.dock")?.pid;
+            .filter(|app| is_dock_bundle(&app.bundle_identifier));
+        let Some(dock_pid) = docks.next().map(|dock| dock.pid) else {
+            return Ok(None);
+        };
         if docks.next().is_some() {
             return Err("multiple processes claim com.apple.dock".into());
         }
         let dock_generation = crate::process_start_time_micros(dock_pid)
             .ok_or("cannot identify Dock process generation")?;
-        let (window_id, window_rect) =
-            crate::window_image::dock_overlay_window(dock_pid, scratch_rect)?;
+        let Some((window_id, window_rect)) =
+            crate::window_image::dock_overlay_window(dock_pid, target_rect)?
+        else {
+            return Ok(None);
+        };
+        let raster = Raster::new(window_rect, target_rect, cover_edges)?;
         let (send, requests) = mpsc::channel::<SampleRequest>();
         let (ready, setup) = mpsc::channel();
         // Keep the Objective-C capture objects on one worker, prepared here, so
         // the sample taken while the target app is held in front doesn't have
         // to list windows or build a capture filter.
         std::thread::Builder::new()
-            .name("ck-desk-dock-overlay-witness".into())
+            .name("ck-dock-overlay-witness".into())
             .spawn(move || {
                 let prepared = objc2::rc::autoreleasepool(|_| {
-                    Prepared::new(dock_pid, window_id, window_rect, scratch_rect)
+                    Prepared::new(dock_pid, window_id, window_rect, raster)
                 });
                 let prepared = match prepared {
                     Ok(prepared) => prepared,
@@ -93,24 +118,29 @@ impl DockOverlayWitness {
         setup
             .recv_timeout(LOOKUP_TIMEOUT + Duration::from_secs(1))
             .map_err(|_| "Dock witness setup did not finish")??;
-        Ok(Self {
+        Ok(Some(Self {
             send,
             dock_pid,
             window_id,
             window_rect,
             dock_generation,
-        })
+        }))
     }
 
     /// Stop rather than sample a moved or replaced overlay on another display.
+    #[cfg(feature = "desk-probe")]
     pub fn compare_window(&self, scratch_rect: [f64; 4]) -> Result<(), String> {
-        if crate::process_start_time_micros(self.dock_pid) != Some(self.dock_generation)
+        if !self.same_generation()
             || crate::window_image::dock_overlay_window(self.dock_pid, scratch_rect)?
-                != (self.window_id, self.window_rect)
+                != Some((self.window_id, self.window_rect))
         {
             return Err("Dock overlay identity or geometry changed".into());
         }
         Ok(())
+    }
+
+    pub(super) fn same_generation(&self) -> bool {
+        crate::process_start_time_micros(self.dock_pid) == Some(self.dock_generation)
     }
 
     /// There is no alternate capture path, including when the cutoff wins.
@@ -140,16 +170,23 @@ struct Raster {
 }
 
 impl Raster {
-    fn new([x, y, w, h]: [f64; 4], [sx, sy, sw, sh]: [f64; 4]) -> Result<Self, String> {
+    fn new(
+        [x, y, w, h]: [f64; 4],
+        [sx, sy, sw, sh]: [f64; 4],
+        cover_edges: bool,
+    ) -> Result<Self, String> {
         // CoreGraphics and ScreenCaptureKit frames are top-down screen points.
-        // Request one output pixel per point and count only pixels inside scratch.
+        // The probe measures interior pixels. Certification must also include
+        // pixels intersecting a fractional window edge.
+        let start = if cover_edges { f64::floor } else { f64::ceil };
+        let end = if cover_edges { f64::ceil } else { f64::floor };
         let raster = Self {
             width: w as usize,
             height: h as usize,
-            left: (sx - x).ceil() as usize,
-            top: (sy - y).ceil() as usize,
-            right: (sx + sw - x).floor() as usize,
-            bottom: (sy + sh - y).floor() as usize,
+            left: start(sx - x) as usize,
+            top: start(sy - y) as usize,
+            right: end(sx + sw - x) as usize,
+            bottom: end(sy + sh - y) as usize,
         };
         if w.fract() != 0.0
             || h.fract() != 0.0
@@ -169,13 +206,12 @@ struct Prepared {
     configuration: Retained<SCStreamConfiguration>,
     // The configuration's background colour is an `assign` property: it does
     // not retain the colour, so the colour must outlive every capture.
-    _background: CFRetained<CGColor>,
+    background: CFRetained<CGColor>,
     raster: Raster,
 }
 
 impl Prepared {
-    fn new(dock_pid: u32, id: u32, rect: [f64; 4], scratch: [f64; 4]) -> Result<Self, String> {
-        let raster = Raster::new(rect, scratch)?;
+    fn new(dock_pid: u32, id: u32, rect: [f64; 4], raster: Raster) -> Result<Self, String> {
         crate::establish_window_server_connection();
         let window = find_window(id, LOOKUP_TIMEOUT).map_err(|error| {
             format!("ScreenCaptureKit did not supply Dock window {id}: {error}")
@@ -187,7 +223,7 @@ impl Prepared {
                 .ok_or("ScreenCaptureKit Dock window has no owner")?;
             let frame = window.frame();
             if u32::try_from(owner.processID()).ok() != Some(dock_pid)
-                || owner.bundleIdentifier().to_string() != DOCK_BUNDLE
+                || !is_dock_bundle(&owner.bundleIdentifier().to_string())
                 || window.windowLayer() != 20
                 || [
                     frame.origin.x,
@@ -216,7 +252,7 @@ impl Prepared {
             Ok(Self {
                 filter,
                 configuration,
-                _background: clear,
+                background: clear,
                 raster,
             })
         }
@@ -227,7 +263,10 @@ impl Prepared {
         let sink = result.clone();
         let raster = self.raster;
         let callback_fence = fence.clone();
+        // Even if our wait expires, the completion can still be pending.
+        let background = self.background.clone();
         let handler = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
+            let _keep_background_alive = &background;
             let arrived = Instant::now();
             if arrived >= until || !callback_fence() {
                 return;
@@ -248,6 +287,7 @@ impl Prepared {
         if Instant::now() >= until || !fence() {
             return Err("Dock witness cutoff passed before capture was requested".into());
         }
+        #[cfg(feature = "desk-probe")]
         let requested_at = Instant::now();
         // SAFETY: the worker owns the single-window filter and configuration;
         // the framework retains the completion block if it calls it later.
@@ -258,7 +298,7 @@ impl Prepared {
                 Some(&handler),
             );
         }
-        let (frame_arrived_at, (total, near_opaque, near_transparent)) = result
+        let (_frame_arrived_at, counts) = result
             .wait(until.saturating_duration_since(Instant::now()))
             .ok_or("ScreenCaptureKit Dock window image timed out")??;
         let returned_at = Instant::now();
@@ -266,17 +306,23 @@ impl Prepared {
             return Err("Dock alpha sample returned after the cutoff".into());
         }
         Ok(AlphaSample {
+            #[cfg(feature = "desk-probe")]
             requested_at,
-            frame_arrived_at,
+            #[cfg(feature = "desk-probe")]
+            frame_arrived_at: _frame_arrived_at,
+            #[cfg(feature = "desk-probe")]
             returned_at,
-            total,
-            near_opaque,
-            near_transparent,
+            total: counts.total,
+            nonzero: counts.nonzero,
+            #[cfg(feature = "desk-probe")]
+            near_opaque: counts.near_opaque,
+            #[cfg(feature = "desk-probe")]
+            near_transparent: counts.near_transparent,
         })
     }
 }
 
-fn read_alpha(image: &CGImage, raster: Raster) -> Result<(usize, usize, usize), String> {
+fn read_alpha(image: &CGImage, raster: Raster) -> Result<AlphaCounts, String> {
     if (CGImage::width(Some(image)), CGImage::height(Some(image))) != (raster.width, raster.height)
     {
         return Err("ScreenCaptureKit returned unexpected Dock image dimensions".into());
@@ -307,33 +353,49 @@ fn read_alpha(image: &CGImage, raster: Raster) -> Result<(usize, usize, usize), 
     count_alpha(bytes, CGImage::bytes_per_row(Some(image)), raster, channel)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct AlphaCounts {
+    total: usize,
+    nonzero: usize,
+    #[cfg(feature = "desk-probe")]
+    near_opaque: usize,
+    #[cfg(feature = "desk-probe")]
+    near_transparent: usize,
+}
+
 fn count_alpha(
     bytes: &[u8],
     stride: usize,
     raster: Raster,
     channel: usize,
-) -> Result<(usize, usize, usize), String> {
+) -> Result<AlphaCounts, String> {
     if stride < raster.width.saturating_mul(4) || bytes.len() < stride.saturating_mul(raster.height)
     {
         return Err("Dock pixel buffer is shorter than its raster".into());
     }
-    let mut opaque = 0;
-    let mut transparent = 0;
+    let mut counts = AlphaCounts {
+        total: (raster.right - raster.left) * (raster.bottom - raster.top),
+        nonzero: 0,
+        #[cfg(feature = "desk-probe")]
+        near_opaque: 0,
+        #[cfg(feature = "desk-probe")]
+        near_transparent: 0,
+    };
     for y in raster.top..raster.bottom {
         for alpha in bytes[y * stride + 4 * raster.left + channel..y * stride + 4 * raster.right]
             .iter()
             .step_by(4)
             .copied()
         {
-            opaque += usize::from(alpha >= 250);
-            transparent += usize::from(alpha <= 5);
+            counts.nonzero += usize::from(alpha != 0);
+            #[cfg(feature = "desk-probe")]
+            {
+                counts.near_opaque += usize::from(alpha >= 250);
+                counts.near_transparent += usize::from(alpha <= 5);
+            }
         }
     }
-    Ok((
-        (raster.right - raster.left) * (raster.bottom - raster.top),
-        opaque,
-        transparent,
-    ))
+    Ok(counts)
 }
 
 #[cfg(test)]
@@ -342,7 +404,7 @@ mod tests {
 
     #[test]
     fn dock_alpha_counts_only_scratch_pixels_at_the_inclusive_thresholds() {
-        let raster = Raster::new([-5.0, 10.0, 4.0, 3.0], [-4.0, 11.0, 3.0, 1.0]).unwrap();
+        let raster = Raster::new([-5.0, 10.0, 4.0, 3.0], [-4.0, 11.0, 3.0, 1.0], false).unwrap();
         let stride = 20;
         // A non-alpha channel is opaque everywhere; it must not affect counts.
         let mut bytes = [255; 60];
@@ -352,7 +414,10 @@ mod tests {
             .for_each(|(i, alpha)| {
                 bytes[stride + 4 * (i + 1) + 3] = alpha;
             });
-        assert_eq!(count_alpha(&bytes, stride, raster, 3).unwrap(), (3, 1, 1));
+        let counts = count_alpha(&bytes, stride, raster, 3).unwrap();
+        assert_eq!((counts.total, counts.nonzero), (3, 3));
+        #[cfg(feature = "desk-probe")]
+        assert_eq!((counts.near_opaque, counts.near_transparent), (1, 1));
         assert!(count_alpha(&bytes[..59], stride, raster, 3).is_err());
     }
 }

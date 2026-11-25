@@ -650,6 +650,7 @@ where
                         .then_some(cerebellum_computer::app_state::image::ImageDecision::Unknown),
                     fronting: None,
                     fronting_record: image_plan.fronting.and_then(fronting::Fronting::row_record),
+                    dock_overlay_exemption: None,
                 });
             let mut custody = AuditImageCustody {
                 audit: &audit,

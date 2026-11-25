@@ -51,6 +51,12 @@ pub struct ImageReadEvidence {
     /// in the row's open result. Unlike `fronting` above, which describes
     /// only an image bracket, this is the read's whole reply-level record.
     pub fronting_record: Option<crate::audit::FrontingRecord>,
+    pub dock_overlay_exemption: Option<DockOverlayExemption>,
+}
+
+pub struct DockOverlayExemption {
+    pub window_id: u32,
+    pub sample_count: usize,
 }
 
 /// Only counts and process identity cross the journal boundary; tree strings
@@ -168,6 +174,10 @@ impl<R: Redactor, T: SeverityTaxonomy, S: JournalStorage> AuditImageCustody<'_, 
         }
         if let Some(record) = &evidence.fronting_record {
             result["fronting"] = serde_json::json!(record);
+        }
+        if let Some(exemption) = &evidence.dock_overlay_exemption {
+            result["dock_overlay_window_id"] = serde_json::json!(exemption.window_id);
+            result["dock_overlay_sample_count"] = serde_json::json!(exemption.sample_count);
         }
         lock_audit(self.audit)
             .finalize_dispatched(

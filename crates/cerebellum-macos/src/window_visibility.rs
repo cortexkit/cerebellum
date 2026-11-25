@@ -8,7 +8,7 @@ pub enum WindowVisibility {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Rect {
     pub x: f64,
     pub y: f64,
@@ -17,6 +17,16 @@ pub(crate) struct Rect {
 }
 
 impl Rect {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn from_frame([x, y, width, height]: [f64; 4]) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
     fn valid(self) -> bool {
         [
             self.x,
@@ -65,6 +75,17 @@ pub(crate) fn frontmost_from_windows(windows: &[Window]) -> Option<i32> {
         }
         i32::try_from(window.pid?).ok().filter(|pid| *pid > 0)
     })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn fronted_frame_matches(windows: &[Window], pid: u32, id: u32, bounds: Rect) -> bool {
+    frontmost_from_windows(windows).and_then(|pid| u32::try_from(pid).ok()) == Some(pid)
+        && windows
+            .iter()
+            .find(|window| {
+                window.pid == Some(pid) && window.layer == Some(0) && window.alpha != Some(0.0)
+            })
+            .is_some_and(|target| target.id == Some(id) && target.bounds == Some(bounds))
 }
 
 /// A standard title bar's height. A picture with nothing to point at appears
@@ -347,18 +368,11 @@ pub(crate) fn visibility_from_windows(
     windows: &[Window],
     displays: &[Rect],
 ) -> (WindowVisibility, VisibilityRule) {
-    classify_visibility(
-        pid,
-        id,
-        windows,
-        displays,
-        #[cfg(feature = "desk-probe")]
-        None,
-    )
+    classify_visibility(pid, id, windows, displays, None)
 }
 
-#[cfg(feature = "desk-probe")]
-pub(crate) fn visibility_from_windows_for_probe(
+#[cfg(any(target_os = "macos", all(test, feature = "desk-probe")))]
+pub(crate) fn visibility_with_cover(
     pid: u32,
     id: u32,
     windows: &[Window],
@@ -373,7 +387,7 @@ fn classify_visibility(
     id: u32,
     windows: &[Window],
     displays: &[Rect],
-    #[cfg(feature = "desk-probe")] cover: Option<&mut Vec<usize>>,
+    cover: Option<&mut Vec<usize>>,
 ) -> (WindowVisibility, VisibilityRule) {
     use VisibilityRule::*;
     use WindowVisibility::*;
@@ -405,11 +419,8 @@ fn classify_visibility(
         return (Covered, OutsideDisplays);
     }
     let mut above_windows = Vec::new();
-    #[cfg(feature = "desk-probe")]
     let mut candidates = Vec::new();
     for (slot, above) in windows[..index].iter().enumerate() {
-        #[cfg(not(feature = "desk-probe"))]
-        let _ = slot;
         if above.cursor_picture {
             continue;
         }
@@ -426,7 +437,6 @@ fn classify_visibility(
             return (Unknown, MissingData);
         }
         above_windows.push((other, other_layer));
-        #[cfg(feature = "desk-probe")]
         if cover.is_some() && other_layer != 0 && bounds.intersection(other).is_some() {
             candidates.push(slot);
         }
@@ -445,7 +455,6 @@ fn classify_visibility(
             .into_iter()
             .filter_map(|(rect, layer)| (layer != 0).then_some(rect)),
     ) {
-        #[cfg(feature = "desk-probe")]
         if let Some(cover) = cover {
             *cover = candidates;
         }
@@ -944,7 +953,7 @@ mod tests {
             VisibilityRule::HigherLayerUnionCoverage,
         );
         assert_eq!(
-            visibility_from_windows_for_probe(7, 1, &windows, &displays, &mut cover),
+            visibility_with_cover(7, 1, &windows, &displays, &mut cover),
             expected
         );
         assert_eq!(visibility_from_windows(7, 1, &windows, &displays), expected);

@@ -49,6 +49,15 @@ pub trait ImageFreshnessSource: Send + Sync {
         };
         (repaints, visibility, decision)
     }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_fronted(
+        &self,
+        _target: &ProcessGrant,
+        _window_id: &str,
+    ) -> Result<Option<cerebellum_macos::PreparedFrontedVisibility>, ImageUnavailable> {
+        Ok(None)
+    }
 }
 
 pub(super) struct NativeImageFreshnessSource;
@@ -72,24 +81,11 @@ impl ImageFreshnessSource for NativeImageFreshnessSource {
             };
             let visibility =
                 id.map(|id| cerebellum_macos::window_visibility_decision(target.pid, id));
-            use cerebellum_macos::VisibilityRule as Rule;
-            use cerebellum_macos::WindowVisibility as Native;
+            let (visibility, decision) = map_native_visibility(visibility);
             (
                 repaints_while_covered(&target.bundle_identity),
-                match visibility {
-                    Some((Native::FullyVisible, _)) => WindowVisibility::FullyVisible,
-                    Some((Native::Covered, _)) => WindowVisibility::Covered,
-                    Some((Native::Unknown, _)) | None => WindowVisibility::Unknown,
-                },
-                match visibility.map(|(_, rule)| rule) {
-                    Some(Rule::TargetAbsent) => ImageDecision::TargetAbsent,
-                    Some(Rule::TargetTransparent) => ImageDecision::TargetTransparent,
-                    Some(Rule::OutsideDisplays) => ImageDecision::OutsideDisplays,
-                    Some(Rule::OverlappingWindow) => ImageDecision::CoveredByWindow,
-                    Some(Rule::HigherLayerUnionCoverage) => ImageDecision::FullyOverlaid,
-                    Some(Rule::NoLayerZeroOverlap) => ImageDecision::FullyVisible,
-                    Some(Rule::MissingData) | None => ImageDecision::Unknown,
-                },
+                visibility,
+                decision,
             )
         }
         #[cfg(not(target_os = "macos"))]
@@ -102,6 +98,50 @@ impl ImageFreshnessSource for NativeImageFreshnessSource {
             )
         }
     }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_fronted(
+        &self,
+        target: &ProcessGrant,
+        window_id: &str,
+    ) -> Result<Option<cerebellum_macos::PreparedFrontedVisibility>, ImageUnavailable> {
+        let generation = target
+            .process_generation_evidence
+            .parse()
+            .map_err(|_| ImageUnavailable::FrontingUnavailable)?;
+        let window_id = window_id
+            .parse()
+            .map_err(|_| ImageUnavailable::NoWindowCaptured)?;
+        cerebellum_macos::PreparedFrontedVisibility::prepare(target.pid, generation, window_id)
+            .map(Some)
+            .map_err(|_| ImageUnavailable::WindowCoveredMayBeStale)
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn map_native_visibility(
+    visibility: Option<(
+        cerebellum_macos::WindowVisibility,
+        cerebellum_macos::VisibilityRule,
+    )>,
+) -> (WindowVisibility, ImageDecision) {
+    use cerebellum_macos::{VisibilityRule as Rule, WindowVisibility as Native};
+    (
+        match visibility {
+            Some((Native::FullyVisible, _)) => WindowVisibility::FullyVisible,
+            Some((Native::Covered, _)) => WindowVisibility::Covered,
+            Some((Native::Unknown, _)) | None => WindowVisibility::Unknown,
+        },
+        match visibility.map(|(_, rule)| rule) {
+            Some(Rule::TargetAbsent) => ImageDecision::TargetAbsent,
+            Some(Rule::TargetTransparent) => ImageDecision::TargetTransparent,
+            Some(Rule::OutsideDisplays) => ImageDecision::OutsideDisplays,
+            Some(Rule::OverlappingWindow) => ImageDecision::CoveredByWindow,
+            Some(Rule::HigherLayerUnionCoverage) => ImageDecision::FullyOverlaid,
+            Some(Rule::NoLayerZeroOverlap) => ImageDecision::FullyVisible,
+            Some(Rule::MissingData) | None => ImageDecision::Unknown,
+        },
+    )
 }
 
 #[cfg(test)]

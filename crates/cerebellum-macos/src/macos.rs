@@ -24,8 +24,14 @@ use objc2_screen_capture_kit::{
 };
 
 #[cfg(feature = "desk-probe")]
-#[path = "dock_overlay_probe.rs"]
-pub mod dock_overlay_probe;
+pub mod dock_overlay_probe {
+    pub use super::dock_overlay::{AlphaSample, DockOverlayWitness, WitnessFence};
+}
+#[path = "dock_overlay.rs"]
+mod dock_overlay;
+#[path = "fronted_visibility.rs"]
+mod fronted_visibility;
+pub use fronted_visibility::{DockExemption, PreparedFrontedVisibility};
 
 /// The prefix of `struct proc_bsdinfo` from `<sys/proc_info.h>`, up to and
 /// including the two fields this reads.
@@ -1281,6 +1287,25 @@ pub fn capture_window_fenced(
     accept_owner: &mut dyn FnMut(u32) -> bool,
     may_acquire: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> Result<RawCapture, CaptureError> {
+    prepare_window_capture(window_id, timeout, source_rect, accept_owner)?
+        .capture(timeout, may_acquire)
+}
+
+/// An owned single-window filter and configuration, before any pixel request.
+pub struct PreparedWindowCapture {
+    window_id: u32,
+    owner_pid_at_capture: u32,
+    frame: [f64; 4],
+    filter: Retained<SCContentFilter>,
+    configuration: Retained<SCStreamConfiguration>,
+}
+
+pub fn prepare_window_capture(
+    window_id: u32,
+    timeout: Duration,
+    source_rect: Option<CaptureSourceRect>,
+    accept_owner: &mut dyn FnMut(u32) -> bool,
+) -> Result<PreparedWindowCapture, CaptureError> {
     // Before any filter is created. Without a window-server connection the
     // filter constructor does not fail -- it aborts the process, which for a
     // module means the whole module dies rather than refusing one capture.
@@ -1354,72 +1379,125 @@ pub fn capture_window_fenced(
         configuration
     };
 
-    let delivery: Arc<Delivery<Result<RawCapture, String>>> = Delivery::new();
-    let sink = delivery.clone();
-    // Whether this call stopped waiting. Held by the completion while it
-    // copies, so the copy and the waiter's giving up never interleave.
-    let abandoned = Arc::new(Mutex::new(false));
-    let completion_abandoned = Arc::clone(&abandoned);
-    let completion_fence = Arc::clone(&may_acquire);
-    let handler = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
-        #[cfg(feature = "desk-probe")]
-        stamp(picture_attempt, "picture_sck_completion_entered");
-        let abandoned = completion_abandoned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *abandoned || !completion_fence() {
-            // Too late: the caller no longer waits, or its time in front
-            // ended. The image is dropped without a pixel being copied.
-            sink.deliver(Err(
-                "the capture arrived too late; its pixels were dropped".to_string()
+    Ok(PreparedWindowCapture {
+        window_id,
+        owner_pid_at_capture,
+        frame: [
+            frame.origin.x,
+            frame.origin.y,
+            frame.size.width,
+            frame.size.height,
+        ],
+        filter,
+        configuration,
+    })
+}
+
+impl PreparedWindowCapture {
+    /// A fronted capture must still describe the same live window before the
+    /// cached filter is used. There is no ScreenCaptureKit lookup on failure.
+    pub fn capture_fronted(
+        &self,
+        window_id: u32,
+        until: Instant,
+        accept_owner: &mut dyn FnMut(u32) -> bool,
+        may_acquire: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<RawCapture, CaptureError> {
+        let owner = self.owner_pid_at_capture;
+        if !may_acquire()
+            || self.window_id != window_id
+            || !crate::window_image::fronted_frame_matches(owner, window_id, self.frame)
+            || !accept_owner(owner)
+        {
+            return Err(CaptureError::Capture(
+                "the prepared fronted window is no longer current".into(),
             ));
-            return;
         }
-        // SAFETY: the system passes either an image or an error, both valid for
-        // this callback. Pixel bytes are copied out before it returns.
-        let outcome = unsafe {
-            if let Some(error) = error.as_ref() {
-                Err(error.localizedDescription().to_string())
-            } else if let Some(image) = image.as_ref() {
-                read_pixels(image, owner_pid_at_capture)
-            } else {
-                Err("the system reported neither an image nor an error".to_string())
-            }
-        };
-        sink.deliver(outcome);
-        drop(abandoned);
-    });
-
-    // The last check before the pixels are requested, after everything the
-    // request needs has been built.
-    if !may_acquire() {
-        return Err(CaptureError::Capture(format!(
-            "window {window_id}: the capture's time ended before it was requested; no pixels \
-             were requested"
-        )));
-    }
-    #[cfg(feature = "desk-probe")]
-    stamp(picture_attempt, "picture_sck_capture_started");
-    // SAFETY: filter and configuration are owned by this frame and outlive the
-    // call; the handler outlives it through the block's own retain.
-    unsafe {
-        SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
-            &filter,
-            &configuration,
-            Some(&handler),
+        let timeout = until.saturating_duration_since(Instant::now());
+        self.capture(
+            timeout,
+            Arc::new(move || Instant::now() < until && may_acquire()),
         )
-    };
+    }
 
-    let outcome = delivery.wait(timeout).unwrap_or_else(|| {
-        *abandoned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        Err(format!("the capture did not arrive within {timeout:?}"))
-    });
-    #[cfg(feature = "desk-probe")]
-    stamp(picture_attempt, "picture_sck_capture_returned");
+    fn capture(
+        &self,
+        timeout: Duration,
+        may_acquire: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<RawCapture, CaptureError> {
+        let window_id = self.window_id;
+        let owner_pid_at_capture = self.owner_pid_at_capture;
+        #[cfg(feature = "desk-probe")]
+        use crate::picture_probe_timing::{stamp, token};
+        #[cfg(feature = "desk-probe")]
+        let picture_attempt = token(window_id);
+        let delivery: Arc<Delivery<Result<RawCapture, String>>> = Delivery::new();
+        let sink = delivery.clone();
+        // Whether this call stopped waiting. Held by the completion while it
+        // copies, so the copy and the waiter's giving up never interleave.
+        let abandoned = Arc::new(Mutex::new(false));
+        let completion_abandoned = Arc::clone(&abandoned);
+        let completion_fence = Arc::clone(&may_acquire);
+        let handler = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
+            #[cfg(feature = "desk-probe")]
+            stamp(picture_attempt, "picture_sck_completion_entered");
+            let abandoned = completion_abandoned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *abandoned || !completion_fence() {
+                // Too late: the caller no longer waits, or its time in front
+                // ended. The image is dropped without a pixel being copied.
+                sink.deliver(Err(
+                    "the capture arrived too late; its pixels were dropped".to_string()
+                ));
+                return;
+            }
+            // SAFETY: the system passes either an image or an error, both valid for
+            // this callback. Pixel bytes are copied out before it returns.
+            let outcome = unsafe {
+                if let Some(error) = error.as_ref() {
+                    Err(error.localizedDescription().to_string())
+                } else if let Some(image) = image.as_ref() {
+                    read_pixels(image, owner_pid_at_capture)
+                } else {
+                    Err("the system reported neither an image nor an error".to_string())
+                }
+            };
+            sink.deliver(outcome);
+            drop(abandoned);
+        });
 
-    outcome.map_err(|reason| explain_capture_failure(reason, screen_is_locked()))
+        // The last check before the pixels are requested, after everything the
+        // request needs has been built.
+        if !may_acquire() {
+            return Err(CaptureError::Capture(format!(
+                "window {window_id}: the capture's time ended before it was requested; no pixels \
+             were requested"
+            )));
+        }
+        #[cfg(feature = "desk-probe")]
+        stamp(picture_attempt, "picture_sck_capture_started");
+        // SAFETY: filter and configuration are owned by this frame and outlive the
+        // call; the handler outlives it through the block's own retain.
+        unsafe {
+            SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
+                &self.filter,
+                &self.configuration,
+                Some(&handler),
+            )
+        };
+
+        let outcome = delivery.wait(timeout).unwrap_or_else(|| {
+            *abandoned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            Err(format!("the capture did not arrive within {timeout:?}"))
+        });
+        #[cfg(feature = "desk-probe")]
+        stamp(picture_attempt, "picture_sck_capture_returned");
+
+        outcome.map_err(|reason| explain_capture_failure(reason, screen_is_locked()))
+    }
 }
 
 /// Classify a failed capture when the screen being locked caused it.

@@ -275,6 +275,30 @@ pub struct PendingSingleWindowCapture {
     pub frame: PendingVisionWindowFrame,
 }
 
+pub struct PreparedFrontedVision {
+    window: EnumeratedWindow,
+    request: WindowCaptureRequest,
+    capture: Option<PreparedVisionCapture>,
+}
+
+/// Kept on the same thread from preparation through acquisition. Native
+/// ScreenCaptureKit filter/configuration objects are not thread-safe.
+pub type PreparedVisionCapture = Box<
+    dyn FnOnce(
+        Option<std::time::Instant>,
+        &AcquisitionFence,
+    ) -> Result<PendingVisionWindowFrame, BackendError>,
+>;
+
+pub type FrontedVisionPreparer =
+    Box<dyn FnOnce(&WindowCaptureRequest) -> Result<PreparedVisionCapture, BackendError>>;
+
+impl PreparedFrontedVision {
+    pub fn window_id(&self) -> &str {
+        &self.window.window_id
+    }
+}
+
 /// The one window a single-window capture took, with its image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SingleWindowCapture {
@@ -616,6 +640,11 @@ pub trait CaptureBackend {
         }
         self.capture_window_unencoded_for_vision(request)
     }
+    /// A native backend can opt into preparing window resources before a front
+    /// request. Without a preparer, window selection still happens in the bracket.
+    fn fronted_vision_preparer(&self) -> Option<FrontedVisionPreparer> {
+        None
+    }
     /// Finish a captured frame without taking another picture. Native backends
     /// encode raw BGRA; the default only completes a prepared synthetic fixture.
     fn encode_window_for_vision(
@@ -842,6 +871,58 @@ impl<B: CaptureBackend> ScopedCaptureController<B> {
         self.verify_vision_owner(&frame.frame)?;
         self.state = CaptureSessionState::Active;
         Ok(PendingSingleWindowCapture { window, frame })
+    }
+
+    /// Pick and prepare one granted window for a backend that needs preparation.
+    /// With no preparer, leave selection to the fronted read. A backend that
+    /// does need preparation must succeed here, before any front request.
+    pub fn prepare_fronted_vision(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<Option<PreparedFrontedVision>, SingleWindowCaptureError> {
+        let Some(prepare) = self.backend.fronted_vision_preparer() else {
+            return Ok(None);
+        };
+        let (window, request) = self.select_vision_window(now_ms)?;
+        let capture =
+            prepare(&request).map_err(|error| SingleWindowCaptureError::Capture(error.into()))?;
+        Ok(Some(PreparedFrontedVision {
+            window,
+            request,
+            capture: Some(capture),
+        }))
+    }
+
+    pub fn capture_prepared_fronted_vision(
+        &mut self,
+        prepared: &mut PreparedFrontedVision,
+        until: Option<std::time::Instant>,
+        may_acquire: &AcquisitionFence,
+    ) -> Result<PendingSingleWindowCapture, SingleWindowCaptureError> {
+        self.check_single_window_permission(prepared.request.captured_at_ms)
+            .map_err(SingleWindowCaptureError::Capture)?;
+        if prepared.request.target != self.target
+            || self
+                .backend
+                .frontmost_window_id(&self.target)
+                .map_err(|error| SingleWindowCaptureError::Capture(error.into()))?
+                .as_deref()
+                != Some(prepared.window_id())
+        {
+            return Err(SingleWindowCaptureError::NoWindow);
+        }
+        let capture = prepared
+            .capture
+            .take()
+            .ok_or(SingleWindowCaptureError::NoWindow)?;
+        let frame = capture(until, may_acquire)
+            .map_err(|error| SingleWindowCaptureError::Capture(error.into()))?;
+        self.verify_vision_owner(&frame.frame)?;
+        self.state = CaptureSessionState::Active;
+        Ok(PendingSingleWindowCapture {
+            window: prepared.window.clone(),
+            frame,
+        })
     }
 
     /// Encode the verified pixels after restore, never recapturing the window.

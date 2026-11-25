@@ -13,7 +13,7 @@ use cerebellum_computer::capture::{
 use cerebellum_computer::dispatch::{BracketStop, RestoreStatus};
 use cerebellum_computer::platform::{PermissionLiveness, PlatformDriver, ProcessGrant};
 
-use super::image_freshness::{image_freshness_decision, ImageFreshnessSource};
+use super::image_freshness::{image_freshness_decision, ImageFreshnessSource, WindowVisibility};
 
 #[derive(Default)]
 pub(super) struct ImageReadPlan {
@@ -56,6 +56,16 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     }
     let mut controller = ScopedCaptureController::with_v1_bounds(backend, grant.clone())
         .map_err(|_| ImageUnavailable::CaptureUnavailable)?;
+    // Resolve ScreenCaptureKit resources before taking the person's focus.
+    // Inside the bracket only current window facts and pixels are needed.
+    let mut prepared = controller
+        .prepare_fronted_vision(now_ms)
+        .map_err(image_capture_error)?;
+    #[cfg(target_os = "macos")]
+    let mut prepared_visibility = match &prepared {
+        Some(window) => freshness.prepare_fronted(grant, window.window_id())?,
+        None => None,
+    };
     let mut captured = Err(ImageUnavailable::FrontingUnavailable);
     // Bringing the target forward changes which application has the person's
     // focus, so it is a mutation: the call's gate must still be open.
@@ -66,10 +76,12 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     if !driver.accept_fronted_dispatch_hooks(super::fronting::boxed_hooks(hooks)) {
         return Err(ImageUnavailable::FrontingUnavailable);
     }
-    // Whether this read may still acquire pixels: the cutoff has not fired
-    // and its absolute deadline has not passed, no cleanup has taken over
-    // restoring the person's application, and the call has not been stopped. Shared with the
-    // platform's capture completion, which may run after the request.
+    // Whether this read may still acquire pixels: the fronting bracket's picture
+    // cutoff (the point after which nothing new may be captured before the
+    // person's app is put back) has not fired and its absolute deadline has not
+    // passed, no cleanup has taken over restoring the person's application, and
+    // the call has not been stopped. Shared with the platform's capture
+    // completion, which may run after the request.
     let fence: cerebellum_computer::capture::AcquisitionFence = {
         let hooks = hooks.clone();
         let cancel = plan.cancel.clone();
@@ -104,22 +116,43 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
             }
             // Even a backend panic must return through the bracket's restore.
             captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let cutoff = hooks.cutoff().and_then(|gate| gate.reserve_start());
+                let before_picture = || {
+                    #[cfg(target_os = "macos")]
+                    if let Some(visibility) = &mut prepared_visibility {
+                        let (state, decision) = super::image_freshness::map_native_visibility(
+                            Some(visibility.check_before(cutoff, &fence)),
+                        );
+                        if let Some(exemption) = visibility.exemption() {
+                            evidence.borrow_mut().dock_overlay_exemption =
+                                Some(cerebellum_computer::app_state::DockOverlayExemption {
+                                    window_id: exemption.window_id,
+                                    sample_count: exemption.sample_count,
+                                });
+                        }
+                        return record_visibility(evidence, None, false, (false, state, decision));
+                    }
+                    check_visibility(freshness, grant, evidence, None, false)
+                };
                 #[cfg(all(feature = "desk-probe", target_os = "macos"))]
-                crate::desk_probe::observe_picture_overlap(
-                    || check_visibility(freshness, grant, evidence, None, false),
-                    hooks.cutoff().and_then(|gate| gate.reserve_start()),
-                    &fence,
-                )?;
+                crate::desk_probe::observe_picture_overlap(before_picture, cutoff, &fence)?;
+                #[cfg(all(target_os = "macos", not(feature = "desk-probe")))]
+                let mut before_picture = before_picture;
                 #[cfg(not(all(feature = "desk-probe", target_os = "macos")))]
-                check_visibility(freshness, grant, evidence, None, false)?;
+                before_picture()?;
                 // The visibility check and the window lookup can block. The
                 // fence is asked again immediately before the pixels are
                 // requested, and by the completion before any are copied:
                 // once it has closed, no pixels are requested, and none are
                 // copied or returned even if ScreenCaptureKit completes a
                 // request already made.
-                let pending =
-                    controller.capture_frontmost_window_unencoded_for_vision_fenced(now_ms, &fence);
+                let pending = match &mut prepared {
+                    Some(window) => {
+                        controller.capture_prepared_fronted_vision(window, cutoff, &fence)
+                    }
+                    None => controller
+                        .capture_frontmost_window_unencoded_for_vision_fenced(now_ms, &fence),
+                };
                 let pending = match pending {
                     Ok(pending) => pending,
                     Err(_) if !fence() => return Err(ImageUnavailable::FrontingBoundExceeded),
@@ -128,13 +161,22 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
                 if !fence() {
                     return Err(ImageUnavailable::FrontingBoundExceeded);
                 }
-                check_visibility(
-                    freshness,
-                    grant,
-                    evidence,
-                    Some(&pending.window.window_id),
-                    false,
-                )?;
+                let window_id = Some(pending.window.window_id.as_str());
+                #[cfg(target_os = "macos")]
+                let checked_native = if let Some(visibility) = &prepared_visibility {
+                    let (state, decision) = super::image_freshness::map_native_visibility(Some(
+                        visibility.check_after(),
+                    ));
+                    record_visibility(evidence, window_id, false, (false, state, decision))?;
+                    true
+                } else {
+                    false
+                };
+                #[cfg(not(target_os = "macos"))]
+                let checked_native = false;
+                if !checked_native {
+                    check_visibility(freshness, grant, evidence, window_id, false)?;
+                }
                 // Last, after the second visibility check: pixels acquired as
                 // the fence closed are not returned.
                 if !fence() {
@@ -234,12 +276,25 @@ fn check_visibility(
     window_id: Option<&str>,
     allow_covered_repainting: bool,
 ) -> Result<(), ImageUnavailable> {
-    let (repaints, visibility, decision) = freshness.inspect_decision(grant, window_id);
+    record_visibility(
+        evidence,
+        window_id,
+        allow_covered_repainting,
+        freshness.inspect_decision(grant, window_id),
+    )
+}
+
+fn record_visibility(
+    evidence: &std::cell::RefCell<ImageReadEvidence>,
+    _window_id: Option<&str>,
+    allow_covered_repainting: bool,
+    (repaints, visibility, decision): (bool, WindowVisibility, ImageDecision),
+) -> Result<(), ImageUnavailable> {
     evidence.borrow_mut().decision = Some(decision);
     #[cfg(all(feature = "desk-probe", target_os = "macos"))]
     if !allow_covered_repainting {
         crate::desk_probe::note_picture_bracket_probe(|probe| {
-            if window_id.is_some() {
+            if _window_id.is_some() {
                 probe.after_capture = Some(decision);
             } else {
                 probe.before_capture = Some(decision);
