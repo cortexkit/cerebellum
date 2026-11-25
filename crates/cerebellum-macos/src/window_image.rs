@@ -340,13 +340,7 @@ pub fn window_visibility_decision(
             crate::VisibilityRule::MissingData,
         );
     };
-    window_visibility_with_entries(
-        pid,
-        id,
-        &entries,
-        #[cfg(feature = "desk-probe")]
-        None,
-    )
+    window_visibility_with_entries(pid, id, &entries)
 }
 
 #[cfg(feature = "desk-probe")]
@@ -400,40 +394,66 @@ pub fn observe_window_overlap_for_probe<T>(
 #[cfg(feature = "desk-probe")]
 pub fn sample_window_overlap_for_probe(pid: u32, id: u32) -> WindowOverlapSample {
     let started_at = std::time::Instant::now();
+    let snapshot = on_screen_window_dictionaries().and_then(|dictionaries| {
+        let entries = cursor_windows_from(&dictionaries)?;
+        Some((dictionaries, entries, visibility_displays()?))
+    });
+    overlap_sample(
+        pid,
+        id,
+        started_at,
+        snapshot
+            .as_ref()
+            .map(|(d, w, s)| (&**d, w.as_slice(), s.as_slice())),
+    )
+}
+
+#[cfg(feature = "desk-probe")]
+fn overlap_sample(
+    pid: u32,
+    id: u32,
+    started_at: std::time::Instant,
+    snapshot: Option<(
+        &WindowDictionaries,
+        &[crate::window_visibility::Window],
+        &[crate::window_visibility::Rect],
+    )>,
+) -> WindowOverlapSample {
     let mut frontmost_normal_pid = None;
     let mut rectangles = Vec::new();
-    let (visibility, rule) = (|| {
-        let dictionaries = on_screen_window_dictionaries()?;
-        let entries = cursor_windows_from(&dictionaries)?;
-        frontmost_normal_pid = crate::window_visibility::frontmost_from_windows(&entries);
-        let mut cover = Vec::new();
-        let decision = window_visibility_with_entries(pid, id, &entries, Some(&mut cover));
-        rectangles.extend(cover.into_iter().filter_map(|slot| {
-            let entry = &entries[slot];
-            let dictionary = dictionaries.get(slot)?;
-            let bounds = entry.bounds?;
-            Some(WindowOverlapRectangle {
-                owner_pid: entry.pid,
-                owner_name: dictionary
-                    .get(&CFString::from_static_str("kCGWindowOwnerName"))
-                    .and_then(|name| name.downcast::<CFString>().ok())
-                    .map(|name| name.to_string()),
-                window_number: entry.id,
-                layer: entry.layer?,
-                bounds: [bounds.x, bounds.y, bounds.width, bounds.height],
-                alpha: entry.alpha?,
-                sharing_state: dictionary
-                    .get(&CFString::from_static_str("kCGWindowSharingState"))
-                    .and_then(|state| state.downcast::<CFNumber>().ok())
-                    .and_then(|state| state.as_i64()),
-            })
-        }));
-        Some(decision)
-    })()
-    .unwrap_or((
-        crate::WindowVisibility::Unknown,
-        crate::VisibilityRule::MissingData,
-    ));
+    let (visibility, rule) = snapshot
+        .map(|(dictionaries, entries, displays)| {
+            frontmost_normal_pid = crate::window_visibility::frontmost_from_windows(entries);
+            let mut cover = Vec::new();
+            let decision = crate::window_visibility::visibility_with_cover(
+                pid, id, entries, displays, &mut cover,
+            );
+            rectangles.extend(cover.into_iter().filter_map(|slot| {
+                let entry = &entries[slot];
+                let dictionary = dictionaries.get(slot)?;
+                let bounds = entry.bounds?;
+                Some(WindowOverlapRectangle {
+                    owner_pid: entry.pid,
+                    owner_name: dictionary
+                        .get(&CFString::from_static_str("kCGWindowOwnerName"))
+                        .and_then(|name| name.downcast::<CFString>().ok())
+                        .map(|name| name.to_string()),
+                    window_number: entry.id,
+                    layer: entry.layer?,
+                    bounds: [bounds.x, bounds.y, bounds.width, bounds.height],
+                    alpha: entry.alpha?,
+                    sharing_state: dictionary
+                        .get(&CFString::from_static_str("kCGWindowSharingState"))
+                        .and_then(|state| state.downcast::<CFNumber>().ok())
+                        .and_then(|state| state.as_i64()),
+                })
+            }));
+            decision
+        })
+        .unwrap_or((
+            crate::WindowVisibility::Unknown,
+            crate::VisibilityRule::MissingData,
+        ));
     WindowOverlapSample {
         pid,
         window_number: id,
@@ -444,6 +464,31 @@ pub fn sample_window_overlap_for_probe(pid: u32, id: u32) -> WindowOverlapSample
         rule,
         rectangles,
     }
+}
+
+pub(super) fn fronted_visibility_snapshot(
+    _pid: u32,
+    _id: u32,
+) -> Option<(
+    Vec<crate::window_visibility::Window>,
+    Vec<crate::window_visibility::Rect>,
+)> {
+    #[cfg(feature = "desk-probe")]
+    let started = std::time::Instant::now();
+    let dictionaries = on_screen_window_dictionaries()?;
+    let windows = cursor_windows_from(&dictionaries)?;
+    let displays = visibility_displays()?;
+    #[cfg(feature = "desk-probe")]
+    if OVERLAP_WITNESS.with_borrow(Option::is_some) {
+        let sample = overlap_sample(
+            _pid,
+            _id,
+            started,
+            Some((&dictionaries, &windows, &displays)),
+        );
+        OVERLAP_WITNESS.with_borrow_mut(|slot| *slot = Some(Some(sample)));
+    }
+    Some((windows, displays))
 }
 
 static CURSOR_GENERATION: std::sync::Mutex<Option<crate::ProcessGeneration>> =
@@ -469,28 +514,27 @@ fn on_screen_window_dictionaries() -> Option<CFRetained<WindowDictionaries>> {
     Some(unsafe { CFRetained::cast_unchecked(windows) })
 }
 
-fn cursor_window_list() -> Option<Vec<crate::window_visibility::Window>> {
+pub(super) fn cursor_window_list() -> Option<Vec<crate::window_visibility::Window>> {
     let dictionaries = on_screen_window_dictionaries()?;
     cursor_windows_from(&dictionaries)
 }
 
 /// Find the Dock's on-screen layer-20 window filling the display that contains
-/// the entire scratch rectangle. CG window alpha is metadata, not the witness.
-#[cfg(feature = "desk-probe")]
+/// the entire target rectangle. CG window alpha is metadata, not the witness.
 pub(super) fn dock_overlay_window(
     dock_pid: u32,
     scratch_rect: [f64; 4],
-) -> Result<(u32, [f64; 4]), String> {
+) -> Result<Option<(u32, [f64; 4])>, String> {
     let [x, y, w, h] = scratch_rect;
     let displays = display_frames().ok_or("active display bounds unavailable")?;
     let mut displays = displays.into_iter().filter(|&[dx, dy, dw, dh]| {
         w > 0.0 && h > 0.0 && x >= dx && y >= dy && x + w <= dx + dw && y + h <= dy + dh
     });
-    let display = displays
-        .next()
-        .ok_or("scratch is not wholly on one display")?;
+    let Some(display) = displays.next() else {
+        return Ok(None);
+    };
     if displays.next().is_some() {
-        return Err("scratch lies on more than one display".into());
+        return Ok(None);
     }
     let mut overlays = cursor_window_list()
         .ok_or("CoreGraphics window list unavailable")?
@@ -499,18 +543,18 @@ pub(super) fn dock_overlay_window(
             let bounds = window.bounds?;
             (window.pid == Some(dock_pid)
                 && window.layer == Some(20)
-                && window.alpha == Some(1.0)
+                && window
+                    .alpha
+                    .is_some_and(|alpha| alpha.is_finite() && alpha != 0.0)
                 && [bounds.x, bounds.y, bounds.width, bounds.height] == display)
                 .then_some(window.id)
                 .flatten()
         });
-    let id = overlays
-        .next()
-        .ok_or("CoreGraphics does not list a full-display Dock layer-20 overlay over scratch")?;
+    let id = overlays.next();
     if overlays.next().is_some() {
-        return Err("CoreGraphics lists multiple matching Dock overlays".into());
+        return Ok(None);
     }
-    Ok((id, display))
+    Ok(id.map(|id| (id, display)))
 }
 
 fn cursor_windows_from(
@@ -592,6 +636,12 @@ pub fn visible_window_frame(pid: u32, id: u32) -> Option<[f64; 4]> {
         .find(|window| window.id == Some(id) && window.pid == Some(pid))?
         .bounds?;
     Some([bounds.x, bounds.y, bounds.width, bounds.height])
+}
+
+pub(super) fn fronted_frame_matches(pid: u32, id: u32, frame: [f64; 4]) -> bool {
+    use crate::window_visibility::{fronted_frame_matches, Rect};
+    cursor_window_list()
+        .is_some_and(|windows| fronted_frame_matches(&windows, pid, id, Rect::from_frame(frame)))
 }
 
 /// Uses the same front-to-back list as the image visibility reading. `frame`
@@ -753,40 +803,42 @@ fn window_visibility_with_entries(
     pid: u32,
     id: u32,
     entries: &[crate::window_visibility::Window],
-    #[cfg(feature = "desk-probe")] cover: Option<&mut Vec<usize>>,
 ) -> (crate::WindowVisibility, crate::VisibilityRule) {
-    use crate::window_visibility::{visibility_from_windows, Rect};
+    use crate::window_visibility::visibility_from_windows;
     use crate::WindowVisibility;
+    let Some(displays) = visibility_displays() else {
+        return (
+            WindowVisibility::Unknown,
+            crate::VisibilityRule::MissingData,
+        );
+    };
+    visibility_from_windows(pid, id, entries, &displays)
+}
+
+pub(super) fn visibility_displays() -> Option<Vec<crate::window_visibility::Rect>> {
+    use crate::window_visibility::Rect;
     let mut ids = [0u32; 32];
     let mut count = 0;
     // SAFETY: ids has capacity for 32 display IDs and count is a valid output pointer.
     let status = unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut count) };
     if status != 0 || count == 0 || count as usize >= ids.len() {
-        return (
-            WindowVisibility::Unknown,
-            crate::VisibilityRule::MissingData,
-        );
+        return None;
     }
-    let displays = ids[..count as usize]
-        .iter()
-        .map(|id| {
-            // SAFETY: the display ID was supplied by CoreGraphics immediately above.
-            let bounds = unsafe { CGDisplayBounds(*id) };
-            Rect {
-                x: bounds.origin.x,
-                y: bounds.origin.y,
-                width: bounds.size.width,
-                height: bounds.size.height,
-            }
-        })
-        .collect::<Vec<_>>();
-    #[cfg(feature = "desk-probe")]
-    if let Some(cover) = cover {
-        return crate::window_visibility::visibility_from_windows_for_probe(
-            pid, id, entries, &displays, cover,
-        );
-    }
-    visibility_from_windows(pid, id, entries, &displays)
+    Some(
+        ids[..count as usize]
+            .iter()
+            .map(|id| {
+                // SAFETY: the display ID was supplied by CoreGraphics immediately above.
+                let bounds = unsafe { CGDisplayBounds(*id) };
+                Rect {
+                    x: bounds.origin.x,
+                    y: bounds.origin.y,
+                    width: bounds.size.width,
+                    height: bounds.size.height,
+                }
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]

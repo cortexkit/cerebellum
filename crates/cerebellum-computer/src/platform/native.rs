@@ -15,8 +15,9 @@ use super::{
 };
 use crate::capture::{
     BackendError, BackendTeardownProgress, BroadDisplayCaptureRequest, CaptureArtifact,
-    CaptureBackend, EnumeratedWindow, PendingVisionWindowFrame, VisionWindowFrame,
-    WindowCaptureFrame, WindowCaptureRequest, WindowChange, WindowChangeKind, WindowFrame,
+    CaptureBackend, EnumeratedWindow, PendingVisionWindowFrame, PreparedVisionCapture,
+    VisionWindowFrame, WindowCaptureFrame, WindowCaptureRequest, WindowChange, WindowChangeKind,
+    WindowFrame,
 };
 #[cfg(test)]
 use cerebellum_macos::test_support as permission_test_support;
@@ -621,21 +622,33 @@ impl CaptureBackend for NativeCaptureBackend {
                 std::sync::Arc::clone(may_acquire),
             )
         })?;
-        let captured_width_px = u32::try_from(capture.width)
-            .map_err(|_| BackendError::Capture("the capture is too wide".into()))?;
-        let captured_height_px = u32::try_from(capture.height)
-            .map_err(|_| BackendError::Capture("the capture is too tall".into()))?;
-        Ok(PendingVisionWindowFrame {
-            frame: VisionWindowFrame {
-                owner_identity: request.target.clone(),
-                owner_identity_verified: true,
-                captured_width_px,
-                captured_height_px,
-                jpeg: Vec::new(),
-                captured_at_ms: request.captured_at_ms,
-            },
-            bgra: Some(capture.bgra),
-        })
+        pending_vision_frame(request, capture)
+    }
+
+    fn prepare_fronted_vision(
+        &mut self,
+        request: &WindowCaptureRequest,
+    ) -> Result<Option<PreparedVisionCapture>, BackendError> {
+        let window_id = fronted_window_id(request)?;
+        let prepared =
+            cerebellum_macos::prepare_window_capture(window_id, self.timeout, None, &mut |owner| {
+                verify_grant(owner, &request.target).is_current()
+            })
+            .map_err(map_macos_capture_error)?;
+        let request = request.clone();
+        Ok(Some(Box::new(move |until, may_acquire| {
+            let until = until
+                .ok_or_else(|| BackendError::Capture("the front has no capture cutoff".into()))?;
+            let capture = capture_granted_window(window_id, &request.target, |accept_owner| {
+                prepared.capture_fronted(
+                    window_id,
+                    until,
+                    accept_owner,
+                    std::sync::Arc::clone(may_acquire),
+                )
+            })?;
+            pending_vision_frame(&request, capture)
+        })))
     }
 
     fn encode_window_for_vision(
@@ -693,6 +706,33 @@ impl CaptureBackend for NativeCaptureBackend {
     fn poll_teardown(&mut self, _elapsed_ms: u64) -> Result<BackendTeardownProgress, BackendError> {
         Ok(BackendTeardownProgress::Complete)
     }
+}
+
+fn fronted_window_id(request: &WindowCaptureRequest) -> Result<u32, BackendError> {
+    request.filter.window_id.parse().map_err(|_| {
+        BackendError::Capture(format!("not a window id: {}", request.filter.window_id))
+    })
+}
+
+fn pending_vision_frame(
+    request: &WindowCaptureRequest,
+    capture: cerebellum_macos::RawCapture,
+) -> Result<PendingVisionWindowFrame, BackendError> {
+    let captured_width_px = u32::try_from(capture.width)
+        .map_err(|_| BackendError::Capture("the capture is too wide".into()))?;
+    let captured_height_px = u32::try_from(capture.height)
+        .map_err(|_| BackendError::Capture("the capture is too tall".into()))?;
+    Ok(PendingVisionWindowFrame {
+        frame: VisionWindowFrame {
+            owner_identity: request.target.clone(),
+            owner_identity_verified: true,
+            captured_width_px,
+            captured_height_px,
+            jpeg: Vec::new(),
+            captured_at_ms: request.captured_at_ms,
+        },
+        bgra: Some(capture.bgra),
+    })
 }
 
 #[cfg(test)]

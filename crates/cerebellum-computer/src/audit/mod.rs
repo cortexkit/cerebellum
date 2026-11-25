@@ -1271,6 +1271,98 @@ mod gate_tests {
     }
 
     #[test]
+    fn dock_exemption_read_rows_reopen_under_the_existing_journal_format() {
+        use crate::app_state::image::ImageCustody;
+        use crate::app_state::{
+            AuditImageCustody, DockOverlayExemption, ImageReadEvidence, ReadStateSummary,
+        };
+        use crate::audit::redaction::ExcludeApplicationText;
+        use cerebellum_core::journal::storage::JournalStorage;
+
+        let storage = InMemoryJournalStorage::new();
+        let open = || {
+            ComputerAudit::new(
+                ExcludeApplicationText,
+                taxonomy(),
+                JournalConfig {
+                    journal_retention_bytes: 200_000,
+                    journal_max_entry_bytes: 40_000,
+                },
+                storage.clone(),
+                custody(),
+            )
+            .unwrap()
+        };
+        let audit = std::sync::Arc::new(std::sync::Mutex::new(open()));
+        for dock_overlay_exemption in [
+            None,
+            Some(DockOverlayExemption {
+                window_id: 37,
+                sample_count: 276_832,
+            }),
+        ] {
+            let mut identity =
+                journal_identity("principal", "conversation", "project", SessionKind::Primary);
+            identity.witness = cerebellum_core::dispatch_witness::DispatchWitness::armed();
+            let evidence = std::cell::RefCell::new(ImageReadEvidence {
+                dock_overlay_exemption,
+                ..Default::default()
+            });
+            let mut read = AuditImageCustody {
+                audit: &audit,
+                identity,
+                now_ms: 10,
+                summary: ReadStateSummary {
+                    grant_identity: ProcessGrant {
+                        pid: 92466,
+                        bundle_identity: "com.apple.TextEdit".into(),
+                        process_generation_evidence: "1".into(),
+                    },
+                    element_count: 1,
+                    unreadable_subtrees: 0,
+                },
+                finalized: false,
+                image_evidence: &evidence,
+            };
+            let reservation = read.reserve().unwrap();
+            read.finalize_read(reservation, false).unwrap();
+        }
+        drop(audit);
+
+        let state = storage.load().unwrap();
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let decoded: cerebellum_core::journal::DurableState =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, state);
+        storage.save(&decoded).unwrap();
+        // Reopen the newly written rows through the unchanged startup and
+        // completion readers, as a binary rollback would.
+        let mut reopened = open();
+        reopened.startup_reconcile(10).unwrap();
+        let entries: Value = serde_json::from_slice(&bytes).unwrap();
+        let results: Vec<Value> = (1..=2)
+            .map(|sequence| {
+                let record = reopened.read_obligation_audit(sequence).unwrap();
+                assert_eq!(record.codec_id, "ck-computer-journal/v3");
+                let entry = &entries["entries"][sequence.to_string()];
+                let bytes = cerebellum_core::serde_base64::decode(entry["bytes"].as_str().unwrap())
+                    .unwrap();
+                let row = ComputerJournalCodec::decode_entry(&bytes).unwrap();
+                assert_eq!(row["phase"], "finalized");
+                assert_eq!(row["codec_version"], "ck-computer-journal/v3");
+                let bytes: Vec<u8> =
+                    serde_json::from_value(row["completed_result"].clone()).unwrap();
+                serde_json::from_slice(&bytes).unwrap()
+            })
+            .collect();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].get("dock_overlay_window_id").is_none());
+        assert!(results[0].get("dock_overlay_sample_count").is_none());
+        assert_eq!(results[1]["dock_overlay_window_id"], 37);
+        assert_eq!(results[1]["dock_overlay_sample_count"], 276_832);
+    }
+
+    #[test]
     fn failed_front_cannot_serialize_as_confirmed_in_reply_or_audit() {
         for body in [
             serde_json::json!({"outcome":"fronting_failed", "fronting":{"fronted":true}}),
