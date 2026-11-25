@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::AnyThread;
+use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::{
     CGColor, CGDataProvider, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo,
 };
@@ -166,6 +167,9 @@ impl Raster {
 struct Prepared {
     filter: Retained<SCContentFilter>,
     configuration: Retained<SCStreamConfiguration>,
+    // The configuration's background colour is an `assign` property: it does
+    // not retain the colour, so the colour must outlive every capture.
+    _background: CFRetained<CGColor>,
     raster: Raster,
 }
 
@@ -212,6 +216,7 @@ impl Prepared {
             Ok(Self {
                 filter,
                 configuration,
+                _background: clear,
                 raster,
             })
         }

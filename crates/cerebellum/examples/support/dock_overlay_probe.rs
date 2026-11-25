@@ -161,11 +161,15 @@ struct Desk<'a> {
 }
 
 impl Desk<'_> {
-    fn verify(&self) -> Result<(), String> {
+    /// `overlay_open` relaxes the scratch-frame check: Mission Control, App
+    /// Exposé and Show Desktop all move or rescale every window while they
+    /// show, so the scratch frame legitimately differs until the overlay
+    /// closes. The Dock window check still runs in every state.
+    fn verify(&self, overlay_open: bool) -> Result<(), String> {
         if screen_is_locked() != Some(false) || frontmost_process_id() != Some(self.person) {
             return Err("screen lock or foreground app changed".into());
         }
-        if visible_window_frame(self.pid, self.window) != Some(self.rect) {
+        if !overlay_open && visible_window_frame(self.pid, self.window) != Some(self.rect) {
             return Err("scratch window or its frame changed".into());
         }
         self.witness.compare_window(self.rect)
@@ -175,7 +179,7 @@ impl Desk<'_> {
         let deadline = Instant::now() + WAIT;
         let mut last = None;
         while Instant::now() < deadline {
-            self.verify()?;
+            self.verify(wanted == Alpha::Opaque)?;
             let sample = self.witness.sample(
                 deadline.min(Instant::now() + SAMPLE_WAIT),
                 Arc::new(|| true),
@@ -220,6 +224,7 @@ impl Desk<'_> {
         &self,
         serve: &impl Fn() -> F,
         before: AlphaSample,
+        overlay_open: bool,
     ) -> FrontEvidence {
         let mut evidence = FrontEvidence {
             record: json!({"before": reading(&before, None), "after": null}),
@@ -229,7 +234,7 @@ impl Desk<'_> {
         if !(self.owns_scratch)() {
             return evidence.stop("scratch ownership changed");
         }
-        if let Err(error) = self.verify() {
+        if let Err(error) = self.verify(overlay_open) {
             return evidence.stop(error);
         }
         let _ = take_fronting_timings();
@@ -287,7 +292,9 @@ impl Desk<'_> {
         {
             return evidence.stop("picture bracket did not restore the original app");
         }
-        if let Err(error) = self.verify() {
+        // An overlay that survived the front still rescales the scratch
+        // window, and that case must count as Survived, not stop the run.
+        if let Err(error) = self.verify(overlay_open) {
             return evidence.stop(error);
         }
         let after = match after {
@@ -363,7 +370,7 @@ async fn rounds<F: Future<Output = Value>>(
     };
     println!("CALIBRATION: leave Dock overlays closed and stand by");
     let before = desk.wait_for(Alpha::Transparent, true).await?;
-    let mut calibration = desk.front(serve, before).await;
+    let mut calibration = desk.front(serve, before, false).await;
     calibration.record["calibration"] = json!(true);
     let calibration_result = match calibration.verdict {
         Verdict::Uncounted => "restore_calibrated",
@@ -389,7 +396,7 @@ async fn rounds<F: Future<Output = Value>>(
             json!({"dock_overlay_ready": round, "attempt": attempt, "baseline": reading(&clear, None)})
         );
         let before = desk.wait_for(Alpha::Opaque, true).await?;
-        let mut front = desk.front(serve, before).await;
+        let mut front = desk.front(serve, before, true).await;
         front.record["round"] = json!(round);
         front.record["attempt"] = json!(attempt);
         front.record["result"] = json!(front.verdict.as_str());
