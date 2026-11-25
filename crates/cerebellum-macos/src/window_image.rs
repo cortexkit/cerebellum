@@ -472,23 +472,40 @@ fn overlap_sample(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum VisibilityScope {
+    ThroughTarget,
+    AllOnScreen,
+}
+
 pub(super) fn fronted_visibility_snapshot(
     _pid: u32,
-    _id: u32,
+    id: u32,
+    scope: VisibilityScope,
 ) -> Option<(
     Vec<crate::window_visibility::Window>,
     Vec<crate::window_visibility::Rect>,
 )> {
     #[cfg(feature = "desk-probe")]
     let started = std::time::Instant::now();
-    let dictionaries = on_screen_window_dictionaries()?;
+    let dictionaries = match scope {
+        VisibilityScope::ThroughTarget => on_screen_through_target(id)?,
+        VisibilityScope::AllOnScreen => on_screen_window_dictionaries()?,
+    };
     let windows = cursor_windows_from(&dictionaries)?;
+    if scope == VisibilityScope::ThroughTarget
+        && !windows.last().is_some_and(|target| {
+            target.id == Some(id) && target.alpha.is_some_and(|alpha| alpha > 0.0)
+        })
+    {
+        return None;
+    }
     let displays = visibility_displays()?;
     #[cfg(feature = "desk-probe")]
     if OVERLAP_WITNESS.with_borrow(Option::is_some) {
         let sample = overlap_sample(
             _pid,
-            _id,
+            id,
             started,
             Some((&dictionaries, &windows, &displays)),
         );
@@ -510,6 +527,36 @@ pub fn register_cursor_generation(generation: Option<crate::ProcessGeneration>) 
 }
 
 type WindowDictionaries = CFArray<CFDictionary<CFString, CFType>>;
+
+fn on_screen_through_target(id: u32) -> Option<CFRetained<WindowDictionaries>> {
+    use objc2_core_foundation::CFBoolean;
+
+    #[cfg(feature = "desk-probe")]
+    let _step = crate::picture_probe_timing::Step::new(
+        crate::picture_probe_timing::token(id),
+        "quartz_through_target_started",
+        "quartz_through_target_returned",
+    );
+    // Quartz's at-or-above list contains all on-screen windows in front of
+    // the target, in z order, with the same desktop exclusion as the full
+    // list. An ID-only query would miss other possible covers.
+    let windows = CGWindowListCopyWindowInfo(
+        CGWindowListOption::OptionOnScreenAboveWindow
+            | CGWindowListOption::OptionIncludingWindow
+            | CGWindowListOption::ExcludeDesktopElements,
+        id,
+    )?;
+    // SAFETY: CoreGraphics documents this result as string-keyed dictionaries.
+    let windows: CFRetained<WindowDictionaries> = unsafe { CFRetained::cast_unchecked(windows) };
+    // IncludingWindow can include the reference window itself. Require that
+    // it is actually on screen, just as in the full on-screen list.
+    let candidate = windows.get(windows.len().checked_sub(1)?)?;
+    let on_screen = candidate.get(&CFString::from_static_str("kCGWindowIsOnscreen"))?;
+    on_screen
+        .downcast_ref::<CFBoolean>()?
+        .as_bool()
+        .then_some(windows)
+}
 
 fn on_screen_window_dictionaries() -> Option<CFRetained<WindowDictionaries>> {
     #[cfg(feature = "desk-probe")]
@@ -648,18 +695,6 @@ pub fn visible_window_frame(pid: u32, id: u32) -> Option<[f64; 4]> {
         .find(|window| window.id == Some(id) && window.pid == Some(pid))?
         .bounds?;
     Some([bounds.x, bounds.y, bounds.width, bounds.height])
-}
-
-pub(super) fn fronted_frame_matches(pid: u32, id: u32, frame: [f64; 4]) -> bool {
-    #[cfg(feature = "desk-probe")]
-    let _step = crate::picture_probe_timing::Step::new(
-        crate::picture_probe_timing::token(id),
-        "prepared_frame_snapshot_started",
-        "prepared_frame_snapshot_returned",
-    );
-    use crate::window_visibility::{fronted_frame_matches, Rect};
-    cursor_window_list()
-        .is_some_and(|windows| fronted_frame_matches(&windows, pid, id, Rect::from_frame(frame)))
 }
 
 /// Uses the same front-to-back list as the image visibility reading. `frame`

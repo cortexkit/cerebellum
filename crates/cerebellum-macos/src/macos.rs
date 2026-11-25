@@ -31,7 +31,7 @@ pub mod dock_overlay_probe {
 mod dock_overlay;
 #[path = "fronted_visibility.rs"]
 mod fronted_visibility;
-pub use fronted_visibility::{DockExemption, PreparedFrontedVisibility};
+pub use fronted_visibility::{DockExemption, FrontedWindowProof, PreparedFrontedVisibility};
 
 /// The prefix of `struct proc_bsdinfo` from `<sys/proc_info.h>`, up to and
 /// including the two fields this reads.
@@ -1399,6 +1399,7 @@ impl PreparedWindowCapture {
     pub fn capture_fronted(
         &self,
         window_id: u32,
+        proof: FrontedWindowProof,
         until: Instant,
         accept_owner: &mut dyn FnMut(u32) -> bool,
         may_acquire: Arc<dyn Fn() -> bool + Send + Sync>,
@@ -1406,7 +1407,7 @@ impl PreparedWindowCapture {
         let owner = self.owner_pid_at_capture;
         if !may_acquire()
             || self.window_id != window_id
-            || !crate::window_image::fronted_frame_matches(owner, window_id, self.frame)
+            || !proof.matches(owner, window_id, self.frame)
             || !accept_owner(owner)
         {
             return Err(CaptureError::Capture(

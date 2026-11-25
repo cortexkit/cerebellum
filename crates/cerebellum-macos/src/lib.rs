@@ -266,9 +266,9 @@ pub use macos::{
     post_event_at_hid_tap_for_measurement, post_event_globally, post_event_to_pid,
     prepare_window_capture, process_owner, process_start_time, process_start_time_micros,
     responsible_process, running_applications, screen_capture_is_permitted, screen_is_locked,
-    CaptureError, CaptureSourceRect, CgEventPostCall, DockExemption, OwnedCgEvent,
-    PreparedFrontedVisibility, PreparedWindowCapture, ProcessOwner, ProcessStartTime, RawCapture,
-    RawWindow, RunningApplication,
+    CaptureError, CaptureSourceRect, CgEventPostCall, DockExemption, FrontedWindowProof,
+    OwnedCgEvent, PreparedFrontedVisibility, PreparedWindowCapture, ProcessOwner, ProcessStartTime,
+    RawCapture, RawWindow, RunningApplication,
 };
 #[cfg(any(target_os = "macos", test))]
 pub use manual_accessibility::{ManualAccessibility, ManualAccessibilityScope};

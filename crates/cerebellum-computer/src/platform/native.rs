@@ -635,13 +635,14 @@ impl CaptureBackend for NativeCaptureBackend {
                 })
                 .map_err(map_macos_capture_error)?;
             let request = request.clone();
-            Ok(Box::new(move |until, may_acquire| {
+            Ok(Box::new(move |proof, until, may_acquire| {
                 let until = until.ok_or_else(|| {
                     BackendError::Capture("the front has no capture cutoff".into())
                 })?;
                 let capture = capture_granted_window(window_id, &request.target, |accept_owner| {
                     prepared.capture_fronted(
                         window_id,
+                        proof,
                         until,
                         accept_owner,
                         std::sync::Arc::clone(may_acquire),
