@@ -8937,6 +8937,10 @@ async fn flow_scope_admission_refuses_flat_calls_before_dispatch_and_records_ref
     );
     let expected = json!({"outcome":"consent_unavailable", "detail":{"reason":"flow_carrier_not_admitted"}, "remedy":"open the flow route through authorized reserved:basal"});
     let (tx, mut rx) = mpsc::channel(8);
+    // A build with no computer plane (Linux, Windows today) refuses
+    // `computer_use` as a disabled tool before any route is consulted, so only
+    // builds that serve it reach flow admission.
+    let computer_served = cerebellum::dispatchable_tool("computer_use").is_some();
     for (corr, name, args) in [
         (801, "browser_use", json!({"action":"launch"})),
         (
@@ -8945,6 +8949,21 @@ async fn flow_scope_admission_refuses_flat_calls_before_dispatch_and_records_ref
             json!({"action":"read_state", "target":"com.example.NotInstalled"}),
         ),
     ] {
+        if name == "computer_use" && !computer_served {
+            let reply = exchange(
+                &planes,
+                &tx,
+                &mut rx,
+                keyed_on(9, corr, name, args, &format!("flow:{corr}")),
+            )
+            .await;
+            assert_eq!(reply.header.ty, FrameType::Error);
+            assert!(
+                rx.try_recv().is_err(),
+                "no elicitation or reverse request was sent"
+            );
+            continue;
+        }
         let reply = exchange(
             &planes,
             &tx,
