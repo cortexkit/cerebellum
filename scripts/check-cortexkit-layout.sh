@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Only four kinds of path under .cortexkit/ may be tracked: release notes,
-# skills, rules and the worker guide. Everything else there is private (internal
+# Only five kinds of path under .cortexkit/ may be tracked: release notes,
+# skills, rules, the worker guide, and top-level `<module>.jsonc` project
+# settings files, which the daemon reads. Everything else there is private (internal
 # documents, scripts, agent state) and must never reach a commit.
 #
 # This lists every tracked path rather than asking git for tracked-and-ignored
@@ -16,7 +17,7 @@ if ! all="$(git -C "$repo" ls-files -- .cortexkit)"; then
   echo "BLIND: git ls-files failed in $repo" >&2
   exit 2
 fi
-bad="$(printf '%s\n' "$all" | grep -vE '^\.cortexkit/(release-notes/|skills/|rules/|WORKER\.md$)' | grep -v '^$' || true)"
+bad="$(printf '%s\n' "$all" | grep -vE '^\.cortexkit/(release-notes/|skills/|rules/|WORKER\.md$|[a-z0-9-]+\.jsonc$)' | grep -v '^$' || true)"
 if [ -n "$bad" ]; then
   printf 'tracked outside the .cortexkit allowlist:\n%s\n' "$bad" >&2
   exit 1

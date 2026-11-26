@@ -13,10 +13,11 @@ new_repo() {
   git init -q "$dir"
   git -C "$dir" config user.email test@example.com
   git -C "$dir" config user.name test
-  printf '.cortexkit/*\n!.cortexkit/WORKER.md\n!.cortexkit/release-notes/\n' > "$dir/.gitignore"
+  printf '.cortexkit/*\n!.cortexkit/WORKER.md\n!.cortexkit/release-notes/\n!.cortexkit/example.jsonc\n' > "$dir/.gitignore"
   mkdir -p "$dir/.cortexkit/release-notes"
   echo guide > "$dir/.cortexkit/WORKER.md"
   echo notes > "$dir/.cortexkit/release-notes/v0.1.0.md"
+  echo "{}" > "$dir/.cortexkit/example.jsonc"
   printf '%s\n' "$dir"
 }
 
@@ -36,7 +37,7 @@ expect() {
 
 clean="$(new_repo clean)"
 git -C "$clean" add -A && git -C "$clean" commit -qm init
-expect 0 "allowlisted paths pass" "$check" "$clean"
+expect 0 "allowlisted paths, including a project settings file, pass" "$check" "$clean"
 
 unignored="$(new_repo unignored)"
 printf '!.cortexkit/notes.md\n' >> "$unignored/.gitignore"
