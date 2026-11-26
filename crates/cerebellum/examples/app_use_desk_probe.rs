@@ -59,7 +59,9 @@
 //! window visibility, does not count toward the three. The attempt log records
 //! timing stamps and whether an image was returned. Timing is passive by
 //! default. `--covered-picture-overlap` additionally samples changing cover on
-//! refused attempts, which can consume the remaining time before the cutoff.
+//! attempts whose visibility check judged the target still covered (so no
+//! picture was taken); that sampling can consume the time left before the
+//! cutoff, so never compare its durations with a passive run.
 //! The summary counts each kind even if a safety check ends the run early.
 //!
 //! On normal return, a failed check, a panic, and Ctrl-C, the probe kills the
