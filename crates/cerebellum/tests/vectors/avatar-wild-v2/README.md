@@ -1,7 +1,7 @@
 # Wild avatar vectors
 
 Copied byte-for-byte from `cortexkit/avatar`, tag `avatarkit-wild-v2`, commit
-`f7532499e2732568a0bc0cb5796649003c1afe2b`:
+`27499662d56c9e8f931e2443210b83c95d41bc4b` (the tag after avatar's history rewrite; before it, `f7532499`):
 
 - `vectors/wild/wild-port-0022.hex`
 - `vectors/tree/wild-port-0022__neutral.json` (version 1, neutral)
