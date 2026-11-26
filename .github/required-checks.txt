@@ -1,0 +1,3 @@
+# Keep this fallback in step with main's required CI checks. When the release
+# token can read branch protection, the gate enforces both sets of names.
+Test (ubuntu)
