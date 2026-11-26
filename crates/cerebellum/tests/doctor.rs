@@ -76,7 +76,8 @@ fn doctor_reports_missing_executable_without_starting_module() {
 #[test]
 fn doctor_manifest_and_usage_do_not_require_homes() {
     let command = |args: &[&str]| {
-        Command::new(program())
+        let binary = support::daemon_binary("ckdev-cerebellum-doctor", program().to_path_buf());
+        Command::new(&binary)
             .env_clear()
             .args(args)
             .output()
@@ -128,8 +129,11 @@ fn production_doctor_passes_read_only_conformance() {
             "output.valid"
         ]
     );
-    // The production binary can prompt, and a scratch image is not a safe
-    // re-pin target. Fix callbacks are exercised separately in unit tests.
+    // The kit's fix rules can't run against the production binary: a fix asks
+    // the person to confirm, and the only Chrome a test can create is a temp
+    // file owned by the test user, which the ownership guard rightly refuses
+    // to re-pin. The fix path is covered by unit tests in `doctor/linux/tests.rs`
+    // with a test-only trust seam.
     assert_eq!(
         skipped,
         [

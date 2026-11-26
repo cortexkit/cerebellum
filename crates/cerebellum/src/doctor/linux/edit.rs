@@ -49,8 +49,10 @@ impl Doctor {
         let original = read_open_text(&file, CONFIG_LIMIT)?;
         let settings = BrowserSettings::parse(&original).map_err(|_| EditError::Changed)?;
         let applied = self.applied();
-        // The doctor helper rechecks the summary and plan, not the evidence.
-        // Recompute and compare the entire confirmed finding while locked.
+        // Before calling a fix, `cortexkit_doctor::module::run` rechecks only the
+        // finding's summary and plan, not its evidence (the new digest). So
+        // recompute the whole finding here, under the file lock, and require it
+        // to equal the one the person confirmed.
         let current =
             identity_finding(&settings, applied.as_ref(), trust).ok_or(EditError::Changed)?;
         let image = current
@@ -65,7 +67,7 @@ impl Doctor {
         replace_settings(&self.config_path, &metadata, &edited, || {
             // When the person declines a settings change, the daemon restores
             // the previous document if the bytes still match what it reviewed,
-            // without taking a flock. Recheck our snapshot before replacing the
+            // without taking any file lock. Recheck our snapshot before replacing the
             // file so we don't knowingly overwrite that restore or an editor's save.
             image.unchanged()
                 && trust.allows(&image.path)

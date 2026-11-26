@@ -86,6 +86,10 @@ fn fixture_binding(path: &str, before: &[Token], name: &str) -> bool {
         // Offline CLI inspection launches the module fixture, never a browser.
         || (path == "cerebellum/tests/manifest_flag.rs"
             && expression.starts_with(&["support", "::", "daemon_binary", "(", "ckdev-cerebellum-manifest"]))
+        // `ck-cerebellum doctor` reads files and prints a document; it never
+        // launches a browser.
+        || (path == "cerebellum/tests/doctor.rs"
+            && expression.starts_with(&["support", "::", "daemon_binary", "(", "ckdev-cerebellum-doctor"]))
         // The managed-settings cases relaunch a ckdev- copy of the calling
         // test binary in a fenced process, never a browser.
         || (path == "cerebellum/tests/support/managed_settings.rs"
