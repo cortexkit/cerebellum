@@ -131,7 +131,9 @@ impl FrontedWindow {
     ) -> (VisibilityDecision, Option<DockExemption>) {
         let (verdict, sole_dock) = self.inspect(windows, displays, dock);
         if let Some(dock) = dock.filter(|_| sole_dock) {
-            if let Some((total, 0)) = sample().filter(|(total, _)| *total > 0) {
+            // Like other higher-layer covers, the Dock only blocks the picture
+            // if it covers the whole target. Require at least one zero-alpha pixel.
+            if let Some((total, _)) = sample().filter(|(total, nonzero)| nonzero < total) {
                 return (
                     VISIBLE,
                     Some(DockExemption {
@@ -201,10 +203,10 @@ impl FrontedVisibilityPrepareError {
 }
 
 /// Why preparing the Dock check failed. That check proves the macOS 27 Dock's
-/// invisible full-screen window is fully transparent before a covered window's
-/// picture is trusted. The desk probe (`dock_overlay_probe`) prints `message`
-/// to the person running it; production replies and health counters carry only
-/// the closed `kind`, so no OS error text leaves the module.
+/// full-screen overlay leaves at least one target pixel transparent, consistent
+/// with refusing only full higher-layer coverage. The Dock overlay desk probe
+/// prints `message` to the person running it; production replies and health
+/// counters carry only the closed `kind`, so no OS error text leaves the module.
 #[derive(Debug)]
 pub(crate) struct DockPrepareFailure {
     kind: FrontedVisibilityPrepareError,
@@ -494,12 +496,38 @@ mod tests {
     }
 
     #[test]
-    fn dock_exemption_refuses_one_nontransparent_pixel() {
+    fn dock_exemption_accepts_a_partly_opaque_sample() {
         let mut windows = RecordedWindowList::textedit_with_dock_overlay();
-        windows.nonzero_samples = 1;
+        windows.nonzero_samples = 656 * 5; // A five-pixel Dock strip across the target.
+        let evidence = Some(DockExemption {
+            window_id: DOCK_WINDOW,
+            sample_count: PIXELS,
+        });
+        assert_eq!(windows.before(), (VISIBLE, evidence));
+        assert_eq!(windows.sample_calls.get(), 1);
+        assert_eq!(windows.after(evidence), VISIBLE);
+    }
+
+    #[test]
+    fn dock_exemption_refuses_a_fully_opaque_sample() {
+        let mut windows = RecordedWindowList::textedit_with_dock_overlay();
+        windows.nonzero_samples = PIXELS;
         assert_eq!(windows.before(), (COVERED, None));
         assert_eq!(windows.sample_calls.get(), 1);
-        exact_match_control();
+    }
+
+    #[test]
+    fn dock_exemption_refuses_an_empty_sample() {
+        let windows = RecordedWindowList::textedit_with_dock_overlay();
+        assert_eq!(
+            windows.target.before(
+                &windows.windows,
+                &[windows.display],
+                windows.prepared_dock(),
+                || Some((0, 0)),
+            ),
+            (COVERED, None)
+        );
     }
 
     #[test]
@@ -561,7 +589,7 @@ mod tests {
         let scene = RecordedWindowList::textedit_with_dock_overlay();
         let snapshot =
             |scope| Some(RecordedWindowList::textedit_with_dock_overlay().snapshot(scope));
-        for failed_sample in [None, Some((0, 0)), Some((PIXELS, 1))] {
+        for failed_sample in [None, Some((0, 0)), Some((PIXELS, PIXELS))] {
             assert_eq!(
                 scene
                     .target

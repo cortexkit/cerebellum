@@ -41,6 +41,23 @@ pub struct AlphaSample {
     pub near_transparent: usize,
 }
 
+#[cfg(feature = "desk-probe")]
+impl AlphaSample {
+    /// Fraction of target pixels with nonzero alpha, counted as covered.
+    pub fn covered_fraction(&self) -> Option<f64> {
+        self.fraction(self.nonzero)
+    }
+
+    /// Fraction of pixels with alpha of at least 250.
+    pub fn near_opaque_fraction(&self) -> Option<f64> {
+        self.fraction(self.near_opaque)
+    }
+
+    fn fraction(&self, count: usize) -> Option<f64> {
+        (self.total != 0).then(|| count as f64 / self.total as f64)
+    }
+}
+
 #[derive(Clone)]
 pub struct DockOverlayWitness {
     send: mpsc::Sender<SampleRequest>,
