@@ -76,7 +76,7 @@ fn doctor_reports_missing_executable_without_starting_module() {
 #[test]
 fn doctor_manifest_and_usage_do_not_require_homes() {
     let command = |args: &[&str]| {
-        let binary = support::daemon_binary("ckdev-cerebellum-doctor", program().to_path_buf());
+        let binary = support::daemon_binary("ckdev-cerebellum-doctor", program());
         Command::new(&binary)
             .env_clear()
             .args(args)
