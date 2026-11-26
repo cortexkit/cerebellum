@@ -28,6 +28,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "println!(\"{manifest}\");",
         "`--manifest` answers before module startup, for the placement gate inspecting the binary",
     ),
+    (
+        "crates/cerebellum-native-host/src/main.rs",
+        "println!(\"ck-cerebellum-native-host {}\", env!(\"CARGO_PKG_VERSION\"));",
+        "exact `--version` answers before the relay starts, for setup checking the installed binary",
+    ),
 ];
 
 #[test]

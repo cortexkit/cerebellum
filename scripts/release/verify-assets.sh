@@ -7,11 +7,7 @@ manifest="${2:?usage: $0 <assets-dir> <expected-manifest>}"
 cmp "$manifest" "$assets/release-manifest.json"
 cd "$assets"
 
-archives=(
-  ck-cerebellum-darwin-arm64.zip
-  ck-cerebellum-native-host-darwin-arm64.zip
-  ck-cerebellum-linux-x64.zip
-)
+archives=(ck-cerebellum-darwin-arm64.zip ck-cerebellum-native-host-darwin-arm64.zip ck-cerebellum-linux-x64.zip)
 shopt -s nullglob dotglob
 files=(*)
 if [[ ${#files[@]} != $((2 * ${#archives[@]} + 1)) ]]; then
