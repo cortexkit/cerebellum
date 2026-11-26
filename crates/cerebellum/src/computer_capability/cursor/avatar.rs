@@ -149,7 +149,10 @@ impl Cache {
             _ => return None,
         };
         let version = row.version.unwrap_or(default_version);
-        if version != default_version {
+        if !matches!(
+            (row.avatar_type.as_str(), version),
+            ("creature.wild", 1 | 2) | ("creature.classic", 2)
+        ) {
             return None;
         }
         let hex = row.genome.as_bytes();
@@ -318,6 +321,48 @@ mod tests {
         include_bytes!("../../../tests/vectors/agent-identity-reads-v1/avatar-read.json");
     const REAL_GENOME: &str =
         include_str!("../../../tests/vectors/agent-identity-reads-v1/wild-port-0005.hex");
+    const WILD_0022: &str =
+        include_str!("../../../tests/vectors/avatar-wild-v2/wild-port-0022.hex");
+    const WILD_0022_V1_NEUTRAL: &str =
+        include_str!("../../../tests/vectors/avatar-wild-v2/wild-port-0022__neutral.json");
+    const WILD_0022_V2_SLEEPY: &[u8] =
+        include_bytes!("../../../tests/vectors/avatar-wild-v2/wild-port-0022__v2__sleepy.svg");
+
+    fn wild_0022_bytes() -> Vec<u8> {
+        WILD_0022
+            .trim()
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn wild_v2_sleepy_and_v1_neutral_match_upstream_vectors() {
+        let genome = wild_0022_bytes();
+        let sleepy = avatar_svg::render_tree_for_bytes(
+            &genome,
+            "creature.wild",
+            2,
+            avatar_svg::Mood::Sleepy,
+        )
+        .expect("wild v2 sleepy must render");
+        assert_eq!(avatar_svg::serialize_tree(&sleepy), WILD_0022_V2_SLEEPY);
+
+        let neutral = avatar_svg::render_tree_for_bytes(
+            &genome,
+            "creature.wild",
+            1,
+            avatar_svg::Mood::Neutral,
+        )
+        .expect("wild v1 neutral must render");
+        assert_eq!(
+            avatar_svg::serialize_tree_json(&neutral).trim(),
+            WILD_0022_V1_NEUTRAL.trim()
+        );
+    }
 
     fn fixture(agent: &str) -> AvatarRow {
         AvatarRow {
@@ -489,7 +534,12 @@ mod tests {
     fn unsupported_type_or_version_is_quietly_plain() {
         let mut cache = Cache::default();
         let mut row = fixture("agent-a");
-        row.version = Some(999);
+        for version in [0, 3, 999] {
+            row.version = Some(version);
+            assert!(cache.render(&row).is_none());
+        }
+        row.avatar_type = "creature.classic".into();
+        row.version = Some(1);
         assert!(cache.render(&row).is_none());
         row.avatar_type = "unknown".into();
         row.version = None;
@@ -734,6 +784,41 @@ mod tests {
             .0
             .iter()
             .any(|pixel| pixel[3] != 0));
+    }
+
+    #[tokio::test]
+    async fn wild_v2_identity_read_draws_a_badge_and_keeps_versions_separate() {
+        let mut row = fixture("agent-a");
+        row.genome = WILD_0022.trim().into();
+        let mut cache = Cache::default();
+        let v1 = cache.render(&row).expect("wild v1 badge");
+        row.version = Some(2);
+        let v2 = cache.render(&row).expect("wild v2 badge");
+        assert_eq!(cache.renders, 2, "version must be part of the cache key");
+        assert_eq!(cache.render(&row), Some(v2.clone()));
+        assert_eq!(cache.renders, 2);
+        assert_eq!(v1.pixels.len(), v2.pixels.len());
+
+        let avatars = source(
+            Some(
+                serde_json::json!({"result":{"avatars":[{"agentId":row.agent_id,"genome":row.genome,"type":row.avatar_type,"version":2}],"generation":1,"incarnation":"0123456789abcdef"}}),
+            ),
+            false,
+        );
+        let mut events = scheduled(avatars.clone()).await;
+        let plain = events.recv().await.unwrap();
+        let update = events.recv().await.unwrap();
+        assert!(plain.avatar_rgba.is_none());
+        assert!(update.avatar_update);
+        assert_eq!(update.serial, plain.serial);
+        assert_eq!(update.avatar_rgba, Some(v2.pixels.clone()));
+        assert!(v2
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] != 0));
+        assert_eq!(avatars.known_avatar("agent-a"), Some(v2));
     }
 
     #[tokio::test]
