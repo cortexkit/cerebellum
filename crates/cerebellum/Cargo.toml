@@ -85,7 +85,8 @@ tokio-util = { workspace = true }
 # SIGTERM runs the same bounded teardown EOF does and then re-raises itself.
 # Unix only: Windows has no SIGTERM, and keeps ending on EOF alone.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.4", features = ["process"] }
+cortexkit-doctor = "=0.3.0"
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 signal-hook = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 
@@ -117,6 +118,9 @@ subc-daemon = { workspace = true, features = ["test-support"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 cortexkit-test-support = "=0.1.14"
+
+[target.'cfg(unix)'.dev-dependencies]
+cortexkit-doctor-conformance = "=0.3.0"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 cerebellum-computer = { path = "../cerebellum-computer", features = ["test-support"] }

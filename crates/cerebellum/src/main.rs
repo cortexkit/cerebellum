@@ -22,24 +22,32 @@ fn print_manifest() {
     println!("{manifest}");
 }
 
-fn main() -> Result<(), cerebellum::ModuleError> {
+fn main() -> Result<std::process::ExitCode, cerebellum::ModuleError> {
+    #[cfg(unix)]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args.next().is_some_and(|arg| arg == "doctor") {
+            return Ok(cerebellum::doctor::run(&args.collect::<Vec<_>>()));
+        }
+    }
     if std::env::args().skip(1).any(|arg| arg == "--version") {
         print_version();
-        return Ok(());
+        return Ok(std::process::ExitCode::SUCCESS);
     }
     if std::env::args().skip(1).any(|arg| arg == "--manifest") {
         print_manifest();
-        return Ok(());
+        return Ok(std::process::ExitCode::SUCCESS);
     }
     if std::env::args().skip(1).any(|arg| arg == "--agent-cursor") {
         agent_cursor();
-        return Ok(());
+        return Ok(std::process::ExitCode::SUCCESS);
     }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("the module runtime can be constructed")
         .block_on(cerebellum::run_entry())
+        .map(|()| std::process::ExitCode::SUCCESS)
 }
 
 #[cfg(not(target_os = "macos"))]

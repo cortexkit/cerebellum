@@ -38,13 +38,13 @@ pub(crate) fn validate_configured_executable_at_load(
     arguments: &[OsString],
     environment: &[(OsString, OsString)],
     expected: &str,
-) -> Result<(), Value> {
+) -> Result<std::path::PathBuf, Value> {
     let expected = expected.to_ascii_lowercase();
     let observation =
         probe_configured_executable(launcher, path, arguments, environment, &expected)?;
     let Some(final_image) = observation.next_exec.as_ref() else {
         if observation.observed.image_sha256 == expected {
-            return Ok(());
+            return Ok(observation.observed.resolved_path);
         }
         return Err(json!({
             "outcome": "executable_identity_mismatch",

@@ -367,6 +367,8 @@ dependencies = [
  "cortexkit-bus-client",
  "cortexkit-bus-naming",
  "cortexkit-bus-nats",
+ "cortexkit-doctor",
+ "cortexkit-doctor-conformance",
  "cortexkit-paths",
  "cortexkit-resource-busy",
  "cortexkit-role-agent-data",
@@ -646,6 +648,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-doctor"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f2de5896733426dec822dab02a4effd9681c6360257d50ec09158866a5bbc6e"
+dependencies = [
+ "cortexkit-log",
+ "cortexkit-store-types",
+ "hmac",
+ "libc",
+ "regex",
+ "ryu-js",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subc-presence",
+]
+
+[[package]]
+name = "cortexkit-doctor-conformance"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "397102e571271e99864b732931e0091d84914ea231c7639e05421693da50c0cf"
+dependencies = [
+ "cortexkit-doctor",
+ "rustix",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "cortexkit-lease"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -657,11 +689,12 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-log"
-version = "0.3.3"
+version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ceae091889f52b64ef218ca24346fd18ed14d24053396d7a8cad031a78c430e7"
+checksum = "8a57138f104249fb102f9844a24eeefe434bfb0665269028f4e207cea850f9be"
 dependencies = [
  "chrono",
+ "cortexkit-lease",
  "cortexkit-store-types",
  "regex",
  "tracing",
@@ -980,7 +1013,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1555,7 +1588,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2139,7 +2172,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2453,7 +2486,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2718,7 +2751,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3030,7 +3063,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -256,6 +256,8 @@ pub(crate) struct StartupSettings {
     pub(crate) agent_cursor: bool,
     pub(crate) browser: BrowserSurface,
     pub(crate) live: LiveSettings,
+    #[cfg(target_os = "linux")]
+    pub(crate) stamped: bool,
 }
 
 fn validate_view(view: &ConfigView) -> Result<(), &'static str> {
@@ -304,6 +306,8 @@ impl StartupSettings {
             health: core.health,
             agent_cursor: core.computer_use.agent_cursor,
             browser,
+            #[cfg(target_os = "linux")]
+            stamped: matches!(view.status, ConfigStatus::Active | ConfigStatus::Pending),
             live: LiveSettings {
                 app_use: core.computer_use.app_use,
                 approved: matches!(view.status, ConfigStatus::Active | ConfigStatus::Pending),
@@ -311,12 +315,23 @@ impl StartupSettings {
         })
     }
 
-    pub(crate) fn validate_browser(&mut self) {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn validate_browser(&mut self) -> crate::doctor::AppliedBrowser {
+        let mut applied = crate::doctor::AppliedBrowser::new(self.stamped);
         if let BrowserSurface::Available(browser) = &self.browser {
-            if let Err(error) = browser_config::validate_browser_config_at_load(browser) {
-                self.browser = BrowserSurface::Refused(error);
+            applied.executable_path = browser.executable_path.clone();
+            applied.expected_identity = browser.expected_identity.clone();
+            match browser_config::probe_browser_config_at_load(browser) {
+                Ok(path) => applied.final_image_path = path,
+                Err(error) => {
+                    if let BrowserConfigReason::FinalImageMismatch { path, .. } = &error.reason {
+                        applied.final_image_path = Some(path.clone());
+                    }
+                    self.browser = BrowserSurface::Refused(error);
+                }
             }
         }
+        applied
     }
 }
 

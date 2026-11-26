@@ -62,6 +62,8 @@ pub mod computer_grants;
 pub mod connector_evidence;
 mod consent_card;
 pub mod consent_drain;
+#[cfg(unix)]
+pub mod doctor;
 // Executable fixtures assert Unix modes and inode reuse.
 mod channel_route;
 #[cfg(all(test, unix))]

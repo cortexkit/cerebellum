@@ -171,88 +171,93 @@ impl std::error::Error for BrowserConfigError {}
 
 pub fn validate_browser_config_at_load(config: &BrowserConfig) -> Result<(), BrowserConfigError> {
     #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::net::UnixStream;
-
-        let Some(path) = config.executable_path.as_deref() else {
-            return Ok(());
-        };
-        // Missing paths retain the existing launch-time `executable_missing`
-        // refusal; there is no image to probe during config loading.
-        if !path.is_file() {
-            return Ok(());
-        }
-        let expected = config
-            .expected_identity
-            .as_deref()
-            .ok_or_else(|| BrowserConfigError {
-                field: "browser.expected_identity".to_string(),
-                reason: BrowserConfigReason::ExpectedIdentityRequired,
-            })?;
-        crate::browser_executable_identity::verify_configured_executable(path, expected).map_err(
-            |refusal| BrowserConfigError {
-                field: "browser.expected_identity".to_string(),
-                reason: BrowserConfigReason::ExecutableProbeFailed(refusal.to_string()),
-            },
-        )?;
-        let (command_child, _command_parent) =
-            UnixStream::pair().map_err(|error| BrowserConfigError {
-                field: "browser.executable_path".to_string(),
-                reason: BrowserConfigReason::ExecutableProbeFailed(error.to_string()),
-            })?;
-        let (_response_parent, response_child) =
-            UnixStream::pair().map_err(|error| BrowserConfigError {
-                field: "browser.executable_path".to_string(),
-                reason: BrowserConfigReason::ExecutableProbeFailed(error.to_string()),
-            })?;
-        let mut launcher = crate::browser_launch::LinuxProcessLauncher::new(
-            command_child.as_raw_fd(),
-            response_child.as_raw_fd(),
-        );
-        let probe_profile = browser_probe_profile_path();
-        // A killed browser leaves `SingletonLock` as a symlink naming
-        // `<hostname>-<pid>` without a timestamp or generation counter. The
-        // custody path cannot prove that link stale and refuses to break it,
-        // so probing the real profile would make the first real launch after
-        // every boot fail with `profile_held_externally`. Crashpad's database
-        // path does not follow `--user-data-dir`, so it needs its own
-        // throwaway path as well. `XDG_CONFIG_HOME` contains that database and
-        // any other home-derived Chromium writes without changing argv. The
-        // `--crash-dumps-dir` switch remains belt-and-braces for builds that
-        // honor it; this Chromium build (measured 2026-08-25) still derives
-        // the handler database from XDG configuration.
-        let crash_dumps_directory = probe_profile.join("crash-dumps");
-        let probe_environment = browser_probe_environment(&probe_profile);
-        let arguments = crate::browser_launch_service::browser_launch_arguments(
-            &probe_profile,
-            &crash_dumps_directory,
-        );
-        let result = crate::browser_executable_identity::validate_configured_executable_at_load(
-            &mut launcher,
-            path,
-            &arguments,
-            &probe_environment,
-            expected,
-        )
-        .map_err(|refusal| BrowserConfigError {
-            field: "browser.expected_identity".to_string(),
-            reason: reason_from_identity_refusal(&refusal, expected),
-        });
-        // Probe cleanup is part of config refusal: leaving SingletonLock or
-        // XDG-derived Crashpad state behind would turn every later boot into a
-        // false `profile_held_externally` refusal. Removal is strict rather
-        // than best-effort so a cleanup failure remains visible at boot.
-        let cleanup = cleanup_browser_probe(&probe_profile);
-        match (result, cleanup) {
-            (Err(error), _) => return Err(error),
-            (Ok(()), Err(error)) => return Err(error),
-            (Ok(()), Ok(())) => {}
-        }
-    }
+    return probe_browser_config_at_load(config).map(|_| ());
     #[cfg(not(target_os = "linux"))]
-    let _ = config;
-    Ok(())
+    {
+        let _ = config;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn probe_browser_config_at_load(
+    config: &BrowserConfig,
+) -> Result<Option<PathBuf>, BrowserConfigError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let Some(path) = config.executable_path.as_deref() else {
+        return Ok(None);
+    };
+    // Missing paths retain the existing launch-time `executable_missing`
+    // refusal; there is no image to probe during config loading.
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let expected = config
+        .expected_identity
+        .as_deref()
+        .ok_or_else(|| BrowserConfigError {
+            field: "browser.expected_identity".to_string(),
+            reason: BrowserConfigReason::ExpectedIdentityRequired,
+        })?;
+    crate::browser_executable_identity::verify_configured_executable(path, expected).map_err(
+        |refusal| BrowserConfigError {
+            field: "browser.expected_identity".to_string(),
+            reason: BrowserConfigReason::ExecutableProbeFailed(refusal.to_string()),
+        },
+    )?;
+    let (command_child, _command_parent) =
+        UnixStream::pair().map_err(|error| BrowserConfigError {
+            field: "browser.executable_path".to_string(),
+            reason: BrowserConfigReason::ExecutableProbeFailed(error.to_string()),
+        })?;
+    let (_response_parent, response_child) =
+        UnixStream::pair().map_err(|error| BrowserConfigError {
+            field: "browser.executable_path".to_string(),
+            reason: BrowserConfigReason::ExecutableProbeFailed(error.to_string()),
+        })?;
+    let mut launcher = crate::browser_launch::LinuxProcessLauncher::new(
+        command_child.as_raw_fd(),
+        response_child.as_raw_fd(),
+    );
+    let probe_profile = browser_probe_profile_path();
+    // A killed browser leaves `SingletonLock` as a symlink naming
+    // `<hostname>-<pid>` without a timestamp or generation counter. The
+    // profile lock check cannot prove that link stale and refuses to break it,
+    // so probing the real profile would make the first real launch after
+    // every boot fail with `profile_held_externally`. Crashpad's database
+    // path does not follow `--user-data-dir`, so it needs its own
+    // throwaway path as well. `XDG_CONFIG_HOME` contains that database and
+    // any other home-derived Chromium writes without changing argv. The
+    // `--crash-dumps-dir` switch remains belt-and-braces for builds that
+    // honor it; this Chromium build (measured 2026-08-25) still derives
+    // the handler database from XDG configuration.
+    let crash_dumps_directory = probe_profile.join("crash-dumps");
+    let probe_environment = browser_probe_environment(&probe_profile);
+    let arguments = crate::browser_launch_service::browser_launch_arguments(
+        &probe_profile,
+        &crash_dumps_directory,
+    );
+    let result = crate::browser_executable_identity::validate_configured_executable_at_load(
+        &mut launcher,
+        path,
+        &arguments,
+        &probe_environment,
+        expected,
+    )
+    .map_err(|refusal| BrowserConfigError {
+        field: "browser.expected_identity".to_string(),
+        reason: reason_from_identity_refusal(&refusal, expected),
+    });
+    // Probe cleanup is part of config refusal: leaving SingletonLock or
+    // XDG-derived Crashpad state behind would turn every later boot into a
+    // false `profile_held_externally` refusal. Removal is strict rather
+    // than best-effort so a cleanup failure remains visible at boot.
+    let cleanup = cleanup_browser_probe(&probe_profile);
+    let path = result?;
+    cleanup?;
+    Ok(Some(path))
 }
 
 #[cfg(target_os = "linux")]
@@ -775,7 +780,10 @@ mod tests {
         config.executable_path = Some(wrapper);
         config.expected_identity = Some(sha256_file_for_test(Path::new("/bin/sleep")));
 
-        validate_browser_config_at_load(&config).expect("terminal image pin accepted");
+        assert_eq!(
+            probe_browser_config_at_load(&config).expect("terminal image pin accepted"),
+            Some(std::fs::canonicalize("/bin/sleep").expect("resolve fixture binary")),
+        );
         assert!(!probe_profile_path().exists(), "success leaked probe tree");
         std::fs::remove_dir_all(root).expect("remove terminal config directory");
     }
