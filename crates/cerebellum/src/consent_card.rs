@@ -99,7 +99,7 @@ impl Fact {
 
 /// How loudly the person's phone announces a card.
 ///
-/// Prefrontal core, which puts consent questions to the person, refuses a
+/// The supervising module, which asks the person for consent, refuses a
 /// consent request without one. The rule this crate
 /// follows: `High` when a tool call is held open while the person decides, so
 /// the agent is stuck until they answer; `Normal` when the question was asked
@@ -116,7 +116,7 @@ pub(crate) enum Urgency {
 /// Always a JSON object whose values are the ones the grant is actually keyed
 /// on (an origin, a bundle identity, a profile uuid), never prose and never a
 /// filesystem path: it is what the person's answer is recorded against.
-/// Prefrontal core refuses a consent request that carries neither a scope nor
+/// The supervising module refuses a consent request that carries neither a scope nor
 /// an argument digest, so every card carries one.
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(transparent)]
@@ -215,7 +215,7 @@ pub(crate) fn assert_contract(body: &Value, ids: &[&str], decline: &str) {
     }
 }
 
-/// Why Prefrontal core refuses a consent request: the `code` and `message` of
+/// Why the supervising module refuses a consent request: the `code` and `message` of
 /// core's `Refusal`.
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,7 +274,7 @@ const CORE_OPTIONAL_KEYS: [&str; 14] = [
     "single_use",
 ];
 
-/// The longest a consent request may stay open in Prefrontal core: a day.
+/// The longest a consent request may stay open in the supervising module: a day.
 #[cfg(test)]
 const CORE_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -323,9 +323,9 @@ fn core_decode_strings(value: &Value, keys: &[&str], optional: bool) -> Result<(
 ///
 /// Unknown option groups, danger defaults and danger-only grants are rejected:
 /// removing broad choices must leave a usable, non-dangerous consent card.
-/// These rules are checked against the copied `danger-option-group-v1` vectors
-/// from Cingulate commit 6bb5f4d. Historical Prefrontal request vectors also
-/// remain checked so the legacy renderer's field shapes do not regress.
+/// These rules are checked against the vendored `danger-option-group-v1`
+/// vectors. Tests also use historical supervisor request vectors to pin the
+/// legacy renderer's field shapes.
 ///
 /// This is not Cingulate's production validator. It checks both the legacy
 /// fields core still accepts (`requestedSchema`, `call_key`, `next_step`),
@@ -604,8 +604,8 @@ mod tests {
         assert!(invalid_kind.message.contains("single_use"));
     }
 
-    /// Prefrontal's consent request vectors, copied byte for byte from
-    /// prefrontal's `test-vectors/elicitation-request-v1/` (see the README
+    /// The supervising module's consent request vectors, copied byte for byte
+    /// from its published vectors (see the README
     /// beside the directory for the source commit).
     const REQUEST_VECTORS: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -646,7 +646,7 @@ mod tests {
         }
     }
 
-    /// The vectors are trusted only as the exact bytes Prefrontal published:
+    /// The vectors are trusted only as the exact bytes the supervising module published:
     /// an edited or reformatted body could agree with this crate's mirror and
     /// disagree with core.
     #[test]
@@ -683,7 +683,7 @@ mod tests {
         );
     }
 
-    /// Prefrontal's published verdicts on 31 request bodies, against
+    /// The supervising module's published verdicts on 31 request bodies, against
     /// `core_verdict`. Every valid card is accepted; every refused body is
     /// refused with core's code, in a message containing the part of core's
     /// diagnostic the vector pins. So the mirror the rendered cards are held to

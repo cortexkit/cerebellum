@@ -49,7 +49,7 @@ const PROBE_CHANNEL: u16 = 9;
 const PROBE_AGENT: &str = "pj-user-browser-probe";
 
 // Use channel-zero admission with the probe's primary head facts and authorized
-// Prefrontal stamp, rather than installing already-accepted facts in the route.
+// supervisor stamp, rather than installing already-accepted facts in the route.
 async fn bind_probe_head(fixture: &Fixture) {
     use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp};
     use subc_protocol::session::ModuleControlRequest;

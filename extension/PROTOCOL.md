@@ -279,9 +279,9 @@ Everything else in caller plans refuses before attaching, including `Runtime.eva
 `Browser.*`/`Target.*`, `Page.bringToFront`, downloads, arbitrary JavaScript and
 commands reaching another tab. The internal `Target.setAutoAttach` pin above is
 not a caller command. CDP node resolution is **DOM.resolveNode**, not
-Runtime.resolveNode. The [CDP gap list](../docs/user-browser-gap-list.md) identifies the current driver's broader AX/DOM,
-geometry/navigation/screenshot/typing vocabulary; this adapter's admitted subset
-is deliberately narrower. The pipe driver's Target bootstrap and presentation
+Runtime.resolveNode. This adapter admits fewer accessibility tree, DOM, geometry,
+navigation, screenshot and typing commands than the managed-browser driver,
+which connects to Chrome over a debugging pipe. Its Target bootstrap and presentation
 commands are not reusable here. The driver also uses a fixed devicePixelRatio
 Runtime.evaluate and isolated-world geometry helpers; those are **not admitted**
 by this contract and cannot be sent unchanged.

@@ -159,9 +159,9 @@ impl Harness for Subject {
         ));
         let planes = Arc::new(planes);
         // The suite opens codemode routes as reserved:basal in a run owned by
-        // prefrontal. Production requires a live, delegating head route.
+        // the supervising module. Production requires a live, delegating head route.
         // Because the route's principal (basal) differs from the scope owner
-        // (prefrontal), the late-result cases can tell whether results
+        // (the supervising module), the late-result cases can tell whether results
         // are held and served per carrying principal, as the contract
         // requires, or wrongly per scope owner.
         let head = ScopeStamp::new(principal(OWNER), HEAD_REF, 1, ScopeKind::Head)

@@ -1,6 +1,6 @@
 //! Explicit live desk probe; never invoked by tests or the Rust gate.
 //!
-//! Run with Ufuk: `cargo run -p cerebellum --example open_app_live`.
+//! Run only with the operator's approval: `cargo run -p cerebellum --example open_app_live`.
 //! Running this probe approves one Calculator launch through the normal app
 //! consent relay. It uses an isolated journal and never activates or quits it.
 //! The responsible pid must equal Calculator's pid, not this probe's pid.

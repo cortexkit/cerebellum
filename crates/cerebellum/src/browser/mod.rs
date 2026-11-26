@@ -3030,7 +3030,7 @@ impl BrowserPlane {
         let response_object = response
             .as_object_mut()
             .expect("navigation response is an object");
-        // The page text sits at the top of the reply, where Prefrontal lifts
+        // The page text sits at the top of the reply, where the supervising module lifts
         // it into a text part, exactly as a snapshot reply carries it.
         if let Some(text) = page
             .as_object_mut()

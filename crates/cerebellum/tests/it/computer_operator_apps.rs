@@ -1,6 +1,6 @@
 //! The applications no agent may use, refused by every action.
 //!
-//! A request from the Alfonso desktop app, or from the phone paired with it,
+//! A request from the operator's desktop app, or from the phone paired with it,
 //! counts as the person's own action only while no agent can drive those
 //! apps. These tests drive `ComputerPlane::serve` in withholding mode, so every
 //! refusal shown here also passed its row's result schema, and they use a
@@ -35,11 +35,11 @@ use support::computer::{
     ScriptedCarrier, TestRedactor, GRANTEE, TARGET_BUNDLE_ID,
 };
 
-/// The Alfonso desktop app, running under its development identifier.
+/// The desktop app, running under its development identifier.
 const ALFONSO: &str = "dev.cortexkit.alfonso";
 const ALFONSO_PID: u32 = 7001;
 /// An application whose bundle identity is nothing special but whose
-/// executable is the Alfonso desktop app's.
+/// executable is the desktop app's.
 const DISGUISED: &str = "com.example.Disguised";
 const DISGUISED_PID: u32 = 7002;
 /// iPhone Mirroring, through which an agent could press the phone app.
@@ -319,7 +319,7 @@ async fn a_target_named_by_its_display_name_is_refused() {
 }
 
 /// The pid form: the bundle identity names nothing special, but the process
-/// it resolves to runs the Alfonso desktop app's executable.
+/// it resolves to runs the desktop app's executable.
 #[tokio::test]
 async fn a_process_running_the_operator_executable_is_refused_whatever_its_identity() {
     let rig = fixture();

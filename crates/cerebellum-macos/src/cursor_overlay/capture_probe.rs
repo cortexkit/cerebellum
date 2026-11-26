@@ -101,7 +101,7 @@ const POLL: Duration = Duration::from_millis(100);
 /// conversion that mixes channels (see the `source_rect_pattern` test). Each
 /// palette colour is therefore compared with both its sRGB form and its
 /// Display P3 form (`COLOURS_P3`). A real display's profile still differs from
-/// textbook P3: on Ufuk's display the four patches read 6 to 21 levels from
+/// textbook P3: on a measured display the four patches read 6 to 21 levels from
 /// their P3 forms, so 48 leaves twice that margin. A pixel must also be nearer
 /// to the expected colour than to any other palette colour; black, white and
 /// mid grey stay out of reach (mid grey is 91 levels from P3 magenta).
@@ -924,7 +924,7 @@ mod tests {
 
     #[test]
     fn the_live_display_p3_capture_matches_every_patch() {
-        // Pixels read on Ufuk's display on 2026-11-09 for the four patches;
+        // Measured Display P3 pixels for the four patches;
         // the second failed the sRGB-only comparison (105 levels off in red).
         let live = [
             [209, 67, 187],

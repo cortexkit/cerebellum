@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use subc_protocol::{BindIdentity, Principal, RouteTarget};
 
-/// The alfonso-core-stamped session kind, read verbatim from the bind facts.
+/// The supervisor-stamped session kind, read verbatim from the bind facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionKind {
@@ -120,7 +120,7 @@ pub struct RouteIdentity {
     /// The durable profile owner, read verbatim from accepted bind facts.
     /// Empty when no agent project was admitted.
     pub agent_project_id: String,
-    /// The alfonso-core-stamped session kind.
+    /// The supervisor-stamped session kind.
     pub session_kind: SessionKind,
     /// The resolved profile disposition for this session kind.
     pub profile_disposition: ProfileDisposition,

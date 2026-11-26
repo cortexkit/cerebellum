@@ -1,5 +1,5 @@
 //! The frame loop's three ways of saying an agent is done with the computer:
-//! a route GOODBYE, a Cancel that stops a computer call, and Prefrontal core's
+//! a route GOODBYE, a Cancel that stops a computer call, and the supervising module's
 //! `session.turn_ended`. Each must hide exactly the badges it owns, and leave
 //! every other agent's badge alone.
 //!

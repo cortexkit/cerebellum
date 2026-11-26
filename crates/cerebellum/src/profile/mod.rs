@@ -2945,7 +2945,7 @@ impl ProfileLifecycle {
         context: &StampedBindContext,
     ) -> PrepareResult {
         // The gate is first.  In particular, no current session, registry,
-        // target, grant, or CKCRED state is consulted while it is disabled.
+        // target, grant, or credential service state is consulted while it is disabled.
         if !self.registry.artifact_enabled() {
             return self.closed_storage(
                 FailureOrigin::RegistryOrStorage,

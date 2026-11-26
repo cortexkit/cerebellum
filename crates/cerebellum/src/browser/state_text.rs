@@ -25,7 +25,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::snapshot_store::{truncate_ax_field, AxRecord, MAX_NAME_BYTES};
 
-/// The reply field that carries the rendered page. Prefrontal lifts a
+/// The reply field that carries the rendered page. The supervising module lifts a
 /// top-level string of this name into a native text part, so the page reaches
 /// the model as text rather than as an escaped JSON string.
 pub const STATE_TEXT_FIELD: &str = "state_text";

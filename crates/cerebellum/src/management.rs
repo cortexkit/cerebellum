@@ -73,8 +73,8 @@ pub const REVOKE_GRANT: &str = "browser.revoke_grant";
 /// List a named agent's standing browser access and always-allow app grants.
 /// Operator-only.
 pub const LIST_GRANTS: &str = "grants.list";
-/// Prefrontal core reports that a head session's turn ended, so that
-/// session's agent cursor badge comes off the screen now. Prefrontal core
+/// The supervising module reports that a head session's turn ended, so that
+/// session's agent cursor badge comes off the screen now. The supervisor
 /// only. Interim: to be replaced by a subscription to the harness module's
 /// turn-ended event, after which core's direct call goes away.
 pub const SESSION_TURN_ENDED: &str = "session.turn_ended";

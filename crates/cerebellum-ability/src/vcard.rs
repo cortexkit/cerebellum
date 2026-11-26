@@ -99,10 +99,10 @@ mod tests {
     use super::*;
     #[test]
     fn vcard_fixtures_decode_structured_escaped_folded_and_grouped_fields() {
-        let cards = parse("BEGIN:VCARD\r\nVERSION:3.0\r\nUID:one\r\nN:Altınok;Ufuk;;;\r\nORG:Cortex\\;Kit;Re\r\n search\r\nitem1.EMAIL;TYPE=\"home,internet\":ufuk@example.test\r\nTEL;TYPE=work:+123\r\nEND:VCARD\r\nBEGIN:VCARD\nVERSION:4.0\nUID:two\nN:Doe;Jane;;;\nTEL;VALUE=uri:tel:+456\nEMAIL:mailto:jane@example.test\nEND:VCARD").unwrap();
+        let cards = parse("BEGIN:VCARD\r\nVERSION:3.0\r\nUID:one\r\nN:Björk;Juniper;;;\r\nORG:Cortex\\;Kit;Re\r\n search\r\nitem1.EMAIL;TYPE=\"home,internet\":juniper@example.test\r\nTEL;TYPE=work:+123\r\nEND:VCARD\r\nBEGIN:VCARD\nVERSION:4.0\nUID:two\nN:Doe;Jane;;;\nTEL;VALUE=uri:tel:+456\nEMAIL:mailto:jane@example.test\nEND:VCARD").unwrap();
         assert_eq!(cards.len(), 2);
-        assert_eq!(cards[0].family_name.as_deref(), Some("Altınok"));
-        assert_eq!(cards[0].given_name.as_deref(), Some("Ufuk"));
+        assert_eq!(cards[0].family_name.as_deref(), Some("Björk"));
+        assert_eq!(cards[0].given_name.as_deref(), Some("Juniper"));
         assert_eq!(
             cards[0].organization.as_deref(),
             Some("Cortex;Kit Research")

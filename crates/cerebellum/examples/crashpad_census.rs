@@ -1220,31 +1220,28 @@ mod census {
 mod tests {
     use super::handler_argv::{parse_handler, split_switches, uploads_from_settings, Uploads};
 
-    /// The handler row a system-wide `ps -axww -o args=` showed on the desk
-    /// for an agent browser, with the user name replaced.
-    const MEASURED_ROW: &str = "/Applications/Google Chrome.app/Contents/Frameworks/Google \
+    /// Synthetic `ps -axww -o args=` row with spaces in the executable and
+    /// data paths, as a Chrome handler on macOS can have.
+    const EXAMPLE_ROW: &str = "/Applications/Google Chrome.app/Contents/Frameworks/Google \
         Chrome Framework.framework/Versions/153.0.8010.53/Helpers/chrome_crashpad_handler \
         --monitor-self-annotation=ptype=crashpad-handler \
-        --database=/Users/someone/Library/Application Support/Google/Chrome/Crashpad \
-        --metrics-dir=/Users/someone/Library/Application Support/Google/Chrome \
-        --url=https://clients2.google.com/cr/report --annotation=channel= \
+        --database=/Users/example-user/Library/Application Support/Google/Chrome/Crashpad \
+        --metrics-dir=/Users/example-user/Library/Application Support/Google/Chrome \
+        --url=https://example.com/cr/report --annotation=channel= \
         --annotation=plat=OS X --annotation=prod=Chrome_Mac \
         --annotation=ver=153.0.8010.53 --handshake-fd=7";
 
     #[test]
     fn a_database_path_with_spaces_is_read_whole() {
-        let argv = parse_handler(MEASURED_ROW).expect("the row is a handler");
+        let argv = parse_handler(EXAMPLE_ROW).expect("the row is a handler");
         assert_eq!(
             argv.database.as_deref(),
-            Some("/Users/someone/Library/Application Support/Google/Chrome/Crashpad")
+            Some("/Users/example-user/Library/Application Support/Google/Chrome/Crashpad")
         );
-        assert_eq!(
-            argv.url.as_deref(),
-            Some("https://clients2.google.com/cr/report")
-        );
+        assert_eq!(argv.url.as_deref(), Some("https://example.com/cr/report"));
         assert_eq!(
             argv.metrics_dir.as_deref(),
-            Some("/Users/someone/Library/Application Support/Google/Chrome")
+            Some("/Users/example-user/Library/Application Support/Google/Chrome")
         );
     }
 

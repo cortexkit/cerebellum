@@ -335,8 +335,8 @@ fn ending_a_conversation_drops_its_handles() {
     assert_eq!(planes.image_handles.held(), 1);
 }
 
-/// The published limit: 4 MiB minus a 64 KiB allowance, which is BROCA's own
-/// `MAX_REFERENCE_IMAGE_BYTES`. A change here changes what BROCA's guard
+/// The published limit: 4 MiB minus a 64 KiB allowance, which is the model-call broker's
+/// `MAX_REFERENCE_IMAGE_BYTES`. A change here changes what the broker's guard
 /// accepts, so it is pinned to the number, not to the arithmetic.
 #[test]
 fn the_mint_limit_is_the_published_number() {
@@ -390,7 +390,7 @@ fn an_image_one_byte_over_the_limit_gets_no_handle() {
     assert_eq!(store.held(), 0);
 }
 
-/// The contract document quotes the mint limit, and BROCA's guard is built on
+/// The contract document quotes the mint limit, and the broker's guard is built on
 /// the same number, so the doc's number and the code's must not drift apart.
 #[test]
 fn the_contract_document_quotes_the_mint_limit() {
@@ -413,7 +413,7 @@ fn the_contract_document_quotes_the_mint_limit() {
         "the document must quote {IMAGE_HANDLE_MAX_BYTES} bytes: {quoted:?}"
     );
     // The derivation it spells out must also hold, and it must name the value
-    // BROCA keeps so a reader can see the two agree.
+    // the broker keeps so a reader can see the two agree.
     assert!(doc.contains("4,194,304") && doc.contains("65,536"));
     assert!(doc.contains("MAX_REFERENCE_IMAGE_BYTES"));
 }

@@ -1,6 +1,6 @@
 # private_content.query v1 vectors
 
-Byte-for-byte `private_content.query` examples for BROCA, captured at
+Byte-for-byte `private_content.query` examples for the model-call broker, captured at
 cerebellum's production `handle_frame_for_test` entry point (which delegates
 to `handle_frame`). They are not replies assembled from an expected JSON
 object. The marked case seeds its mark the way production does: an

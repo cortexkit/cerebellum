@@ -1308,7 +1308,7 @@ async fn the_vault_request_carries_exactly_the_contract_keys() {
 fn only_an_email_shaped_account_label_is_sent_as_email() {
     for (account, email) in [
         ("me@example.com", true),
-        ("first.last+tag@mail.example.co", true),
+        ("first.last+tag@mail.example.com", true),
         ("work", false),
         ("me@localhost", false),
         ("@example.com", false),

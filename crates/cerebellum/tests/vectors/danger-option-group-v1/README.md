@@ -49,7 +49,7 @@ invariants across cases (stripping, the filing rules, the answer refusal).
 
 ## Scenario
 
-Cerebellum, carrying ALF (`agent-alf`), files its app card for TextEdit at
+Cerebellum files an app card for TextEdit on behalf of `agent-alf` at
 `createdAtMs` 1000000 as `el_1`. The card has five options: `app_30m`,
 `app_always`, `deny` (the default, a decline) and, in the danger group,
 `computer_30m` and `computer_always`.

@@ -1,6 +1,6 @@
 //! The backup catalog this module writes into its own data directory.
 //!
-//! The fleet's backup module (engram) backs up a module's data only when the
+//! The backup module backs up a module's data only when the
 //! module's data directory holds an `engram-catalog.json` declaring what each
 //! part of that data is: `portable` (moved to a new machine), `device-local`
 //! (kept on this machine only) or `excluded` (deliberately never backed up,
@@ -21,7 +21,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The file name engram looks for in each module's data directory.
+/// The file name the backup module looks for in each module's data directory.
 pub const CATALOG_FILE: &str = "engram-catalog.json";
 
 /// The declaration, as reviewed in the repository root.
@@ -59,7 +59,7 @@ pub fn catalog_path(module_directory: &Path) -> PathBuf {
 /// time keeps meaning "the declaration last changed then". Otherwise the
 /// bytes go to a temporary file in the same directory, which is renamed over
 /// the catalog: a crash leaves the old catalog or the new one, never half of
-/// one, which engram would refuse as malformed.
+/// one, which the backup module would refuse as malformed.
 pub fn write_catalog(module_directory: &Path) -> io::Result<CatalogWrite> {
     let bytes = catalog_bytes();
     let path = catalog_path(module_directory);
@@ -135,9 +135,9 @@ mod tests {
         }
     }
 
-    // A copy of the descriptor shape engram parses (engram-core's
+    // A copy of the descriptor shape the backup module parses (its
     // `catalog.rs`), kept here because that crate is not a dependency of
-    // this workspace. The enums list exactly the names engram accepts, so an
+    // this workspace. The enums list exactly the names the backup module accepts, so an
     // unknown class or mechanism fails to parse here as it is refused there.
     #[derive(serde::Deserialize)]
     struct Descriptor {
@@ -176,7 +176,7 @@ mod tests {
         LogStream,
     }
 
-    /// Engram's path rule: relative to the module directory, `/`-separated,
+    /// The backup path rule: relative to the module directory, `/`-separated,
     /// and every component a real name (no empty, `.`, `..`, backslash or
     /// drive prefix), so the path means the same on every host.
     fn engram_accepts_path(path: &str) -> bool {
@@ -194,7 +194,7 @@ mod tests {
         serde_json::from_slice(&catalog_bytes()).expect("the catalog parses as engram's descriptor")
     }
 
-    /// The rules engram's planner applies before it captures anything; a
+    /// The rules the backup planner applies before it captures anything; a
     /// catalog that breaks one is refused whole and the module is skipped.
     #[test]
     fn the_catalog_passes_engrams_descriptor_rules() {
@@ -226,7 +226,7 @@ mod tests {
                     entry.entry_id
                 );
             }
-            // Engram only refuses a bad path on excluded and portable
+            // The backup module only refuses a bad path on excluded and portable
             // entries; requiring a good one everywhere keeps every declared
             // path meaningful to its drift checks.
             let path = entry.path.as_deref().expect("every entry names its tree");
@@ -250,7 +250,7 @@ mod tests {
     /// Every tree the module writes under its data directory is declared, so
     /// none is left to read as an oversight. Browser sessions are excluded:
     /// they are signed-in secrets bound to this machine. The audit journal is
-    /// portable so it lands in every backup; engram does not capture its
+    /// portable so it lands in every backup; the backup module does not capture its
     /// device-local class at all, so marking the journal device-local would drop
     /// the audit trail from backups. Restoring it onto another Mac stays an
     /// explicit operator action. Private-content marks are portable too: a

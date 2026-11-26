@@ -8781,11 +8781,7 @@ mod tests {
         // zoom reference to the page containing the omitted subtree.
         let cut = render_fixture(&observation, &url, None, 1_200);
         assert!(cut.text.len() <= 1_200, "{}", cut.text);
-        assert!(
-            cut.text.contains("article Paper Kite Club"),
-            "{}",
-            cut.text
-        );
+        assert!(cut.text.contains("article Paper Kite Club"), "{}", cut.text);
         assert!(!cut.text.contains("complementary Trending"), "{}", cut.text);
         assert!(!cut
             .printed_refs
@@ -8805,8 +8801,7 @@ mod tests {
         assert!(page.text.len() <= 3_000, "{}", page.text);
         assert!(page.text.contains("text A seed swap with"), "{}", page.text);
         assert!(
-            page.text
-                .contains("Curious about balcony gardening?"),
+            page.text.contains("Curious about balcony gardening?"),
             "{}",
             page.text
         );

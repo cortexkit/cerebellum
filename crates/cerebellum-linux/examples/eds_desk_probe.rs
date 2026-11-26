@@ -1,4 +1,5 @@
-//! Run in an isolated Linux login with three pre-populated scratch EDS sources.
+//! Run in an isolated Linux login with three pre-populated Evolution Data
+//! Server scratch sources. Label each with the prefix `Example probe scratch`.
 //! No source creation, writes, authentication or service activation is attempted.
 
 #[cfg(any(target_os = "linux", test))]
@@ -50,9 +51,11 @@ async fn main() {
             sources
                 .iter()
                 .find(|s| {
-                    &s.uid == id && s.kind == kind && s.label.starts_with("CortexKit scratch")
+                    &s.uid == id && s.kind == kind && s.label.starts_with("Example probe scratch")
                 })
-                .expect("UID must name a source of the requested kind labelled CortexKit scratch")
+                .expect(
+                    "UID must name a source of the requested kind labelled Example probe scratch",
+                )
         })
         .collect();
     for source in selected {

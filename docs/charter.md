@@ -1,30 +1,26 @@
 # ck-cerebellum — Charter
 
-Computer use and browser use for the CortexKit fleet. The cerebellum executes
+Computer use and browser use for CortexKit. The cerebellum executes
 coordinated physical action on the machine: it drives browsers, clicks, types,
 scrolls, reads screens, and hands the results back to whichever agent asked.
 
-AFT remains the sensorimotor cortex for *code* (perceives code structure, acts
-on it precisely, project-root-scoped). The cerebellum is the layer below: fine
-motor control on the *machine* — GUI and web, machine-scoped, with its own
-containment story. The two do not overlap: if the target is a file or a repo,
-it is AFT's; if the target is a screen, a window, or a page, it is ours.
+Code tools inspect and edit files in a project. Cerebellum instead drives
+GUI and web surfaces: screens, windows and pages. Those actions have a
+different scope and require their own containment.
 
 ## Why a dedicated module
 
-- **Scope model.** AFT's identity, config tiers, caches, and sandbox all key on
+- **Scope model.** Code tools key identity, configuration, caches and sandboxing on
   a project root. Computer use is machine-scoped and browser sessions are
   conversation/task-scoped; neither fits a root-keyed bind model.
 - **Blast radius.** On macOS this capability requires TCC Screen Recording and
-  Accessibility grants, attributed to the responsible process. Fleet doctrine
-  separates dangerous capabilities into dedicated organs (vault, quota,
-  backups); the machine's two most powerful permissions get their own binary,
+  Accessibility grants, attributed to the responsible process. Dedicated modules handle privileged capabilities such as vault access and
+  backups. Screen recording and input control get their own binary,
   their own policy surface, and a clean TCC attribution anchor.
 - **Lifecycle.** Browser processes, profiles, CDP sessions, and screenshot
   streaming want their own supervision, health gauges, and restart semantics.
-- **Plane discipline.** alfonso-core orchestrates; it is not an effector. The
-  cerebellum is a provider module that alfonso (and any other consumer)
-  reaches through subc routes, exactly like aft tools.
+- **Plane discipline.** The supervising module orchestrates calls rather than
+  driving the machine itself. Consumers reach Cerebellum through `subc` routes.
 
 ## Two planes, one module
 
@@ -59,23 +55,20 @@ they ship as one module with two capability families.
 
 - **Principal-aware by default.** Untrusted binds (`mcp:*` facade callers) get
   no cerebellum tools at all — default-deny in the gateway policy, not an
-  in-module check alone. First-party consumers (alfonso workers, owned
+  in-module check alone. First-party consumers (supervised workers and
   harnesses) get capability-scoped access.
 - **Conversation-scoped grants.** Permission to drive the machine is granted
-  per conversation via the elicitation relay (the bash-after-elicitation
-  pattern), never ambiently. Grant state needs a durable session identity, so
-  delivery is plugin/facade-path per the fleet's delivery-path doctrine.
+  per conversation via the consent relay, never ambiently. Grant state needs a durable session
+  identity, so requests arrive through a plugin or gateway.
 - **Irreversibility honesty.** This module executes the least reversible
-  action class in the fleet (send the email, submit the order). Actions carry
-  the fleet's action-severity taxonomy from day one so reversibility ceilings
-  and ask/quorum routing (Room-2 machinery) apply to it verbatim when team
-  mode arrives — and inform per-action elicitation prompts before then.
+  actions, such as sending an email or submitting an order. Action severity
+  informs per-action consent prompts and can support shared approval rules.
 - **Credential boundary.** The cerebellum never reads the vault. If a workflow
   needs a login, the human logs in once inside a named profile (browser plane)
   or the credential flows through existing custody paths; secrets never
   transit cerebellum tool arguments in plaintext as a design rule.
 
-## Fleet integration
+## Integration
 
 - Supervised subc module (`cerebellum` in subc.jsonc, binary `ck-cerebellum`),
   spawn-attested, wire v2, health v2 (insulated lane, mechanical gauges: CDP
@@ -86,7 +79,7 @@ they ship as one module with two capability families.
 - Storage via cortexkit-store (profiles registry, grant ledger, action audit
   journal); config at `~/.config/cortexkit/cerebellum.jsonc` on macOS and Linux.
 - Screenshot payloads ride the existing 64 MiB frame budget; live viewing /
-  streaming surfaces (for the Cortex app's supervised-session view) are a
+  streaming surfaces (for a client's supervised-session view) are a
   later lane on the existing subscribe machinery.
 
 ## Open design questions (for the design rounds)
@@ -102,7 +95,7 @@ they ship as one module with two capability families.
    contract between model-visible images and input synthesis (retina scaling
    is a classic corruption source), redaction hooks for sensitive regions.
 5. Action audit: what the journal records per action (screenshot-before?
-   DOM-hash? intent string from the caller?) and its retention/engram story.
+   DOM-hash? intent string from the caller?) and its retention and backup policy.
 6. Sequencing and liveness: action choreography (wait-for conditions,
    retries), deadlines, and what "the page never settled" looks like as a
    typed outcome.
@@ -119,9 +112,8 @@ they ship as one module with two capability families.
 
 ## Sequencing
 
-1. Design rounds on the open questions (Ufuk seeds with initial documents;
-   adversarial gates per fleet practice).
+1. Review candidate designs for the open questions.
 2. Walking skeleton: browser plane, one managed profile, navigate/read/click
    against a real page over the subc wire.
 3. Computer plane behind the grant ceremony, macOS only.
-4. Streaming/live-view lane when the Cortex app needs it.
+4. Streaming and live viewing when clients need them.

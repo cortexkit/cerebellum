@@ -1,4 +1,4 @@
-//! This module is deliberately an adapter boundary, not a CKCRED client.  A
+//! This module is deliberately an adapter boundary, not a credential-service client.  A
 //! later production integration supplies the verifier and sealing implementation.
 //! The types here limit the browser plane to validated identity facts, an
 //! immutable registry identity, and closed custody results.
@@ -236,7 +236,7 @@ impl RegistryIdentityEvidence {
     }
 }
 
-/// The exact authority projected to the CKCRED verifier.
+/// The exact authority projected to the credential verifier.
 ///
 /// There is intentionally no profile name, grant reference, path, lock, owner,
 /// seal, or browser-state member in this type.
@@ -338,7 +338,7 @@ impl ProfileOutcome {
     }
 }
 
-/// Closed CKCRED adapter failures.  No adapter error text crosses this seam.
+/// Closed credential adapter failures.  No adapter error text crosses this seam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CkcredUnavailable {
     MissingAdapter,
@@ -364,7 +364,7 @@ pub enum AuthorityDecision {
     NonAffirmative,
 }
 
-/// Operations for which CKCRED compatibility and availability are evaluated.
+/// Operations for which credential service compatibility and availability are evaluated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CustodyOperation {
     GrantVerification,
@@ -383,7 +383,7 @@ pub enum UuidProtocolAvailability {
     Disabled,
 }
 
-/// S9's only external custody dependency.  It has no CKCRED crate or runtime
+/// The only external custody dependency. It has no credential-service crate or runtime
 /// binding; production wiring supplies an implementation of this trait.
 ///
 /// Every method receives the authority projected by [`AuthorityTuple`].  There

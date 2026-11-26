@@ -133,7 +133,7 @@ impl Registry {
     fn get_managed_objects(&self, #[zbus(header)] header: zbus::message::Header<'_>) -> Objects {
         no_activation(&header);
         [("cal", "Calendar"), ("tasks", "Task List"), ("book", "Address Book")].into_iter().map(|(uid, extension)| {
-            let data = format!("[Data Source]\nDisplayName=CortexKit scratch {uid}\nEnabled=true\n[{extension}]\nBackendName=local\n");
+            let data = format!("[Data Source]\nDisplayName=Example probe scratch {uid}\nEnabled=true\n[{extension}]\nBackendName=local\n");
             let properties = HashMap::from([
                 ("UID".into(), OwnedVariant::from(zbus::Str::from(uid))),
                 ("Data".into(), OwnedVariant::from(zbus::Str::from(data))),

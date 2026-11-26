@@ -2,7 +2,7 @@
 //! and parses the call, then hands it to
 //! [`Coordinator::turn_ended`](crate::computer_capability::cursor::Coordinator::turn_ended).
 //!
-//! Interim. Prefrontal core calls this directly today. The intended source is a
+//! Interim. The supervising module calls this directly today. The intended source is a
 //! harness module publishing its `turn_ended` event on the event plane, with
 //! cerebellum subscribing; when that lands, this adapter and core's direct call
 //! are deleted and the subscription calls the same internal function. Nothing

@@ -723,7 +723,7 @@ pub fn fade_alpha(fraction: f64, reduce_motion: bool) -> f64 {
 }
 
 /// The side of the square, in pixels, that an avatar is averaged down to
-/// before its colour is read. The Alfonso phone app reads its agents' colours
+/// before its colour is read. The phone app reads its agents' colours
 /// from exactly this many pixels (24 x 24), so a badge here takes the same
 /// colour as the agent's page there.
 pub const TINT_SAMPLE_SIDE: usize = 24;
@@ -748,7 +748,7 @@ impl AvatarTint {
     }
 }
 
-/// The phone's colour reading, ported from the Alfonso app's
+/// The phone's colour reading, ported from the phone app's
 /// `CreatureTint.dominantHue(of:)`: the hue of the creature's colourful
 /// pixels, weighted toward the most saturated ones. `pixels` is premultiplied
 /// RGBA, 8 bits per channel, in any order (the phone reads a 24 x 24 bitmap).

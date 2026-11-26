@@ -1,6 +1,6 @@
 # Session turn-ended v1 vectors
 
-**Interim contract.** `session.turn_ended` is a direct call from Prefrontal
+**Interim contract.** `session.turn_ended` is a direct call from the supervising module
 (`reserved:prefrontal`) to cerebellum's management surface. It is to
 be replaced by a harness module publishing its `turn_ended` event on the event
 plane, with cerebellum subscribing; core's direct call is then deleted. The

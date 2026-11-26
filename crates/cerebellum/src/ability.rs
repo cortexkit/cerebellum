@@ -47,7 +47,7 @@ pub(crate) const fn platform() -> Platform {
 }
 
 /// The manifest declares a build's potential, not the person's current access.
-/// Catalog tokens and SUBC capability identifiers use different spellings.
+/// Catalog tokens and supervisor capability identifiers use different spellings.
 pub(crate) fn manifest_capabilities() -> impl Iterator<Item = String> {
     platform().tokens().iter().map(|token| {
         map_capability(token.as_str()).expect("declared ability token has a manifest form")

@@ -906,7 +906,7 @@ async fn live_daemon_declares_browser_controls_without_an_executable() {
         .provides
         .iter()
         .any(|name| name == "permissions/v1"));
-    // Prefrontal core checks for this before it reports turn endings.
+    // The supervising module checks for this before it reports turn endings.
     assert!(entry
         .capabilities
         .as_ref()
@@ -1287,8 +1287,8 @@ async fn start_live_daemon_with_browser(
         // The daemon captures each child's stderr into a run directory it
         // resolves from ITS OWN environment, and this daemon runs inside the
         // test binary, whose HOME is the real one. Without this the module's
-        // stderr lands in the operator's live run dir; SUBC found
-        // `cerebellum.stderr.log` there. Point it at the isolated home.
+        // stderr would land in the operator's live run directory. Point the
+        // daemon at the isolated home instead.
         .with_live_children_record(run.join("live-children.json"))
         .with_machine_id_path(data_home.join("cortexkit/machine-id"))
         .with_capture_logs_dir(&capture_logs_dir)
