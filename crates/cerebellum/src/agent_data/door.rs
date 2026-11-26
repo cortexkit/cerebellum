@@ -1,4 +1,4 @@
-//! Short-lived authenticated routes to engram's session door.
+//! Short-lived authenticated routes to the backup module's session endpoint.
 
 use super::{error, unavailable, ErrorBody, RefusalCode};
 use crate::login_capture::vault::BoxFuture;

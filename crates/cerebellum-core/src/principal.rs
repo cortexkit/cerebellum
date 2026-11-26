@@ -38,7 +38,7 @@ impl PrincipalTrust {
 
 /// Map a stamped bind principal to a trust classification.
 ///
-/// This mirrors AFT's policy mapping (docs/subc-principal.md §3):
+/// The trust categories follow the daemon-stamped principal:
 /// - `Direct` → trusted (first-party host plugins).
 /// - `Reserved{module_id}` → per-id allowlist over daemon-spawned, spawn-
 ///   attested module ids; see [`is_first_party_module_id`] for the ids
@@ -105,10 +105,9 @@ fn is_first_party_module_id(module_id: &str) -> bool {
 ///
 /// Cerebellum's standing permissions (site grants, app grants, the takeover
 /// grant) belong to the conversation a person gave them in. Every session's
-/// browser and computer calls reach cerebellum through Prefrontal's forwarding
-/// operations, so Prefrontal is the only caller that may act
-/// under a conversation. Any other first-party module (AFT, Broca, the routing
-/// module, a `direct` host plugin) could otherwise open a route under a
+/// browser and computer calls reach cerebellum through the supervising module,
+/// so only that module may act under a conversation. Any other first-party
+/// module or `direct` host plugin could otherwise open a route under a
 /// conversation and act on the permissions given there without anyone being
 /// asked.
 pub const SESSION_CALLER_MODULE_ID: &str = "prefrontal";

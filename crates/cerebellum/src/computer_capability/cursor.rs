@@ -1246,11 +1246,11 @@ impl Coordinator {
     }
 
     /// Core's fallback notification ends the active badges drawn by its scope.
-    /// Thalamus hints name an agent; Broca events name the session on the
+    /// Harness hints name an agent; model-call events name the session on the
     /// route bind. All end signals consume the appearance under the drawing lock.
     ///
     /// The direct notification matches the daemon-stamped `scope_ref`.
-    /// `session_ref` is the harness runner's own ref. When a Thalamus live
+    /// `session_ref` is the harness runner's own ref. When a harness live
     /// start has associated an agent with a runner session,
     /// the fallback must agree with that session too.
     ///

@@ -1,9 +1,9 @@
 # `image.resolve`, v1
 
-This is the cerebellum receive-side contract for Broca, which fetches the
+This is the cerebellum receive-side contract for the model-call broker, which fetches the
 screenshot a codemode program handed it by handle. A codemode program's result
 is far too small to carry a screenshot's bytes, so a screenshot reply also
-carries an opaque `image_handle`, and Broca resolves that handle here before
+carries an opaque `image_handle`, and the broker resolves that handle here before
 passing the image to a model call. The executable examples are in
 [`crates/cerebellum/tests/vectors/image-resolve-v1`](../../crates/cerebellum/tests/vectors/image-resolve-v1/).
 They are exact request and reply bytes captured at cerebellum's production
@@ -90,8 +90,8 @@ than JSON. The body is laid out as
 u32 big-endian head length | head JSON | the image's own encoded bytes
 ```
 
-The head is a closed object with exactly these members, which are BROCA
-model-batch §13.1's names:
+The head is a closed object with these exact members, using the model-batch
+field names:
 
 ```json
 {"content_type":"image/png","sha256":"<64 lowercase hex>","length":<byte count>}
@@ -120,7 +120,7 @@ allowance, which covers the frame's 21-byte header, the four-byte head length,
 and the head JSON itself. The head is at most about 150 bytes, so the allowance
 is far larger than the head can be.
 
-The number is the same one BROCA's `MAX_REFERENCE_IMAGE_BYTES`
+The number is the same one the broker's `MAX_REFERENCE_IMAGE_BYTES`
 (`cortexkit_model_batch::image`) holds; cerebellum does not depend on that
 crate, so it carries its own constant and a test pins both the value and the
 arithmetic. An image over the limit gets no `image_handle`: the reply omits the
@@ -140,9 +140,9 @@ carrying exactly this body:
 `session`. The goldens pin the exact bytes.)
 
 Unknown handles, expired handles and handles captured under a scope outside the
-caller's union all get this one body, byte for byte. Refusals are JSON in a `Response` frame, never an `Error` frame: SUBC's
-contract says so too, so a malformed request and a handle that does not resolve
-are told apart by body shape, not by frame type. `detail.field` is always
+caller's union all get this one body, byte for byte. Refusals are JSON in a
+`Response` frame, never an `Error` frame. Distinguish a malformed request from a
+handle that does not resolve by body shape, not frame type. `detail.field` is always
 `handle`; there is no reason code, because a reason code would say which of the
 three happened. A caller with the reply bytes cannot tell them apart, and a
 handle that does not resolve tells it nothing about whether one does.

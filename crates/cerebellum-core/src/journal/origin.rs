@@ -1,7 +1,7 @@
 //! Who really asked for a tool call that another module relayed, as the audit
 //! records write it down.
 //!
-//! A relaying module (Prefrontal, for every agent call) is the route's own
+//! A relaying module (the supervisor, for agent calls) is the route's own
 //! principal, so without this every relayed call reads as that module's call.
 //! The request's `origin` member names the caller behind it. It is the
 //! relaying module's claim and nothing checks it, so it is recorded for

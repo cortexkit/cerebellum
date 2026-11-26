@@ -1,6 +1,6 @@
 # `private_content.query`, v1
 
-This is the cerebellum receive-side contract for Broca, which asks — before a
+This is the cerebellum receive-side contract for the model-call broker, which asks — before a
 model call — whether a scope has read private content. A wrong "no" sends
 private content to a provider the person never approved, so every doubt answers
 "yes, from every source". The executable examples are in
@@ -9,9 +9,7 @@ They are exact request and reply bytes captured at cerebellum's production
 `handle_frame_for_test` entry point (which delegates to `handle_frame`), not
 reconstructed tool-result examples.
 
-BROCA's first live call failed because it guessed the shape: it sent an extra
-`owner` parameter and decoded the reply through a `result` wrapper. Both
-guesses are wrong. The request takes no `owner` (an unknown field is refused),
+The request takes no `owner` (an unknown field is refused),
 and the success reply is a bare body with no `result` wrapper and no `outcome`
 field. Anything with an `outcome` field is a refusal, and it means marked (see
 [For callers](#for-callers)).
@@ -115,14 +113,14 @@ What marks a scope, and how long the mark lasts:
 - **Union over the run, its head, and the named parent.** The answer unions
   the marks of the requested scope with the head of every live run with that
   scope ref (found through the route table's `run_head`) and with the parent
-  scope ref each such run's stamp names (`handle`, ~906-929). When Broca
+  scope ref named in each run's stamp. When the caller
   names a `parent_scope_ref` — for a run that never opened a cerebellum
   route, for example after source was pasted from a head's read — that parent
-  is propagated into and added to the union too (`handle`, ~930-936).
+  receives the run's marks and is added to the union.
 - **Parent propagation is head-kept.** Copying a run's marks to the parent
-  Broca names records them under head retention, so the parent and its other
-  runs inherit the mark; the answer never waits for the copy to reach the
-  file (`propagate`, ~812-831).
+  the caller names records them under head retention, so the parent and its
+  other runs inherit the mark. The answer does not wait for the copy to be
+  written to disk.
 - **Run marks expire after 24 hours; head marks never do.** Run marks lapse
   24 hours after their latest read; head marks are never pruned. A head keeps
   what it read in its context for its whole life, which is also why version 1
@@ -159,5 +157,5 @@ own-browser replays always count as `signed_in_site` when they carry content
   cerebellum route. Never send `owner`, `result`, or any other wrapper: the
   closed key set refuses them, and a refused query answers nothing about the
   scope.
-- Query the scope (and its Broca-known parent) before the model call, and
+- Query the scope (and its parent, when known) before the model call, and
   route content accordingly when `private_content` is true.

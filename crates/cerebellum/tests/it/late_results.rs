@@ -742,7 +742,7 @@ async fn hello_manifest_declares_late_results_capability() {
         capabilities.contains(&json!("tool-provider/v1")),
         "HELLO must declare the catalog provider role"
     );
-    // Declared beside late results: both tell Prefrontal core which of its
+    // Declared beside late results: both tell the supervising module which of its
     // calls this module serves.
     assert!(
         capabilities.contains(&json!("session-turn-ended/v1")),

@@ -1,4 +1,4 @@
-//! Development builds of the Alfonso desktop app, served through the plane.
+//! Development builds of the operator's desktop app, served through the plane.
 //!
 //! Only the agents in `DEV_BUILD_DRIVERS` may drive a development build, and
 //! they do so with no card: the call is admitted as if an "always" app grant
@@ -44,7 +44,7 @@ type Plane = ComputerPlane<
     InMemoryJournalStorage,
 >;
 
-/// CKDESK, the agent that develops the Alfonso desktop app.
+/// The reserved identity of the agent that develops the desktop app.
 const CKDESK: &str = "agent_16013c86";
 /// Any other agent.
 const OTHER_AGENT: &str = "agent_0badc0de";
@@ -304,7 +304,7 @@ fn development_snapshot_reports_a_clean_ad_hoc_signature_and_release_mismatch() 
 fn development_snapshot_preserves_both_signature_errors_even_when_identity_fails() {
     let mut fixtures = apps();
     let app = fixtures.iter_mut().find(|app| app.pid == DEV_PID).unwrap();
-    let detail = "signature reader: OSStatus -67050\npath: /Volumes/Test Disk/Alfonso.app";
+    let detail = "signature reader: OSStatus -67050\npath: /Volumes/Example Disk/Example.app";
     app.signature = Err(AppIdentityUnreadable::Failed {
         detail: detail.into(),
     });
@@ -315,7 +315,7 @@ fn development_snapshot_preserves_both_signature_errors_even_when_identity_fails
         assert_eq!(snapshot[field]["detail"], detail);
         assert_eq!(
             snapshot[field]["error"],
-            "Failed { detail: \"signature reader: OSStatus -67050\\npath: /Volumes/Test Disk/Alfonso.app\" }"
+            "Failed { detail: \"signature reader: OSStatus -67050\\npath: /Volumes/Example Disk/Example.app\" }"
         );
     }
 }
@@ -376,7 +376,7 @@ async fn ckdesk_operator_refusal_reports_the_first_failed_development_check() {
 
 #[tokio::test]
 async fn unreadable_program_location_refuses_with_path_error_and_recovery() {
-    const PATH: &str = "/Volumes/Test/AlfonsoReview.app/Contents/MacOS/alfonso-desktop";
+    const PATH: &str = "/Volumes/Example Disk/Review.app/Contents/MacOS/example-desktop";
     let mut rig = rig();
     rig.plane.process_executable = Arc::new(|_| {
         Err(operator_apps::ProgramLocationUnreadable {
@@ -836,7 +836,7 @@ fn caller_from_scope(attributes: subc_protocol::scope::ScopeAttributes) -> Conse
 
 #[tokio::test]
 async fn a_scope_naming_ckdesk_only_on_behalf_of_it_is_refused() {
-    // The control: a scope whose agent is CKDESK, delegating, is CKDESK's head.
+    // The control: a scope with the development agent identity and delegation is its head.
     let delegated = caller_from_scope(
         subc_protocol::scope::ScopeAttributes::new()
             .with_agent_id(Some(CKDESK.into()))
@@ -857,8 +857,8 @@ async fn a_scope_naming_ckdesk_only_on_behalf_of_it_is_refused() {
         .await;
     assert_eq!(reply["outcome"], "completed", "{reply}");
 
-    // A scope that names CKDESK only as the agent it works on behalf of has
-    // no agent of its own, and gets none of CKDESK's authority.
+    // A scope that names the development agent only as the agent it works for has
+    // no agent of its own and gets none of the development agent's authority.
     let attributed = caller_from_scope(
         subc_protocol::scope::ScopeAttributes::new().with_on_behalf_of_agent(Some(CKDESK.into())),
     );

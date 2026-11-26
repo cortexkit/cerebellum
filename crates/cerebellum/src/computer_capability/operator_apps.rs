@@ -1,7 +1,7 @@
 //! The applications no agent may use: the ones that confirm the person's own
 //! actions.
 //!
-//! A request sent from the Alfonso desktop app, or from the phone paired with
+//! A request sent from the operator's desktop app, or from the phone paired with
 //! it, counts as the operator's own action. That holds only while no agent
 //! can drive those apps, so every `computer_use` action aimed at one is
 //! refused outright: before any grant is looked up, before any question is
@@ -16,7 +16,7 @@
 //! # Development builds
 //!
 //! One exception is compiled in too. The agents in [`DEV_BUILD_DRIVERS`],
-//! which develop the Alfonso desktop app, may drive its development builds:
+//! which develop the desktop app, may drive its development builds:
 //! the identities marked [`Class::DevelopmentBuild`], running with a
 //! signature that can be read and is not the released app's (Team ID
 //! [`RELEASE_TEAM_ID`]). For those agents such a build is admitted as if an
@@ -74,12 +74,12 @@ use crate::CancelHandle;
 /// `authorization_denied`.
 pub(crate) const OPERATOR_APP_BLOCKED: &str = "operator_app_blocked";
 
-/// The agents that may drive development builds of the Alfonso desktop app,
-/// by the admitted agent identity grants are held under. Only CKDESK, the
-/// agent that develops the app.
+/// The agents that may drive desktop development builds, identified by the
+/// same agent identity used for grants. Only the app's development agent is
+/// admitted.
 pub(crate) const DEV_BUILD_DRIVERS: &[&str] = &["agent_16013c86"];
 
-/// The Apple Developer Team ID that signs the released Alfonso desktop app.
+/// The Apple Developer Team ID that signs the released desktop app.
 /// A process carrying it is never taken for a development build, which is
 /// signed ad hoc.
 pub(crate) const RELEASE_TEAM_ID: &str = "5R5846NBPW";
@@ -97,9 +97,9 @@ enum Identity {
 /// Who may use an application an entry names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Class {
-    /// No agent: the released Alfonso app, and iPhone Mirroring.
+    /// No agent: the released desktop app, and iPhone Mirroring.
     Always,
-    /// A development build of the Alfonso desktop app, which only the agents
+    /// A development build of the desktop app, which only the agents
     /// in [`DEV_BUILD_DRIVERS`] may use, and only while it is not signed as
     /// the released app.
     DevelopmentBuild,
@@ -114,8 +114,8 @@ struct OperatorApp {
     /// Where this identity is used. Documentation only: every entry is
     /// checked on every platform. On macOS a target names a bundle identity
     /// and on Windows an executable file name, and an identity that belongs
-    /// to Alfonso on one platform names nothing else on another, so matching
-    /// all of them everywhere can only refuse more.
+    /// to the desktop app on one platform names nothing else on another.
+    /// Checking all identities on every platform can only refuse more.
     #[allow(dead_code)]
     platform: &'static str,
 }
@@ -126,30 +126,28 @@ struct OperatorApp {
 /// LaunchServices and file names are case-insensitive on Windows, and a
 /// lower-case spelling of one of these names is still that app on Linux.
 ///
-/// These are interim values from CKDESK, the team that ships the Alfonso
-/// desktop app; CKDESK confirms the final release values, and this table is
-/// updated when it does.
+/// Keep these entries in sync with the identities of the released app and
+/// its development builds.
 const OPERATOR_APPS: &[OperatorApp] = &[
-    // The Alfonso desktop app: today's development build.
+    // The current desktop development build.
     OperatorApp {
         identity: Identity::BundleIdentity("dev.cortexkit.alfonso"),
         class: Class::DevelopmentBuild,
         platform: "macos",
     },
-    // The Alfonso desktop app: the recommended release identifier.
+    // The desktop app's release identifier.
     OperatorApp {
         identity: Identity::BundleIdentity("io.cortexkit.alfonso.desktop"),
         class: Class::Always,
         platform: "macos",
     },
-    // iPhone Mirroring. Through it an agent could press the buttons of the
-    // Alfonso app on the person's phone.
+    // iPhone Mirroring would let an agent drive the operator's phone app.
     OperatorApp {
         identity: Identity::BundleIdentity("com.apple.ScreenContinuity"),
         class: Class::Always,
         platform: "macos",
     },
-    // The development build's executable, inside Alfonso.app.
+    // The development build's executable, inside the desktop app bundle.
     OperatorApp {
         identity: Identity::Executable("alfonso-desktop"),
         class: Class::DevelopmentBuild,

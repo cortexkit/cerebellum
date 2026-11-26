@@ -206,7 +206,7 @@ impl Participant {
         let mut cut = current.cloned().unwrap_or_default();
         let reply = match op {
             Op::Prepare => {
-                // Persist the snapshot before uploading it to engram's session
+                // Persist the snapshot before uploading it to the backup module's session
                 // stream. A failed upload must retry the same bytes even if more
                 // marks arrive meanwhile.
                 if cut.payloads.is_empty() {

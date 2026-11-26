@@ -216,7 +216,7 @@ fn assert_refused_as_not_admitted(frames: &[Frame], label: &str) {
     );
 }
 
-/// First-party principals other than Prefrontal's core module.
+/// First-party principals other than the supervising module.
 fn other_first_party_principals() -> Vec<(Option<Principal>, &'static str)> {
     vec![
         (Some(Principal::Direct), "direct"),
@@ -376,7 +376,7 @@ async fn a_refused_caller_is_never_asked_about_a_site() {
 
 /// The management surface refuses the same callers: asking the person for a
 /// new site grant is a call in the conversation's name, so it is refused to
-/// every caller but Prefrontal's core module, without a question being put.
+/// every caller but the supervising module, without a question being put.
 #[tokio::test]
 async fn a_refused_caller_cannot_open_a_grant_on_the_management_surface() {
     for (principal, label) in other_first_party_principals() {

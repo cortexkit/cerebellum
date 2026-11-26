@@ -626,7 +626,7 @@ fn failed_custody_restoration_transfers_to_recovery_without_unlocking() {
         )
         .unwrap();
     let evidence = prepared.recovery_evidence().unwrap();
-    // The first abort has a CKCRED failure and records recovery ownership.
+    // The first abort has a credential service failure and records recovery ownership.
     assert!(matches!(
         coordinator.abort(&prepared, AbortCause::DispatchCommitFailed),
         LifecycleResult::Failed(ProfileOutcome::ProfileStorageUnavailable {

@@ -1,12 +1,11 @@
-//! Whole reads of three recorded application shapes, rendered to the exact
-//! text a caller gets: X's home timeline in Chrome, Bionic Reading's
-//! settings panel, and the Magic Context dashboard.
+//! Whole reads of three application shapes, rendered to the exact text a
+//! caller gets: a synthetic timeline in Chrome, Bionic Reading's settings
+//! panel, and a dashboard.
 //!
-//! The fixtures are cut down from real accessibility trees read from those
-//! applications, keeping what made each expensive to read before: X wraps
-//! every post in empty containers and names the post's container with the
-//! whole post; Bionic's panel is mostly unnamed groups around a few controls;
-//! the dashboard has two hundred chart points with six-line labels, every
+//! The timeline's accounts, posts and URLs are invented. It keeps the shape
+//! of an X-like timeline, with empty wrappers and containers named with the
+//! whole post. Bionic's panel is mostly unnamed groups around a few controls.
+//! The dashboard has two hundred chart points with six-line labels, every
 //! session row as a button and again as nine texts, and a full menu bar.
 
 use super::super::render::{
@@ -111,7 +110,7 @@ fn id(node: &ObservedNode) -> &str {
 }
 
 // ---------------------------------------------------------------------------
-// X's home timeline in Chrome
+// Synthetic X-like home timeline in Chrome
 // ---------------------------------------------------------------------------
 
 const POSTS: [(&str, &str, &str, &str); 7] = [
@@ -196,7 +195,7 @@ fn post(index: usize) -> RawElement {
         .with_children(vec![tokens.wrap(vec![header, text, actions])])
 }
 
-/// X's home timeline with the tab `selected` chosen and these posts shown.
+/// The synthetic home timeline with the tab `selected` chosen and these posts shown.
 fn x_timeline_with(selected: usize, posts: &[usize]) -> Vec<RawElement> {
     let t = Tokens::new();
     let mut address = t.element("AXTextField").described("Address and search bar");
@@ -256,7 +255,10 @@ fn x_timeline_with(selected: usize, posts: &[usize]) -> Vec<RawElement> {
                 "Wren Workshop opens its seed library Trending now · News · 849 posts",
                 "example.com/i/trending/1",
             ),
-            t.link("Paper Kite Club shares a folding guide", "example.com/i/trending/2"),
+            t.link(
+                "Paper Kite Club shares a folding guide",
+                "example.com/i/trending/2",
+            ),
         ]);
     let web = t
         .titled("AXWebArea", "Synthetic Kestrel Feed")
@@ -507,14 +509,14 @@ kq10 navigation Primary
   kq14 link Direct Messages, Value: example.com/i/chat
   kq15 link Profile, Value: example.com/juniper_example
   kq16 link Post, Value: example.com/compose/post
-kq17 main Home timeline  [2 elements: Timeline: Your Home Timeline, ~3.8 KB]
+kq17 main Home timeline  [2 elements: Timeline: Your Home Timeline, ~4.1 KB]
   kq20 tab group  [3 tabs: For you, Following, AI Developer Tools, ~126 B]
-  kq24 group Timeline: Your Home Timeline  [2 elements: Your Home Timeline, ~3.6 KB]
-    kq28 group Wren Workshop Verified account @wren_example 17 seconds ago The rain moved our seed swap indoors. Bring envelopes for the seed table and label any packets you would like others to take home. 59 views  [3 elements: The rain moved our seed swap indoors. Br…, 59 views, ~815 B]
-    kq44 group Pebble Post Verified account @pebble_post 19 minutes ago A seed swap with @moss_example 159 views  [3 elements: A seed swap with @moss_example, 159 views, ~588 B]
-    kq60 group Spindle Press Verified account @spindle_press 20 minutes ago We're planning a live garden tour with Sage. Curious about balcony gardening? Leave a question below. 259 views  [3 elements: We're planning a live garden tour with S…, 259 views, ~754 B]
-    kq76 group Paper Kite Club Verified account @paper_kite_club 29 minutes ago Fold along with us! · Pocket kite · Paper boat 359 views  [3 elements: Fold along with us! · Pocket kite · Pape…, 359 views, ~604 B]
-    kq92 group Copper Lantern Verified account @lantern_example 18 hours ago How did those seedlings do? 459 views  [3 elements: How did those seedlings do?, 459 views, ~566 B]
+  kq24 group Timeline: Your Home Timeline  [2 elements: Your Home Timeline, ~3.8 KB]
+    kq28 group Wren Workshop Verified account @wren_example 17 seconds ago The rain moved our seed swap indoors. Bring envelopes for the seed table and label any packets you would like others to take home. 59 views  [3 elements: The rain moved our seed swap indoors. Br…, 59 views, ~823 B]
+    kq44 group Pebble Post Verified account @pebble_post 19 minutes ago A seed swap with @moss_example 159 views  [3 elements: A seed swap with @moss_example, 159 views, ~616 B]
+    kq60 group Spindle Press Verified account @spindle_press 20 minutes ago We're planning a live garden tour with Sage. Curious about balcony gardening? Leave a question below. 259 views  [3 elements: We're planning a live garden tour with S…, 259 views, ~774 B]
+    kq76 group Paper Kite Club Verified account @paper_kite_club 29 minutes ago Fold along with us! · Pocket kite · Paper boat 359 views  [3 elements: Fold along with us! · Pocket kite · Pape…, 359 views, ~684 B]
+    kq92 group Copper Lantern Verified account @lantern_example 18 hours ago How did those seedlings do? 459 views  [3 elements: How did those seedlings do?, 459 views, ~644 B]
 kq108 complementary Trending
   kq109 link Wren Workshop opens its seed library Trending now · News · 849 posts, Value: example.com/i/trending/1
   kq110 link Paper Kite Club shares a folding guide, Value: example.com/i/trending/2
@@ -524,7 +526,7 @@ kq111 menu bar
   kq114 menu bar item File  [0 children; closed]
 ";
 
-/// X's timeline outlines to its landmarks, its tabs and one line per post,
+/// The synthetic timeline outlines to its landmarks, its tabs and one line per post,
 /// each post readable from its container's label, in under 3 KB.
 #[test]
 fn x_timeline_outline_is_golden() {
@@ -556,9 +558,8 @@ kq28 group Wren Workshop Verified account @wren_example 17 seconds ago The rain 
 fn an_x_post_reads_after_one_zoom() {
     let read = observe(x_timeline());
     let post = find(&read.roots, "Wren Workshop");
-    assert!(
-        outline_of("Google Chrome", &read).contains(&format!("\n    {} group Wren Workshop", id(post)))
-    );
+    assert!(outline_of("Google Chrome", &read)
+        .contains(&format!("\n    {} group Wren Workshop", id(post))));
     assert_eq!(zoom_of("Google Chrome", &read, id(post)), X_POST);
 }
 
@@ -829,7 +830,7 @@ Removed element IDs: kq28-59
 focused: kq10 navigation Primary
 ";
 
-/// A tab switch on X: the two tabs that changed, the posts that appeared
+/// A tab switch on the synthetic timeline: the two tabs that changed, the posts that appeared
 /// with everything they say, the posts that went as one id range, and what
 /// has focus.
 #[test]

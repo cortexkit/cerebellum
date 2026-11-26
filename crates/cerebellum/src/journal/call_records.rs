@@ -6,8 +6,8 @@
 //!
 //! A relay that loses a reply cannot tell whether the call ran. Without a
 //! record, resending a keystroke or a click types or clicks twice. So every
-//! caller that mints a `call_key` (the key is opaque here: Broca's
-//! `<lineage_id>:<wal_seq>`, Claude Code's `cc:<tool_use id>`, Prefrontal's
+//! caller that mints a `call_key` (the key is opaque here: the model-call broker's
+//! `<lineage_id>:<wal_seq>`, Claude Code's `cc:<tool_use id>`, the supervising module's
 //! `pf:<relay record id>`) gets one record per `(route principal, call_key)`.
 //! The principal is part of the key because two callers can mint the same
 //! string, and one caller's key must never answer for another's call. The

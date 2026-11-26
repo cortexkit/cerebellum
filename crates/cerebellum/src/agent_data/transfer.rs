@@ -1,4 +1,4 @@
-//! Engram's authenticated cut metadata bounds and identifies the marks bytes.
+//! The backup module's authenticated cut metadata bounds and identifies the marks bytes.
 
 use super::*;
 use cortexkit_role_agent_data::errors::{DigestMismatchDetail, ParticipantFailedDetail};

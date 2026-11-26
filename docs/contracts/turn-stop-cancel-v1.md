@@ -1,6 +1,6 @@
 # Turn-stop cancellation, v1
 
-This is the cerebellum receive-side contract for Prefrontal core (ALF), which
+This is the cerebellum receive-side contract for the supervising module, which
 relays a head's `browser_use` and `computer_use` calls. It uses subc wire v2
 (`subc-protocol` 0.31.0). The executable examples are in
 [`crates/cerebellum/tests/vectors/turn-stop-cancel-v1`](../../crates/cerebellum/tests/vectors/turn-stop-cancel-v1/).

@@ -3173,7 +3173,7 @@ pub struct Planes {
     computer_for_test: Option<Arc<computer_capability::ScriptedComputerPlane>>,
     pub health: Arc<HealthState>,
     private_content: Arc<private_content::PrivateContent>,
-    /// Screenshot bytes a codemode program may hand to Broca by handle.
+    /// Screenshot bytes a codemode program may hand to the model-call broker by handle.
     image_handles: Arc<image_handles::ImageHandles>,
     signed_in: Arc<browser_signed_in::SignedInDomains>,
     cancellations: RequestCancellations,
@@ -3824,7 +3824,7 @@ async fn handle_route_request(
         return Box::pin(handle_keyed_tool_request_inner(frame, writer, planes)).await;
     }
     if private_content::is_broca(&facts.principal) {
-        // Broca's privacy decision must not queue behind a browser action or
+        // The broker's privacy decision must not queue behind a browser action or
         // consent drain. Its management route has no other authority.
         let request: Option<Value> = serde_json::from_slice(&frame.body).ok();
         let method = request
@@ -4067,10 +4067,10 @@ pub async fn resume_browser_handoff_for_test(planes: &Planes, identity: &RouteId
 /// Cerebellum's standing permissions (site grants, app grants, the takeover
 /// grant) are keyed on the conversation a person gave them in. A route names
 /// its conversation at bind, and every first-party module may open a route
-/// under any conversation, so the conversation key alone would let AFT, Broca,
-/// the routing module or a `direct` plugin reuse a permission the person gave
-/// someone else, without being asked. Only Prefrontal's core module carries
-/// sessions to cerebellum; everyone else is refused here.
+/// under any conversation, so the key alone would let other first-party modules
+/// or a `direct` plugin reuse a permission the person gave someone else,
+/// without being asked. Only the supervising module carries sessions to
+/// cerebellum; everyone else is refused here.
 ///
 /// Why at dispatch rather than at bind: a bind says who opened the route and
 /// under which conversation, not which call will follow, and the operator's
@@ -4431,7 +4431,7 @@ pub async fn send_hello_for_test(
 
 /// Build an eligible HELLO fixture with the browser-plane pins as the single
 /// top-level manifest extension. Production status-only HELLOs use the normal
-/// typed SUBC manifest path above when no release inputs are bound.
+/// typed protocol manifest path above when no release inputs are bound.
 pub async fn send_hello_with_browser_plane_pins_for_test(
     writer: &mpsc::Sender<Frame>,
     module_id: &str,
@@ -4517,7 +4517,7 @@ static USER_BROWSER_CONNECTION_GAUGES: user_browser_bridge::ConnectionGauges =
     user_browser_bridge::ConnectionGauges::new();
 
 /// Write `engram-catalog.json` into the module's data directory, so the
-/// fleet's backup module knows what that directory holds on every machine,
+/// backup module knows what that directory holds on every machine,
 /// including a new one where nobody placed the file by hand.
 ///
 /// Called only from the production entry point: tests write catalogs into
@@ -4553,7 +4553,7 @@ pub async fn handle_control_request_for_test_with_bindings(
 }
 
 /// The principal a test bind carries when it stands for a session's calls:
-/// Prefrontal's core module, the only caller admitted to act in a conversation.
+/// The supervising module, the only caller admitted to act in a conversation.
 pub fn session_caller_principal_for_test() -> Option<subc_protocol::Principal> {
     Some(subc_protocol::Principal::Reserved {
         module_id: cerebellum_core::principal::SESSION_CALLER_MODULE_ID.to_string(),

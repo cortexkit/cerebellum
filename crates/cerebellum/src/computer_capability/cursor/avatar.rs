@@ -131,7 +131,7 @@ fn rasterize(
     Some(pixmap.take())
 }
 
-/// The agent's colour the way the Alfonso phone app reads it, so a badge
+/// The agent's colour the way the phone app reads it, so a badge
 /// here matches the agent's page there: the creature in its neutral mood,
 /// with its ground shadow as the phone draws it, at the phone's size, then
 /// averaged down to the phone's 24 x 24 sample. Memory only.
@@ -443,7 +443,7 @@ mod tests {
             .any(|primitive| primitive.role == Some(avatar_svg::Role::GroundShadow)));
     }
 
-    /// Agent colours the Alfonso phone app computed for three creatures; see
+    /// Agent colours the phone app computed for three creatures; see
     /// the README beside the file.
     const COLOUR_VECTORS: &str = include_str!("../../../tests/fixtures/avatar-colour/vectors.json");
 
@@ -459,7 +459,7 @@ mod tests {
 
     /// How close our reading must come to the phone's. The phone rasterizes
     /// with CoreGraphics and we with resvg, so a pixel here and there
-    /// differs; CKIOS, who produced the vectors, gave these margins for that.
+    /// differs; the tolerance covers that rendering difference.
     const HUE_TOLERANCE: f64 = 0.003;
     const SATURATION_TOLERANCE: f64 = 0.015;
 

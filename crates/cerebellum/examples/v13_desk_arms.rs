@@ -458,7 +458,8 @@ mod desk {
     const TEXT: &str = "com.apple.TextEdit";
     const DISCORD: &str = "com.hnc.Discord";
     const FINDER: &str = "com.apple.finder";
-    const CONTENT: &str = "CortexKit scratch desk check. Nothing in this document is user data.\n";
+    const CONTENT: &str =
+        "Example scratch document for a desk check. Nothing in this document is user data.\n";
 
     #[repr(C)]
     #[derive(Clone, Copy)]

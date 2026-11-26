@@ -59,7 +59,8 @@ cargo build -p cerebellum --example live_launch
 PROBE=/tmp/ck-hardened-launch-probe
 rm -rf "$PROBE" && mkdir -p "$PROBE/home" "$PROBE/tmp"
 cp target/debug/examples/live_launch "$PROBE/live_launch"
-codesign --force --sign "Apple Development: ISMET UFUK ALTINOK (7UX762GU88)" \
+: "${SIGNING_IDENTITY:?Set SIGNING_IDENTITY to your Apple Development certificate name}"
+codesign --force --sign "$SIGNING_IDENTITY" \
   --identifier ck-cerebellum-live-launch-probe --options runtime \
   "$PROBE/live_launch"
 scripts/check-placed-hardening.sh "$PROBE/live_launch"   # must print "hardened:"

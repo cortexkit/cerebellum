@@ -50,7 +50,7 @@ pub const SCOPE_ADMISSION_CAPABILITY: &str = "cerebellum-scope-admission/v1";
 
 /// Lets route openers discover that keyed calls can settle after their reply.
 pub const LATE_RESULTS_CAPABILITY: &str = "late-results/v1";
-/// This module serves `session.turn_ended`, so Prefrontal core can tell it a
+/// This module serves `session.turn_ended`, so the supervising module can tell it a
 /// head session's turn ended and that session's cursor badge should go.
 pub const SESSION_TURN_ENDED_CAPABILITY: &str = "session-turn-ended/v1";
 
@@ -574,7 +574,7 @@ fn append_browser_flat_tool(manifest: &mut ModuleManifest) {
 }
 
 /// Serialize the standard manifest and its single top-level browser-plane
-/// extension for HELLO/release tooling. The external SUBC manifest type used by
+/// extension for HELLO/release tooling. The external `subc_protocol` manifest type used by
 /// status-only builds predates extensions, so composition is explicit here.
 pub fn serialize_with_browser_plane_pins(
     module_id: &str,

@@ -1701,14 +1701,14 @@ pub(super) async fn resume_browser_handoff(planes: &Planes, identity: &RouteIden
 
 /// Adapter for `session.turn_ended`: admit, parse, hand off, acknowledge.
 ///
-/// Interim: Prefrontal core calls this directly until the harness publishes a
-/// turn-ended event this module subscribes to; then this adapter goes, and the
+/// Interim: the supervising module calls this directly until the harness
+/// publishes a turn-ended event; then this adapter goes, and the
 /// subscription calls [`computer_capability::cursor::Coordinator::turn_ended`]
 /// the same way.
 ///
 /// Only the agent's orchestrator may call it, by exact reserved principal. A flow
 /// carrier or another first-party module is refused like any other caller of
-/// a Prefrontal-only operation. Once admitted and well formed, the reply is
+/// a supervisor-only operation. Once admitted and well formed, the reply is
 /// always an acknowledgement, even for a session that drew no badge: the
 /// caller learns nothing about which sessions used the computer. It writes no
 /// journal and touches nothing but the cursor badge: it hides the badge, and
@@ -1789,8 +1789,8 @@ async fn handle_session_turn_ended(
 
 /// `image.resolve`: the bytes a screenshot handle stands for.
 ///
-/// Broca calls this to fetch the screenshot a codemode program passed by
-/// handle, because the bytes are far larger than a program's result may carry.
+/// The model-call broker fetches screenshots a codemode program passes by
+/// handle, since the bytes are too large for the program result.
 /// Only `reserved:broca` on a management surface reaches it, checked by the
 /// route dispatcher before this runs.
 ///
@@ -1844,9 +1844,9 @@ async fn handle_image_resolve(
     let resolved = planes
         .image_handles
         .resolve(handle, &scopes, wall_clock_ms());
-    // A refusal stays a JSON body in a Response frame, the same shape
-    // private_content refuses with: Broca reads anything carrying `outcome` as
-    // a refusal, and an error frame would be a different contract.
+    // Like private_content, refusals use a JSON body in a Response frame.
+    // The model-call broker treats a body with `outcome` as a refusal; an
+    // Error frame would violate that contract.
     debug_assert!(resolved
         .as_ref()
         .is_none_or(|resolved| resolved.body.len() <= image_handles::MAX_RESOLVE_BODY_BYTES));

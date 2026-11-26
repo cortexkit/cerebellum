@@ -1,8 +1,8 @@
-//! Screenshot handles a codemode program can hand to Broca, and their bytes.
+//! Screenshot handles a codemode program can hand to the model-call broker, and their bytes.
 //!
 //! A program's result is too small to carry a screenshot, so every screenshot
 //! this module returns also gets a short handle. The program passes the handle
-//! to Broca's model call, and Broca asks this module (`image.resolve`) for the
+//! to the model call, and the broker asks this module (`image.resolve`) for the
 //! bytes. Nothing here reaches the disk, the journal or a call record: the
 //! bytes a reply carried live in memory, keyed by their handle, and they go
 //! when the handle expires or the conversation that captured them ends.
@@ -10,7 +10,7 @@
 //! A handle is minted only for a capture whose route carries a scope stamp,
 //! because the resolver authorizes a fetch by scope and an unstamped capture
 //! belongs to no scope anyone could name. A capture on an unstamped route
-//! omits the field, and Broca's call then refuses with `image_unavailable`.
+//! omits the field, and the resolve call then refuses with `image_unavailable`.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard};
@@ -32,15 +32,15 @@ pub(crate) const TOTAL_BYTES_LIMIT: usize = 64 * 1024 * 1024;
 /// the daemon's per-frame cap is the head plus the image, not an encoding of
 /// it.
 ///
-/// This is the same number BROCA's `MAX_REFERENCE_IMAGE_BYTES` holds; this
-/// module may not depend on BROCA's crate, so the value is restated here and
+/// This is the same number the model-call broker's `MAX_REFERENCE_IMAGE_BYTES` holds; this
+/// module may not depend on the broker's crate, so the value is restated here and
 /// a test pins both the arithmetic and the published number.
 pub const IMAGE_HANDLE_MAX_BYTES: usize = 4 * 1024 * 1024 - 64 * 1024;
 
 /// How the body of a successful resolve is laid out: a big-endian length of the
 /// head JSON, then the head JSON, then the image's own bytes.
 ///
-/// The field names are BROCA's model-batch §13.1 vocabulary, kept here in one
+/// The field names are the broker's model-batch §13.1 vocabulary, kept here in one
 /// place so a rename is one edit.
 pub(crate) const HEAD_CONTENT_TYPE: &str = "content_type";
 pub(crate) const HEAD_SHA256: &str = "sha256";
@@ -72,7 +72,7 @@ fn binary_body(content_type: &str, sha256: &str, bytes: &[u8]) -> Vec<u8> {
 /// puts the delivered frame over the daemon's 4 MiB cap.
 pub const MAX_RESOLVE_BODY_BYTES: usize = 4 * 1024 * 1024 - 21;
 
-/// The wire operation Broca calls.
+/// The wire operation the broker calls.
 pub(crate) const RESOLVE: &str = "image.resolve";
 /// The mime types a handle may hold. The resolver's reply names one, and these
 /// are the two snapshot encodings this module produces.
