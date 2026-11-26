@@ -72,6 +72,8 @@ fn reading(sample: &AlphaSample, front: Option<Instant>) -> Value {
     json!({
         "alpha": alpha(sample).as_str(),
         "pixels": sample.total,
+        "covered_fraction": sample.covered_fraction(),
+        "near_opaque_fraction": sample.near_opaque_fraction(),
         "near_opaque": sample.near_opaque,
         "near_transparent": sample.near_transparent,
         "requested_ms": offset(sample.requested_at),
@@ -184,6 +186,7 @@ impl Desk<'_> {
                 deadline.min(Instant::now() + SAMPLE_WAIT),
                 Arc::new(|| true),
             )?;
+            println!("{}", json!({"dock_overlay_poll": reading(&sample, None)}));
             let idle = if quiet {
                 let (since, input) = SessionEventTap::hardware_input_snapshot()
                     .ok_or("hardware input observer unavailable")?;
@@ -427,6 +430,36 @@ mod tests {
         assert_eq!(classify(100, 0, 98), Alpha::Mixed);
         assert_eq!(classify(99, 98, 0), Alpha::Mixed);
         assert_eq!(classify(0, 0, 0), Alpha::Mixed);
+    }
+
+    #[test]
+    fn alpha_reading_distinguishes_coverage_from_near_opacity() {
+        let now = Instant::now();
+        let sample = AlphaSample {
+            requested_at: now,
+            frame_arrived_at: now,
+            returned_at: now,
+            total: 8,
+            nonzero: 2,
+            near_opaque: 1,
+            near_transparent: 6,
+        };
+        let record = reading(&sample, None);
+        assert_eq!(record["covered_fraction"], json!(0.25));
+        assert_eq!(record["near_opaque_fraction"], json!(0.125));
+
+        let empty = reading(
+            &AlphaSample {
+                total: 0,
+                nonzero: 0,
+                near_opaque: 0,
+                near_transparent: 0,
+                ..sample
+            },
+            None,
+        );
+        assert_eq!(empty.get("covered_fraction"), Some(&Value::Null));
+        assert_eq!(empty.get("near_opaque_fraction"), Some(&Value::Null));
     }
 
     #[test]
