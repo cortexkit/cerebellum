@@ -23,6 +23,16 @@ pub(crate) fn content_named_fixture(
     bytes: &[u8],
     mode: u32,
 ) -> PathBuf {
+    content_named_fixture_with_miss_hook(label, file_name, bytes, mode, || {})
+}
+
+fn content_named_fixture_with_miss_hook(
+    label: &str,
+    file_name: &str,
+    bytes: &[u8],
+    mode: u32,
+    on_miss: impl FnOnce(),
+) -> PathBuf {
     assert!(
         !label.is_empty()
             && label
@@ -42,9 +52,28 @@ pub(crate) fn content_named_fixture(
     hold_fixture_lock(&directory).expect("lock content-named fixture");
     fs::create_dir_all(&directory).expect("create content-named fixture directory");
     let path = directory.join(file_name);
-    if matches_fixture(&path, bytes, mode) {
-        remove_stale_siblings(label);
-        return path;
+    if !matches_fixture(&path, bytes, mode) {
+        on_miss();
+        publish_fixture(&directory, file_name, &path, bytes, mode);
+    }
+    remove_stale_siblings(label);
+    path
+}
+
+fn publish_fixture(directory: &Path, file_name: &str, path: &Path, bytes: &[u8], mode: u32) {
+    // The shared fixture lease prevents pruning but allows concurrent callers.
+    // Recheck under a writer lock so a second publisher does not unlink an
+    // executable a child may already be running.
+    let writer_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join(".publish.lock"))
+        .expect("open fixture writer lock");
+    writer_lock.lock().expect("lock fixture for publication");
+    if matches_fixture(path, bytes, mode) {
+        return;
     }
 
     // A unique sibling plus rename prevents concurrent readers from seeing a
@@ -70,7 +99,7 @@ pub(crate) fn content_named_fixture(
         file.write_all(bytes)?;
         file.set_permissions(fs::Permissions::from_mode(mode))?;
         drop(file);
-        fs::rename(&temporary_path, &path)?;
+        fs::rename(&temporary_path, path)?;
         Ok(())
     })();
     if let Err(error) = write_result {
@@ -78,11 +107,9 @@ pub(crate) fn content_named_fixture(
         panic!("write content-named fixture: {error}");
     }
     assert!(
-        matches_fixture(&path, bytes, mode),
+        matches_fixture(path, bytes, mode),
         "fixture content or mode changed after write"
     );
-    remove_stale_siblings(label);
-    path
 }
 
 fn remove_stale_siblings(label: &str) {
@@ -203,6 +230,7 @@ fn matches_fixture(path: &Path, bytes: &[u8], mode: u32) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+    use std::sync::mpsc;
     use std::time::{Duration, SystemTime};
 
     fn set_directory_mtime(path: &Path, modified: SystemTime) {
@@ -318,6 +346,50 @@ mod tests {
             let _ = fs::remove_dir_all(path);
             let _ = fs::remove_file(fixture_lock_path(path));
         }
+    }
+
+    #[test]
+    fn concurrent_publishers_preserve_the_first_fixture_inode() {
+        let label = format!(
+            "concurrent-publish-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let bytes = b"same bytes from both publishers";
+        std::thread::scope(|scope| {
+            let (missed_tx, missed_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let label = label.as_str();
+            let second = scope.spawn(move || {
+                content_named_fixture_with_miss_hook(label, "fixture", bytes, 0o700, || {
+                    missed_tx.send(()).expect("report cache miss");
+                    resume_rx.recv().expect("wait for the first publication");
+                })
+            });
+
+            // Both publishers see an empty cache. Let the first finish before
+            // the other resumes, just as a child can start from the first copy.
+            missed_rx.recv().expect("second publisher saw the miss");
+            let first = content_named_fixture(label, "fixture", bytes, 0o700);
+            let opened = File::open(&first).expect("open first publication");
+            resume_tx.send(()).expect("resume second publisher");
+            let same = second.join().expect("second publisher finished");
+            let first_inode = opened.metadata().expect("first inode").ino();
+            let published_inode = fs::metadata(&same).expect("published inode").ino();
+            drop(opened);
+
+            let directory = first.parent().expect("fixture directory");
+            fs::remove_dir_all(directory).expect("remove test fixture");
+            fs::remove_file(fixture_lock_path(directory)).expect("remove test fixture lock");
+            assert_eq!(first, same);
+            assert_eq!(
+                published_inode, first_inode,
+                "a second publisher must not replace the first executable inode"
+            );
+        });
     }
 
     #[test]
