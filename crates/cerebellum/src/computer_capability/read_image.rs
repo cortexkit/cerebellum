@@ -58,12 +58,17 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
         .map_err(|_| ImageUnavailable::CaptureUnavailable)?;
     // Resolve ScreenCaptureKit resources before taking the person's focus.
     // Inside the bracket only current window facts and pixels are needed.
+    #[cfg(target_os = "macos")]
     let mut prepared = controller
         .prepare_fronted_vision(now_ms)
         .map_err(image_capture_error)?;
     #[cfg(target_os = "macos")]
     let mut prepared_visibility = match &prepared {
-        Some(window) => freshness.prepare_fronted(grant, window.window_id())?,
+        Some(window) => Some(
+            freshness
+                .prepare_fronted(grant, window.window_id())?
+                .ok_or(ImageUnavailable::FrontingUnavailable)?,
+        ),
         None => None,
     };
     let mut captured = Err(ImageUnavailable::FrontingUnavailable);
@@ -116,13 +121,17 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
             }
             // Even a backend panic must return through the bracket's restore.
             captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(target_os = "macos")]
                 let cutoff = hooks.cutoff().and_then(|gate| gate.reserve_start());
+                #[cfg(target_os = "macos")]
+                let mut capture_proof = None;
                 let before_picture = || {
                     #[cfg(target_os = "macos")]
                     if let Some(visibility) = &mut prepared_visibility {
-                        let (state, decision) = super::image_freshness::map_native_visibility(
-                            Some(visibility.check_before(cutoff, &fence)),
-                        );
+                        let (decision, proof) = visibility.check_before(cutoff, &fence);
+                        capture_proof = proof;
+                        let (state, decision) =
+                            super::image_freshness::map_native_visibility(Some(decision));
                         if let Some(exemption) = visibility.exemption() {
                             evidence.borrow_mut().dock_overlay_exemption =
                                 Some(cerebellum_computer::app_state::DockOverlayExemption {
@@ -146,13 +155,18 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
                 // once it has closed, no pixels are requested, and none are
                 // copied or returned even if ScreenCaptureKit completes a
                 // request already made.
+                #[cfg(target_os = "macos")]
                 let pending = match &mut prepared {
                     Some(window) => {
-                        controller.capture_prepared_fronted_vision(window, cutoff, &fence)
+                        let proof = capture_proof.ok_or(ImageUnavailable::FrontingUnavailable)?;
+                        controller.capture_prepared_fronted_vision(window, proof, cutoff, &fence)
                     }
                     None => controller
                         .capture_frontmost_window_unencoded_for_vision_fenced(now_ms, &fence),
                 };
+                #[cfg(not(target_os = "macos"))]
+                let pending =
+                    controller.capture_frontmost_window_unencoded_for_vision_fenced(now_ms, &fence);
                 let pending = match pending {
                     Ok(pending) => pending,
                     Err(_) if !fence() => return Err(ImageUnavailable::FrontingBoundExceeded),

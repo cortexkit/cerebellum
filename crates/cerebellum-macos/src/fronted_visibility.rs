@@ -3,11 +3,13 @@
 use std::time::Instant;
 
 use super::dock_overlay::{DockOverlayWitness, WitnessFence};
+use crate::window_image::VisibilityScope;
 use crate::window_visibility::{
     fronted_frame_matches, visibility_with_cover, Rect, VisibilityRule, Window, WindowVisibility,
 };
 
 pub type VisibilityDecision = (WindowVisibility, VisibilityRule);
+type Snapshot = (Vec<Window>, Vec<Rect>);
 
 const UNKNOWN: VisibilityDecision = (WindowVisibility::Unknown, VisibilityRule::MissingData);
 const VISIBLE: VisibilityDecision = (
@@ -34,7 +36,61 @@ struct FrontedWindow {
     bounds: Rect,
 }
 
+/// The window certified for this acquisition. `PreparedWindowCapture` must
+/// match its cached ScreenCaptureKit filter's owner, window ID and frame to
+/// this proof before requesting pixels.
+pub struct FrontedWindowProof {
+    pid: u32,
+    generation: u64,
+    id: u32,
+    bounds: Rect,
+}
+
+impl FrontedWindowProof {
+    pub(super) fn matches(&self, pid: u32, id: u32, frame: [f64; 4]) -> bool {
+        self.pid == pid
+            && self.id == id
+            && self.bounds == Rect::from_frame(frame)
+            && crate::process_start_time_micros(pid) == Some(self.generation)
+    }
+}
+
 impl FrontedWindow {
+    fn observe_before(
+        &self,
+        mut snapshot: impl FnMut(VisibilityScope) -> Option<Snapshot>,
+        mut current_dock: impl FnMut() -> Option<DockWindow>,
+        sample: impl FnOnce() -> Option<(usize, usize)>,
+    ) -> (VisibilityDecision, Option<DockExemption>) {
+        let Some((windows, displays)) = snapshot(VisibilityScope::ThroughTarget) else {
+            return (UNKNOWN, None);
+        };
+        let (verdict, exemption) = self.before(&windows, &displays, current_dock(), sample);
+        if exemption.is_none() {
+            return (verdict, None);
+        }
+        // Focus or cover can change while ScreenCaptureKit samples the Dock
+        // window's alpha. Recheck before acquiring the target's pixels.
+        let verdict = snapshot(VisibilityScope::ThroughTarget)
+            .map_or(UNKNOWN, |(windows, displays)| {
+                self.after(&windows, &displays, current_dock(), exemption)
+            });
+        (verdict, exemption)
+    }
+
+    fn observe_after(
+        &self,
+        snapshot: impl FnOnce(VisibilityScope) -> Option<Snapshot>,
+        current_dock: impl FnOnce() -> Option<DockWindow>,
+        exemption: Option<DockExemption>,
+    ) -> VisibilityDecision {
+        // Only a new list, read after the pixels arrive, can certify the
+        // target is still frontmost and the cover has not changed.
+        snapshot(VisibilityScope::AllOnScreen).map_or(UNKNOWN, |(windows, displays)| {
+            self.after(&windows, &displays, current_dock(), exemption)
+        })
+    }
+
     fn inspect(
         &self,
         windows: &[Window],
@@ -130,11 +186,17 @@ impl PreparedFrontedVisibility {
         })
     }
 
-    fn snapshot(&self) -> Option<(Vec<Window>, Vec<Rect>)> {
+    fn snapshot(&self, scope: VisibilityScope) -> Option<Snapshot> {
+        #[cfg(feature = "desk-probe")]
+        let _step = crate::picture_probe_timing::Step::new(
+            crate::picture_probe_timing::token(self.target.id),
+            "visibility_snapshot_started",
+            "visibility_snapshot_returned",
+        );
         if crate::process_start_time_micros(self.target.pid) != Some(self.generation) {
             return None;
         }
-        crate::window_image::fronted_visibility_snapshot(self.target.pid, self.target.id)
+        crate::window_image::fronted_visibility_snapshot(self.target.pid, self.target.id, scope)
     }
 
     fn current_dock(&self) -> Option<DockWindow> {
@@ -153,33 +215,43 @@ impl PreparedFrontedVisibility {
         &mut self,
         until: Option<Instant>,
         fence: &WitnessFence,
-    ) -> VisibilityDecision {
-        self.exemption = None;
-        let Some((windows, displays)) = self.snapshot() else {
-            return UNKNOWN;
-        };
-        let (verdict, exemption) =
-            self.target
-                .before(&windows, &displays, self.current_dock(), || {
-                    let sample = self.dock.as_ref()?.sample(until?, fence.clone()).ok()?;
-                    Some((sample.total, sample.nonzero))
-                });
+    ) -> (VisibilityDecision, Option<FrontedWindowProof>) {
+        let (verdict, exemption) = self.target.observe_before(
+            |scope| self.snapshot(scope),
+            || self.current_dock(),
+            || {
+                #[cfg(feature = "desk-probe")]
+                let _step = crate::picture_probe_timing::Step::new(
+                    crate::picture_probe_timing::token(self.target.id),
+                    "dock_witness_started",
+                    "dock_witness_returned",
+                );
+                let sample = self.dock.as_ref()?.sample(until?, fence.clone()).ok()?;
+                Some((sample.total, sample.nonzero))
+            },
+        );
         self.exemption = exemption;
-        if exemption.is_some() {
-            // Recheck the cover and focus after sampling, so the sample's
-            // wait does not leave a stale visibility decision before capture.
-            self.check_after()
-        } else {
-            verdict
-        }
+        let proof = (verdict.0 == WindowVisibility::FullyVisible).then_some(FrontedWindowProof {
+            pid: self.target.pid,
+            generation: self.generation,
+            id: self.target.id,
+            bounds: self.target.bounds,
+        });
+        (verdict, proof)
     }
 
     pub fn check_after(&self) -> VisibilityDecision {
-        let Some((windows, displays)) = self.snapshot() else {
-            return UNKNOWN;
-        };
-        self.target
-            .after(&windows, &displays, self.current_dock(), self.exemption)
+        #[cfg(feature = "desk-probe")]
+        let _step = crate::picture_probe_timing::Step::new(
+            crate::picture_probe_timing::token(self.target.id),
+            "visibility_recheck_started",
+            "visibility_recheck_returned",
+        );
+        self.target.observe_after(
+            |scope| self.snapshot(scope),
+            || self.current_dock(),
+            self.exemption,
+        )
     }
 
     pub fn exemption(&self) -> Option<DockExemption> {
@@ -225,6 +297,7 @@ mod tests {
                 windows: vec![
                     entry(DOCK, DOCK_WINDOW, 20, display),
                     entry(TARGET, TARGET_WINDOW, 0, bounds),
+                    entry(69_489, 55, 0, bounds),
                 ],
                 display,
                 dock_bundle: "com.apple.dock",
@@ -269,6 +342,18 @@ mod tests {
                     Rect::from_frame([1550.0, 400.0, 100.0, 200.0]),
                 ),
             );
+        }
+
+        fn snapshot(mut self, scope: VisibilityScope) -> Snapshot {
+            if scope == VisibilityScope::ThroughTarget {
+                let target = self
+                    .windows
+                    .iter()
+                    .position(|window| window.id == Some(TARGET_WINDOW))
+                    .unwrap();
+                self.windows.truncate(target + 1);
+            }
+            (self.windows, vec![self.display])
         }
     }
 
@@ -364,5 +449,79 @@ mod tests {
         assert!(evidence.is_some());
         windows.lose_front();
         assert_eq!(windows.after(evidence), UNKNOWN);
+    }
+
+    #[test]
+    fn at_or_above_target_and_full_lists_agree_on_cover() {
+        let recorded_scene = |kind| {
+            let mut scene = RecordedWindowList::textedit_with_dock_overlay();
+            match kind {
+                "second cover" => scene.windows.insert(
+                    1,
+                    entry(69_489, 10, 1, Rect::from_frame([350.0, 150.0, 100.0, 50.0])),
+                ),
+                "Dock absent" => {
+                    scene.windows.remove(0);
+                }
+                _ => {}
+            }
+            scene
+        };
+        for (kind, expected) in [
+            ("sole Dock", (COVERED, true)),
+            ("second cover", (COVERED, false)),
+            ("Dock absent", (VISIBLE, false)),
+        ] {
+            for scope in [VisibilityScope::AllOnScreen, VisibilityScope::ThroughTarget] {
+                let scene = recorded_scene(kind);
+                let scoped = recorded_scene(kind).snapshot(scope);
+                assert_eq!(
+                    scene
+                        .target
+                        .inspect(&scoped.0, &scoped.1, scene.prepared_dock()),
+                    expected,
+                    "{kind}: {scope:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn picture_only_reads_the_full_list_after_capture() {
+        use VisibilityScope::{AllOnScreen, ThroughTarget};
+
+        let scene = RecordedWindowList::textedit_with_dock_overlay();
+        let pixels_arrived = Cell::new(false);
+        let reads = std::cell::RefCell::new(Vec::new());
+        let snapshot = |scope| {
+            reads.borrow_mut().push((pixels_arrived.get(), scope));
+            let mut live = RecordedWindowList::textedit_with_dock_overlay();
+            if pixels_arrived.get() {
+                live.lose_front();
+            }
+            Some(live.snapshot(scope))
+        };
+        let (before, evidence) =
+            scene
+                .target
+                .observe_before(snapshot, || scene.prepared_dock(), || Some((PIXELS, 0)));
+        assert_eq!(before, VISIBLE);
+        assert!(evidence.is_some());
+        pixels_arrived.set(true);
+        assert_eq!(
+            scene
+                .target
+                .observe_after(snapshot, || scene.prepared_dock(), evidence),
+            UNKNOWN,
+            "focus lost after pixels arrived must withhold the image",
+        );
+        assert_eq!(
+            reads.into_inner(),
+            [
+                (false, ThroughTarget),
+                (false, ThroughTarget),
+                (true, AllOnScreen)
+            ],
+        );
     }
 }

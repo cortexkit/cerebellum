@@ -17,7 +17,7 @@ pub fn begin_picture_timing_for_probe(window: u32) {
     *ACTIVE.lock().unwrap() = Some(Attempt {
         window,
         token: NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed),
-        stamps: Vec::new(),
+        stamps: Vec::with_capacity(64),
     });
 }
 
@@ -47,6 +47,22 @@ pub(crate) fn stamp(token: Option<u64>, phase: &'static str) {
     let now = Instant::now();
     if let Some(attempt) = ACTIVE.lock().unwrap().as_mut().filter(|a| a.token == token) {
         attempt.stamps.push((phase, now));
+    }
+}
+
+/// Pair the start with a return stamp even when the native query fails.
+pub(crate) struct Step(Option<u64>, &'static str);
+
+impl Step {
+    pub(crate) fn new(token: Option<u64>, start: &'static str, end: &'static str) -> Self {
+        stamp(token, start);
+        Self(token, end)
+    }
+}
+
+impl Drop for Step {
+    fn drop(&mut self) {
+        stamp(self.0, self.1);
     }
 }
 
