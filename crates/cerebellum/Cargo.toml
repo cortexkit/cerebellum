@@ -93,7 +93,7 @@ tokio = { workspace = true, features = ["signal"] }
 async-nats = { version = "=0.50.0", default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 cerebellum-macos = { path = "../cerebellum-macos" }
-avatar-svg = { git = "ssh://git@github.com/cortexkit/avatar.git", rev = "722ea8ae411510913be8941c836dd74cd97e0b96" }
+avatar-svg = { git = "ssh://git@github.com/cortexkit/avatar.git", rev = "f7532499e2732568a0bc0cb5796649003c1afe2b" }
 resvg = "0.44"
 
 [target.'cfg(target_os = "linux")'.dependencies]
