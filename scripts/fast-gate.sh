@@ -309,6 +309,8 @@ start_static_phase "no test requests macOS permissions" \
   bash -c 'scripts/lib/mac-permission-request-scan.test.sh >/dev/null && python3 scripts/lib/mac-permission-request-scan.py .'
 start_static_phase "test and script ck-* executions use ckdev names" \
   bash -c 'scripts/lib/ckdev-naming-scan.test.sh >/dev/null && python3 scripts/lib/ckdev-naming-scan.py .'
+start_static_phase "only allowlisted .cortexkit paths are tracked" \
+  bash -c 'scripts/check-cortexkit-layout.test.sh >/dev/null && scripts/check-cortexkit-layout.sh'
 # This proof builds format_versions, so it must not overlap another Cargo phase.
 run_serial_phase "format-floor gate proofs: scripts/lib/format-floor-gate.test.sh" scripts/lib/format-floor-gate.test.sh
 

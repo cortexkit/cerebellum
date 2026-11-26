@@ -263,6 +263,8 @@ start_parallel_phase "source file size limit" \
   bash -c 'scripts/file-size-check.test.sh && scripts/file-size-check.sh'
 start_parallel_phase "no test journals to the operator's disk" check_tests_do_not_journal_durably
 start_parallel_phase "no test requests macOS permissions" check_tests_do_not_request_macOS_permissions
+start_parallel_phase "only allowlisted .cortexkit paths are tracked" \
+  bash -c 'scripts/check-cortexkit-layout.test.sh >/dev/null && scripts/check-cortexkit-layout.sh'
 start_parallel_phase "test and script ck-* executions use ckdev names" check_test_binaries_use_ckdev_names
 start_parallel_phase "scripts/module-wiring-gate.sh" ./scripts/module-wiring-gate.sh
 start_parallel_phase "scripts/lib/format-floor-gate.test.sh" scripts/lib/format-floor-gate.test.sh
