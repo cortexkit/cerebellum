@@ -40,7 +40,7 @@ pub const IMAGE_HANDLE_MAX_BYTES: usize = 4 * 1024 * 1024 - 64 * 1024;
 /// How the body of a successful resolve is laid out: a big-endian length of the
 /// head JSON, then the head JSON, then the image's own bytes.
 ///
-/// The field names are the broker's model-batch §13.1 vocabulary, kept here in one
+/// The field names are the model runner's image-handle vocabulary, kept here in one
 /// place so a rename is one edit.
 pub(crate) const HEAD_CONTENT_TYPE: &str = "content_type";
 pub(crate) const HEAD_SHA256: &str = "sha256";

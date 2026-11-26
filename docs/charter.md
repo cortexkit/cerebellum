@@ -13,11 +13,14 @@ different scope and require their own containment.
 - **Scope model.** Code tools key identity, configuration, caches and sandboxing on
   a project root. Computer use is machine-scoped and browser sessions are
   conversation/task-scoped; neither fits a root-keyed bind model.
-- **Blast radius.** On macOS this capability requires TCC Screen Recording and
-  Accessibility grants, attributed to the responsible process. Dedicated modules handle privileged capabilities such as vault access and
-  backups. Screen recording and input control get their own binary,
-  their own policy surface, and a clean TCC attribution anchor.
-- **Lifecycle.** Browser processes, profiles, CDP sessions, and screenshot
+- **Blast radius.** On macOS this capability requires the Screen Recording and
+  Accessibility privacy grants (TCC, macOS's privacy permission system),
+  attributed to the responsible process. Dedicated modules handle privileged
+  capabilities such as vault access and backups. Screen recording and input
+  control get their own binary, their own policy surface, and a clean
+  permission attribution anchor.
+- **Lifecycle.** Browser processes, profiles, Chrome DevTools Protocol (CDP)
+  sessions, and screenshot
   streaming want their own supervision, health gauges, and restart semantics.
 - **Plane discipline.** The supervising module orchestrates calls rather than
   driving the machine itself. Consumers reach Cerebellum through `subc` routes.
