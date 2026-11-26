@@ -1,5 +1,10 @@
 # ck-cerebellum
 
+> [!WARNING]
+> **Alpha.** Cerebellum is in early development and is not yet released for general use.
+> Breaking changes will happen between versions, including changes to its settings,
+> stored data and interfaces. Pin an exact version if you depend on it.
+
 Browser and desktop control for CortexKit agents.
 
 Cerebellum lets an agent use a web browser and desktop applications on your
