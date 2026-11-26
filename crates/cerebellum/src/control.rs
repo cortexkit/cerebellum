@@ -501,9 +501,11 @@ async fn send_principal_denied(
 ///   lifetime (`PICTURE_READ_LIFETIME_MS`) and had their fronting lock
 ///   released as for a timed-out read: how many have still not returned
 ///   (`still_running`) and how many there have been since the module
-///   started (`total`).
+///   started (`total`);
+/// - `windowImageWithholding`, stale-cover refusals by stage and prepare error
+///   kind since module start. Missing keys are zero.
 ///
-/// Counters are atomic and none changes the status. The helper PID, when
+/// None of these gauges changes the status. The helper PID, when
 /// present, is checked against the OS process-start time without waiting on
 /// its transport.
 pub(super) fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleControlResponse {
@@ -520,6 +522,10 @@ pub(super) fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleCo
         metrics.insert(
             "lateFrontingJournalFailures".into(),
             json!(computer_capability::late_fronting_journal_failures()),
+        );
+        metrics.insert(
+            "windowImageWithholding".into(),
+            computer_capability::image_withholding::image_withholding_counts(),
         );
         #[cfg(target_os = "macos")]
         {

@@ -17,6 +17,21 @@ struct Freshness {
 }
 
 impl ImageFreshnessSource for Freshness {
+    #[cfg(target_os = "macos")]
+    fn prepare_fronted(
+        &self,
+        _target: &ProcessGrant,
+        _window_id: &str,
+    ) -> Result<
+        Option<cerebellum_macos::PreparedFrontedVisibility>,
+        cerebellum::computer_capability::image_freshness::FrontedPreparationError,
+    > {
+        use cerebellum::computer_capability::image_freshness::FrontedPreparationError;
+        Err(FrontedPreparationError::Visibility(
+            cerebellum_macos::FrontedVisibilityPrepareError::DockCaptureLookup,
+        ))
+    }
+
     fn inspect(&self, target: &ProcessGrant, id: Option<&str>) -> (bool, WindowVisibility) {
         (
             false,
@@ -61,8 +76,23 @@ struct TrackedCapture {
     captures: Arc<AtomicUsize>,
     encodes: Arc<AtomicUsize>,
     frontmost: Arc<AtomicU32>,
+    #[cfg(target_os = "macos")]
+    fail_prepare: bool,
 }
 impl CaptureBackend for TrackedCapture {
+    #[cfg(target_os = "macos")]
+    fn fronted_vision_preparer(&self) -> Option<FrontedVisionPreparer> {
+        self.fail_prepare.then(|| {
+            Box::new(
+                |_: &WindowCaptureRequest| -> Result<PreparedVisionCapture, BackendError> {
+                    Ok(Box::new(|_, _, _| {
+                        panic!("failed visibility setup must not capture")
+                    }))
+                },
+            ) as FrontedVisionPreparer
+        })
+    }
+
     fn screen_recording_liveness(&self) -> cerebellum_computer::platform::PermissionLiveness {
         self.inner.screen_recording_liveness()
     }
@@ -145,7 +175,15 @@ async fn read(
     still_covered: bool,
     cover_during_capture: bool,
 ) -> (Value, Value, Arc<Mutex<Shared>>, usize) {
-    read_with_app_grant(script, still_covered, cover_during_capture, false).await
+    read_with_app_grant(
+        script,
+        still_covered,
+        cover_during_capture,
+        false,
+        #[cfg(target_os = "macos")]
+        false,
+    )
+    .await
 }
 
 async fn read_with_app_grant(
@@ -153,6 +191,7 @@ async fn read_with_app_grant(
     still_covered: bool,
     cover_during_capture: bool,
     allow_once: bool,
+    #[cfg(target_os = "macos")] fail_prepare: bool,
 ) -> (Value, Value, Arc<Mutex<Shared>>, usize) {
     let shared = Shared::handle();
     shared.lock().unwrap().fronted = script;
@@ -218,6 +257,8 @@ async fn read_with_app_grant(
                     captures: captures.clone(),
                     encodes: encodes.clone(),
                     frontmost: frontmost.clone(),
+                    #[cfg(target_os = "macos")]
+                    fail_prepare,
                 },
             ),
         )
@@ -302,8 +343,15 @@ async fn covered_read_fronts_captures_and_restores_with_only_an_app_grant() {
 
 #[tokio::test]
 async fn covered_read_spends_allow_once_on_the_waiting_call_not_a_retry() {
-    let (_, _, shared, captures) =
-        read_with_app_grant(FrontingScript::default(), false, false, true).await;
+    let (_, _, shared, captures) = read_with_app_grant(
+        FrontingScript::default(),
+        false,
+        false,
+        true,
+        #[cfg(target_os = "macos")]
+        false,
+    )
+    .await;
     assert_eq!(captures, 1);
     assert_eq!(
         shared.lock().unwrap().image_front_requests,
@@ -354,6 +402,10 @@ async fn still_covered_after_fronting_never_captures() {
         "window_covered_may_be_stale"
     );
     assert_eq!(
+        reply["image_unavailable"]["detail"],
+        json!({"stage":"covered_before_capture"})
+    );
+    assert_eq!(
         captures, 0,
         "withholding captured pixels is not refusing capture"
     );
@@ -369,6 +421,10 @@ async fn still_covered_after_fronting_never_captures() {
 #[tokio::test]
 async fn cover_racing_capture_withholds_pixels_and_restores() {
     let (reply, row, _, captures) = read(FrontingScript::default(), false, true).await;
+    assert_eq!(
+        reply["image_unavailable"]["detail"],
+        json!({"stage":"covered_after_capture"})
+    );
     assert_eq!(captures, 1);
     assert!(reply.get("image").is_none());
     assert_eq!(
@@ -377,6 +433,27 @@ async fn cover_racing_capture_withholds_pixels_and_restores() {
     );
     assert_eq!(row["image_decision"], "covered_by_window");
     assert_eq!(row["image_fronting"]["restored"], true);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn visibility_prepare_failure_names_its_kind_without_fronting_or_capturing() {
+    let (reply, row, shared, captures) =
+        read_with_app_grant(FrontingScript::default(), false, false, false, true).await;
+    assert_eq!(reply["outcome"], "completed");
+    assert_eq!(
+        reply["image_unavailable"],
+        json!({
+            "reason": "window_covered_may_be_stale",
+            "detail": {"stage": "prepare_failed", "prepare_error": "dock_capture_lookup"}
+        })
+    );
+    assert_eq!(captures, 0);
+    assert!(reply.get("image").is_none());
+    assert!(reply.get("image_fronting").is_none());
+    assert!(shared.lock().unwrap().image_front_requests.is_empty());
+    assert_eq!(row["image_decision"], "covered_by_window");
+    assert_eq!(row["image_returned"], false);
 }
 
 #[tokio::test]
@@ -445,6 +522,10 @@ async fn person_change_refuses_fronting_but_does_not_block_an_unfronted_read() {
             assert_eq!(reply["reason"], "window_changed");
         } else {
             assert_eq!(reply["outcome"], "completed");
+            assert_eq!(
+                reply["image_unavailable"]["detail"],
+                json!({"stage":"covered_before_capture"})
+            );
             assert_eq!(
                 reply["image_unavailable"]["reason"],
                 "window_covered_may_be_stale"

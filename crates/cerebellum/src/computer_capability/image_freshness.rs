@@ -29,6 +29,13 @@ pub fn image_freshness_decision(
     }
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub enum FrontedPreparationError {
+    Unavailable(ImageUnavailable),
+    Visibility(cerebellum_macos::FrontedVisibilityPrepareError),
+}
+
 /// Read facts before capture and again for the exact window whose pixels were taken.
 /// Tests supply facts without depending on the desktop running the suite.
 /// The boolean certifies measured repainting while covered, not an engine guess.
@@ -55,7 +62,7 @@ pub trait ImageFreshnessSource: Send + Sync {
         &self,
         _target: &ProcessGrant,
         _window_id: &str,
-    ) -> Result<Option<cerebellum_macos::PreparedFrontedVisibility>, ImageUnavailable> {
+    ) -> Result<Option<cerebellum_macos::PreparedFrontedVisibility>, FrontedPreparationError> {
         Ok(None)
     }
 }
@@ -104,17 +111,16 @@ impl ImageFreshnessSource for NativeImageFreshnessSource {
         &self,
         target: &ProcessGrant,
         window_id: &str,
-    ) -> Result<Option<cerebellum_macos::PreparedFrontedVisibility>, ImageUnavailable> {
-        let generation = target
-            .process_generation_evidence
-            .parse()
-            .map_err(|_| ImageUnavailable::FrontingUnavailable)?;
-        let window_id = window_id
-            .parse()
-            .map_err(|_| ImageUnavailable::NoWindowCaptured)?;
+    ) -> Result<Option<cerebellum_macos::PreparedFrontedVisibility>, FrontedPreparationError> {
+        let generation = target.process_generation_evidence.parse().map_err(|_| {
+            FrontedPreparationError::Unavailable(ImageUnavailable::FrontingUnavailable)
+        })?;
+        let window_id = window_id.parse().map_err(|_| {
+            FrontedPreparationError::Unavailable(ImageUnavailable::NoWindowCaptured)
+        })?;
         cerebellum_macos::PreparedFrontedVisibility::prepare(target.pid, generation, window_id)
             .map(Some)
-            .map_err(|_| ImageUnavailable::WindowCoveredMayBeStale)
+            .map_err(FrontedPreparationError::Visibility)
     }
 }
 

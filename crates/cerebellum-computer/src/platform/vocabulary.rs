@@ -25,9 +25,9 @@ use std::sync::OnceLock;
 // the format to /v2. A reviewer read the mismatch as a mistake before finding
 // both fields in the artifact, so it is stated here rather than re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v2";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v36";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v37";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v36.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v37.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "b8fcf12d5524665f806bbb5e7da2cedd38f3ef2a61afcdf1a35c34c79ffbd1d8";
+    "b667411568557ea5b58d2ef146d53734a91b6fb5495a6f4344ec4d511e2cfac1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -1520,6 +1520,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn stale_image_withholding_detail_is_optional_and_closed() {
+        use serde_json::json;
+
+        let id = "computer.read_state";
+        let mut reply = json!({"outcome": "completed", "image_unavailable": {
+            "reason": "window_covered_may_be_stale"
+        }});
+        assert!(withheld(id, &reply).is_empty());
+        for detail in [
+            json!({"stage": "covered_before_capture"}),
+            json!({"stage": "covered_after_capture"}),
+            json!({"stage": "dock_witness"}),
+            json!({"stage": "prepare_failed", "prepare_error": "window_not_on_screen"}),
+        ] {
+            reply["image_unavailable"]["detail"] = detail;
+            assert!(withheld(id, &reply).is_empty(), "{reply}");
+        }
+        for detail in [
+            json!({"stage": "prepare_failed"}),
+            json!({"stage": "covered_after_capture", "prepare_error": "dock_display_bounds"}),
+            json!({"stage": "prepare_failed", "prepare_error": "unclassified"}),
+            json!({"stage": "unknown"}),
+            json!({"stage": "dock_witness", "window_id": 17}),
+        ] {
+            reply["image_unavailable"]["detail"] = detail;
+            assert!(!withheld(id, &reply).is_empty(), "{reply}");
+        }
+        reply["image_unavailable"] = json!({
+            "reason": "image_needs_takeover",
+            "detail": {"grant": "takeover", "grant_label": "take control", "scope": {"takeover": "machine"}}
+        });
+        assert!(withheld(id, &reply).is_empty(), "{reply}");
     }
 
     #[test]

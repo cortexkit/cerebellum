@@ -30,8 +30,10 @@ pub mod dock_overlay_probe {
 #[path = "dock_overlay.rs"]
 mod dock_overlay;
 #[path = "fronted_visibility.rs"]
-mod fronted_visibility;
-pub use fronted_visibility::{DockExemption, FrontedWindowProof, PreparedFrontedVisibility};
+pub(crate) mod fronted_visibility;
+pub use fronted_visibility::{
+    DockExemption, FrontedVisibilityPrepareError, FrontedWindowProof, PreparedFrontedVisibility,
+};
 
 /// The prefix of `struct proc_bsdinfo` from `<sys/proc_info.h>`, up to and
 /// including the two fields this reads.

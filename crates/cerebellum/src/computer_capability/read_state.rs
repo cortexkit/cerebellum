@@ -564,8 +564,11 @@ where
                     "height_px": image.height_px,
                 });
             }
-            Ok((None, Some(reason), fronting)) => {
+            Ok((None, Some((reason, withholding)), fronting)) => {
                 reply["image_unavailable"] = json!({"reason": reason.as_str()});
+                if let Some(withholding) = withholding {
+                    reply["image_unavailable"]["detail"] = withholding.detail();
+                }
                 if let Some(fronting) = fronting {
                     reply["image_fronting"] = json!(fronting);
                 }
@@ -620,7 +623,10 @@ where
     ) -> Result<
         (
             Option<ReleasedImage>,
-            Option<ImageUnavailable>,
+            Option<(
+                ImageUnavailable,
+                Option<image_withholding::ImageWithholding>,
+            )>,
             Option<ImageFronting>,
         ),
         ImageUnavailable,
@@ -643,22 +649,28 @@ where
                 grant.pid,
                 manual_accessibility,
             );
-            let evidence =
-                std::cell::RefCell::new(cerebellum_computer::app_state::ImageReadEvidence {
-                    decision: image_plan
-                        .requested
-                        .then_some(cerebellum_computer::app_state::image::ImageDecision::Unknown),
-                    fronting: None,
-                    fronting_record: image_plan.fronting.and_then(fronting::Fronting::row_record),
-                    dock_overlay_exemption: None,
-                });
+            let trace = read_image::ImageReadTrace {
+                evidence: std::cell::RefCell::new(
+                    cerebellum_computer::app_state::ImageReadEvidence {
+                        decision: image_plan.requested.then_some(
+                            cerebellum_computer::app_state::image::ImageDecision::Unknown,
+                        ),
+                        fronting: None,
+                        fronting_record: image_plan
+                            .fronting
+                            .and_then(fronting::Fronting::row_record),
+                        dock_overlay_exemption: None,
+                    },
+                ),
+                withholding: std::cell::Cell::new(None),
+            };
             let mut custody = AuditImageCustody {
                 audit: &audit,
                 identity,
                 now_ms,
                 summary,
                 finalized: false,
-                image_evidence: &evidence,
+                image_evidence: &trace.evidence,
             };
             let Some(backend) = backend else {
                 let reservation = custody
@@ -684,7 +696,7 @@ where
                     freshness.as_ref(),
                     &grant,
                     &image_plan,
-                    &evidence,
+                    &trace,
                     &mut || {
                         if let Some(posting) = posting.take() {
                             own_input.end_posting(posting);
@@ -699,10 +711,13 @@ where
             if !custody.finalized {
                 return Err(ImageUnavailable::AuditUnavailable);
             }
-            let fronting = evidence.into_inner().fronting;
+            let fronting = trace.evidence.into_inner().fronting;
             Ok(match image {
                 Ok(image) => (Some(image), None, fronting),
-                Err(reason) => (None, Some(reason), fronting),
+                Err(reason) => {
+                    let withholding = image_withholding::record(reason, trace.withholding.get());
+                    (None, Some((reason, withholding)), fronting)
+                }
             })
         })
         .await

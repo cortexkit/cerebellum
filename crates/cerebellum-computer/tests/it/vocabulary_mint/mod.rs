@@ -2779,3 +2779,46 @@ pub fn v36_from_v35(previous: &Value, revision: &str) -> Value {
     }
     next
 }
+
+/// Distinguish visibility preparation from the checks before and after capture.
+pub fn v37_from_v36(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    let read_state = next["rows"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["capability_id"] == "computer.read_state")
+        .unwrap();
+    let detail = read_state["result_schema"]
+        .pointer_mut("/properties/image_unavailable/properties/detail")
+        .unwrap();
+    let takeover = detail.clone();
+    let visibility = json!({"type":"object", "additionalProperties":false, "required":["stage"],
+        "properties":{"stage":{"type":"string", "enum":[
+            "covered_before_capture", "covered_after_capture", "dock_witness"
+        ]}}
+    });
+    let prepare = json!({
+        "type":"object", "additionalProperties":false, "required":["stage", "prepare_error"],
+        "properties":{
+            "stage":{"type":"string", "enum":["prepare_failed"]},
+            "prepare_error":{"type":"string", "enum":[
+                "window_not_on_screen", "dock_workspace_lookup", "dock_multiple_processes",
+                "dock_process_generation", "dock_display_bounds", "dock_window_list",
+                "dock_raster", "dock_worker_start", "dock_worker_wait", "dock_capture_lookup",
+                "dock_capture_owner", "dock_capture_identity_or_frame"
+            ]}
+        }
+    });
+    // Validate the shared object before checking the mutually exclusive forms.
+    detail["required"] = json!([]);
+    detail["properties"]["stage"] = visibility["properties"]["stage"].clone();
+    detail["properties"]["stage"]["enum"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("prepare_failed"));
+    detail["properties"]["prepare_error"] = prepare["properties"]["prepare_error"].clone();
+    detail["anyOf"] = json!([takeover, visibility, prepare]);
+    next
+}

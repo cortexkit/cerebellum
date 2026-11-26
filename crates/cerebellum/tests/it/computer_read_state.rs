@@ -1114,7 +1114,7 @@ async fn covered_unmeasured_app_image_refusal_passes_withholding_and_keeps_tree(
         assert_eq!(reply["outcome"], "completed", "{reply}");
         assert_eq!(
             reply["image_unavailable"],
-            json!({"reason": "window_covered_may_be_stale"})
+            json!({"reason": "window_covered_may_be_stale", "detail": {"stage":"covered_before_capture"}})
         );
         assert!(reply.get("image").is_none());
         assert!(reply["state_text"].as_str().unwrap().contains("GoToWindow"));

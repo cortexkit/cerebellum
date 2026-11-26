@@ -343,6 +343,12 @@ async fn health_check_returns_insulated_report() {
                 assert!(obj.contains_key(key), "metrics include {key}");
             }
             assert_eq!(obj["turnEndedLastAtMs"], serde_json::Value::Null);
+            assert_eq!(
+                obj["windowImageWithholding"],
+                serde_json::json!({
+                    "byStage": {}, "byPrepareError": {}
+                })
+            );
             // The background-mode preview's work counts, beside the other
             // agent-cursor gauges, which only macOS reports.
             #[cfg(target_os = "macos")]

@@ -15,13 +15,15 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v36.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v37.json");
 const V33_ARTIFACT_SHA256: &str =
     "bec5b6cad004606960c684bafea3c7b219fc780cec9630158c29ff935833c849";
 const V34_ARTIFACT_SHA256: &str =
     "7c36bfd082d83e1dd24db1fcf9110eb58c1ad2059aeea7b9b4068f7c9c0ab4bd";
 const V35_ARTIFACT_SHA256: &str =
     "53779c253a1ceae727b8a19b1fe3bded97b88523ba33bfdb7630fb778877cfeb";
+const V36_ARTIFACT_SHA256: &str =
+    "b8fcf12d5524665f806bbb5e7da2cedd38f3ef2a61afcdf1a35c34c79ffbd1d8";
 /// The digests of retained historical artifacts: operator-app refusal, image
 /// handles and terminal-keystroke result envelopes, respectively.
 const V30_ARTIFACT_SHA256: &str =
@@ -149,6 +151,8 @@ fn every_repository_vocabulary_mirror_names_the_current_revision() {
                 V34_ARTIFACT_SHA256
             } else if path.ends_with("v35.json") {
                 V35_ARTIFACT_SHA256
+            } else if path.ends_with("v36.json") {
+                V36_ARTIFACT_SHA256
             } else {
                 panic!("{path} is a vocabulary artifact with no pinned digest")
             };
@@ -830,7 +834,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v34_from_v33(&generated, historical_revision(34).as_str().unwrap());
     let generated =
         vocabulary_mint::v35_from_v34(&generated, historical_revision(35).as_str().unwrap());
-    let generated = vocabulary_mint::v36_from_v35(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v36_from_v35(&generated, historical_revision(36).as_str().unwrap());
+    let generated = vocabulary_mint::v37_from_v36(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -2083,9 +2089,13 @@ fn v33_only_adds_the_optional_development_diagnostic_to_results() {
 fn mint_current_vocabulary_artifact() {
     let resources = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
     let revision = COMPUTER_ACTION_VOCABULARY_REVISION;
-    let generated = vocabulary_mint::v36_from_v35(&historical_v35(), revision);
+    let generated = vocabulary_mint::v37_from_v36(&historical_v36(), revision);
     let bytes = canonical_json_bytes(&generated).unwrap();
     std::fs::write(resources.join(format!("{revision}.json")), &bytes).unwrap();
+    let source_lock = resources.join("../../cerebellum/resources/implementation-source-lock.json");
+    let mut lock: Value = serde_json::from_slice(&std::fs::read(&source_lock).unwrap()).unwrap();
+    lock["computer_action_vocabulary_sha256"] = json!(hex_digest(&bytes));
+    std::fs::write(source_lock, canonical_json_bytes(&lock).unwrap()).unwrap();
     println!(
         "minted {} bytes; sha256 {}",
         bytes.len(),
@@ -2309,6 +2319,15 @@ fn v35_only_adds_running_list_failure_and_semantic_select_all_results() {
         historical_v35(),
         vocabulary_mint::v35_from_v34(&recreated_v34(), historical_revision(35).as_str().unwrap())
     );
+}
+
+fn historical_v36() -> Value {
+    let resources = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
+    let revision = historical_revision(36);
+    let bytes = std::fs::read(resources.join(format!("{}.json", revision.as_str().unwrap())))
+        .expect("read the historical v36 artifact");
+    assert_eq!(hex_digest(&bytes), V36_ARTIFACT_SHA256);
+    serde_json::from_slice(&bytes).expect("v36 is valid JSON")
 }
 
 fn historical_v35() -> Value {
