@@ -4,9 +4,11 @@
 # private file force-added past the ignore rule, and a directory git can't read.
 set -euo pipefail
 
-check="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/check-cortexkit-layout.sh"
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+check="$here/check-cortexkit-layout.sh"
 scratch="$(mktemp -d)"
-trap 'rm -rf "$scratch"' EXIT
+source "$here/lib/fail-closed-exit.sh"
+trap 'fail_closed_exit rm -rf "$scratch"' EXIT
 
 new_repo() {
   local dir="$scratch/$1"
@@ -54,3 +56,4 @@ expect 1 "a force-added private file fails" "$check" "$forced"
 
 mkdir "$scratch/not-a-repo"
 expect 2 "an unreadable repository fails closed" "$check" "$scratch/not-a-repo"
+finished=1
