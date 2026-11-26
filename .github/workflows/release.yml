@@ -149,7 +149,7 @@ jobs:
           done
           extension_stage="$RUNNER_TEMP/ck-cerebellum-extension"
           CEREBELLUM_EXTENSION_DIR="$extension_stage" bash scripts/install-extension.sh
-          (cd "$extension_stage" && zip -q -X -r "$GITHUB_WORKSPACE/assets/ck-cerebellum-extension.zip" .)
+          (cd "$extension_stage" && zip -q -X -r "$GITHUB_WORKSPACE/assets/ck-cerebellum-extension-$PLATFORM.zip" .)
 
       - name: Remove temporary macOS signing credentials
         if: ${{ always() && runner.os == 'macOS' }}
@@ -174,7 +174,7 @@ jobs:
           for archive in *.zip; do
             wrapper=$(mktemp -d "$RUNNER_TEMP/cerebellum-release.XXXXXX")
             unzip -q "$archive" -d "$wrapper"
-            if [[ "$archive" == ck-cerebellum-extension.zip ]]; then
+            if [[ "$archive" == "ck-cerebellum-extension-$PLATFORM.zip" ]]; then
               diff -r "$RUNNER_TEMP/ck-cerebellum-extension" "$wrapper"
               shasum -a 256 "$archive" > "$archive.sha256"
               rm -r "$wrapper"
