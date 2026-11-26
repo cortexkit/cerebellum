@@ -75,13 +75,21 @@ pub(super) async fn run(
                 .insert(tokio::task::spawn_blocking(move || {
                     let mut config = config;
                     let mut live = LiveSettings::default();
-                    if let Some(mut startup) = startup {
-                        startup.validate_browser();
+                    #[cfg(target_os = "linux")]
+                    let mut applied_browser = None;
+                    if let Some(startup) = startup {
+                        #[cfg(target_os = "linux")]
+                        let startup = {
+                            let mut startup = startup;
+                            applied_browser = Some(startup.validate_browser());
+                            startup
+                        };
                         let StartupSettings {
                             health,
                             agent_cursor,
                             browser,
                             live: effective,
+                            ..
                         } = startup;
                         config.health = health;
                         config.agent_cursor = agent_cursor;
@@ -94,6 +102,10 @@ pub(super) async fn run(
                     if real_module {
                         prepared.planes.runtime_browser = Some(config.browser.clone());
                         apply_live(&prepared.planes, live);
+                        #[cfg(target_os = "linux")]
+                        if let Some(applied) = applied_browser {
+                            applied.record();
+                        }
                     }
                     (config, prepared, report)
                 }))
