@@ -200,8 +200,11 @@ impl FrontedVisibilityPrepareError {
     }
 }
 
-/// The local Dock witness probe keeps the error message. Production exposes
-/// only the closed error kind.
+/// Why preparing the Dock check failed. That check proves the macOS 27 Dock's
+/// invisible full-screen window is fully transparent before a covered window's
+/// picture is trusted. The desk probe (`dock_overlay_probe`) prints `message`
+/// to the person running it; production replies and health counters carry only
+/// the closed `kind`, so no OS error text leaves the module.
 #[derive(Debug)]
 pub(crate) struct DockPrepareFailure {
     kind: FrontedVisibilityPrepareError,
