@@ -61,4 +61,4 @@ Cerebellum export `05142d0b1d2ee1593dd114c170734f0c0ac14d7a`. Subsequent fixture
 and retained-operation routing changes preserve those JSON bytes.
 
 The two `user-browser-ordinary` exports are new and need receiver-side validation
-in the phone app; the earlier receiver acceptance does not cover these files.
+in CKIOS; the earlier receiver acceptance above does not cover these new files.

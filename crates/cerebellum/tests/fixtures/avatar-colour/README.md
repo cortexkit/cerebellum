@@ -1,12 +1,13 @@
 # Avatar colour reference vectors
 
 `vectors.json` holds three creature genomes (`creature.wild`, version 1) and
-the agent colour the phone app computes for each. The test
+the agent colour the Alfonso phone app computes for each. The test
 `avatar_colour_matches_the_phone_for_its_reference_creatures` (in
 `src/computer_capability/cursor/avatar.rs`) checks our reading against them.
 
-The phone app generated these reference values using `CreatureTint` at
-commit `1f8f9b1`. Each creature was drawn in its neutral mood with its ground
+Where it came from: CKIOS produced the file from the Alfonso app's
+`CreatureTint` (`dominantHue(of:)` and `init(creature:)`), at alfonso-ios
+commit 1f8f9b1. Each creature was drawn in its neutral mood, with its ground
 shadow.
 
 Fields:

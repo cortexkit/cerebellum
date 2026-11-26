@@ -2,7 +2,7 @@
 
 These are raw `elicitation/create` params bodies decoded by
 `ConsentRequest::decode` / `ConsentRequest::validate` in
-the supervising module's consent decoder, not JSON-RPC envelopes.
+`crates/prefrontal-core-store/src/elicitation.rs`, not JSON-RPC envelopes.
 Requester ownership comes from the transport, not these bodies.
 
 Core treats `scope` as an opaque, provider-defined object and requires a present

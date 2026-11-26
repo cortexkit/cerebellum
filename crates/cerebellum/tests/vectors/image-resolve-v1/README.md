@@ -1,6 +1,6 @@
 # image.resolve v1 vectors
 
-Byte-for-byte `image.resolve` examples for the model-call broker, captured at cerebellum's
+Byte-for-byte `image.resolve` examples for BROCA, captured at cerebellum's
 production `handle_frame_for_test` entry point (which delegates to
 `handle_frame`). They are not replies assembled from an expected JSON object.
 The success case resolves a handle minted the way a capture reply mints it,

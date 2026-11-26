@@ -80,7 +80,7 @@ Aggregator cases (cingulate, called by the phone through Callosum unless noted):
 | `revoke-refused-not-operator` | An agent's carrier route: refused by name. |
 | `revoke-refused-no-operator-surface` | `reserved:callosum` without the operator-surface stamp: refused by name. |
 
-`plexus` and `aft` appear only as illustrative module ids for the unreachable and
+Plexus and AFT appear only as illustrative module ids for the unreachable and
 unsupported statuses; neither is committed to serve `permissions/v1` here.
 Revoke carries no authority field and there is no code to mint: authority is the
 route stamp, and ambiguous drops are resolved through Callosum's effects-v1

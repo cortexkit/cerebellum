@@ -1,12 +1,12 @@
-# elicitation-request-v1 (supervisor request vectors)
+# elicitation-request-v1 (copied from Prefrontal)
 
-`elicitation-request-v1/` is a byte-for-byte copy of the supervising module's consent
-request vectors, `test-vectors/elicitation-request-v1/` at upstream commit
+`elicitation-request-v1/` is a byte-for-byte copy of Prefrontal's consent
+request vectors, `test-vectors/elicitation-request-v1/` at prefrontal commit
 d15391996594ce24ba53aa42fd1c31bb85922745. Its own `README.md` describes them.
 Do not edit, reformat or add files inside that directory: it must stay
-identical to what the supervising module published.
+identical to what Prefrontal published.
 
-The supervising module decodes the `params` of every consent `elicitation/create`
+Prefrontal core decodes the `params` of every consent `elicitation/create`
 cerebellum sends with `ConsentRequest::decode`. A body core refuses is never
 shown to the person: core answers `not_put_to_anyone`. These vectors pin what
 core accepts and refuses. Cerebellum's tests use them in two ways, both in
