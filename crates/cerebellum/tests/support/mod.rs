@@ -30,8 +30,18 @@ pub fn daemon_binary(label: &str, path: impl AsRef<std::path::Path>) -> std::pat
     use std::os::unix::fs::PermissionsExt;
 
     let path = path.as_ref();
-    let metadata = std::fs::metadata(path).expect("stat the test executable");
-    let bytes = std::fs::read(path).expect("read the test executable");
+    let metadata = std::fs::metadata(path).unwrap_or_else(|error| {
+        panic!(
+            "stat test executable {label} at {}: {error}",
+            path.display()
+        )
+    });
+    let bytes = std::fs::read(path).unwrap_or_else(|error| {
+        panic!(
+            "read test executable {label} at {}: {error}",
+            path.display()
+        )
+    });
     content_named_fixture::content_named_fixture(
         label,
         label,
