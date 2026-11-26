@@ -147,6 +147,9 @@ jobs:
           for binary in ck-cerebellum ck-cerebellum-native-host; do
             bash scripts/release/macos-sign-notarize.sh "target/release/$binary" "assets/$binary-$PLATFORM.zip"
           done
+          extension_stage="$RUNNER_TEMP/ck-cerebellum-extension"
+          CEREBELLUM_EXTENSION_DIR="$extension_stage" bash scripts/install-extension.sh
+          (cd "$extension_stage" && zip -q -X -r "$GITHUB_WORKSPACE/assets/ck-cerebellum-extension.zip" .)
 
       - name: Remove temporary macOS signing credentials
         if: ${{ always() && runner.os == 'macOS' }}
@@ -164,14 +167,20 @@ jobs:
           mkdir assets
           zip -q -j "assets/ck-cerebellum-$PLATFORM.zip" target/release/ck-cerebellum
 
-      - name: Verify archived executables and write checksums
+      - name: Verify archived files and write checksums
         shell: bash
         run: |
           cd assets
           for archive in *.zip; do
-            binary=${archive%"-$PLATFORM.zip"}
             wrapper=$(mktemp -d "$RUNNER_TEMP/cerebellum-release.XXXXXX")
             unzip -q "$archive" -d "$wrapper"
+            if [[ "$archive" == ck-cerebellum-extension.zip ]]; then
+              diff -r "$RUNNER_TEMP/ck-cerebellum-extension" "$wrapper"
+              shasum -a 256 "$archive" > "$archive.sha256"
+              rm -r "$wrapper"
+              continue
+            fi
+            binary=${archive%"-$PLATFORM.zip"}
             case "$binary" in
               ck-cerebellum) expected="ck-cerebellum ($RELEASE_COMMIT) tree=clean" ;;
               ck-cerebellum-native-host) expected="ck-cerebellum-native-host $HOST_VERSION" ;;

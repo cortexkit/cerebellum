@@ -9,6 +9,7 @@ pub mod browsers;
 mod framing;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod registration;
 #[cfg(all(unix, any(target_os = "macos", test)))]
 mod relay;
 

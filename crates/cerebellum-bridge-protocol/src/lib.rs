@@ -29,6 +29,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const CEREBELLUM_REQUIREMENT: &str = "identifier \"ck-cerebellum\" and anchor apple generic and certificate leaf[subject.OU] = \"5R5846NBPW\"";
 pub const HOST_REQUIREMENT: &str = "identifier \"ck-cerebellum-native-host\" and anchor apple generic and certificate leaf[subject.OU] = \"5R5846NBPW\"";
+pub const NATIVE_HOST_NAME: &str = "com.cortexkit.cerebellum";
 pub const EXTENSION_ID: &str = "bfmlflnlaflnibiellpjjifdbcifciei";
 pub const EXTENSION_ORIGIN: &str = "chrome-extension://bfmlflnlaflnibiellpjjifdbcifciei/";
 pub const EXTENSION_PUBLIC_KEY_B64: &str = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyHcwdQ6UQq9vCfCvfUtsoBzv2Nc6Tc0KX7tLbunrVjVO14a70w3gn2gn4ovsxPCO2QijT+7zRr+M/2EAPytHJOZPrqYlRsLJjKP4LqE9NXRI/nVnrZaDmDnqn29JBjnXRGNQ8fl0IXb3QKqOwrUh92w0TK8ZCMaOOHNv6o7ctl3HNor8iKnFR/v+YRTsaCXwzeYkcSN/LL4o4LJVFwAdM5iv2tfJDq3n1DAlHDNZVzsFDPFmLpiOfMphNIQpBopX8ZEH6RjQ4llYakTiYX/UlGX2eZe20e6lCbCt12s7arMA22OMYViKnrVTkMG27vAJRuRydze5SAUydLg3ngycqwIDAQAB";
