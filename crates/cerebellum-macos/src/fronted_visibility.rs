@@ -61,13 +61,17 @@ impl FrontedWindow {
         mut snapshot: impl FnMut(VisibilityScope) -> Option<Snapshot>,
         mut current_dock: impl FnMut() -> Option<DockWindow>,
         sample: impl FnOnce() -> Option<(usize, usize)>,
-    ) -> (VisibilityDecision, Option<DockExemption>) {
+    ) -> (VisibilityDecision, Option<DockExemption>, bool) {
         let Some((windows, displays)) = snapshot(VisibilityScope::ThroughTarget) else {
-            return (UNKNOWN, None);
+            return (UNKNOWN, None, false);
         };
-        let (verdict, exemption) = self.before(&windows, &displays, current_dock(), sample);
+        let mut attempted_witness = false;
+        let (verdict, exemption) = self.before(&windows, &displays, current_dock(), || {
+            attempted_witness = true;
+            sample()
+        });
         if exemption.is_none() {
-            return (verdict, None);
+            return (verdict, None, attempted_witness);
         }
         // Focus or cover can change while ScreenCaptureKit samples the Dock
         // window's alpha. Recheck before acquiring the target's pixels.
@@ -75,7 +79,7 @@ impl FrontedWindow {
             .map_or(UNKNOWN, |(windows, displays)| {
                 self.after(&windows, &displays, current_dock(), exemption)
             });
-        (verdict, exemption)
+        (verdict, exemption, false)
     }
 
     fn observe_after(
@@ -160,6 +164,65 @@ impl FrontedWindow {
     }
 }
 
+/// A closed, text-free reason visibility preparation stopped before fronting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrontedVisibilityPrepareError {
+    WindowNotOnScreen,
+    DockWorkspaceLookup,
+    DockMultipleProcesses,
+    DockProcessGeneration,
+    DockDisplayBounds,
+    DockWindowList,
+    DockRaster,
+    DockWorkerStart,
+    DockWorkerWait,
+    DockCaptureLookup,
+    DockCaptureOwner,
+    DockCaptureIdentityOrFrame,
+}
+
+impl FrontedVisibilityPrepareError {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WindowNotOnScreen => "window_not_on_screen",
+            Self::DockWorkspaceLookup => "dock_workspace_lookup",
+            Self::DockMultipleProcesses => "dock_multiple_processes",
+            Self::DockProcessGeneration => "dock_process_generation",
+            Self::DockDisplayBounds => "dock_display_bounds",
+            Self::DockWindowList => "dock_window_list",
+            Self::DockRaster => "dock_raster",
+            Self::DockWorkerStart => "dock_worker_start",
+            Self::DockWorkerWait => "dock_worker_wait",
+            Self::DockCaptureLookup => "dock_capture_lookup",
+            Self::DockCaptureOwner => "dock_capture_owner",
+            Self::DockCaptureIdentityOrFrame => "dock_capture_identity_or_frame",
+        }
+    }
+}
+
+/// The local Dock witness probe keeps the error message. Production exposes
+/// only the closed error kind.
+#[derive(Debug)]
+pub(crate) struct DockPrepareFailure {
+    kind: FrontedVisibilityPrepareError,
+    message: String,
+}
+
+impl DockPrepareFailure {
+    pub(crate) fn new(kind: FrontedVisibilityPrepareError, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<DockPrepareFailure> for String {
+    fn from(error: DockPrepareFailure) -> Self {
+        error.message
+    }
+}
+
 /// The exact target and optional single-window Dock witness prepared before any
 /// front request. Neither preparation nor a failed visibility check reads pixels.
 pub struct PreparedFrontedVisibility {
@@ -170,10 +233,14 @@ pub struct PreparedFrontedVisibility {
 }
 
 impl PreparedFrontedVisibility {
-    pub fn prepare(pid: u32, generation: u64, window_id: u32) -> Result<Self, String> {
+    pub fn prepare(
+        pid: u32,
+        generation: u64,
+        window_id: u32,
+    ) -> Result<Self, FrontedVisibilityPrepareError> {
         let frame = crate::window_image::visible_window_frame(pid, window_id)
-            .ok_or("prepared window is not on screen")?;
-        let dock = DockOverlayWitness::prepare_for_rect(frame, true)?;
+            .ok_or(FrontedVisibilityPrepareError::WindowNotOnScreen)?;
+        let dock = DockOverlayWitness::prepare_for_rect(frame, true).map_err(|error| error.kind)?;
         Ok(Self {
             target: FrontedWindow {
                 pid,
@@ -215,8 +282,8 @@ impl PreparedFrontedVisibility {
         &mut self,
         until: Option<Instant>,
         fence: &WitnessFence,
-    ) -> (VisibilityDecision, Option<FrontedWindowProof>) {
-        let (verdict, exemption) = self.target.observe_before(
+    ) -> (VisibilityDecision, Option<FrontedWindowProof>, bool) {
+        let (verdict, exemption, dock_witness_failed) = self.target.observe_before(
             |scope| self.snapshot(scope),
             || self.current_dock(),
             || {
@@ -237,7 +304,7 @@ impl PreparedFrontedVisibility {
             id: self.target.id,
             bounds: self.target.bounds,
         });
-        (verdict, proof)
+        (verdict, proof, dock_witness_failed)
     }
 
     pub fn check_after(&self) -> VisibilityDecision {
@@ -487,6 +554,27 @@ mod tests {
     }
 
     #[test]
+    fn failed_dock_witness_keeps_the_same_covered_verdict() {
+        let scene = RecordedWindowList::textedit_with_dock_overlay();
+        let snapshot =
+            |scope| Some(RecordedWindowList::textedit_with_dock_overlay().snapshot(scope));
+        for failed_sample in [None, Some((0, 0)), Some((PIXELS, 1))] {
+            assert_eq!(
+                scene
+                    .target
+                    .observe_before(snapshot, || scene.prepared_dock(), || failed_sample),
+                (COVERED, None, true)
+            );
+        }
+        assert_eq!(
+            scene
+                .target
+                .observe_before(snapshot, || None, || panic!("no matching Dock")),
+            (COVERED, None, false)
+        );
+    }
+
+    #[test]
     fn picture_only_reads_the_full_list_after_capture() {
         use VisibilityScope::{AllOnScreen, ThroughTarget};
 
@@ -501,12 +589,13 @@ mod tests {
             }
             Some(live.snapshot(scope))
         };
-        let (before, evidence) =
+        let (before, evidence, dock_witness_failed) =
             scene
                 .target
                 .observe_before(snapshot, || scene.prepared_dock(), || Some((PIXELS, 0)));
         assert_eq!(before, VISIBLE);
         assert!(evidence.is_some());
+        assert!(!dock_witness_failed);
         pixels_arrived.set(true);
         assert_eq!(
             scene

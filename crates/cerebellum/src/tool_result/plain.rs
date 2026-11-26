@@ -734,6 +734,14 @@ pub(super) fn facts(
     if let Some(unavailable) = object.get("image_unavailable") {
         if let Some(reason) = text_of(unavailable, "reason") {
             lines.push(image_unavailable_line(reason));
+            if let Some(detail) = unavailable.get("detail") {
+                if let Some(stage) = text_of(detail, "stage") {
+                    lines.push(match text_of(detail, "prepare_error") {
+                        Some(kind) => format!("Image withholding stage: {stage} ({kind})."),
+                        None => format!("Image withholding stage: {stage}."),
+                    });
+                }
+            }
         }
     }
     let read_page = object.get("read_page").and_then(Value::as_object);
@@ -1028,6 +1036,20 @@ mod tests {
             !lines.iter().any(|line| line.contains("detail.required")),
             "{lines:#?}"
         );
+    }
+
+    #[test]
+    fn stale_image_explanation_preserves_reason_and_names_the_withholding_stage() {
+        let lines = fact_lines(json!({
+            "outcome": "completed",
+            "image_unavailable": {
+                "reason": "window_covered_may_be_stale",
+                "detail": {"stage": "prepare_failed", "prepare_error": "dock_capture_lookup"}
+            }
+        }));
+        assert!(lines.contains(&"No image: window covered may be stale.".into()));
+        assert!(lines
+            .contains(&"Image withholding stage: prepare_failed (dock_capture_lookup).".into()));
     }
 
     #[test]

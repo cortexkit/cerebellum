@@ -13,6 +13,7 @@ use objc2_core_graphics::{
 use objc2_foundation::NSError;
 use objc2_screen_capture_kit::{SCContentFilter, SCScreenshotManager, SCStreamConfiguration};
 
+use super::fronted_visibility::{DockPrepareFailure, FrontedVisibilityPrepareError as Kind};
 use super::{find_window, Delivery};
 
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -65,24 +66,33 @@ impl DockOverlayWitness {
     pub(super) fn prepare_for_rect(
         target_rect: [f64; 4],
         cover_edges: bool,
-    ) -> Result<Option<Self>, String> {
-        let mut docks = crate::workspace_running_applications()?
+    ) -> Result<Option<Self>, DockPrepareFailure> {
+        let mut docks = crate::workspace_running_applications()
+            .map_err(|error| DockPrepareFailure::new(Kind::DockWorkspaceLookup, error))?
             .into_iter()
             .filter(|app| is_dock_bundle(&app.bundle_identifier));
         let Some(dock_pid) = docks.next().map(|dock| dock.pid) else {
             return Ok(None);
         };
         if docks.next().is_some() {
-            return Err("multiple processes claim com.apple.dock".into());
+            return Err(DockPrepareFailure::new(
+                Kind::DockMultipleProcesses,
+                "multiple processes claim com.apple.dock",
+            ));
         }
-        let dock_generation = crate::process_start_time_micros(dock_pid)
-            .ok_or("cannot identify Dock process generation")?;
+        let dock_generation = crate::process_start_time_micros(dock_pid).ok_or_else(|| {
+            DockPrepareFailure::new(
+                Kind::DockProcessGeneration,
+                "cannot identify Dock process generation",
+            )
+        })?;
         let Some((window_id, window_rect)) =
             crate::window_image::dock_overlay_window(dock_pid, target_rect)?
         else {
             return Ok(None);
         };
-        let raster = Raster::new(window_rect, target_rect, cover_edges)?;
+        let raster = Raster::new(window_rect, target_rect, cover_edges)
+            .map_err(|error| DockPrepareFailure::new(Kind::DockRaster, error))?;
         let (send, requests) = mpsc::channel::<SampleRequest>();
         let (ready, setup) = mpsc::channel();
         // Keep the Objective-C capture objects on one worker, prepared here, so
@@ -114,10 +124,17 @@ impl DockOverlayWitness {
                     let _ = request.reply.send(result);
                 }
             })
-            .map_err(|error| format!("cannot start Dock witness worker: {error}"))?;
+            .map_err(|error| {
+                DockPrepareFailure::new(
+                    Kind::DockWorkerStart,
+                    format!("cannot start Dock witness worker: {error}"),
+                )
+            })?;
         setup
             .recv_timeout(LOOKUP_TIMEOUT + Duration::from_secs(1))
-            .map_err(|_| "Dock witness setup did not finish")??;
+            .map_err(|_| {
+                DockPrepareFailure::new(Kind::DockWorkerWait, "Dock witness setup did not finish")
+            })??;
         Ok(Some(Self {
             send,
             dock_pid,
@@ -211,16 +228,27 @@ struct Prepared {
 }
 
 impl Prepared {
-    fn new(dock_pid: u32, id: u32, rect: [f64; 4], raster: Raster) -> Result<Self, String> {
+    fn new(
+        dock_pid: u32,
+        id: u32,
+        rect: [f64; 4],
+        raster: Raster,
+    ) -> Result<Self, DockPrepareFailure> {
         crate::establish_window_server_connection();
         let window = find_window(id, LOOKUP_TIMEOUT).map_err(|error| {
-            format!("ScreenCaptureKit did not supply Dock window {id}: {error}")
+            DockPrepareFailure::new(
+                Kind::DockCaptureLookup,
+                format!("ScreenCaptureKit did not supply Dock window {id}: {error}"),
+            )
         })?;
         // SAFETY: the retained window and owner live through these property reads.
         unsafe {
-            let owner = window
-                .owningApplication()
-                .ok_or("ScreenCaptureKit Dock window has no owner")?;
+            let owner = window.owningApplication().ok_or_else(|| {
+                DockPrepareFailure::new(
+                    Kind::DockCaptureOwner,
+                    "ScreenCaptureKit Dock window has no owner",
+                )
+            })?;
             let frame = window.frame();
             if u32::try_from(owner.processID()).ok() != Some(dock_pid)
                 || !is_dock_bundle(&owner.bundleIdentifier().to_string())
@@ -232,10 +260,10 @@ impl Prepared {
                     frame.size.height,
                 ] != rect
             {
-                return Err(
-                    "ScreenCaptureKit Dock window identity or frame disagrees with CoreGraphics"
-                        .into(),
-                );
+                return Err(DockPrepareFailure::new(
+                    Kind::DockCaptureIdentityOrFrame,
+                    "ScreenCaptureKit Dock window identity or frame disagrees with CoreGraphics",
+                ));
             }
             let filter = SCContentFilter::initWithDesktopIndependentWindow(
                 SCContentFilter::alloc(),

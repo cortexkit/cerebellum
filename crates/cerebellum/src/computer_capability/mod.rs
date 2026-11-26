@@ -108,6 +108,7 @@ mod fronting;
 #[cfg(test)]
 mod fronting_tests;
 pub mod image_freshness;
+pub(crate) mod image_withholding;
 pub(crate) mod operator_confirm;
 #[cfg(test)]
 mod settle_tests;

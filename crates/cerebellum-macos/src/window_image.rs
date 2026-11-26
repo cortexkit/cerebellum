@@ -583,9 +583,15 @@ pub(super) fn cursor_window_list() -> Option<Vec<crate::window_visibility::Windo
 pub(super) fn dock_overlay_window(
     dock_pid: u32,
     scratch_rect: [f64; 4],
-) -> Result<Option<(u32, [f64; 4])>, String> {
+) -> Result<Option<(u32, [f64; 4])>, crate::macos::fronted_visibility::DockPrepareFailure> {
+    use crate::macos::fronted_visibility::{
+        DockPrepareFailure, FrontedVisibilityPrepareError as Kind,
+    };
+
     let [x, y, w, h] = scratch_rect;
-    let displays = display_frames().ok_or("active display bounds unavailable")?;
+    let displays = display_frames().ok_or_else(|| {
+        DockPrepareFailure::new(Kind::DockDisplayBounds, "active display bounds unavailable")
+    })?;
     let mut displays = displays.into_iter().filter(|&[dx, dy, dw, dh]| {
         w > 0.0 && h > 0.0 && x >= dx && y >= dy && x + w <= dx + dw && y + h <= dy + dh
     });
@@ -596,7 +602,9 @@ pub(super) fn dock_overlay_window(
         return Ok(None);
     }
     let mut overlays = cursor_window_list()
-        .ok_or("CoreGraphics window list unavailable")?
+        .ok_or_else(|| {
+            DockPrepareFailure::new(Kind::DockWindowList, "CoreGraphics window list unavailable")
+        })?
         .into_iter()
         .filter_map(|window| {
             let bounds = window.bounds?;

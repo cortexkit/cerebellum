@@ -14,6 +14,12 @@ use cerebellum_computer::dispatch::{BracketStop, RestoreStatus};
 use cerebellum_computer::platform::{PermissionLiveness, PlatformDriver, ProcessGrant};
 
 use super::image_freshness::{image_freshness_decision, ImageFreshnessSource, WindowVisibility};
+use super::image_withholding::ImageWithholding;
+
+pub(super) struct ImageReadTrace {
+    pub evidence: std::cell::RefCell<ImageReadEvidence>,
+    pub withholding: std::cell::Cell<Option<ImageWithholding>>,
+}
 
 #[derive(Default)]
 pub(super) struct ImageReadPlan {
@@ -37,15 +43,15 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     freshness: &dyn ImageFreshnessSource,
     grant: &ProcessGrant,
     plan: &ImageReadPlan,
-    evidence: &std::cell::RefCell<ImageReadEvidence>,
+    trace: &ImageReadTrace,
     after_fronting: &mut dyn FnMut(),
 ) -> Result<WindowImageCapture, ImageUnavailable> {
     let now_ms = plan.now_ms;
     if !plan.bring_to_front {
-        return capture_visible(backend, freshness, grant, evidence, now_ms);
+        return capture_visible(backend, freshness, grant, trace, now_ms);
     }
     let (_, _, decision) = freshness.inspect_decision(grant, None);
-    evidence.borrow_mut().decision = Some(decision);
+    trace.evidence.borrow_mut().decision = Some(decision);
     let hooks = plan
         .hooks
         .as_ref()
@@ -64,11 +70,20 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
         .map_err(image_capture_error)?;
     #[cfg(target_os = "macos")]
     let mut prepared_visibility = match &prepared {
-        Some(window) => Some(
-            freshness
-                .prepare_fronted(grant, window.window_id())?
-                .ok_or(ImageUnavailable::FrontingUnavailable)?,
-        ),
+        Some(window) => {
+            use super::image_freshness::FrontedPreparationError;
+            match freshness.prepare_fronted(grant, window.window_id()) {
+                Ok(Some(visibility)) => Some(visibility),
+                Ok(None) => return Err(ImageUnavailable::FrontingUnavailable),
+                Err(FrontedPreparationError::Unavailable(reason)) => return Err(reason),
+                Err(FrontedPreparationError::Visibility(error)) => {
+                    trace
+                        .withholding
+                        .set(Some(ImageWithholding::PrepareFailed(error)));
+                    return Err(ImageUnavailable::WindowCoveredMayBeStale);
+                }
+            }
+        }
         None => None,
     };
     let mut captured = Err(ImageUnavailable::FrontingUnavailable);
@@ -128,20 +143,26 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
                 let before_picture = || {
                     #[cfg(target_os = "macos")]
                     if let Some(visibility) = &mut prepared_visibility {
-                        let (decision, proof) = visibility.check_before(cutoff, &fence);
+                        let (decision, proof, dock_witness_failed) =
+                            visibility.check_before(cutoff, &fence);
                         capture_proof = proof;
                         let (state, decision) =
                             super::image_freshness::map_native_visibility(Some(decision));
                         if let Some(exemption) = visibility.exemption() {
-                            evidence.borrow_mut().dock_overlay_exemption =
+                            trace.evidence.borrow_mut().dock_overlay_exemption =
                                 Some(cerebellum_computer::app_state::DockOverlayExemption {
                                     window_id: exemption.window_id,
                                     sample_count: exemption.sample_count,
                                 });
                         }
-                        return record_visibility(evidence, None, false, (false, state, decision));
+                        let stage = if dock_witness_failed {
+                            ImageWithholding::DockWitness
+                        } else {
+                            ImageWithholding::BeforeCapture
+                        };
+                        return record_visibility(trace, stage, false, (false, state, decision));
                     }
-                    check_visibility(freshness, grant, evidence, None, false)
+                    check_visibility(freshness, grant, trace, None, false)
                 };
                 #[cfg(all(feature = "desk-probe", target_os = "macos"))]
                 crate::desk_probe::observe_picture_overlap(before_picture, cutoff, &fence)?;
@@ -181,7 +202,12 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
                     let (state, decision) = super::image_freshness::map_native_visibility(Some(
                         visibility.check_after(),
                     ));
-                    record_visibility(evidence, window_id, false, (false, state, decision))?;
+                    record_visibility(
+                        trace,
+                        ImageWithholding::AfterCapture,
+                        false,
+                        (false, state, decision),
+                    )?;
                     true
                 } else {
                     false
@@ -189,7 +215,7 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
                 #[cfg(not(target_os = "macos"))]
                 let checked_native = false;
                 if !checked_native {
-                    check_visibility(freshness, grant, evidence, window_id, false)?;
+                    check_visibility(freshness, grant, trace, window_id, false)?;
                 }
                 // Last, after the second visibility check: pixels acquired as
                 // the fence closed are not returned.
@@ -213,7 +239,7 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
             probe.deadline = gate.deadline();
         }
     });
-    evidence.borrow_mut().fronting = Some(ImageFronting::from(&report));
+    trace.evidence.borrow_mut().fronting = Some(ImageFronting::from(&report));
     if let Some(hooks) = &plan.hooks {
         // The bracket ran the call's restore decision through the hooks, so
         // the row can say how the front ended before it is finalized.
@@ -222,7 +248,7 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
             .map_or(cerebellum_core::config::AppUse::Background, |fronting| {
                 fronting.mode
             });
-        evidence.borrow_mut().fronting_record = super::fronting::hooked_fronting(
+        trace.evidence.borrow_mut().fronting_record = super::fronting::hooked_fronting(
             mode,
             super::fronting::Purpose::NeedsFront,
             &hooks.peek(),
@@ -251,7 +277,7 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
         .encode_window_for_vision(pending)
         .map_err(image_capture_error)?;
     if report.previous_frontmost != Some(grant.pid) {
-        evidence.borrow_mut().decision = Some(ImageDecision::FrontedThenVisible);
+        trace.evidence.borrow_mut().decision = Some(ImageDecision::FrontedThenVisible);
     }
     Ok(window_image(captured, grant))
 }
@@ -260,13 +286,13 @@ fn capture_visible<B: CaptureBackend>(
     backend: B,
     freshness: &dyn ImageFreshnessSource,
     grant: &ProcessGrant,
-    evidence: &std::cell::RefCell<ImageReadEvidence>,
+    trace: &ImageReadTrace,
     now_ms: u64,
 ) -> Result<WindowImageCapture, ImageUnavailable> {
     if backend.screen_recording_liveness() != PermissionLiveness::Live {
         return Err(ImageUnavailable::ScreenRecordingNotLive);
     }
-    check_visibility(freshness, grant, evidence, None, true)?;
+    check_visibility(freshness, grant, trace, None, true)?;
     let mut controller = ScopedCaptureController::with_v1_bounds(backend, grant.clone())
         .map_err(|_| ImageUnavailable::CaptureUnavailable)?;
     let captured = controller
@@ -276,7 +302,7 @@ fn capture_visible<B: CaptureBackend>(
     check_visibility(
         freshness,
         grant,
-        evidence,
+        trace,
         Some(&captured.window.window_id),
         true,
     )?;
@@ -286,29 +312,34 @@ fn capture_visible<B: CaptureBackend>(
 fn check_visibility(
     freshness: &dyn ImageFreshnessSource,
     grant: &ProcessGrant,
-    evidence: &std::cell::RefCell<ImageReadEvidence>,
+    trace: &ImageReadTrace,
     window_id: Option<&str>,
     allow_covered_repainting: bool,
 ) -> Result<(), ImageUnavailable> {
+    let stage = if window_id.is_some() {
+        ImageWithholding::AfterCapture
+    } else {
+        ImageWithholding::BeforeCapture
+    };
     record_visibility(
-        evidence,
-        window_id,
+        trace,
+        stage,
         allow_covered_repainting,
         freshness.inspect_decision(grant, window_id),
     )
 }
 
 fn record_visibility(
-    evidence: &std::cell::RefCell<ImageReadEvidence>,
-    _window_id: Option<&str>,
+    trace: &ImageReadTrace,
+    stage: ImageWithholding,
     allow_covered_repainting: bool,
     (repaints, visibility, decision): (bool, WindowVisibility, ImageDecision),
 ) -> Result<(), ImageUnavailable> {
-    evidence.borrow_mut().decision = Some(decision);
+    trace.evidence.borrow_mut().decision = Some(decision);
     #[cfg(all(feature = "desk-probe", target_os = "macos"))]
     if !allow_covered_repainting {
         crate::desk_probe::note_picture_bracket_probe(|probe| {
-            if _window_id.is_some() {
+            if matches!(stage, ImageWithholding::AfterCapture) {
                 probe.after_capture = Some(decision);
             } else {
                 probe.before_capture = Some(decision);
@@ -316,7 +347,9 @@ fn record_visibility(
         });
     }
     // Fronted reads never capture a still-covered window, even for a measured engine.
-    image_freshness_decision(repaints && allow_covered_repainting, visibility)
+    image_freshness_decision(repaints && allow_covered_repainting, visibility).inspect_err(|_| {
+        trace.withholding.set(Some(stage));
+    })
 }
 
 fn image_capture_error(error: SingleWindowCaptureError) -> ImageUnavailable {
