@@ -113,6 +113,17 @@ fn no_app_identity_reader_means_no_computer_advertisement_even_with_all_release_
         .all(|tool| tool.name != "computer_use" && !tool.name.starts_with("computer.")));
 }
 
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn computer_tools_have_no_dispatch_route_without_a_production_plane() {
+    let dispatchable: Vec<_> = bound_advertised_rows()
+        .into_iter()
+        .chain(["computer_use"])
+        .filter_map(cerebellum::dispatchable_tool)
+        .collect();
+    assert!(dispatchable.is_empty(), "dispatchable: {dispatchable:?}");
+}
+
 fn available_capabilities(context: &ComputerCapabilityAdvertisementContext) -> Vec<String> {
     capability_declarations(context, true)
         .into_iter()

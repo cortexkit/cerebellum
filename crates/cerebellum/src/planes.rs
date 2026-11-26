@@ -368,7 +368,7 @@ impl Planes {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer_admitted: Arc::new(
                 computer_release_evidence(&default_computer_context())
-                    .gate_admitted_capabilities
+                    .advertised_capabilities
                     .into_iter()
                     .collect(),
             ),
