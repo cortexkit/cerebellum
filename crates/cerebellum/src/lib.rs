@@ -1185,23 +1185,17 @@ pub fn capability_withheld(name: &str, browser_configured: bool) -> Option<Capab
 }
 
 fn dispatchable_tool_with_browser(name: &str, browser_configured: bool) -> Option<&str> {
-    if browser_configured
+    let browser = browser_configured
         && (name == flat_tools::BROWSER_USE
             || browser_session::CONTROL_TOOLS.contains(&name)
             || (browser::BrowserCapability::parse(name).is_some()
-                && browser::has_wire_dispatch_route(name)))
-    {
-        Some(name)
-    } else if name == flat_tools::COMPUTER_USE || computer_capability::servable(name).is_some() {
-        // A computer capability is dispatchable when this module can serve it,
-        // which is a property of the code rather than of the host. Whether it is
-        // ADVERTISED depends further on the audit gate and on this being macOS;
-        // those are checked where the manifest is built, so a host that cannot
-        // serve one never offers it.
-        Some(name)
-    } else {
-        None
-    }
+                && browser::has_wire_dispatch_route(name)));
+    // Knowing the action name is not enough: the build needs a computer
+    // handler and an identity reader to authorize app grants.
+    let computer = cfg!(any(target_os = "macos", target_os = "windows"))
+        && management::PlatformResolver::HAS_APP_IDENTITY_READER
+        && (name == flat_tools::COMPUTER_USE || computer_capability::servable(name).is_some());
+    (browser || computer).then_some(name)
 }
 
 /// What this system reports about the permissions the computer plane needs, and

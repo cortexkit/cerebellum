@@ -1316,7 +1316,7 @@ pub(super) async fn handle_tool_request_inner(
     let known_capability = dispatchable_tool_with_browser(name, browser_admitted)
         .or_else(|| browser::fill::admitted(name, &planes.browser, browser_admitted));
     let Some(capability_name) = known_capability else {
-        if name == flat_tools::BROWSER_USE {
+        if matches!(name, flat_tools::BROWSER_USE | flat_tools::COMPUTER_USE) {
             return tool_provider::send_error(
                 cortexkit_role_tool_provider::errors::tool_disabled(name),
                 (ver, channel, epoch, corr),
