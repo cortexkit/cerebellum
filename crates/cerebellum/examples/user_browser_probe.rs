@@ -20,17 +20,17 @@
 //! directory on success, failure, timeout, Ctrl-C and SIGTERM. SIGKILL of the
 //! supervisor or machine failure cannot run cleanup.
 
-use cerebellum_bridge_protocol::{EXTENSION_ID, EXTENSION_ORIGIN, EXTENSION_PUBLIC_KEY_B64};
+use cerebellum_bridge_protocol::{
+    EXTENSION_ID, EXTENSION_ORIGIN, EXTENSION_PUBLIC_KEY_B64, NATIVE_HOST_NAME,
+};
 use cerebellum_core::private_fs;
+use cerebellum_native_host::registration::write_manifest;
 use serde_json::{json, Value};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[path = "user_browser_probe/fixture_http.rs"]
 mod fixture_http;
 
-const HOST: &str = "com.cortexkit.cerebellum";
-const CHROME_MANIFEST_DIR: &str = "Library/Application Support/Google/Chrome/NativeMessagingHosts";
 const BUDGET_SECS: u64 = 180;
 
 // Chrome for Testing runs with a scratch HOME, so without a mock keychain
@@ -115,61 +115,6 @@ fn extension_is_pinned(extension: &Path) -> Result<(), String> {
         return Err("extension key differs from the pinned host origin".into());
     }
     Ok(())
-}
-
-// Reject links before creating directories, so installation cannot follow a
-// redirected Chrome directory into a different browser's profile or manifest.
-fn no_links(path: &Path) -> Result<(), String> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component);
-        match std::fs::symlink_metadata(&current) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(format!("refusing symlink {}", current.display()))
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    Ok(())
-}
-
-fn write_manifest(home: &Path, host: &Path) -> Result<PathBuf, String> {
-    if !home.is_absolute() || !host.is_absolute() || !host.is_file() {
-        return Err("home and existing host executable must be absolute".into());
-    }
-    write_manifest_at(&home.join(CHROME_MANIFEST_DIR), host)
-}
-
-fn write_manifest_at(directory: &Path, host: &Path) -> Result<PathBuf, String> {
-    let path = directory.join(format!("{HOST}.json"));
-    no_links(&path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if std::fs::metadata(&path).is_ok_and(|m| !m.is_file() || m.nlink() != 1) {
-            return Err("refusing non-regular or multiply linked manifest".into());
-        }
-    }
-    let manifest = json!({
-        "name": HOST, "description": "CortexKit Chrome bridge", "path": host,
-        "type": "stdio", "allowed_origins": [EXTENSION_ORIGIN]
-    });
-    let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
-    private_fs::create_dir_all(directory).map_err(|e| e.to_string())?;
-    let mut file = private_fs::create_file(&path).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| e.to_string())?;
-    }
-    file.write_all(&bytes)
-        .and_then(|_| file.write_all(b"\n"))
-        .and_then(|_| file.sync_all())
-        .map_err(|e| e.to_string())?;
-    Ok(path)
 }
 
 struct Scratch(PathBuf);
@@ -730,7 +675,8 @@ mod live {
     use cerebellum::user_browser_bridge::{BridgeListener, Route};
     use cerebellum::{JournalPersistence, Planes};
     use cerebellum_core::health::HealthState;
-    use std::io::Read;
+    use cerebellum_native_host::registration::write_manifest_at;
+    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -2342,10 +2288,12 @@ fn installer_control() -> Result<(), String> {
     let path = write_manifest(&home, &host)?;
     let actual: Value = serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
-    let expected_path = home.join("Library/Application Support/Google/Chrome/NativeMessagingHosts/com.cortexkit.cerebellum.json");
+    let expected_path = home.join(format!(
+        "Library/Application Support/Google/Chrome/NativeMessagingHosts/{NATIVE_HOST_NAME}.json"
+    ));
     if path != expected_path
         || actual
-            != json!({"name":"com.cortexkit.cerebellum","description":"CortexKit Chrome bridge","path":host,"type":"stdio","allowed_origins":["chrome-extension://bfmlflnlaflnibiellpjjifdbcifciei/"]})
+            != json!({"name":NATIVE_HOST_NAME,"description":"CortexKit Chrome bridge","path":host,"type":"stdio","allowed_origins":[EXTENSION_ORIGIN]})
     {
         return Err(
             "manifest must pin exactly the reviewed extension, stdio host, and Chrome-only path"

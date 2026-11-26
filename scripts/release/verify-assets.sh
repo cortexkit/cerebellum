@@ -7,11 +7,11 @@ manifest="${2:?usage: $0 <assets-dir> <expected-manifest>}"
 cmp "$manifest" "$assets/release-manifest.json"
 cd "$assets"
 
-archives=(ck-cerebellum-darwin-arm64.zip ck-cerebellum-native-host-darwin-arm64.zip ck-cerebellum-linux-x64.zip)
+archives=(ck-cerebellum-darwin-arm64.zip ck-cerebellum-native-host-darwin-arm64.zip ck-cerebellum-extension.zip ck-cerebellum-linux-x64.zip)
 shopt -s nullglob dotglob
 files=(*)
 if [[ ${#files[@]} != $((2 * ${#archives[@]} + 1)) ]]; then
-  echo 'Unexpected asset count: expected exactly the three ZIPs, their sidecars, and release-manifest.json.' >&2
+  echo 'Unexpected asset count: expected exactly the four ZIPs, their sidecars, and release-manifest.json.' >&2
   exit 1
 fi
 

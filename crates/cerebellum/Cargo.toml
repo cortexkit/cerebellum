@@ -100,6 +100,7 @@ resvg = "0.44"
 cerebellum-linux = { path = "../cerebellum-linux" }
 
 [dev-dependencies]
+cerebellum-native-host = { path = "../cerebellum-native-host" }
 cerebellum-core = { path = "../cerebellum-core", features = ["test-support"] }
 async-trait = "0.1"
 cortexkit-role-agent-data = { workspace = true, features = ["test-vectors"] }

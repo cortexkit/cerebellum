@@ -33,6 +33,16 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "println!(\"ck-cerebellum-native-host {}\", env!(\"CARGO_PKG_VERSION\"));",
         "exact `--version` answers before the relay starts, for setup checking the installed binary",
     ),
+    (
+        "crates/cerebellum-native-host/src/main.rs",
+        "eprintln!(\"ck-cerebellum-native-host --register: {reason}\");",
+        "exact `--register` gives setup one stderr line when registration fails",
+    ),
+    (
+        "crates/cerebellum-native-host/src/main.rs",
+        "eprintln!(\"Usage: ck-cerebellum-native-host --register (macOS only)\");",
+        "exact `--register` reports macOS-only usage instead of starting the relay",
+    ),
 ];
 
 #[test]
