@@ -984,7 +984,7 @@ async fn live_daemon_declares_browser_controls_without_an_executable() {
     assert!(names.contains("browser.status"), "{names:?}");
     assert!(names.contains("browser_use"), "{names:?}");
 
-    let route = open_live_route(&mut client, 2).await;
+    let route = open_live_route(&mut client).await;
 
     let denied = send_live_tool_request(&mut client, route, 3, json!({"action":"status"})).await;
     assert_eq!(
@@ -1518,24 +1518,42 @@ async fn wait_for_cerebellum_catalog(stream: &mut TcpStream) -> ClientControlRes
     panic!("real subc did not register cerebellum before the deadline");
 }
 
-async fn open_live_route(stream: &mut TcpStream, corr: u64) -> (u16, u32) {
-    let response = send_control_request(
-        stream,
-        corr,
-        ClientControlRequest::RouteOpen {
-            busy_refusals: None,
-            role_versions: None,
-            target: RouteTarget::ToolProvider {
-                module_id: MODULE_ID.to_string(),
-            },
-            identity: BindIdentity::new("conformance", "conversation-live"),
-            consumer_identity: None,
-            consumer_capabilities: None,
-            admission_facts: None,
-            scope: None,
-        },
-    )
-    .await;
+async fn open_live_route(stream: &mut TcpStream) -> (u16, u32) {
+    // Registration makes the module visible in the catalog before it has
+    // installed managed settings. Retry only that startup refusal.
+    let response = timeout(HANG_GUARD, async {
+        // Use a separate correlation-ID range from wait_for_cerebellum_catalog.
+        let mut corr = 1_u64 << 32;
+        loop {
+            let response = send_control_request(
+                stream,
+                corr,
+                ClientControlRequest::RouteOpen {
+                    busy_refusals: None,
+                    role_versions: None,
+                    target: RouteTarget::ToolProvider {
+                        module_id: MODULE_ID.to_string(),
+                    },
+                    identity: BindIdentity::new("conformance", "conversation-live"),
+                    consumer_identity: None,
+                    consumer_capabilities: None,
+                    admission_facts: None,
+                    scope: None,
+                },
+            )
+            .await;
+            if response.header.ty != FrameType::Error
+                || !serde_json::from_slice::<subc_protocol::ErrorBody>(&response.body)
+                    .is_ok_and(|error| error.code == "not_ready")
+            {
+                return response;
+            }
+            corr += 1;
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cerebellum did not become ready to bind a route before the deadline");
     assert_eq!(
         response.header.ty,
         FrameType::Response,
@@ -1550,6 +1568,52 @@ async fn open_live_route(stream: &mut TcpStream, corr: u64) -> (u16, u32) {
         } => (route_channel, route_epoch),
         other => panic!("expected route.open response, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn live_route_waits_for_managed_settings_after_registration() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let daemon = async {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut first_corr = None;
+        // Hold back readiness until the caller has seen the startup refusal.
+        for (ty, body) in [
+            (
+                FrameType::Error,
+                json!({"code":"not_ready","message":"Cerebellum is waiting for managed settings"}),
+            ),
+            (
+                FrameType::Response,
+                json!({"op":"route.open","route_channel":23,"route_epoch":42}),
+            ),
+        ] {
+            let request = read_frame(&mut stream).await.unwrap().unwrap();
+            assert_eq!(request.header.ty, FrameType::Request);
+            let body_request: ClientControlRequest = serde_json::from_slice(&request.body).unwrap();
+            assert!(matches!(
+                body_request,
+                ClientControlRequest::RouteOpen { .. }
+            ));
+            if let Some(corr) = first_corr.replace(request.header.corr) {
+                assert_ne!(corr, request.header.corr);
+            }
+            let response = Frame::build(
+                ty,
+                cerebellum::control_flags(),
+                0,
+                0,
+                request.header.corr,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut stream, &response).await.unwrap();
+        }
+    };
+    let (route, ()) = tokio::join!(open_live_route(&mut client), daemon);
+    assert_eq!(route, (23, 42));
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
