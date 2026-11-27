@@ -16,6 +16,8 @@ mod accessibility;
 mod devtools_pipe;
 #[cfg(windows)]
 mod file_identity;
+#[cfg(windows)]
+mod image_file_facts;
 #[cfg(any(target_os = "windows", test))]
 mod session;
 #[cfg(target_os = "windows")]
@@ -36,6 +38,10 @@ pub use accessibility::{
 pub use devtools_pipe::{spawn_with_devtools_pipe, DevToolsPipeReader, DevToolsProcess};
 #[cfg(windows)]
 pub use file_identity::{file_identity, FileIdentity};
+#[cfg(windows)]
+pub use image_file_facts::{
+    lock_image_file, retain_image_process, ImageMappingReading, LockedImageFile,
+};
 #[cfg(target_os = "windows")]
 pub use token_facts::{
     current_process_token_elevation_type, current_process_token_facts, TokenElevationType,

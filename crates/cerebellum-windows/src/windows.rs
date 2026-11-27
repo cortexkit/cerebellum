@@ -52,7 +52,7 @@ pub enum ProcessHandleError {
 /// The handle closes when this wrapper drops.
 #[derive(Debug)]
 pub struct RetainedProcessHandle {
-    handle: HANDLE,
+    pub(crate) handle: HANDLE,
 }
 
 impl Drop for RetainedProcessHandle {
@@ -80,22 +80,24 @@ pub fn process_start_time(pid: u32) -> ProcessStartTime {
         Ok(process) => process,
         Err(error) => return error.into(),
     };
+    process.creation_time()
+}
+
+impl RetainedProcessHandle {
+    pub fn creation_time(&self) -> ProcessStartTime {
+        creation_time(self.handle)
+    }
+}
+
+fn creation_time(handle: HANDLE) -> ProcessStartTime {
     let mut creation = empty_file_time();
     let mut exit = empty_file_time();
     let mut kernel = empty_file_time();
     let mut user = empty_file_time();
 
-    // SAFETY: `process.handle` is a live handle owned by `process`, and every
+    // SAFETY: the caller holds the live process handle, and every
     // output pointer names a writable `FILETIME` for the duration of this call.
-    let read = unsafe {
-        GetProcessTimes(
-            process.handle,
-            &mut creation,
-            &mut exit,
-            &mut kernel,
-            &mut user,
-        )
-    };
+    let read = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
     if read == 0 {
         return process_access_failure().into();
     }
@@ -157,7 +159,7 @@ pub fn enumerated_window_visibility(pid: u32) -> WindowVisibility {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessAccessFailure {
+pub(crate) enum ProcessAccessFailure {
     NoSuchProcess,
     AccessDenied,
     Unclassified(u32),
@@ -184,9 +186,15 @@ impl From<ProcessAccessFailure> for ProcessHandleError {
 }
 
 fn open_process_handle(pid: u32) -> Result<RetainedProcessHandle, ProcessAccessFailure> {
-    // SAFETY: the access mask is the documented query-limited read, inheritance
-    // is disabled, and `pid` is passed by value.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    open_process_handle_with_access(pid, PROCESS_QUERY_LIMITED_INFORMATION)
+}
+
+pub(crate) fn open_process_handle_with_access(
+    pid: u32,
+    access: u32,
+) -> Result<RetainedProcessHandle, ProcessAccessFailure> {
+    // SAFETY: inheritance is disabled, and all arguments are passed by value.
+    let handle = unsafe { OpenProcess(access, 0, pid) };
     if handle.is_null() {
         return Err(process_access_failure());
     }
