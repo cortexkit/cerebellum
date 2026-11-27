@@ -5,7 +5,7 @@
 //! the caller that produced them.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -425,10 +425,18 @@ fn sibling_path(path: &Path, role: &str) -> PathBuf {
     ))
 }
 
+#[cfg(not(windows))]
 fn sync_directory(path: &Path) -> Result<(), RefusalRingError> {
-    File::open(path)
+    fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| io_error("directory sync", path, error))
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> Result<(), RefusalRingError> {
+    // Windows cannot flush a directory through std::fs::File. The ring
+    // snapshot itself is flushed before rename.
+    Ok(())
 }
 
 fn io_error(operation: &'static str, path: &Path, error: io::Error) -> RefusalRingError {

@@ -694,7 +694,12 @@ mod tests {
             parse_browser_config(&value.to_string()).unwrap_err().reason,
             BrowserConfigReason::PathNotAbsolute
         );
-        value["browser"]["executable_path"] = serde_json::json!("/Applications/Chrome");
+        let absolute_executable = if cfg!(windows) {
+            r"C:\Chrome\chrome.exe"
+        } else {
+            "/Applications/Chrome"
+        };
+        value["browser"]["executable_path"] = serde_json::json!(absolute_executable);
         assert_eq!(
             parse_browser_config(&value.to_string()).unwrap_err().reason,
             BrowserConfigReason::ExpectedIdentityRequired

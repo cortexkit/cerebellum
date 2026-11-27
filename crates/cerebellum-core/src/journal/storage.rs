@@ -595,6 +595,7 @@ fn unique_sibling_path(target: &Path, role: &str) -> PathBuf {
     ))
 }
 
+#[cfg(not(windows))]
 fn sync_directory(path: &Path) -> Result<(), StorageError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
@@ -602,6 +603,13 @@ fn sync_directory(path: &Path) -> Result<(), StorageError> {
             path: path.to_path_buf(),
             source: io_diagnostic(source),
         })
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> Result<(), StorageError> {
+    // Windows cannot flush a directory through std::fs::File. The snapshot
+    // itself is flushed before rename.
+    Ok(())
 }
 
 fn io_diagnostic(error: io::Error) -> super::IoDiagnostic {
@@ -910,6 +918,18 @@ mod tests {
             .load()
             .expect("reload state");
 
+        assert_eq!(reopened, state(42));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_prepares_storage_and_reopens_a_replaced_snapshot() {
+        let directory = TemporaryDirectory::new("prepare-and-replace");
+        let path = directory.join("nested").join("journal.json");
+        let storage = FilesystemJournalStorage::prepare(&path).expect("prepare journal storage");
+        storage.save(&state(7)).expect("write the first snapshot");
+        storage.save(&state(42)).expect("replace the snapshot");
+        let reopened = FilesystemJournalStorage::new(&path).load().unwrap();
         assert_eq!(reopened, state(42));
     }
 
