@@ -1315,6 +1315,17 @@ pub(super) async fn handle_tool_request_inner(
     let browser_admitted = planes.browser_admitted();
     let known_capability = dispatchable_tool_with_browser(name, browser_admitted)
         .or_else(|| browser::fill::admitted(name, &planes.browser, browser_admitted));
+    #[cfg(all(test, target_os = "windows"))]
+    let known_capability = known_capability.or_else(|| {
+        // An opted-in fixture supplies the computer plane in place of the
+        // native identity reader. The catalog and per-row checks still run.
+        (planes
+            .computer
+            .as_ref()
+            .is_ok_and(|plane| plane.wire_dispatch_for_test)
+            && (name == flat_tools::COMPUTER_USE || computer_capability::servable(name).is_some()))
+        .then_some(name)
+    });
     let Some(capability_name) = known_capability else {
         if matches!(name, flat_tools::BROWSER_USE | flat_tools::COMPUTER_USE) {
             return tool_provider::send_error(

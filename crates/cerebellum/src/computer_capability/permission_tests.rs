@@ -128,6 +128,7 @@ fn permission_states_never_change_serialized_tool_definitions() {
 mod wire {
     use super::*;
     use crate::computer_capability::permissions::live_for_test;
+    use crate::computer_capability::{computer_audit, ComputerPlane, ResultSchemaEnforcement};
     use crate::test_support::HANG_GUARD;
     use cerebellum_computer::platform::TargetResolution;
     use serde_json::{json, Value};
@@ -155,16 +156,18 @@ mod wire {
         planes.management = Arc::new(crate::management::ManagementPlane::new(Arc::new(
             NothingRuns(lookups.clone()),
         )));
-        planes.computer =
-            super::super::computer_audit(crate::JournalPersistence::Isolated).map(|audit| {
-                Arc::new(
-                    super::super::ComputerPlane::with_synthetic_driver_and_result_schema_enforcement(audit, super::super::ResultSchemaEnforcement::Withhold, || {
-                        panic!("permission refusal must not construct a dispatch driver")
-                    })
-                    .with_permission_liveness(report)
-                    .with_session_lock_for_test(Some(false)),
-                )
-            });
+        planes.computer = computer_audit(crate::JournalPersistence::Isolated).map(|audit| {
+            let plane = ComputerPlane::with_synthetic_driver_and_result_schema_enforcement(
+                audit,
+                ResultSchemaEnforcement::Withhold,
+                || panic!("permission refusal must not construct a dispatch driver"),
+            )
+            .with_permission_liveness(report)
+            .with_session_lock_for_test(Some(false));
+            #[cfg(target_os = "windows")]
+            let plane = plane.with_wire_dispatch_for_test();
+            Arc::new(plane)
+        });
         // Missing-permission calls must be advertised before they can return a
         // permission refusal. Build the admitted set with the production
         // advertisement function rather than installing a test-only list.

@@ -75,16 +75,17 @@ fn rig_with_history(
         custody,
     )
     .unwrap();
-    planes.computer = Ok(Arc::new(
-        ComputerPlane::with_synthetic_driver_and_result_schema_enforcement(
-            audit,
-            ResultSchemaEnforcement::Withhold,
-            NativeComputerPlatformDriver::default,
-        )
-        .with_launch_history(history)
-        .with_session_lock_for_test(Some(locked))
-        .with_app_state_source(desk.source()),
-    ));
+    let plane = ComputerPlane::with_synthetic_driver_and_result_schema_enforcement(
+        audit,
+        ResultSchemaEnforcement::Withhold,
+        NativeComputerPlatformDriver::default,
+    )
+    .with_launch_history(history)
+    .with_session_lock_for_test(Some(locked))
+    .with_app_state_source(desk.source());
+    #[cfg(target_os = "windows")]
+    let plane = plane.with_wire_dispatch_for_test();
+    planes.computer = Ok(Arc::new(plane));
     // Permissions deliberately absent: inventory, LaunchServices and public
     // window metadata require none and must not ask the OS to grant anything.
     planes.computer_admitted = Arc::new(
@@ -159,6 +160,16 @@ async fn wire_with_decision(
             }
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn scripted_inventory_serves_without_a_native_app_identity_reader() {
+    assert!(crate::dispatchable_tool(crate::flat_tools::COMPUTER_USE).is_none());
+    let (planes, _, _) = rig();
+    let (reply, questions) = wire(&planes, "list_apps", json!({})).await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(questions, 0);
 }
 
 #[tokio::test]
@@ -526,16 +537,17 @@ async fn open_app_first_action_refuses_a_differently_signed_older_process() {
             process: support::grant(),
             executable_path: older_path.join("Contents/MacOS/Safari"),
         }];
-    planes.computer = Ok(Arc::new(
-        ComputerPlane::with_synthetic_driver_and_result_schema_enforcement(
-            super::computer_audit(crate::JournalPersistence::Isolated).unwrap(),
-            ResultSchemaEnforcement::Withhold,
-            NativeComputerPlatformDriver::default,
-        )
-        .with_permission_liveness(super::permissions::live_for_test())
-        .with_session_lock_for_test(Some(false))
-        .with_app_state_source(desk.source()),
-    ));
+    let plane = ComputerPlane::with_synthetic_driver_and_result_schema_enforcement(
+        super::computer_audit(crate::JournalPersistence::Isolated).unwrap(),
+        ResultSchemaEnforcement::Withhold,
+        NativeComputerPlatformDriver::default,
+    )
+    .with_permission_liveness(super::permissions::live_for_test())
+    .with_session_lock_for_test(Some(false))
+    .with_app_state_source(desk.source());
+    #[cfg(target_os = "windows")]
+    let plane = plane.with_wire_dispatch_for_test();
+    planes.computer = Ok(Arc::new(plane));
     planes.computer_admitted = Arc::new(["computer.read_state".to_string()].into());
     let (reply, questions) = wire_with_decision(
         &planes,
