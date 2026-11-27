@@ -5,12 +5,19 @@ use cerebellum::{
     computer_release_evidence_with_exercised_rows, ComputerAdvertisementScope,
     ComputerCapabilityAdvertisementContext, ComputerGateOutcome, ComputerReleaseInputs,
 };
+#[cfg(target_os = "linux")]
+use cerebellum_computer::platform::LinuxReleaseInputs;
 use cerebellum_computer::platform::{
     capability_declarations, PermissionLiveness, PermissionLivenessReport, PermissionProbeResult,
     PermissionService, StartupCapabilityProbe, VocabularyDigestInputs,
     COMPUTER_ACTION_VOCABULARY_SHA256,
 };
 use subc_protocol::manifest::{ProviderRole, Tool};
+
+#[cfg(target_os = "linux")]
+const RELEASE_GATE_COUNT: usize = 22;
+#[cfg(not(target_os = "linux"))]
+const RELEASE_GATE_COUNT: usize = 16;
 
 fn valid_inputs() -> ComputerReleaseInputs {
     ComputerReleaseInputs {
@@ -29,6 +36,15 @@ fn valid_inputs() -> ComputerReleaseInputs {
         app_use_fronting_review_revision: Some("fixture-app-use-fronting-review-v1".into()),
         windows_actuation_review_revision: Some("fixture-windows-actuation-review-v1".into()),
         release_signing_topology_revision: Some("fixture-signing-topology-v1".into()),
+        #[cfg(target_os = "linux")]
+        linux: LinuxReleaseInputs {
+            app_identity: Some("fixture-app-identity-review-v1".into()),
+            semantic: Some("fixture-semantic-review-v1".into()),
+            launch: Some("fixture-launch-review-v1".into()),
+            x11_capture: Some("fixture-x11-capture-review-v1".into()),
+            x11_fronting: Some("fixture-x11-fronting-review-v1".into()),
+            x11_takeover: Some("fixture-x11-takeover-review-v1".into()),
+        },
         vocabulary_digests: VocabularyDigestInputs {
             manifest_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.into()),
             source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.into()),
@@ -77,7 +93,10 @@ fn vocabulary_digest_mismatch_keeps_the_release_closed() {
     context.inputs.vocabulary_digests.source_lock_digest =
         cerebellum_computer::platform::implementation_source_lock_digest();
     let bound = computer_release_evidence(&context);
-    assert_eq!(bound.gate_outcomes, vec![ComputerGateOutcome::Pass; 16]);
+    assert_eq!(
+        bound.gate_outcomes,
+        vec![ComputerGateOutcome::Pass; RELEASE_GATE_COUNT]
+    );
     assert_eq!(available_capabilities(&context), bound_advertised_rows());
 
     // A stale source lock is an implementation failure, not a missing
@@ -124,10 +143,33 @@ fn tonights_all_live_computer_use_definition_is_byte_identical() {
 
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn no_app_identity_reader_means_no_computer_advertisement_even_with_all_release_bindings() {
+fn no_app_identity_support_means_no_computer_advertisement() {
     let context = valid_context();
+    #[cfg(target_os = "linux")]
+    let context = {
+        let mut context = context;
+        context.inputs.linux.app_identity = None;
+        context
+    };
     let evidence = computer_release_evidence(&context);
-    assert_eq!(evidence.gate_outcomes, vec![ComputerGateOutcome::Pass; 16]);
+    assert_eq!(evidence.gate_outcomes.len(), RELEASE_GATE_COUNT);
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(
+        evidence.gate_outcomes,
+        vec![ComputerGateOutcome::Pass; RELEASE_GATE_COUNT]
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        evidence
+            .gate_outcomes
+            .iter()
+            .filter(|gate| **gate != ComputerGateOutcome::Pass)
+            .cloned()
+            .collect::<Vec<_>>(),
+        [ComputerGateOutcome::MissingExternalInput {
+            gate: LinuxReleaseInputs::IDENTITY.into()
+        }]
+    );
     assert_eq!(evidence.canonical_row_count, 13);
     assert!(
         evidence.advertised_capabilities.is_empty(),
@@ -165,17 +207,20 @@ fn available_capabilities(context: &ComputerCapabilityAdvertisementContext) -> V
         .collect()
 }
 
-/// Rows the fully bound build can run with mouse-up recovery measured.
+/// Rows admitted by the platform's reviews and its recorded recovery measurement.
 fn bound_advertised_rows() -> Vec<&'static str> {
     vec![
         "computer.read_state",
         "computer.press_element",
+        #[cfg(not(target_os = "linux"))]
         "computer.press_point",
         "computer.write_text",
         "computer.type",
         "computer.keys",
         "computer.takeover_move",
+        #[cfg(not(target_os = "linux"))]
         "computer.takeover_click",
+        #[cfg(not(target_os = "linux"))]
         "computer.takeover_drag",
         "computer.takeover_scroll",
         "computer.wait",
@@ -192,9 +237,11 @@ fn bound_advertised_rows_but(withheld: &[&str]) -> Vec<&'static str> {
         .collect()
 }
 
-const TAKEOVER_ROWS: [&str; 4] = [
+const TAKEOVER_ROWS: &[&str] = &[
     "computer.takeover_move",
+    #[cfg(not(target_os = "linux"))]
     "computer.takeover_click",
+    #[cfg(not(target_os = "linux"))]
     "computer.takeover_drag",
     "computer.takeover_scroll",
 ];
@@ -204,6 +251,63 @@ fn tools(manifest: &subc_protocol::manifest::ModuleManifest) -> Vec<&Tool> {
         panic!("computer integration must retain the tool provider role")
     };
     tools.iter().collect()
+}
+
+fn assert_manifest_routes(manifest: &subc_protocol::manifest::ModuleManifest) {
+    #[cfg(not(target_os = "linux"))]
+    for tool in tools(manifest) {
+        assert_eq!(
+            cerebellum::dispatchable_tool(&tool.name),
+            Some(tool.name.as_str()),
+            "{} is advertised but dispatch would reject it as an unknown method",
+            tool.name
+        );
+    }
+    // The fixture's attestations are not the compiler's. Linux checks the
+    // handler registry and flat translation without binding release keys.
+    #[cfg(target_os = "linux")]
+    {
+        use cerebellum::{computer_capability::servable, flat_tools};
+        let tools = tools(manifest);
+        let mut granular = BTreeSet::new();
+        let mut flat_routes = BTreeSet::new();
+        for tool in tools {
+            if tool.name == flat_tools::COMPUTER_USE {
+                let actions = tool.schema["properties"]["action"]["enum"]
+                    .as_array()
+                    .expect("computer_use lists its supported actions");
+                assert!(!actions.is_empty());
+                for action in actions {
+                    let translated =
+                        flat_tools::translate_computer(&serde_json::json!({"action": action}))
+                            .expect("an advertised action must translate");
+                    let flat_tools::FlatDispatch::Computer { capability, .. } = translated else {
+                        panic!("computer_use action {action} did not translate to a computer row");
+                    };
+                    assert!(
+                        servable(&capability).is_some(),
+                        "no handler for {capability}"
+                    );
+                    assert!(
+                        flat_routes.insert(capability.clone()),
+                        "duplicate flat route for {capability}"
+                    );
+                }
+            } else {
+                assert!(
+                    servable(&tool.name).is_some(),
+                    "no handler for {}",
+                    tool.name
+                );
+                assert!(
+                    granular.insert(tool.name.clone()),
+                    "duplicate tool {}",
+                    tool.name
+                );
+            }
+        }
+        assert_eq!(flat_routes, granular, "flat and granular routes must agree");
+    }
 }
 
 #[test]
@@ -235,17 +339,12 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     let context = valid_context();
     let evidence = computer_release_evidence(&context);
 
-    // Complete release identifiers admit all reviewed rows now that recovery
-    // is measured. This was originally asserted against the manifest, on the assumption that
-    // advertisement is a function of the identifiers alone -- the assumption
-    // that allowed a capability to be advertised which dispatch cannot serve.
-    // Advertisement also requires production grant support and dispatchability,
-    // so the driver-level identifier half is asserted here and the module's
-    // manifest half below.
+    // Driver declarations establish the reviewed rows. The module must also
+    // route each one it advertises and withhold platforms with no wired plane.
     assert_eq!(available_capabilities(&context), bound_advertised_rows());
     assert_eq!(
         evidence.gate_admitted_capabilities,
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
             bound_advertised_rows()
         } else {
             vec![]
@@ -261,17 +360,13 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
         .filter(|tool| tool.name.starts_with("computer."))
         .map(|tool| tool.name.clone())
         .collect();
-    assert!(computer_tools
-        .iter()
-        .all(|name| cerebellum::dispatchable_tool(name).is_some()));
+    assert_manifest_routes(&manifest);
 
     assert_eq!(evidence.frozen_row_count, 13);
     assert_eq!(evidence.advertised_capabilities, computer_tools);
 
-    // The scope describes what is advertised rather than what the identifiers
-    // admit. A macOS build carrying every review advertises all frozen rows;
-    // elsewhere no production app identity
-    // reader exists, so no app grant can authorize even wait.
+    // Full bindings still do not admit Linux point presses or unmeasured down
+    // gestures. Only the macOS fixture advertises every frozen row.
     //
     // This is a release-visible claim: it says what a caller can do on the
     // computer plane rather than only what it declares. Changing this
@@ -281,18 +376,20 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
         evidence.scope,
         if cfg!(target_os = "macos") {
             ComputerAdvertisementScope::AllFrozenRows
+        } else if cfg!(target_os = "linux") {
+            ComputerAdvertisementScope::PartialRuntimeAdvertisement
         } else {
             ComputerAdvertisementScope::EmptyRuntimeAdvertisement
         }
     );
     assert_eq!(
         computer_tools,
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
             bound_advertised_rows()
         } else {
             vec![]
         },
-        "the advertised set must match the platform's production grant support"
+        "the advertised set must match the platform's release and dispatch support"
     );
     assert_eq!(evidence.exercised_row_count, 0);
     assert!(!evidence.functional_computer_plane);
@@ -303,7 +400,7 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     // support.
     assert_eq!(
         computer_release_evidence_with_exercised_rows(&context, 1).functional_computer_plane,
-        cfg!(target_os = "macos")
+        cfg!(any(target_os = "macos", target_os = "linux"))
     );
 
     // Advertising without exercising is not a functional claim. This is the
@@ -321,20 +418,19 @@ fn complete_immutable_pins_advertise_only_canonical_runtime_rows_and_keep_zero_e
     assert!(!computer_release_evidence_with_exercised_rows(&empty, 1).functional_computer_plane);
 }
 
-/// The keystroke rows are advertised under the input review and nothing
-/// else, and no retired or unserved capability is ever offered, whatever is
-/// bound.
+/// Unbinding the platform's keystroke review withdraws keystrokes, and no
+/// retired or unserved capability is offered even with all reviews bound.
 #[test]
 fn caller_manifest_requires_the_input_review_to_advertise_keystrokes() {
     let advertised = |context: &ComputerCapabilityAdvertisementContext| {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             tools(&build_manifest_with_computer_plane("cerebellum", context))
                 .into_iter()
                 .map(|tool| tool.name.clone())
                 .collect::<BTreeSet<_>>()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             available_capabilities(context)
                 .into_iter()
@@ -349,10 +445,13 @@ fn caller_manifest_requires_the_input_review_to_advertise_keystrokes() {
     assert!(offered.contains("computer.read_state"), "{offered:?}");
     for served in [
         "computer.press_element",
+        #[cfg(not(target_os = "linux"))]
         "computer.press_point",
         "computer.write_text",
         "computer.takeover_move",
+        #[cfg(not(target_os = "linux"))]
         "computer.takeover_click",
+        #[cfg(not(target_os = "linux"))]
         "computer.takeover_drag",
         "computer.takeover_scroll",
     ] {
@@ -372,12 +471,25 @@ fn caller_manifest_requires_the_input_review_to_advertise_keystrokes() {
     }
 
     let mut unreviewed = bound;
-    unreviewed.inputs.input_review_revision = None;
+    set_keystroke_review(&mut unreviewed.inputs, None);
     let offered = advertised(&unreviewed);
     assert!(
         !offered.contains("computer.type") && !offered.contains("computer.keys"),
         "the caller manifest offered keystrokes without their review: {offered:?}"
     );
+}
+
+fn set_keystroke_review(inputs: &mut ComputerReleaseInputs, value: Option<String>) -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        inputs.linux.x11_fronting = value;
+        LinuxReleaseInputs::FRONTING
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        inputs.input_review_revision = value;
+        "input_review_revision"
+    }
 }
 
 /// A suppressed capability says which condition suppressed it.
@@ -404,10 +516,17 @@ fn a_suppressed_capability_names_the_condition_that_suppressed_it() {
     assert_eq!(declaration_reason(&valid_context()), None);
 
     let mut missing_input_review = valid_context();
-    missing_input_review.inputs.input_review_revision = None;
+    set_keystroke_review(&mut missing_input_review.inputs, None);
     assert_eq!(
         declaration_reason(&missing_input_review),
-        Some("synthetic input review revision is not bound".to_string())
+        Some(
+            if cfg!(target_os = "linux") {
+                "route_not_reviewed"
+            } else {
+                "synthetic input review revision is not bound"
+            }
+            .to_string()
+        )
     );
 
     let mut permission_denied = valid_context();
@@ -479,15 +598,14 @@ fn the_advertisement_context_reflects_this_system() {
 /// The check runs against the context the module really ships, and also against
 /// a context with every release identifier supplied, because that is the change
 /// that would create a mismatch. A development build binds no review, so it may
-/// advertise nothing at all; the fully bound context keeps the macOS check
-/// from passing on an empty list. Other platforms intentionally offer nothing
-/// because the production resolver cannot supply app identities for grants.
+/// advertise nothing at all; the fully bound context exercises the handler
+/// routes on macOS and Linux without binding real reviews.
 #[test]
 fn every_shipped_advertisement_can_be_dispatched() {
     let shipped =
         build_manifest_with_computer_plane("cerebellum", &cerebellum::default_computer_context());
     let bound = build_manifest_with_computer_plane("cerebellum", &valid_context());
-    if cfg!(target_os = "macos") {
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
         assert!(
             !tools(&bound).is_empty(),
             "an empty manifest would satisfy this vacuously"
@@ -499,14 +617,7 @@ fn every_shipped_advertisement_can_be_dispatched() {
         );
     }
     for manifest in [&shipped, &bound] {
-        for tool in tools(manifest) {
-            assert_eq!(
-                cerebellum::dispatchable_tool(&tool.name),
-                Some(tool.name.as_str()),
-                "{} is advertised but dispatch would reject it as an unknown method",
-                tool.name
-            );
-        }
+        assert_manifest_routes(manifest);
     }
 }
 
@@ -515,7 +626,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
     let complete = valid_context();
     assert_eq!(
         computer_release_evidence(&complete).gate_outcomes,
-        vec![ComputerGateOutcome::Pass; 16],
+        vec![ComputerGateOutcome::Pass; RELEASE_GATE_COUNT],
         "the complete fixture must prove the passing direction before it is spoiled"
     );
 
@@ -536,6 +647,18 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
         "vocabulary_manifest_digest",
         "vocabulary_source_lock_digest",
         "vocabulary_computed_artifact_digest",
+        #[cfg(target_os = "linux")]
+        LinuxReleaseInputs::IDENTITY,
+        #[cfg(target_os = "linux")]
+        LinuxReleaseInputs::SEMANTIC,
+        #[cfg(target_os = "linux")]
+        LinuxReleaseInputs::LAUNCH,
+        #[cfg(target_os = "linux")]
+        LinuxReleaseInputs::CAPTURE,
+        #[cfg(target_os = "linux")]
+        LinuxReleaseInputs::FRONTING,
+        #[cfg(target_os = "linux")]
+        LinuxReleaseInputs::TAKEOVER,
     ];
     for gate in fields {
         let mut inputs = complete.inputs.clone();
@@ -562,6 +685,18 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             "vocabulary_computed_artifact_digest" => {
                 inputs.vocabulary_digests.computed_artifact_digest = None
             }
+            #[cfg(target_os = "linux")]
+            LinuxReleaseInputs::IDENTITY => inputs.linux.app_identity = None,
+            #[cfg(target_os = "linux")]
+            LinuxReleaseInputs::SEMANTIC => inputs.linux.semantic = None,
+            #[cfg(target_os = "linux")]
+            LinuxReleaseInputs::LAUNCH => inputs.linux.launch = None,
+            #[cfg(target_os = "linux")]
+            LinuxReleaseInputs::CAPTURE => inputs.linux.x11_capture = None,
+            #[cfg(target_os = "linux")]
+            LinuxReleaseInputs::FRONTING => inputs.linux.x11_fronting = None,
+            #[cfg(target_os = "linux")]
+            LinuxReleaseInputs::TAKEOVER => inputs.linux.x11_takeover = None,
             _ => unreachable!(),
         }
         let context = ComputerCapabilityAdvertisementContext {
@@ -570,21 +705,57 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             startup: complete.startup.clone(),
         };
         let evidence = computer_release_evidence(&context);
-        let actual = evidence.gate_outcomes.iter().find(|outcome| {
-            matches!(
-                outcome,
-                ComputerGateOutcome::MissingExternalInput { gate: found } if found == gate
-            )
-        });
+        let failed: Vec<_> = evidence
+            .gate_outcomes
+            .iter()
+            .filter(|outcome| **outcome != ComputerGateOutcome::Pass)
+            .cloned()
+            .collect();
         assert_eq!(
-            actual,
-            Some(&ComputerGateOutcome::MissingExternalInput {
+            failed,
+            [ComputerGateOutcome::MissingExternalInput {
                 gate: gate.to_string(),
-            }),
-            "missing pin {gate} must remain externally unresolved"
+            }],
+            "only missing pin {gate} must remain externally unresolved"
         );
         let admitted = available_capabilities(&context);
+        #[cfg(target_os = "linux")]
+        assert_eq!(evidence.advertised_capabilities, admitted, "{gate}");
         match gate {
+            #[cfg(target_os = "linux")]
+            LinuxReleaseInputs::IDENTITY | "release_signing_topology_revision" => {
+                assert!(admitted.is_empty(), "{gate} governs every Linux row")
+            }
+            #[cfg(target_os = "linux")]
+            LinuxReleaseInputs::SEMANTIC => assert_eq!(admitted, ["computer.open_app"], "{gate}"),
+            #[cfg(target_os = "linux")]
+            LinuxReleaseInputs::LAUNCH => assert_eq!(
+                admitted,
+                bound_advertised_rows_but(&["computer.open_app"]),
+                "{gate}"
+            ),
+            #[cfg(target_os = "linux")]
+            LinuxReleaseInputs::CAPTURE | LinuxReleaseInputs::TAKEOVER => assert_eq!(
+                admitted,
+                bound_advertised_rows_but(TAKEOVER_ROWS),
+                "{gate} governs the takeover rows"
+            ),
+            #[cfg(target_os = "linux")]
+            "input_review_revision"
+            | "app_state_review_revision"
+            | "element_addressed_review_revision"
+            | "takeover_dispatch_review_revision"
+            | "global_dispatch_review_revision" => assert_eq!(
+                admitted,
+                bound_advertised_rows(),
+                "{gate} does not govern Linux rows"
+            ),
+            #[cfg(target_os = "linux")]
+            LinuxReleaseInputs::FRONTING => assert_eq!(
+                admitted,
+                bound_advertised_rows_but(&["computer.type", "computer.keys"]),
+                "{gate} governs the keystroke rows"
+            ),
             "takeover_pointer_fronting_review_revision" => {
                 assert!(cerebellum::takeover_pointer_fronting_admitted(
                     &complete.inputs
@@ -599,20 +770,26 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
                     "unbound drag retains its legacy frontmost-only route; click remains withheld"
                 );
             }
-            "attendance_contract_owner"
-            | "attendance_contract_revision"
-            | "input_review_revision" => {
+            "attendance_contract_owner" | "attendance_contract_revision" => {
                 assert_eq!(
                     admitted,
                     bound_advertised_rows_but(&["computer.type", "computer.keys"]),
                     "{gate} governs the keystroke rows"
                 )
             }
+            #[cfg(not(target_os = "linux"))]
+            "input_review_revision" => assert_eq!(
+                admitted,
+                bound_advertised_rows_but(&["computer.type", "computer.keys"]),
+                "{gate} governs the keystroke rows"
+            ),
+            #[cfg(not(target_os = "linux"))]
             "release_signing_topology_revision" => assert_eq!(
                 admitted,
                 vec!["computer.wait"],
                 "{gate} governs every reviewed row"
             ),
+            #[cfg(not(target_os = "linux"))]
             "app_state_review_revision" => assert_eq!(
                 admitted,
                 bound_advertised_rows_but(&[
@@ -622,6 +799,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
                 ]),
                 "{gate} governs the state read and the application list"
             ),
+            #[cfg(not(target_os = "linux"))]
             "element_addressed_review_revision" => assert_eq!(
                 admitted,
                 bound_advertised_rows_but(&[
@@ -637,10 +815,11 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
             // forward for keystrokes, but that is checked when a keystroke is
             // served: without it the keystroke rows are still advertised and
             // still serve an application that is already frontmost.
+            #[cfg(not(target_os = "linux"))]
             "takeover_dispatch_review_revision" | "global_dispatch_review_revision" => {
                 assert_eq!(
                     admitted,
-                    bound_advertised_rows_but(&TAKEOVER_ROWS),
+                    bound_advertised_rows_but(TAKEOVER_ROWS),
                     "{gate} governs the takeover rows alone"
                 )
             }
@@ -668,7 +847,7 @@ fn every_missing_pin_is_reported_as_external_input_and_suppresses_affected_adver
 fn supplied_placeholder_external_pin_is_an_implementation_failure_not_an_unresolved_input() {
     for invalid_value in ["placeholder", "tbd", "unknown"] {
         let mut inputs = valid_inputs();
-        inputs.input_review_revision = Some(invalid_value.into());
+        let key = set_keystroke_review(&mut inputs, Some(invalid_value.into()));
         let context = ComputerCapabilityAdvertisementContext {
             inputs,
             permissions: valid_context().permissions,
@@ -679,18 +858,18 @@ fn supplied_placeholder_external_pin_is_an_implementation_failure_not_an_unresol
             matches!(
                 outcome,
                 ComputerGateOutcome::ImplementationFailure { gate }
-                    if gate == "input_review_revision"
+                    if gate == key
             )
         });
         assert_eq!(
             actual,
             Some(&ComputerGateOutcome::ImplementationFailure {
-                gate: "input_review_revision".to_string(),
+                gate: key.to_string(),
             }),
             "{invalid_value} must not be accepted as a review attestation"
         );
         assert_eq!(
-            evidence.gate_outcomes.iter().find(|outcome| matches!(outcome, ComputerGateOutcome::MissingExternalInput { gate } if gate == "input_review_revision")),
+            evidence.gate_outcomes.iter().find(|outcome| matches!(outcome, ComputerGateOutcome::MissingExternalInput { gate } if gate == key)),
             None,
             "a supplied {invalid_value} value must not be classified as an absent review"
         );
@@ -701,24 +880,28 @@ fn supplied_placeholder_external_pin_is_an_implementation_failure_not_an_unresol
     }
 }
 
-/// The takeover rows need both the global-dispatch review and the takeover
-/// review, each proved by isolation: with every other release input bound
-/// and every permission live, leaving exactly one of the two unbound
-/// withholds all four rows, from the declaration, the release gate and the
-/// manifest, and each withheld row names that review as the reason.
+/// The platform's two takeover reviews are independently necessary with
+/// every other input bound. Removing either one withdraws every otherwise
+/// advertised takeover row from declarations, release evidence and the manifest.
 #[test]
 fn the_takeover_rows_need_both_reviews_each_proved_by_isolation() {
     // Positive admission of every pointer row proves the missing-review negatives below.
     let bound = valid_context();
     let admitted = computer_release_evidence(&bound).gate_admitted_capabilities;
-    for row in TAKEOVER_ROWS {
+    for &row in TAKEOVER_ROWS {
         assert!(available_capabilities(&bound).contains(&row.to_string()));
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
             assert!(admitted.contains(&row.to_string()), "{row}: {admitted:?}");
         }
     }
 
-    for (gate, reason) in [
+    #[cfg(target_os = "linux")]
+    let reviews = [
+        (LinuxReleaseInputs::CAPTURE, "route_not_reviewed"),
+        (LinuxReleaseInputs::TAKEOVER, "route_not_reviewed"),
+    ];
+    #[cfg(not(target_os = "linux"))]
+    let reviews = [
         (
             "global_dispatch_review_revision",
             "global dispatch review revision is not bound",
@@ -727,11 +910,17 @@ fn the_takeover_rows_need_both_reviews_each_proved_by_isolation() {
             "takeover_dispatch_review_revision",
             "takeover dispatch review revision is not bound",
         ),
-    ] {
+    ];
+    for (gate, reason) in reviews {
         let mut inputs = valid_inputs();
         match gate {
             "global_dispatch_review_revision" => inputs.global_dispatch_review_revision = None,
-            _ => inputs.takeover_dispatch_review_revision = None,
+            "takeover_dispatch_review_revision" => inputs.takeover_dispatch_review_revision = None,
+            #[cfg(target_os = "linux")]
+            LinuxReleaseInputs::CAPTURE => inputs.linux.x11_capture = None,
+            #[cfg(target_os = "linux")]
+            LinuxReleaseInputs::TAKEOVER => inputs.linux.x11_takeover = None,
+            _ => unreachable!(),
         }
         let context = ComputerCapabilityAdvertisementContext {
             inputs,
@@ -752,15 +941,19 @@ fn the_takeover_rows_need_both_reviews_each_proved_by_isolation() {
             );
         }
         let evidence = computer_release_evidence(&context);
-        assert!(
+        assert_eq!(
             evidence
                 .gate_outcomes
-                .contains(&ComputerGateOutcome::MissingExternalInput {
-                    gate: gate.to_string(),
-                }),
-            "{gate} is not reported as an unresolved input"
+                .iter()
+                .filter(|outcome| **outcome != ComputerGateOutcome::Pass)
+                .cloned()
+                .collect::<Vec<_>>(),
+            [ComputerGateOutcome::MissingExternalInput {
+                gate: gate.to_string(),
+            }],
+            "{gate} must be the only unresolved input"
         );
-        for row in TAKEOVER_ROWS {
+        for &row in TAKEOVER_ROWS {
             assert!(
                 !evidence
                     .gate_admitted_capabilities
@@ -777,7 +970,7 @@ fn the_takeover_rows_need_both_reviews_each_proved_by_isolation() {
         // The rest of the served surface is untouched by either review.
         assert_eq!(
             available_capabilities(&context),
-            bound_advertised_rows_but(&TAKEOVER_ROWS),
+            bound_advertised_rows_but(TAKEOVER_ROWS),
             "{gate}"
         );
     }
@@ -791,11 +984,18 @@ fn the_takeover_rows_need_both_reviews_each_proved_by_isolation() {
 /// withdraws it. The list of running applications a caller picks a target
 /// from is part of the same reviewed surface, so the key withdraws it too.
 #[test]
-fn every_tree_read_is_withdrawn_by_the_app_state_key() {
+fn every_tree_read_is_withdrawn_by_its_platform_review() {
     const TREE_READS: [&str; 3] = ["computer.read_state", "computer.wait", "computer.list_apps"];
     let bound = valid_context();
     let mut inputs = valid_inputs();
-    inputs.app_state_review_revision = None;
+    #[cfg(target_os = "linux")]
+    {
+        inputs.linux.semantic = None;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        inputs.app_state_review_revision = None;
+    }
     let unbound = ComputerCapabilityAdvertisementContext {
         inputs,
         permissions: bound.permissions.clone(),
@@ -806,18 +1006,18 @@ fn every_tree_read_is_withdrawn_by_the_app_state_key() {
     let without_key = computer_release_evidence(&unbound).gate_admitted_capabilities;
     let manifest_without_key = build_manifest_with_computer_plane("cerebellum", &unbound);
     for row in TREE_READS {
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
             assert!(with_key.contains(&row.to_string()), "{row}: {with_key:?}");
         }
         assert!(
             !without_key.contains(&row.to_string()),
-            "{row} was admitted with the app_state review unbound: {without_key:?}"
+            "{row} was admitted without its review: {without_key:?}"
         );
         assert!(
             tools(&manifest_without_key)
                 .iter()
                 .all(|tool| tool.name != row),
-            "{row} was in the manifest with the app_state review unbound"
+            "{row} was in the manifest without its review"
         );
     }
     // The key withdraws tree reads and app launch, which resolves its bundle
@@ -832,4 +1032,10 @@ fn every_tree_read_is_withdrawn_by_the_app_state_key() {
             .collect();
         assert_eq!(without_key, expected);
     }
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        without_key,
+        ["computer.open_app"],
+        "launch has its own Linux review"
+    );
 }
