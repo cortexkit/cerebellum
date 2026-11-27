@@ -19,6 +19,7 @@ desk-probe = ["cerebellum-macos/desk-probe"]
 # Developer ID. This weaker pin is for operator-approved browser tests only;
 # cerebellum-macos rejects the feature in signing-attested release builds.
 chrome-for-testing-parent-probe = ["cerebellum-macos/chrome-for-testing-parent-probe"]
+bridge-test-identities = ["cerebellum-bridge-protocol/bridge-test-identities"]
 
 [[bin]]
 name = "ck-cerebellum"
