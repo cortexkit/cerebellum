@@ -7,15 +7,8 @@ manifest="${2:?usage: $0 <assets-dir> <expected-manifest>}"
 cmp "$manifest" "$assets/release-manifest.json"
 cd "$assets"
 
-archives=(
-  ck-cerebellum-darwin-arm64.zip
-  ck-cerebellum-native-host-darwin-arm64.zip
-  ck-cerebellum-extension-darwin-arm64.zip
-  ck-cerebellum-linux-x64.zip
-  ck-cerebellum-linux-arm64.zip
-  ck-cerebellum-windows-x64.zip
-  ck-cerebellum-windows-arm64.zip
-)
+# One line: the ckdev naming scan reads each line of a multi-line array as a command.
+archives=(ck-cerebellum-darwin-arm64.zip ck-cerebellum-native-host-darwin-arm64.zip ck-cerebellum-extension-darwin-arm64.zip ck-cerebellum-linux-x64.zip ck-cerebellum-linux-arm64.zip ck-cerebellum-windows-x64.zip ck-cerebellum-windows-arm64.zip)
 shopt -s nullglob dotglob
 files=(*)
 if [[ ${#files[@]} != $((2 * ${#archives[@]} + 1)) ]]; then
