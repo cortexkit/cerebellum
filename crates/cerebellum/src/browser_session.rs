@@ -482,6 +482,8 @@ pub struct BrowserClickPosition {
 pub enum BrowserInputEvent {
     Press(BrowserClickPosition),
     Release(BrowserClickPosition),
+    KeyPress,
+    KeyRelease,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -523,6 +525,10 @@ pub enum ClickNavigation {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BrowserClickOutcome {
+    KeyPressed {
+        navigation: ClickNavigation,
+        dialogs: Vec<BrowserJavaScriptDialog>,
+    },
     OptionSelected {
         value: String,
         selected_index: i64,
@@ -859,6 +865,16 @@ pub trait OwnedBrowserProcess: Send {
         _document_epoch: u64,
         _current_origin: &str,
         _expected: Option<&crate::classification::NonTypeClassificationRecord>,
+        _deadline_ms: u64,
+        _input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        Err(ClickDriveError::ClassificationChanged)
+    }
+
+    fn press_key_classified(
+        &mut self,
+        _context: &str,
+        _target: &crate::browser::keys::KeyTarget,
         _deadline_ms: u64,
         _input_dispatched: &mut dyn FnMut(BrowserInputEvent),
     ) -> Result<BrowserClickOutcome, ClickDriveError> {
@@ -2287,6 +2303,18 @@ impl OperationGuard {
                 deadline_ms,
                 input_dispatched,
             )
+        })
+    }
+
+    pub(crate) fn press_key_classified(
+        &mut self,
+        context: &str,
+        target: &crate::browser::keys::KeyTarget,
+        deadline_ms: u64,
+        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        self.drive(ClickDriveError::Navigation, |process| {
+            process.press_key_classified(context, target, deadline_ms, input_dispatched)
         })
     }
 

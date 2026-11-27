@@ -4,7 +4,7 @@
 
 pub(super) const SELECT: &str = "function() { if (typeof this.select === 'function') { this.select(); } else { const range = this.ownerDocument.createRange(); range.selectNodeContents(this); const selection = this.ownerDocument.getSelection(); selection.removeAllRanges(); selection.addRange(range); } }";
 pub(super) const APPEND_CARET: &str = "function() { if (typeof this.setSelectionRange === 'function') { const end = this.value.length; this.setSelectionRange(end, end); } else { const range = this.ownerDocument.createRange(); range.selectNodeContents(this); range.collapse(false); const selection = this.ownerDocument.getSelection(); selection.removeAllRanges(); selection.addRange(range); } return true; }";
-pub(super) const HAS_FOCUS: &str = "function() { return this.ownerDocument.hasFocus() && this.getRootNode().activeElement === this; }";
+pub(crate) const HAS_FOCUS: &str = "function() { return this.ownerDocument.hasFocus() && this.getRootNode().activeElement === this; }";
 pub(crate) const CHOOSE_OPTION: &str = "function() { if (!(this instanceof HTMLOptionElement)) { throw new Error('target is not an option'); } const select = this.closest('select'); if (!select) { throw new Error('option has no select'); } const group = this.closest('optgroup'); if (this.disabled || select.disabled || (group && group.disabled)) { throw new Error('option, optgroup or select is disabled'); } this.selected = select.multiple ? !this.selected : true; select.dispatchEvent(new Event('input', {bubbles:true})); select.dispatchEvent(new Event('change', {bubbles:true})); return {value:select.value, selectedIndex:select.selectedIndex}; }";
 
 #[cfg(test)]

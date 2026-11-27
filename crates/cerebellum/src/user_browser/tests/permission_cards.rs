@@ -1110,6 +1110,7 @@ async fn user_browser_writer_rejects_broad_or_worker_permanent_answers() {
                     cancel: CancelHandle::pending(),
                     connection: fixture.epoch,
                     action: "open_grant",
+                    key: None,
                 };
                 for choice in [
                     BrowserGrantChoice::AllSitesThirtyMinutes,

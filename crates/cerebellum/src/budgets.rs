@@ -743,6 +743,13 @@ pub const USER_BROWSER_ACTIONS: [ActionBudget; 13] = [
 ];
 
 pub fn user_browser(action: &str) -> Option<&'static ActionBudget> {
+    // Keys keep all focus and revalidation stages inside the existing action
+    // deadline rather than extending the published browser reply bound.
+    let action = if action == "press_key" {
+        "click_point"
+    } else {
+        action
+    };
     lookup(&USER_BROWSER_ACTIONS, action).or_else(|| {
         matches!(
             action,
@@ -776,7 +783,7 @@ pub const fn user_consent_count(action: &str) -> u64 {
     // (for example a submit button), and once for a link to a different site.
     // Typing only edits a field, so it needs no link-destination approval.
     match action.as_bytes() {
-        b"click" | b"click_point" => 3,
+        b"click" | b"click_point" | b"press_key" => 3,
         b"snapshot" | b"screenshot" | b"navigate" | b"scroll" | b"type" | b"open_grant" => 1,
         _ => 0,
     }
@@ -1032,7 +1039,11 @@ pub fn computer(action: &str) -> Option<&'static ActionBudget> {
 }
 
 pub fn browser(action: &str) -> Option<&'static ActionBudget> {
-    lookup(&BROWSER_ACTIONS, action)
+    if action == "press_key" {
+        Some(&BROWSER_CLICK)
+    } else {
+        lookup(&BROWSER_ACTIONS, action)
+    }
 }
 
 pub fn management(method: &str) -> Option<&'static ActionBudget> {
@@ -1620,6 +1631,11 @@ mod tests {
         );
         assert_eq!(COMPUTER_MAX_PARK_MS, CONSENT_PARK_LIMIT_MS);
         assert_eq!(BROWSER_MAX_PARK_MS, 3 * USER_CONSENT_MS);
+        let key_work = user_browser("press_key").unwrap().work_ms;
+        let key_consent = user_consent_count("press_key") * USER_CONSENT_MS;
+        assert_eq!(key_work, 208_000);
+        assert_eq!(key_consent, 3 * USER_CONSENT_MS);
+        assert!(key_work + key_consent <= BROWSER_MAX_ACTION_MS);
         for (reply, queue, park, work, envelope) in [
             (
                 COMPUTER_REPLY_MAX_MS,

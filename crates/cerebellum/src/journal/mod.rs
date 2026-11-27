@@ -443,6 +443,8 @@ pub enum Action {
         #[serde(rename = "ref")]
         reference: String,
         snapshot_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     Type {
         #[serde(rename = "ref")]
@@ -596,6 +598,31 @@ impl JournalEntry {
         line.push('\n');
         line
     }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_legacy_key_entry(line: &str) -> JournalEntry {
+    // The pre-key journal reader declared these two Click fields and ignored
+    // extra members within that variant. The outer JournalEntry is unchanged.
+    #[derive(Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum LegacyAction {
+        Click {
+            #[serde(rename = "ref")]
+            reference: String,
+            snapshot_id: String,
+        },
+    }
+    let mut old_bytes: serde_json::Value = serde_json::from_str(line).unwrap();
+    if old_bytes["action"]["kind"] == "click" {
+        let LegacyAction::Click {
+            reference,
+            snapshot_id,
+        } = serde_json::from_value(old_bytes["action"].clone()).unwrap();
+        old_bytes["action"] =
+            serde_json::json!({"kind":"click","ref":reference,"snapshot_id":snapshot_id});
+    }
+    serde_json::from_value(old_bytes).expect("the running journal reader accepts the row")
 }
 
 /// Manifest-bound journal deployment configuration.

@@ -378,8 +378,13 @@ impl JournalStore {
         origin: Option<&str>,
         outcome: &str,
         input_dispatched: Option<bool>,
+        key: Option<crate::browser::keys::Key>,
     ) -> Result<(), JournalError> {
         let handle = self.reserve_policy_event(&identity)?;
+        let mut detail = serde_json::json!({"browser":"user","action":action,"origin":origin,"outcome":outcome,"input_dispatched":input_dispatched});
+        if let Some(key) = key {
+            detail["key"] = serde_json::json!(key.name());
+        }
         let entry = JournalEntry {
             format_version: FORMAT_VERSION.to_string(),
             sequence: handle.sequence(),
@@ -396,9 +401,7 @@ impl JournalStore {
             snapshot_ids: Vec::new(),
             outcome: None,
             payload: None,
-            detail: Some(
-                serde_json::json!({"browser":"user","action":action,"origin":origin,"outcome":outcome,"input_dispatched":input_dispatched}),
-            ),
+            detail: Some(detail),
         };
         self.commit_reserved_policy(handle, entry.export_line().into_bytes())?;
         if outcome == "dispatch_committed" {

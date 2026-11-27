@@ -13,6 +13,9 @@ use crate::snapshot_store::{
 };
 use std::sync::{atomic::AtomicUsize, Mutex};
 
+#[path = "held_browser_press_key_tests.rs"]
+mod press_key;
+
 const PAGE_TEXT: &str = "held-page-text-must-never-reach-call-records-8d741";
 const PNG: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -22,6 +25,8 @@ struct Page {
     navigation_attempts: AtomicUsize,
     navigations: AtomicUsize,
     inputs: AtomicUsize,
+    submits: AtomicUsize,
+    document_replaced: AtomicUsize,
     private_redirect: std::sync::atomic::AtomicBool,
     gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     navigation_started: tokio::sync::Notify,
@@ -78,7 +83,11 @@ impl OwnedBrowserProcess for Browser {
         Ok(CommittedDocument::new(
             self.0.url.lock().unwrap().clone(),
             1,
-            "loader",
+            if self.0.document_replaced.load(Ordering::SeqCst) == 0 {
+                "loader"
+            } else {
+                "new-loader"
+            },
         ))
     }
     fn snapshot(
@@ -143,6 +152,31 @@ impl OwnedBrowserProcess for Browser {
     ) -> Result<BrowserClickOutcome, ClickDriveError> {
         self.0.inputs.fetch_add(1, Ordering::SeqCst);
         panic!("a stale held ref must not dispatch")
+    }
+    fn press_key_classified(
+        &mut self,
+        _: &str,
+        target: &crate::browser::keys::KeyTarget,
+        _: u64,
+        input: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        self.0.inputs.fetch_add(1, Ordering::SeqCst);
+        input(BrowserInputEvent::KeyPress);
+        input(BrowserInputEvent::KeyRelease);
+        let navigation = if target.key.event(true)["text"] == "\r" {
+            self.0.submits.fetch_add(1, Ordering::SeqCst);
+            *self.0.url.lock().unwrap() = "https://example.com/submitted".into();
+            let mut tracker = browser::Tracker::default();
+            tracker.url_final = Some("https://example.com/submitted".into());
+            tracker.load_observed = true;
+            ClickNavigation::MainFrame(Box::new(tracker))
+        } else {
+            ClickNavigation::NoneObserved { window_ms: 100 }
+        };
+        Ok(BrowserClickOutcome::KeyPressed {
+            navigation,
+            dialogs: Vec::new(),
+        })
     }
     fn generation_matches(&self) -> bool {
         true

@@ -1,5 +1,7 @@
 use super::*;
 
+mod press_key;
+
 #[test]
 fn site_card_uses_plain_capability_and_hazard_words() {
     let hazards = BTreeSet::from(HazardClass::ALL);
@@ -148,6 +150,7 @@ struct DoubleState {
     popup_once_on_metadata: bool,
     new_tab_link: bool,
     password: bool,
+    press_key_submits: bool,
     payment: bool,
     remove_group_on_card: bool,
     foreign_hit: bool,
@@ -1193,6 +1196,13 @@ fn execute(
             }
             "Input.dispatchKeyEvent" => {
                 state.inputs.push(method.into());
+                if state.press_key_submits
+                    && command["params"]
+                        == json!({"type":"keyDown","key":"Enter","code":"Enter","windowsVirtualKeyCode":13,"text":"\r"})
+                {
+                    tab.url = "https://example.com/submitted".into();
+                    tab.loader += 1;
+                }
                 if command["params"]["key"] == "End" {
                     state.typed_caret = state.typed_value.len();
                     state.typed_selected = false;

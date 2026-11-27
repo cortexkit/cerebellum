@@ -1,0 +1,270 @@
+{
+  "tp1:browser_use:e1b534c70f50f0f50b03ab190ee62389011feac9a04dba6d54f965ac4228b786:1": {
+    "reads": [],
+    "record_schema": {
+      "fields": {
+        "action": "code",
+        "app": "app_id",
+        "plane": "code",
+        "postsReturned": "integer",
+        "site": "web_origin"
+      },
+      "name": "cerebellum_call",
+      "revision": 1
+    },
+    "tool": {
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "action": {
+            "enum": [
+              "launch",
+              "open_tab",
+              "claim_tab",
+              "status",
+              "close",
+              "navigate",
+              "snapshot",
+              "screenshot",
+              "scroll",
+              "click",
+              "type",
+              "press_key",
+              "click_point",
+              "fill_login",
+              "open_grant",
+              "present",
+              "resume",
+              "import_login",
+              "capture_login",
+              "revoke_access"
+            ],
+            "type": "string"
+          },
+          "amount": {
+            "default": 600,
+            "maximum": 10000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "browser": {
+            "enum": [
+              "own",
+              "user"
+            ],
+            "type": "string"
+          },
+          "browser_session_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "clear_first": {
+            "default": false,
+            "type": "boolean"
+          },
+          "credential_domain": {
+            "type": "string"
+          },
+          "direction": {
+            "enum": [
+              "up",
+              "down",
+              "left",
+              "right"
+            ],
+            "type": "string"
+          },
+          "fetch_url": {
+            "type": "string"
+          },
+          "hazards": {
+            "items": {
+              "enum": [
+                "credential_form_submit",
+                "financial_form_submit",
+                "unverified_form_contents"
+              ],
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          },
+          "image_height_px": {
+            "type": "integer"
+          },
+          "image_width_px": {
+            "type": "integer"
+          },
+          "intent": {
+            "type": "string"
+          },
+          "key": {
+            "enum": [
+              "enter",
+              "escape",
+              "tab",
+              "shift_tab",
+              "up",
+              "down",
+              "left",
+              "right",
+              "home",
+              "end",
+              "page_up",
+              "page_down",
+              "backspace",
+              "delete"
+            ],
+            "type": "string"
+          },
+          "login_url": {
+            "type": "string"
+          },
+          "max_bytes": {
+            "default": 5000,
+            "maximum": 262144,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "mode": {
+            "default": "actionable",
+            "enum": [
+              "actionable",
+              "ax",
+              "dom_full"
+            ],
+            "type": "string"
+          },
+          "origin": {
+            "type": "string"
+          },
+          "origins": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 256,
+            "minItems": 1,
+            "type": "array"
+          },
+          "otp_ref": {
+            "type": "string"
+          },
+          "password_ref": {
+            "type": "string"
+          },
+          "point": {
+            "additionalProperties": false,
+            "properties": {
+              "x": {
+                "type": "integer"
+              },
+              "y": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          "read_page": {
+            "default": false,
+            "type": "boolean"
+          },
+          "ref": {
+            "type": "string"
+          },
+          "role_filter": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "type": "array"
+          },
+          "secret": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "severity": {
+            "additionalProperties": false,
+            "properties": {
+              "credential": {
+                "type": "boolean"
+              },
+              "financial": {
+                "type": "boolean"
+              },
+              "tier": {
+                "maximum": 5,
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "tier",
+              "credential",
+              "financial"
+            ],
+            "type": "object"
+          },
+          "severity_tier": {
+            "maximum": 4,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "snapshot_id": {
+            "type": "string"
+          },
+          "tab": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 10000,
+            "type": "string"
+          },
+          "text_filter": {
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "username_ref": {
+            "type": "string"
+          },
+          "wait": {
+            "enum": [
+              "settle",
+              "none"
+            ],
+            "type": "string"
+          },
+          "wait_for_ms": {
+            "maximum": 10000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "zoom": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "name": "browser_use",
+      "semantics": 1
+    }
+  }
+}

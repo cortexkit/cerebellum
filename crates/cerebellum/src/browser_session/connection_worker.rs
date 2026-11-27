@@ -663,6 +663,18 @@ impl OwnedBrowserProcess for ConnectionWorker {
             )
         })
     }
+    fn press_key_classified(
+        &mut self,
+        context: &str,
+        target: &crate::browser::keys::KeyTarget,
+        deadline: u64,
+        callback: &mut dyn FnMut(BrowserInputEvent),
+    ) -> Result<BrowserClickOutcome, ClickDriveError> {
+        let (context, target) = (context.to_owned(), target.clone());
+        self.input(callback, move |p, callback| {
+            p.press_key_classified(&context, &target, deadline, callback)
+        })
+    }
     forward!(fn type_classified(&mut self, context: &str, target: &crate::browser_type::TypeDispatch, text: &str, clear: bool, deadline: u64) -> Result<crate::browser_type::BrowserTypeResult, NavigationDriveError>;
         { (context.to_owned(), target.clone(), zeroize::Zeroizing::new(text.to_owned()), clear, deadline) } => |(context, target, text, clear, deadline)| move |p: &mut dyn OwnedBrowserProcess| p.type_classified(&context, &target, &text, clear, deadline));
     forward!(fn check_fill_login(&mut self, context: &str, dispatch: &crate::browser::fill::FillDispatch, deadline: u64) -> Result<Option<&'static str>, NavigationDriveError>;

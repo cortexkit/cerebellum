@@ -19,6 +19,7 @@ const POINTER_MOVE_SCROLL_PUBLISHED: &str =
     include_str!("../../resources/tool-views/published-v3.json");
 const BROWSER_FILTERED_WAIT_PUBLISHED: &str =
     include_str!("../../resources/tool-views/published-v4.json");
+const BROWSER_KEYS_PUBLISHED: &str = include_str!("../../resources/tool-views/published-v5.json");
 const BROWSER_ROW: &str = include_str!("../../resources/tool-views/browser-row.ui");
 const BROWSER_PAGE: &str = include_str!("../../resources/tool-views/browser-page.ui");
 const COMPUTER_ROW: &str = include_str!("../../resources/tool-views/computer-row.ui");
@@ -34,6 +35,7 @@ const TOOL_CATALOG_DIGEST: &str =
 /// Raised whenever a template changes. A pin's record schema and reads never
 /// change; the display server replaces a kept view only at a higher revision.
 pub(crate) const TEMPLATE_REVISION: u64 = 6;
+const BROWSER_KEYS_TEMPLATE_REVISION: u64 = 7;
 
 fn template(profile: &str, source: &str) -> Value {
     json!({
@@ -51,21 +53,43 @@ fn templates(tool: &str) -> (&'static str, &'static str) {
     }
 }
 
+fn tool_templates(tool: &str, input: &Value) -> (Value, u64) {
+    let (row, page) = templates(tool);
+    // Old browser pins do not declare `input.key`; keep their original
+    // templates so every input reference remains valid for its own pin.
+    let keys = tool == flat_tools::BROWSER_USE && input["properties"].get("key").is_some();
+    let source = |template: &'static str| {
+        if keys {
+            std::borrow::Cow::Owned(template.replacen(
+                "export const action = ",
+                "export const action = input.action == \"press_key\" ? \"Press key: \" + (input.key ?? \"\") : ",
+                1,
+            ))
+        } else {
+            std::borrow::Cow::Borrowed(template)
+        }
+    };
+    (
+        json!({"row": template("tool_row", &source(row)), "page": template("tool_page", &source(page))}),
+        if keys {
+            BROWSER_KEYS_TEMPLATE_REVISION
+        } else {
+            TEMPLATE_REVISION
+        },
+    )
+}
+
 /// The view for one pin, read from the published table as data. Neither the
 /// record schema, the reads nor the tool definition is rebuilt from current
 /// code, so a later definition change cannot alter a pin already served.
 fn view(pin: &str, entry: &Value) -> ViewManifest {
     let tool = SchemaPin::parse(pin).expect("published pin").tool;
-    let (row, page) = templates(&tool);
+    let (template, revision) = tool_templates(&tool, &entry["tool"]["input_schema"]);
     let schema = serde_json::from_value(entry["record_schema"].clone()).expect("kept schema");
     let reads = serde_json::from_value(entry["reads"].clone()).expect("kept reads");
     let tool = serde_json::from_value(entry["tool"].clone()).expect("kept tool definition");
-    let template = json!({
-        "row": template("tool_row", row),
-        "page": template("tool_page", page),
-    });
     ViewManifest::new(schema, reads, template)
-        .with_template_revision(TEMPLATE_REVISION)
+        .with_template_revision(revision)
         .with_tool(tool)
 }
 
@@ -76,6 +100,7 @@ fn published() -> BTreeMap<String, ViewManifest> {
         POINTER_FRONTING_PUBLISHED,
         POINTER_MOVE_SCROLL_PUBLISHED,
         BROWSER_FILTERED_WAIT_PUBLISHED,
+        BROWSER_KEYS_PUBLISHED,
     ] {
         let addition: BTreeMap<String, Value> =
             serde_json::from_str(table).expect("pointer-fronting published views");

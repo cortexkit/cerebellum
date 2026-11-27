@@ -1565,6 +1565,7 @@ pub(super) async fn handle_tool_request_inner(
             capability,
             arguments,
         }) => (capability.as_str(), arguments),
+        Some(flat_tools::FlatDispatch::BrowserKey { arguments, .. }) => (browser::CLICK, arguments),
         Some(flat_tools::FlatDispatch::Management { .. }) => unreachable!("returned above"),
         Some(flat_tools::FlatDispatch::UserBrowser { .. }) => unreachable!("returned above"),
         None => (name, arguments),
@@ -1913,7 +1914,7 @@ pub(super) async fn handle_tool_request_inner(
     if capability != browser::BrowserCapability::WaitFor {
         call.commit_point_follows();
     }
-    let result = Box::pin(serve_browser_with_consent(
+    let serve = Box::pin(serve_browser_with_consent(
         planes,
         &accepted_facts,
         writer,
@@ -1923,8 +1924,13 @@ pub(super) async fn handle_tool_request_inner(
         BROWSER_CONSENT_PARK_LIMIT
             .try_with(|limit| *limit)
             .unwrap_or(Duration::from_secs(120)),
-    ))
-    .await;
+    ));
+    let result = match translated.as_ref() {
+        Some(flat_tools::FlatDispatch::BrowserKey { key, .. }) => {
+            browser::keys::PRESS_KEY.scope(*key, serve).await
+        }
+        _ => serve.await,
+    };
     if planes.routes.get(channel, epoch).is_none() {
         return Ok(());
     }
