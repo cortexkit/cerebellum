@@ -40,8 +40,13 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/cerebellum-native-host/src/main.rs",
-        "eprintln!(\"Usage: ck-cerebellum-native-host --register (macOS only)\");",
-        "exact `--register` reports macOS-only usage instead of starting the relay",
+        "eprintln!(\"native messaging registration is unavailable on this platform\");",
+        "exact `--register` on a platform without registration says so instead of starting the relay",
+    ),
+    (
+        "crates/cerebellum-native-host/src/main.rs",
+        "eprintln!(\"{reason}\");",
+        "exact `--register` names the unbound build gate in one stderr line instead of starting the relay",
     ),
     (
         "crates/cerebellum-bridge-protocol/src/bin/peer-trailer.rs",
