@@ -14,6 +14,7 @@ default = []
 # Pinned Chrome for Testing probes require the machine owner's approval to launch
 # that browser; this feature is forbidden in attested release builds.
 chrome-for-testing-parent-probe = ["cerebellum-macos/chrome-for-testing-parent-probe"]
+bridge-test-identities = ["cerebellum-bridge-protocol/bridge-test-identities"]
 
 [dependencies]
 cerebellum-bridge-protocol = { path = "../cerebellum-bridge-protocol" }

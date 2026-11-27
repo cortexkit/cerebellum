@@ -1,42 +1,44 @@
 use crate::framing::{read_native_frame, write_native_frame};
+use crate::transport::Transport;
 use cerebellum_bridge_protocol::{
     decode_raw_relay_body, raw_relay_body, read_frame as read_socket_control_frame, read_raw_relay,
-    write_frame as write_socket_control_frame, write_raw_relay, Frame, ParentAttestation,
+    write_frame as write_socket_control_frame, write_raw_relay, Frame, HostParentAttestation,
     PROTOCOL_VERSION,
 };
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::time::Duration;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) fn establish_session(
+pub(crate) fn establish_session<T: Transport, P: Into<HostParentAttestation>>(
     extension_origin: String,
-    check_parent: impl FnOnce() -> io::Result<ParentAttestation>,
-    connect: impl FnOnce() -> io::Result<UnixStream>,
-    check_server: impl FnOnce(&UnixStream) -> io::Result<()>,
-) -> io::Result<(UnixStream, u64)> {
+    check_parent: impl FnOnce() -> io::Result<P>,
+    connect: impl FnOnce() -> io::Result<T>,
+    check_server: impl FnOnce(&T) -> io::Result<()>,
+) -> io::Result<(T, u64)> {
     // This ordering is a trust boundary: a local caller of the signed host must
     // not even connect, and a fake server must receive neither hello nor content.
-    let parent = check_parent()?;
-    if parent.team_id.is_some() == parent.probe_cdhash.is_some() {
+    let parent = check_parent()?.into();
+    if parent
+        .as_legacy()
+        .is_some_and(|parent| parent.team_id.is_some() == parent.probe_cdhash.is_some())
+    {
         return Err(invalid_data(
             "parent identity must name exactly one signer or probe hash",
         ));
     }
     let mut socket = connect()?;
     socket.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    socket.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    socket.set_write_timeout(HANDSHAKE_TIMEOUT)?;
     check_server(&socket)?;
     write_socket_control_frame(
         &mut socket,
         &Frame::HostHello {
             protocol: PROTOCOL_VERSION,
             extension_origin,
-            parent: parent.into(),
+            parent,
         },
     )?;
     let epoch = match read_socket_control_frame(&mut socket)? {
@@ -123,7 +125,7 @@ impl fmt::Display for RelayEnd {
 /// them makes the extension reject the first command as an unknown frame and
 /// close the port.
 pub(crate) fn relay(
-    mut socket: UnixStream,
+    mut socket: impl Transport,
     epoch: u64,
     mut chrome_input: impl Read + Send + 'static,
     chrome_output: &mut impl Write,
@@ -135,7 +137,7 @@ pub(crate) fn relay(
     .map_err(invalid_data)
     .and_then(|accepted| write_native_frame(chrome_output, &accepted));
     if let Err(error) = accepted {
-        let _ = socket.shutdown(Shutdown::Both);
+        let _ = socket.disconnect();
         return RelayEnd::ChromeWrite(error);
     }
     let mut input_socket = match socket.try_clone() {
@@ -150,14 +152,14 @@ pub(crate) fn relay(
             // Report before shutting the socket down: the output side then sees
             // EOF and can tell that this side ended first.
             let _ = sender.send(end);
-            let _ = input_socket.shutdown(Shutdown::Both);
+            let _ = input_socket.disconnect();
         });
     if let Err(error) = input_thread {
-        let _ = socket.shutdown(Shutdown::Both);
+        let _ = socket.disconnect();
         return RelayEnd::Setup(error);
     }
     let to_chrome = relay_to_chrome(&mut socket, chrome_output);
-    let _ = socket.shutdown(Shutdown::Both);
+    let _ = socket.disconnect();
     // Do not join a thread blocked on Chrome's stdin after a server disconnect.
     // Returning from main exits the host and closes the native port immediately.
     match (to_chrome, receiver.try_recv()) {
@@ -206,10 +208,15 @@ fn invalid_data(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> i
 }
 
 #[cfg(test)]
+mod conformance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use cerebellum_bridge_protocol::ParentAttestation;
     use serde_json::value::RawValue;
     use std::io::Cursor;
+    use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn parent() -> io::Result<ParentAttestation> {
@@ -228,7 +235,7 @@ mod tests {
     #[test]
     fn rejected_parent_never_calls_the_socket_connector() {
         let connected = AtomicBool::new(false);
-        let result = establish_session(
+        let result = establish_session::<UnixStream, ParentAttestation>(
             origin(),
             || {
                 Err(io::Error::new(

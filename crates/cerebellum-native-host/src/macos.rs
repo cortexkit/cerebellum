@@ -25,10 +25,7 @@ pub(crate) fn run() -> io::Result<()> {
 }
 
 fn session() -> io::Result<RelayEnd> {
-    let origin = std::env::args_os()
-        .nth(1)
-        .and_then(|origin| origin.into_string().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing extension origin"))?;
+    let origin = crate::extension_origin(std::env::args_os())?;
     let (socket, epoch) = establish_session(
         origin,
         check_parent,
