@@ -52,6 +52,77 @@ fn check_stalled_handshake<T: Transport>((host, mut peer): (T, T), prefilled: Op
     }
 }
 
+#[cfg(all(windows, feature = "bridge-test-identities"))]
+mod windows {
+    use super::*;
+    use crate::windows::test_pair;
+
+    #[test]
+    fn stalled_handshake_read_times_out() {
+        check_stalled_handshake(test_pair(1024), None);
+    }
+
+    #[test]
+    fn stalled_handshake_write_times_out() {
+        let (mut host, peer) = test_pair(1024);
+        host.set_write_timeout(Duration::from_millis(100)).unwrap();
+        // Fill the Windows byte pipe before trying the shared handshake.
+        let mut prefilled = 0;
+        let chunk = [0; 1024];
+        loop {
+            match host.write(&chunk) {
+                Ok(written) if written != 0 => prefilled += written,
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => break,
+                result => panic!("could not fill pipe: {result:?}"),
+            }
+            assert!(
+                prefilled <= MAX_FRAME_BYTES,
+                "pipe did not backpressure the writer"
+            );
+        }
+        // A whole-buffer write can wait even though a small hello fits in the
+        // remaining quota. Exhaust that quota a byte at a time as well.
+        loop {
+            match host.write(&[0]) {
+                Ok(1) => prefilled += 1,
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => break,
+                result => panic!("could not fill pipe: {result:?}"),
+            }
+            assert!(
+                prefilled <= MAX_FRAME_BYTES,
+                "pipe did not backpressure the writer"
+            );
+        }
+        check_stalled_handshake((host, peer), Some(prefilled));
+    }
+
+    #[test]
+    fn handshake_rejects_an_oversized_frame() {
+        check_handshake_bound(test_pair(1024));
+    }
+
+    #[test]
+    fn accepted_relay_stays_open_preserves_bytes_and_ends_on_disconnect() {
+        check_accepted_relay(test_pair(1024));
+    }
+
+    #[test]
+    fn chrome_eof_cancels_an_idle_relay_read_and_closes_the_pipe() {
+        let (host, mut peer) = test_pair(1024);
+        let (send, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            let end = relay(host, 23, io::empty(), &mut Vec::new());
+            let _ = send.send(end);
+        });
+        let end = done
+            .recv_timeout(TEST_LIMIT)
+            .expect("Chrome EOF did not end the relay");
+        assert!(matches!(end, RelayEnd::ChromeClosed), "{end}");
+        peer.set_read_timeout(Some(TEST_LIMIT)).unwrap();
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
+}
+
 fn check_handshake_bound<T: Transport>((host, mut peer): (T, T)) {
     let prefix = (MAX_FRAME_BYTES as u32 + 1).to_be_bytes();
     peer.write_all(&prefix).unwrap();

@@ -453,6 +453,7 @@ dependencies = [
  "cerebellum-bridge-protocol",
  "cerebellum-core",
  "cerebellum-macos",
+ "cerebellum-windows",
  "cortexkit-paths",
  "cortexkit-test-support",
  "libc",

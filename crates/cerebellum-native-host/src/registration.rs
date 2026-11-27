@@ -13,6 +13,9 @@ use serde_json::json;
 
 use crate::browsers::HOST_MANIFEST_LOCATIONS;
 
+#[cfg(windows)]
+mod windows;
+
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Register the canonical path of this running executable for the current user.
@@ -20,7 +23,7 @@ static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub fn register_running_executable() -> Result<PathBuf, String> {
     #[cfg(target_os = "linux")]
     let base = linux_config_base()?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     let home = std::env::var_os("HOME").ok_or_else(|| "HOME is unset".to_owned())?;
     let executable = std::env::current_exe()
         .map_err(|error| format!("could not locate the running executable: {error}"))?;
@@ -39,7 +42,9 @@ pub fn register_running_executable() -> Result<PathBuf, String> {
         write_manifest_at(&base.join("chromium/NativeMessagingHosts"), &executable)?;
         Ok(chrome)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    return windows::register(&executable);
+    #[cfg(not(any(target_os = "linux", windows)))]
     write_manifest(Path::new(&home), &executable)
 }
 
@@ -82,6 +87,8 @@ pub fn write_manifest_at(directory: &Path, executable: &Path) -> Result<PathBuf,
     if !executable.is_absolute() || !executable.is_file() {
         return Err("the canonical host executable must be an absolute regular file".into());
     }
+    #[cfg(windows)]
+    let executable = windows::chrome_path(&executable);
     let executable_text = executable
         .to_str()
         .ok_or_else(|| "host executable path is not valid UTF-8".to_owned())?;

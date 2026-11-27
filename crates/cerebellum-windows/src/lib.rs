@@ -7,6 +7,11 @@
 //! Keep additions small and mechanical. This is the auditable place for Windows
 //! calls, not a place to move application policy.
 
+#![cfg_attr(
+    all(windows, not(feature = "bridge-test-identities")),
+    doc = "\nA normal build does not expose the fixture pipe constructor.\n\n```compile_fail,E0432\nuse cerebellum_windows::create_test_pipe_instance_default_security;\n```"
+)]
+
 // Windows APIs and their raw handles exist only on Windows. Keeping this module
 // and its public surface behind the same gate makes other hosts build an empty
 // library rather than a pretend implementation.
@@ -20,8 +25,14 @@ mod devtools_pipe;
 mod file_identity;
 #[cfg(windows)]
 mod image_file_facts;
+#[cfg(windows)]
+mod named_pipe;
 #[cfg(any(windows, test))]
 mod pe_product;
+#[cfg(windows)]
+mod process_readings;
+#[cfg(windows)]
+mod registry_values;
 #[cfg(any(target_os = "windows", test))]
 mod session;
 #[cfg(windows)]
@@ -62,12 +73,23 @@ pub use image_file_facts::{
     lock_image_file, retain_image_process, ImageMappingReading, LockedImageFile,
     ProcessPackageFields,
 };
+#[cfg(all(windows, feature = "bridge-test-identities"))]
+pub use named_pipe::create_test_pipe_instance_default_security;
+#[cfg(windows)]
+pub use named_pipe::{
+    named_pipe_client_pid, named_pipe_server_pid, open_named_pipe_client, wait_named_pipe,
+    OverlappedPipe, ERROR_PIPE_BUSY,
+};
+#[cfg(windows)]
+pub use process_readings::system_time_100ns;
+#[cfg(windows)]
+pub use registry_values::set_current_user_default_string;
 #[cfg(windows)]
 pub use signer_facts::{AuthenticodeFacts, SignerFields};
 #[cfg(target_os = "windows")]
 pub use token_facts::{
-    current_process_token_elevation_type, current_process_token_facts, TokenElevationType,
-    TokenFacts,
+    current_process_token_elevation_type, current_process_token_facts,
+    current_process_token_user_sid, TokenElevationType, TokenFacts,
 };
 #[cfg(windows)]
 pub use window_identity_facts::{

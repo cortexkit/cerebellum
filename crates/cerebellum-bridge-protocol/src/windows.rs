@@ -1,4 +1,4 @@
-//! Windows native-messaging image predicates, independent of process ancestry.
+//! Windows native-messaging image, peer and launch-chain predicates.
 //!
 //! Readings can block. The caller owns the deadline and retained process handles.
 
@@ -17,6 +17,13 @@ use cerebellum_windows::{
 pub use cerebellum_windows::{
     retain_process_handle_for_image, ImageReadError, OpenedProcessImage, ProcessHandleError,
     RetainedProcessHandle,
+};
+pub use ed25519_dalek::VerifyingKey;
+
+mod identity;
+pub use identity::{
+    attest_parent, current_user_sid, observe_client_peer, observe_server_peer, ParentEvidence,
+    PeerIdentity, PeerObservationError, VerifiedHost,
 };
 
 #[cfg(test)]

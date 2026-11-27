@@ -1,5 +1,5 @@
 //! A silent native-messaging relay that authenticates its Chrome parent and the
-//! local cerebellum socket server. Cerebellum separately authenticates the host.
+//! local cerebellum server. Cerebellum separately authenticates the host.
 //!
 //! The host never interprets action payloads. The cerebellum browser bridge owns
 //! action admission, epochs, deadlines, cancellation and chunking.
@@ -8,36 +8,38 @@ use std::ffi::OsString;
 use std::io;
 
 pub mod browsers;
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
 mod framing;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 pub mod registration;
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos", test)))]
+#[cfg(any(
+    windows,
+    all(unix, any(target_os = "linux", target_os = "macos", test))
+))]
 mod relay;
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos", test)))]
+#[cfg(any(
+    windows,
+    all(unix, any(target_os = "linux", target_os = "macos", test))
+))]
 mod transport;
+#[cfg(windows)]
+mod windows;
 
 /// Check whether this build can enable the native-messaging bridge.
 pub fn check_build_gate() -> io::Result<()> {
     #[cfg(target_os = "linux")]
     linux::build_key()?;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        #[cfg(target_os = "windows")]
-        const REVISION: Option<&str> =
-            option_env!("CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION");
-        #[cfg(not(target_os = "windows"))]
-        const REVISION: Option<&str> = None;
-
-        cerebellum_bridge_protocol::classify_bridge_gate(
-            REVISION,
-            option_env!("CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY"),
-        )
-        .ok_or_else(unbound_gate)?;
-    }
+    #[cfg(windows)]
+    windows::build_key()?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    cerebellum_bridge_protocol::classify_bridge_gate(
+        None,
+        option_env!("CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY"),
+    )
+    .ok_or_else(unbound_gate)?;
     Ok(())
 }
 
@@ -64,7 +66,11 @@ pub fn run() -> io::Result<()> {
     {
         macos::run()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        windows::run(windows::build_key()?)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         check_build_gate()?;
         let _ = extension_origin(std::env::args_os())?;

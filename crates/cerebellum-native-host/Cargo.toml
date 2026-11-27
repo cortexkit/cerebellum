@@ -14,7 +14,7 @@ default = []
 # Pinned Chrome for Testing probes require the machine owner's approval to launch
 # that browser; this feature is forbidden in attested release builds.
 chrome-for-testing-parent-probe = ["cerebellum-macos/chrome-for-testing-parent-probe"]
-bridge-test-identities = ["cerebellum-bridge-protocol/bridge-test-identities"]
+bridge-test-identities = ["cerebellum-bridge-protocol/bridge-test-identities", "cerebellum-windows/bridge-test-identities"]
 
 [dependencies]
 cerebellum-bridge-protocol = { path = "../cerebellum-bridge-protocol" }
@@ -26,6 +26,9 @@ libc = "=0.2.189"
 [target.'cfg(target_os = "macos")'.dependencies]
 cerebellum-macos = { path = "../cerebellum-macos" }
 cortexkit-paths = "=0.1.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+cerebellum-windows = { path = "../cerebellum-windows" }
 
 [dev-dependencies]
 cerebellum-core = { path = "../cerebellum-core" }
