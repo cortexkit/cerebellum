@@ -323,8 +323,6 @@ impl Planes {
             routes,
             browser,
             browser_config,
-            #[cfg(test)]
-            synthetic_browser_dispatch: false,
             runtime_browser: None,
             sessions,
             user_browser: user_browser_bridge::UserBrowserBridge::with_user_grants(user_grants),
@@ -417,6 +415,8 @@ impl Planes {
                     .into_iter()
                     .collect(),
             ),
+            #[cfg(test)]
+            synthetic_browser_dispatch: false,
             #[cfg(test)]
             route_test_handler: None,
             #[cfg(test)]
