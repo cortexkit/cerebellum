@@ -9427,14 +9427,9 @@ async fn flow_login_and_standing_offer_sites_refuse_without_cards() {
             json!({"action":"present","origin":"https://page.example:8443"}),
         ),
     ] {
-        let withheld = cfg!(windows) && action["action"] != "open_grant";
         let reply = flow_wire_call(&planes, corr, action).await;
-        if withheld {
-            assert_eq!(reply["code"], "browser_action_not_supported", "{reply}");
-        } else {
-            assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
-            assert_eq!(reply["detail"]["reason"], "unattended_flow", "{reply}");
-        }
+        assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+        assert_eq!(reply["detail"]["reason"], "unattended_flow", "{reply}");
     }
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
 }

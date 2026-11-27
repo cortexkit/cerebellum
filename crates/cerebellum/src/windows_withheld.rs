@@ -28,6 +28,22 @@ const OWN_ACTIONS: &[(&str, &str, Refusal)] = &[
 ];
 
 pub(super) fn tool_refusal(name: &str, arguments: &Value) -> Option<&'static Refusal> {
+    tool_refusal_for(name, arguments, |_| true)
+}
+
+pub(super) fn tool_dispatch_refusal(name: &str, arguments: &Value) -> Option<&'static Refusal> {
+    // Present, resume, capture and import still run the management route's
+    // authorization checks. That dispatcher refuses them before any backend call.
+    tool_refusal_for(name, arguments, |legacy| {
+        legacy == browser::fill::FILL_LOGIN
+    })
+}
+
+fn tool_refusal_for(
+    name: &str,
+    arguments: &Value,
+    allows_row: impl Fn(&str) -> bool,
+) -> Option<&'static Refusal> {
     if name != flat_tools::BROWSER_USE {
         return legacy_tool_refusal(name);
     }
@@ -37,9 +53,9 @@ pub(super) fn tool_refusal(name: &str, arguments: &Value) -> Option<&'static Ref
         _ => {}
     }
     let action = arguments.get("action")?.as_str()?;
-    OWN_ACTIONS
-        .iter()
-        .find_map(|(flat, _, refusal)| (*flat == action).then_some(refusal))
+    OWN_ACTIONS.iter().find_map(|(flat, legacy, refusal)| {
+        (*flat == action && allows_row(legacy)).then_some(refusal)
+    })
 }
 
 pub(super) fn legacy_tool_refusal(name: &str) -> Option<&'static Refusal> {

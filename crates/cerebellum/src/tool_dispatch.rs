@@ -1448,7 +1448,7 @@ pub(super) async fn handle_tool_request_inner(
 
     #[cfg(windows)]
     if planes.enforce_windows_browser_refusals() {
-        if let Some(refusal) = windows_withheld::tool_refusal(name, arguments) {
+        if let Some(refusal) = windows_withheld::tool_dispatch_refusal(name, arguments) {
             return send_route_error(
                 writer,
                 ver,
