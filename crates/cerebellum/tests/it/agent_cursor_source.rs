@@ -170,8 +170,9 @@ fn display_capture_is_absent_and_the_probe_uses_production_single_window_capture
     // shipped module, not just in the historically used macos.rs file.
     let planted = source_scan::scratch_directory("display-capture-scan");
     std::fs::create_dir(planted.join("nested")).unwrap();
+    let planted_source = planted.join("nested").join("escaped.rs");
     std::fs::write(
-        planted.join("nested/escaped.rs"),
+        &planted_source,
         "fn capture() { SCContentFilter::initWithDisplay_excludingWindows(); }",
     )
     .unwrap();
@@ -180,10 +181,7 @@ fn display_capture_is_absent_and_the_probe_uses_production_single_window_capture
     std::fs::remove_dir_all(&planted).unwrap();
     assert_eq!(
         detected,
-        [planted
-            .join("nested/escaped.rs")
-            .to_string_lossy()
-            .into_owned()],
+        [planted_source.to_string_lossy().into_owned()],
         "planted display capture was invisible"
     );
 }

@@ -439,9 +439,15 @@ fn test_browser_spawns_cannot_bypass_the_headless_helper() {
     let mut failures = Vec::new();
     let mut scanned = 0;
     for file in files {
-        let relative = file.strip_prefix(crates).unwrap().to_str().unwrap();
+        // The allowlist uses repository-relative paths with `/` on every host.
+        let relative = file
+            .strip_prefix(crates)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .replace(std::path::MAIN_SEPARATOR, "/");
         if matches!(
-            relative,
+            relative.as_str(),
             "cerebellum/src/test_browser.rs" | "cerebellum/tests/it/tests_never_headed.rs"
         ) {
             continue;
@@ -455,7 +461,7 @@ fn test_browser_spawns_cannot_bypass_the_headless_helper() {
         };
         scanned += 1;
         failures.extend(
-            violations(relative, &source)
+            violations(&relative, &source)
                 .into_iter()
                 .map(|failure| format!("{relative}:{failure}")),
         );

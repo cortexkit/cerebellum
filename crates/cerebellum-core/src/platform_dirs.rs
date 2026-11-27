@@ -75,21 +75,24 @@ mod tests {
     /// `/home` prefix would fail the Windows shape).
     #[test]
     fn absolute_results_pass_through_unchanged() {
-        for absolute in [
+        #[cfg(not(windows))]
+        let paths = [
             "/home/op/.local/share",
             "/tmp/x/.config",
             "/Users/op/Library",
-        ] {
+        ];
+        #[cfg(windows)]
+        let paths = [
+            r"C:\Users\op\AppData\Roaming",
+            r"D:\Config",
+            r"\\server\share\config",
+        ];
+        for absolute in paths {
             assert_eq!(
                 absolute_or_none(absolute.to_string()),
                 Some(PathBuf::from(absolute))
             );
         }
-        #[cfg(windows)]
-        assert_eq!(
-            absolute_or_none(r"C:\Users\op\AppData\Roaming".to_string()),
-            Some(PathBuf::from(r"C:\Users\op\AppData\Roaming"))
-        );
     }
 
     /// The live call agrees with the callable on this host, which has a

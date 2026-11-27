@@ -1,4 +1,4 @@
-//! A narrow seam over Windows process, pipe and window primitives.
+//! A narrow seam over Windows process, pipe, window, and filesystem primitives.
 //!
 //! This crate exists so platform-neutral crates can keep their exact
 //! `#![forbid(unsafe_code)]` boundary. It reports raw operating-system readings
@@ -14,6 +14,8 @@
 mod accessibility;
 #[cfg(windows)]
 mod devtools_pipe;
+#[cfg(windows)]
+mod file_identity;
 #[cfg(any(target_os = "windows", test))]
 mod session;
 #[cfg(target_os = "windows")]
@@ -32,6 +34,8 @@ pub use accessibility::{
 };
 #[cfg(windows)]
 pub use devtools_pipe::{spawn_with_devtools_pipe, DevToolsPipeReader, DevToolsProcess};
+#[cfg(windows)]
+pub use file_identity::{file_identity, FileIdentity};
 #[cfg(target_os = "windows")]
 pub use token_facts::{
     current_process_token_elevation_type, current_process_token_facts, TokenElevationType,

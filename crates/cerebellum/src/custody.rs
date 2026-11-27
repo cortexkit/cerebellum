@@ -707,9 +707,24 @@ mod capture_user_data_dir_tests {
         capture_user_data_dir_admitted(arguments, Path::new(ROOT), Path::new(FRESH))
     }
 
+    // Capture launches admit POSIX paths; the agent browser is withheld on Windows.
+    #[cfg(unix)]
     #[test]
     fn exactly_the_fresh_directory_is_admitted() {
         assert!(admitted(&arguments(FRESH)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn even_the_exact_native_path_is_refused_on_windows() {
+        let root = Path::new(r"C:\Capture");
+        let fresh = root.join("profile-1");
+        assert!(fresh.is_absolute());
+        assert!(!capture_user_data_dir_admitted(
+            &arguments(fresh.to_str().unwrap()),
+            root,
+            &fresh,
+        ));
     }
 
     #[test]

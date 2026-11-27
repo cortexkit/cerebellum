@@ -4,7 +4,7 @@
 //! Records are monotonic: signing out does not erase a previously observed login.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -403,9 +403,12 @@ impl SignedInDomains {
                 .map_err(|e| e.to_string())?;
             drop(file);
             fs::rename(&temporary, path).map_err(|e| e.to_string())?;
-            File::open(directory)
+            // Windows cannot flush the directory through std::fs::File.
+            #[cfg(not(windows))]
+            fs::File::open(directory)
                 .and_then(|file| file.sync_all())
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            Ok(())
         })();
         if written.is_err() {
             let _ = fs::remove_file(temporary);
@@ -417,6 +420,25 @@ impl SignedInDomains {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_persists_and_reopens_login_evidence() {
+        let scratch = cortexkit_test_support::ScratchDir::new("windows-signed-in-domains");
+        let path = scratch.join(FILE_NAME);
+        let store = SignedInDomains::open(path.clone());
+        store
+            .initialize_profile("agent", "default", "fresh", true)
+            .unwrap();
+        assert!(!store.has_login_evidence("agent", "default"));
+        store
+            .record("agent", "default", "https://example.com")
+            .unwrap();
+        drop(store);
+        let reopened = SignedInDomains::open(path);
+        assert!(reopened.is_signed_in("agent", "default", "https://example.com"));
+        assert!(!reopened.is_signed_in("agent", "default", "https://example.org"));
+    }
 
     #[test]
     fn login_domains_use_private_psl_boundaries_and_ignore_ports() {

@@ -377,6 +377,8 @@ async fn export_served_flat_tools() {
     let _ = fs::remove_dir_all(root);
 }
 
+// This compares a live browser_use registration, which only macOS and Linux serve.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test]
 async fn live_daemon_catalog_preserves_registered_flat_definition() {
     let Some(home) = managed_settings::fenced_home(
@@ -438,6 +440,39 @@ async fn live_daemon_catalog_preserves_registered_flat_definition() {
         serde_json::to_vec(&answer.tools[0].input_schema).unwrap(),
         serde_json::to_vec(&flat.schema).unwrap()
     );
+    drop(client);
+    daemon.stop();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn live_daemon_catalog_omits_the_agent_browser_on_windows() {
+    let Some(home) = managed_settings::fenced_home(
+        "tool_provider::live_daemon_catalog_omits_the_agent_browser_on_windows",
+        HANG_GUARD,
+    )
+    .await
+    else {
+        return;
+    };
+    let (mut daemon, connection) = start_live_daemon_with_browser(true, Some(home)).await;
+    let mut client = connect_client(&connection).await;
+    let ClientControlResponse::CatalogList { modules, .. } =
+        wait_for_cerebellum_catalog(&mut client).await
+    else {
+        panic!("expected catalog");
+    };
+    let module = modules
+        .iter()
+        .find(|module| module.module_id == MODULE_ID)
+        .unwrap();
+    for role in &module.roles {
+        if let ProviderRole::ToolProvider { tools, .. } = role {
+            assert!(tools
+                .iter()
+                .all(|tool| { tool.name != "browser_use" && !tool.name.starts_with("browser.") }));
+        }
+    }
     drop(client);
     daemon.stop();
 }

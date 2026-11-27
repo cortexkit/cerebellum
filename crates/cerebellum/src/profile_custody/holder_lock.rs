@@ -1,6 +1,8 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, Read, Write};
+#[cfg(not(windows))]
+use std::io::Read;
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -737,7 +739,10 @@ where
 
     pub fn mint_holder(&self) -> Result<HolderId, ProfileCustodyLockError> {
         let mut entropy = [0_u8; 32];
+        #[cfg(not(windows))]
         File::open("/dev/urandom")?.read_exact(&mut entropy)?;
+        #[cfg(windows)]
+        getrandom::getrandom(&mut entropy).map_err(|error| io::Error::other(error.to_string()))?;
         Ok(HolderId(format!("holder-{}", hex(&entropy))))
     }
 
@@ -1059,8 +1064,16 @@ fn replace_record(
     sync_directory(root)
 }
 
+#[cfg(not(windows))]
 fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    // The custody record is flushed before the rename. Windows cannot flush
+    // its parent directory through std::fs::File.
+    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {

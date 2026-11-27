@@ -137,3 +137,19 @@ jobs:
       - name: Test suite, one process per test
         if: ${{ !cancelled() }}
         run: cargo nextest run --workspace
+
+  test-windows:
+    name: Test (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    # A cold native workspace run takes about 22 minutes. Leave room for
+    # slower runners without letting a wedged test consume hours.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Native Rust workspace tests
+        run: cargo test --locked --workspace --no-fail-fast
