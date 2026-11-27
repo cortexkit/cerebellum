@@ -658,6 +658,19 @@ pub struct HeldManagedRoot {
     identity: StableIdentity,
 }
 
+fn open_directory_handle(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // CreateFileW requires this flag for directory handles, even for read access.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    options.open(path)
+}
+
 impl HeldManagedRoot {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RootError> {
         let supplied = path.as_ref();
@@ -669,7 +682,7 @@ impl HeldManagedRoot {
             return Err(RootError::NotDirectory);
         }
         let canonical = fs::canonicalize(supplied)?;
-        let handle = OpenOptions::new().read(true).open(&canonical)?;
+        let handle = open_directory_handle(&canonical)?;
         let metadata = handle.metadata()?;
         if !metadata.is_dir() {
             return Err(RootError::NotDirectory);
@@ -742,6 +755,9 @@ impl HeldManagedRoot {
         }
         let parent = target.parent().ok_or(RootError::InvalidTarget)?;
         if create {
+            #[cfg(windows)]
+            cerebellum_core::private_fs::create_dir_all(parent)?;
+            #[cfg(not(windows))]
             fs::create_dir_all(parent)?;
         }
         let canonical_parent = fs::canonicalize(parent)?;
@@ -771,7 +787,7 @@ impl HeldManagedRoot {
         if !self.contained(&canonical) {
             return Err(RootError::OutsideRoot);
         }
-        let handle = OpenOptions::new().read(true).open(&canonical)?;
+        let handle = open_directory_handle(&canonical)?;
         let identity = stable_identity(&handle.metadata()?);
         Ok(TargetHandle {
             path: canonical,

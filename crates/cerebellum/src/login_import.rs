@@ -1192,17 +1192,14 @@ struct PrivateTempDir {
 
 impl PrivateTempDir {
     fn new(label: &str) -> io::Result<Self> {
-        let root = std::env::temp_dir();
+        Self::new_in(&std::env::temp_dir(), label)
+    }
+
+    fn new_in(root: &Path, label: &str) -> io::Result<Self> {
         for _ in 0..32 {
-            let path = unique_path(&root, &format!("ck-login-import-{label}"));
-            match fs::create_dir(&path) {
-                Ok(()) => {
-                    if let Err(error) = set_private_directory_permissions(&path) {
-                        let _ = fs::remove_dir_all(&path);
-                        return Err(error);
-                    }
-                    return Ok(Self { path });
-                }
+            let path = unique_path(root, &format!("ck-login-import-{label}"));
+            match create_private_temp_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
@@ -1235,24 +1232,36 @@ fn unique_path(parent: &Path, prefix: &str) -> PathBuf {
 
 fn copy_private(source: &Path, destination: &Path) -> io::Result<()> {
     let mut source_file = OpenOptions::new().read(true).open(source)?;
+    #[cfg(windows)]
+    let mut destination_file = cerebellum_core::private_fs::create_new_file(destination)?;
+    #[cfg(not(windows))]
     let mut destination_file = OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(destination)?;
     io::copy(&mut source_file, &mut destination_file)?;
     destination_file.sync_all()?;
+    #[cfg(unix)]
     set_private_file_permissions(destination)?;
     Ok(())
 }
 
-#[cfg(unix)]
-fn set_private_directory_permissions(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+#[cfg(windows)]
+fn create_private_temp_dir(path: &Path) -> io::Result<()> {
+    cerebellum_core::private_fs::create_dir(path)
 }
 
-#[cfg(not(unix))]
-fn set_private_directory_permissions(_path: &Path) -> io::Result<()> {
+#[cfg(not(windows))]
+fn create_private_temp_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
+            let _ = fs::remove_dir_all(path);
+            return Err(error);
+        }
+    }
     Ok(())
 }
 
@@ -1260,11 +1269,6 @@ fn set_private_directory_permissions(_path: &Path) -> io::Result<()> {
 fn set_private_file_permissions(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1275,6 +1279,27 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::browser_session::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn login_import_scratch_and_copies_have_protected_owner_only_dacls() {
+        use cortexkit_lease::test_support::{
+            assert_broad_inherited, assert_owner_only, grant_everyone,
+        };
+
+        let parent = PrivateTempDir::new("acl-test").unwrap();
+        grant_everyone(parent.path());
+        let source = parent.path().join("inherited-control");
+        fs::write(&source, b"fixture").unwrap();
+        assert_broad_inherited(&source);
+
+        let scratch = PrivateTempDir::new_in(parent.path(), "child").unwrap();
+        assert_owner_only(scratch.path(), true, true);
+        let copy = scratch.path().join("Cookies");
+        copy_private(&source, &copy).unwrap();
+        assert_owner_only(&copy, false, true);
+        assert_eq!(fs::read(&copy).unwrap(), b"fixture");
+    }
 
     struct ImportProcess(Arc<Mutex<Vec<&'static str>>>);
     impl OwnedBrowserProcess for ImportProcess {

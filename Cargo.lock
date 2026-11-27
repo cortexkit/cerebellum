@@ -369,6 +369,7 @@ dependencies = [
  "cortexkit-bus-nats",
  "cortexkit-doctor",
  "cortexkit-doctor-conformance",
+ "cortexkit-lease",
  "cortexkit-paths",
  "cortexkit-resource-busy",
  "cortexkit-role-agent-data",
