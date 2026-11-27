@@ -16,6 +16,8 @@ mod accessibility;
 mod devtools_pipe;
 #[cfg(any(target_os = "windows", test))]
 mod session;
+#[cfg(target_os = "windows")]
+mod token_facts;
 #[cfg(any(target_os = "windows", test))]
 mod window_list;
 #[cfg(target_os = "windows")]
@@ -30,6 +32,11 @@ pub use accessibility::{
 };
 #[cfg(windows)]
 pub use devtools_pipe::{spawn_with_devtools_pipe, DevToolsPipeReader, DevToolsProcess};
+#[cfg(target_os = "windows")]
+pub use token_facts::{
+    current_process_token_elevation_type, current_process_token_facts, TokenElevationType,
+    TokenFacts,
+};
 #[cfg(target_os = "windows")]
 pub use windows::{
     current_session_provenance, enumerate_top_level_windows, enumerated_window_visibility,

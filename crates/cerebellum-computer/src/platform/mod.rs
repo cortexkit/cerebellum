@@ -219,6 +219,16 @@ pub struct StartupCapabilityProbe {
     pub os_major: u16,
     pub private_envelope_recognized: bool,
     pub permissions: PermissionLivenessReport,
+    pub windows_elevation: WindowsElevation,
+}
+
+/// Windows reads both the elevation flag and the mandatory integrity level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WindowsElevation {
+    Medium,
+    ElevatedOrAboveMedium,
+    #[default]
+    UnreadableOrBelowMedium,
 }
 
 /// Immutable release inputs are optional until release binding. External values
@@ -234,6 +244,14 @@ pub struct ImmutableReleaseInputs {
     pub capture_review_revision: Option<String>,
     pub semantic_actuation_review_revision: Option<String>,
     pub windows_actuation_review_revision: Option<String>,
+    pub windows_app_identity_review_revision: Option<String>,
+    pub windows_app_state_review_revision: Option<String>,
+    pub windows_app_launch_review_revision: Option<String>,
+    pub windows_capture_review_revision: Option<String>,
+    pub windows_fronting_review_revision: Option<String>,
+    pub windows_element_addressed_review_revision: Option<String>,
+    pub windows_input_bracket_review_revision: Option<String>,
+    pub windows_takeover_review_revision: Option<String>,
     /// The review of `computer.read_state`: the application-state tree, its
     /// element ids, and its window image.
     pub app_state_review_revision: Option<String>,

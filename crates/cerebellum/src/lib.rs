@@ -113,6 +113,7 @@ pub mod profile;
 pub mod profile_custody;
 pub mod public_suffix;
 mod registration;
+mod release_inputs;
 #[cfg(test)]
 mod result_negotiation_tests;
 #[cfg(test)]
@@ -161,6 +162,7 @@ use crate::management::ManagementPlane;
 use crate::management_bounds::{
     close_idle_for_import_off_task, on_call_blocking_pool, spawn_handoff_poll, HandoffSettle,
 };
+use crate::release_inputs::compiled_release_inputs;
 use cerebellum_core::identity::RouteSurface;
 use socket2::{SockRef, TcpKeepalive};
 use subc_protocol::session::{
@@ -1237,104 +1239,6 @@ fn computer_permission_readings(
     Ok((Vec::new(), None))
 }
 
-/// Collect the release attestations supplied to the compiler and derive the
-/// vocabulary mirrors from their independent checked-in sources.
-///
-/// External identifiers use `option_env!` so a release invocation must
-/// supply each attestation before compilation. Starting a binary with a new
-/// environment value cannot manufacture a review after the binary was built.
-fn compiled_release_inputs() -> ComputerReleaseInputs {
-    let semantic_actuation_review_revision =
-        option_env!("CEREBELLUM_SEMANTIC_ACTUATION_REVIEW_REVISION");
-    let windows_actuation_review_revision =
-        option_env!("CEREBELLUM_WINDOWS_ACTUATION_REVIEW_REVISION");
-    let app_state_review_revision = option_env!("CEREBELLUM_APP_STATE_REVIEW_REVISION");
-    let element_addressed_review_revision =
-        option_env!("CEREBELLUM_ELEMENT_ADDRESSED_REVIEW_REVISION");
-    let takeover_dispatch_review_revision =
-        option_env!("CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION");
-    let app_use_fronting_review_revision =
-        option_env!("CEREBELLUM_APP_USE_FRONTING_REVIEW_REVISION");
-    let release_signing_topology_revision =
-        option_env!("CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION");
-    release_inputs_from_build_bindings(BuildReleaseBindings {
-        attendance_contract_owner: option_env!("CEREBELLUM_ATTENDANCE_CONTRACT_OWNER"),
-        attendance_contract_revision: option_env!("CEREBELLUM_ATTENDANCE_CONTRACT_REVISION"),
-        input_review_revision: option_env!("CEREBELLUM_INPUT_REVIEW_REVISION"),
-        global_dispatch_review_revision: option_env!("CEREBELLUM_GLOBAL_DISPATCH_REVIEW_REVISION"),
-        capture_review_revision: option_env!("CEREBELLUM_CAPTURE_REVIEW_REVISION"),
-        semantic_actuation_review_revision,
-        windows_actuation_review_revision,
-        app_state_review_revision,
-        element_addressed_review_revision,
-        takeover_dispatch_review_revision,
-        takeover_pointer_fronting_review_revision: option_env!(
-            "CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION"
-        ),
-        app_use_fronting_review_revision,
-        release_signing_topology_revision,
-    })
-}
-
-struct BuildReleaseBindings<'a> {
-    attendance_contract_owner: Option<&'a str>,
-    attendance_contract_revision: Option<&'a str>,
-    input_review_revision: Option<&'a str>,
-    global_dispatch_review_revision: Option<&'a str>,
-    capture_review_revision: Option<&'a str>,
-    semantic_actuation_review_revision: Option<&'a str>,
-    windows_actuation_review_revision: Option<&'a str>,
-    app_state_review_revision: Option<&'a str>,
-    element_addressed_review_revision: Option<&'a str>,
-    takeover_dispatch_review_revision: Option<&'a str>,
-    takeover_pointer_fronting_review_revision: Option<&'a str>,
-    app_use_fronting_review_revision: Option<&'a str>,
-    release_signing_topology_revision: Option<&'a str>,
-}
-
-fn release_inputs_from_build_bindings(bindings: BuildReleaseBindings<'_>) -> ComputerReleaseInputs {
-    let computed_vocabulary_digest = computer::platform::computed_vocabulary_sha256();
-    ComputerReleaseInputs {
-        attendance_contract_owner: bindings.attendance_contract_owner.map(str::to_owned),
-        attendance_contract_revision: bindings.attendance_contract_revision.map(str::to_owned),
-        input_review_revision: bindings.input_review_revision.map(str::to_owned),
-        global_dispatch_review_revision: bindings
-            .global_dispatch_review_revision
-            .map(str::to_owned),
-        capture_review_revision: bindings.capture_review_revision.map(str::to_owned),
-        semantic_actuation_review_revision: bindings
-            .semantic_actuation_review_revision
-            .map(str::to_owned),
-        windows_actuation_review_revision: bindings
-            .windows_actuation_review_revision
-            .map(str::to_owned),
-        app_state_review_revision: bindings.app_state_review_revision.map(str::to_owned),
-        element_addressed_review_revision: bindings
-            .element_addressed_review_revision
-            .map(str::to_owned),
-        takeover_dispatch_review_revision: bindings
-            .takeover_dispatch_review_revision
-            .map(str::to_owned),
-        takeover_pointer_fronting_review_revision: bindings
-            .takeover_pointer_fronting_review_revision
-            .map(str::to_owned),
-        app_use_fronting_review_revision: bindings
-            .app_use_fronting_review_revision
-            .map(str::to_owned),
-        release_signing_topology_revision: bindings
-            .release_signing_topology_revision
-            .map(str::to_owned),
-        vocabulary_digests: computer::platform::VocabularyDigestInputs {
-            // The manifest and computed-artifact mirrors are recalculated from
-            // the frozen vocabulary, while the source-lock digest comes from its
-            // separate checked-in file. Each is compared with its expected digest.
-            manifest_digest: Some(computed_vocabulary_digest.clone()),
-            source_lock_digest: computer::platform::implementation_source_lock_digest(),
-            computed_artifact_digest: Some(computed_vocabulary_digest),
-        },
-    }
-}
-
 /// Whether the build carries an attestation that release evidence reports as
 /// passing. An empty value or a stand-in such as "placeholder" binds nothing,
 /// exactly as the release gate reports it.
@@ -1452,6 +1356,10 @@ fn probe_computer_context() -> ComputerCapabilityAdvertisementContext {
         permissions: PermissionLivenessReport::from_results(permission_results),
         ..Default::default()
     };
+    #[cfg(target_os = "windows")]
+    {
+        startup.windows_elevation = computer::platform::WindowsElevation::read_current_process();
+    }
     if probe_panicked {
         startup.permissions = PermissionLivenessReport::probe_failed();
     }

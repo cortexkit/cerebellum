@@ -14,6 +14,28 @@ use std::collections::BTreeMap;
 pub const WINDOWS_ACTUATION_UNREVIEWED: &str = "windows_actuation_unreviewed";
 const UIA_ROLE_PREFIX: &str = "uia_control_type:";
 
+impl WindowsElevation {
+    /// Read this process's primary token without prompting for elevation.
+    #[cfg(target_os = "windows")]
+    pub fn read_current_process() -> Self {
+        Self::from_token_reading(
+            cerebellum_windows::current_process_token_facts()
+                .map(|facts| (facts.elevated, facts.integrity_rid)),
+        )
+    }
+
+    fn from_token_reading(reading: Option<(bool, u32)>) -> Self {
+        // SECURITY_MANDATORY_MEDIUM_RID. Medium-plus is not the same level.
+        const MEDIUM_RID: u32 = 0x2000;
+        match reading {
+            Some((true, _)) => Self::ElevatedOrAboveMedium,
+            Some((false, rid)) if rid > MEDIUM_RID => Self::ElevatedOrAboveMedium,
+            Some((false, MEDIUM_RID)) => Self::Medium,
+            _ => Self::UnreadableOrBelowMedium,
+        }
+    }
+}
+
 /// A capture backend whose type makes Windows capture absence explicit.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsUnsupportedCaptureBackend;
@@ -1168,6 +1190,7 @@ mod tests {
                 source_lock_digest: Some(digest.clone()),
                 computed_artifact_digest: Some(digest),
             },
+            ..Default::default()
         }
     }
 
@@ -1178,6 +1201,7 @@ mod tests {
             permissions: permissions.clone(),
             startup: StartupCapabilityProbe {
                 permissions,
+                windows_elevation: WindowsElevation::Medium,
                 ..Default::default()
             },
         }
@@ -1198,6 +1222,54 @@ mod tests {
             advertised(&context(fully_bound_inputs())),
             vec!["computer.wait"]
         );
+    }
+
+    #[test]
+    fn legacy_wait_does_not_require_signing_topology_or_medium_integrity() {
+        let inputs = ImmutableReleaseInputs {
+            windows_actuation_review_revision: Some("fixture-windows-actuation".into()),
+            vocabulary_digests: fully_bound_inputs().vocabulary_digests,
+            ..Default::default()
+        };
+        let mut reviewed = context(inputs);
+        let mut unbound = context(ImmutableReleaseInputs::default());
+        for elevation in [
+            WindowsElevation::Medium,
+            WindowsElevation::ElevatedOrAboveMedium,
+            WindowsElevation::UnreadableOrBelowMedium,
+        ] {
+            reviewed.startup.windows_elevation = elevation;
+            unbound.startup.windows_elevation = elevation;
+            assert_eq!(
+                advertised(&reviewed),
+                vec!["computer.wait"],
+                "{elevation:?}"
+            );
+            assert!(advertised(&unbound).is_empty(), "{elevation:?}");
+        }
+    }
+
+    #[test]
+    fn windows_elevation_requires_a_readable_non_elevated_medium_token() {
+        use WindowsElevation::{ElevatedOrAboveMedium, Medium, UnreadableOrBelowMedium};
+        assert_eq!(
+            StartupCapabilityProbe::default().windows_elevation,
+            UnreadableOrBelowMedium
+        );
+        for (reading, expected) in [
+            (Some((false, 0x2000)), Medium),
+            (Some((true, 0x2000)), ElevatedOrAboveMedium),
+            (Some((false, 0x2100)), ElevatedOrAboveMedium),
+            (Some((false, 0x3000)), ElevatedOrAboveMedium),
+            (Some((false, 0x1000)), UnreadableOrBelowMedium),
+            (None, UnreadableOrBelowMedium),
+        ] {
+            assert_eq!(
+                WindowsElevation::from_token_reading(reading),
+                expected,
+                "{reading:?}"
+            );
+        }
     }
 
     #[test]

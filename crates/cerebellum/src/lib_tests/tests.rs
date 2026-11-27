@@ -435,6 +435,7 @@ fn probe_refused_browser_surface_hides_tools_and_discloses_probe_reason() {
 }
 
 use super::*;
+use crate::release_inputs::{release_inputs_from_build_bindings, BuildReleaseBindings};
 use cerebellum_computer::platform::TargetResolution;
 use subc_protocol::Principal;
 
@@ -3737,6 +3738,7 @@ fn build_bindings_preserve_absence_and_bind_only_the_supplied_capture_review() {
         takeover_pointer_fronting_review_revision: None,
         app_use_fronting_review_revision: None,
         release_signing_topology_revision: None,
+        ..Default::default()
     });
     assert_eq!(
         inputs,
@@ -3765,6 +3767,7 @@ fn build_bindings_preserve_absence_and_bind_only_the_supplied_capture_review() {
                     computer::platform::COMPUTER_ACTION_VOCABULARY_SHA256.to_string(),
                 ),
             },
+            ..Default::default()
         }
     );
 }
@@ -3819,6 +3822,7 @@ fn struck_gates_remain_recorded_and_are_not_evaluated() {
             takeover_pointer_fronting_review_revision: Some("fixture-pointer-fronting-review"),
             app_use_fronting_review_revision: Some("fixture-app-use-fronting-review"),
             release_signing_topology_revision: Some("fixture-signing-topology"),
+            ..Default::default()
         }),
         permissions: Default::default(),
         startup: StartupCapabilityProbe::default(),
@@ -4227,6 +4231,7 @@ fn fully_bound_release_bindings() -> BuildReleaseBindings<'static> {
         takeover_pointer_fronting_review_revision: Some("fixture-pointer-fronting-review"),
         app_use_fronting_review_revision: Some("fixture-app-use-fronting-review"),
         release_signing_topology_revision: Some("fixture-signing-topology"),
+        ..Default::default()
     }
 }
 
@@ -4444,6 +4449,7 @@ fn the_release_gate_holds_the_takeover_rows_to_both_reviews() {
                 takeover_pointer_fronting_review_revision: Some("fixture-pointer-review"),
                 app_use_fronting_review_revision: Some("fixture-app-use-fronting-review"),
                 release_signing_topology_revision: Some("fixture-signing-topology"),
+                ..Default::default()
             }),
             permissions: Default::default(),
             startup: StartupCapabilityProbe::default(),

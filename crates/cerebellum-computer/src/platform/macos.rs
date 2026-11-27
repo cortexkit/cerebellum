@@ -81,6 +81,7 @@ impl StartupCapabilityProbe {
             os_major: input.os_major,
             private_envelope_recognized: envelope.run(input),
             permissions,
+            ..Default::default()
         }
     }
 }
@@ -2832,6 +2833,7 @@ mod tests {
                 source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
                 computed_artifact_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
             },
+            ..Default::default()
         }
     }
 
@@ -3020,6 +3022,7 @@ mod tests {
                     source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
                     computed_artifact_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
                 },
+                ..Default::default()
             },
             permissions: PermissionLivenessReport::default(),
             startup: driver.startup_probe().clone(),
@@ -3067,6 +3070,7 @@ mod tests {
                     source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
                     computed_artifact_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
                 },
+                ..Default::default()
             },
             permissions: PermissionLivenessReport::probe_failed(),
             startup,
