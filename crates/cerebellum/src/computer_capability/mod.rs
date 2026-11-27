@@ -635,6 +635,8 @@ where
     /// screen happens to be locked while they run.
     #[cfg(test)]
     session_lock_for_test: Option<Option<bool>>,
+    #[cfg(all(test, target_os = "windows"))]
+    pub(crate) wire_dispatch_for_test: bool,
 }
 
 impl<B, R, T, S> ComputerPlane<B, R, T, S, UnsupportedPlatformDriver>
@@ -742,6 +744,8 @@ where
             app_use_seen_for_test: StdMutex::new(Vec::new()),
             #[cfg(test)]
             session_lock_for_test: None,
+            #[cfg(all(test, target_os = "windows"))]
+            wire_dispatch_for_test: false,
         }
     }
 
@@ -771,6 +775,14 @@ where
     #[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
     pub(crate) fn with_session_lock_for_test(mut self, state: Option<bool>) -> Self {
         self.session_lock_for_test = Some(state);
+        self
+    }
+
+    /// Let a scripted plane serve the rows its wire fixture admits even though
+    /// Windows has no native app identity reader. This does not admit any rows.
+    #[cfg(all(test, target_os = "windows"))]
+    pub(crate) fn with_wire_dispatch_for_test(mut self) -> Self {
+        self.wire_dispatch_for_test = true;
         self
     }
 
