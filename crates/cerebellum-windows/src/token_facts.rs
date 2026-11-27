@@ -59,7 +59,7 @@ pub fn current_process_token_facts() -> Option<TokenFacts> {
 
 impl RetainedProcessHandle {
     pub fn token_facts(&self) -> Option<TokenFacts> {
-        token_facts(Token::from_process(self.handle)?)
+        token_facts(Token::from_process(self.raw_handle())?)
     }
 }
 

@@ -148,6 +148,8 @@ pub use operator_apps::{ExecutableReader, ProgramLocationUnreadable};
 #[cfg(test)]
 mod permission_tests;
 mod permissions;
+#[cfg(any(target_os = "linux", windows))]
+mod platform_precheck;
 mod press_reply_windows;
 mod preview;
 mod preview_call;
@@ -1048,41 +1050,9 @@ where
         // served row that returns pixels.
         make_backend: impl FnOnce(&cerebellum_computer::platform::ProcessGrant) -> B,
     ) -> Result<Value, CapabilityResultValidationError> {
-        #[cfg(target_os = "linux")]
-        if let Some(session) = &self.linux_session {
-            if let Some(reply) = session.refusal(capability.capability()).await {
-                return self.finish_reply(
-                    capability.capability(),
-                    serialize::refused_in_queue(capability, reply),
-                );
-            }
-        }
-        #[cfg(windows)]
-        if matches!(capability.0, Served::Wait) {
-            #[cfg(test)]
-            let admitted = self.windows_app_state_for_test.is_some();
-            #[cfg(not(test))]
-            let admitted = false;
-            if !admitted {
-                if let Ok(parsed) = parse_wait_request(arguments) {
-                    if parsed.predicate.readback_attribute()
-                        == cerebellum_computer::platform::AccessibilityReadbackAttribute::Value
-                    {
-                        return self.finish_reply(
-                            capability.capability(),
-                            wait_wire_reply(WaitResult {
-                                outcome: WaitOutcome::Indeterminate,
-                                evidence: WaitEvidence::Indeterminate {
-                                    predicate: parsed.predicate,
-                                    readback: None,
-                                    reason: "scoped_read_unsupported".to_owned(),
-                                },
-                                attempts: 0,
-                            }),
-                        );
-                    }
-                }
-            }
+        #[cfg(any(target_os = "linux", windows))]
+        if let Some(reply) = self.platform_precheck(capability, arguments).await {
+            return self.finish_reply(capability.capability(), reply);
         }
         let settings = self.app_use.settings_for_call();
         let app_use = self.app_use.approved_mode(settings, &context.cancel).await;

@@ -6,6 +6,8 @@ use super::disclaimed_binary_paths::{tokens, Token, TokenKind};
 use super::support::source_scan;
 use std::path::{Path, PathBuf};
 
+const BRIDGE_PROCESS_TEST: &str = "cerebellum/src/user_browser_bridge/linux/tests/process.rs";
+
 fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(directory).expect("read browser test sources") {
         let path = entry.expect("source entry").path();
@@ -273,6 +275,97 @@ fn preview_skip_relocation(before: &[Token], binding: usize, expression: &[&str]
             .any(|w| w == copy)
 }
 
+fn token_positions<'a>(words: &'a [Token], snippet: &str) -> impl Iterator<Item = usize> + 'a {
+    let pattern = tokens(snippet);
+    words
+        .windows(pattern.len())
+        .enumerate()
+        .filter_map(move |(index, window)| {
+            window
+                .iter()
+                .zip(&pattern)
+                .all(|(actual, expected)| {
+                    actual.kind == expected.kind && actual.text == expected.text
+                })
+                .then_some(index)
+        })
+}
+
+fn linux_bridge_fixture_spawn(words: &[Token], command: usize) -> bool {
+    let has = |snippet| token_positions(words, snippet).next().is_some();
+    match words.get(command + 4).map(|word| word.text.as_str()) {
+        // The parent and client re-exec only copies of the test binary, not a
+        // browser. Check both launch sites, including the client path handed
+        // down by the parent-launching test via CK_FIXTURE_CLIENT.
+        Some("image") => {
+            token_positions(words, "Command::new(image)").eq([command])
+                && token_positions(words, "fixture_command").count() == 3
+                && token_positions(words, ".connect(").count() == 5
+                && token_positions(words, "fixture.connect(&fixture.host, true)").count() == 3
+                && has("fixture.connect(&fixture.host, false)")
+                && has(r#"
+                    fn fixture_command(image: impl AsRef<std::ffi::OsStr>) -> Command {
+                        let mut command = Command::new(image);
+                        command.args(["--exact", FIXTURE, "--ignored", "--nocapture"]).stdout(Stdio::null());
+                        command
+                    }
+                "#)
+                && has(r#"
+                    let variable = |name| std::env::var_os(name).expect("missing fixture input");
+                    if variable("CK_FIXTURE_ROLE") == "parent" {
+                        let status = fixture_command(variable("CK_FIXTURE_CLIENT"))
+                "#)
+                && has(r#"
+                    fixture_command(&self.parent)
+                        .env("CK_FIXTURE_ROLE", "parent")
+                        .env("CK_FIXTURE_CLIENT", image)
+                "#)
+                && has(r#"
+                    for image in [&fixture.unsigned, &fixture.parent, &fixture.invalid] {
+                        let mut peer = fixture.connect(image, true);
+                "#)
+                && has(r#"
+                    let unsigned = root.0.join("unsigned");
+                    fs::copy(std::env::current_exe().unwrap(), &unsigned).unwrap();
+                    let parent = copy_and_sign(&unsigned, "test-parent", "parent");
+                    let host = copy_and_sign(&unsigned, "host", "host");
+                    let invalid = root.0.join("invalid");
+                    fs::copy(&host, &invalid).unwrap();
+                "#)
+                && has("Self { root, parent, host, unsigned, invalid, }")
+                && has(r#"
+                    fn copy_and_sign(unsigned: &Path, role: &str, filename: &str) -> PathBuf {
+                        let destination = unsigned.with_file_name(filename);
+                        fs::copy(unsigned, &destination).unwrap();
+                "#)
+                && has(r#"
+                    assert!(result.status.success(), "signing fixture failed: {result:?}");
+                    destination
+                    }
+                "#)
+        }
+        // peer-trailer signs the fixture copies with the test key and exits;
+        // it is a release-signing CLI, not a browser. The fixture-specific
+        // override is for build servers that store it separately.
+        Some("signer") => {
+            token_positions(words, r#"Command::new(signer).args(["sign", "--test-key"]).arg(&destination)"#)
+                .eq([command])
+                && token_positions(words, "signer").count() == 2
+                && token_positions(&words[..command], r#"
+                    let signer = std::env::var_os("CK_BRIDGE_FIXTURE_SIGNER")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            std::env::current_exe().unwrap().ancestors()
+                                .map(|directory| directory.join("peer-trailer"))
+                                .find(|candidate| candidate.is_file())
+                                .expect("build peer-trailer in the same profile or set CK_BRIDGE_FIXTURE_SIGNER")
+                        });
+                "#).next().is_some()
+        }
+        _ => false,
+    }
+}
+
 fn violations(path: &str, source: &str) -> Vec<String> {
     let tokens = tokens(source);
     let mut found = Vec::new();
@@ -358,7 +451,9 @@ fn violations(path: &str, source: &str) -> Vec<String> {
         let name = if at(4) == Some("&") { at(5) } else { at(4) };
         let relocated_fixture =
             name.is_some_and(|name| fixture_binding(path, &tokens[..index], name));
-        if !fixed_cli && !self_reexec && !relocated_fixture {
+        let bridge_fixture =
+            path == BRIDGE_PROCESS_TEST && linux_bridge_fixture_spawn(&tokens, index);
+        if !fixed_cli && !self_reexec && !relocated_fixture && !bridge_fixture {
             found.push(format!(
                 "{}: Command executable must use a reviewed fixture or test_browser",
                 token.line
@@ -534,6 +629,56 @@ fn only_the_reviewed_preview_skip_self_binary_relocation_is_allowed() {
             violations(path, &planted).len(),
             1,
             "unreviewed binding escaped: {new}"
+        );
+    }
+}
+
+#[test]
+fn only_the_reviewed_linux_bridge_fixture_spawns_are_allowed() {
+    let source = include_str!("../../src/user_browser_bridge/linux/tests/process.rs");
+    assert_eq!(
+        violations(BRIDGE_PROCESS_TEST, source),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        violations("cerebellum/tests/unreviewed.rs", source).len(),
+        2
+    );
+
+    for (old, new) in [
+        ("fs::copy(std::env::current_exe()", "fs::copy(browser_exe()"),
+        (
+            "copy_and_sign(&unsigned, \"test-parent\"",
+            "copy_and_sign(&browser, \"test-parent\"",
+        ),
+        ("fixture_command(&self.parent)", "fixture_command(&browser)"),
+        (
+            "fixture.connect(&fixture.host, false)",
+            "fixture.connect(&browser, false)",
+        ),
+        (
+            ".env(\"CK_FIXTURE_CLIENT\", image)",
+            ".env(\"CK_FIXTURE_CLIENT\", browser)",
+        ),
+        (".join(\"peer-trailer\")", ".join(\"chrome\")"),
+        (
+            "var_os(\"CK_BRIDGE_FIXTURE_SIGNER\")",
+            "var_os(\"BROWSER\")",
+        ),
+        (
+            "let result = Command::new(signer)",
+            "let signer = browser; let result = Command::new(signer)",
+        ),
+        (
+            "let result = Command::new(signer)",
+            "Command::new(signer).spawn(); let result = Command::new(signer)",
+        ),
+    ] {
+        let planted = source.replace(old, new);
+        assert_ne!(source, planted, "control did not mutate {old}");
+        assert!(
+            !violations(BRIDGE_PROCESS_TEST, &planted).is_empty(),
+            "unreviewed launch escaped: {new}"
         );
     }
 }
