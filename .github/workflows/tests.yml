@@ -134,12 +134,14 @@ jobs:
         run: cargo nextest run --workspace
 
       - name: Native Linux app identity fixtures
-        if: ${{ !cancelled() && runner.os == 'Linux' && runner.environment == 'github-hosted' }}
+        if: ${{ !cancelled() }}
         timeout-minutes: 6
         shell: bash
         run: |
-          test "$GITHUB_ACTIONS" = true
-          test "$RUNNER_ENVIRONMENT" = github-hosted
+          if [[ ${GITHUB_ACTIONS:-} != true || ${RUNNER_ENVIRONMENT:-} != github-hosted ]]; then
+            echo 'Skipping privileged fixtures outside GitHub-hosted Ubuntu.'
+            exit 0
+          fi
           timeout 90s sudo -n apt-get update -q
           timeout 90s sudo -n apt-get install -qy --no-install-recommends rpm btrfs-progs
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT unshare --mount --propagation private --'

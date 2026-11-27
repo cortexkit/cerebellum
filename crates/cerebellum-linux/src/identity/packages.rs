@@ -353,10 +353,22 @@ fn rpm_db_files(dir: &File) -> Result<Vec<(OsString, ImageKey)>, Refusal> {
         if !metadata.is_file() || !protected(&metadata) {
             return Err(AppIdentityUnproven);
         }
-        files.push((name, image_key(&metadata)));
+        let stamp = rpm_file_stamp(&name, image_key(&metadata));
+        files.push((name, stamp));
     }
     files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
+}
+
+fn rpm_file_stamp(name: &OsStr, mut key: ImageKey) -> ImageKey {
+    if name == "rpmdb.sqlite-shm" {
+        // SQLite updates its shared-memory index and reader locks during a
+        // query. Keep exact stamps for the database and its write-ahead log,
+        // where package records live; still check this sidecar's identity and size.
+        key.mtime = (0, 0);
+        key.ctime = (0, 0);
+    }
+    key
 }
 
 fn query_rpm(root: &File, db: &Path) -> Result<Vec<u8>, Refusal> {
@@ -654,6 +666,47 @@ mod tests {
         assert!(rpm_record(b"Other\t8\n'/bin/other'\t\n", &paths)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn rpm_snapshot_distinguishes_sqlite_reader_bookkeeping_from_database_changes() {
+        let before = ImageKey {
+            dev: 8,
+            ino: 42,
+            size: 32768,
+            mtime: (10, 20),
+            ctime: (10, 20),
+        };
+        let after_read = ImageKey {
+            mtime: (10, 30),
+            ctime: (10, 30),
+            ..before
+        };
+        let shared_memory = OsStr::new("rpmdb.sqlite-shm");
+        assert_eq!(
+            rpm_file_stamp(shared_memory, before),
+            rpm_file_stamp(shared_memory, after_read),
+            "a query may update the SQLite read-lock index"
+        );
+        for filename in ["rpmdb.sqlite", "rpmdb.sqlite-wal", "Packages", "other-shm"] {
+            let path = OsStr::new(filename);
+            assert_ne!(
+                rpm_file_stamp(path, before),
+                rpm_file_stamp(path, after_read),
+                "{filename} must retain its timestamp evidence"
+            );
+        }
+        for changed in [
+            ImageKey { dev: 9, ..before },
+            ImageKey { ino: 43, ..before },
+            ImageKey { size: 0, ..before },
+        ] {
+            assert_ne!(
+                rpm_file_stamp(shared_memory, before),
+                rpm_file_stamp(shared_memory, changed),
+                "the shared-memory file must not be replaced or resized"
+            );
+        }
     }
 
     #[test]
