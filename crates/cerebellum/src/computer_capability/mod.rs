@@ -3600,8 +3600,8 @@ fn unknown_key_refusal(name: &str) -> Value {
 ///
 /// The table is lowercase-only, so the lookup lowercases first: that maps
 /// both the common aliases (`enter`, `cmd`, `down`) and a wrong-case
-/// accepted spelling (`Return`, `Command`). There is no `delete` entry in
-/// the wire table, so `del` gets no suggestion rather than a wrong one.
+/// accepted spelling (`Return`, `Command`). The wire table names the
+/// forward-delete key `forward_delete`, so `del` and `delete` point there.
 fn unknown_key_suggestion(name: &str) -> Option<String> {
     let lowered = name.to_lowercase();
     let alias = match lowered.as_str() {
@@ -3617,6 +3617,7 @@ fn unknown_key_suggestion(name: &str) -> Option<String> {
         "win" => Some("windows"),
         "pageup" => Some("page_up"),
         "pagedown" => Some("page_down"),
+        "del" | "delete" => Some("forward_delete"),
         _ => None,
     };
     if let Some(alias) = alias {
@@ -4322,6 +4323,11 @@ mod synthetic_parse_tests {
                 "pagedown",
                 r#"unknown key "pagedown"; use "page_down" instead."#,
             ),
+            ("del", r#"unknown key "del"; use "forward_delete" instead."#),
+            (
+                "delete",
+                r#"unknown key "delete"; use "forward_delete" instead."#,
+            ),
         ] {
             let refusal = parse(
                 ComputerCapability::Keys,
@@ -4342,11 +4348,10 @@ mod synthetic_parse_tests {
     }
 
     /// A name no lookup knows is refused as not a key name, pointing at the
-    /// tool description's key names rather than guessing. `del` has no
-    /// suggestion because the wire table has no `delete` entry.
+    /// tool description's key names rather than guessing.
     #[test]
     fn unknown_key_names_without_a_suggestion_say_so() {
-        for name in ["frobnicate", "del", "delete"] {
+        for name in ["frobnicate", "page-up"] {
             let refusal = parse(
                 ComputerCapability::Keys,
                 json!({"keys": [name], "target": "editor"}),
