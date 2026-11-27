@@ -55,7 +55,10 @@ for crate_dir in crates/*/; do
     sources_scanned=$((sources_scanned + 1))
     relative="${file#"$src"/}"
     case "$relative" in
-      lib.rs | main.rs) continue ;;
+      # Crate roots: the library, the default binary, and each Cargo-discovered
+      # binary in src/bin/ (a single file, or a folder's main.rs). Nothing
+      # declares them; Cargo builds them as their own crates.
+      lib.rs | main.rs | bin/*.rs) [[ "$relative" != bin/*/* || "$relative" == bin/*/main.rs ]] && continue ;;
     esac
 
     if [ "$(basename "$relative")" = "mod.rs" ]; then

@@ -43,6 +43,11 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "eprintln!(\"Usage: ck-cerebellum-native-host --register (macOS only)\");",
         "exact `--register` reports macOS-only usage instead of starting the relay",
     ),
+    (
+        "crates/cerebellum-bridge-protocol/src/bin/peer-trailer.rs",
+        "eprintln!(\"peer-trailer: {error}\");",
+        "a release-workflow signing tool, never started by the daemon; its one error line goes to the CI log",
+    ),
 ];
 
 #[test]
