@@ -123,6 +123,7 @@ async fn user_browser_retains_the_authorizing_row_and_rechecks_it_before_plan_di
         cancel: CancelHandle::pending(),
         connection: fixture.epoch,
         action: "navigate",
+        key: None,
     };
     let severity = Severity::new(3, false, false);
     crate::grant_enforcement::scope(CancelHandle::pending(), async {

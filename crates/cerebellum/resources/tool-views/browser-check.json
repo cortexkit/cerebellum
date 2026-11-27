@@ -21,6 +21,7 @@
           "scroll",
           "click",
           "type",
+          "press_key",
           "click_point",
           "fill_login",
           "open_grant",
@@ -99,6 +100,26 @@
         "description": "Short reason for the action, for policy and audit. Required for: navigate, click, click_point.",
         "type": "string"
       },
+      "key": {
+        "description": "Key to press. Required for: press_key.",
+        "enum": [
+          "enter",
+          "escape",
+          "tab",
+          "shift_tab",
+          "up",
+          "down",
+          "left",
+          "right",
+          "home",
+          "end",
+          "page_up",
+          "page_down",
+          "backspace",
+          "delete"
+        ],
+        "type": "string"
+      },
       "login_url": {
         "description": "Login page the person is handed; login is observed on its origin. Required for: capture_login.",
         "type": "string"
@@ -166,7 +187,7 @@
         "type": "boolean"
       },
       "ref": {
-        "description": "Element reference returned by the named snapshot. Required for: click, type.",
+        "description": "Element reference returned by the named snapshot. Required for: click, type, press_key.",
         "type": "string"
       },
       "role_filter": {
@@ -216,7 +237,7 @@
         "type": "integer"
       },
       "snapshot_id": {
-        "description": "Snapshot identifier that prevents acting on stale page data. Required for: click, click_point.",
+        "description": "Snapshot identifier that prevents acting on stale page data. Required for: click, press_key, click_point.",
         "type": "string"
       },
       "tab": {
@@ -492,6 +513,16 @@
     },
     {
       "input": {
+        "action": "press_key",
+        "key": "enter"
+      },
+      "record": {
+        "durationMs": 10,
+        "outcome": "success"
+      }
+    },
+    {
+      "input": {
         "action": "fill_login",
         "otp_ref": "otp",
         "password_ref": "pass",
@@ -544,7 +575,7 @@
         "profile": "tool_page",
         "reads": [],
         "schema": "occipital.template/1",
-        "source": "export const action = input.action == \"snapshot\" ? \"Read page\" : input.action == \"navigate\" ? \"Navigate\" : input.action == \"click\" || input.action == \"click_point\" ? \"Click\" : input.action == \"type\" ? \"Type\" : input.action == \"screenshot\" ? \"Screenshot\" : input.action == \"open_tab\" ? \"Open tab\" : input.action == \"claim_tab\" ? \"Use tab\" : input.action == \"fill_login\" ? \"Fill login\" : input.action == \"open_grant\" ? \"Request approval\" : input.action == \"present\" ? \"Sign in\" : input.action == \"resume\" ? \"Resume\" : input.action == \"import_login\" ? \"Import login\" : input.action == \"capture_login\" ? \"Save login\" : input.action == \"revoke_access\" ? \"Revoke access\" : input.action == \"launch\" ? \"Open browser\" : input.action == \"close\" ? \"Close browser\" : input.action == \"scroll\" ? \"Scroll\" : input.action == \"status\" ? \"Status\" : Replace(input.action, \"_\", \" \")\nexport const authority = Last(Split(First(Split(First(Split(First(Split(Last(Split(view.record.site ?? input.url ?? \"\", \"://\")), \"/\")), \"?\")), \"#\")), \"@\"))\nexport const host = StartsWith(authority, \"[\") ? First(Split(authority, \"]\")) + \"]\" : First(Split(authority, \":\"))\nexport const outcome = view.completion.outcome ?? view.record.outcome\nexport const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason\nexport const reasonText = reason == \"screen_locked\" ? \"Screen locked\" : reason == \"element_disabled\" ? \"Button disabled\" : reason == \"point_in_another_window\" ? \"Point in another window\" : reason == \"consent_declined\" ? \"Declined\" : reason == \"consent_expired\" ? \"Approval expired\" : reason == \"state_changed_by_person\" ? \"You were using the app\" : reason == \"operator_app_blocked\" ? \"App not allowed\" : reason == \"consent\" ? \"Approval asked\" : reason == \"login_handoff\" ? \"Not signed in\" : reason == \"scope_ended\" ? \"Run ended\" : reason == \"cancelled\" ? \"Cancelled\" : reason == \"outcome_unknown\" ? \"Outcome unknown\" : \"Another reason\"\nexport const status = outcome == \"held\" ? (reason == \"login_handoff\" ? \"Not signed in\" : \"Approval asked\") : outcome == \"error\" ? \"Refused\" : outcome == \"partial\" ? \"Outcome unknown\" : outcome == \"success\" ? \"Done\" : view.call.phase == \"running\" ? \"Running\" : \"No outcome kept\"\nexport const duration = view.completion.durationMs ?? view.record.durationMs\nexport const queued = view.completion.queuedMs ?? view.record.queuedMs ?? 0\nexport const held = view.completion.heldMs ?? view.record.heldMs ?? 0\n\n<CardHeader title={action} subtitle={host} />\n<Card appearance=\"clear\" gap=\"xs\">\n<TextContent text={\"Outcome: \" + status} size=\"small\" />\n{reason == null ? null : <TextContent text={\"Reason: \" + reasonText} size=\"small\" />}\n{reason != null && reasonText == \"Another reason\" ? <Styled tone=\"muted\">{reason}</Styled> : null}\n{duration == null ? (view.call.phase == \"running\" ? <Elapsed start={view.call.startedAtMs ?? now} /> : null) : <TextContent text={\"Duration: \" + FormatDuration(duration)} size=\"small\" />}\n{queued > 0 ? <TextContent text={\"Waited in line: \" + FormatDuration(queued)} size=\"small\" /> : null}\n{held > 0 ? <TextContent text={\"Waited for you: \" + FormatDuration(held)} size=\"small\" /> : null}\n</Card>\n\n{input.action == \"type\" ? <CardHeader title=\"Typed text\" /> : null}\n{input.action == \"type\" ? <CodeBlock codeString={input.text ?? \"\"} /> : null}\n{input.action == \"fill_login\" ? <TextContent text={\"Fields: \" + (input.username_ref == null ? \"\" : \"Username · \") + \"Password\" + (input.otp_ref == null ? \"\" : \" · One-time code\")} size=\"small\" /> : null}\n"
+        "source": "export const action = input.action == \"press_key\" ? \"Press key: \" + (input.key ?? \"\") : input.action == \"snapshot\" ? \"Read page\" : input.action == \"navigate\" ? \"Navigate\" : input.action == \"click\" || input.action == \"click_point\" ? \"Click\" : input.action == \"type\" ? \"Type\" : input.action == \"screenshot\" ? \"Screenshot\" : input.action == \"open_tab\" ? \"Open tab\" : input.action == \"claim_tab\" ? \"Use tab\" : input.action == \"fill_login\" ? \"Fill login\" : input.action == \"open_grant\" ? \"Request approval\" : input.action == \"present\" ? \"Sign in\" : input.action == \"resume\" ? \"Resume\" : input.action == \"import_login\" ? \"Import login\" : input.action == \"capture_login\" ? \"Save login\" : input.action == \"revoke_access\" ? \"Revoke access\" : input.action == \"launch\" ? \"Open browser\" : input.action == \"close\" ? \"Close browser\" : input.action == \"scroll\" ? \"Scroll\" : input.action == \"status\" ? \"Status\" : Replace(input.action, \"_\", \" \")\nexport const authority = Last(Split(First(Split(First(Split(First(Split(Last(Split(view.record.site ?? input.url ?? \"\", \"://\")), \"/\")), \"?\")), \"#\")), \"@\"))\nexport const host = StartsWith(authority, \"[\") ? First(Split(authority, \"]\")) + \"]\" : First(Split(authority, \":\"))\nexport const outcome = view.completion.outcome ?? view.record.outcome\nexport const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason\nexport const reasonText = reason == \"screen_locked\" ? \"Screen locked\" : reason == \"element_disabled\" ? \"Button disabled\" : reason == \"point_in_another_window\" ? \"Point in another window\" : reason == \"consent_declined\" ? \"Declined\" : reason == \"consent_expired\" ? \"Approval expired\" : reason == \"state_changed_by_person\" ? \"You were using the app\" : reason == \"operator_app_blocked\" ? \"App not allowed\" : reason == \"consent\" ? \"Approval asked\" : reason == \"login_handoff\" ? \"Not signed in\" : reason == \"scope_ended\" ? \"Run ended\" : reason == \"cancelled\" ? \"Cancelled\" : reason == \"outcome_unknown\" ? \"Outcome unknown\" : \"Another reason\"\nexport const status = outcome == \"held\" ? (reason == \"login_handoff\" ? \"Not signed in\" : \"Approval asked\") : outcome == \"error\" ? \"Refused\" : outcome == \"partial\" ? \"Outcome unknown\" : outcome == \"success\" ? \"Done\" : view.call.phase == \"running\" ? \"Running\" : \"No outcome kept\"\nexport const duration = view.completion.durationMs ?? view.record.durationMs\nexport const queued = view.completion.queuedMs ?? view.record.queuedMs ?? 0\nexport const held = view.completion.heldMs ?? view.record.heldMs ?? 0\n\n<CardHeader title={action} subtitle={host} />\n<Card appearance=\"clear\" gap=\"xs\">\n<TextContent text={\"Outcome: \" + status} size=\"small\" />\n{reason == null ? null : <TextContent text={\"Reason: \" + reasonText} size=\"small\" />}\n{reason != null && reasonText == \"Another reason\" ? <Styled tone=\"muted\">{reason}</Styled> : null}\n{duration == null ? (view.call.phase == \"running\" ? <Elapsed start={view.call.startedAtMs ?? now} /> : null) : <TextContent text={\"Duration: \" + FormatDuration(duration)} size=\"small\" />}\n{queued > 0 ? <TextContent text={\"Waited in line: \" + FormatDuration(queued)} size=\"small\" /> : null}\n{held > 0 ? <TextContent text={\"Waited for you: \" + FormatDuration(held)} size=\"small\" /> : null}\n</Card>\n\n{input.action == \"type\" ? <CardHeader title=\"Typed text\" /> : null}\n{input.action == \"type\" ? <CodeBlock codeString={input.text ?? \"\"} /> : null}\n{input.action == \"fill_login\" ? <TextContent text={\"Fields: \" + (input.username_ref == null ? \"\" : \"Username · \") + \"Password\" + (input.otp_ref == null ? \"\" : \" · One-time code\")} size=\"small\" /> : null}\n"
       },
       "row": {
         "catalog": {
@@ -555,10 +586,10 @@
         "profile": "tool_row",
         "reads": [],
         "schema": "occipital.template/1",
-        "source": "export const action = input.action == \"snapshot\" ? \"Read page\" : input.action == \"navigate\" ? \"Navigate\" : input.action == \"click\" || input.action == \"click_point\" ? \"Click\" : input.action == \"type\" ? \"Type\" : input.action == \"screenshot\" ? \"Screenshot\" : input.action == \"open_tab\" ? \"Open tab\" : input.action == \"claim_tab\" ? \"Use tab\" : input.action == \"fill_login\" ? \"Fill login\" : input.action == \"open_grant\" ? \"Request approval\" : input.action == \"present\" ? \"Sign in\" : input.action == \"resume\" ? \"Resume\" : input.action == \"import_login\" ? \"Import login\" : input.action == \"capture_login\" ? \"Save login\" : input.action == \"revoke_access\" ? \"Revoke access\" : input.action == \"launch\" ? \"Open browser\" : input.action == \"close\" ? \"Close browser\" : input.action == \"scroll\" ? \"Scroll\" : input.action == \"status\" ? \"Status\" : Replace(input.action, \"_\", \" \")\nexport const authority = Last(Split(First(Split(First(Split(First(Split(Last(Split(view.record.site ?? input.url ?? \"\", \"://\")), \"/\")), \"?\")), \"#\")), \"@\"))\nexport const host = StartsWith(authority, \"[\") ? First(Split(authority, \"]\")) + \"]\" : First(Split(authority, \":\"))\nexport const outcome = view.completion.outcome ?? view.record.outcome\nexport const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason\n\n<Card appearance=\"clear\" direction=\"row\" gap=\"s\" align=\"center\">\n<TextContent text={action} maxLines={1} />\n<Slot width=\"fill\">\n<TextContent text={host} size=\"small\" maxLines={1} />\n</Slot>\n<Slot width=\"short\">\n{outcome == \"held\" ? <Badge text={reason == \"login_handoff\" ? \"Signed out\" : \"Asked you\"} tone=\"neutral\" /> : outcome == \"error\" ? <Badge text=\"Refused\" tone=\"danger\" /> : outcome == \"partial\" ? <Badge text=\"Unknown\" tone=\"warning\" /> : outcome == \"success\" ? <Badge text=\"Done\" tone=\"neutral\" /> : null}\n</Slot>\n<Slot width=\"short\">\n{outcome == null && view.call.phase == \"running\" ? <Elapsed start={view.call.startedAtMs ?? now} /> : view.completion.durationMs == null && view.record.durationMs == null ? null : <TextContent text={FormatDuration(view.completion.durationMs ?? view.record.durationMs ?? 0)} size=\"small\" maxLines={1} />}\n</Slot>\n</Card>\n"
+        "source": "export const action = input.action == \"press_key\" ? \"Press key: \" + (input.key ?? \"\") : input.action == \"snapshot\" ? \"Read page\" : input.action == \"navigate\" ? \"Navigate\" : input.action == \"click\" || input.action == \"click_point\" ? \"Click\" : input.action == \"type\" ? \"Type\" : input.action == \"screenshot\" ? \"Screenshot\" : input.action == \"open_tab\" ? \"Open tab\" : input.action == \"claim_tab\" ? \"Use tab\" : input.action == \"fill_login\" ? \"Fill login\" : input.action == \"open_grant\" ? \"Request approval\" : input.action == \"present\" ? \"Sign in\" : input.action == \"resume\" ? \"Resume\" : input.action == \"import_login\" ? \"Import login\" : input.action == \"capture_login\" ? \"Save login\" : input.action == \"revoke_access\" ? \"Revoke access\" : input.action == \"launch\" ? \"Open browser\" : input.action == \"close\" ? \"Close browser\" : input.action == \"scroll\" ? \"Scroll\" : input.action == \"status\" ? \"Status\" : Replace(input.action, \"_\", \" \")\nexport const authority = Last(Split(First(Split(First(Split(First(Split(Last(Split(view.record.site ?? input.url ?? \"\", \"://\")), \"/\")), \"?\")), \"#\")), \"@\"))\nexport const host = StartsWith(authority, \"[\") ? First(Split(authority, \"]\")) + \"]\" : First(Split(authority, \":\"))\nexport const outcome = view.completion.outcome ?? view.record.outcome\nexport const reason = view.completion.outcome == null ? view.record.reason : view.completion.reason\n\n<Card appearance=\"clear\" direction=\"row\" gap=\"s\" align=\"center\">\n<TextContent text={action} maxLines={1} />\n<Slot width=\"fill\">\n<TextContent text={host} size=\"small\" maxLines={1} />\n</Slot>\n<Slot width=\"short\">\n{outcome == \"held\" ? <Badge text={reason == \"login_handoff\" ? \"Signed out\" : \"Asked you\"} tone=\"neutral\" /> : outcome == \"error\" ? <Badge text=\"Refused\" tone=\"danger\" /> : outcome == \"partial\" ? <Badge text=\"Unknown\" tone=\"warning\" /> : outcome == \"success\" ? <Badge text=\"Done\" tone=\"neutral\" /> : null}\n</Slot>\n<Slot width=\"short\">\n{outcome == null && view.call.phase == \"running\" ? <Elapsed start={view.call.startedAtMs ?? now} /> : view.completion.durationMs == null && view.record.durationMs == null ? null : <TextContent text={FormatDuration(view.completion.durationMs ?? view.record.durationMs ?? 0)} size=\"small\" maxLines={1} />}\n</Slot>\n</Card>\n"
       }
     },
-    "template_revision": 6,
+    "template_revision": 7,
     "tool": {
       "input_schema": {
         "additionalProperties": false,
@@ -580,6 +611,7 @@
               "scroll",
               "click",
               "type",
+              "press_key",
               "click_point",
               "fill_login",
               "open_grant",
@@ -646,6 +678,25 @@
             "type": "integer"
           },
           "intent": {
+            "type": "string"
+          },
+          "key": {
+            "enum": [
+              "enter",
+              "escape",
+              "tab",
+              "shift_tab",
+              "up",
+              "down",
+              "left",
+              "right",
+              "home",
+              "end",
+              "page_up",
+              "page_down",
+              "backspace",
+              "delete"
+            ],
             "type": "string"
           },
           "login_url": {

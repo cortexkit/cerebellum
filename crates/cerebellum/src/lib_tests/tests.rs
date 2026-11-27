@@ -3861,7 +3861,7 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
         "manifest-fixture",
         &unbound_context,
         &BrowserSurface::NotConfigured,
-        Some(provenance),
+        Some(provenance.clone()),
     );
     let digest = |manifest: &Value| manifest::sha256_hex(manifest.to_string().as_bytes());
     println!(
@@ -3869,11 +3869,49 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
         digest(&value),
         digest(&unbound)
     );
+    // Historical pins predate the flat press_key action. Remove only its
+    // enum member, input property and mentions in the tool definition.
+    let without_press_key = |mut previous: Value| {
+        for role in previous["provides"].as_array_mut().unwrap() {
+            if let Some(tools) = role.get_mut("tools").and_then(Value::as_array_mut) {
+                for tool in tools
+                    .iter_mut()
+                    .filter(|tool| tool["name"] == "browser_use")
+                {
+                    crate::flat_tools::remove_press_key_definition(tool);
+                }
+            }
+        }
+        previous
+    };
+    let browser = BrowserSurface::Available(
+        browser_config::parse_browser_config(include_str!(
+            "../../tests/fixtures/legacy-macos-settings.jsonc"
+        ))
+        .unwrap()
+        .unwrap(),
+    );
+    let configured = compose_manifest("manifest-fixture", &context, &browser, Some(provenance));
+    let prior_configured = without_press_key(configured.clone());
+    #[cfg(target_os = "linux")]
+    let configured_pins = [
+        "63b9befa57320ce343e87e90a302181c8dc95fe73374877d14e93db2208d68ff",
+        "20d766513de57467a64377c89253525b142603bd15ca610a392f1518b77ac880",
+    ];
+    #[cfg(target_os = "macos")]
+    let configured_pins = [
+        "4809827b64d6d775e26c3c73115fc2bca98003594ce0d07210f31256a8009010",
+        "79f982e516edc44da7144b9890aeed8f875ef40ac51b8c24e8df40f7e3758efd",
+    ];
+    assert_eq!(
+        [digest(&prior_configured), digest(&configured)],
+        configured_pins
+    );
     // Historical bound manifests withheld click/drag before recovery was
     // measured. Subtract exactly their admission, including the selected
     // flat definition and release-evidence counts, without repinning history.
     let before_measurement = if cfg!(target_os = "macos") {
-        let mut previous = agent_data::tests::without_agent_data(&value);
+        let mut previous = without_press_key(agent_data::tests::without_agent_data(&value));
         let release = &mut previous["computer_plane_release"];
         let down = ["computer.takeover_click", "computer.takeover_drag"];
         for field in ["gate_admitted_capabilities", "advertised_capabilities"] {
@@ -3915,7 +3953,7 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
         );
         previous
     } else {
-        agent_data::tests::without_agent_data(&value)
+        without_press_key(agent_data::tests::without_agent_data(&value))
     };
     // Subtract only display.read for comparisons with older manifests.
     // Every pre-existing operation and tool definition remains pinned.
@@ -3935,8 +3973,9 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
         previous
     };
     let before_read = without_display_read(&before_measurement);
-    let before_read_unbound =
-        without_display_read(&agent_data::tests::without_agent_data(&unbound));
+    let before_read_unbound = without_display_read(&without_press_key(
+        agent_data::tests::without_agent_data(&unbound),
+    ));
     #[cfg(target_os = "linux")]
     let before_read_pins = [
         "7e31cf93aff05066e6057747b36fb780f6972b37c6eea61c67f5acd17a64289e",

@@ -300,6 +300,22 @@ pub struct NonTypeClassificationRecord {
     /// its fingerprint. These contain DOM metadata only, never input values.
     #[serde(skip)]
     pub login_field: Option<LoginFieldFacts>,
+    // Key-only activation metadata is not part of the frozen click record.
+    #[serde(skip)]
+    pub(crate) implicit_submit: Option<Result<ImplicitSubmit, ClassificationError>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImplicitSubmit {
+    pub(crate) activation: Box<NonTypeClassificationRecord>,
+    pub(crate) method: FormMethod,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FormMethod {
+    Get,
+    Post,
+    Dialog,
 }
 
 // Login metadata is revalidated by fill_login only. Including it in equality
@@ -809,6 +825,7 @@ pub fn classify_non_type(
         credential,
         financial,
         login_field: None,
+        implicit_submit: None,
     };
     record.validate().map_err(|error| match error {
         ClassificationError::CanonicalRecordOutOfBounds => error,
@@ -1047,7 +1064,7 @@ fn effective_input_type(
     }
 }
 
-fn activation_invokes_submit(element: &ElementClassificationInput) -> bool {
+pub(crate) fn activation_invokes_submit(element: &ElementClassificationInput) -> bool {
     // Submission needs a form owner: an ancestor <form>, or a `form` attribute
     // naming a form in the same document. A submit-type control without one
     // submits nothing, so it must not be rated as a form submit (which would

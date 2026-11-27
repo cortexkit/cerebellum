@@ -806,6 +806,7 @@ fn fields(plane: &str, args: &Value) -> Map<String, Value> {
                 | "screenshot"
                 | "scroll"
                 | "click"
+                | "press_key"
                 | "type"
                 | "click_point"
                 | "fill_login"

@@ -961,10 +961,33 @@ impl GrantStore {
         attempted_origin: &str,
         public_document: bool,
     ) -> Result<AuthorizationDecision, AuthorizationError> {
+        self.authorize_document_input(request, attempted_origin, public_document, None)
+    }
+
+    pub(crate) fn authorize_document_input(
+        &self,
+        mut request: AuthorizationRequest<'_>,
+        attempted_origin: &str,
+        public_document: bool,
+        key: Option<crate::browser::keys::Key>,
+    ) -> Result<AuthorizationDecision, AuthorizationError> {
         self.ensure_valid()?;
         let (computed, fingerprint) =
             computed_required_severity(request.action, request.classification)?;
-        let required_hazards = target_hazards(request.action, request.classification)?;
+        let (computed, required_hazards, destinations) = if let Some(key) = key {
+            let record = request
+                .classification
+                .ok_or(AuthorizationError::SeverityUnclassifiable)?;
+            let policy = key.policy(record)?;
+            request.requested_severity = policy.severity;
+            (policy.severity, policy.hazards, policy.destinations)
+        } else {
+            let hazards = target_hazards(request.action, request.classification)?;
+            let destination = request
+                .classification
+                .and_then(|record| record.activation_destination_origin.as_deref());
+            (computed, hazards, [destination, None])
+        };
         let floor = if computed.tier == OBSERVE {
             computed
         } else {
@@ -982,10 +1005,7 @@ impl GrantStore {
             &required_hazards,
             public_document,
         )?;
-        if let Some(destination) = request
-            .classification
-            .and_then(|record| record.activation_destination_origin.as_deref())
-        {
+        for destination in destinations.into_iter().flatten() {
             self.select_conversation_or_standing(
                 &request,
                 effective,

@@ -1,9 +1,11 @@
+mod actuation;
 mod capture;
 #[cfg(test)]
 mod classification_golden;
 mod classification_index;
 mod fill;
 mod frames;
+mod implicit_submit;
 pub(crate) mod native_select;
 mod peers;
 mod scroll;
@@ -1554,10 +1556,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             }
         }
 
-        self.actuate_click(
+        self.actuate_input(
             context_key,
             &attachment.session_id,
-            position,
+            actuation::Input::Mouse(position),
             deadline,
             deadline_ms,
             input_dispatched,
@@ -1610,10 +1612,10 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         }
         let (session, local) = target.unwrap_or((attachment.session_id, position));
         let outcome = self
-            .actuate_click(
+            .actuate_input(
                 context_key,
                 &session,
-                local,
+                actuation::Input::Mouse(local),
                 deadline,
                 deadline_ms,
                 input_dispatched,
@@ -1623,7 +1625,8 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
         // The public point is in the addressed screenshot's coordinate system,
         // even when input used a child renderer's local coordinate system.
         Ok(match outcome {
-            selected @ BrowserClickOutcome::OptionSelected { .. } => selected,
+            other @ (BrowserClickOutcome::OptionSelected { .. }
+            | BrowserClickOutcome::KeyPressed { .. }) => other,
             BrowserClickOutcome::Clicked { navigation, .. } => BrowserClickOutcome::Clicked {
                 position,
                 navigation,
@@ -1725,161 +1728,6 @@ impl<IO: CdpPipeIo> CdpNavigationDriver<IO> {
             scale,
             page_x,
             page_y,
-        })
-    }
-
-    /// Dispatch press then release at `position`, then report what the click
-    /// did to the main frame. `settle_deadline_ms` bounds the wait for a
-    /// navigation the click started, measured from when it was seen to start,
-    /// as `browser.navigate` bounds its own.
-    #[allow(clippy::too_many_arguments)]
-    fn actuate_click<C: NavigationClock>(
-        &mut self,
-        context_key: &str,
-        session_id: &str,
-        position: BrowserClickPosition,
-        deadline: Instant,
-        settle_deadline_ms: u64,
-        input_dispatched: &mut dyn FnMut(BrowserInputEvent),
-        clock: &mut C,
-    ) -> Result<BrowserClickOutcome, NavigationDriveError> {
-        // Page events must be enabled before either input dispatch. Arming after a
-        // blocked release would leave the first dialog waiting for an answer,
-        // and the events that show the click starting a navigation arrive
-        // while the input commands are still in flight.
-        self.command(
-            "Page.enable",
-            None,
-            Some(session_id.to_string()),
-            deadline,
-            None,
-            clock,
-        )?;
-        // Network events are what a navigation settles on (in-flight requests
-        // reaching quiet) and where the landing document's status comes from.
-        self.command(
-            "Network.enable",
-            None,
-            Some(session_id.to_string()),
-            deadline,
-            None,
-            clock,
-        )?;
-
-        // Tracked from the press onward: Chrome reports a link click's
-        // navigation request before it acknowledges the release.
-        let mut tracker = Tracker::default();
-        if self.continuously_serviced {
-            self.enable_lifecycle_events(deadline, clock)?;
-            tracker.begin_loader_fence(self.frame_generation);
-        }
-        let mut dialogs = Vec::new();
-        let mut press_params = mouse_event_params("mousePressed", position);
-        press_params.insert("button".into(), Value::String("left".into()));
-        press_params.insert("clickCount".into(), Value::Number(1.into()));
-        let mut press_dispatched = || input_dispatched(BrowserInputEvent::Press(position));
-        let press = self.command_response_handling_javascript_dialogs(
-            "Input.dispatchMouseEvent",
-            Some(press_params),
-            Some(session_id.to_string()),
-            deadline,
-            Some(&mut press_dispatched),
-            &mut dialogs,
-            (context_key, &mut tracker),
-            clock,
-        )?;
-        if press.error.is_some() {
-            return Err(NavigationDriveError::CdpFailure);
-        }
-
-        let mut release_params = mouse_event_params("mouseReleased", position);
-        release_params.insert("button".into(), Value::String("left".into()));
-        release_params.insert("clickCount".into(), Value::Number(1.into()));
-        let mut release_dispatched = || input_dispatched(BrowserInputEvent::Release(position));
-        let release = self.command_response_handling_javascript_dialogs(
-            "Input.dispatchMouseEvent",
-            Some(release_params),
-            Some(session_id.to_string()),
-            deadline,
-            Some(&mut release_dispatched),
-            &mut dialogs,
-            (context_key, &mut tracker),
-            clock,
-        )?;
-        if release.error.is_some() {
-            return Err(NavigationDriveError::CdpFailure);
-        }
-
-        let navigation =
-            self.observe_click_navigation(context_key, tracker, settle_deadline_ms, clock)?;
-        if dialogs.is_empty() {
-            Ok(BrowserClickOutcome::Clicked {
-                position,
-                navigation,
-            })
-        } else {
-            Ok(BrowserClickOutcome::JavaScriptDialogDismissed {
-                position,
-                dialogs,
-                navigation,
-            })
-        }
-    }
-
-    /// Wait up to [`CLICK_NAVIGATION_WINDOW`] for the main frame to start
-    /// navigating, and if it does, settle that navigation exactly as
-    /// `browser.navigate` settles its own.
-    fn observe_click_navigation<C: NavigationClock>(
-        &mut self,
-        context_key: &str,
-        mut tracker: Tracker,
-        settle_deadline_ms: u64,
-        clock: &mut C,
-    ) -> Result<ClickNavigation, NavigationDriveError> {
-        let window_end = clock
-            .now()
-            .checked_add(CLICK_NAVIGATION_WINDOW)
-            .ok_or(NavigationDriveError::CdpFailure)?;
-        while !tracker.main_frame_navigation_observed()
-            && tracker.same_document_url().is_none()
-            && clock.now() < window_end
-            && !read_cancelled()
-        {
-            let turn = self.read_turn(None, Some((context_key, &mut tracker)), clock.now())?;
-            if tracker.main_frame_navigation_observed() || tracker.same_document_url().is_some() {
-                break;
-            }
-            if matches!(turn, ReadTurn::WouldBlock) {
-                let remaining = window_end.saturating_duration_since(clock.now());
-                clock.sleep(cmp::min(POLL_INTERVAL, remaining));
-            }
-        }
-
-        if tracker.main_frame_navigation_observed() {
-            // The same first token `browser.navigate` records. Placed first
-            // because the landing page may already have fired `load` while
-            // the input commands were in flight.
-            tracker.lifecycle.insert(0, "navigation_started".into());
-            let settle_deadline = clock
-                .now()
-                .checked_add(Duration::from_millis(settle_deadline_ms))
-                .ok_or(NavigationDriveError::CdpFailure)?;
-            self.settle_navigation(
-                context_key,
-                &mut tracker,
-                settle_deadline,
-                Tracker::navigation_ended_without_commit,
-                clock,
-            )?;
-            return Ok(ClickNavigation::MainFrame(Box::new(tracker)));
-        }
-        if let Some(url) = tracker.same_document_url() {
-            return Ok(ClickNavigation::SameDocument {
-                url: url.to_string(),
-            });
-        }
-        Ok(ClickNavigation::NoneObserved {
-            window_ms: CLICK_NAVIGATION_WINDOW.as_millis() as u64,
         })
     }
 
@@ -4226,6 +4074,7 @@ fn classify_indexed(
     })?;
     let node = &nodes[target_index];
     if node.local_name == "input" {
+        record.implicit_submit = context.implicit_submit(target_index, document_epoch);
         let bounded_attribute = |attribute| {
             node.attributes
                 .get(attribute)
@@ -4375,7 +4224,12 @@ impl DomClassificationContext<'_> {
                     .and_then(|owner| self.nodes[owner].attributes.get("action"))
             }),
             _ => None,
-        }?;
+        };
+        self.resolve_activation_destination(declared)
+    }
+
+    fn resolve_activation_destination(&self, declared: Option<&String>) -> Option<String> {
+        let declared = declared?;
         let declared = declared.trim();
         if declared.starts_with("//") {
             return self
@@ -4544,6 +4398,10 @@ fn command_effect(
         match release_type {
             Some(release_type) => {
                 let mut release = params.cloned().unwrap_or_default();
+                if method == KEY_EVENT {
+                    release.remove("text");
+                    release.remove("unmodifiedText");
+                }
                 release.insert("type".into(), Value::String(release_type.into()));
                 CommandEffect::Press(HeldPress {
                     session_id,

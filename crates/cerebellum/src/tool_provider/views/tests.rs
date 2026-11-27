@@ -104,6 +104,7 @@ fn every_published_pin_recomputes_from_its_stored_tool() {
     kept.extend(
         serde_json::from_str::<BTreeMap<String, Value>>(BROWSER_FILTERED_WAIT_PUBLISHED).unwrap(),
     );
+    kept.extend(serde_json::from_str::<BTreeMap<String, Value>>(BROWSER_KEYS_PUBLISHED).unwrap());
     for (pin, entry) in &kept {
         let tool: ViewTool = serde_json::from_value(entry["tool"].clone()).unwrap();
         assert_eq!(tool.name, SchemaPin::parse(pin).unwrap().tool, "{pin}");
@@ -146,6 +147,32 @@ fn filtered_browser_wait_publication_keeps_historical_pins() {
             .get("wait_for_ms")
             .is_some());
     }
+}
+
+#[test]
+fn browser_key_view_keeps_the_previous_pin_and_uses_its_own_revision() {
+    assert_eq!(
+        manifest::sha256_hex(BROWSER_KEYS_PUBLISHED.as_bytes()),
+        "d831d2472cb2fda35969506a676d51827f460700dd06e8f5b24d2a36090ca480"
+    );
+    let existing: BTreeMap<String, Value> =
+        serde_json::from_str(BROWSER_FILTERED_WAIT_PUBLISHED).unwrap();
+    let mut added: BTreeMap<String, Value> = serde_json::from_str(BROWSER_KEYS_PUBLISHED).unwrap();
+    let (pin, _) = added.pop_first().expect("published key view");
+    assert!(added.is_empty());
+    let served = published();
+    for old in existing.keys() {
+        let view = &served[old];
+        assert_eq!(view.template_revision, TEMPLATE_REVISION);
+        assert_eq!(view.template["row"]["source"], BROWSER_ROW);
+    }
+    let view = &served[&pin];
+    assert_eq!(view.template_revision, BROWSER_KEYS_TEMPLATE_REVISION);
+    assert!(view.template["row"]["source"]
+        .as_str()
+        .unwrap()
+        .contains("input.key"));
+    assert!(view.check_pin(&pin).unwrap());
 }
 
 #[test]
@@ -232,19 +259,18 @@ fn provider_view_tool_vectors_agree_with_what_views_serve() {
 fn views_embed_exact_template_bytes_and_checked_inputs() {
     let served = published();
     for tool in current_definitions() {
-        let (row, page, check) = match tool.name.as_str() {
-            flat_tools::BROWSER_USE => (
-                BROWSER_ROW,
-                BROWSER_PAGE,
-                include_str!("../../../resources/tool-views/browser-check.json"),
-            ),
-            flat_tools::COMPUTER_USE => (
-                COMPUTER_ROW,
-                COMPUTER_PAGE,
-                include_str!("../../../resources/tool-views/computer-check.json"),
-            ),
+        let check = match tool.name.as_str() {
+            flat_tools::BROWSER_USE => {
+                include_str!("../../../resources/tool-views/browser-check.json")
+            }
+            flat_tools::COMPUTER_USE => {
+                include_str!("../../../resources/tool-views/computer-check.json")
+            }
             _ => unreachable!(),
         };
+        let (templates, revision) = tool_templates(&tool.name, &tool.input_schema);
+        let row = templates["row"]["source"].as_str().unwrap();
+        let page = templates["page"]["source"].as_str().unwrap();
         let view = &served[&pin(&tool)];
         assert_eq!(
             view.template["row"]["source"].as_str().unwrap().as_bytes(),
@@ -254,7 +280,7 @@ fn views_embed_exact_template_bytes_and_checked_inputs() {
             view.template["page"]["source"].as_str().unwrap().as_bytes(),
             page.as_bytes()
         );
-        assert_eq!(view.template_revision, TEMPLATE_REVISION);
+        assert_eq!(view.template_revision, revision);
         let check: Value = serde_json::from_str(check).unwrap();
         assert_eq!(check["input_schema"], tool.input_schema);
         // The published view carries the shipped definition behind its pin,
@@ -326,7 +352,7 @@ fn row_badges_fit_short_slots_at_phone_width() {
 #[test]
 fn views_validate_requests_and_answer_only_requested_pins() {
     let pins = published().into_keys().collect::<Vec<_>>();
-    assert_eq!(pins.len(), 5);
+    assert_eq!(pins.len(), 6);
     let request = cortexkit_role_tool_provider::views::ViewsRequest::new(vec![
         pins[0].clone(),
         pins[0].clone(),
@@ -367,29 +393,26 @@ fn views_validate_requests_and_answer_only_requested_pins() {
 #[test]
 #[ignore = "explicit fixture generator"]
 fn export_checker_inputs() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/tool-views");
+    let root = std::env::var_os("CK_TOOL_VIEW_CHECK_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/tool-views")
+        });
+    let mut browser_keys = BTreeMap::new();
     for tool in current_definitions() {
         let name = if tool.name == flat_tools::BROWSER_USE {
             "browser"
         } else {
             "computer"
         };
-        let (row, page) = if name == "browser" {
-            (BROWSER_ROW, BROWSER_PAGE)
-        } else {
-            (COMPUTER_ROW, COMPUTER_PAGE)
-        };
-        let view = ViewManifest::new(
-            tool_display::schema(),
-            vec![],
-            json!({"row":template("tool_row",row),"page":template("tool_page",page)}),
-        )
-        .with_template_revision(TEMPLATE_REVISION)
-        .with_tool(ViewTool::new(
-            &tool.name,
-            cortexkit_role_tool_provider::catalog::structural_schema(&tool.input_schema),
-            tool.semantics,
-        ));
+        let (templates, revision) = tool_templates(&tool.name, &tool.input_schema);
+        let view = ViewManifest::new(tool_display::schema(), vec![], templates)
+            .with_template_revision(revision)
+            .with_tool(ViewTool::new(
+                &tool.name,
+                cortexkit_role_tool_provider::catalog::structural_schema(&tool.input_schema),
+                tool.semantics,
+            ));
         let input = if name == "browser" {
             json!({"action":"snapshot","url":"https://example.com/start"})
         } else {
@@ -443,6 +466,7 @@ fn export_checker_inputs() {
                 json!({"input":{"action":"status"},"record":{"outcome":"success","durationMs":10}}),
             );
             samples.push(json!({"input":{"action":"type","text":"Text kept only on the page"},"record":{"outcome":"success","durationMs":10}}));
+            samples.push(json!({"input":{"action":"press_key","key":"enter"},"record":{"outcome":"success","durationMs":10}}));
             samples.push(json!({"input":{"action":"fill_login","secret":"must-not-render","username_ref":"user","password_ref":"pass","otp_ref":"otp"},"record":{"outcome":"success","durationMs":10}}));
             samples.push(json!({"input":{"action":"navigate","url":"https://user:password@example.com:8443/path?q=1#fragment"}}));
             samples.push(json!({"input":{"action":"navigate","url":"https://[::1]:8443/path"},"record":{"outcome":"success","durationMs":10,"site":"https://[::1]:8443"}}));
@@ -462,6 +486,12 @@ fn export_checker_inputs() {
             format!("{}\n", serde_json::to_string_pretty(&check).unwrap()),
         )
         .unwrap();
+        if name == "browser" && std::env::var_os("CK_TOOL_VIEW_CHECK_OUTPUT").is_some() {
+            browser_keys.insert(
+                pin(&tool),
+                json!({"record_schema":view.record_schema,"reads":view.reads,"tool":view.tool}),
+            );
+        }
         println!(
             "{} {}",
             pin(&tool),
@@ -476,5 +506,12 @@ fn export_checker_inputs() {
             }))
             .unwrap()
         );
+    }
+    if !browser_keys.is_empty() {
+        std::fs::write(
+            root.join("published-v5.json"),
+            format!("{}\n", serde_json::to_string_pretty(&browser_keys).unwrap()),
+        )
+        .unwrap();
     }
 }
