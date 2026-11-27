@@ -96,14 +96,14 @@ pub struct ProcessPackageFields {
 impl RetainedProcessHandle {
     pub fn pid(&self) -> u32 {
         // This handle remains attached to one process object.
-        unsafe { GetProcessId(self.handle) }
+        unsafe { GetProcessId(self.raw_handle()) }
     }
 
     pub fn package_fields(&self) -> io::Result<Option<ProcessPackageFields>> {
-        let Some(family) = process_string(self.handle, GetPackageFamilyName)? else {
+        let Some(family) = process_string(self.raw_handle(), GetPackageFamilyName)? else {
             return Ok(None);
         };
-        let aumid = process_string(self.handle, GetApplicationUserModelId)?
+        let aumid = process_string(self.raw_handle(), GetApplicationUserModelId)?
             .ok_or(io::ErrorKind::InvalidData)?;
         Ok(Some(ProcessPackageFields { family, aumid }))
     }
@@ -112,7 +112,9 @@ impl RetainedProcessHandle {
         let mut path = vec![0; 32768];
         let mut len = path.len() as u32;
         // The retained process and writable UTF-16 buffer live through the call.
-        if unsafe { QueryFullProcessImageNameW(self.handle, 0, path.as_mut_ptr(), &mut len) } == 0 {
+        if unsafe { QueryFullProcessImageNameW(self.raw_handle(), 0, path.as_mut_ptr(), &mut len) }
+            == 0
+        {
             return Err(io::Error::last_os_error());
         }
         path.truncate(len as usize);
@@ -121,7 +123,7 @@ impl RetainedProcessHandle {
 
     pub fn process_wait_pending(&self) -> bool {
         // The caller holds the process handle; a zero timeout never waits.
-        unsafe { WaitForSingleObject(self.handle, 0) == WAIT_TIMEOUT }
+        unsafe { WaitForSingleObject(self.raw_handle(), 0) == WAIT_TIMEOUT }
     }
 
     pub fn image_mapping(&self, file: &LockedImageFile) -> io::Result<ImageMappingReading> {
@@ -130,7 +132,7 @@ impl RetainedProcessHandle {
         // supplied file handle and the process handle remain owned and open.
         let status = unsafe {
             NtQueryInformationProcess(
-                self.handle,
+                self.raw_handle(),
                 PROCESS_IMAGE_FILE_MAPPING,
                 (&mut handle as *mut HANDLE).cast(),
                 std::mem::size_of::<HANDLE>() as u32,

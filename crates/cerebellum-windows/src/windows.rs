@@ -1,11 +1,16 @@
-use std::{ffi::c_void, mem};
+use std::{
+    ffi::c_void,
+    mem,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+};
 
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER,
-        ERROR_INVALID_PARAMETER, FILETIME, HANDLE, HWND, LPARAM,
+        GetLastError, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER,
+        FILETIME, HANDLE, HWND, LPARAM,
     },
     Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED},
+    Storage::FileSystem::SYNCHRONIZE,
     System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId},
     System::Threading::{
         GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -52,16 +57,12 @@ pub enum ProcessHandleError {
 /// The handle closes when this wrapper drops.
 #[derive(Debug)]
 pub struct RetainedProcessHandle {
-    pub(crate) handle: HANDLE,
+    handle: OwnedHandle,
 }
 
-impl Drop for RetainedProcessHandle {
-    fn drop(&mut self) {
-        // SAFETY: `handle` came from a successful `OpenProcess` call and this
-        // wrapper owns it exclusively, so Drop closes it exactly once.
-        unsafe {
-            CloseHandle(self.handle);
-        }
+impl RetainedProcessHandle {
+    pub(crate) fn raw_handle(&self) -> HANDLE {
+        self.handle.as_raw_handle()
     }
 }
 
@@ -72,6 +73,14 @@ impl Drop for RetainedProcessHandle {
 /// retains the kernel object; callers decide whether and how to use that fact.
 pub fn retain_process_handle(pid: u32) -> Result<RetainedProcessHandle, ProcessHandleError> {
     open_process_handle(pid).map_err(Into::into)
+}
+
+/// Retain a process for image observation and a subsequent liveness check.
+pub fn retain_process_handle_for_image(
+    pid: u32,
+) -> Result<RetainedProcessHandle, ProcessHandleError> {
+    open_process_handle_with_access(pid, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)
+        .map_err(Into::into)
 }
 
 /// Read the `FILETIME` at which Windows created the process currently holding `pid`.
@@ -85,7 +94,7 @@ pub fn process_start_time(pid: u32) -> ProcessStartTime {
 
 impl RetainedProcessHandle {
     pub fn creation_time(&self) -> ProcessStartTime {
-        creation_time(self.handle)
+        creation_time(self.raw_handle())
     }
 }
 
@@ -193,12 +202,15 @@ pub(crate) fn open_process_handle_with_access(
     pid: u32,
     access: u32,
 ) -> Result<RetainedProcessHandle, ProcessAccessFailure> {
-    // SAFETY: inheritance is disabled, and all arguments are passed by value.
+    // SAFETY: the caller supplies the documented process access mask, inheritance
+    // is disabled, and `pid` is passed by value.
     let handle = unsafe { OpenProcess(access, 0, pid) };
     if handle.is_null() {
         return Err(process_access_failure());
     }
 
+    // SAFETY: successful OpenProcess returned a uniquely owned, closeable handle.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
     Ok(RetainedProcessHandle { handle })
 }
 
@@ -422,8 +434,9 @@ fn query_executable_basename_with_capacity(
     // SAFETY: `process.handle` is a live handle owned by `process`; `buf` is
     // writable for `capacity` UTF-16 units; `char_count` is the documented in/out
     // size in characters.
-    let ok =
-        unsafe { QueryFullProcessImageNameW(process.handle, 0, buf.as_mut_ptr(), &mut char_count) };
+    let ok = unsafe {
+        QueryFullProcessImageNameW(process.raw_handle(), 0, buf.as_mut_ptr(), &mut char_count)
+    };
     if ok == 0 {
         // SAFETY: this reads the calling thread's last-error value immediately
         // after a failing Windows call and before another Windows call can replace it.

@@ -5,7 +5,7 @@
 //! and holds raw process references; callers decide what those readings mean.
 //!
 //! Keep additions small and mechanical. This is the auditable place for Windows
-//! calls, not a place to move application policy.
+//! calls, including the image predicates that consume handle-bound trust data.
 
 // Windows APIs and their raw handles exist only on Windows. Keeping this module
 // and its public surface behind the same gate makes other hosts build an empty
@@ -13,11 +13,15 @@
 #[cfg(any(target_os = "windows", test))]
 mod accessibility;
 #[cfg(windows)]
+mod browser_image;
+#[cfg(windows)]
 mod devtools_pipe;
 #[cfg(windows)]
 mod file_identity;
 #[cfg(windows)]
 mod image_file_facts;
+#[cfg(any(windows, test))]
+mod pe_product;
 #[cfg(any(target_os = "windows", test))]
 mod session;
 #[cfg(windows)]
@@ -37,6 +41,10 @@ pub use accessibility::{
     AccessibilityInvokeError, AccessibilityInvokeOutcome, AccessibilityReadBounds,
     AccessibilityReadFailure, UiaAccessibilityTree, UiaControlTypeAndName, UiaElement,
     UiaElementIdentity, UiaElementName, UiaRectangle, UiaTreeCompleteness,
+};
+#[cfg(windows)]
+pub use browser_image::{
+    verify_installed_chrome, verify_system_cmd, ImageRefusal, OpenedProcessImage,
 };
 #[cfg(windows)]
 pub use devtools_pipe::{spawn_with_devtools_pipe, DevToolsPipeReader, DevToolsProcess};
@@ -62,8 +70,8 @@ pub use window_identity_facts::{
 #[cfg(target_os = "windows")]
 pub use windows::{
     current_session_provenance, enumerate_top_level_windows, enumerated_window_visibility,
-    process_start_time, retain_process_handle, ProcessHandleError, ProcessStartTime,
-    RetainedProcessHandle, WindowVisibility,
+    process_start_time, retain_process_handle, retain_process_handle_for_image, ProcessHandleError,
+    ProcessStartTime, RetainedProcessHandle, WindowVisibility,
 };
 
 // Pure data, so it is reachable wherever the readers that carry it are.
