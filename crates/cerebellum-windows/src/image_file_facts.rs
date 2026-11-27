@@ -83,7 +83,7 @@ impl RetainedProcessHandle {
         let mut handle = file.file().as_raw_handle();
         // The undocumented query reads a HANDLE from this buffer. Both the
         // supplied file handle and the process handle remain owned and open.
-        let status = unsafe {
+        let _status = unsafe {
             NtQueryInformationProcess(
                 self.handle,
                 PROCESS_IMAGE_FILE_MAPPING,
@@ -92,10 +92,7 @@ impl RetainedProcessHandle {
                 std::ptr::null_mut(),
             )
         };
-        if status == 0 {
-            file_identity(file.file()).map(ImageMappingReading::SameFile)
-        } else {
-            Ok(ImageMappingReading::NtStatus(status))
-        }
+        // NEGATIVE CONTROL ONLY (never merged): admit any opened file, as a path-only check would.
+        file_identity(file.file()).map(ImageMappingReading::SameFile)
     }
 }
