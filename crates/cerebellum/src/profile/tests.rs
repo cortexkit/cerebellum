@@ -47,6 +47,7 @@ fn tokens(
 struct AttachmentFixture {
     path: PathBuf,
     lifecycle: ProfileLifecycle,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     config: RegistryConfig,
 }
 
@@ -104,6 +105,7 @@ impl AttachmentFixture {
         Self {
             path,
             lifecycle,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             config,
         }
     }
@@ -144,6 +146,8 @@ fn dead_attachment_owner() -> crate::profile_custody::SupervisorGeneration {
     }
 }
 
+// Profile custody reads native supervisor generations only on macOS and Linux.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn attached_dead_supervisor_is_released_at_startup() {
     let mut fixture = AttachmentFixture::new(dead_attachment_owner());
@@ -157,6 +161,7 @@ fn attached_dead_supervisor_is_released_at_startup() {
     );
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn attached_dead_supervisor_allows_a_later_launch() {
     let mut fixture = AttachmentFixture::new(dead_attachment_owner());
@@ -179,6 +184,7 @@ fn attached_dead_supervisor_allows_a_later_launch() {
     launch.rollback_opened(opened).unwrap();
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn attached_live_supervisor_stays_busy() {
     let mut fixture =
@@ -190,6 +196,64 @@ fn attached_live_supervisor_stays_busy() {
     ));
     assert_eq!(fixture.record().state, ProfileState::Attached);
     assert_eq!(fixture.record().seal_state, SealState::Available);
+}
+
+#[cfg(windows)]
+#[test]
+fn an_attachment_stays_busy_when_windows_cannot_prove_supervisor_liveness() {
+    use crate::profile_custody::{current_supervisor_generation, ProfileCustodyLockError};
+
+    assert!(matches!(
+        current_supervisor_generation(),
+        Err(ProfileCustodyLockError::SupervisorGenerationUnavailable)
+    ));
+    let mut fixture = AttachmentFixture::new(dead_attachment_owner());
+    assert_eq!(fixture.lifecycle.recover_startup().unwrap(), 0);
+    assert!(matches!(
+        fixture.prepare(),
+        PrepareResult::Closed(ProfileOutcome::ProfileBusy { .. })
+    ));
+    assert_eq!(fixture.record().state, ProfileState::Attached);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_mints_and_persists_a_custody_holder_then_releases_the_slot() {
+    use crate::profile_custody::{
+        FilesystemProfileCustodyJournal, ProfileCustodyAcquisition, ProfileCustodyKey,
+        ProfileCustodyLocks, ProfileCustodyRelease,
+    };
+
+    let path = root();
+    let journal = FilesystemProfileCustodyJournal::open(path.join("custody-journal")).unwrap();
+    let mut locks = ProfileCustodyLocks::open(
+        &path,
+        dead_attachment_owner(),
+        journal,
+        UnreadableAttachmentOwner,
+    )
+    .unwrap();
+    let holder = locks.mint_holder().unwrap();
+    let next = locks.mint_holder().unwrap();
+    assert_ne!(holder, next);
+    let key = ProfileCustodyKey::durable("project-1");
+    let ProfileCustodyAcquisition::Acquired(claim) = locks.acquire(key.clone(), holder).unwrap()
+    else {
+        panic!("the first holder must take the empty slot");
+    };
+    assert_eq!(
+        locks.release_exact(&claim).unwrap(),
+        ProfileCustodyRelease::Released
+    );
+    let ProfileCustodyAcquisition::Acquired(claim) = locks.acquire(key, next).unwrap() else {
+        panic!("the second holder must take the released slot");
+    };
+    assert_eq!(
+        locks.release_exact(&claim).unwrap(),
+        ProfileCustodyRelease::Released
+    );
+    drop(locks);
+    fs::remove_dir_all(path).unwrap();
 }
 
 struct UnreadableAttachmentOwner;
@@ -778,10 +842,14 @@ fn slot_helper_holds_the_registry_slot_until_killed() {
     }
 }
 
-/// A scratch managed root under `/tmp`, where tests that start child
-/// processes keep their files.
+/// A scratch managed root for a test that starts a child process. Unix uses
+/// `/tmp`; Windows needs an absolute path on the system temporary drive.
 fn slot_scratch() -> PathBuf {
-    let scratch = PathBuf::from("/tmp").join(format!(
+    #[cfg(windows)]
+    let temporary = std::env::temp_dir();
+    #[cfg(not(windows))]
+    let temporary = PathBuf::from("/tmp");
+    let scratch = temporary.join(format!(
         "ck-s8-slot-{}-{}",
         std::process::id(),
         ROOT_COUNTER.fetch_add(1, Ordering::Relaxed)
