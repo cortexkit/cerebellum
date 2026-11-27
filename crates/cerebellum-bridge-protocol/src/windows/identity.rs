@@ -9,6 +9,9 @@ use cerebellum_windows::{
 };
 use std::{fmt, io, os::windows::io::AsHandle};
 
+#[cfg(test)]
+mod tests;
+
 const TARGET: &str = env!("CEREBELLUM_WINDOWS_TARGET");
 
 pub fn current_user_sid() -> io::Result<String> {

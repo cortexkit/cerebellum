@@ -10,6 +10,9 @@ description = "Raw Windows process and window readings for ck-cerebellum. A thin
 name = "cerebellum_windows"
 path = "src/lib.rs"
 
+[features]
+bridge-test-identities = []
+
 # Windows bindings are needed only where their APIs exist. On every other host
 # this crate compiles to an empty library, so the workspace stays portable.
 [target.'cfg(target_os = "windows")'.dependencies]

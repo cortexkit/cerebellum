@@ -207,10 +207,10 @@ fn invalid_data(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> i
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(unix, all(windows, feature = "bridge-test-identities"))))]
 mod conformance;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use cerebellum_bridge_protocol::ParentAttestation;
