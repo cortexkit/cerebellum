@@ -384,6 +384,7 @@ name = "cerebellum-bridge-protocol"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "cerebellum-linux",
  "cortexkit-paths",
  "ed25519-dalek",
  "serde",
@@ -423,8 +424,6 @@ dependencies = [
 name = "cerebellum-linux"
 version = "0.1.0"
 dependencies = [
- "cerebellum-bridge-protocol",
- "ed25519-dalek",
  "libc",
  "serde",
  "sha2",

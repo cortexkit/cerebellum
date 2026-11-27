@@ -27,6 +27,8 @@ use std::io::{self, Read, Write};
 
 mod attestation;
 mod gate;
+#[cfg(target_os = "linux")]
+pub mod linux;
 mod paths;
 pub mod peer_trailer;
 
