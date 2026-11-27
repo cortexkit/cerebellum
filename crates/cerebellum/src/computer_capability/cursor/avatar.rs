@@ -113,13 +113,12 @@ fn rasterize(
     ground_shadow: bool,
 ) -> Option<Vec<u8>> {
     let mut tree =
-        avatar_svg::render_tree_for_bytes(bytes, avatar_type, version, avatar_svg::Mood::Neutral)
-            .ok()?;
+        avatar::render_tree_for_bytes(bytes, avatar_type, version, avatar::Mood::Neutral).ok()?;
     if !ground_shadow {
         tree.primitives
-            .retain(|primitive| primitive.role != Some(avatar_svg::Role::GroundShadow));
+            .retain(|primitive| primitive.role != Some(avatar::Role::GroundShadow));
     }
-    let svg = avatar_svg::serialize_tree(&tree);
+    let svg = avatar::serialize_tree(&tree);
     let svg_tree = resvg::usvg::Tree::from_data(&svg, &resvg::usvg::Options::default()).ok()?;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(side, side)?;
     let scale = side as f32 / svg_tree.size().width();
@@ -342,24 +341,16 @@ mod tests {
     #[test]
     fn wild_v2_sleepy_and_v1_neutral_match_upstream_vectors() {
         let genome = wild_0022_bytes();
-        let sleepy = avatar_svg::render_tree_for_bytes(
-            &genome,
-            "creature.wild",
-            2,
-            avatar_svg::Mood::Sleepy,
-        )
-        .expect("wild v2 sleepy must render");
-        assert_eq!(avatar_svg::serialize_tree(&sleepy), WILD_0022_V2_SLEEPY);
+        let sleepy =
+            avatar::render_tree_for_bytes(&genome, "creature.wild", 2, avatar::Mood::Sleepy)
+                .expect("wild v2 sleepy must render");
+        assert_eq!(avatar::serialize_tree(&sleepy), WILD_0022_V2_SLEEPY);
 
-        let neutral = avatar_svg::render_tree_for_bytes(
-            &genome,
-            "creature.wild",
-            1,
-            avatar_svg::Mood::Neutral,
-        )
-        .expect("wild v1 neutral must render");
+        let neutral =
+            avatar::render_tree_for_bytes(&genome, "creature.wild", 1, avatar::Mood::Neutral)
+                .expect("wild v1 neutral must render");
         assert_eq!(
-            avatar_svg::serialize_tree_json(&neutral).trim(),
+            avatar::serialize_tree_json(&neutral).trim(),
             WILD_0022_V1_NEUTRAL.trim()
         );
     }
@@ -430,17 +421,12 @@ mod tests {
         assert_eq!(cache.renders, 1);
         // Removing a role is independent of whichever label AVA gives it.
         let bytes = vec![0xaa; 16_384];
-        let tree = avatar_svg::render_tree_for_bytes(
-            &bytes,
-            "creature.wild",
-            1,
-            avatar_svg::Mood::Neutral,
-        )
-        .unwrap();
+        let tree = avatar::render_tree_for_bytes(&bytes, "creature.wild", 1, avatar::Mood::Neutral)
+            .unwrap();
         assert!(tree
             .primitives
             .iter()
-            .any(|primitive| primitive.role == Some(avatar_svg::Role::GroundShadow)));
+            .any(|primitive| primitive.role == Some(avatar::Role::GroundShadow)));
     }
 
     /// Agent colours the phone app computed for three creatures; see

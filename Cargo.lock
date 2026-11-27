@@ -209,42 +209,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
-name = "avatar-genome"
-version = "0.1.0"
-source = "git+https://github.com/cortexkit/avatar?rev=27499662d56c9e8f931e2443210b83c95d41bc4b#27499662d56c9e8f931e2443210b83c95d41bc4b"
-dependencies = [
- "avatar-phenotype",
- "avatar-tables",
- "blake3",
-]
-
-[[package]]
-name = "avatar-phenotype"
-version = "0.1.0"
-source = "git+https://github.com/cortexkit/avatar?rev=27499662d56c9e8f931e2443210b83c95d41bc4b#27499662d56c9e8f931e2443210b83c95d41bc4b"
-dependencies = [
- "serde_json",
-]
-
-[[package]]
-name = "avatar-svg"
-version = "0.1.0"
-source = "git+https://github.com/cortexkit/avatar?rev=27499662d56c9e8f931e2443210b83c95d41bc4b#27499662d56c9e8f931e2443210b83c95d41bc4b"
-dependencies = [
- "avatar-genome",
- "avatar-phenotype",
- "avatar-tables",
-]
-
-[[package]]
-name = "avatar-tables"
-version = "0.1.0"
-source = "git+https://github.com/cortexkit/avatar?rev=27499662d56c9e8f931e2443210b83c95d41bc4b#27499662d56c9e8f931e2443210b83c95d41bc4b"
-dependencies = [
- "blake3",
-]
-
-[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -355,7 +319,6 @@ version = "0.1.0"
 dependencies = [
  "async-nats",
  "async-trait",
- "avatar-svg",
  "base64",
  "cerebellum-ability",
  "cerebellum-bridge-protocol",
@@ -365,6 +328,7 @@ dependencies = [
  "cerebellum-macos",
  "cerebellum-native-host",
  "cerebellum-windows",
+ "cortexkit-avatar",
  "cortexkit-bus-client",
  "cortexkit-bus-naming",
  "cortexkit-bus-nats",
@@ -594,6 +558,132 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77745e017f5edba1a9c1d854f6f3a52dac8a12dd5af5d2f54aecf61e43d80d30"
 dependencies = [
  "libm",
+]
+
+[[package]]
+name = "cortexkit-avatar"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfa5e1f14b3058bf219bf0b67e111e932a12af805ecef73b5d930b892b359d4b"
+dependencies = [
+ "cortexkit-avatar-drawn-heads",
+ "cortexkit-avatar-genome",
+ "cortexkit-avatar-knitted-toys",
+ "cortexkit-avatar-phenotype",
+ "cortexkit-avatar-pixel-critters",
+ "cortexkit-avatar-raster",
+ "cortexkit-avatar-small-robots",
+ "cortexkit-avatar-sprouts",
+ "cortexkit-avatar-svg",
+ "cortexkit-avatar-wild-plus",
+]
+
+[[package]]
+name = "cortexkit-avatar-drawn-heads"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c5def80ca3d047499c9d0b0cade6f6d014c89369a0243cd57d7f0ddbfc5f922"
+dependencies = [
+ "cortexkit-avatar-svg",
+ "cortexkit-avatar-tables",
+]
+
+[[package]]
+name = "cortexkit-avatar-genome"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "510c5d8d5249294534a818601f257d741da156d60666b4a0299a4761919fd9d3"
+dependencies = [
+ "blake3",
+ "cortexkit-avatar-phenotype",
+ "cortexkit-avatar-tables",
+]
+
+[[package]]
+name = "cortexkit-avatar-knitted-toys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc3f5fa60f65c2c97606061c9596e561d418f5cf7a1a55ad87b2a6239b8bef4a"
+dependencies = [
+ "cortexkit-avatar-svg",
+ "cortexkit-avatar-tables",
+]
+
+[[package]]
+name = "cortexkit-avatar-phenotype"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea2f7fff4976aa96066a0fbcd0154e53a5b5da07ef4f1f8c2e1417520bf6be97"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "cortexkit-avatar-pixel-critters"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57075bcd2a1b5040fc067f035ea1e1181a9b2a4de8354db73842be30c08f4fac"
+dependencies = [
+ "cortexkit-avatar-svg",
+ "cortexkit-avatar-tables",
+]
+
+[[package]]
+name = "cortexkit-avatar-raster"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bfd4ab8cb3952ef0920c20033454f1159e138ccd396407f2a0d90b7a04614ab"
+dependencies = [
+ "cortexkit-avatar-svg",
+ "resvg",
+]
+
+[[package]]
+name = "cortexkit-avatar-small-robots"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4a2ce17686c78a3d458de12539467f40190e534f935a155bab68c8a86a9d0c4"
+dependencies = [
+ "cortexkit-avatar-svg",
+ "cortexkit-avatar-tables",
+]
+
+[[package]]
+name = "cortexkit-avatar-sprouts"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c157312ed514aa5a7bfec4a349b12ff6b2ad036fda31d2a2ef01a5047d0f28f"
+dependencies = [
+ "cortexkit-avatar-svg",
+ "cortexkit-avatar-tables",
+]
+
+[[package]]
+name = "cortexkit-avatar-svg"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3558cd63a3561e5644a9b11cec418a50afe25d3b3a89318112c27f15e6e1e68"
+dependencies = [
+ "cortexkit-avatar-phenotype",
+ "cortexkit-avatar-tables",
+]
+
+[[package]]
+name = "cortexkit-avatar-tables"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d2b30b95a7efa3f0106304170d12632eb0a56114da4d2d897fc55d1cc07763d"
+dependencies = [
+ "blake3",
+]
+
+[[package]]
+name = "cortexkit-avatar-wild-plus"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13947d4341bb570398fb2f35bc02428608e65784928d2dec07c7e9f73656b0ad"
+dependencies = [
+ "cortexkit-avatar-svg",
 ]
 
 [[package]]
