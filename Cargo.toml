@@ -47,3 +47,8 @@ signal-hook = { version = "0.4", default-features = false }
 # Test fixtures hash executable bytes; keep hashing fast in dev and inherited test builds.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# The managed-settings daemon hashes the real module executable and rejects
+# files over 512 MiB. Keep source locations without full DWARF in test builds.
+[profile.test]
+debug = "line-tables-only"
