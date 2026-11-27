@@ -32,24 +32,21 @@ fn version(products: &[Vec<u8>]) -> Vec<u8> {
 }
 
 #[test]
-fn product_name_is_exact_and_unique() {
-    assert_eq!(
-        version_strings(&version(&[product("Google Chrome")]), "Google Chrome"),
-        Some(true)
-    );
+fn reads_product_name_without_normalizing_and_reports_ambiguous_metadata() {
     for name in [
+        "Google Chrome",
         "Google Chrome Beta",
         "google chrome",
         "Google Chrome\0extra",
         "",
     ] {
         assert_eq!(
-            version_strings(&version(&[product(name)]), "Google Chrome"),
-            Some(false)
+            version_strings(&version(&[product(name)])),
+            Some(vec![name.to_owned()])
         );
     }
     let duplicate = version(&[product("Google Chrome"), product("Google Chrome")]);
-    assert_eq!(version_strings(&duplicate, "Google Chrome"), Some(false));
+    assert_eq!(version_strings(&duplicate), None);
 }
 
 #[test]
@@ -91,20 +88,17 @@ fn reads_product_from_resource_section_not_certificate_table() {
     set(&mut image, section + 16, 0x200);
     set(&mut image, section + 20, 0x400);
     let check = |image: &[u8]| {
-        matches(
-            |offset, buf| {
-                let i = offset as usize;
-                let bytes = image
-                    .get(i..i + buf.len())
-                    .ok_or(std::io::ErrorKind::UnexpectedEof)?;
-                buf.copy_from_slice(bytes);
-                Ok(())
-            },
-            "Google Chrome",
-        )
+        read_product_names(|offset, buf| {
+            let i = offset as usize;
+            let bytes = image
+                .get(i..i + buf.len())
+                .ok_or(std::io::ErrorKind::UnexpectedEof)?;
+            buf.copy_from_slice(bytes);
+            Ok(())
+        })
     };
-    assert!(check(&image));
-    assert!(!check(&image[..0x5ff]));
+    assert_eq!(check(&image), Some(vec!["Google Chrome".into()]));
+    assert_eq!(check(&image[..0x5ff]), None);
     set(&mut image, optional + 144, 0x450);
-    assert!(!check(&image));
+    assert_eq!(check(&image), None);
 }

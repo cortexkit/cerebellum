@@ -4,10 +4,10 @@ if ($env:GITHUB_ACTIONS -cne 'true' -or $env:RUNNER_ENVIRONMENT -cne 'github-hos
     throw 'This test installs an ephemeral root and runs only on GitHub-hosted Windows runners.'
 }
 
-function Invoke-PredicateTest([string] $Filter, [bool] $Ignored) {
+function Invoke-PredicateTest([string] $Filter, [bool] $Ignored, [string] $Package = 'cerebellum-bridge-protocol') {
     $start = [System.Diagnostics.ProcessStartInfo]::new('cargo')
     $start.UseShellExecute = $false
-    $arguments = @('test', '--release', '--locked', '-p', 'cerebellum-windows', '--lib', $Filter, '--')
+    $arguments = @('test', '--release', '--locked', '-p', $Package, '--lib', $Filter, '--')
     if ($Ignored) { $arguments += '--ignored' }
     foreach ($arg in $arguments) { $start.ArgumentList.Add($arg) }
     $process = [System.Diagnostics.Process]::Start($start)
@@ -25,7 +25,8 @@ function Invoke-PredicateTest([string] $Filter, [bool] $Ignored) {
 if ((Get-Service CryptSvc).Status -ne 'Running') {
     throw 'The Windows Cryptographic Services catalog service must be running.'
 }
-Invoke-PredicateTest 'browser_image::' $false
+Invoke-PredicateTest 'browser_image::' $false 'cerebellum-windows'
+Invoke-PredicateTest 'windows::tests' $false
 Invoke-PredicateTest 'native_system_and_chrome_signers_are_isolated' $true
 
 $scratch = Join-Path $env:RUNNER_TEMP "ck-image-predicates-$([Guid]::NewGuid())"

@@ -6,14 +6,11 @@ const MAX_RESOURCE_BYTES: usize = 4 * 1024 * 1024;
 const RT_VERSION: u32 = 16;
 const DIRECTORY: u32 = 1 << 31;
 
-pub(crate) fn matches(
+pub(crate) fn read_product_names(
     mut read_at: impl FnMut(u64, &mut [u8]) -> std::io::Result<()>,
-    expected: &str,
-) -> bool {
-    let Some((table, rva)) = resource_table(&mut read_at) else {
-        return false;
-    };
-    version_matches(&table, rva, expected) == Some(true)
+) -> Option<Vec<String>> {
+    let (table, rva) = resource_table(&mut read_at)?;
+    version_products(&table, rva)
 }
 
 fn resource_table(
@@ -88,7 +85,7 @@ fn resource_table(
     Some((table, rva))
 }
 
-fn version_matches(table: &[u8], rva: u32, expected: &str) -> Option<bool> {
+fn version_products(table: &[u8], rva: u32) -> Option<Vec<String>> {
     let mut versions = directory_entries(table, 0)?.filter(|&(id, _)| id == RT_VERSION);
     let version = versions.next()?.1;
     if versions.next().is_some() {
@@ -96,6 +93,7 @@ fn version_matches(table: &[u8], rva: u32, expected: &str) -> Option<bool> {
     }
     let mut names = 0;
     let mut resources = 0;
+    let mut products = Vec::new();
     for (_, name) in directory_entries(table, directory_offset(version)?)? {
         names += 1;
         if names > 64 {
@@ -109,12 +107,12 @@ fn version_matches(table: &[u8], rva: u32, expected: &str) -> Option<bool> {
             let entry = lang as usize;
             let start = u32_at(table, entry)?.checked_sub(rva)? as usize;
             let size = u32_at(table, entry + 4)? as usize;
-            if !version_strings(table.get(start..start.checked_add(size)?)?, expected)? {
-                return Some(false);
-            }
+            products.extend(version_strings(
+                table.get(start..start.checked_add(size)?)?,
+            )?);
         }
     }
-    Some(resources != 0)
+    (!products.is_empty()).then_some(products)
 }
 
 fn directory_offset(entry: u32) -> Option<usize> {
@@ -140,35 +138,40 @@ fn directory_entries(table: &[u8], offset: usize) -> Option<impl Iterator<Item =
     )
 }
 
-fn version_strings(buf: &[u8], expected: &str) -> Option<bool> {
+fn version_strings(buf: &[u8]) -> Option<Vec<String>> {
     let root = Block::read(buf)?;
     if !wide_eq(root.key, "VS_VERSION_INFO") {
         return None;
     }
-    let mut found = false;
+    let mut products = Vec::new();
     for child in root.children() {
         let child = child?;
         if !wide_eq(child.key, "StringFileInfo") {
             continue;
         }
         for locale in child.children() {
-            let mut seen = false;
+            let mut product = None;
             for string in locale?.children() {
                 let string = string?;
                 if wide_eq(string.key, "ProductName") {
-                    if seen || !string.text || !terminated_wide_eq(string.value, expected) {
-                        return Some(false);
+                    if product.is_some() || !string.text {
+                        return None;
                     }
-                    seen = true;
+                    let text = string.value.strip_suffix(&[0, 0])?;
+                    let units: Vec<u16> = text
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .copied()
+                        .map(u16::from_le_bytes)
+                        .collect();
+                    product = Some(String::from_utf16(&units).ok()?);
                 }
             }
-            if !seen {
-                return Some(false);
-            }
-            found = true;
+            products.push(product?);
         }
     }
-    Some(found)
+    (!products.is_empty()).then_some(products)
 }
 
 struct Block<'a> {
@@ -223,12 +226,6 @@ impl<'a> Block<'a> {
 
 fn align4(offset: usize) -> usize {
     (offset + 3) & !3
-}
-
-fn terminated_wide_eq(bytes: &[u8], expected: &str) -> bool {
-    bytes
-        .strip_suffix(&[0, 0])
-        .is_some_and(|text| wide_eq(text, expected))
 }
 
 fn wide_eq(bytes: &[u8], expected: &str) -> bool {

@@ -5,32 +5,47 @@ use std::os::windows::io::AsRawHandle;
 use std::ptr::{null, null_mut};
 
 use windows_sys::core::{w, GUID};
-use windows_sys::Win32::Foundation::{
-    LocalFree, CERT_E_REVOCATION_FAILURE, CRYPT_E_NO_REVOCATION_CHECK, CRYPT_E_REVOCATION_OFFLINE,
-    ERROR_SERVICE_NOT_ACTIVE,
-};
+use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Cryptography::{
-    szOID_COMMON_NAME, szOID_ORGANIZATION_NAME, Catalog::*, CertVerifyCertificateChainPolicy,
-    CryptDecodeObjectEx, CERT_CHAIN_CONTEXT, CERT_CHAIN_POLICY_MICROSOFT_ROOT,
-    CERT_CHAIN_POLICY_PARA, CERT_CHAIN_POLICY_STATUS, CERT_CONTEXT, CERT_NAME_INFO,
-    CERT_RDN_ENCODED_BLOB, CERT_RDN_OCTET_STRING, CERT_TRUST_IS_OFFLINE_REVOCATION,
-    CERT_TRUST_REVOCATION_STATUS_UNKNOWN, CRYPT_DECODE_ALLOC_FLAG, X509_ASN_ENCODING,
-    X509_UNICODE_NAME,
+    szOID_COMMON_NAME, szOID_ORGANIZATION_NAME, Catalog::*, CertGetCertificateContextProperty,
+    CertVerifyCertificateChainPolicy, CryptDecodeObjectEx, CERT_CHAIN_CONTEXT,
+    CERT_CHAIN_POLICY_MICROSOFT_ROOT, CERT_CHAIN_POLICY_PARA, CERT_CHAIN_POLICY_STATUS,
+    CERT_CONTEXT, CERT_NAME_INFO, CERT_RDN_ENCODED_BLOB, CERT_RDN_OCTET_STRING,
+    CERT_SHA1_HASH_PROP_ID, CRYPT_DECODE_ALLOC_FLAG, X509_ASN_ENCODING, X509_UNICODE_NAME,
 };
 use windows_sys::Win32::Security::WinTrust::*;
 
-use super::{last_error, wide_z, ImageRefusal, OpenedProcessImage};
+use super::{last_error, wide_z, ImageReadError, OpenedProcessImage};
 
-const OFFLINE_BITS: u32 = CERT_TRUST_REVOCATION_STATUS_UNKNOWN | CERT_TRUST_IS_OFFLINE_REVOCATION;
-
-fn trust_status_ok(status: i32, chain_errors: u32) -> bool {
-    matches!(
-        status,
-        0 | CERT_E_REVOCATION_FAILURE | CRYPT_E_REVOCATION_OFFLINE | CRYPT_E_NO_REVOCATION_CHECK
-    ) && chain_errors & !OFFLINE_BITS == 0
+#[derive(Debug)]
+pub struct SignatureReading {
+    pub status: i32,
+    pub chain_errors: u32,
+    pub root_thumbprint: Result<[u8; 20], ImageReadError>,
 }
 
-pub(super) fn verify_catalog(image: &OpenedProcessImage) -> Result<(), ImageRefusal> {
+#[derive(Debug)]
+pub struct AuthenticodeReading {
+    pub signature: SignatureReading,
+    pub subject: Result<SignerSubject, ImageReadError>,
+}
+
+#[derive(Debug)]
+pub struct MicrosoftRootReading {
+    pub signature: SignatureReading,
+    pub policy_status: Result<u32, ImageReadError>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SignerSubject {
+    pub organizations: Vec<String>,
+    pub common_names: Vec<String>,
+}
+
+/// Read the first SHA-256 system catalog entry for this handle and its signer.
+pub fn read_catalog_signer(
+    image: &OpenedProcessImage,
+) -> Result<MicrosoftRootReading, ImageReadError> {
     let admin = CatalogAdmin::open()?;
     let mut hash = [0; 32]; // SHA-256, selected by the admin context.
     let mut bytes = hash.len() as u32;
@@ -40,10 +55,10 @@ pub(super) fn verify_catalog(image: &OpenedProcessImage) -> Result<(), ImageRefu
         CryptCATAdminCalcHashFromFileHandle2(admin.0, file, &mut bytes, hash.as_mut_ptr(), 0)
     };
     if ok == 0 {
-        return Err(catalog_refusal(last_error(), ImageRefusal::CatalogHash));
+        return Err(ImageReadError::CatalogHash(last_error()));
     }
     if bytes != hash.len() as u32 {
-        return Err(ImageRefusal::CatalogHash(0));
+        return Err(ImageReadError::CatalogHash(0));
     }
 
     let catalog = admin.lookup(&hash)?;
@@ -53,10 +68,10 @@ pub(super) fn verify_catalog(image: &OpenedProcessImage) -> Result<(), ImageRefu
     };
     // SAFETY: catalog is retained and info is writable for its declared size.
     if unsafe { CryptCATCatalogInfoFromContext(catalog.context, &mut info, 0) } == 0 {
-        return Err(catalog_refusal(last_error(), ImageRefusal::CatalogInfo));
+        return Err(ImageReadError::CatalogInfo(last_error()));
     }
     if info.wszCatalogFile[0] == 0 || !info.wszCatalogFile.contains(&0) {
-        return Err(ImageRefusal::CatalogInfo(0));
+        return Err(ImageReadError::CatalogInfo(0));
     }
 
     // A catalog member tag is the uppercase hexadecimal catalog hash.
@@ -86,27 +101,43 @@ pub(super) fn verify_catalog(image: &OpenedProcessImage) -> Result<(), ImageRefu
     // SAFETY: the union points to catalog_info, and all referenced buffers and
     // handles remain live until both VERIFY and CLOSE return.
     unsafe {
-        with_trust(
+        read_from_provider(
             WTD_CHOICE_CATALOG,
             WINTRUST_DATA_0 {
                 pCatalog: &mut catalog_info,
             },
-            |_, chain| microsoft_root(chain),
+            |signature, _, chain| MicrosoftRootReading {
+                signature,
+                policy_status: microsoft_root_status(chain),
+            },
         )
     }
 }
 
-pub(super) fn verify_chrome(image: &OpenedProcessImage) -> Result<(), ImageRefusal> {
-    with_embedded_trust(image, |signer, _| {
-        google_subject(signer_certificate(signer)?)
-    })?;
-    require_chrome_product(image)
+/// Read the embedded Authenticode signer, with no catalog fallback.
+pub fn read_authenticode(
+    image: &OpenedProcessImage,
+) -> Result<AuthenticodeReading, ImageReadError> {
+    read_embedded(image, |signature, signer, _| AuthenticodeReading {
+        signature,
+        subject: signer_certificate(signer, 0).and_then(read_subject),
+    })
 }
 
-fn with_embedded_trust(
+/// Read the Microsoft-root policy result for the embedded signer's chain.
+pub fn read_embedded_root_status(
     image: &OpenedProcessImage,
-    check_signer: impl FnOnce(&CRYPT_PROVIDER_SGNR, &CERT_CHAIN_CONTEXT) -> Result<(), ImageRefusal>,
-) -> Result<(), ImageRefusal> {
+) -> Result<MicrosoftRootReading, ImageReadError> {
+    read_embedded(image, |signature, _, chain| MicrosoftRootReading {
+        signature,
+        policy_status: microsoft_root_status(chain),
+    })
+}
+
+fn read_embedded<T>(
+    image: &OpenedProcessImage,
+    read_signer: impl FnOnce(SignatureReading, &CRYPT_PROVIDER_SGNR, &CERT_CHAIN_CONTEXT) -> T,
+) -> Result<T, ImageReadError> {
     let path = wide_z(image.final_path.as_os_str());
     let mut file_info = WINTRUST_FILE_INFO {
         cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
@@ -117,23 +148,18 @@ fn with_embedded_trust(
     // SAFETY: the union points to file_info, and the path and the same image
     // handle remain live until both VERIFY and CLOSE return.
     unsafe {
-        with_trust(
+        read_from_provider(
             WTD_CHOICE_FILE,
             WINTRUST_DATA_0 {
                 pFile: &mut file_info,
             },
-            check_signer,
+            read_signer,
         )
     }
 }
 
-fn require_chrome_product(image: &OpenedProcessImage) -> Result<(), ImageRefusal> {
-    product_matches(image, "Google Chrome")
-        .then_some(())
-        .ok_or(ImageRefusal::ProductName)
-}
-
-fn product_matches(image: &OpenedProcessImage, expected: &str) -> bool {
+/// Read the PE's embedded ProductName values from the open file.
+pub fn read_product_names(image: &OpenedProcessImage) -> Option<Vec<String>> {
     let read_at = |mut offset, mut buf: &mut [u8]| {
         while !buf.is_empty() {
             let n = image.file.seek_read(buf, offset)?;
@@ -145,13 +171,13 @@ fn product_matches(image: &OpenedProcessImage, expected: &str) -> bool {
         }
         Ok(())
     };
-    crate::pe_product::matches(read_at, expected)
+    crate::pe_product::read_product_names(read_at)
 }
 
 struct CatalogAdmin(isize);
 
 impl CatalogAdmin {
-    fn open() -> Result<Self, ImageRefusal> {
+    fn open() -> Result<Self, ImageReadError> {
         let mut admin = 0;
         // SAFETY: the output handle is writable. The GUID and SHA-256 name
         // select the system component catalog database and hash algorithm.
@@ -159,12 +185,12 @@ impl CatalogAdmin {
             CryptCATAdminAcquireContext2(&mut admin, &DRIVER_ACTION_VERIFY, w!("SHA256"), null(), 0)
         };
         if ok == 0 || admin == 0 {
-            return Err(catalog_refusal(last_error(), ImageRefusal::CatalogOpen));
+            return Err(ImageReadError::CatalogOpen(last_error()));
         }
         Ok(Self(admin))
     }
 
-    fn lookup(&self, hash: &[u8; 32]) -> Result<CatalogMatch<'_>, ImageRefusal> {
+    fn lookup(&self, hash: &[u8; 32]) -> Result<CatalogMatch<'_>, ImageReadError> {
         // SAFETY: the admin handle and hash remain live. Null starts lookup
         // at the first catalog; never fall back to a different hash or signer.
         let context = unsafe {
@@ -177,20 +203,12 @@ impl CatalogAdmin {
             )
         };
         if context == 0 {
-            return Err(catalog_refusal(last_error(), ImageRefusal::CatalogNotFound));
+            return Err(ImageReadError::CatalogNotFound(last_error()));
         }
         Ok(CatalogMatch {
             admin: self,
             context,
         })
-    }
-}
-
-fn catalog_refusal(code: u32, otherwise: fn(u32) -> ImageRefusal) -> ImageRefusal {
-    if code == ERROR_SERVICE_NOT_ACTIVE {
-        ImageRefusal::CatalogServiceInactive
-    } else {
-        otherwise(code)
     }
 }
 
@@ -215,11 +233,11 @@ impl Drop for CatalogMatch<'_> {
 
 /// `subject` must carry the pointer for `choice`; all data reachable through
 /// it must outlive both WinVerifyTrust calls, including the guard's unwind path.
-unsafe fn with_trust(
+unsafe fn read_from_provider<T>(
     choice: u32,
     subject: WINTRUST_DATA_0,
-    check_signer: impl FnOnce(&CRYPT_PROVIDER_SGNR, &CERT_CHAIN_CONTEXT) -> Result<(), ImageRefusal>,
-) -> Result<(), ImageRefusal> {
+    read_signer: impl FnOnce(SignatureReading, &CRYPT_PROVIDER_SGNR, &CERT_CHAIN_CONTEXT) -> T,
+) -> Result<T, ImageReadError> {
     let mut session = TrustSession {
         action: WINTRUST_ACTION_GENERIC_VERIFY_V2,
         data: WINTRUST_DATA {
@@ -235,9 +253,11 @@ unsafe fn with_trust(
     };
     // SAFETY: session is writable, and subject's pointers satisfy the contract above.
     let status = unsafe { session.run() };
-    let result = session.inspect(status, check_signer);
+    let result = session.read(status, read_signer);
     let close = session.close();
-    result.and(close)
+    let reading = result?;
+    close?;
+    Ok(reading)
 }
 
 struct TrustSession {
@@ -257,59 +277,48 @@ impl TrustSession {
         }
     }
 
-    fn inspect(
+    fn read<T>(
         &self,
         status: i32,
-        check_signer: impl FnOnce(&CRYPT_PROVIDER_SGNR, &CERT_CHAIN_CONTEXT) -> Result<(), ImageRefusal>,
-    ) -> Result<(), ImageRefusal> {
+        read_signer: impl FnOnce(SignatureReading, &CRYPT_PROVIDER_SGNR, &CERT_CHAIN_CONTEXT) -> T,
+    ) -> Result<T, ImageReadError> {
         if self.data.hWVTStateData.is_null() {
-            return Err(ImageRefusal::TrustStateMissing(status));
+            return Err(ImageReadError::TrustStateMissing(status));
         }
         // SAFETY: the provider state from VERIFY remains live until CLOSE.
         let (signer, chain) = unsafe {
             let provider = WTHelperProvDataFromStateData(self.data.hWVTStateData);
             if provider.is_null() {
-                return Err(ImageRefusal::TrustStateMissing(status));
+                return Err(ImageReadError::TrustStateMissing(status));
             }
             let signer = WTHelperGetProvSignerFromChain(provider, 0, 0, 0)
                 .as_ref()
-                .ok_or(ImageRefusal::TrustStateMissing(status))?;
+                .ok_or(ImageReadError::TrustStateMissing(status))?;
             let chain = signer
                 .pChainContext
                 .as_ref()
-                .ok_or(ImageRefusal::TrustStateMissing(status))?;
+                .ok_or(ImageReadError::TrustStateMissing(status))?;
             (signer, chain)
         };
-        authorize(status, chain.TrustStatus.dwErrorStatus, || {
-            check_signer(signer, chain)
-        })
+        let signature = SignatureReading {
+            status,
+            chain_errors: chain.TrustStatus.dwErrorStatus,
+            root_thumbprint: root_thumbprint(signer),
+        };
+        Ok(read_signer(signature, signer, chain))
     }
 
-    fn close(&mut self) -> Result<(), ImageRefusal> {
+    fn close(&mut self) -> Result<(), ImageReadError> {
         self.data.dwStateAction = WTD_STATEACTION_CLOSE;
-        // SAFETY: the guard lives within with_trust, which retains subject data.
+        // SAFETY: the provider's input buffers and handles remain live here.
         let status = unsafe { self.run() };
         self.data.dwStateAction = WTD_STATEACTION_IGNORE;
         if status == 0 {
             Ok(())
         } else {
-            Err(ImageRefusal::TrustClose(status))
+            Err(ImageReadError::TrustClose(status))
         }
     }
-}
-
-fn authorize(
-    status: i32,
-    chain_errors: u32,
-    require_signer: impl FnOnce() -> Result<(), ImageRefusal>,
-) -> Result<(), ImageRefusal> {
-    if !trust_status_ok(status, chain_errors) {
-        return Err(ImageRefusal::Trust {
-            status,
-            chain_errors,
-        });
-    }
-    require_signer()
 }
 
 impl Drop for TrustSession {
@@ -320,7 +329,7 @@ impl Drop for TrustSession {
     }
 }
 
-fn microsoft_root(chain: &CERT_CHAIN_CONTEXT) -> Result<(), ImageRefusal> {
+fn microsoft_root_status(chain: &CERT_CHAIN_CONTEXT) -> Result<u32, ImageReadError> {
     let params = CERT_CHAIN_POLICY_PARA {
         cbSize: size_of::<CERT_CHAIN_POLICY_PARA>() as u32,
         ..Default::default()
@@ -340,27 +349,56 @@ fn microsoft_root(chain: &CERT_CHAIN_CONTEXT) -> Result<(), ImageRefusal> {
         )
     };
     if ok == 0 {
-        Err(ImageRefusal::MicrosoftRootApi(last_error()))
-    } else if status.dwError != 0 {
-        Err(ImageRefusal::MicrosoftRootPolicy(status.dwError))
+        Err(ImageReadError::MicrosoftRootApi(last_error()))
     } else {
-        Ok(())
+        Ok(status.dwError)
     }
 }
 
-fn signer_certificate(signer: &CRYPT_PROVIDER_SGNR) -> Result<&CERT_CONTEXT, ImageRefusal> {
-    // SAFETY: the signer and its first certificate context are retained by
+fn signer_certificate(
+    signer: &CRYPT_PROVIDER_SGNR,
+    index: u32,
+) -> Result<&CERT_CONTEXT, ImageReadError> {
+    // SAFETY: the signer and its certificate context are retained by
     // WinVerifyTrust state. The accessor's API takes a mutable pointer but
     // only reads the signer; the returned references do not outlive it.
     unsafe {
-        let cert = WTHelperGetProvCertFromChain(std::ptr::from_ref(signer).cast_mut(), 0)
+        let cert = WTHelperGetProvCertFromChain(std::ptr::from_ref(signer).cast_mut(), index)
             .as_ref()
-            .ok_or(ImageRefusal::SignerSubject)?;
-        cert.pCert.as_ref().ok_or(ImageRefusal::SignerSubject)
+            .ok_or(ImageReadError::MissingCertificate)?;
+        cert.pCert
+            .as_ref()
+            .ok_or(ImageReadError::MissingCertificate)
     }
 }
 
-fn google_subject(cert: &CERT_CONTEXT) -> Result<(), ImageRefusal> {
+fn root_thumbprint(signer: &CRYPT_PROVIDER_SGNR) -> Result<[u8; 20], ImageReadError> {
+    let last = signer
+        .csCertChain
+        .checked_sub(1)
+        .ok_or(ImageReadError::MissingCertificate)?;
+    let root = signer_certificate(signer, last)?;
+    let mut thumbprint = [0u8; 20];
+    let mut bytes = thumbprint.len() as u32;
+    // SAFETY: the certificate is retained; the output buffer holds the SHA-1 thumbprint.
+    let ok = unsafe {
+        CertGetCertificateContextProperty(
+            root,
+            CERT_SHA1_HASH_PROP_ID,
+            thumbprint.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    if ok == 0 {
+        return Err(ImageReadError::CertificateProperty(last_error()));
+    }
+    if bytes != thumbprint.len() as u32 {
+        return Err(ImageReadError::CertificateProperty(0));
+    }
+    Ok(thumbprint)
+}
+
+fn read_subject(cert: &CERT_CONTEXT) -> Result<SignerSubject, ImageReadError> {
     // Decode the Subject itself. Display-name helpers can fall back to the
     // Subject Alternative Name and do not detect duplicate attributes.
     // SAFETY: the certificate and its Subject BLOB belong to the live state.
@@ -368,20 +406,20 @@ fn google_subject(cert: &CERT_CONTEXT) -> Result<(), ImageRefusal> {
         &cert
             .pCertInfo
             .as_ref()
-            .ok_or(ImageRefusal::SignerSubject)?
+            .ok_or(ImageReadError::MissingCertificate)?
             .Subject
     };
     // SAFETY: the certificate's subject buffer is valid for the reported size.
     let encoded = unsafe {
         if subject.pbData.is_null() || subject.cbData == 0 {
-            return Err(ImageRefusal::SignerSubject);
+            return Err(ImageReadError::SubjectEncoding);
         }
         std::slice::from_raw_parts(subject.pbData, subject.cbData as usize)
     };
-    google_distinguished_name(encoded)
+    read_distinguished_name(encoded)
 }
 
-fn google_distinguished_name(encoded: &[u8]) -> Result<(), ImageRefusal> {
+fn read_distinguished_name(encoded: &[u8]) -> Result<SignerSubject, ImageReadError> {
     let mut decoded: *mut CERT_NAME_INFO = null_mut();
     let mut size = 0;
     // SAFETY: subject is a live encoded name; ALLOC writes a pointer to decoded.
@@ -390,7 +428,7 @@ fn google_distinguished_name(encoded: &[u8]) -> Result<(), ImageRefusal> {
             X509_ASN_ENCODING,
             X509_UNICODE_NAME,
             encoded.as_ptr(),
-            u32::try_from(encoded.len()).map_err(|_| ImageRefusal::SignerSubject)?,
+            u32::try_from(encoded.len()).map_err(|_| ImageReadError::SubjectEncoding)?,
             CRYPT_DECODE_ALLOC_FLAG,
             null(),
             (&mut decoded as *mut *mut CERT_NAME_INFO).cast(),
@@ -398,61 +436,62 @@ fn google_distinguished_name(encoded: &[u8]) -> Result<(), ImageRefusal> {
         )
     };
     if ok == 0 || decoded.is_null() {
-        return Err(ImageRefusal::SignerSubject);
+        return Err(ImageReadError::SubjectDecode(last_error()));
     }
     let name = DecodedName(decoded);
-    name.require_google()
+    name.read_fields()
 }
 
 struct DecodedName(*mut CERT_NAME_INFO);
 
 impl DecodedName {
-    fn require_google(&self) -> Result<(), ImageRefusal> {
+    fn read_fields(&self) -> Result<SignerSubject, ImageReadError> {
         // SAFETY: Crypt32 allocated and decoded the CERT_NAME_INFO and each
         // nested array and string; all remain live while self owns the block.
         unsafe {
             let name = &*self.0;
-            let mut seen_org = false;
-            let mut seen_cn = false;
+            let mut subject = SignerSubject::default();
             for i in 0..name.cRDN as usize {
                 let rdn = &*name.rgRDN.add(i);
                 for j in 0..rdn.cRDNAttr as usize {
                     let attr = &*rdn.rgRDNAttr.add(j);
                     let oid = CStr::from_ptr(attr.pszObjId.cast());
-                    let seen = if oid == CStr::from_ptr(szOID_ORGANIZATION_NAME.cast()) {
-                        &mut seen_org
+                    let fields = if oid == CStr::from_ptr(szOID_ORGANIZATION_NAME.cast()) {
+                        &mut subject.organizations
                     } else if oid == CStr::from_ptr(szOID_COMMON_NAME.cast()) {
-                        &mut seen_cn
+                        &mut subject.common_names
                     } else {
                         continue;
                     };
                     // X509_UNICODE_NAME returns UTF-16 values whose byte counts
-                    // exclude the trailing zero; require the entire exact value.
-                    const GOOGLE: &str = "Google LLC";
-                    let expected = GOOGLE.encode_utf16().flat_map(u16::to_le_bytes);
+                    // exclude the trailing zero. Preserve all values, including duplicates.
                     let value = &attr.Value;
-                    if *seen
-                        || matches!(
-                            attr.dwValueType as i32,
-                            CERT_RDN_ENCODED_BLOB | CERT_RDN_OCTET_STRING
-                        )
-                        || value.cbData as usize != 2 * GOOGLE.len()
-                        || value.pbData.is_null()
-                        || !std::slice::from_raw_parts(value.pbData, value.cbData as usize)
-                            .iter()
-                            .copied()
-                            .eq(expected)
+                    if matches!(
+                        attr.dwValueType as i32,
+                        CERT_RDN_ENCODED_BLOB | CERT_RDN_OCTET_STRING
+                    ) || !value.cbData.is_multiple_of(2)
+                        || (value.cbData != 0 && value.pbData.is_null())
                     {
-                        return Err(ImageRefusal::SignerSubject);
+                        return Err(ImageReadError::SubjectEncoding);
                     }
-                    *seen = true;
+                    let bytes = if value.cbData == 0 {
+                        &[]
+                    } else {
+                        std::slice::from_raw_parts(value.pbData, value.cbData as usize)
+                    };
+                    let units: Vec<u16> = bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .copied()
+                        .map(u16::from_le_bytes)
+                        .collect();
+                    fields.push(
+                        String::from_utf16(&units).map_err(|_| ImageReadError::SubjectEncoding)?,
+                    );
                 }
             }
-            if seen_org && seen_cn {
-                Ok(())
-            } else {
-                Err(ImageRefusal::SignerSubject)
-            }
+            Ok(subject)
         }
     }
 }

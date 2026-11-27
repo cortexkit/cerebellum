@@ -20,5 +20,8 @@ zeroize = "=1.9.1"
 [target.'cfg(target_os = "linux")'.dependencies]
 cerebellum-linux = { path = "../cerebellum-linux" }
 
+[target.'cfg(windows)'.dependencies]
+cerebellum-windows = { path = "../cerebellum-windows" }
+
 [dev-dependencies]
 base64 = "0.22"

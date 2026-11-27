@@ -1,7 +1,6 @@
-//! Windows native-messaging image checks, independent of process ancestry.
+//! Paths and signature readings from Windows image and directory handles.
 
 use std::ffi::{OsStr, OsString};
-use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::mem::size_of;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -26,12 +25,27 @@ use crate::RetainedProcessHandle;
 #[cfg(test)]
 mod tests;
 mod trust;
+pub use trust::{
+    read_authenticode, read_catalog_signer, read_embedded_root_status, read_product_names,
+    AuthenticodeReading, MicrosoftRootReading, SignatureReading, SignerSubject,
+};
+
+pub mod image_status {
+    pub use windows_sys::Win32::Foundation::{
+        CERT_E_REVOCATION_FAILURE, CERT_E_UNTRUSTEDROOT, CRYPT_E_NO_REVOCATION_CHECK,
+        CRYPT_E_REVOCATION_OFFLINE, ERROR_SERVICE_NOT_ACTIVE, TRUST_E_BAD_DIGEST,
+    };
+    pub use windows_sys::Win32::Security::Cryptography::{
+        CERT_TRUST_IS_NOT_SIGNATURE_VALID, CERT_TRUST_IS_NOT_TIME_VALID,
+        CERT_TRUST_IS_OFFLINE_REVOCATION, CERT_TRUST_IS_REVOKED, CERT_TRUST_IS_UNTRUSTED_ROOT,
+        CERT_TRUST_REVOCATION_STATUS_UNKNOWN,
+    };
+}
 
 const PATH_CAPACITY: usize = 32_768;
-const CHROME_RELATIVE: &str = r"Google\Chrome\Application\chrome.exe";
 
 #[derive(Debug)]
-pub enum ImageRefusal {
+pub enum ImageReadError {
     QueryImage(u32),
     OpenImage(std::io::Error),
     FinalPath(u32),
@@ -39,36 +53,21 @@ pub enum ImageRefusal {
     ProgramFilesRegistry(u32),
     InvalidPath,
     OpenRoot(std::io::Error),
-    UnexpectedPath,
     CatalogOpen(u32),
     CatalogHash(u32),
     CatalogNotFound(u32),
-    CatalogServiceInactive,
     CatalogInfo(u32),
     TrustStateMissing(i32),
-    Trust { status: i32, chain_errors: u32 },
     TrustClose(i32),
     MicrosoftRootApi(u32),
-    MicrosoftRootPolicy(u32),
-    SignerSubject,
-    ProductName,
+    MissingCertificate,
+    CertificateProperty(u32),
+    SubjectDecode(u32),
+    SubjectEncoding,
 }
-
-impl fmt::Display for ImageRefusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CatalogServiceInactive => {
-                f.write_str("Windows' Cryptographic Services is not running")
-            }
-            other => write!(f, "Windows image verification refused: {other:?}"),
-        }
-    }
-}
-
-impl std::error::Error for ImageRefusal {}
 
 /// An image opened for reading with neither write nor delete sharing. Its path
-/// and verification data come from that handle, not a second open of the path.
+/// and signature readings come from that handle, not a second open of the path.
 #[derive(Debug)]
 pub struct OpenedProcessImage {
     file: File,
@@ -78,7 +77,7 @@ pub struct OpenedProcessImage {
 impl OpenedProcessImage {
     /// Query the retained process, then open the file Windows names. This does
     /// not prove that the named file is the image already mapped in the process.
-    pub fn open(process: &RetainedProcessHandle) -> Result<Self, ImageRefusal> {
+    pub fn open(process: &RetainedProcessHandle) -> Result<Self, ImageReadError> {
         let mut path = vec![0u16; PATH_CAPACITY];
         let mut len = path.len() as u32;
         // SAFETY: the process owns a live handle; path and len are writable.
@@ -86,58 +85,70 @@ impl OpenedProcessImage {
             QueryFullProcessImageNameW(process.raw_handle(), 0, path.as_mut_ptr(), &mut len)
         };
         if ok == 0 {
-            return Err(ImageRefusal::QueryImage(last_error()));
+            return Err(ImageReadError::QueryImage(last_error()));
         }
         let path = checked_path(&path, len)?;
         Self::open_path(&path)
     }
 
-    fn open_path(path: &Path) -> Result<Self, ImageRefusal> {
+    /// Open a path for image readings without asserting it belongs to a process.
+    pub fn open_path(path: &Path) -> Result<Self, ImageReadError> {
         let file = OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ)
             .open(path)
-            .map_err(ImageRefusal::OpenImage)?;
+            .map_err(ImageReadError::OpenImage)?;
         let final_path = final_path(&file)?;
         Ok(Self { file, final_path })
     }
 
-    /// Return the same open file for the bridge's signed peer-trailer check.
+    /// Return the normalized path read from the open file.
+    pub fn final_path(&self) -> &Path {
+        &self.final_path
+    }
+
+    /// Return the existing open file without reopening its path.
     pub fn into_file(self) -> File {
         self.file
     }
 }
 
-/// Require the system-directory cmd.exe and its Microsoft-rooted SHA-256 catalog.
-pub fn verify_system_cmd(image: &OpenedProcessImage) -> Result<(), ImageRefusal> {
-    let root = open_root(&system_directory()?)?;
-    require_path(image, &root, "cmd.exe")?;
-    trust::verify_catalog(image)
+/// Retain a directory and the normalized path read from that directory handle.
+#[derive(Debug)]
+pub struct OpenedMachineDirectory {
+    _directory: File,
+    final_path: PathBuf,
 }
 
-/// Require a machine-installed Chrome Stable image and its Google signature.
-pub fn verify_installed_chrome(image: &OpenedProcessImage) -> Result<(), ImageRefusal> {
-    let native_root = open_root(&program_files_directory(w!("ProgramFilesDir"))?)?;
-    // Match the native root first: only ask the registry for the second root
-    // when the first could not account for the image.
-    if !path_matches(image, &native_root, CHROME_RELATIVE)? {
-        let x86_root = open_root(&program_files_directory(w!("ProgramFilesDir (x86)"))?)?;
-        require_path(image, &x86_root, CHROME_RELATIVE)?;
+impl OpenedMachineDirectory {
+    pub fn final_path(&self) -> &Path {
+        &self.final_path
     }
-    trust::verify_chrome(image)
 }
 
-fn system_directory() -> Result<PathBuf, ImageRefusal> {
+pub fn read_system_directory() -> Result<OpenedMachineDirectory, ImageReadError> {
     let mut path = vec![0u16; PATH_CAPACITY];
     // SAFETY: path has the specified writable capacity in UTF-16 units.
     let len = unsafe { GetSystemDirectoryW(path.as_mut_ptr(), path.len() as u32) };
     if len == 0 {
-        return Err(ImageRefusal::SystemDirectory(last_error()));
+        return Err(ImageReadError::SystemDirectory(last_error()));
     }
-    checked_path(&path, len)
+    open_root(&checked_path(&path, len)?)
 }
 
-fn program_files_directory(value: PCWSTR) -> Result<PathBuf, ImageRefusal> {
+#[derive(Clone, Copy, Debug)]
+pub enum ProgramFilesDirectory {
+    Native,
+    X86,
+}
+
+pub fn read_program_files_directory(
+    which: ProgramFilesDirectory,
+) -> Result<OpenedMachineDirectory, ImageReadError> {
+    let value: PCWSTR = match which {
+        ProgramFilesDirectory::Native => w!("ProgramFilesDir"),
+        ProgramFilesDirectory::X86 => w!("ProgramFilesDir (x86)"),
+    };
     let mut path = vec![0u16; PATH_CAPACITY];
     let mut bytes = (path.len() * size_of::<u16>()) as u32;
     // SAFETY: the key path and value name are static, terminated strings; path
@@ -154,23 +165,23 @@ fn program_files_directory(value: PCWSTR) -> Result<PathBuf, ImageRefusal> {
         )
     };
     if status != ERROR_SUCCESS {
-        return Err(ImageRefusal::ProgramFilesRegistry(status));
+        return Err(ImageReadError::ProgramFilesRegistry(status));
     }
     let units = bytes / size_of::<u16>() as u32;
     if !bytes.is_multiple_of(2) || units == 0 || path.get(units as usize - 1) != Some(&0) {
-        return Err(ImageRefusal::InvalidPath);
+        return Err(ImageReadError::InvalidPath);
     }
-    checked_path(&path, units - 1)
+    open_root(&checked_path(&path, units - 1)?)
 }
 
-fn open_root(path: &Path) -> Result<File, ImageRefusal> {
+fn open_root(path: &Path) -> Result<OpenedMachineDirectory, ImageReadError> {
     // A caller's local DOS-device map can shadow a system drive letter. Open
     // trusted machine paths through the global map, not the caller's aliases.
     let mut units = path.as_os_str().encode_wide();
     match (units.next(), units.next(), units.next()) {
         (Some(drive), Some(58), Some(92))
             if u8::try_from(drive).is_ok_and(|d| d.is_ascii_alphabetic()) => {}
-        _ => return Err(ImageRefusal::InvalidPath),
+        _ => return Err(ImageReadError::InvalidPath),
     }
     let mut global_path = OsString::from(r"\\?\GLOBALROOT\GLOBAL??\");
     global_path.push(path.as_os_str());
@@ -179,14 +190,18 @@ fn open_root(path: &Path) -> Result<File, ImageRefusal> {
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(global_path)
-        .map_err(ImageRefusal::OpenRoot)?;
-    if !root.metadata().map_err(ImageRefusal::OpenRoot)?.is_dir() {
-        return Err(ImageRefusal::InvalidPath);
+        .map_err(ImageReadError::OpenRoot)?;
+    if !root.metadata().map_err(ImageReadError::OpenRoot)?.is_dir() {
+        return Err(ImageReadError::InvalidPath);
     }
-    Ok(root)
+    let final_path = final_path(&root)?;
+    Ok(OpenedMachineDirectory {
+        _directory: root,
+        final_path,
+    })
 }
 
-fn final_path(file: &File) -> Result<PathBuf, ImageRefusal> {
+fn final_path(file: &File) -> Result<PathBuf, ImageReadError> {
     let mut path = vec![0u16; PATH_CAPACITY];
     // SAFETY: the file owns a live handle; path is writable for the specified size.
     // FILE_NAME_NORMALIZED is zero. Use the kernel volume name, not a drive alias.
@@ -199,43 +214,23 @@ fn final_path(file: &File) -> Result<PathBuf, ImageRefusal> {
         )
     };
     if len == 0 {
-        return Err(ImageRefusal::FinalPath(last_error()));
+        return Err(ImageReadError::FinalPath(last_error()));
     }
     checked_path(&path, len)
 }
 
-fn checked_path(buffer: &[u16], len: u32) -> Result<PathBuf, ImageRefusal> {
+fn checked_path(buffer: &[u16], len: u32) -> Result<PathBuf, ImageReadError> {
     // Successful callers leave room for the terminator and report a length
     // that excludes it. Longer values are requirements, not bytes written.
     if len as usize >= buffer.len() || buffer[len as usize] != 0 {
-        return Err(ImageRefusal::InvalidPath);
+        return Err(ImageReadError::InvalidPath);
     }
     let units = &buffer[..len as usize];
     let path = PathBuf::from(OsString::from_wide(units));
     if units.contains(&0) || !path.is_absolute() {
-        return Err(ImageRefusal::InvalidPath);
+        return Err(ImageReadError::InvalidPath);
     }
     Ok(path)
-}
-
-fn path_matches(
-    image: &OpenedProcessImage,
-    root: &File,
-    relative: &str,
-) -> Result<bool, ImageRefusal> {
-    // Exact normalized names also distinguish different files in directories
-    // where Windows has case-sensitive lookup enabled.
-    Ok(image.final_path.as_os_str() == final_path(root)?.join(relative).as_os_str())
-}
-
-fn require_path(
-    image: &OpenedProcessImage,
-    root: &File,
-    relative: &str,
-) -> Result<(), ImageRefusal> {
-    path_matches(image, root, relative)?
-        .then_some(())
-        .ok_or(ImageRefusal::UnexpectedPath)
 }
 
 fn wide_z(value: &OsStr) -> Vec<u16> {

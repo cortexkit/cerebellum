@@ -5,7 +5,7 @@
 //! and holds raw process references; callers decide what those readings mean.
 //!
 //! Keep additions small and mechanical. This is the auditable place for Windows
-//! calls, including the image predicates that consume handle-bound trust data.
+//! calls, not a place to move application policy.
 
 // Windows APIs and their raw handles exist only on Windows. Keeping this module
 // and its public surface behind the same gate makes other hosts build an empty
@@ -44,7 +44,10 @@ pub use accessibility::{
 };
 #[cfg(windows)]
 pub use browser_image::{
-    verify_installed_chrome, verify_system_cmd, ImageRefusal, OpenedProcessImage,
+    image_status, read_authenticode, read_catalog_signer, read_embedded_root_status,
+    read_product_names, read_program_files_directory, read_system_directory, AuthenticodeReading,
+    ImageReadError, MicrosoftRootReading, OpenedMachineDirectory, OpenedProcessImage,
+    ProgramFilesDirectory, SignatureReading, SignerSubject,
 };
 #[cfg(windows)]
 pub use devtools_pipe::{spawn_with_devtools_pipe, DevToolsPipeReader, DevToolsProcess};
