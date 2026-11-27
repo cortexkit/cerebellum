@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v39.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v40.json");
 const V33_ARTIFACT_SHA256: &str =
     "bec5b6cad004606960c684bafea3c7b219fc780cec9630158c29ff935833c849";
 const V34_ARTIFACT_SHA256: &str =
@@ -28,6 +28,8 @@ const V37_ARTIFACT_SHA256: &str =
     "b667411568557ea5b58d2ef146d53734a91b6fb5495a6f4344ec4d511e2cfac1";
 const V38_ARTIFACT_SHA256: &str =
     "ef93079a444aae23f5302d9ab72bee0b3a3cb22da729eec3c15123e786a4879a";
+const V39_ARTIFACT_SHA256: &str =
+    "32cb9e4ea8197dd8f4ec5abd6085af47ee1812ba9e8908d903bada9263f154ea";
 /// The digests of retained historical artifacts: operator-app refusal, image
 /// handles and terminal-keystroke result envelopes, respectively.
 const V30_ARTIFACT_SHA256: &str =
@@ -161,6 +163,8 @@ fn every_repository_vocabulary_mirror_names_the_current_revision() {
                 V37_ARTIFACT_SHA256
             } else if path.ends_with("v38.json") {
                 V38_ARTIFACT_SHA256
+            } else if path.ends_with("v39.json") {
+                V39_ARTIFACT_SHA256
             } else {
                 panic!("{path} is a vocabulary artifact with no pinned digest")
             };
@@ -233,6 +237,75 @@ fn implementation_source_lock_digest_matches_the_artifact() {
     assert_eq!(
         implementation_source_lock_digest().as_deref(),
         Some(COMPUTER_ACTION_VOCABULARY_SHA256)
+    );
+}
+
+fn historical_v39() -> Value {
+    let resources = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
+    let revision = historical_revision(39);
+    let bytes = std::fs::read(resources.join(format!("{}.json", revision.as_str().unwrap())))
+        .expect("read the historical v39 artifact");
+    assert_eq!(hex_digest(&bytes), V39_ARTIFACT_SHA256);
+    serde_json::from_slice(&bytes).expect("v39 is valid JSON")
+}
+
+fn artifact_words(artifact: &str) -> BTreeSet<&str> {
+    artifact
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .collect()
+}
+
+#[test]
+fn linux_desktop_mint_only_adds_new_reason_ids() {
+    let v38 = historical_v38().to_string();
+    let v39 = historical_v39().to_string();
+    let next = artifact_words(VOCABULARY);
+    let v38 = artifact_words(&v38);
+    let v39 = artifact_words(&v39);
+    for id in [
+        "no_supported_session",
+        "route_not_reviewed",
+        "stale_reference",
+        "app_identity_unproven",
+        "package_checksum_unavailable",
+        "interpreter_hosted_image",
+        "image_replaced_since_launch",
+        "executable_mapping_unverifiable",
+        "launch_entry_unsupported",
+        "launch_scope_unavailable",
+        "launch_child_exited",
+        "launch_status_unknown",
+        "accessibility_tree_unavailable",
+        "picture_unattributable",
+        "wayland_seat_input_unverifiable",
+        "point_hit_test_unsupported",
+        "pointer_target_unverifiable",
+        "character_not_typable",
+        "keymap_changed",
+        "key_grabbed_elsewhere",
+        "shortcut_bindings_unreadable",
+        "window_not_mapped",
+        "backend_unavailable",
+    ] {
+        assert!(!v38.contains(id), "{id} is already named in v38");
+        assert!(!v39.contains(id), "{id} is already named in v39");
+        assert!(next.contains(id), "the mint omits {id}");
+    }
+    assert!(!next.contains("focus_unknown"));
+}
+
+#[test]
+fn linux_desktop_mint_preserves_every_declaration_and_request_schema() {
+    let declaration_bytes = |mut vocabulary: Value| {
+        vocabulary.as_object_mut().unwrap().remove("revision");
+        for row in vocabulary["rows"].as_array_mut().unwrap() {
+            row.as_object_mut().unwrap().remove("result_schema");
+        }
+        canonical_json_bytes(&vocabulary).unwrap()
+    };
+    assert_eq!(
+        declaration_bytes(historical_v39()),
+        declaration_bytes(serde_json::from_str(VOCABULARY).unwrap()),
     );
 }
 
@@ -848,7 +921,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v37_from_v36(&generated, historical_revision(37).as_str().unwrap());
     let generated =
         vocabulary_mint::v38_from_v37(&generated, historical_revision(38).as_str().unwrap());
-    let generated = vocabulary_mint::v39_from_v38(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v39_from_v38(&generated, historical_revision(39).as_str().unwrap());
+    let generated = vocabulary_mint::v40_from_v39(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -2101,7 +2176,7 @@ fn v33_only_adds_the_optional_development_diagnostic_to_results() {
 fn mint_current_vocabulary_artifact() {
     let resources = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
     let revision = COMPUTER_ACTION_VOCABULARY_REVISION;
-    let generated = vocabulary_mint::v39_from_v38(&historical_v38(), revision);
+    let generated = vocabulary_mint::v40_from_v39(&historical_v39(), revision);
     let bytes = canonical_json_bytes(&generated).unwrap();
     std::fs::write(resources.join(format!("{revision}.json")), &bytes).unwrap();
     let source_lock = resources.join("../../cerebellum/resources/implementation-source-lock.json");
@@ -2362,8 +2437,12 @@ fn historical_v38() -> Value {
 #[test]
 fn v39_only_adds_capture_excluded_to_the_image_unavailable_reason() {
     let previous = historical_v38();
-    let mut current = vocabulary_mint::v39_from_v38(&previous, COMPUTER_ACTION_VOCABULARY_REVISION);
-    assert_eq!(current["revision"], "computer_action_vocabulary-v39");
+    let mut current = historical_v39();
+    assert_eq!(current["revision"], historical_revision(39));
+    assert_eq!(
+        current,
+        vocabulary_mint::v39_from_v38(&previous, current["revision"].as_str().unwrap())
+    );
     current["revision"] = previous["revision"].clone();
     let read_state_result = &mut current["rows"][0]["result_schema"];
     let reasons = read_state_result["properties"]["image_unavailable"]["properties"]["reason"]

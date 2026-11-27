@@ -2862,3 +2862,226 @@ pub fn v39_from_v38(previous: &Value, revision: &str) -> Value {
         .push(json!("capture_excluded"));
     next
 }
+
+const SESSION_REASONS: &[(&str, &str)] = &[
+    (
+        "no_supported_session",
+        "no supported desktop session could be verified",
+    ),
+    (
+        "route_not_reviewed",
+        "the build has not been reviewed for this operation",
+    ),
+];
+const BACKEND_REASON: (&str, &str) = (
+    "backend_unavailable",
+    "a service needed for the operation is unavailable",
+);
+const BINDING_REASONS: &[(&str, &str)] = &[
+    (
+        "stale_reference",
+        "the session or referenced object changed",
+    ),
+    (
+        "app_identity_unproven",
+        "the application's identity could not be proven",
+    ),
+    (
+        "package_checksum_unavailable",
+        "the package record has no checksum for the file",
+    ),
+    (
+        "image_replaced_since_launch",
+        "the running program image or one of its mappings was replaced",
+    ),
+    (
+        "executable_mapping_unverifiable",
+        "an executable mapping could not be verified",
+    ),
+];
+const INTERPRETER_REASON: (&str, &str) = (
+    "interpreter_hosted_image",
+    "the verified image is an interpreter or shared runtime, not an app identity",
+);
+const TREE_REASON: (&str, &str) = (
+    "accessibility_tree_unavailable",
+    "the target has no readable accessibility tree",
+);
+const SECURE_REASONS: &[(&str, &str)] = &[
+    (
+        "secure_field_focused",
+        "the element to receive input is a password or payment field",
+    ),
+    (
+        "focus_unreadable",
+        "the element to receive input could not be ruled out as a password or payment field",
+    ),
+];
+const SEAT_REASON: (&str, &str) = (
+    "wayland_seat_input_unverifiable",
+    "the session cannot verify the recipient of seat input",
+);
+const WINDOW_REASON: (&str, &str) = ("window_not_mapped", "the target window is not viewable");
+const KEY_REASONS: &[(&str, &str)] = &[
+    (
+        "character_not_typable",
+        "the active keyboard layout cannot type a requested character",
+    ),
+    (
+        "keymap_changed",
+        "the keyboard layout or modifier state changed during delivery",
+    ),
+    (
+        "key_grabbed_elsewhere",
+        "another client holds a conflicting keyboard grab",
+    ),
+    (
+        "shortcut_bindings_unreadable",
+        "the desktop shortcut bindings could not be verified",
+    ),
+];
+const LAUNCH_REASONS: &[(&str, &str)] = &[
+    (
+        "launch_entry_unsupported",
+        "the installed launch entry could not be verified as a supported entry",
+    ),
+    (
+        "launch_scope_unavailable",
+        "the child could not be placed in its own scope",
+    ),
+    (
+        "launch_child_exited",
+        "the child exited during launch settling; activation was not verified",
+    ),
+    (
+        "launch_status_unknown",
+        "the child could not be waited on; activation was not verified",
+    ),
+];
+const POINT_REASON: (&str, &str) = (
+    "point_hit_test_unsupported",
+    "the platform has no reviewed point-press route",
+);
+const POINTER_REASON: (&str, &str) = (
+    "pointer_target_unverifiable",
+    "the destination could not be verified as a non-secure element in the target window",
+);
+const PICTURE_REASON: (&str, &str) = (
+    "picture_unattributable",
+    "a picture cannot be attributed to the target window in this session",
+);
+
+fn describe_reasons(field: &mut Value, reasons: &[(&str, &str)]) {
+    let mut description = field["description"].as_str().unwrap_or_default().to_owned();
+    for (id, meaning) in reasons {
+        description.push_str(&format!(" {id}: {meaning}."));
+    }
+    field["description"] = json!(description.trim_start());
+}
+
+/// Describe the reasons each desktop route can report without closing the
+/// existing free-form reason field. A refused picture and a refused request
+/// to bring the window forward have separate lists of allowed reasons.
+pub fn v40_from_v39(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    for row in next["rows"].as_array_mut().unwrap() {
+        let id = row["capability_id"].as_str().unwrap().to_owned();
+        let id = id.strip_prefix("computer.").unwrap();
+        let schema = &mut row["result_schema"];
+        let reason = &mut schema["properties"]["reason"];
+        describe_reasons(reason, SESSION_REASONS);
+        if id != "press_point" {
+            describe_reasons(reason, &[BACKEND_REASON]);
+        }
+        if !matches!(id, "list_apps" | "press_point") {
+            describe_reasons(reason, BINDING_REASONS);
+            if id != "open_app" {
+                describe_reasons(reason, &[INTERPRETER_REASON]);
+            }
+        }
+        match id {
+            "read_state" | "wait" => describe_reasons(reason, &[TREE_REASON]),
+            "press_element" | "write_text" => {
+                describe_reasons(reason, &[TREE_REASON]);
+                describe_reasons(reason, SECURE_REASONS);
+                schema["properties"]["outcome"]["enum"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("secure_field_refused"));
+            }
+            "press_point" => describe_reasons(reason, &[POINT_REASON]),
+            "type" | "keys" => {
+                describe_reasons(reason, &[SEAT_REASON, WINDOW_REASON]);
+                describe_reasons(reason, KEY_REASONS);
+                describe_reasons(reason, SECURE_REASONS);
+                describe_reasons(
+                    reason,
+                    &[
+                        (
+                            "lock",
+                            "the chord can lock the session or is a lone system modifier tap",
+                        ),
+                        ("logout", "the chord can end the session"),
+                        (
+                            "vt_switch",
+                            "the chord can switch the active virtual terminal",
+                        ),
+                        ("sysrq", "the chord can invoke a system request"),
+                        ("power", "the chord can suspend or power off the machine"),
+                    ],
+                );
+                if id == "type" {
+                    for outcome in [
+                        "/properties/outcome/enum",
+                        "/anyOf/0/properties/outcome/enum",
+                    ] {
+                        schema
+                            .pointer_mut(outcome)
+                            .unwrap()
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!("chord_blocked"));
+                    }
+                }
+            }
+            "takeover_move" | "takeover_click" | "takeover_drag" | "takeover_scroll" => {
+                describe_reasons(reason, &[SEAT_REASON, WINDOW_REASON, POINTER_REASON]);
+            }
+            "open_app" => {
+                describe_reasons(reason, LAUNCH_REASONS);
+                let detail = &mut schema["properties"]["detail"]["properties"];
+                detail["exit_status"] = json!({
+                    "type": "integer",
+                    "description": "The child's exit code. A launch_child_exited reply includes exactly one of exit_status and signal; launch_status_unknown includes neither.",
+                });
+                detail["signal"] = json!({
+                    "type": "integer",
+                    "description": "The number of the signal that terminated the child. A launch_child_exited reply includes exactly one of exit_status and signal; launch_status_unknown includes neither.",
+                });
+            }
+            "list_apps" => {}
+            _ => panic!("no desktop reason review for {id}"),
+        }
+        if id == "read_state" {
+            let reason = &mut schema["properties"]["image_unavailable"]["properties"]["reason"];
+            let reasons = [
+                PICTURE_REASON,
+                SESSION_REASONS[1],
+                BACKEND_REASON,
+                WINDOW_REASON,
+            ];
+            describe_reasons(reason, &reasons);
+            reason["enum"]
+                .as_array_mut()
+                .unwrap()
+                .extend(reasons.map(|(id, _)| json!(id)));
+            schema["properties"]["image_fronting"]["properties"]["reason"] = json!({
+                "type": "string",
+                "enum": ["fronting_unavailable"],
+                "description": "Present when fronting was requested, but no front request could be made. The image result is reported separately.",
+            });
+        }
+    }
+    next
+}

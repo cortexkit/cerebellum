@@ -71,6 +71,37 @@ fn valid_context() -> ComputerCapabilityAdvertisementContext {
     }
 }
 
+#[test]
+fn vocabulary_digest_mismatch_keeps_the_release_closed() {
+    let mut context = valid_context();
+    context.inputs.vocabulary_digests.source_lock_digest =
+        cerebellum_computer::platform::implementation_source_lock_digest();
+    let bound = computer_release_evidence(&context);
+    assert_eq!(bound.gate_outcomes, vec![ComputerGateOutcome::Pass; 16]);
+    assert_eq!(available_capabilities(&context), bound_advertised_rows());
+
+    // A stale source lock is an implementation failure, not a missing
+    // release input; a fully bound driver must withhold every row anyway.
+    context.inputs.vocabulary_digests.source_lock_digest = Some("0".repeat(64));
+    let mismatch = computer_release_evidence(&context);
+    let failures: Vec<_> = mismatch
+        .gate_outcomes
+        .iter()
+        .filter(|outcome| **outcome != ComputerGateOutcome::Pass)
+        .cloned()
+        .collect();
+    assert_eq!(mismatch.gate_outcomes.len(), bound.gate_outcomes.len());
+    assert_eq!(
+        failures,
+        [ComputerGateOutcome::ImplementationFailure {
+            gate: "vocabulary_source_lock_digest".into(),
+        }]
+    );
+    assert!(mismatch.gate_admitted_capabilities.is_empty());
+    assert!(mismatch.advertised_capabilities.is_empty());
+    assert!(available_capabilities(&context).is_empty());
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn tonights_all_live_computer_use_definition_is_byte_identical() {

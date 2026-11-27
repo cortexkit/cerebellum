@@ -7,16 +7,38 @@ use super::synthetic::{SyntheticKey, SyntheticKeyModifiers};
 pub enum BlockedChordPlatform {
     MacOs,
     Windows,
+    Linux,
+}
+
+/// Linux keysyms used by the blocked chords but absent from the wire key list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxFloorKeysym {
+    SysRq,
+    PowerOff,
+    Sleep,
+    Suspend,
+    Hibernate,
+    LogOff,
+    ScreenSaver,
+}
+
+/// A key or key sequence that can end the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedKey {
+    Synthetic(SyntheticKey),
+    LinuxKeysym(LinuxFloorKeysym),
+    LinuxSuperTap,
+    LinuxSysRqWithAnyKey,
 }
 
 /// A platform-specific chord that ends the session this module is running in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockedChord {
     pub platform: BlockedChordPlatform,
-    /// Canonical wire spelling, also used to name this chord in tests and logs.
+    /// Canonical wire spelling when expressible there; otherwise a name for logs.
     pub chord: &'static [&'static str],
     pub modifiers: SyntheticKeyModifiers,
-    pub key: SyntheticKey,
+    pub key: BlockedKey,
     pub reason: &'static str,
 }
 
@@ -39,7 +61,7 @@ pub const BLOCKED_CHORDS: &[BlockedChord] = &[
             control: true,
             ..SyntheticKeyModifiers::NONE
         },
-        key: SyntheticKey::Q,
+        key: BlockedKey::Synthetic(SyntheticKey::Q),
         reason: "lock",
     },
     // Ends the macOS session by logging the user out.
@@ -51,7 +73,7 @@ pub const BLOCKED_CHORDS: &[BlockedChord] = &[
             shift: true,
             ..SyntheticKeyModifiers::NONE
         },
-        key: SyntheticKey::Q,
+        key: BlockedKey::Synthetic(SyntheticKey::Q),
         reason: "logout",
     },
     // Ends the macOS session by opening the force-quit dialog.
@@ -63,7 +85,7 @@ pub const BLOCKED_CHORDS: &[BlockedChord] = &[
             option: true,
             ..SyntheticKeyModifiers::NONE
         },
-        key: SyntheticKey::Escape,
+        key: BlockedKey::Synthetic(SyntheticKey::Escape),
         reason: "force_quit",
     },
     // Ends the macOS session by emptying the Trash.
@@ -75,7 +97,7 @@ pub const BLOCKED_CHORDS: &[BlockedChord] = &[
             shift: true,
             ..SyntheticKeyModifiers::NONE
         },
-        key: SyntheticKey::Backspace,
+        key: BlockedKey::Synthetic(SyntheticKey::Backspace),
         reason: "empty_trash",
     },
     // Ends the macOS session by force-quitting the frontmost app without a dialog.
@@ -88,7 +110,7 @@ pub const BLOCKED_CHORDS: &[BlockedChord] = &[
             shift: true,
             ..SyntheticKeyModifiers::NONE
         },
-        key: SyntheticKey::Escape,
+        key: BlockedKey::Synthetic(SyntheticKey::Escape),
         reason: "force_quit",
     },
     // Ends the macOS session by logging the user out at once, without the
@@ -102,7 +124,7 @@ pub const BLOCKED_CHORDS: &[BlockedChord] = &[
             shift: true,
             ..SyntheticKeyModifiers::NONE
         },
-        key: SyntheticKey::Q,
+        key: BlockedKey::Synthetic(SyntheticKey::Q),
         reason: "logout",
     },
     // Empties the Trash in Finder without asking for confirmation.
@@ -115,7 +137,7 @@ pub const BLOCKED_CHORDS: &[BlockedChord] = &[
             shift: true,
             ..SyntheticKeyModifiers::NONE
         },
-        key: SyntheticKey::Backspace,
+        key: BlockedKey::Synthetic(SyntheticKey::Backspace),
         reason: "empty_trash",
     },
     // Ends the Windows session by locking the workstation.
@@ -126,20 +148,194 @@ pub const BLOCKED_CHORDS: &[BlockedChord] = &[
             windows: true,
             ..SyntheticKeyModifiers::NONE
         },
-        key: SyntheticKey::L,
+        key: BlockedKey::Synthetic(SyntheticKey::L),
         reason: "lock",
     },
+    linux_chord(
+        &["option", "sysrq", "any"],
+        modifiers(false, false, true, false),
+        BlockedKey::LinuxSysRqWithAnyKey,
+        "sysrq",
+    ),
+    linux_chord(
+        &["command", "l"],
+        modifiers(true, false, false, false),
+        BlockedKey::Synthetic(SyntheticKey::L),
+        "lock",
+    ),
+    linux_ctrl_alt(&["control", "option", "l"], SyntheticKey::L, "lock"),
+    linux_ctrl_alt(
+        &["control", "option", "forward_delete"],
+        SyntheticKey::ForwardDelete,
+        "logout",
+    ),
+    linux_ctrl_alt(
+        &["control", "option", "backspace"],
+        SyntheticKey::Backspace,
+        "logout",
+    ),
+    linux_ctrl_alt(&["control", "option", "f1"], SyntheticKey::F1, "vt_switch"),
+    linux_ctrl_alt(&["control", "option", "f2"], SyntheticKey::F2, "vt_switch"),
+    linux_ctrl_alt(&["control", "option", "f3"], SyntheticKey::F3, "vt_switch"),
+    linux_ctrl_alt(&["control", "option", "f4"], SyntheticKey::F4, "vt_switch"),
+    linux_ctrl_alt(&["control", "option", "f5"], SyntheticKey::F5, "vt_switch"),
+    linux_ctrl_alt(&["control", "option", "f6"], SyntheticKey::F6, "vt_switch"),
+    linux_ctrl_alt(&["control", "option", "f7"], SyntheticKey::F7, "vt_switch"),
+    linux_ctrl_alt(&["control", "option", "f8"], SyntheticKey::F8, "vt_switch"),
+    linux_ctrl_alt(&["control", "option", "f9"], SyntheticKey::F9, "vt_switch"),
+    linux_ctrl_alt(
+        &["control", "option", "f10"],
+        SyntheticKey::F10,
+        "vt_switch",
+    ),
+    linux_ctrl_alt(
+        &["control", "option", "f11"],
+        SyntheticKey::F11,
+        "vt_switch",
+    ),
+    linux_ctrl_alt(
+        &["control", "option", "f12"],
+        SyntheticKey::F12,
+        "vt_switch",
+    ),
+    linux_keysym(&["XF86PowerOff"], LinuxFloorKeysym::PowerOff, "power"),
+    linux_keysym(&["XF86Sleep"], LinuxFloorKeysym::Sleep, "power"),
+    linux_keysym(&["XF86Suspend"], LinuxFloorKeysym::Suspend, "power"),
+    linux_keysym(&["XF86Hibernate"], LinuxFloorKeysym::Hibernate, "power"),
+    linux_keysym(&["XF86LogOff"], LinuxFloorKeysym::LogOff, "logout"),
+    linux_keysym(&["XF86ScreenSaver"], LinuxFloorKeysym::ScreenSaver, "lock"),
+    linux_chord(
+        &["command"],
+        modifiers(true, false, false, false),
+        BlockedKey::LinuxSuperTap,
+        "lock",
+    ),
 ];
 
-/// Return the session-ending chord that exactly matches this platform and input.
+const fn linux_chord(
+    chord: &'static [&'static str],
+    modifiers: SyntheticKeyModifiers,
+    key: BlockedKey,
+    reason: &'static str,
+) -> BlockedChord {
+    BlockedChord {
+        platform: BlockedChordPlatform::Linux,
+        chord,
+        modifiers,
+        key,
+        reason,
+    }
+}
+
+const fn linux_ctrl_alt(
+    chord: &'static [&'static str],
+    key: SyntheticKey,
+    reason: &'static str,
+) -> BlockedChord {
+    linux_chord(
+        chord,
+        modifiers(false, true, true, false),
+        BlockedKey::Synthetic(key),
+        reason,
+    )
+}
+
+const fn linux_keysym(
+    chord: &'static [&'static str],
+    key: LinuxFloorKeysym,
+    reason: &'static str,
+) -> BlockedChord {
+    linux_chord(
+        chord,
+        SyntheticKeyModifiers::NONE,
+        BlockedKey::LinuxKeysym(key),
+        reason,
+    )
+}
+
+/// Return the session-ending chord that exactly matches a synthetic key and modifiers.
+/// Linux delivery must use [`linux_blocked_chord`] to check keysyms and held keys too.
 pub fn blocked_chord(
     modifiers: SyntheticKeyModifiers,
     key: SyntheticKey,
     platform: BlockedChordPlatform,
 ) -> Option<&'static BlockedChord> {
     BLOCKED_CHORDS.iter().find(|blocked| {
-        blocked.platform == platform && blocked.modifiers == modifiers && blocked.key == key
+        blocked.platform == platform
+            && blocked.modifiers == modifiers
+            && blocked.key == BlockedKey::Synthetic(key)
     })
+}
+
+/// The key the Linux planner resolved, not the name in the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxResolvedKey {
+    Synthetic(SyntheticKey),
+    Keysym(LinuxFloorKeysym),
+    /// A positively identified key outside the floor, such as a printable
+    /// non-Latin character. An unresolved or ambiguous key is not `Other`.
+    Other,
+}
+
+/// The input the Linux planner has verified it is about to post.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxChordInput {
+    Key {
+        /// Effective modifiers at the post, including those the person holds.
+        modifiers: SyntheticKeyModifiers,
+        key: LinuxResolvedKey,
+        sysrq_held: bool,
+    },
+    /// A Super press and release with no other key in the chord.
+    SuperTap,
+}
+
+/// The planner could not establish the key or effective modifier state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinuxChordUnreadable;
+
+/// Check a resolved Linux input against the blocked session-ending chords.
+/// If the planner cannot construct the input with certainty, `None` refuses
+/// instead of being treated as an unlisted chord. Only `Ok(None)` passes this check.
+pub fn linux_blocked_chord(
+    input: Option<LinuxChordInput>,
+) -> Result<Option<&'static BlockedChord>, LinuxChordUnreadable> {
+    let input = input.ok_or(LinuxChordUnreadable)?;
+    Ok(BLOCKED_CHORDS.iter().find(|blocked| {
+        blocked.platform == BlockedChordPlatform::Linux
+            && match (blocked.key, input) {
+                (BlockedKey::LinuxSuperTap, LinuxChordInput::SuperTap) => true,
+                (
+                    BlockedKey::LinuxSysRqWithAnyKey,
+                    LinuxChordInput::Key {
+                        modifiers,
+                        key,
+                        sysrq_held,
+                    },
+                ) => {
+                    // Stop the initial trigger as well as any continuation
+                    // after the person has already pressed Alt and SysRq.
+                    modifiers.option
+                        && (sysrq_held || key == LinuxResolvedKey::Keysym(LinuxFloorKeysym::SysRq))
+                }
+                (
+                    BlockedKey::LinuxKeysym(blocked_key),
+                    LinuxChordInput::Key {
+                        key: LinuxResolvedKey::Keysym(key),
+                        ..
+                    },
+                ) => blocked_key == key,
+                (
+                    BlockedKey::Synthetic(blocked_key),
+                    LinuxChordInput::Key {
+                        modifiers,
+                        key: LinuxResolvedKey::Synthetic(key),
+                        ..
+                    },
+                ) => blocked_key == key && blocked.modifiers == modifiers,
+                _ => false,
+            }
+    }))
 }
 
 /// The platform that this build can dispatch synthetic input to.
@@ -446,13 +642,97 @@ mod tests {
     #[test]
     fn every_listed_chord_is_found_only_on_its_platform() {
         for blocked in BLOCKED_CHORDS {
+            let BlockedKey::Synthetic(key) = blocked.key else {
+                assert_eq!(blocked.platform, BlockedChordPlatform::Linux);
+                continue;
+            };
             assert_eq!(
-                blocked_chord(blocked.modifiers, blocked.key, blocked.platform),
+                blocked_chord(blocked.modifiers, key, blocked.platform),
                 Some(blocked),
                 "{} chord is absent from the session floor",
                 blocked.reason
             );
         }
+    }
+
+    #[test]
+    fn linux_session_floor_covers_the_required_chords() {
+        use LinuxFloorKeysym::*;
+        use LinuxResolvedKey::{Keysym, Other, Synthetic};
+        use SyntheticKey::*;
+
+        let super_only = modifiers(true, false, false, false);
+        let ctrl_alt = modifiers(false, true, true, false);
+        let alt = modifiers(false, false, true, false);
+        let check = |modifiers, key, sysrq_held, reason| {
+            let input = LinuxChordInput::Key {
+                modifiers,
+                key,
+                sysrq_held,
+            };
+            assert_eq!(
+                linux_blocked_chord(Some(input))
+                    .unwrap()
+                    .map(|row| row.reason),
+                reason,
+                "{input:?}"
+            );
+        };
+        check(super_only, Synthetic(L), false, Some("lock"));
+        check(ctrl_alt, Synthetic(L), false, Some("lock"));
+        check(ctrl_alt, Synthetic(ForwardDelete), false, Some("logout"));
+        check(ctrl_alt, Synthetic(Backspace), false, Some("logout"));
+        for key in [F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12] {
+            check(ctrl_alt, Synthetic(key), false, Some("vt_switch"));
+        }
+        check(alt, Keysym(SysRq), false, Some("sysrq"));
+        check(ctrl_alt, Other, true, Some("sysrq"));
+        check(ctrl_alt, Synthetic(F1), true, Some("sysrq"));
+        for key in [PowerOff, Sleep, Suspend, Hibernate] {
+            check(
+                SyntheticKeyModifiers::NONE,
+                Keysym(key),
+                false,
+                Some("power"),
+            );
+        }
+        check(
+            SyntheticKeyModifiers::NONE,
+            Keysym(LogOff),
+            false,
+            Some("logout"),
+        );
+        check(
+            SyntheticKeyModifiers::NONE,
+            Keysym(ScreenSaver),
+            false,
+            Some("lock"),
+        );
+        check(alt, Keysym(PowerOff), false, Some("power"));
+        assert_eq!(
+            linux_blocked_chord(Some(LinuxChordInput::SuperTap))
+                .unwrap()
+                .unwrap()
+                .reason,
+            "lock"
+        );
+        assert_eq!(
+            BLOCKED_CHORDS
+                .iter()
+                .filter(|r| r.platform == BlockedChordPlatform::Linux)
+                .count(),
+            24
+        );
+
+        // Ordinary input and harmless near misses do not match a blocked chord.
+        check(super_only, Synthetic(S), false, None);
+        check(alt, Synthetic(F1), false, None);
+        check(SyntheticKeyModifiers::NONE, Other, false, None);
+    }
+
+    #[test]
+    fn linux_session_floor_refuses_unresolved_input() {
+        assert_eq!(linux_blocked_chord(None), Err(LinuxChordUnreadable));
     }
 
     #[test]
