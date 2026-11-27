@@ -1245,11 +1245,15 @@ async fn start_live_daemon_with_browser(
         fs::create_dir_all(&config_dir).expect("create isolated module config directory");
         // A missing executable provides a configured settings fixture without
         // depending on the machine having a browser installed.
+        #[cfg(windows)]
+        let missing_browser = directory.join("nonexistent").join("Test Browser.exe");
+        #[cfg(not(windows))]
+        let missing_browser = Path::new("/nonexistent/Test Browser");
         fs::write(
             config_dir.join("cerebellum.jsonc"),
             serde_json::to_vec(&json!({
                 "browser": {
-                    "executable_path": "/nonexistent/Test Browser",
+                    "executable_path": missing_browser,
                     "expected_identity": "test.browser",
                     "launch_handshake_deadline_ms": 10_000,
                     "termination_grace_period_ms": 5_000,
@@ -1518,6 +1522,7 @@ async fn wait_for_cerebellum_catalog(stream: &mut TcpStream) -> ClientControlRes
     panic!("real subc did not register cerebellum before the deadline");
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn open_live_route(stream: &mut TcpStream, corr: u64) -> (u16, u32) {
     let response = send_control_request(
         stream,
