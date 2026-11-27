@@ -16,6 +16,8 @@ fn parent() -> io::Result<ParentAttestation> {
 const TEST_LIMIT: Duration = Duration::from_secs(HANDSHAKE_TIMEOUT.as_secs() + 2);
 
 fn check_stalled_handshake<T: Transport>((host, mut peer): (T, T), prefilled: Option<usize>) {
+    // Darwin doesn't let the peer set a timeout after the host disconnects.
+    peer.set_read_timeout(Some(TEST_LIMIT)).unwrap();
     let (result, done) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let _ = result.send(establish_session(
@@ -38,7 +40,6 @@ fn check_stalled_handshake<T: Transport>((host, mut peer): (T, T), prefilled: Op
         "{error}"
     );
 
-    peer.set_read_timeout(Some(TEST_LIMIT)).unwrap();
     let mut sent = Vec::new();
     peer.read_to_end(&mut sent).unwrap();
     if let Some(prefilled) = prefilled {
