@@ -284,8 +284,11 @@ async fn tool_views_are_advertised_and_match_catalog_pins() {
             panic!("catalog pin has no view: {pin}");
         };
         assert_eq!(view.record_schema.name, "cerebellum_call");
-        // The revision tracks the catalog digest so readers can replace retained views.
-        assert_eq!(view.template_revision, 6);
+        // The revision moves when a template changes, so readers replace
+        // retained views: the browser templates moved to 7 when they gained
+        // the press_key row; the computer templates are unchanged at 6.
+        let expected_revision = if tool.name == "browser_use" { 7 } else { 6 };
+        assert_eq!(view.template_revision, expected_revision, "{}", tool.name);
         assert!(view.reads.is_empty());
         assert_eq!(view.template["row"]["profile"], "tool_row");
         assert_eq!(view.template["page"]["profile"], "tool_page");

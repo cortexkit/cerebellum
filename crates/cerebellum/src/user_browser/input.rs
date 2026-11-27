@@ -342,7 +342,7 @@ async fn input_inner(
                 Some(snapshot.interaction),
                 &frame,
                 vec![
-                    // CDP scrolls the node without page-supplied JavaScript or
+                    // The Chrome DevTools Protocol scrolls the node without page-supplied JavaScript or
                     // activating its tab. Measure in the same attachment after
                     // scrolling, not against the snapshot's old page position.
                     command(

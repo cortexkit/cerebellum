@@ -129,10 +129,10 @@ impl Key {
             "key":key,"code":code,"windowsVirtualKeyCode":vk,
         });
         if self == Self::ShiftTab {
-            params["modifiers"] = json!(8); // CDP's Shift bit.
+            params["modifiers"] = json!(8); // The Shift bit in the Chrome DevTools Protocol's modifier mask.
         }
         if down && self == Self::Enter {
-            // A Return character triggers Blink's native Enter default action.
+            // A Return character triggers the browser's native Enter default action.
             params["text"] = json!("\r");
         }
         params
