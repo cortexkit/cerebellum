@@ -28,6 +28,7 @@ use std::io::{self, Read, Write};
 mod attestation;
 mod gate;
 mod paths;
+pub mod peer_trailer;
 
 pub use attestation::{
     AttestationV1, HostParentAttestation, LinuxBrowser, LinuxPackage, LinuxPackageManager,

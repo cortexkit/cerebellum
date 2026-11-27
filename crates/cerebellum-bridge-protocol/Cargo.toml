@@ -11,10 +11,11 @@ bridge-test-identities = []
 
 [dependencies]
 cortexkit-paths = { version = "=0.1.2", default-features = false }
-ed25519-dalek = { version = "=2.2.0", default-features = false }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["pkcs8", "pem", "zeroize"] }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
+sha2 = { workspace = true }
+zeroize = "=1.9.1"
 
 [dev-dependencies]
-sha2 = { workspace = true }
 base64 = "0.22"

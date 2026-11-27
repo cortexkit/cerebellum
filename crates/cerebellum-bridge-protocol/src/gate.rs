@@ -1,3 +1,4 @@
+use crate::peer_trailer::parse_public_key;
 use ed25519_dalek::VerifyingKey;
 
 const CI_REVISION: &str = "ci-unreviewed";
@@ -14,28 +15,14 @@ pub fn classify_bridge_gate(
         return None;
     }
 
-    let hex = public_key_hex?.as_bytes();
-    let mut key_bytes = [0; 32];
-    if hex.len() != key_bytes.len() * 2 {
-        return None;
-    }
-    for (pair, byte) in hex.as_chunks::<2>().0.iter().zip(&mut key_bytes) {
-        let high = char::from(pair[0]).to_digit(16)?;
-        let low = char::from(pair[1]).to_digit(16)?;
-        *byte = ((high << 4) | low) as u8;
-    }
-
-    let key = VerifyingKey::from_bytes(&key_bytes).ok()?;
-    // Weak Ed25519 keys can decode, but they do not securely verify a peer.
-    (!key.is_weak()).then_some(key)
+    parse_public_key(public_key_hex?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer_trailer::TEST_PEER_PUBLIC_KEY_HEX as VALID_KEY;
 
-    // RFC 8032's first Ed25519 test vector public key, not a bridge release key.
-    const VALID_KEY: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
     // Compressed y = 2 has no corresponding x on the Ed25519 curve.
     const OFF_CURVE: &str = "0200000000000000000000000000000000000000000000000000000000000000";
     const IDENTITY: &str = "0100000000000000000000000000000000000000000000000000000000000000";
