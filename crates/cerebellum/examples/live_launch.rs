@@ -137,10 +137,17 @@ async fn main() {
 // This probe checks profile reuse across plane restarts, which requires disk
 // storage. Refuse before constructing a plane unless its data home is scratch.
 fn require_scratch_data_home(data_home: Option<std::ffi::OsString>) -> Result<(), String> {
+    require_scratch_data_home_under(data_home, Path::new("/tmp"))
+}
+
+fn require_scratch_data_home_under(
+    data_home: Option<std::ffi::OsString>,
+    scratch_root: &Path,
+) -> Result<(), String> {
     let path = data_home.ok_or("refusing: set XDG_DATA_HOME to a scratch directory under /tmp")?;
     let path = std::fs::canonicalize(path)
         .map_err(|error| format!("refusing: scratch XDG_DATA_HOME: {error}"))?;
-    let temporary = std::fs::canonicalize("/tmp")
+    let temporary = std::fs::canonicalize(scratch_root)
         .map_err(|error| format!("refusing: scratch root: {error}"))?;
     if path == temporary || !path.starts_with(&temporary) {
         return Err("refusing: XDG_DATA_HOME must be a scratch directory under /tmp".into());
@@ -1030,14 +1037,17 @@ mod tests {
 
     #[test]
     fn durable_probe_requires_a_scratch_data_home() {
-        assert!(require_scratch_data_home(None).is_err());
-        assert!(require_scratch_data_home(Some("/tmp".into())).is_err());
-        assert!(require_scratch_data_home(Some("/".into())).is_err());
-        let root =
-            PathBuf::from("/tmp").join(format!("live-launch-scratch-{}", std::process::id()));
-        std::fs::create_dir(&root).unwrap();
-        assert!(require_scratch_data_home(Some(root.clone().into_os_string())).is_ok());
-        std::fs::remove_dir(root).unwrap();
+        let scratch = cortexkit_test_support::ScratchDir::new("live-launch-scratch");
+        let root = scratch.join("root");
+        let child = root.join("probe");
+        std::fs::create_dir_all(&child).unwrap();
+        let admit = |path: Option<&Path>| {
+            require_scratch_data_home_under(path.map(|path| path.as_os_str().to_owned()), &root)
+        };
+        assert!(admit(None).is_err());
+        assert!(admit(Some(&root)).is_err());
+        assert!(admit(Some(scratch.path())).is_err());
+        assert!(admit(Some(&child)).is_ok());
     }
 
     #[test]
