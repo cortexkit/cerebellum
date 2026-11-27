@@ -16,7 +16,11 @@ use crate::browsers::HOST_MANIFEST_LOCATIONS;
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Register the canonical path of this running executable for the current user.
+/// On Linux, returns the Google Chrome manifest path after writing both manifests.
 pub fn register_running_executable() -> Result<PathBuf, String> {
+    #[cfg(target_os = "linux")]
+    let base = linux_config_base()?;
+    #[cfg(not(target_os = "linux"))]
     let home = std::env::var_os("HOME").ok_or_else(|| "HOME is unset".to_owned())?;
     let executable = std::env::current_exe()
         .map_err(|error| format!("could not locate the running executable: {error}"))?;
@@ -26,7 +30,27 @@ pub fn register_running_executable() -> Result<PathBuf, String> {
     if !executable.is_absolute() {
         return Err("the canonical running executable path is not absolute".into());
     }
+    #[cfg(target_os = "linux")]
+    {
+        let chrome = write_manifest_at(
+            &base.join("google-chrome/NativeMessagingHosts"),
+            &executable,
+        )?;
+        write_manifest_at(&base.join("chromium/NativeMessagingHosts"), &executable)?;
+        Ok(chrome)
+    }
+    #[cfg(not(target_os = "linux"))]
     write_manifest(Path::new(&home), &executable)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_config_base() -> Result<PathBuf, String> {
+    let nonempty = |name| std::env::var_os(name).filter(|value| !value.is_empty());
+    nonempty("CHROME_CONFIG_HOME")
+        .or_else(|| nonempty("XDG_CONFIG_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| nonempty("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .ok_or_else(|| "HOME is unset".to_owned())
 }
 
 /// Write Chrome's manifest below an explicit home directory.

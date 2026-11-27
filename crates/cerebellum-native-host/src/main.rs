@@ -14,7 +14,7 @@ fn main() -> ExitCode {
             eprintln!("{reason}");
             return ExitCode::from(2);
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             return match cerebellum_native_host::registration::register_running_executable() {
                 Ok(_) => ExitCode::SUCCESS,
@@ -24,7 +24,7 @@ fn main() -> ExitCode {
                 }
             };
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             eprintln!("native messaging registration is unavailable on this platform");
             return ExitCode::FAILURE;
