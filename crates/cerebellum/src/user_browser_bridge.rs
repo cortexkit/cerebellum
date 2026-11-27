@@ -1,6 +1,6 @@
 //! Authenticated user-browser transport and non-replaying action lifecycle.
 //!
-//! Socket framing and host admission live in `cerebellum-bridge-protocol`.
+//! Transport admission checks peer identity before reading the framed hello.
 //! After admission, each relay contains a closed [`Message`]: `id`, `epoch`,
 //! and a `body` tagged by `type`. The server sends Attach with a command, waits
 //! for Attached, sends Dispatch exactly once, waits for Dispatched, then waits
@@ -1080,9 +1080,15 @@ async fn next_reply(
 }
 
 #[cfg(any(target_os = "macos", all(unix, test)))]
-mod socket;
+mod admission;
+#[cfg(any(target_os = "macos", target_os = "linux", windows, all(unix, test)))]
+mod listener;
+#[cfg(any(target_os = "macos", target_os = "linux", windows, all(unix, test)))]
+pub use listener::BridgeListener;
 #[cfg(any(target_os = "macos", all(unix, test)))]
-pub use socket::BridgeListener;
+mod session;
+#[cfg(any(target_os = "macos", all(unix, test)))]
+mod socket;
 
 #[cfg(test)]
 mod tests;
