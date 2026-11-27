@@ -847,7 +847,7 @@ fn sqlite_read(program: &Path, store: &Path, sql: &str) -> io::Result<String> {
     sqlite_read_until(program, store, sql, Instant::now() + TRANSFER_TIMEOUT)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn sqlite_write(program: &Path, store: &Path, sql: &str) -> io::Result<String> {
     sqlite_read_until(program, store, sql, Instant::now() + TRANSFER_TIMEOUT)
 }
@@ -1274,10 +1274,13 @@ fn set_private_file_permissions(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::sync::Mutex;
+    #[cfg(unix)]
     use std::time::Duration;
 
-    use std::sync::Mutex;
-
+    #[cfg(unix)]
     use crate::browser_session::*;
 
     #[cfg(windows)]
@@ -1301,7 +1304,12 @@ mod tests {
         assert_eq!(fs::read(&copy).unwrap(), b"fixture");
     }
 
+    // Login import uses the system sqlite3 program and macOS/Linux browser
+    // paths. Run these CLI-backed tests on Windows when Cerebellum ports
+    // login import and controlled browser sessions for the alpha release.
+    #[cfg(unix)]
     struct ImportProcess(Arc<Mutex<Vec<&'static str>>>);
+    #[cfg(unix)]
     impl OwnedBrowserProcess for ImportProcess {
         fn navigate(
             &mut self,
@@ -1347,16 +1355,20 @@ mod tests {
             Ok(Default::default())
         }
     }
+    #[cfg(unix)]
     struct ImportCleanup;
+    #[cfg(unix)]
     impl SessionCleanup for ImportCleanup {
         fn after_reap(&mut self) -> Result<SessionCleanupOutcome, CleanupStage> {
             Ok(SessionCleanupOutcome::Complete)
         }
     }
+    #[cfg(unix)]
     struct ImportLauncher {
         events: Arc<Mutex<Vec<&'static str>>>,
         fail: bool,
     }
+    #[cfg(unix)]
     impl BrowserSessionLauncher for ImportLauncher {
         fn launch(&self, _: &crate::AcceptedBindFacts, _: &str) -> Result<LaunchedBrowser, Value> {
             self.events.lock().unwrap().push("launch");
@@ -1372,6 +1384,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     async fn open_import_case(
         decision: &str,
         presented: bool,
@@ -1542,6 +1555,7 @@ mod tests {
         (reply, status, old_id, recorded)
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn import_open_session_closes_copies_and_relaunches() {
         let (reply, status, old, events) =
@@ -1570,6 +1584,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn import_restores_url_only_with_a_grant() {
         let (reply, _, _, events) = open_import_case("transfer:chrome", false, false, true).await;
@@ -1580,6 +1595,7 @@ mod tests {
         assert_eq!(events, ["close", "copy", "launch", "navigate"]);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn import_deny_and_hand_off_leave_open_session_untouched() {
         for decision in ["deny", "hand_off", "transfer:unknown", "cancel"] {
@@ -1614,6 +1630,7 @@ mod tests {
     /// nobody was shown is shown to nobody next time either. Reported as
     /// `denied`, a question the carrier never put to anyone told the agent the
     /// person had refused.
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_import_question_that_ended_unanswered_is_never_reported_as_denied() {
         // Script the card's ending, then check its wire outcome and remedy.
@@ -1669,6 +1686,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn import_presented_session_is_not_closed() {
         let (reply, status, old, events) =
@@ -1687,6 +1705,7 @@ mod tests {
     /// remedy: the agent cannot copy from a source that is not there, so the
     /// person hands the login over instead. The remedy names the flat
     /// `present` action, never the granular `browser.present` capability.
+    #[cfg(unix)]
     #[test]
     fn a_transfer_with_no_source_behind_it_reports_the_hand_off_remedy() {
         let root = TestRoot::new("transfer-without-source");
@@ -1742,6 +1761,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn import_relaunch_failure_preserves_transferred_outcome() {
         let (reply, status, _, events) =
@@ -1821,6 +1841,9 @@ mod tests {
         assert!(!read_marker.exists(), "cookie store reader was invoked");
     }
 
+    // These fixtures use Unix's system sqlite3. Tests that do not use the
+    // program still run on Windows before login import is available there.
+    #[cfg(unix)]
     #[derive(Clone, Copy)]
     struct Cookie<'a> {
         host: &'a str,
@@ -1841,12 +1864,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn cookie_store(application_support: &Path, source: &BrowserSource) -> PathBuf {
         application_support
             .join(&source.data_directory)
             .join(COOKIES_RELATIVE_PATH)
     }
 
+    #[cfg(unix)]
     fn create_store(path: &Path, cookies: &[Cookie<'_>]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut sql = String::from(
@@ -1877,6 +1902,7 @@ mod tests {
         sqlite_write(Path::new(SQLITE_PROGRAM), path, &sql).unwrap();
     }
 
+    #[cfg(unix)]
     fn encrypted_hex(path: &Path, name: &str) -> String {
         sqlite_read(
             Path::new(SQLITE_PROGRAM),
@@ -1891,6 +1917,7 @@ mod tests {
         .to_string()
     }
 
+    #[cfg(unix)]
     #[test]
     fn presence_reads_host_key_and_nothing_else() {
         let root = TestRoot::new("presence");
@@ -1972,6 +1999,7 @@ mod tests {
     /// zero-byte rollback journal beside an idle store. The journal must ride
     /// along with the copy (a hot one is what makes the copy consistent), and
     /// an idle one must not change the answer.
+    #[cfg(unix)]
     #[test]
     fn an_idle_journal_beside_the_store_rides_with_the_copy_and_hides_nothing() {
         let root = TestRoot::new("idle-journal");
@@ -2001,6 +2029,7 @@ mod tests {
     /// read the half-applied pages as truth. The fixture builds that journal by
     /// hand from the page as it stood before a second row was added, so the
     /// copy must roll back to one row while the file alone says two.
+    #[cfg(unix)]
     #[test]
     fn a_hot_journal_rides_with_the_copy_and_rolls_the_store_back() {
         let root = TestRoot::new("hot-journal");
@@ -2075,6 +2104,7 @@ mod tests {
     /// so the count alone would come back looking right; the consistency
     /// check on the whole copy is what turns it into a refusal, and the caller
     /// reports unreadable rather than a number.
+    #[cfg(unix)]
     #[test]
     fn a_torn_copy_is_refused_even_where_the_cookie_rows_still_read() {
         let root = TestRoot::new("torn-copy");
@@ -2138,6 +2168,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn session_only_rows_are_not_offered() {
         let root = TestRoot::new("session-only");
@@ -2182,6 +2213,7 @@ mod tests {
         assert!(question.contains("hand_off"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn transfer_is_offered_only_for_the_launch_binary() {
         let root = TestRoot::new("binary-match");
@@ -2227,6 +2259,7 @@ mod tests {
             .contains("transfer:brave"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn transfer_copies_rows_unchanged() {
         let root = TestRoot::new("unchanged");
@@ -2282,6 +2315,7 @@ mod tests {
         assert_eq!(encrypted_hex(&target, "auth"), before);
     }
 
+    #[cfg(unix)]
     #[test]
     fn transfer_prunes_before_the_store_touches_the_profile_path() {
         let root = TestRoot::new("prune-first");
@@ -2355,6 +2389,7 @@ mod tests {
         assert!(profile_precondition("https://x.com", true).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_browser_does_not_fail_the_op() {
         let root = TestRoot::new("unreadable");
@@ -2490,6 +2525,7 @@ mod tests {
         assert!(marker.exists(), "the SQLite invocation control did not run");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_missing_agent_store_is_created_from_the_pruned_copy() {
         let root = TestRoot::new("missing-target");
@@ -2549,6 +2585,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn deny_and_hand_off_copy_nothing() {
         let root = TestRoot::new("no-copy");
