@@ -409,7 +409,7 @@ async fn live_daemon_catalog_preserves_registered_flat_definition() {
             }
         })
         .unwrap();
-    let address = open_live_route(&mut client, 100).await;
+    let address = open_live_route(&mut client).await;
     let mut request = frame(
         address.0,
         json!({"name":"tool.catalog","arguments":{"params":{}}}),

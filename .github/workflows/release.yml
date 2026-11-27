@@ -72,6 +72,15 @@ jobs:
           - platform: linux-x64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: windows-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - platform: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
     env:
       PLATFORM: ${{ matrix.platform }}
       RELEASE_COMMIT: ${{ needs.verify.outputs.commit }}
@@ -81,18 +90,36 @@ jobs:
         with:
           ref: ${{ needs.verify.outputs.commit }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+        env:
+          # The release scripts need LF line endings under Git Bash on Windows.
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: 'false'
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable-${{ matrix.target }}
+      - uses: actions/setup-python@v6
+        if: runner.os == 'Windows'
+        with:
+          python-version: '3.13'
       - name: Require the native target
         env:
           TARGET: ${{ matrix.target }}
-        run: test "$(rustc --print host-tuple)" = "$TARGET"
+        shell: bash
+        run: |
+          case "${TARGET%%-*}:$RUNNER_ARCH" in
+            aarch64:ARM64|x86_64:X64) ;;
+            *) echo "::error::$TARGET cannot run natively on $RUNNER_ARCH"; exit 1 ;;
+          esac
+          test "$(rustc --print host-tuple)" = "$TARGET"
+
+      - name: Test workspace on the native target
+        run: cargo test --locked --workspace
 
       # No private checkout credential belongs in the public release build.
       - name: Build attested module
-        run: ./scripts/release-build.sh
-      - name: Test Linux workspace
-        if: runner.os == 'Linux'
-        run: cargo test --locked --workspace
+        shell: bash
+        run: bash scripts/release-build.sh
       - name: Build macOS native messaging host
         if: runner.os == 'macOS'
         run: cargo build --locked --release -p cerebellum-native-host --bin ck-cerebellum-native-host
@@ -167,13 +194,27 @@ jobs:
           mkdir assets
           zip -q -j "assets/ck-cerebellum-$PLATFORM.zip" target/release/ck-cerebellum
 
+      # TODO(windows-signing): Add Authenticode once CortexKit has a Windows signing process for its modules.
+      - name: Package unsigned executable (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir assets
+          python -m zipfile -c "assets/ck-cerebellum-$PLATFORM.zip" target/release/ck-cerebellum.exe
+
       - name: Verify archived files and write checksums
         shell: bash
         run: |
           cd assets
           for archive in *.zip; do
             wrapper=$(mktemp -d "$RUNNER_TEMP/cerebellum-release.XXXXXX")
-            unzip -q "$archive" -d "$wrapper"
+            if [[ "$RUNNER_OS" == Windows ]]; then
+              python -m zipfile -e "$archive" "$wrapper"
+              suffix=.exe
+            else
+              unzip -q "$archive" -d "$wrapper"
+              suffix=
+            fi
             if [[ "$archive" == "ck-cerebellum-extension-$PLATFORM.zip" ]]; then
               diff -r "$RUNNER_TEMP/ck-cerebellum-extension" "$wrapper"
               shasum -a 256 "$archive" > "$archive.sha256"
@@ -189,12 +230,17 @@ jobs:
             if [[ "$RUNNER_OS" == macOS ]]; then
               bash ../scripts/check-placed-hardening.sh "$wrapper/$binary"
             fi
-            reported=$("$wrapper/$binary" --version)
+            reported=$("$wrapper/$binary$suffix" --version)
             if [[ "$reported" != "$expected" ]]; then
               echo "::error::$archive reports '$reported', expected '$expected'"
               exit 1
             fi
-            shasum -a 256 "$archive" > "$archive.sha256"
+            if [[ "$RUNNER_OS" == Windows ]]; then
+              checksum=$(sha256sum -b "$archive")
+              printf '%s  %s\n' "${checksum%% *}" "$archive" > "$archive.sha256"
+            else
+              shasum -a 256 "$archive" > "$archive.sha256"
+            fi
             rm -r "$wrapper"
           done
 
