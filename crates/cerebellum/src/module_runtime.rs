@@ -18,7 +18,7 @@ const STARTUP_WAIT: Duration = Duration::from_secs(5);
 pub(super) struct Prepared {
     pub(super) planes: Planes,
     pub(super) teardown: ShutdownTeardown,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) _user_browser_listener: Option<user_browser_bridge::BridgeListener>,
 }
 

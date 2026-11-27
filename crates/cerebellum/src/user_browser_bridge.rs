@@ -260,7 +260,7 @@ impl ConnectionGauges {
         }
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     fn record_connected(&self) {
         self.connected_at_ms
             .store(wall_clock_ms(), Ordering::Relaxed);
@@ -320,7 +320,7 @@ fn wall_clock_ms() -> u64 {
 }
 
 struct State {
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     next_epoch: u64,
     next_id: u64,
     stopped: bool,
@@ -331,7 +331,7 @@ struct State {
     /// Whether the socket writer wrote each action's Attach (`true`) or
     /// dropped it because the action had already been cancelled (`false`),
     /// as it first judged that Attach.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     attaches_written: BTreeMap<u64, bool>,
 }
 
@@ -428,11 +428,11 @@ impl UserBrowserBridge {
         // so neither can consume the previous connection's replies.
         let mut random = [0; 8];
         getrandom::getrandom(&mut random).expect("connection epoch entropy unavailable");
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", target_os = "linux", test))]
         let epoch = (u64::from_le_bytes(random) & ((1 << 52) - 1)).max(1);
         Self(Arc::new(Inner {
             state: Mutex::new(State {
-                #[cfg(any(target_os = "macos", test))]
+                #[cfg(any(target_os = "macos", target_os = "linux", test))]
                 next_epoch: epoch,
                 next_id: 1,
                 stopped: false,
@@ -440,7 +440,7 @@ impl UserBrowserBridge {
                 replies: BTreeMap::new(),
                 calls: BTreeMap::new(),
                 controls: BTreeMap::new(),
-                #[cfg(any(target_os = "macos", test))]
+                #[cfg(any(target_os = "macos", target_os = "linux", test))]
                 attaches_written: BTreeMap::new(),
             }),
             lane: tokio::sync::Mutex::new(()),
@@ -562,7 +562,7 @@ impl UserBrowserBridge {
         }
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     fn connect(&self) -> Result<(u64, mpsc::Receiver<Message>, watch::Receiver<bool>), Reason> {
         let mut state = self.state();
         if state.stopped {
@@ -602,7 +602,7 @@ impl UserBrowserBridge {
         }
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     fn receive(&self, message: Message) {
         let mut state = self.state();
         if state.connection.as_ref().map(|c| c.epoch) != Some(message.epoch) {
@@ -619,7 +619,7 @@ impl UserBrowserBridge {
         }
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub(super) fn should_send(&self, message: &Message) -> bool {
         let mut state = self.state();
         if state.stopped || state.connection.as_ref().map(|c| c.epoch) != Some(message.epoch) {
@@ -1034,7 +1034,7 @@ impl Drop for Registration {
         state.calls.remove(&self.id);
         state.controls.remove(&self.id);
         state.replies.remove(&self.id);
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", target_os = "linux", test))]
         state.attaches_written.remove(&self.id);
     }
 }
@@ -1079,15 +1079,17 @@ async fn next_reply(
     }
 }
 
-#[cfg(any(target_os = "macos", all(unix, test)))]
+#[cfg(any(target_os = "macos", target_os = "linux", all(unix, test)))]
 mod admission;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(any(target_os = "macos", target_os = "linux", windows, all(unix, test)))]
 mod listener;
 #[cfg(any(target_os = "macos", target_os = "linux", windows, all(unix, test)))]
 pub use listener::BridgeListener;
-#[cfg(any(target_os = "macos", all(unix, test)))]
+#[cfg(any(target_os = "macos", target_os = "linux", all(unix, test)))]
 mod session;
-#[cfg(any(target_os = "macos", all(unix, test)))]
+#[cfg(any(target_os = "macos", target_os = "linux", all(unix, test)))]
 mod socket;
 
 #[cfg(test)]
