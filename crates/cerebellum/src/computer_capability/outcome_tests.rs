@@ -312,6 +312,12 @@ fn replies(capability: ComputerCapability) -> Vec<Value> {
     );
     match capability {
         ComputerCapability::Type => {
+            // Shipped typing submits text, not a key combination. Keep this
+            // reserved reply valid for planners that can refuse a blocked chord.
+            replies.push(keystrokes::refused_before_posting(chord_blocked_refusal(
+                "control+option+l",
+                "lock",
+            )));
             replies.push(json!({"outcome": "completed", "effect_status": "effect_observed"}));
             // The diff an accepted keystroke carries, as text.
             let mut typed = json!({"outcome": "completed", "effect_status": "effect_observed"});
@@ -555,7 +561,7 @@ fn every_computer_capability_accepts_bounded_call_shapes() {
 
 #[test]
 fn every_type_outcome_survives_withholding() {
-    check_outcomes(ComputerCapability::Type, &["completed"]);
+    check_outcomes(ComputerCapability::Type, &["chord_blocked", "completed"]);
 }
 
 #[test]
