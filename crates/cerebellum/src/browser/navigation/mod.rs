@@ -5273,11 +5273,15 @@ fn collect_dom_facts(
 }
 
 #[cfg(test)]
+mod evidence_tests;
+#[cfg(test)]
 mod large_page_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod native_select_tests;
 #[cfg(test)]
 mod read_loop_tests;
+#[cfg(test)]
+mod test_support;
 
 #[cfg(test)]
 mod tests {
@@ -5286,6 +5290,7 @@ mod tests {
 
     use serde_json::json;
 
+    pub(super) use super::test_support::FakeClock;
     use super::*;
     use crate::browser::QUIET_MS;
     use crate::snapshot_store::{
@@ -5424,28 +5429,6 @@ mod tests {
         }
     }
 
-    pub(super) struct FakeClock {
-        now: Instant,
-    }
-
-    impl FakeClock {
-        pub(super) fn new() -> Self {
-            Self {
-                now: Instant::now(),
-            }
-        }
-    }
-
-    impl NavigationClock for FakeClock {
-        fn now(&mut self) -> Instant {
-            self.now
-        }
-
-        fn sleep(&mut self, duration: Duration) {
-            self.now += duration;
-        }
-    }
-
     fn driver(frames: impl IntoIterator<Item = Value>) -> CdpNavigationDriver<FakePipe> {
         CdpNavigationDriver::new(
             FakePipe::with_frames(frames),
@@ -5455,7 +5438,7 @@ mod tests {
         .with_incremental_ax_snapshots()
     }
 
-    fn driver_with_download_denial(
+    pub(super) fn driver_with_download_denial(
         frames: impl IntoIterator<Item = Value>,
     ) -> CdpNavigationDriver<FakePipe> {
         let replies = std::iter::once(json!({"id":1,"result":{}})).chain(frames.into_iter().map(
@@ -5516,7 +5499,7 @@ mod tests {
             ]}}),
         ]);
         let mut clock = FakeClock::new();
-        let started = clock.now;
+        let started = clock.now();
         let observation = driver
             .snapshot_with_clock(
                 "route-own",
@@ -5529,7 +5512,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            clock.now.duration_since(started),
+            clock.now().duration_since(started),
             Duration::from_millis(crate::budgets::CDP_STEP_MS)
         );
         assert_eq!(observation.records.len(), 1);
