@@ -362,6 +362,8 @@ fn save(path: &PathBuf, floor: &FormatFloor, document: &Document) -> io::Result<
         file.write_all(&serde_json::to_vec(document)?)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
+        // Windows cannot flush a parent directory through std::fs::File.
+        #[cfg(not(windows))]
         File::open(directory)?.sync_all()?;
         Ok(())
     })();

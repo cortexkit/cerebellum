@@ -1059,8 +1059,16 @@ fn replace_record(
     sync_directory(root)
 }
 
+#[cfg(not(windows))]
 fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    // The custody record is flushed before the rename. Windows cannot flush
+    // its parent directory through std::fs::File.
+    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {

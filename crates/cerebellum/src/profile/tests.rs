@@ -288,6 +288,33 @@ fn root_is_held_and_target_containment_is_revalidated() {
     fs::remove_dir_all(path).unwrap();
 }
 
+#[cfg(windows)]
+#[test]
+fn created_profile_target_parent_has_a_protected_owner_only_dacl() {
+    use cortexkit_lease::test_support::{
+        assert_broad_inherited, assert_owner_only, grant_everyone,
+    };
+
+    let path = root();
+    grant_everyone(&path);
+    let control = path.join("inherited-control");
+    fs::write(&control, b"fixture").unwrap();
+    assert_broad_inherited(&control);
+
+    let root = HeldManagedRoot::open(&path).unwrap();
+    let target = root
+        .target_path(Path::new("profiles/new-profile"), true)
+        .unwrap();
+    let parent = target.parent().unwrap();
+    assert_owner_only(parent, true, true);
+    let held_parent = root.open_target(Path::new("profiles")).unwrap();
+    assert_eq!(held_parent.canonical_path(), parent);
+    held_parent.revalidate().unwrap();
+    drop(held_parent);
+    drop(root);
+    fs::remove_dir_all(path).unwrap();
+}
+
 #[test]
 fn root_identity_decision_is_platform_neutral_and_ignores_the_device() {
     let birth_time = BirthTime {

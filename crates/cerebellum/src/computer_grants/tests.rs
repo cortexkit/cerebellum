@@ -602,6 +602,10 @@ async fn two_app_holders_elect_exactly_one_execution() {
     );
 }
 
+// These login-import tests use the system sqlite3 program and macOS/Linux
+// browser paths. Run them on Windows when Cerebellum ports login import and
+// controlled browser sessions for the alpha release.
+#[cfg(unix)]
 fn sqlite(path: &Path, sql: &str) -> String {
     let output = std::process::Command::new("/usr/bin/sqlite3")
         .arg(path)
@@ -616,6 +620,7 @@ fn sqlite(path: &Path, sql: &str) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+#[cfg(unix)]
 fn two_browser_plan(root: &Path) -> crate::login_import::LoginImportPlan {
     fs::create_dir_all(root.join("managed/profile")).unwrap();
     let executable = root.join("browser");
@@ -654,6 +659,7 @@ fn two_browser_plan(root: &Path) -> crate::login_import::LoginImportPlan {
 }
 
 /// Start at the prepared-plan boundary without inspecting the operator's browsers.
+#[cfg(unix)]
 async fn invoke_plan(
     planes: &Planes,
     plan: crate::login_import::LoginImportPlan,
@@ -667,6 +673,7 @@ async fn invoke_plan(
     .await
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn late_import_approval_copies_the_selected_browser_and_reports_execution() {
     let planes = app_planes();
@@ -716,6 +723,7 @@ async fn late_import_approval_copies_the_selected_browser_and_reports_execution(
     crate::browser::validate_browser_result(crate::management::IMPORT_LOGIN, &reply).unwrap();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn new_import_endings_pass_result_schema_enforcement() {
     for ending in [
