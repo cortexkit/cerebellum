@@ -2,14 +2,16 @@
 
 use crate::RetainedProcessHandle;
 use std::ffi::c_void;
+use std::io;
 use std::mem::size_of;
 use std::ptr::null_mut;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, HANDLE};
+use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsValidSid, TokenElevation,
     TokenElevationType as TOKEN_ELEVATION_TYPE_CLASS, TokenElevationTypeDefault,
-    TokenElevationTypeFull, TokenElevationTypeLimited, TokenIntegrityLevel, TOKEN_ELEVATION,
-    TOKEN_ELEVATION_TYPE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    TokenElevationTypeFull, TokenElevationTypeLimited, TokenIntegrityLevel, TokenUser,
+    TOKEN_ELEVATION, TOKEN_ELEVATION_TYPE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -36,11 +38,19 @@ impl Token {
     }
 
     fn from_process(process: HANDLE) -> Option<Self> {
+        Self::open(process).ok()
+    }
+
+    fn open(process: HANDLE) -> io::Result<Self> {
         let mut token = null_mut();
         // SAFETY: The caller supplies a live process handle, and `token`
         // receives an independently owned handle on success.
         let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
-        (opened != 0).then(|| Self(token))
+        if opened == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self(token))
+        }
     }
 }
 
@@ -59,8 +69,67 @@ pub fn current_process_token_facts() -> Option<TokenFacts> {
 
 impl RetainedProcessHandle {
     pub fn token_facts(&self) -> Option<TokenFacts> {
-        token_facts(Token::from_process(self.handle)?)
+        token_facts(Token::from_process(self.raw_handle())?)
     }
+
+    pub fn token_user_sid(&self) -> io::Result<String> {
+        token_user_sid(Token::open(self.raw_handle())?)
+    }
+}
+
+pub fn current_process_token_user_sid() -> io::Result<String> {
+    // SAFETY: GetCurrentProcess returns the live process pseudo-handle.
+    token_user_sid(Token::open(unsafe { GetCurrentProcess() })?)
+}
+
+fn token_user_sid(token: Token) -> io::Result<String> {
+    let mut needed = 0;
+    // SAFETY: The token is live; the null output asks for the buffer length.
+    let ok = unsafe { GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut needed) };
+    if ok == 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+            return Err(error);
+        }
+    }
+    if (needed as usize) < size_of::<TOKEN_USER>() {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let mut data = vec![0_usize; (needed as usize).div_ceil(size_of::<usize>())];
+    let mut written = 0;
+    // SAFETY: data has enough space, is pointer-aligned, and stays alive until
+    // the SID pointer from TOKEN_USER is no longer needed.
+    let ok = unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            data.as_mut_ptr().cast(),
+            needed,
+            &mut written,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (written as usize) < size_of::<TOKEN_USER>() {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let mut text = null_mut();
+    // SAFETY: A successful TokenUser query initialized the header and SID;
+    // text is writable and receives a system-allocated NUL-terminated string.
+    if unsafe { ConvertSidToStringSidW((*data.as_ptr().cast::<TOKEN_USER>()).User.Sid, &mut text) }
+        == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: text is the live, NUL-terminated allocation returned above.
+    let sid = unsafe {
+        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+        let sid = String::from_utf16(std::slice::from_raw_parts(text, len));
+        LocalFree(text.cast());
+        sid
+    };
+    sid.map_err(io::Error::other)
 }
 
 fn token_facts(token: Token) -> Option<TokenFacts> {

@@ -225,14 +225,14 @@ fn process_access_failure() -> ProcessAccessFailure {
     }
 }
 
-fn empty_file_time() -> FILETIME {
+pub(crate) fn empty_file_time() -> FILETIME {
     FILETIME {
         dwLowDateTime: 0,
         dwHighDateTime: 0,
     }
 }
 
-fn file_time_ticks(time: FILETIME) -> u64 {
+pub(crate) fn file_time_ticks(time: FILETIME) -> u64 {
     (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
 }
 

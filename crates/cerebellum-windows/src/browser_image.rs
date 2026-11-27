@@ -111,6 +111,10 @@ impl OpenedProcessImage {
     pub fn into_file(self) -> File {
         self.file
     }
+
+    pub fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
 }
 
 /// Retain a directory and the normalized path read from that directory handle.

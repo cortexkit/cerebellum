@@ -20,8 +20,12 @@ mod devtools_pipe;
 mod file_identity;
 #[cfg(windows)]
 mod image_file_facts;
+#[cfg(windows)]
+mod named_pipe;
 #[cfg(any(windows, test))]
 mod pe_product;
+#[cfg(windows)]
+mod process_readings;
 #[cfg(any(target_os = "windows", test))]
 mod session;
 #[cfg(windows)]
@@ -63,11 +67,15 @@ pub use image_file_facts::{
     ProcessPackageFields,
 };
 #[cfg(windows)]
+pub use named_pipe::{named_pipe_client_pid, named_pipe_server_pid, wait_named_pipe};
+#[cfg(windows)]
+pub use process_readings::system_time_100ns;
+#[cfg(windows)]
 pub use signer_facts::{AuthenticodeFacts, SignerFields};
 #[cfg(target_os = "windows")]
 pub use token_facts::{
-    current_process_token_elevation_type, current_process_token_facts, TokenElevationType,
-    TokenFacts,
+    current_process_token_elevation_type, current_process_token_facts,
+    current_process_token_user_sid, TokenElevationType, TokenFacts,
 };
 #[cfg(windows)]
 pub use window_identity_facts::{
