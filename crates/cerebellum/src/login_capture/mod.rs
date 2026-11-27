@@ -758,6 +758,10 @@ pub fn run_bounded(
     const POLL: Duration = Duration::from_millis(10);
     let started = Instant::now();
     let mut command = std::process::Command::new(program);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let mut child = crate::launch_nonce::without_launch_nonce(&mut command)
         .args(arguments)
         .stdin(std::process::Stdio::null())

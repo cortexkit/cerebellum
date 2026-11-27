@@ -1,0 +1,165 @@
+name: Windows browser
+
+on:
+  push:
+    branches: [main, 'train/**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-browser:
+    name: Windows browser (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            chrome_machine: '8664'
+            chrome_msi: https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            chrome_machine: 'aa64'
+            chrome_msi: https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise_arm64.msi
+    env:
+      CARGO_TERM_COLOR: never
+      CK_WINDOWS_BROWSER_HEADFUL_CI: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+
+      - name: Install and verify native Chrome Stable
+        env:
+          CHROME_MSI_URL: ${{ matrix.chrome_msi }}
+          CHROME_MACHINE: ${{ matrix.chrome_machine }}
+          RUST_TARGET: ${{ matrix.target }}
+        run: |
+          if (-not ((rustc -vV) -contains "host: $env:RUST_TARGET")) {
+            throw "Expected a native Rust host: $env:RUST_TARGET"
+          }
+          $installer = Join-Path $env:RUNNER_TEMP 'chrome-stable.msi'
+          Invoke-WebRequest $env:CHROME_MSI_URL -OutFile $installer
+          $install = Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /qn /norestart" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Chrome MSI exited $($install.ExitCode)" }
+          $chrome = Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'
+          $reader = [IO.BinaryReader]::new([IO.File]::OpenRead($chrome))
+          try {
+            if ($reader.ReadUInt16() -ne 0x5a4d) { throw "Missing MZ signature: $chrome" }
+            $reader.BaseStream.Position = 0x3c
+            $reader.BaseStream.Position = $reader.ReadUInt32()
+            if ($reader.ReadUInt32() -ne 0x4550) { throw "Missing PE signature: $chrome" }
+            $machine = '{0:x4}' -f $reader.ReadUInt16()
+            if ($machine -ne $env:CHROME_MACHINE) {
+              throw "Expected PE Machine $env:CHROME_MACHINE, got $machine in $chrome"
+            }
+          } finally {
+            $reader.Dispose()
+          }
+          if ($env:CI -ne 'true' -or $env:CK_WINDOWS_BROWSER_HEADFUL_CI -ne '1') {
+            throw 'The CI-only headful browser gate is missing'
+          }
+          "CK_WINDOWS_BROWSER_CHROME=$chrome" >> $env:GITHUB_ENV
+
+      - name: Key unbound workspace tests
+        run: |
+          cargo test --locked --workspace -- --format=pretty | Tee-Object (Join-Path $env:RUNNER_TEMP 'unbound.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Key unbound workspace clippy
+        run: cargo clippy --locked --workspace --all-targets
+
+      - name: Key bound workspace tests
+        run: |
+          cargo test --locked --workspace --features cerebellum/windows-browser-release -- --format=pretty | Tee-Object (Join-Path $env:RUNNER_TEMP 'bound.log')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check executed Windows browser cases
+        run: |
+          if (-not (Test-Path -LiteralPath $env:CK_WINDOWS_BROWSER_CHROME -PathType Leaf)) {
+            throw 'Native Chrome is required even before real-browser cases are added'
+          }
+          if ($env:CI -ne 'true' -or $env:CK_WINDOWS_BROWSER_HEADFUL_CI -ne '1') {
+            throw 'The CI-only headful browser gate is missing'
+          }
+          $prefixes = @{ real = 'windows_browser_real_'; headful = 'windows_browser_headful_' }
+          $expected = @{}
+          foreach ($line in Get-Content .github/windows-executed-cases.txt) {
+            if ($line -match '^\s*(#|$)') { continue }
+            if ($line -cnotmatch '^(unbound|bound|real|headful) ([A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)*)$') {
+              throw "Invalid Windows case: $line"
+            }
+            $phase, $case = $Matches[1], $Matches[2]
+            if ($prefixes.ContainsKey($phase) -and ($case -csplit '::')[-1] -cnotlike "$($prefixes[$phase])*") {
+              throw "Case $case does not use the $phase test-name prefix"
+            }
+            if ($expected[$phase] -ccontains $case) { throw "Duplicate case: $line" }
+            $expected[$phase] += @($case)
+          }
+          foreach ($phase in 'unbound', 'bound') {
+            if (-not $expected[$phase]) { throw "No $phase cases in the checked-in file" }
+          }
+          $report = Join-Path $env:RUNNER_TEMP 'windows-executed-cases.txt'
+          New-Item -ItemType File -Path $report | Out-Null
+          foreach ($phase in 'unbound', 'bound', 'real', 'headful') {
+            if (-not $expected.ContainsKey($phase)) { continue }
+            $log = Join-Path $env:RUNNER_TEMP "$phase.log"
+            if ($prefixes.ContainsKey($phase)) {
+              cargo test --locked -p cerebellum --lib --features windows-browser-release ($prefixes[$phase]) -- --ignored --format=pretty | Tee-Object $log
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            $passed = @(foreach ($line in Get-Content -LiteralPath $log) {
+              if ($line -cmatch '^test (\S+) \.\.\. ok\s*$') { $Matches[1] }
+            })
+            if ($passed.Count -eq 0) { throw "No $phase tests executed successfully" }
+            $passed | Sort-Object -Unique | ForEach-Object { "$phase $_" } | Add-Content -LiteralPath $report
+            foreach ($case in $expected[$phase]) {
+              if ($passed -cnotcontains $case) { throw "Missing executed Windows case: $phase $case" }
+            }
+          }
+
+      - name: Upload executed Windows cases
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-executed-cases-${{ matrix.target }}
+          path: ${{ runner.temp }}/windows-executed-cases.txt
+          if-no-files-found: error
+
+      - name: Key bound workspace clippy
+        env:
+          CLIPPY_CONF_DIR: ${{ github.workspace }}/.github/windows-spawn-clippy
+        run: cargo clippy --locked --workspace --all-targets --target ${{ matrix.target }} --features cerebellum/windows-browser-release -- -D clippy::disallowed_methods
+
+      - name: Reject a direct spawn in the Clippy fixture
+        env:
+          CLIPPY_CONF_DIR: ${{ github.workspace }}/.github/windows-spawn-clippy
+        run: |
+          $output = clippy-driver --target '${{ matrix.target }}' --crate-type lib --emit metadata --error-format=json -o "$env:RUNNER_TEMP/direct_call.rmeta" -D clippy::disallowed_methods .github/windows-spawn-clippy/direct_call.rs 2>&1
+          if ($LASTEXITCODE -eq 0) { throw 'Clippy accepted a forbidden direct spawn' }
+          $output | Write-Host
+          $refusals = @($output | ForEach-Object { "$_" | ConvertFrom-Json } | Where-Object {
+            $_.level -eq 'error' -and $_.code.code -eq 'clippy::disallowed_methods' -and
+            $_.message -like '*std::process::Command::spawn*' -and
+            @($_.spans | Where-Object { $_.is_primary -and $_.file_name -like '*direct_call.rs' }).Count -eq 1
+          })
+          if ($refusals.Count -ne 1) { throw 'Expected one disallowed-methods error at the fixture call' }
+
+  macos-pins:
+    name: macOS browser pins
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: HELLO manifest pin
+        run: cargo test --locked -p cerebellum --lib hello_manifest
+      - name: Flat catalog definition pins
+        run: cargo test --locked -p cerebellum --lib catalog_preserves_flat_definition_bytes
+      - name: Conformance pins
+        run: cargo test --locked -p cerebellum --test conformance

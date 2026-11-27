@@ -291,6 +291,30 @@ pub(crate) fn arrive(frame: &Frame, planes: &Planes) -> Option<ConversationPosit
         .routes
         .get(frame.header.channel, frame.header.epoch)?;
     let body: Value = serde_json::from_slice(&frame.body).ok()?;
+    #[cfg(windows)]
+    if planes.enforce_windows_browser_refusals() {
+        match facts.surface {
+            RouteSurface::Tools => {
+                let name = body.get("name")?.as_str()?;
+                if (!planes.browser_dispatch_admitted()
+                    && (name == crate::flat_tools::BROWSER_USE || name.starts_with("browser.")))
+                    || crate::windows_withheld::tool_refusal(name, &body["arguments"]).is_some()
+                {
+                    // Queue checks for the person's browser consult its bridge.
+                    // Unavailable calls must never reach those checks.
+                    return None;
+                }
+            }
+            RouteSurface::Management => {
+                if crate::windows_withheld::management_refusal(body.get("method")?.as_str()?)
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+            RouteSurface::Unsupported | RouteSurface::AgentData => {}
+        }
+    }
     let queued = match facts.surface {
         RouteSurface::Tools => {
             let name = body.get("name")?.as_str()?;

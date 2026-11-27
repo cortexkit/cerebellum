@@ -889,6 +889,10 @@ fn sqlite(
             "SQLite transfer timed out",
         ));
     }
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let mut child = command
         .arg(store)
         .arg(sql)

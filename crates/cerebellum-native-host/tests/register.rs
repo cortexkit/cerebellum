@@ -191,6 +191,10 @@ fn registration_with_an_unbound_gate_prints_the_neutral_message_and_exits_two() 
     assert_eq!(error.to_string(), MESSAGE);
     let home =
         std::env::temp_dir().join(format!("cknh-register-unsupported-{}", std::process::id()));
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let output = std::process::Command::new(cortexkit_test_support::ckdev_binary(env!(
         "CARGO_BIN_EXE_ck-cerebellum-native-host"
     )))

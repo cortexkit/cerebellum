@@ -2,6 +2,10 @@ use std::process::Command;
 
 #[test]
 fn version_prints_name_and_package_version_without_a_browser() {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let output = Command::new(cortexkit_test_support::ckdev_binary(env!(
         "CARGO_BIN_EXE_ck-cerebellum-native-host"
     )))
@@ -24,6 +28,10 @@ fn version_prints_name_and_package_version_without_a_browser() {
 
 #[test]
 fn a_chrome_invocation_does_not_print_version_text() {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let output = Command::new(cortexkit_test_support::ckdev_binary(env!(
         "CARGO_BIN_EXE_ck-cerebellum-native-host"
     )))

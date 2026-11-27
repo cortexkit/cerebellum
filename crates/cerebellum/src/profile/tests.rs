@@ -894,6 +894,10 @@ fn contended(resolution: Result<DurableResolution, RegistryError>) -> bool {
 fn a_killed_slot_holder_does_not_lock_out_the_next_open() {
     let scratch = slot_scratch();
     let root = scratch.join("root");
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let mut helper = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",

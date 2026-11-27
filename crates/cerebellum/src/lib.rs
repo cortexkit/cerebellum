@@ -990,7 +990,7 @@ fn compose_hello_manifest(
     provenance: Option<subc_protocol::manifest::ManifestProvenance>,
 ) -> Value {
     let browser_admitted = browser_fixture.map_or_else(browser_build_admits, |surface| {
-        matches!(surface, BrowserSurface::Available(_))
+        browser_build_admits() && matches!(surface, BrowserSurface::Available(_))
     });
     let mut manifest =
         build_manifest_with_computer_plane_and_provenance(module_id, context, provenance);
@@ -1066,8 +1066,15 @@ fn compose_hello_manifest(
 }
 
 fn browser_build_admits() -> bool {
-    cfg!(any(target_os = "macos", target_os = "linux"))
+    cfg!(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, feature = "windows-browser-release"),
+    ))
 }
+
+#[cfg(windows)]
+mod windows_withheld;
 
 /// The tool names this module can actually serve, or `None` for a name it
 /// cannot.
@@ -3150,6 +3157,8 @@ pub struct Planes {
     pub routes: Arc<RouteBindings>,
     pub browser: Arc<BrowserPlane>,
     pub browser_config: Option<BrowserConfig>,
+    #[cfg(test)]
+    synthetic_browser_dispatch: bool,
     runtime_browser: Option<BrowserSurface>,
     pub sessions: browser_session::BrowserSessions,
     pub user_browser: user_browser_bridge::UserBrowserBridge,
@@ -4739,11 +4748,14 @@ pub async fn handle_tool_request_for_test_with_existing_planes(
 /// computer audit and launch journal into the operator's data home, which is
 /// backed up and holds real browser profiles.
 fn isolated_test_planes(health_state: &Arc<HealthState>) -> Planes {
-    Planes::with_browser_config_journaling(
+    let planes = Planes::with_browser_config_journaling(
         Arc::clone(health_state),
         Some(Planes::short_test_browser_config()),
         JournalPersistence::Isolated,
-    )
+    );
+    #[cfg(test)]
+    let planes = planes.with_synthetic_browser_dispatch();
+    planes
 }
 
 pub async fn handle_tool_request_for_test(

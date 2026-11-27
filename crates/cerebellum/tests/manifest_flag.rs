@@ -46,6 +46,10 @@ fn binary() -> &'static Path {
         let binary = cortexkit_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-cerebellum"));
         let binary = support::daemon_binary("ckdev-cerebellum-manifest", binary);
         // Pay macOS's first-execution signature scan before measuring CLI latency.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "migrated by the spawn-wrapper slice"
+        )]
         assert!(Command::new(&binary)
             .arg("--version")
             .output()
@@ -57,6 +61,10 @@ fn binary() -> &'static Path {
 }
 
 fn inspect(home: &Path) -> Value {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let mut child = Command::new(binary())
         .arg("--manifest")
         .env_clear()

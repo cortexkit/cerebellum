@@ -41,13 +41,21 @@ pub(crate) fn browser_tools() -> Vec<subc_protocol::manifest::Tool> {
 }
 
 fn catalog_tools(planes: &Planes) -> Vec<CatalogTool> {
-    let browser_names = if planes.browser_admitted() {
+    definitions_for_planes(planes, planes.browser_admitted())
+}
+
+fn definitions_for_planes(_planes: &Planes, browser_admitted: bool) -> Vec<CatalogTool> {
+    let browser_names = if browser_admitted {
         browser_tools().into_iter().map(|tool| tool.name).collect()
     } else {
         Vec::new()
     };
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    let computer_names = planes.computer_admitted.iter().cloned().collect::<Vec<_>>();
+    let computer_names = _planes
+        .computer_admitted
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let computer_names = Vec::new();
     definitions(&browser_names, &computer_names)
@@ -185,6 +193,70 @@ fn catalog(arguments: &Map<String, Value>, planes: &Planes) -> Result<Value, Err
     }
 }
 
+#[cfg(all(test, windows, not(feature = "windows-browser-release")))]
+#[test]
+fn windows_browser_unbound_catalog_pin() {
+    let config = browser_config::parse_browser_config(
+        r#"{"browser":{
+            "executable_path":"C:\\browser-fixture\\chrome.exe",
+            "expected_identity":"previous-string-pin",
+            "launch_handshake_deadline_ms":1000,
+            "termination_grace_period_ms":1000,
+            "browser_idle_timeout_ms":30000,
+            "browser_exit_observation_deadline_ms":1000,
+            "navigation_settle_deadline_ms":1000
+        }}"#,
+    )
+    .expect("string-valued Windows config must still parse")
+    .expect("the fixture must have a browser block");
+    assert_eq!(
+        config.expected_identity.as_deref(),
+        Some("previous-string-pin")
+    );
+    let planes = Planes::with_browser_config_journaling(
+        Arc::new(HealthState::new()),
+        Some(config.clone()),
+        JournalPersistence::Isolated,
+    );
+    assert!(planes.runtime_browser.is_none());
+    assert!(planes.launch_service.is_none());
+    let actual = catalog(&Map::new(), &planes).unwrap();
+    assert_eq!(
+        catalog(
+            &Map::new(),
+            &planes.clone().with_synthetic_browser_dispatch()
+        )
+        .unwrap(),
+        actual
+    );
+    let expected = include_str!("../tests/fixtures/windows-browser-unbound-catalog.json");
+    let tool_names = actual["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        tool_names.is_empty(),
+        "unbound Windows catalog included {tool_names:?} (catalog digest {})",
+        actual["catalog_digest"]
+    );
+    assert_eq!(
+        format!("{}\n", serde_json::to_string_pretty(&actual).unwrap()),
+        expected
+    );
+    let configured = serialize_manifest_with_browser_configuration(
+        "cerebellum",
+        &BrowserSurface::Available(config),
+    );
+    let unconfigured =
+        serialize_manifest_with_browser_configuration("cerebellum", &BrowserSurface::NotConfigured);
+    assert_eq!(
+        configured, unconfigured,
+        "unbound Windows HELLO must not advertise browser tools"
+    );
+}
+
 pub(crate) fn check_tool_call(
     object: &Map<String, Value>,
     planes: &Planes,
@@ -217,7 +289,7 @@ pub(crate) fn check_tool_call(
     if pin.is_none() && !matches!(name, flat_tools::BROWSER_USE | flat_tools::COMPUTER_USE) {
         return Ok(());
     }
-    let tool = catalog_tools(planes)
+    let tool = definitions_for_planes(planes, planes.browser_dispatch_admitted())
         .into_iter()
         .find(|tool| tool.name == name);
     let Some(tool) = tool else {

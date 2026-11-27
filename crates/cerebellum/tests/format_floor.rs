@@ -463,6 +463,10 @@ fn isolated_stores_neither_create_nor_read_the_operator_floor() {
     fs::create_dir_all(&journal_floor).unwrap();
     fs::create_dir_all(&browser_floor).unwrap();
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",

@@ -1312,7 +1312,7 @@ pub(super) async fn handle_tool_request_inner(
     // of login material. With the rollout switch on, startup gives a running
     // module's plane the live vault source; planes built for tests get none
     // unless a test installs one.
-    let browser_admitted = planes.browser_admitted();
+    let browser_admitted = planes.browser_dispatch_admitted();
     let known_capability = dispatchable_tool_with_browser(name, browser_admitted)
         .or_else(|| browser::fill::admitted(name, &planes.browser, browser_admitted));
     #[cfg(all(test, target_os = "windows"))]
@@ -1338,6 +1338,13 @@ pub(super) async fn handle_tool_request_inner(
                 )
         };
         desktop.then_some(name)
+    });
+    #[cfg(windows)]
+    let known_capability = known_capability.or_else(|| {
+        (browser_admitted
+            && planes.enforce_windows_browser_refusals()
+            && windows_withheld::legacy_tool_refusal(name).is_some())
+        .then_some(name)
     });
     let Some(capability_name) = known_capability else {
         if matches!(name, flat_tools::BROWSER_USE | flat_tools::COMPUTER_USE) {
@@ -1438,6 +1445,22 @@ pub(super) async fn handle_tool_request_inner(
         )
         .await;
     };
+
+    #[cfg(windows)]
+    if planes.enforce_windows_browser_refusals() {
+        if let Some(refusal) = windows_withheld::tool_refusal(name, arguments) {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                refusal.code,
+                refusal.message,
+            )
+            .await;
+        }
+    }
 
     let translated = if name == flat_tools::COMPUTER_USE {
         match flat_tools::translate_computer(arguments) {

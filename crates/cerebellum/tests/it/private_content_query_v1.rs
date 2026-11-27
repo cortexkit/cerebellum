@@ -210,6 +210,7 @@ impl SessionCleanup for Cleanup {
 /// Drives the real management handler for the three pinned cases and compares
 /// the exact request and reply bytes.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn private_content_query_wire_shapes_match_their_goldens() {
     let config = BrowserConfig {
         executable_path: None,

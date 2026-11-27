@@ -52,6 +52,10 @@ fn main() {
     // `--no-optional-locks`: a plain status refreshes the index's stat cache
     // and rewrites the index, which is watched above, so every build would
     // dirty the next one and this crate would never be fresh.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let dirty = Command::new("git")
         .args(["--no-optional-locks", "status", "--porcelain"])
         .output()
@@ -67,9 +71,12 @@ fn main() {
 
 /// One trimmed line of git output, or `None` when git fails or prints nothing.
 fn git<const N: usize>(args: [&str; N]) -> Option<String> {
-    Command::new("git")
-        .args(args)
-        .output()
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
+    let output = Command::new("git").args(args).output();
+    output
         .ok()
         .filter(|out| out.status.success())
         .and_then(|out| String::from_utf8(out.stdout).ok())

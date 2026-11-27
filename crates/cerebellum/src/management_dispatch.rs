@@ -314,6 +314,21 @@ pub(super) async fn handle_management_request_observed(
         )
         .await;
     }
+    #[cfg(windows)]
+    if planes.enforce_windows_browser_refusals() {
+        if let Some(refusal) = windows_withheld::management_refusal(method) {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                refusal.code,
+                refusal.message,
+            )
+            .await;
+        }
+    }
     let params = object
         .get("params")
         .cloned()

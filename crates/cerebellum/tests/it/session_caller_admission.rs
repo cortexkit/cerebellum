@@ -226,6 +226,7 @@ fn other_first_party_principals() -> Vec<(Option<Principal>, &'static str)> {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn prefrontal_dispatches_through_tool_and_management_routes() {
     for (principal, admitted, bind_allowed) in [
         (reserved("prefrontal"), true, true),
@@ -295,6 +296,7 @@ async fn retired_prefrontal_core_cannot_bind() {
 /// granted site passes authorization and stops only because no browser is
 /// running, while the ungranted site is put to the person instead.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn the_session_caller_acts_on_its_agents_grant() {
     let service = super::support::computer::cingulate::ScriptedCarrier::default();
     let planes = service.install(planes_with_a_grant().await);
@@ -351,6 +353,7 @@ async fn the_session_caller_acts_on_its_agents_grant() {
 /// route's conversation's grant is not used: had the grant been read, the
 /// navigation would have got as far as the admitted caller's did.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn other_first_party_callers_are_refused_before_their_conversations_grant() {
     for (principal, label) in other_first_party_principals() {
         let planes = planes_with_a_grant().await;
@@ -365,6 +368,7 @@ async fn other_first_party_callers_are_refused_before_their_conversations_grant(
 /// the refusal come after the site grant was looked up, the missing grant
 /// would have put a question to the person first.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_refused_caller_is_never_asked_about_a_site() {
     for (principal, label) in other_first_party_principals() {
         let planes = planes_with_a_grant().await;
@@ -547,11 +551,21 @@ async fn an_unscoped_session_route_cannot_raise_login_cards() {
         };
         let frames = frames_for(&planes, route_request(80, body)).await;
         assert_eq!(frames.len(), 1, "no reverse question frame");
-        assert_eq!(frames[0].header.ty, FrameType::Response);
         let reply: Value = serde_json::from_slice(&frames[0].body).unwrap();
-        assert_eq!(reply["outcome"], "consent_unavailable", "{method}: {reply}");
-        assert_eq!(reply["detail"]["reason"], "no_agent_session", "{reply}");
-        cerebellum::browser::validate_browser_result(method, &reply).unwrap();
+        if cfg!(windows) {
+            assert_eq!(frames[0].header.ty, FrameType::Error);
+            let expected = if capture && !cfg!(feature = "windows-browser-release") {
+                "tool_disabled"
+            } else {
+                "browser_action_not_supported"
+            };
+            assert_eq!(reply["code"], expected, "{method}: {reply}");
+        } else {
+            assert_eq!(frames[0].header.ty, FrameType::Response);
+            assert_eq!(reply["outcome"], "consent_unavailable", "{method}: {reply}");
+            assert_eq!(reply["detail"]["reason"], "no_agent_session", "{reply}");
+            cerebellum::browser::validate_browser_result(method, &reply).unwrap();
+        }
     }
     assert_eq!(script.opens(), 0);
     assert!(script.calls().is_empty());

@@ -130,6 +130,7 @@ async fn catalog(planes: &Planes, arguments: Value) -> Frame {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn worker_provider_operations_bypass_unsynced_head() {
     use cortexkit_role_tool_provider::{describe::RoleDescribe, ops, PROVIDES};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -393,11 +394,15 @@ async fn catalog_carries_exact_browser_capability_tags() {
     bind(&planes, 9, "prefrontal").await;
     let full: CatalogAnswer =
         serde_json::from_slice(&catalog(&planes, json!({})).await.body).unwrap();
-    let browser = full
-        .tools
-        .iter()
-        .find(|tool| tool.name == "browser_use")
-        .unwrap();
+    let browser = full.tools.iter().find(|tool| tool.name == "browser_use");
+    if cfg!(all(windows, not(feature = "windows-browser-release"))) {
+        assert!(
+            browser.is_none(),
+            "unbound Windows must not advertise browser_use"
+        );
+        return;
+    }
+    let browser = browser.expect("configured browser tool");
     assert_eq!(
         browser.capabilities,
         ["browser.use/v1", "cerebellum:browser.use/v1"]
@@ -514,6 +519,7 @@ async fn catalog_refuses_unknown_inputs_and_omits_disabled_browser() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn mismatched_schema_pins_are_refused_before_dispatch() {
     let planes = planes(true);
     bind(&planes, 9, "prefrontal").await;
@@ -609,6 +615,7 @@ fn assert_fork_refusal(reply: &Frame, case: &str) {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn fork_tool_call_vectors_are_refused() {
     for (host, sample) in [
         (
@@ -636,6 +643,7 @@ async fn fork_tool_call_vectors_are_refused() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn fork_tool_call_writes_no_call_record_or_journal_row() {
     use cerebellum::journal::call_records::{CallRecords, InMemoryCallRecordStorage};
 
@@ -672,6 +680,7 @@ async fn fork_tool_call_writes_no_call_record_or_journal_row() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn fork_tool_call_leaves_absent_and_null_ids_unchanged() {
     let planes = planes(true);
     bind(&planes, 9, "prefrontal").await;
@@ -728,6 +737,7 @@ async fn another_principals_key_is_an_unknown_call() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn withdrawal_checks_the_carriers_own_record_scope() {
     use cerebellum::journal::call_records::{CallState, Lookup};
 
@@ -839,6 +849,7 @@ fn mode_scope(
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn served_modes_reach_status_on_the_production_handler() {
     use subc_protocol::call_mode::CallMode;
     for mode in [CallMode::Classic, CallMode::Codemode, CallMode::Flow] {
@@ -894,6 +905,7 @@ async fn unknown_mode_refused_before_grants_and_argument_dispatch() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn codemode_never_elicits_a_consent_card() {
     use subc_protocol::call_mode::CallMode;
     let service = super::support::computer::cingulate::ScriptedCarrier::default();
@@ -939,6 +951,7 @@ async fn codemode_never_elicits_a_consent_card() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn flow_still_refuses_consent_on_the_production_handler() {
     use subc_protocol::call_mode::CallMode;
     let planes = planes(true);
@@ -963,6 +976,7 @@ async fn flow_still_refuses_consent_on_the_production_handler() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn classic_still_elicits_a_consent_card() {
     let service = super::support::computer::cingulate::ScriptedCarrier::default();
     let mut planes = service.install(planes(true));
@@ -1037,6 +1051,7 @@ async fn classic_still_elicits_a_consent_card() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn call_members_cannot_enable_a_result_reader() {
     let planes = planes(true);
     bind_with_readers(&planes, 9, "prefrontal", None, None, None).await;
@@ -1062,6 +1077,7 @@ async fn call_members_cannot_enable_a_result_reader() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn keyed_replays_use_the_current_routes_result_reader() {
     for first_reads in [false, true] {
         let planes = planes(true);

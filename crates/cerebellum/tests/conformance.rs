@@ -372,6 +372,7 @@ async fn health_check_returns_insulated_report() {
 /// When no browser session exists, `browser.status` returns only the flat
 /// no-session result and omits profile-related fields from older status responses.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn browser_status_returns_flat_no_session_result() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
@@ -409,6 +410,7 @@ async fn browser_status_returns_flat_no_session_result() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn tool_requests_serve_without_preset_and_refuse_named_presets() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
@@ -452,6 +454,7 @@ async fn tool_requests_serve_without_preset_and_refuse_named_presets() {
 /// browser.status with an unknown field returns `invalid_request` with the
 /// pinned detail shape (application-level rejection, not a transport Error).
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn browser_status_unknown_field_returns_invalid_request_in_body() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
@@ -529,6 +532,7 @@ async fn browser_status_rejects_management_envelope() {
 /// Missing and wrongly typed tool-route envelope members are application
 /// validation failures carried by normal Response frames.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn browser_status_rejects_malformed_tool_envelopes() {
     let cases = [
         (Value::Null, "$", "wrong_type"),
@@ -572,6 +576,7 @@ async fn browser_status_rejects_malformed_tool_envelopes() {
 /// Every non-object capability arguments value is rejected as a wrong type
 /// in a normal Response frame, rather than being treated as a route error.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn browser_status_top_level_wrong_types_return_response_frames() {
     let values = [
         Value::Null,
@@ -712,6 +717,7 @@ async fn hello_frame_is_channel_zero_epoch_zero() {
 /// Data-plane identity comes from the accepted bind facts. Fields added to the
 /// tool request cannot change the resolved session kind or profile boundary.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn accepted_bind_facts_drive_profile_resolution() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
@@ -789,6 +795,7 @@ async fn accepted_bind_facts_drive_profile_resolution() {
 /// A bind with an explicit empty effective scope denies browser.status even
 /// for a valid canonical tool-route request.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn accepted_effective_scope_is_not_widened_by_request_body() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
@@ -1259,6 +1266,10 @@ async fn start_live_daemon_with_browser(
     // a production-named image or a hard link to a concurrently rebuilt binary.
     // The module exits immediately without --subc, so this costs nothing once
     // the binary is already validated.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let _ = tokio::process::Command::new(&binary)
         .envs(cortexkit_test_support::fenced_subc_daemon_env(&directory))
         .stdin(std::process::Stdio::null())
@@ -1437,6 +1448,10 @@ fn a_failing_live_test_prints_what_the_module_wrote() {
         panic!("a live test failing while the module's output is on disk");
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
         .args([
             "--exact",
@@ -1941,6 +1956,7 @@ async fn a_capability_the_release_gates_withhold_is_refused_at_dispatch() {
 /// Driven with a fully valid request so schema validation cannot satisfy the
 /// assertion before session admission is reached.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn navigation_without_an_open_session_is_refused_at_the_wire() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());

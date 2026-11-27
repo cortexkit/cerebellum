@@ -93,6 +93,10 @@ fn every_repository_vocabulary_mirror_names_the_current_revision() {
     // Git enumerates repository inputs, including new untracked files. Its ignore
     // rules exclude build outputs and local state, which are not source mirrors.
     // No source directory, extension, or individual mirror is exempted.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let listing = std::process::Command::new("git")
         .args([
             "ls-files",

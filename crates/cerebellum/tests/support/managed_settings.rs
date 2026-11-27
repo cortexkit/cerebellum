@@ -12,6 +12,10 @@ pub async fn fenced_home(test: &str, hang_guard: Duration) -> Option<PathBuf> {
         "ckdev-cerebellum-settings",
         std::env::current_exe().unwrap(),
     );
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let output = tokio::time::timeout(
         hang_guard,
         tokio::process::Command::new(exe)

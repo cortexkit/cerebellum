@@ -47,13 +47,16 @@ use support::HANG_GUARD;
 mod cingulate_answer;
 use cingulate_answer::cingulate::ScriptedCarrier;
 
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 #[path = "support/browser_stable_refs.rs"]
 mod stable_refs;
 
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 #[path = "support/browser_queue.rs"]
 mod browser_queue;
 #[path = "support/permissions.rs"]
 mod permission_support;
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 #[path = "support/turn_stop_browser.rs"]
 mod turn_stop_browser;
 #[path = "support/turn_stop_vectors.rs"]
@@ -1091,34 +1094,39 @@ fn real_manifest_path_advertises_exactly_the_configured_wire_surface() {
             .collect()
     }
 
-    assert_eq!(
-        names(true),
-        [
-            "browser.launch",
-            "browser.status",
-            "browser.close",
-            "browser.navigate",
-            "browser.snapshot",
-            "browser.type",
-            "browser.click",
-            // Both admitted after being driven through this wire path against
-            // Chrome 151, THROUGH their authorization gates.
-            "browser.screenshot",
-            "browser.scroll",
-            // click_point addresses a retained screenshot, so its risk is the
-            // pixel-to-css mapping rather than the dispatch: a click that lands
-            // somewhere plausible is worse than one that fails, because nothing
-            // reports it. A page listener recorded (600,476) css where the
-            // mapping predicts 476.75 -- truncation against rounding. A scale
-            // error, the failure this guards, would have shown as a factor.
-            "browser.click_point",
-        ]
-        .map(str::to_string)
-    );
+    if cfg!(all(windows, not(feature = "windows-browser-release"))) {
+        assert!(names(true).is_empty());
+    } else {
+        assert_eq!(
+            names(true),
+            [
+                "browser.launch",
+                "browser.status",
+                "browser.close",
+                "browser.navigate",
+                "browser.snapshot",
+                "browser.type",
+                "browser.click",
+                // Both admitted after being driven through this wire path against
+                // Chrome 151, THROUGH their authorization gates.
+                "browser.screenshot",
+                "browser.scroll",
+                // click_point addresses a retained screenshot, so its risk is the
+                // pixel-to-css mapping rather than the dispatch: a click that lands
+                // somewhere plausible is worse than one that fails, because nothing
+                // reports it. A page listener recorded (600,476) css where the
+                // mapping predicts 476.75 -- truncation against rounding. A scale
+                // error, the failure this guards, would have shown as a factor.
+                "browser.click_point",
+            ]
+            .map(str::to_string)
+        );
+    }
     assert!(names(false).is_empty());
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -1277,6 +1285,7 @@ async fn wire_launch_reaches_ready_refuses_a_duplicate_and_closes_after_reap() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn cleanup_failure_step_reaches_the_caller_not_a_schema_violation() {
     let launcher = Arc::new(RecordingLauncher {
         reap_failure: true,
@@ -1319,6 +1328,7 @@ async fn cleanup_failure_step_reaches_the_caller_not_a_schema_violation() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -1375,6 +1385,7 @@ async fn wire_snapshot_requires_a_grant_for_the_current_page_origin_before_cdp()
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_snapshot_mints_the_ref_that_wire_click_dispatches() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -1436,6 +1447,7 @@ async fn wire_snapshot_mints_the_ref_that_wire_click_dispatches() {
 /// ref, with no separate ref table, and a ref read off a line is one the click
 /// handler accepts and dispatches.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_click_dispatches_a_ref_read_from_the_page_text() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -1487,6 +1499,7 @@ async fn wire_click_dispatches_a_ref_read_from_the_page_text() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_click_without_a_covering_grant_dispatches_no_input() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -1545,6 +1558,7 @@ async fn wire_click_without_a_covering_grant_dispatches_no_input() {
 /// same click succeed; a remedy that leaves the outcome unchanged sends the
 /// caller round the same loop forever.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_grant_admits_it() {
     let launcher = Arc::new(RecordingLauncher {
         cross_site_link_target: true,
@@ -1638,6 +1652,7 @@ async fn wire_click_above_the_grant_ceiling_names_the_severity_and_the_named_gra
 /// only tier 1, but a grant without hazards is never minted below compose, so
 /// the request names tier 2: the ceiling the grant it opens really carries.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_no_grant_names_the_origin_and_severity_and_the_named_grant_admits_it() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -1740,6 +1755,7 @@ async fn wire_open_grant_refuses_the_opaque_null_origin_without_asking_a_person(
 /// caller to go to an http(s) page instead. Offering `origins: ["null"]` would
 /// send the caller to a grant `browser.open_grant` refuses.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_snapshot_on_an_opaque_origin_page_says_to_navigate_and_offers_no_grant() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -1791,6 +1807,7 @@ fn planes_with_installed_grants(
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn scroll_wire_uses_observe_grant_and_retained_ref_without_fronting() {
     let launcher = Arc::new(RecordingLauncher {
         hazardous_target: true,
@@ -1844,6 +1861,7 @@ async fn scroll_wire_uses_observe_grant_and_retained_ref_without_fronting() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn scroll_wire_validates_target_alternatives_before_dispatch() {
     let planes = planes_with_installed_grants(&Arc::new(RecordingLauncher::default()), vec![]);
     for (corr, args) in [
@@ -1885,6 +1903,7 @@ async fn click_cross_site_link(planes: &Planes, corr: u64) -> Value {
 /// reaches the severity, the severity refusal names the attempted origin in
 /// its grant request, so the one grant it describes fixes both.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_click_origin_mismatch_at_sufficient_severity_stays_origin_scope() {
     let launcher = Arc::new(RecordingLauncher {
         cross_site_link_target: true,
@@ -1945,6 +1964,7 @@ async fn wire_click_origin_mismatch_at_sufficient_severity_stays_origin_scope() 
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
     let launcher = Arc::new(RecordingLauncher {
         hazardous_target: true,
@@ -2014,6 +2034,7 @@ async fn wire_click_names_an_undisclosed_target_hazard_before_input() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_launch_withholds_undeclared_launcher_reply_at_the_dispatch_site() {
     let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
@@ -2066,6 +2087,7 @@ fn browser_control_outcome_vocabularies_reject_undeclared_words() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn failed_startup_recovery_refuses_launch_while_health_stays_answerable() {
     let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
@@ -2091,6 +2113,7 @@ async fn failed_startup_recovery_refuses_launch_while_health_stays_answerable() 
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn route_unbind_runs_the_same_reap_then_cleanup_ladder() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -2126,6 +2149,7 @@ async fn route_unbind_runs_the_same_reap_then_cleanup_ladder() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn all_browser_controls_share_the_existing_invalid_request_shape() {
     let planes = permission_support::planes(
         Arc::new(HealthState::new()),
@@ -2163,6 +2187,7 @@ async fn all_browser_controls_share_the_existing_invalid_request_shape() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn operation_authority_refusal_precedes_parameter_validation_and_effects() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -2196,6 +2221,7 @@ async fn operation_authority_refusal_precedes_parameter_validation_and_effects()
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn missing_operation_authority_has_no_launch_effects() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -2215,6 +2241,7 @@ async fn missing_operation_authority_has_no_launch_effects() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn unattested_project_cannot_reach_profile_launch() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -2234,6 +2261,7 @@ async fn unattested_project_cannot_reach_profile_launch() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_empty_attested_project_refuses_launch_with_a_typed_reason() {
     let launcher = Arc::new(RecordingLauncher {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2343,6 +2371,7 @@ async fn launch_on_route_with_facts(admission_facts: Value) -> (Value, usize) {
 /// same bind with that fact absent does. Driven through a real `route.bind`
 /// and `browser.launch`, because the bind path is where the facts are read.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_fact_outside_its_root_camel_case_key_refuses_a_launch_as_if_absent() {
     let operations = json!(["browser.launch"]);
 
@@ -2422,6 +2451,7 @@ async fn a_fact_outside_its_root_camel_case_key_refuses_a_launch_as_if_absent() 
 /// normally: an unknown fact is ignored, never refused, so a carrier can stamp
 /// facts for other consumers on the same route.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_unknown_top_level_fact_beside_the_root_facts_still_launches() {
     let (body, launches) = launch_on_route_with_facts(json!({
         "agentProjectId": "pj-accepted",
@@ -2444,6 +2474,7 @@ async fn an_unknown_top_level_fact_beside_the_root_facts_still_launches() {
 /// refused by name with the offending key, and the route it named serves
 /// nothing afterwards.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_capability_scope_in_a_retired_place_refuses_the_bind() {
     let base = json!({
         "agentProjectId": "pj-accepted",
@@ -2508,6 +2539,7 @@ async fn a_capability_scope_in_a_retired_place_refuses_the_bind() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_malformed_capability_scope_refuses_the_bind() {
     for scope in [
         json!(null),
@@ -2561,6 +2593,7 @@ async fn a_malformed_capability_scope_refuses_the_bind() {
 /// contract check: had the reply bypassed its schema or fallen outside it,
 /// enforcement would have answered `computer_result_schema_violation` instead.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_route_opened_without_the_carrier_is_refused_with_a_reason_through_the_contract() {
     let planes = permission_support::planes(
         Arc::new(HealthState::new()),
@@ -2785,6 +2818,10 @@ fn an_isolated_plane_leaves_nothing_under_the_data_home() {
     std::fs::create_dir_all(&data_home).expect("create the scratch data home");
     std::fs::create_dir_all(&home).expect("create the scratch home");
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let output = std::process::Command::new(std::env::current_exe().expect("test binary path"))
         .args([
             "--exact",
@@ -2980,6 +3017,7 @@ fn walk(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn present_with_opaque_origin_does_not_front_browser() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -3002,11 +3040,15 @@ async fn present_with_opaque_origin_does_not_front_browser() {
     )
     .await
     .unwrap();
-    let reply = rx.recv().await.expect("an invalid-request response");
+    let reply = rx.recv().await.expect("a refusal");
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(body["outcome"], "invalid_request", "{body}");
-    assert_eq!(body["detail"]["field"], "origin", "{body}");
-    assert_eq!(body["detail"]["reason_code"], "invalid_origin", "{body}");
+    if cfg!(windows) {
+        assert_eq!(body["code"], "browser_action_not_supported", "{body}");
+    } else {
+        assert_eq!(body["outcome"], "invalid_request", "{body}");
+        assert_eq!(body["detail"]["field"], "origin", "{body}");
+        assert_eq!(body["detail"]["reason_code"], "invalid_origin", "{body}");
+    }
     assert!(rx.try_recv().is_err(), "an elicitation frame was sent");
     assert!(
         launcher.effects.lock().unwrap().is_empty(),
@@ -3015,6 +3057,7 @@ async fn present_with_opaque_origin_does_not_front_browser() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn present_fronts_then_marks_human_in_control() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -3062,6 +3105,7 @@ async fn present_fronts_then_marks_human_in_control() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn present_that_cannot_front_is_refused_not_presented() {
     let launcher = Arc::new(RecordingLauncher {
         present_error: Some("fronting was refused by Chrome"),
@@ -3103,6 +3147,7 @@ async fn present_that_cannot_front_is_refused_not_presented() {
 /// calls next, never the granular `browser.<x>` capability id, which no
 /// agent tool provides. Each path is driven through the real handoff calls.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn present_and_resume_refusals_name_flat_actions() {
     fn has_granular_id(remedy: &str) -> bool {
         let mut rest = remedy;
@@ -3216,6 +3261,7 @@ async fn present_and_resume_refusals_name_flat_actions() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn resume_closes_by_caller_and_reports_it() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -3248,6 +3294,7 @@ async fn resume_closes_by_caller_and_reports_it() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn cookie_values_never_leave_the_driver() {
     const SECRET: &str = "SECRET-9f1c";
     let launcher = Arc::new(RecordingLauncher {
@@ -3365,6 +3412,7 @@ async fn response_body(planes: &Planes, corr: u64, name: &str, arguments: Value)
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn poisoned_session_lock_refuses_status_close_and_launch_through_the_wire() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -3404,6 +3452,7 @@ async fn poisoned_session_lock_refuses_status_close_and_launch_through_the_wire(
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn poisoned_session_lock_refuses_a_browser_action_through_the_wire() {
     let launcher = Arc::new(RecordingLauncher::default());
     let mut planes = permission_support::planes(
@@ -3452,6 +3501,7 @@ impl BrowserSessionLauncher for PoisonedRegistryLauncher {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn poisoned_profile_registry_lock_launch_refusal_reaches_the_caller_not_a_schema_violation() {
     let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
@@ -3493,6 +3543,7 @@ impl BrowserSessionLauncher for UntrustedRootLauncher {
 /// undeclared, so the caller received `computer_result_schema_violation` and
 /// lost the remedy that would have told it to rebind the profile root.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn untrusted_profile_root_launch_refusal_reaches_the_caller_not_a_schema_violation() {
     let mut planes = permission_support::planes(
         Arc::new(HealthState::new()),
@@ -3573,6 +3624,7 @@ fn recording_planes(launcher: &Arc<RecordingLauncher>) -> Planes {
 // readable: before, the ended context survived the relaunch and every read on
 // the new browser was refused as no_session.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_browser_relaunched_after_close_serves_snapshots() {
     let launcher = Arc::new(RecordingLauncher::default());
     let planes = recording_planes(&launcher);
@@ -3601,6 +3653,7 @@ async fn a_browser_relaunched_after_close_serves_snapshots() {
 // snapshot call: the read runs in the same page context and was refused the
 // same way.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_browser_relaunched_after_close_serves_navigate_read_page() {
     let launcher = Arc::new(RecordingLauncher::default());
     let planes = recording_planes(&launcher);
@@ -3639,6 +3692,7 @@ async fn a_browser_relaunched_after_close_serves_navigate_read_page() {
 // a snapshot id from the crashed browser must not address anything on the new
 // one: its refs name elements of a page that is gone.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_browser_relaunched_after_a_crash_reads_fresh_and_drops_old_snapshots() {
     let launcher = Arc::new(RecordingLauncher::default());
     let planes = recording_planes(&launcher);
@@ -3692,6 +3746,7 @@ async fn a_browser_relaunched_after_a_crash_reads_fresh_and_drops_old_snapshots(
 
 // A closed browser that nobody relaunched stays closed: reads keep refusing.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_closed_browser_without_relaunch_still_refuses_snapshots() {
     let launcher = Arc::new(RecordingLauncher::default());
     let planes = recording_planes(&launcher);
@@ -4487,6 +4542,7 @@ async fn click_link(scenario: ClickScenario, granted_origins: &[&str]) -> (Plane
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_click_that_navigates_cross_origin_reports_where_it_landed_and_that_reading_there_is_ungranted(
 ) {
     let (planes, clicked, _) =
@@ -4529,6 +4585,7 @@ async fn a_click_that_navigates_cross_origin_reports_where_it_landed_and_that_re
 /// read again -- must succeed. A refusal whose remedy leaves the caller to
 /// guess the tier or hazards sends it round the same loop.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_following_it_succeeds() {
     let page = CommittedPage::default();
     let config = BrowserConfig {
@@ -4630,6 +4687,7 @@ async fn an_origin_scope_refusal_names_the_grant_that_admits_the_read_and_follow
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_click_landing_on_a_granted_origin_says_it_can_be_read() {
     let (_, clicked, _) = click_link(
         ClickScenario::CrossOriginRedirect,
@@ -4646,6 +4704,7 @@ async fn a_click_landing_on_a_granted_origin_says_it_can_be_read() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_click_that_navigates_nowhere_says_none_was_observed() {
     let (_, clicked, _) = click_link(ClickScenario::NoNavigation, &[CLICK_PAGE_ORIGIN]).await;
 
@@ -4665,6 +4724,7 @@ async fn a_click_that_navigates_nowhere_says_none_was_observed() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_subframe_navigation_is_not_reported_as_the_page_navigating() {
     let (planes, clicked, _) = click_link(ClickScenario::SubframeOnly, &[CLICK_PAGE_ORIGIN]).await;
 
@@ -4685,6 +4745,7 @@ async fn a_subframe_navigation_is_not_reported_as_the_page_navigating() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_click_whose_dialog_is_dismissed_reports_the_dialog_and_no_navigation() {
     let (planes, clicked, _) =
         click_link(ClickScenario::DialogDismissed, &[CLICK_PAGE_ORIGIN]).await;
@@ -4793,6 +4854,7 @@ async fn refusal_records(planes: &Planes) -> Vec<(String, String)> {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_snapshot_in_both_modes() {
     let (launcher, planes) = navigated_to_landed(&["https://landed.example:8443"]).await;
     // The same read succeeds while the page stays where it was navigated, so
@@ -4837,6 +4899,7 @@ async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_snapsh
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_screenshot() {
     let (launcher, planes) = navigated_to_landed(&["https://landed.example:8443"]).await;
     let before = response_body(&planes, 3, "browser.screenshot", json!({})).await;
@@ -4866,6 +4929,7 @@ async fn a_page_that_moves_itself_off_the_granted_origin_refuses_the_next_screen
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_snapshot_that_fails_because_the_page_moved_reports_the_move() {
     let (launcher, planes) = navigated_to_landed(&["https://landed.example:8443"]).await;
 
@@ -4896,6 +4960,7 @@ async fn a_snapshot_that_fails_because_the_page_moved_reports_the_move() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_navigation_that_commits_during_a_read_discards_the_capture() {
     let (launcher, planes) = navigated_to_landed(&["https://landed.example:8443"]).await;
 
@@ -4970,6 +5035,7 @@ async fn a_navigation_that_commits_during_a_read_discards_the_capture() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_page_that_stays_put_reads_as_before() {
     let (_launcher, planes) = navigated_to_landed(&["https://landed.example:8443"]).await;
 
@@ -5002,6 +5068,7 @@ async fn a_page_that_stays_put_reads_as_before() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_read_authorizes_against_the_live_origin_when_the_tracker_is_stale() {
     // Only the page's CURRENT origin is readable; the one the module tracked
     // is not. Authorizing against the tracker would refuse both reads.
@@ -5023,6 +5090,7 @@ async fn a_read_authorizes_against_the_live_origin_when_the_tracker_is_stale() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_round_trip_through_another_origin_during_a_read_discards_the_capture() {
     let (launcher, planes) = navigated_to_landed(&["https://landed.example:8443"]).await;
 
@@ -5158,6 +5226,7 @@ async fn click_screenshot_point(planes: &Planes, corr: u64, screenshot: &Value) 
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn screenshot_wire_preserves_liftable_image_and_click_dimensions() {
     let (planes, _page, commands) = actuation_planes().await;
     let screenshot = response_body(&planes, 100, "browser.screenshot", json!({})).await;
@@ -5194,6 +5263,7 @@ async fn screenshot_wire_preserves_liftable_image_and_click_dimensions() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_action_on_a_snapshot_of_a_page_that_has_since_moved_dispatches_no_input() {
     let (planes, page, commands) = actuation_planes().await;
     let snapshot = response_body(&planes, 100, "browser.snapshot", json!({"mode": "ax"})).await;
@@ -5231,6 +5301,7 @@ async fn an_action_on_a_snapshot_of_a_page_that_has_since_moved_dispatches_no_in
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_action_after_a_same_document_fragment_change_still_dispatches() {
     let (planes, page, commands) = actuation_planes().await;
     let snapshot = response_body(&planes, 100, "browser.snapshot", json!({"mode": "ax"})).await;
@@ -5398,6 +5469,7 @@ async fn answer_browser(
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn blocking_browser_grant_allow_continues_same_navigation() {
     let (planes, launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -5455,6 +5527,7 @@ async fn blocking_browser_grant_allow_continues_same_navigation() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn blocking_browser_grant_deny_never_navigates() {
     let (planes, launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -5486,6 +5559,7 @@ async fn blocking_browser_grant_deny_never_navigates() {
 /// nobody. `refused` is an error frame in place of an answer, which is how a
 /// consumer with no handler for questions refuses one.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn blocking_browser_grant_reports_each_unanswered_ending_by_name() {
     let cases = [
         (
@@ -5596,21 +5670,25 @@ async fn late_in_call_answer(decision: &str, _linkable: bool) {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn late_in_call_always_answer_records_standing_origin() {
     late_in_call_answer("allow_origin_always", true).await;
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn late_in_call_temporary_answer_records_agent_grant() {
     late_in_call_answer("allow_30m", true).await;
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn late_in_call_always_uses_the_raised_id_without_a_payload_id() {
     late_in_call_answer("allow_origin_always", false).await;
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn blocking_browser_grant_timeout_keeps_late_answer() {
     let (planes, launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -5646,6 +5724,7 @@ async fn blocking_browser_grant_timeout_keeps_late_answer() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn blocking_browser_grant_cancel_detaches_while_the_conversation_is_bound() {
     let (planes, launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -5681,6 +5760,7 @@ async fn blocking_browser_grant_cancel_detaches_while_the_conversation_is_bound(
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn blocking_browser_grant_wait_releases_session_locks() {
     let (planes, _) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -5716,6 +5796,7 @@ async fn blocking_browser_grant_wait_releases_session_locks() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn blocking_browser_grant_unfixable_refusals_never_ask() {
     let (planes, launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -5745,6 +5826,7 @@ async fn blocking_browser_grant_unfixable_refusals_never_ask() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn blocking_browser_grant_goodbye_and_drain_withdraw_only_held_cards() {
     for timed_out in [false, true] {
         for draining in [false, true] {
@@ -5981,6 +6063,7 @@ async fn allowed_keyed_navigation(
 const ROUTE_STACK_BUDGET_BYTES: usize = 1024 * 1024;
 
 #[test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 fn a_browser_call_fits_half_a_default_thread_stack() {
     let call = std::thread::Builder::new()
         .name("route-stack-budget".into())
@@ -6003,6 +6086,7 @@ fn a_browser_call_fits_half_a_default_thread_stack() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn keyed_call_consent_card_carries_the_dispatcher_key() {
     let (planes, _launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -6020,6 +6104,7 @@ async fn keyed_call_consent_card_carries_the_dispatcher_key() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn unkeyed_call_consent_card_omits_call_key() {
     let (planes, _launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -6031,6 +6116,7 @@ async fn unkeyed_call_consent_card_omits_call_key() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_resend_after_completion_returns_the_recorded_reply_without_executing() {
     let (planes, launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -6056,6 +6142,7 @@ async fn a_resend_after_completion_returns_the_recorded_reply_without_executing(
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_resend_while_the_first_is_running_does_not_run_twice() {
     let (planes, launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -6087,6 +6174,7 @@ async fn a_resend_while_the_first_is_running_does_not_run_twice() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn the_same_call_key_from_two_principals_is_two_records() {
     let (planes, launcher) = blocking_grant_fixture().await;
     bind_second_principal(&planes).await;
@@ -6125,6 +6213,7 @@ async fn the_same_call_key_from_two_principals_is_two_records() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_call_without_a_call_key_runs_as_before_and_leaves_no_record() {
     let (planes, launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -6142,6 +6231,7 @@ async fn a_call_without_a_call_key_runs_as_before_and_leaves_no_record() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn withdrawing_a_completed_call_answers_its_result_identically_on_every_repeat() {
     let (planes, _launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -6157,6 +6247,7 @@ async fn withdrawing_a_completed_call_answers_its_result_identically_on_every_re
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn withdrawing_a_running_call_is_already_started_with_outcome_unknown() {
     let (planes, _launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -6180,6 +6271,7 @@ async fn withdrawing_a_running_call_is_already_started_with_outcome_unknown() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn withdrawing_a_denied_call_is_refused_denied() {
     let (planes, _launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -6197,6 +6289,7 @@ async fn withdrawing_a_denied_call_is_refused_denied() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn withdrawing_a_consent_pending_call_keeps_late_always_answer_without_navigation() {
     let (planes, launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -6242,6 +6335,7 @@ async fn withdrawing_a_consent_pending_call_keeps_late_always_answer_without_nav
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn withdrawing_an_unknown_key_is_unknown_call() {
     let (planes, _launcher) = blocking_grant_fixture().await;
     bind_route(&planes, 9, reserved("prefrontal"), None).await;
@@ -6252,6 +6346,7 @@ async fn withdrawing_an_unknown_key_is_unknown_call() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_third_principal_learns_nothing_about_another_carriers_key() {
     let (planes, _launcher) = blocking_grant_fixture().await;
     bind_second_principal(&planes).await;
@@ -6263,6 +6358,7 @@ async fn a_third_principal_learns_nothing_about_another_carriers_key() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn malformed_keys_and_a_second_key_on_a_withdrawal_are_invalid_requests() {
     let (planes, launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -6339,6 +6435,7 @@ async fn malformed_keys_and_a_second_key_on_a_withdrawal_are_invalid_requests() 
 /// records nor a withdrawal's record, whether the call completed or was
 /// refused.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn typed_text_never_reaches_the_call_records() {
     const SECRET: &str = "PLANTED-SECRET-7f3c1e";
     let (mut planes, _launcher) = blocking_grant_fixture().await;
@@ -6489,6 +6586,7 @@ fn with_readable_call_records(
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn flow_id_scope_stamp_binds_but_session_calls_are_refused() {
     let planes = permission_support::planes(
         Arc::new(HealthState::new()),
@@ -6603,6 +6701,7 @@ async fn quarantined_session() -> (
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_call_on_a_quarantined_session_is_a_target_busy_result_recorded_refused() {
     let (planes, launcher, storage, tx, mut rx, hold) = quarantined_session().await;
 
@@ -6610,6 +6709,12 @@ async fn a_call_on_a_quarantined_session_is_a_target_busy_result_recorded_refuse
         .await
         .unwrap();
     let refused = frame_for(&mut rx, 802).await;
+    if cfg!(windows) {
+        assert_eq!(refused.header.ty, FrameType::Error);
+        assert_eq!(body(&refused)["code"], "browser_action_not_supported");
+        assert_eq!(launcher.effects.lock().unwrap().len(), effects_before);
+        return;
+    }
     assert_eq!(
         refused.header.ty,
         FrameType::Response,
@@ -6677,6 +6782,7 @@ async fn a_call_on_a_quarantined_session_is_a_target_busy_result_recorded_refuse
 /// as a target_busy result of the fill, instead of queueing it behind the
 /// stuck worker. Nothing reaches the browser.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_fill_login_on_a_quarantined_session_is_a_target_busy_result() {
     let (planes, launcher, _storage, tx, mut rx, _hold) = quarantined_session().await;
     let effects_before = launcher.effects.lock().unwrap().len();
@@ -6716,6 +6822,7 @@ async fn a_fill_login_on_a_quarantined_session_is_a_target_busy_result() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_close_of_a_quarantined_session_bypasses_the_lane_the_stuck_worker_holds() {
     let (planes, _launcher, _storage, tx, mut rx, hold) = quarantined_session().await;
     let status = body(&invoke_existing(&planes, 802, "browser.status", json!({})).await);
@@ -6739,6 +6846,7 @@ async fn a_close_of_a_quarantined_session_bypasses_the_lane_the_stuck_worker_hol
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_call_with_no_blocking_worker_free_is_refused_before_dispatch() {
     let (mut planes, launcher) = blocking_grant_fixture().await;
     let storage = with_readable_call_records(&mut planes);
@@ -6811,6 +6919,7 @@ async fn bind_other_conversation(planes: &Planes, channel: u16) {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_stuck_worker_keeps_its_permits_until_it_ends() {
     let (mut planes, launcher) = blocking_grant_fixture().await;
     // One pair: the stuck call's work and release permits.
@@ -6866,6 +6975,7 @@ async fn a_stuck_worker_keeps_its_permits_until_it_ends() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_close_behind_a_running_navigation_waits_for_it_and_closes_gracefully() {
     let (planes, launcher) = blocking_grant_fixture().await;
     close_route(&planes).await;
@@ -6916,6 +7026,7 @@ async fn a_close_behind_a_running_navigation_waits_for_it_and_closes_gracefully(
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn named_preset_refusal_records_refused_before_dispatch() {
     let (mut planes, _launcher) = blocking_grant_fixture().await;
     let storage = with_readable_call_records(&mut planes);
@@ -6952,6 +7063,7 @@ async fn named_preset_refusal_records_refused_before_dispatch() {
 /// `route_unbound` and ends the conversation's computer state as it always
 /// did, and the module asks the daemon nothing.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_unscoped_route_behaves_exactly_as_before_scopes() {
     let (mut planes, _launcher) = blocking_grant_fixture().await;
     let storage = with_readable_call_records(&mut planes);
@@ -6995,6 +7107,7 @@ async fn an_unscoped_route_behaves_exactly_as_before_scopes() {
 /// A keyed call on a scoped route records the stamp's owner, ref and epoch,
 /// and no text from its arguments.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_scoped_call_records_the_stamps_identity_and_no_text() {
     const SECRET: &str = "PLANTED-SECRET-5d2a90";
     let (mut planes, _launcher) = blocking_grant_fixture().await;
@@ -7064,6 +7177,7 @@ async fn carrier_call_under_scope() -> (Planes, mpsc::Sender<Frame>, mpsc::Recei
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn the_authorized_owner_naming_the_carrier_gets_the_carriers_answer() {
     let (planes, tx, mut rx, own) = carrier_call_under_scope().await;
     bind_route(
@@ -7102,6 +7216,7 @@ async fn the_authorized_owner_naming_the_carrier_gets_the_carriers_answer() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_owner_withdraw_without_a_carrier_is_carrier_required() {
     let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
     bind_route(
@@ -7116,6 +7231,7 @@ async fn an_owner_withdraw_without_a_carrier_is_carrier_required() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_carrier_naming_another_carrier_is_carrier_mismatch() {
     let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
     bind_route(&planes, 13, reserved("aft"), Some(scope_stamp(4, true))).await;
@@ -7150,6 +7266,7 @@ async fn a_carrier_naming_another_carrier_is_carrier_mismatch() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_owner_naming_a_carrier_that_raised_no_such_call_learns_nothing() {
     let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
     bind_route(
@@ -7174,6 +7291,7 @@ async fn an_owner_naming_a_carrier_that_raised_no_such_call_learns_nothing() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_owner_the_daemon_does_not_authorize_may_not_withdraw() {
     let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
     bind_route(
@@ -7198,6 +7316,7 @@ async fn an_owner_the_daemon_does_not_authorize_may_not_withdraw() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_owner_at_another_epoch_may_not_withdraw() {
     let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
     bind_route(
@@ -7222,6 +7341,7 @@ async fn an_owner_at_another_epoch_may_not_withdraw() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_named_scope_that_differs_from_the_stamp_is_refused() {
     let (planes, tx, mut rx, _own) = carrier_call_under_scope().await;
     bind_route(
@@ -7378,6 +7498,7 @@ async fn wait_until_closed(planes: &Planes) {
 /// the production reply boundary, which withholds a reply its result schema
 /// does not declare.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_definitive_scope_end_closes_the_browser_and_question_but_keeps_agent_grants() {
     for answer in [
         describe_answer("ended", Some(4), true, true),
@@ -7506,6 +7627,7 @@ async fn bind_reply(
 
 /// Replacing a head scope ends its pending work, not the agent's reusable rows.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_agent_grant_remains_usable_after_its_head_scope_epoch_is_replaced() {
     let (planes, launcher) = blocking_grant_fixture().await;
     bind_route(
@@ -7572,6 +7694,7 @@ async fn an_agent_grant_remains_usable_after_its_head_scope_epoch_is_replaced() 
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn scope_epoch_replacement_cancels_late_in_call_card() {
     let (planes, launcher) = blocking_grant_fixture().await;
     bind_route(
@@ -7615,6 +7738,7 @@ async fn scope_epoch_replacement_cancels_late_in_call_card() {
 /// A question the epoch-1 session left open grants nothing when answered
 /// after the epoch-2 bind.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_open_epoch_1_question_answered_after_the_epoch_2_bind_grants_nothing() {
     let (planes, _launcher) = blocking_grant_fixture().await;
     bind_route(
@@ -7652,6 +7776,7 @@ async fn an_open_epoch_1_question_answered_after_the_epoch_2_bind_grants_nothing
 /// An epoch-2 bind while the epoch-1 session's browser is open closes it as
 /// `scope_revoked`.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_epoch_2_bind_closes_the_epoch_1_browser_as_scope_revoked() {
     let (planes, _launcher) = blocking_grant_fixture().await;
     bind_route(
@@ -7685,6 +7810,7 @@ async fn an_epoch_2_bind_closes_the_epoch_1_browser_as_scope_revoked() {
 /// `scope_ended` and never bound. A route of the replaced epoch that is still
 /// bound serves nothing more either.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_stale_lower_epoch_bind_is_refused() {
     let (planes, _launcher) = blocking_grant_fixture().await;
     bind_route(
@@ -7731,6 +7857,7 @@ async fn a_stale_lower_epoch_bind_is_refused() {
 /// daemon restart is the case that matters most: a restart must not destroy
 /// an agent's work.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_non_definitive_answer_leaves_the_browser_the_grants_and_the_question() {
     let restart_like = (
         FrameType::Response,
@@ -7785,6 +7912,7 @@ async fn a_non_definitive_answer_leaves_the_browser_the_grants_and_the_question(
 
 /// No answer at all within the describe bound is not an end either.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_unanswered_describe_leaves_everything_in_place() {
     let (mut planes, _launcher) = blocking_grant_fixture().await;
     planes.scopes = Arc::new(cerebellum::scope_watch::ScopeRevocation::with_intervals(
@@ -7814,6 +7942,7 @@ async fn an_unanswered_describe_leaves_everything_in_place() {
 /// While another route under the same scope is still bound, a non-definitive
 /// answer is not asked about again: that route's own close will ask.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_scope_with_a_route_still_bound_is_not_polled() {
     let (mut planes, _launcher) = blocking_grant_fixture().await;
     planes.scopes = Arc::new(cerebellum::scope_watch::ScopeRevocation::with_intervals(
@@ -7935,6 +8064,7 @@ fn stored_record(
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_relayed_call_names_its_origin_on_its_journal_rows_and_its_call_record() {
     let (mut planes, _launcher) = blocking_grant_fixture().await;
     let storage = with_readable_call_records(&mut planes);
@@ -7970,6 +8100,7 @@ async fn a_relayed_call_names_its_origin_on_its_journal_rows_and_its_call_record
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_call_naming_no_origin_records_none() {
     let (mut planes, _launcher) = blocking_grant_fixture().await;
     let storage = with_readable_call_records(&mut planes);
@@ -7992,6 +8123,7 @@ async fn a_call_naming_no_origin_records_none() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_invalid_origin_is_recorded_absent_with_its_marker_and_never_refuses_the_call() {
     let (mut planes, launcher) = blocking_grant_fixture().await;
     let storage = with_readable_call_records(&mut planes);
@@ -8053,6 +8185,7 @@ async fn an_invalid_origin_is_recorded_absent_with_its_marker_and_never_refuses_
 /// records. The control call plants text within the bounds and must be
 /// found, or the scan proves nothing.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn text_planted_in_an_origin_past_its_bounds_reaches_no_record() {
     const CONTROL: &str = "PLANTED-ORIGIN-CONTROL-3b9e";
     const OVERLONG_KEY: &str = "PLANTED-ORIGIN-KEY-77c1";
@@ -8112,6 +8245,7 @@ async fn text_planted_in_an_origin_past_its_bounds_reaches_no_record() {
 /// in finding a call key's record: a resend naming another origin is the same
 /// call, answered from the first one's record.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn the_origin_changes_no_answer_and_no_call_key_lookup() {
     let (mut planes, launcher) = blocking_grant_fixture().await;
     let storage = with_readable_call_records(&mut planes);
@@ -8184,6 +8318,7 @@ async fn the_origin_changes_no_answer_and_no_call_key_lookup() {
 /// module as its origin, and the admitted principal's call is served even
 /// when its origin names a module that may not act.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_relayed_call_is_admitted_only_as_its_route_principal() {
     let (planes, _launcher) = blocking_grant_fixture().await;
     bind_second_principal(&planes).await;
@@ -8231,6 +8366,7 @@ async fn a_relayed_call_is_admitted_only_as_its_route_principal() {
 /// A relayed call waiting on a person is cancelled by its correlation id
 /// exactly as any other call is.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn a_relayed_call_is_cancelled_like_any_other() {
     let (planes, launcher) = blocking_grant_fixture().await;
     let (tx, mut rx) = mpsc::channel(8);
@@ -8658,34 +8794,40 @@ async fn assert_scope_unattested(stamp: subc_protocol::scope::ScopeStamp, princi
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn scope_admission_requires_owner_authorized() {
     let mut stamp = admission_stamp();
     stamp.owner_authorized = false;
     assert_scope_unattested(stamp, reserved("prefrontal")).await;
 }
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn scope_admission_requires_core_owner() {
     let mut stamp = admission_stamp();
     stamp.owner = reserved("broca");
     assert_scope_unattested(stamp, reserved("prefrontal")).await;
 }
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn scope_admission_requires_core_route_principal() {
     assert_scope_unattested(admission_stamp(), reserved("striatum")).await;
 }
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn scope_admission_excludes_flow_scopes() {
     let mut stamp = admission_stamp();
     stamp.attributes.flow_id = Some("flow-1".into());
     assert_scope_unattested(stamp, reserved("prefrontal")).await;
 }
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn scope_admission_requires_agent_id() {
     let mut stamp = admission_stamp();
     stamp.attributes.agent_id = None;
     assert_scope_unattested(stamp, reserved("prefrontal")).await;
 }
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn scope_admission_current_worker_shape_attests_nothing() {
     let mut stamp = admission_stamp();
     stamp.kind = subc_protocol::scope::ScopeKind::Worker;
@@ -8702,6 +8844,7 @@ async fn scope_admission_current_worker_shape_attests_nothing() {
     );
 }
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn scope_admission_worker_with_agent_gets_controls_and_disposable_profile() {
     let (planes, launcher) = scope_admission_planes();
     let mut stamp = admission_stamp();
@@ -8727,6 +8870,7 @@ async fn scope_admission_worker_with_agent_gets_controls_and_disposable_profile(
     }
 }
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn scope_admission_ephemeral_gets_no_controls() {
     let (planes, launcher) = scope_admission_planes();
     let mut stamp = admission_stamp();
@@ -8765,6 +8909,7 @@ async fn seed_scope_standing_grant(planes: &Planes) {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn scope_admission_head_launches_for_agent_and_reads_standing_grants() {
     let (mut planes, _) = scope_admission_planes();
     // Exercise production profile selection and custody without starting Chrome.
@@ -8829,6 +8974,7 @@ async fn scope_admission_head_launches_for_agent_and_reads_standing_grants() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn scope_admission_nondelegating_head_has_no_durable_profile_or_standing_access() {
     let (planes, launcher) = scope_admission_planes();
     seed_scope_standing_grant(&planes).await;
@@ -8883,6 +9029,7 @@ async fn scope_admission_nondelegating_head_has_no_durable_profile_or_standing_a
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn scope_admission_conflicting_facts_refuse_bind_and_agreeing_facts_bind() {
     for (field, value) in [
         ("agentProjectId", json!("pj-other")),
@@ -8917,6 +9064,7 @@ async fn scope_admission_conflicting_facts_refuse_bind_and_agreeing_facts_bind()
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn flow_scope_admission_refuses_flat_calls_before_dispatch_and_records_refusal() {
     let (mut planes, launcher) = scope_admission_planes();
     let storage = with_readable_call_records(&mut planes);
@@ -9120,6 +9268,7 @@ fn flow_planes() -> (Planes, Arc<RecordingLauncher>) {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn flow_owner_standing_grant_navigates_without_elicitation() {
     let (planes, launcher) = flow_planes();
     seed_scope_standing_grant(&planes).await;
@@ -9138,6 +9287,7 @@ async fn flow_owner_standing_grant_navigates_without_elicitation() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn flow_missing_browser_grant_refuses_before_launch_or_navigation() {
     let (planes, launcher) = flow_planes();
     grant_browser(&planes, "https://page.example:8443", vec![]).await;
@@ -9150,6 +9300,7 @@ async fn flow_missing_browser_grant_refuses_before_launch_or_navigation() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn nondelegating_basal_flow_cannot_use_its_agents_standing_grant() {
     let (planes, launcher) = flow_planes();
     seed_scope_standing_grant(&planes).await;
@@ -9183,6 +9334,7 @@ async fn nondelegating_basal_flow_cannot_use_its_agents_standing_grant() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn flow_global_and_nondelegating_have_no_profile_or_standing_authority() {
     for no_agent in [true, false] {
         let (planes, launcher) = flow_planes();
@@ -9216,6 +9368,7 @@ async fn flow_global_and_nondelegating_have_no_profile_or_standing_authority() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn flow_carrier_requires_exact_basal_authorized_core_stamp() {
     for (principal, owner, authorized) in [
         ("prefrontal", "prefrontal", true),
@@ -9245,6 +9398,7 @@ async fn flow_carrier_requires_exact_basal_authorized_core_stamp() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn flow_login_and_standing_offer_sites_refuse_without_cards() {
     let (planes, launcher) = flow_planes();
     bind_flow_wire(&planes, Some(flow_stamp()), reserved("basal")).await;
@@ -9266,9 +9420,14 @@ async fn flow_login_and_standing_offer_sites_refuse_without_cards() {
             json!({"action":"present","origin":"https://page.example:8443"}),
         ),
     ] {
+        let withheld = cfg!(windows) && action["action"] != "open_grant";
         let reply = flow_wire_call(&planes, corr, action).await;
-        assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
-        assert_eq!(reply["detail"]["reason"], "unattended_flow", "{reply}");
+        if withheld {
+            assert_eq!(reply["code"], "browser_action_not_supported", "{reply}");
+        } else {
+            assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+            assert_eq!(reply["detail"]["reason"], "unattended_flow", "{reply}");
+        }
     }
     assert_eq!(*launcher.launches.lock().unwrap(), 0);
 }
@@ -9478,6 +9637,7 @@ fn frame_fixture() -> Arc<Mutex<FrameFixture>> {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn top_page_read_covers_ungranted_frame_but_actions_require_frame_origin() {
     let fixture = frame_fixture();
     let launcher = Arc::new(RecordingLauncher {
@@ -9551,6 +9711,7 @@ async fn top_page_read_covers_ungranted_frame_but_actions_require_frame_origin()
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn frame_ref_and_point_actions_use_frame_origin_not_shell_origin() {
     let fixture = frame_fixture();
     let launcher = Arc::new(RecordingLauncher {
@@ -9592,6 +9753,7 @@ async fn frame_ref_and_point_actions_use_frame_origin_not_shell_origin() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn navigated_frame_ref_is_stale_before_mouse_input() {
     let fixture = frame_fixture();
     let launcher = Arc::new(RecordingLauncher {
@@ -9653,6 +9815,7 @@ fn frame_submit_record(
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn frame_credential_and_payment_submit_is_refused_by_ref_and_point_wire_paths() {
     for (financial, missing_hazard) in [
         (true, "financial_form_submit"),
@@ -9707,6 +9870,7 @@ async fn frame_credential_and_payment_submit_is_refused_by_ref_and_point_wire_pa
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn screenshot_accepts_embedded_frame_churn_under_top_page_read_grant() {
     let fixture = frame_fixture();
     fixture.lock().unwrap().churn_on_screenshot = true;
@@ -9811,6 +9975,7 @@ async fn type_wire(planes: &Planes, reference: &str, text: &str, clear_first: bo
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_plain_field_dispatches_characters() {
     let page = TypePage::default();
     let value = page.value.clone();
@@ -9833,6 +9998,7 @@ async fn wire_type_plain_field_dispatches_characters() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_clear_first_replaces_value() {
     let page = TypePage::default();
     let value = page.value.clone();
@@ -9846,6 +10012,7 @@ async fn wire_type_clear_first_replaces_value() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_number_input_clear_first_replaces_value() {
     let page = TypePage {
         input_type: "number".into(),
@@ -9861,6 +10028,7 @@ async fn wire_type_number_input_clear_first_replaces_value() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_number_and_email_append_without_selection_range() {
     for kind in ["number", "email"] {
         let page = TypePage {
@@ -9877,6 +10045,7 @@ async fn wire_type_number_and_email_append_without_selection_range() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_sensitive_names_and_ids_do_not_match_substrings() {
     for (kind, name, id, expected) in [
         ("number", "card_number", "", Some("payment_field")),
@@ -9919,6 +10088,7 @@ async fn wire_type_sensitive_names_and_ids_do_not_match_substrings() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_rechecks_sensitive_name_after_focus() {
     let page = TypePage {
         input_type: "number".into(),
@@ -9939,6 +10109,7 @@ async fn wire_type_rechecks_sensitive_name_after_focus() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_rechecks_sensitive_name_and_focus_after_end_key() {
     for sensitive in [false, true] {
         let page = TypePage {
@@ -9962,6 +10133,7 @@ async fn wire_type_rechecks_sensitive_name_and_focus_after_end_key() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_unsupported_fields_name_type_and_alternative() {
     for kind in [
         "date",
@@ -10002,6 +10174,7 @@ async fn wire_type_unsupported_fields_name_type_and_alternative() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_sensitive_cross_origin_fields_refuse_before_authorization() {
     for (input_type, autocomplete) in [
         ("password", ""),
@@ -10045,6 +10218,7 @@ async fn wire_type_sensitive_cross_origin_fields_refuse_before_authorization() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_ungranted_frame_names_its_origin() {
     let (planes, _, commands, reference) = type_fixture(TypePage {
         frame_origin: Some("https://ungranted.example".into()),
@@ -10065,6 +10239,7 @@ async fn wire_type_ungranted_frame_names_its_origin() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_stale_document_refuses_before_input() {
     let (planes, page, commands, reference) = type_fixture(TypePage::default()).await;
     page.commit("https://example.com/different-document");
@@ -10078,6 +10253,7 @@ async fn wire_type_stale_document_refuses_before_input() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_missing_text_is_refused_by_name() {
     let (planes, _, _, reference) = type_fixture(TypePage::default()).await;
     let reply = body(
@@ -10100,6 +10276,7 @@ fn contains_type_secret(records: &[String], secret: &str) -> bool {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_planted_secret_absent_from_all_records() {
     const SECRET: &str = "PLANTED-BROWSER-TYPE-SECRET-7f3c1e";
     let page = TypePage::default();
@@ -10144,6 +10321,7 @@ async fn wire_type_planted_secret_absent_from_all_records() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_append_moves_caret_to_end() {
     let page = TypePage::default();
     let value = page.value.clone();
@@ -10155,6 +10333,7 @@ async fn wire_type_append_moves_caret_to_end() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_clear_verifies_empty_before_insert() {
     let page = TypePage {
         ignore_delete: true,
@@ -10174,6 +10353,7 @@ async fn wire_type_clear_verifies_empty_before_insert() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_focus_failure_is_retryable_not_internal() {
     let (planes, _, commands, reference) = type_fixture(TypePage {
         fail_focus: true,
@@ -10194,6 +10374,7 @@ async fn wire_type_focus_failure_is_retryable_not_internal() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_initializes_runtime_before_resolving_cold_target() {
     let page = TypePage {
         cold_runtime: true,
@@ -10218,6 +10399,7 @@ async fn wire_type_initializes_runtime_before_resolving_cold_target() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_emulates_focus_before_setting_append_caret() {
     let page = TypePage::default();
     assert!(!*page.has_focus.lock().unwrap());
@@ -10230,6 +10412,7 @@ async fn wire_type_emulates_focus_before_setting_append_caret() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn wire_type_emulates_focus_once_per_attached_session() {
     let page = TypePage::default();
     let has_focus = page.has_focus.clone();
@@ -10328,10 +10511,12 @@ async fn navigate_unanswered(method: &'static str, code: &str, sent: bool) {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn navigate_target_timeout_is_retryable() {
     navigate_unanswered("Target.createTarget", "navigate_target_not_ready", false).await;
 }
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn navigate_attachment_timeout_is_retryable() {
     navigate_unanswered(
         "Target.attachToTarget",
@@ -10341,19 +10526,23 @@ async fn navigate_attachment_timeout_is_retryable() {
     .await;
 }
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn navigate_page_timeout_is_retryable() {
     navigate_unanswered("Page.enable", "navigate_page_not_ready", false).await;
 }
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn navigate_network_timeout_is_retryable() {
     navigate_unanswered("Network.enable", "navigate_network_not_ready", false).await;
 }
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn navigate_response_timeout_requires_snapshot() {
     navigate_unanswered("Page.navigate", "navigate_response_not_ready", true).await;
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn navigate_zero_budget_never_dispatches() {
     navigate_unanswered("Target.createTarget", "navigate_deadline_expired", false).await;
 }
@@ -10385,6 +10574,7 @@ async fn flow_permission_query(planes: &Planes, corr: u64, params: Value) -> Val
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn flow_browser_missing_permission_roundtrip_and_private_journal() {
     let (planes, launcher) = flow_planes();
     bind_flow_wire(&planes, Some(flow_stamp()), reserved("basal")).await;
@@ -10615,6 +10805,7 @@ impl cerebellum::agent_grants::AgentGrantStorage for HeldAgentGrantSave {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn navigate_joins_open_grant_and_waits_for_the_drain_winners_stored_effect() {
     let storage = Arc::new(HeldAgentGrantSave::new());
     let standing = permission_support::store(
@@ -10703,12 +10894,14 @@ async fn navigate_joins_open_grant_and_waits_for_the_drain_winners_stored_effect
     );
 }
 
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 #[path = "it/agent_holder_enforcement.rs"]
 mod agent_holder_enforcement;
 
 /// The own-browser screenshot leaves with a handle whose bytes are exactly the
 /// PNG the reply carried, and that handle resolves under the capturing scope.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn an_own_browser_screenshot_carries_a_resolvable_handle() {
     let (launcher, planes) = navigated_to_landed(&["https://landed.example:8443"]).await;
     let reply = response_body_scoped(
@@ -10743,6 +10936,7 @@ async fn an_own_browser_screenshot_carries_a_resolvable_handle() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
 async fn connected_private_documents_require_site_consent_for_snapshot_and_click() {
     use cerebellum::agent_grants::{GrantHolder, GrantSubject};
     use cerebellum::authorization::{with_standing_caller, StandingCaller};
