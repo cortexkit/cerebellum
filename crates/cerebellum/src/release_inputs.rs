@@ -20,7 +20,7 @@ pub(super) fn compiled_release_inputs() -> ComputerReleaseInputs {
         option_env!("CEREBELLUM_APP_USE_FRONTING_REVIEW_REVISION");
     let release_signing_topology_revision =
         option_env!("CEREBELLUM_RELEASE_SIGNING_TOPOLOGY_REVISION");
-    release_inputs_from_build_bindings(BuildReleaseBindings {
+    let inputs = release_inputs_from_build_bindings(BuildReleaseBindings {
         attendance_contract_owner: option_env!("CEREBELLUM_ATTENDANCE_CONTRACT_OWNER"),
         attendance_contract_revision: option_env!("CEREBELLUM_ATTENDANCE_CONTRACT_REVISION"),
         input_review_revision: option_env!("CEREBELLUM_INPUT_REVIEW_REVISION"),
@@ -58,7 +58,13 @@ pub(super) fn compiled_release_inputs() -> ComputerReleaseInputs {
         ),
         app_use_fronting_review_revision,
         release_signing_topology_revision,
-    })
+    });
+    #[cfg(target_os = "linux")]
+    let inputs = ComputerReleaseInputs {
+        linux: crate::computer_capability::linux::compiled_reviews(),
+        ..inputs
+    };
+    inputs
 }
 
 #[derive(Default)]
@@ -144,6 +150,8 @@ pub(super) fn release_inputs_from_build_bindings(
         release_signing_topology_revision: bindings
             .release_signing_topology_revision
             .map(str::to_owned),
+        #[cfg(target_os = "linux")]
+        linux: Default::default(),
         vocabulary_digests: computer::platform::VocabularyDigestInputs {
             // The manifest and computed-artifact mirrors are recalculated from
             // the frozen vocabulary, while the source-lock digest comes from its

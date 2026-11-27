@@ -347,7 +347,7 @@ struct ComputerReleaseGate {
 /// struck and excluded from evaluation because they lack independent evidence.
 /// Keeping them in the table prevents a future change from restoring an
 /// unsupported comparison.
-const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 24] = [
+const COMPUTER_RELEASE_GATE_TABLE: &[ComputerReleaseGate] = &[
     ComputerReleaseGate {
         name: "vocabulary_manifest_digest",
         source: ComputerReleaseGateSource::VocabularyManifestDigest,
@@ -414,6 +414,18 @@ const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 24] = [
         name: "release_signing_topology_revision",
         source: ComputerReleaseGateSource::External,
     },
+    #[cfg(target_os = "linux")]
+    ComputerReleaseGate::external(computer::platform::LinuxReleaseInputs::IDENTITY),
+    #[cfg(target_os = "linux")]
+    ComputerReleaseGate::external(computer::platform::LinuxReleaseInputs::SEMANTIC),
+    #[cfg(target_os = "linux")]
+    ComputerReleaseGate::external(computer::platform::LinuxReleaseInputs::LAUNCH),
+    #[cfg(target_os = "linux")]
+    ComputerReleaseGate::external(computer::platform::LinuxReleaseInputs::CAPTURE),
+    #[cfg(target_os = "linux")]
+    ComputerReleaseGate::external(computer::platform::LinuxReleaseInputs::FRONTING),
+    #[cfg(target_os = "linux")]
+    ComputerReleaseGate::external(computer::platform::LinuxReleaseInputs::TAKEOVER),
     ComputerReleaseGate {
         name: "computer_action_vocabulary_revision",
         source: ComputerReleaseGateSource::StruckSelfReferential {
@@ -463,6 +475,16 @@ const COMPUTER_RELEASE_GATE_TABLE: [ComputerReleaseGate; 24] = [
         },
     },
 ];
+
+#[cfg(target_os = "linux")]
+impl ComputerReleaseGate {
+    const fn external(name: &'static str) -> Self {
+        Self {
+            name,
+            source: ComputerReleaseGateSource::External,
+        }
+    }
+}
 
 fn pin_outcome(
     gate: &'static str,
@@ -551,6 +573,10 @@ fn external_release_input<'a>(inputs: &'a ComputerReleaseInputs, gate: &str) -> 
         }
         "app_use_fronting_review_revision" => inputs.app_use_fronting_review_revision.as_deref(),
         "release_signing_topology_revision" => inputs.release_signing_topology_revision.as_deref(),
+        #[cfg(target_os = "linux")]
+        gate if computer::platform::LinuxReleaseInputs::GATES.contains(&gate) => {
+            inputs.linux.review(gate)
+        }
         _ => unreachable!("every external release gate has a bound input"),
     }
 }
@@ -572,6 +598,25 @@ fn declaration_gate_passes(
         return false;
     }
     let id = declaration.capability_id.as_str();
+    #[cfg(target_os = "linux")]
+    {
+        use computer::audit::ComputerCapability;
+        let Some(capability) = ComputerCapability::parse(id) else {
+            return false;
+        };
+        let bound = |gate: &str| gate_passes(outcomes, gate);
+        bound("release_signing_topology_revision")
+            && (!matches!(
+                capability,
+                ComputerCapability::Type | ComputerCapability::Keys
+            ) || (bound("attendance_contract_owner") && bound("attendance_contract_revision")))
+            && computer::platform::LinuxReleaseInputs::row_reviewed(
+                capability,
+                bound,
+                computer::platform::LINUX_X11_DOWN_GESTURE_RECOVERY_MEASURED,
+            )
+    }
+    #[cfg(not(target_os = "linux"))]
     if matches!(
         id,
         "computer.read_state" | "computer.wait" | "computer.list_apps"
@@ -679,7 +724,12 @@ fn advertised_computer_declarations<'a>(
 ) -> Vec<&'a ComputerCapabilityDeclaration> {
     gate_admitted_computer_declarations(declarations, outcomes)
         .into_iter()
-        .filter(|declaration| dispatchable_tool(&declaration.capability_id).is_some())
+        .filter(|declaration| {
+            #[cfg(target_os = "linux")]
+            return computer_capability::servable(&declaration.capability_id).is_some();
+            #[cfg(not(target_os = "linux"))]
+            return dispatchable_tool(&declaration.capability_id).is_some();
+        })
         .collect()
 }
 
@@ -710,11 +760,12 @@ fn canonical_computer_declarations(
     context: &ComputerCapabilityAdvertisementContext,
 ) -> (Vec<ComputerCapabilityDeclaration>, ComputerGateOutcomes) {
     #[cfg(target_os = "windows")]
-    let mut declarations =
-        computer::platform::WindowsPlatformDriver::default().declarations(context);
+    let declarations = computer::platform::WindowsPlatformDriver::default().declarations(context);
     #[cfg(not(target_os = "windows"))]
-    let mut declarations =
+    let declarations =
         computer::platform::capability_declarations(context, cfg!(target_os = "macos"));
+    #[cfg(not(target_os = "linux"))]
+    let mut declarations = declarations;
     // Driver declarations describe reviewed platform operations, not whether
     // this module can authorize them. A computer plane needs app grants for its
     // scoped actions; the production resolver cannot mint those without an
@@ -722,6 +773,7 @@ fn canonical_computer_declarations(
     // Withhold at the module assembly boundary so both HELLO and release
     // evidence agree, without changing driver-level review declarations. This
     // is a compile-time fact, not a probe of the person's grants or permissions.
+    #[cfg(not(target_os = "linux"))]
     if !management::PlatformResolver::HAS_APP_IDENTITY_READER {
         for declaration in &mut declarations {
             declaration.advertised = false;
@@ -1323,11 +1375,9 @@ fn preview_capture_admitted(inputs: &ComputerReleaseInputs) -> bool {
 /// Public so that a test can check the manifest this module really sends,
 /// rather than one assembled to look like it.
 ///
-/// Permission readings are taken once at startup and never re-queried, by design.
-/// A later grant is not seen until cerebellum restarts. Readings serve diagnostics
-/// and call-time admission, not advertisement. The queries never request a grant,
-/// so permission checks cannot change advertisement or raise a system permission
-/// prompt.
+/// Startup permission readings serve diagnostics and call-time admission, not
+/// advertisement. On Linux the startup report is empty; call admission reads
+/// the desktop session instead. Neither check requests a grant.
 pub fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
     static CONTEXT: std::sync::OnceLock<ComputerCapabilityAdvertisementContext> =
         std::sync::OnceLock::new();
@@ -3122,7 +3172,7 @@ pub struct Planes {
     ///
     /// Keeping the outcome in one field prevents availability and its diagnostic
     /// from drifting into contradictory states.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pub computer: Result<
         Arc<computer_capability::RunningComputerPlane>,
         computer_capability::ComputerPlaneUnavailable,
@@ -3134,7 +3184,7 @@ pub struct Planes {
     /// this the derivation runs one way only, and a build whose release
     /// identifiers are unbound advertises nothing while still serving a
     /// capability a caller names directly.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     pub computer_admitted: Arc<std::collections::BTreeSet<String>>,
     /// `browser.capture_login`: one capture at a time, and its residue.
     pub capture: Arc<login_capture::CaptureModule>,
@@ -3536,6 +3586,8 @@ async fn handle_frame(
             ));
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             let computer_arrival = computer_capability::computer_arrival(&frame, planes);
+            #[cfg(target_os = "linux")]
+            let computer_arrival = computer_capability::computer_arrival(&frame, planes).await;
             let browser_arrival = browser_queue::arrive(&frame, planes);
             let guard = Arc::new(planes.health.enter_request());
             let writer = writer.clone();
@@ -3592,9 +3644,9 @@ async fn handle_frame(
                 // browser continuation's key and consent id to its new guard.
                 let dispatch = browser_held::with_context(resumed_browser, dispatch);
                 let dispatch = BROWSER_CONSENT_PARK_LIMIT.scope(browser_park_limit, dispatch);
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
                 let result = computer_capability::serialized_call(computer_arrival, dispatch).await;
-                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
                 let result = dispatch.await;
                 result
             };

@@ -1326,6 +1326,19 @@ pub(super) async fn handle_tool_request_inner(
             && (name == flat_tools::COMPUTER_USE || computer_capability::servable(name).is_some()))
         .then_some(name)
     });
+    #[cfg(target_os = "linux")]
+    let known_capability = known_capability.or_else(|| {
+        let desktop = if name == flat_tools::COMPUTER_USE {
+            !planes.computer_admitted.is_empty()
+        } else {
+            computer_capability::servable(name).is_some()
+                && !matches!(
+                    planes.computer,
+                    Err(computer_capability::ComputerPlaneUnavailable::NoLinuxReviews)
+                )
+        };
+        desktop.then_some(name)
+    });
     let Some(capability_name) = known_capability else {
         if matches!(name, flat_tools::BROWSER_USE | flat_tools::COMPUTER_USE) {
             return tool_provider::send_error(
@@ -1669,7 +1682,7 @@ pub(super) async fn handle_tool_request_inner(
     // sees it. The two planes share a request envelope and nothing else, so a
     // computer capability reaching the browser handler would be reported as an
     // unknown method -- a refusal that describes the wrong subsystem.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     if let Some(servable) = computer_capability::servable(name) {
         let clock = planes.lease_clock.as_ref();
 
@@ -1685,6 +1698,7 @@ pub(super) async fn handle_tool_request_inner(
         // tool, because it means the same thing: this build knows the name and
         // does not serve it. A consumer keys its handling on the code, and two
         // spellings of one fact would force it to keep a per-plane list.
+        #[cfg(not(target_os = "linux"))]
         if !planes.computer_admitted.contains(name) {
             let withheld = CapabilityWithheld::NotAdmitted;
             return send_route_error(

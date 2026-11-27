@@ -278,6 +278,90 @@ pub struct ImmutableReleaseInputs {
     pub app_use_fronting_review_revision: Option<String>,
     pub release_signing_topology_revision: Option<String>,
     pub vocabulary_digests: VocabularyDigestInputs,
+    #[cfg(target_os = "linux")]
+    pub linux: LinuxReleaseInputs,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinuxReleaseInputs {
+    pub app_identity: Option<String>,
+    pub semantic: Option<String>,
+    pub launch: Option<String>,
+    pub x11_capture: Option<String>,
+    pub x11_fronting: Option<String>,
+    pub x11_takeover: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxReleaseInputs {
+    pub const IDENTITY: &str = "linux_app_identity_review_revision";
+    pub const SEMANTIC: &str = "linux_semantic_review_revision";
+    pub const LAUNCH: &str = "linux_launch_review_revision";
+    pub const CAPTURE: &str = "linux_x11_capture_review_revision";
+    pub const FRONTING: &str = "linux_x11_fronting_review_revision";
+    pub const TAKEOVER: &str = "linux_x11_takeover_review_revision";
+    pub const GATES: [&str; 6] = [
+        Self::IDENTITY,
+        Self::SEMANTIC,
+        Self::LAUNCH,
+        Self::CAPTURE,
+        Self::FRONTING,
+        Self::TAKEOVER,
+    ];
+
+    pub fn review(&self, gate: &str) -> Option<&str> {
+        match gate {
+            Self::IDENTITY => &self.app_identity,
+            Self::SEMANTIC => &self.semantic,
+            Self::LAUNCH => &self.launch,
+            Self::CAPTURE => &self.x11_capture,
+            Self::FRONTING => &self.x11_fronting,
+            Self::TAKEOVER => &self.x11_takeover,
+            _ => return None,
+        }
+        .as_deref()
+    }
+
+    pub fn bound(&self, gate: &str) -> bool {
+        linux_attestation_bound(self.review(gate))
+    }
+
+    pub fn row_reviewed(
+        capability: crate::audit::ComputerCapability,
+        bound: impl Fn(&str) -> bool,
+        down_gesture_measured: bool,
+    ) -> bool {
+        use crate::audit::ComputerCapability::*;
+        bound(Self::IDENTITY)
+            && match capability {
+                ListApps | Wait | ReadState | PressElement | WriteText => bound(Self::SEMANTIC),
+                OpenApp => bound(Self::LAUNCH),
+                Type | Keys => bound(Self::SEMANTIC) && bound(Self::FRONTING),
+                TakeoverMove | TakeoverScroll | TakeoverDrag | TakeoverClick => {
+                    bound(Self::SEMANTIC)
+                        && bound(Self::CAPTURE)
+                        && bound(Self::TAKEOVER)
+                        && (!matches!(capability, TakeoverClick | TakeoverDrag)
+                            || down_gesture_measured)
+                        && (capability != TakeoverClick || bound(Self::FRONTING))
+                }
+                PressPoint | Click | Scroll | Move | Drag | Screenshot => false,
+            }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub const LINUX_X11_DOWN_GESTURE_RECOVERY_MEASURED: bool = false;
+
+#[cfg(target_os = "linux")]
+fn linux_attestation_bound(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        !value.trim().is_empty()
+            && !["placeholder", "tbd", "unknown"]
+                .iter()
+                .any(|stand_in| value.eq_ignore_ascii_case(stand_in))
+    })
 }
 
 impl ImmutableReleaseInputs {
@@ -285,6 +369,7 @@ impl ImmutableReleaseInputs {
         validate_vocabulary_digests(&self.vocabulary_digests).is_ok()
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn input_dispatch_ready(&self) -> bool {
         self.attendance_contract_owner.is_some()
             && self.attendance_contract_revision.is_some()
@@ -292,6 +377,7 @@ impl ImmutableReleaseInputs {
             && self.release_signing_topology_revision.is_some()
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn global_dispatch_ready(&self) -> bool {
         self.global_dispatch_review_revision.is_some()
             && self.release_signing_topology_revision.is_some()
@@ -300,6 +386,7 @@ impl ImmutableReleaseInputs {
     /// Both reviews the takeover rows need: the review of the global pointer
     /// stream and its per-post checks, and the review of handing that pointer
     /// to the agent under a takeover grant. Neither covers the other.
+    #[cfg(not(target_os = "linux"))]
     fn takeover_dispatch_ready(&self) -> bool {
         self.global_dispatch_ready() && self.takeover_dispatch_review_revision.is_some()
     }
@@ -332,6 +419,7 @@ pub fn capability_declarations(
 /// synthetic support on evidence that this build resolved private SkyLight
 /// symbols, which no path uses. The flag still exists on the startup probe as a
 /// reported fact; it decides nothing.
+#[cfg(not(target_os = "linux"))]
 fn capability_declaration(
     capability: crate::audit::ComputerCapability,
     context: &CapabilityAdvertisementContext,
@@ -628,6 +716,69 @@ fn capability_declaration(
                 || semantic_support == SupportState::Supported
                 || background_support == SupportState::Supported
                 || observed_support),
+        suppression_reason,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn capability_declaration(
+    capability: crate::audit::ComputerCapability,
+    context: &CapabilityAdvertisementContext,
+    _platform_available: bool,
+) -> CapabilityDeclaration {
+    use crate::audit::ComputerCapability::*;
+    let id = capability.capability_id();
+    let inputs = &context.inputs;
+    let permissions = vocabulary::required_permission_services(id);
+    let suppression_reason = if let Err(error) = &permissions {
+        Some(format!("required permissions are not resolvable: {error}"))
+    } else if !inputs.vocabulary_ready() {
+        Some("computer action vocabulary input unresolved".into())
+    } else if !linux_attestation_bound(inputs.release_signing_topology_revision.as_deref()) {
+        Some("release signing topology revision is not bound".into())
+    } else if capability == PressPoint {
+        Some("point_hit_test_unsupported".into())
+    } else if !LinuxReleaseInputs::row_reviewed(
+        capability,
+        |gate| inputs.linux.bound(gate),
+        LINUX_X11_DOWN_GESTURE_RECOVERY_MEASURED,
+    ) {
+        Some("route_not_reviewed".into())
+    } else if matches!(capability, Type | Keys)
+        && !(linux_attestation_bound(inputs.attendance_contract_owner.as_deref())
+            && linux_attestation_bound(inputs.attendance_contract_revision.as_deref()))
+    {
+        Some("attendance contract inputs are not bound".into())
+    } else {
+        None
+    };
+    let dispatch_modes = match capability {
+        TakeoverMove | TakeoverClick | TakeoverDrag | TakeoverScroll => {
+            vec![DispatchMode::Observed]
+        }
+        ReadState | PressElement | WriteText | OpenApp => vec![DispatchMode::Background],
+        Type | Keys => vec![DispatchMode::Background, DispatchMode::Observed],
+        _ => vec![],
+    };
+    let synthetic_observed = if dispatch_modes.contains(&DispatchMode::Observed) {
+        SupportState::ConsentGated
+    } else {
+        SupportState::Unsupported
+    };
+    CapabilityDeclaration {
+        capability_id: id.into(),
+        action_kind: capability.action_kind(),
+        dispatch_modes,
+        semantic_path: SupportState::Unsupported,
+        synthetic_background: SupportState::Unsupported,
+        synthetic_observed,
+        required_permissions: permissions.unwrap_or_default(),
+        retry_class: if matches!(capability, ReadState | Wait | ListApps) {
+            RetryClass::Idempotent
+        } else {
+            RetryClass::NeverAutomaticRetry
+        },
+        advertised: suppression_reason.is_none(),
         suppression_reason,
     }
 }
@@ -2829,6 +2980,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn an_unavailable_platform_advertises_only_the_platform_neutral_wait() {
         let digest = COMPUTER_ACTION_VOCABULARY_SHA256.to_string();

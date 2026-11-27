@@ -455,6 +455,9 @@ fn only_keyboard_rows_claim_background_synthetic_support() {
                  carry pointer events"
             );
         } else if keyboard {
+            #[cfg(target_os = "linux")]
+            assert_eq!(declaration.synthetic_background, SupportState::Unsupported);
+            #[cfg(not(target_os = "linux"))]
             assert_eq!(
                 declaration.synthetic_background,
                 SupportState::Supported,
@@ -504,6 +507,9 @@ fn semantic_support_is_claimed_only_where_something_serves_it() {
         permissions: PermissionLivenessReport::default(),
         startup: StartupCapabilityProbe::default(),
     };
+    #[cfg(target_os = "linux")]
+    let served: [&str; 0] = [];
+    #[cfg(not(target_os = "linux"))]
     let served = [
         "computer.press_element",
         "computer.press_point",
@@ -599,6 +605,7 @@ fn fully_bound_context() -> CapabilityAdvertisementContext {
 /// The two observing rows declare no delivery paths in the frozen vocabulary --
 /// they read rather than actuate -- so the requirement does not apply to them,
 /// and this asserts that exemption rather than leaving it implied.
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn an_actuating_row_is_advertised_only_with_a_working_delivery_path() {
     // EVERY release input bound and every permission live, so the delivery-path

@@ -5,7 +5,7 @@
 //! registers a message index and reserves a conversation position if ready.
 //! The spawned task waits for its predecessor, resolves the app, reserves its
 //! app position, then releases the conversation lane before waiting for the
-//! app. Platform work can never hold the frame reader.
+//! app. Linux's bounded session check is the only platform query on arrival.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -17,7 +17,7 @@ use cerebellum_computer::app_state::source::HitScope;
 use cerebellum_computer::capture::CaptureBackend;
 use cerebellum_computer::platform::{PlatformDriver, SyntheticPoint};
 use cerebellum_core::clock::MonotonicClock;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use cerebellum_core::journal::message_position_from_request_member;
 use cerebellum_core::journal::{JournalStorage, Redactor, SeverityTaxonomy};
 use serde_json::Value;
@@ -112,7 +112,7 @@ impl From<ConsentRefusal> for QueueRefusal {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub(crate) async fn scope<T>(
     arrival: Option<ConversationPosition>,
     future: impl Future<Output = T>,
@@ -120,13 +120,15 @@ pub(crate) async fn scope<T>(
     ARRIVAL.scope(RefCell::new(arrival), future).await
 }
 
-/// Register an arrival without resolving a target, waiting for a predecessor,
-/// or querying the platform. Refused calls still use the normal reply handler.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-pub(crate) fn arrive(
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn arrival_candidate(
     frame: &subc_protocol::Frame,
     planes: &crate::Planes,
-) -> Option<ConversationPosition> {
+) -> Option<(
+    Servable,
+    String,
+    Option<subc_protocol::tool_call::MessagePosition>,
+)> {
     let body: Value = serde_json::from_slice(&frame.body).ok()?;
     let name = body.get("name")?.as_str()?;
     let arguments = body.get("arguments")?;
@@ -146,16 +148,23 @@ pub(crate) fn arrive(
     let position = message_position_from_request_member(body.get("origin"));
     if (matches!(capability.0, Served::ListApps) && position.is_none())
         || valid_request(capability, arguments).is_err()
-        || !planes
-            .computer_admitted
-            .contains(capability.capability().capability_id())
+    {
+        return None;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if !planes
+        .computer_admitted
+        .contains(capability.capability().capability_id())
     {
         return None;
     }
     let facts = planes
         .routes
         .get(frame.header.channel, frame.header.epoch)?;
+    #[cfg(not(target_os = "linux"))]
     let declared = crate::dispatchable_tool(name)?;
+    #[cfg(target_os = "linux")]
+    let declared = name;
     if !facts.admits_session_calls()
         || crate::session_flow_refusal(&facts).is_some()
         || !facts.allows_capability(declared)
@@ -171,6 +180,17 @@ pub(crate) fn arrive(
     {
         return None;
     }
+    Some((capability, facts.identity.conversation_key, position))
+}
+
+/// Register an arrival without resolving a target or waiting for a predecessor.
+/// Refused calls still use the normal reply handler.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn arrive(
+    frame: &subc_protocol::Frame,
+    planes: &crate::Planes,
+) -> Option<ConversationPosition> {
+    let (capability, conversation, position) = arrival_candidate(frame, planes)?;
     let plane = planes.computer.as_ref().ok()?;
     let (permissions, serializer) = (&plane.permissions, &plane.serializer);
     #[cfg(all(test, target_os = "macos"))]
@@ -182,7 +202,21 @@ pub(crate) fn arrive(
     if super::permissions::refusal(capability.capability(), permissions).is_some() {
         return None;
     }
-    Some(serializer.arrive(facts.identity.conversation_key, position))
+    Some(serializer.arrive(conversation, position))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn arrive(
+    frame: &subc_protocol::Frame,
+    planes: &crate::Planes,
+) -> Option<ConversationPosition> {
+    let plane = planes.computer.as_ref().ok()?;
+    let (capability, conversation, position) = arrival_candidate(frame, planes)?;
+    let session = plane.linux_session.as_ref()?;
+    if session.refusal(capability.capability()).await.is_some() {
+        return None;
+    }
+    Some(plane.serializer.arrive(conversation, position))
 }
 
 impl<B, R, T, S, D> ComputerPlane<B, R, T, S, D>
