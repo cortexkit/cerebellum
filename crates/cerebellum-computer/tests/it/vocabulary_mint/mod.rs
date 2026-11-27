@@ -2844,3 +2844,21 @@ pub fn v38_from_v37(previous: &Value, revision: &str) -> Value {
     }));
     next
 }
+
+/// A picture can be unavailable because the window is excluded from capture.
+pub fn v39_from_v38(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    let read_state = next["rows"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["capability_id"] == "computer.read_state")
+        .unwrap();
+    read_state["result_schema"]
+        .pointer_mut("/properties/image_unavailable/properties/reason/enum")
+        .and_then(Value::as_array_mut)
+        .unwrap()
+        .push(json!("capture_excluded"));
+    next
+}

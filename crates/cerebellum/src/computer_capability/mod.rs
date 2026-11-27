@@ -767,9 +767,8 @@ where
     }
 
     /// Serve as though the screen-lock reading were `state`, whatever the
-    /// machine running the test reports. Only the macOS frame-loop tests
-    /// serve the production plane, so it is compiled for them alone.
-    #[cfg(all(test, target_os = "macos"))]
+    /// machine running the frame-loop test reports.
+    #[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
     pub(crate) fn with_session_lock_for_test(mut self, state: Option<bool>) -> Self {
         self.session_lock_for_test = Some(state);
         self
@@ -2397,7 +2396,11 @@ where
                 json!({"outcome":"completed", STATE_TEXT_FIELD:text, "apps":apps, "truncated":truncated,"installed_list":if installed.complete {"complete"} else {"partial"}})
             }
             Err(_) => {
-                json!({"outcome":"targets_unreadable","unreadable":{"reason":"window_list_unavailable"},"remedy":"the running applications could not be read; retry, or name an application by app identity (a bundle id on macOS)"})
+                #[cfg(target_os = "windows")]
+                let remedy = "the running applications could not be read; retry, or name an application by app identity";
+                #[cfg(not(target_os = "windows"))]
+                let remedy = "the running applications could not be read; retry, or name an application by app identity (a bundle id on macOS)";
+                json!({"outcome":"targets_unreadable","unreadable":{"reason":"window_list_unavailable"},"remedy":remedy})
             }
         }
     }

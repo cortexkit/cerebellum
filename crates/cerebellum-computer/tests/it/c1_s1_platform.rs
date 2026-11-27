@@ -15,7 +15,7 @@ use cerebellum_computer::platform::{MacOs26PlatformDriver, StartupProbeInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v38.json");
+const VOCABULARY: &str = include_str!("../../resources/computer_action_vocabulary-v39.json");
 const V33_ARTIFACT_SHA256: &str =
     "bec5b6cad004606960c684bafea3c7b219fc780cec9630158c29ff935833c849";
 const V34_ARTIFACT_SHA256: &str =
@@ -26,6 +26,8 @@ const V36_ARTIFACT_SHA256: &str =
     "b8fcf12d5524665f806bbb5e7da2cedd38f3ef2a61afcdf1a35c34c79ffbd1d8";
 const V37_ARTIFACT_SHA256: &str =
     "b667411568557ea5b58d2ef146d53734a91b6fb5495a6f4344ec4d511e2cfac1";
+const V38_ARTIFACT_SHA256: &str =
+    "ef93079a444aae23f5302d9ab72bee0b3a3cb22da729eec3c15123e786a4879a";
 /// The digests of retained historical artifacts: operator-app refusal, image
 /// handles and terminal-keystroke result envelopes, respectively.
 const V30_ARTIFACT_SHA256: &str =
@@ -157,6 +159,8 @@ fn every_repository_vocabulary_mirror_names_the_current_revision() {
                 V36_ARTIFACT_SHA256
             } else if path.ends_with("v37.json") {
                 V37_ARTIFACT_SHA256
+            } else if path.ends_with("v38.json") {
+                V38_ARTIFACT_SHA256
             } else {
                 panic!("{path} is a vocabulary artifact with no pinned digest")
             };
@@ -842,7 +846,9 @@ fn the_minted_artifact_is_the_generator_output_from_v12() {
         vocabulary_mint::v36_from_v35(&generated, historical_revision(36).as_str().unwrap());
     let generated =
         vocabulary_mint::v37_from_v36(&generated, historical_revision(37).as_str().unwrap());
-    let generated = vocabulary_mint::v38_from_v37(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
+    let generated =
+        vocabulary_mint::v38_from_v37(&generated, historical_revision(38).as_str().unwrap());
+    let generated = vocabulary_mint::v39_from_v38(&generated, COMPUTER_ACTION_VOCABULARY_REVISION);
     let bytes = canonical_json_bytes(&generated).unwrap();
     assert!(
         bytes == VOCABULARY.as_bytes(),
@@ -2095,7 +2101,7 @@ fn v33_only_adds_the_optional_development_diagnostic_to_results() {
 fn mint_current_vocabulary_artifact() {
     let resources = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
     let revision = COMPUTER_ACTION_VOCABULARY_REVISION;
-    let generated = vocabulary_mint::v38_from_v37(&historical_v37(), revision);
+    let generated = vocabulary_mint::v39_from_v38(&historical_v38(), revision);
     let bytes = canonical_json_bytes(&generated).unwrap();
     std::fs::write(resources.join(format!("{revision}.json")), &bytes).unwrap();
     let source_lock = resources.join("../../cerebellum/resources/implementation-source-lock.json");
@@ -2342,6 +2348,30 @@ fn v37_mint_matches_the_retained_artifact() {
         historical_v37(),
         vocabulary_mint::v37_from_v36(&historical_v36(), historical_revision(37).as_str().unwrap())
     );
+}
+
+fn historical_v38() -> Value {
+    let resources = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
+    let revision = historical_revision(38);
+    let bytes = std::fs::read(resources.join(format!("{}.json", revision.as_str().unwrap())))
+        .expect("read the historical v38 artifact");
+    assert_eq!(hex_digest(&bytes), V38_ARTIFACT_SHA256);
+    serde_json::from_slice(&bytes).expect("v38 is valid JSON")
+}
+
+#[test]
+fn v39_only_adds_capture_excluded_to_the_image_unavailable_reason() {
+    let previous = historical_v38();
+    let mut current = vocabulary_mint::v39_from_v38(&previous, COMPUTER_ACTION_VOCABULARY_REVISION);
+    assert_eq!(current["revision"], "computer_action_vocabulary-v39");
+    current["revision"] = previous["revision"].clone();
+    let read_state_result = &mut current["rows"][0]["result_schema"];
+    let reasons = read_state_result["properties"]["image_unavailable"]["properties"]["reason"]
+        ["enum"]
+        .as_array_mut()
+        .unwrap();
+    assert_eq!(reasons.pop(), Some(json!("capture_excluded")));
+    assert_eq!(current, previous);
 }
 
 fn historical_v36() -> Value {
