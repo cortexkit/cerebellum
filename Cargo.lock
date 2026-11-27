@@ -454,6 +454,7 @@ dependencies = [
  "cerebellum-macos",
  "cortexkit-paths",
  "cortexkit-test-support",
+ "libc",
  "serde_json",
 ]
 
