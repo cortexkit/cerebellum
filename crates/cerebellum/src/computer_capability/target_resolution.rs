@@ -12,12 +12,9 @@ where
     /// application's display name, or the refusal for a name that matches
     /// no running application or several.
     ///
-    /// A target spelled like a bundle identity (dotted, no spaces) is returned
-    /// as it is, without listing anything, so the process lookup that follows
-    /// still refuses one nobody runs as `not_running`. A display name is
-    /// matched against the running applications; when they cannot be listed,
-    /// the name is returned as it is and the process lookup refuses it as it
-    /// would any unknown bundle identity.
+    /// A target already spelled as an app identity goes directly to process
+    /// lookup. A display name is matched against running applications; if the
+    /// list cannot be read, process lookup handles the original name.
     pub(crate) async fn resolve_target_name(&self, target: &str) -> Result<String, Value> {
         self.resolve_target_name_holding(target, None).await
     }
@@ -64,11 +61,18 @@ where
     }
 }
 
-/// Whether a target is spelled like a bundle identity (`com.apple.Safari`)
-/// rather than a display name (`Safari`): dotted, with no spaces.
+/// Whether a target names an identity rather than a display name. Linux
+/// requires a scheme prefix; dotted desktop IDs are names, not identities.
 pub(crate) fn looks_like_bundle_identity(target: &str) -> bool {
-    let target = target.trim();
-    target.contains('.') && !target.contains(char::is_whitespace)
+    #[cfg(target_os = "linux")]
+    {
+        cerebellum_linux::identity::is_subject(target.trim())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let target = target.trim();
+        target.contains('.') && !target.contains(char::is_whitespace)
+    }
 }
 
 /// A target name resolved to a running application.
@@ -120,15 +124,27 @@ fn candidate_list(apps: &[&RunningApp]) -> Vec<Value> {
         .collect()
 }
 
-/// The distinct bundle identities among `apps`, sorted.
-fn distinct_identities<'a>(apps: &[&'a RunningApp]) -> Vec<&'a str> {
-    let mut identities: Vec<&str> = apps
-        .iter()
-        .map(|app| app.bundle_identity.as_str())
-        .collect();
-    identities.sort_unstable();
-    identities.dedup();
-    identities
+/// On Linux a package can contain different apps, and a name can match
+/// multiple processes of the same app. Do not collapse them to one match.
+fn target_matches<'a>(apps: &[&'a RunningApp]) -> Vec<&'a str> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut seen = std::collections::HashSet::new();
+        apps.iter()
+            .filter(|app| seen.insert(app.pid))
+            .map(|app| app.bundle_identity.as_str())
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut identities: Vec<&str> = apps
+            .iter()
+            .map(|app| app.bundle_identity.as_str())
+            .collect();
+        identities.sort_unstable();
+        identities.dedup();
+        identities
+    }
 }
 
 /// What a `target` given as a name resolves to among the running
@@ -140,11 +156,31 @@ fn distinct_identities<'a>(apps: &[&'a RunningApp]) -> Vec<&'a str> {
 /// [`names_in_part`]), so a model that shortens "Magic Context Dashboard"
 /// to "Magic Context" still reaches it; the reply then names the application
 /// it picked. A partial name fitting several applications is refused with
-/// all of them listed, never guessed between. Several processes of one
-/// application are one match here; resolving the bundle identity then
-/// refuses them as `ambiguous` exactly as it always has.
+/// all of them listed, never guessed between. macOS and Windows match the
+/// identity here and defer instance ambiguity to process resolution.
 pub(super) fn match_target_name(target: &str, apps: &[RunningApp]) -> Result<MatchedTarget, Value> {
     let wanted = target.trim();
+    #[cfg(target_os = "linux")]
+    if looks_like_bundle_identity(wanted) {
+        let matching: Vec<_> = apps
+            .iter()
+            .filter(|app| app.bundle_identity == wanted)
+            .collect();
+        return match target_matches(&matching).as_slice() {
+            [only] => Ok(MatchedTarget {
+                bundle_identity: (*only).to_owned(),
+                partial_name: None,
+            }),
+            [] => Err(not_named(wanted)),
+            _ => Err(json!({
+                "outcome": "ambiguous_app",
+                "target": wanted,
+                "candidates": candidate_list(&matching),
+                "remedy": "several running applications have this identity; retry with the name of the one you mean",
+            })),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
     if let Some(app) = apps
         .iter()
         .find(|app| app.bundle_identity.eq_ignore_ascii_case(wanted))
@@ -158,7 +194,7 @@ pub(super) fn match_target_name(target: &str, apps: &[RunningApp]) -> Result<Mat
         .iter()
         .filter(|app| app.name.trim().eq_ignore_ascii_case(wanted))
         .collect();
-    match distinct_identities(&named).as_slice() {
+    match target_matches(&named).as_slice() {
         [only] => {
             return Ok(MatchedTarget {
                 bundle_identity: (*only).to_string(),
@@ -182,7 +218,7 @@ pub(super) fn match_target_name(target: &str, apps: &[RunningApp]) -> Result<Mat
         .iter()
         .filter(|app| names_in_part(&app.name, wanted))
         .collect();
-    match distinct_identities(&partly).as_slice() {
+    match target_matches(&partly).as_slice() {
         [only] => Ok(MatchedTarget {
             bundle_identity: (*only).to_string(),
             partial_name: partly
@@ -190,13 +226,7 @@ pub(super) fn match_target_name(target: &str, apps: &[RunningApp]) -> Result<Mat
                 .find(|app| app.bundle_identity == *only)
                 .map(|app| app.name.trim().to_string()),
         }),
-        [] => Err(json!({
-            "outcome": "no_running_app_named",
-            "target": wanted,
-            "remedy": "no running application has this name or app identity; list_apps shows \
-                       the running applications, and any of their names or app identities \
-                       (bundle ids on macOS) is a target",
-        })),
+        [] => Err(not_named(wanted)),
         _ => Err(json!({
             "outcome": "ambiguous_app",
             "target": wanted,
@@ -205,6 +235,16 @@ pub(super) fn match_target_name(target: &str, apps: &[RunningApp]) -> Result<Mat
                        the app identity (a bundle id on macOS) of the one you mean",
         })),
     }
+}
+
+fn not_named(wanted: &str) -> Value {
+    json!({
+            "outcome": "no_running_app_named",
+            "target": wanted,
+            "remedy": "no running application has this name or app identity; list_apps shows \
+                       the running applications, and any of their names or app identities \
+                       (bundle ids on macOS) is a target",
+    })
 }
 
 #[cfg(test)]
@@ -227,6 +267,30 @@ mod name_match_tests {
             app("Mail", "com.apple.mail", 3),
             app("Mailspring", "com.example.mailspring", 4),
         ]
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_subject_prefix_and_instance_ambiguity() {
+        for scheme in ["dpkg:fixture", "rpm:Fixture", "snap:fixture", "sha256:cafe"] {
+            assert!(looks_like_bundle_identity(scheme));
+        }
+        assert!(!looks_like_bundle_identity("org.example.Fixture"));
+        assert!(!looks_like_bundle_identity("flatpak:org.example.Fixture"));
+        let first = app("org.example.Fixture", "dpkg:fixture", 17);
+        let repeated = [first.clone(), first.clone()];
+        assert_eq!(
+            match_target_name("org.example.Fixture", &repeated)
+                .unwrap()
+                .bundle_identity,
+            "dpkg:fixture"
+        );
+        let distinct = [first, app("org.example.Fixture", "dpkg:fixture", 42)];
+        for target in ["org.example.Fixture", "dpkg:fixture"] {
+            let refusal = match_target_name(target, &distinct).unwrap_err();
+            assert_eq!(refusal["outcome"], "ambiguous_app");
+            assert_eq!(refusal["candidates"].as_array().unwrap().len(), 2);
+        }
     }
 
     #[test]

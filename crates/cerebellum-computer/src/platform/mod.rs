@@ -355,13 +355,28 @@ impl LinuxReleaseInputs {
 pub const LINUX_X11_DOWN_GESTURE_RECOVERY_MEASURED: bool = false;
 
 #[cfg(target_os = "linux")]
-fn linux_attestation_bound(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        !value.trim().is_empty()
-            && !["placeholder", "tbd", "unknown"]
-                .iter()
-                .any(|stand_in| value.eq_ignore_ascii_case(stand_in))
-    })
+pub const fn linux_attestation_bound(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let mut bytes = value.as_bytes();
+    // The compiled identity-reader flag and the advertised capabilities
+    // must agree on which review revisions are valid, even for Unicode spaces.
+    loop {
+        bytes = match bytes {
+            [] => return false,
+            [b'\t'..=b'\r' | b' ', rest @ ..]
+            | [0xc2, 0x85 | 0xa0, rest @ ..]
+            | [0xe1, 0x9a, 0x80, rest @ ..]
+            | [0xe2, 0x80, 0x80..=0x8a | 0xa8 | 0xa9 | 0xaf, rest @ ..]
+            | [0xe2, 0x81, 0x9f, rest @ ..]
+            | [0xe3, 0x80, 0x80, rest @ ..] => rest,
+            _ => break,
+        };
+    }
+    !value.eq_ignore_ascii_case("placeholder")
+        && !value.eq_ignore_ascii_case("tbd")
+        && !value.eq_ignore_ascii_case("unknown")
 }
 
 impl ImmutableReleaseInputs {

@@ -635,6 +635,91 @@ fn scratch_directory(label: &str) -> std::path::PathBuf {
     directory
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_identity_grants_keep_package_upgrades_but_not_digest_always_answers() {
+    let directory = scratch_directory("linux-app-grants");
+    let path = directory.join("agent-grants.json");
+    let open = || {
+        Arc::new(agent_grants_over(Arc::new(
+            FilesystemAgentGrantStorage::new(&path),
+        )))
+    };
+    let make_need = |subject: &str, ad_hoc| GrantNeed::App {
+        bundle_identity: subject.to_string(),
+        display_name: "Editor".to_string(),
+        code: Arc::new(InjectedCode::new(Ok(AppIdentity {
+            team_id: None,
+            designated_requirement: subject.to_string(),
+            ad_hoc,
+            apple_anchored: false,
+        }))),
+    };
+    let package = "dpkg:editor";
+    let local = format!("sha256:{}", "a1".repeat(32));
+    let first = open();
+    let allow = ScriptedCarrier::answering(&["allow_always"]);
+    let grant = first
+        .require(
+            &make_need(package, false),
+            &asking(&allow, caller("installed", true)),
+            &cerebellum::CancelHandle::pending(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(grant.persisted, Some(Ok(())));
+    assert!(decisions(&allow.questions()[0])
+        .iter()
+        .any(|choice| choice == "allow_always"));
+    drop(first);
+
+    let reopened = open();
+    let silence = ScriptedCarrier::default();
+    reopened
+        .require(
+            &make_need(package, false),
+            &asking(&silence, caller("after-upgrade", true)),
+            &cerebellum::CancelHandle::pending(),
+        )
+        .await
+        .unwrap();
+    assert!(silence.questions().is_empty());
+
+    let force_always = ScriptedCarrier::answering(&["allow_always"]);
+    let refusal = reopened
+        .require(
+            &make_need(&local, true),
+            &asking(&force_always, caller("after-upgrade", true)),
+            &cerebellum::CancelHandle::pending(),
+        )
+        .await
+        .unwrap_err()
+        .reply(Some(&local));
+    assert_eq!(refusal["reason"], "unrecognized_answer");
+    assert!(!decisions(&force_always.questions()[0])
+        .iter()
+        .any(|choice| choice == "allow_always"));
+    assert_eq!(force_always.questions()[0]["params"]["scope"]["app"], local);
+
+    let deny_local = ScriptedCarrier::answering(&["deny"]);
+    let refusal = reopened
+        .require(
+            &make_need(&local, true),
+            &asking(&deny_local, caller("after-upgrade", true)),
+            &cerebellum::CancelHandle::pending(),
+        )
+        .await;
+    assert!(matches!(refusal, Err(ConsentRefusal::Denied { .. })));
+    assert!(reopened.holds(&caller("after-upgrade", true), &make_need(package, false)));
+    assert!(!reopened.holds(&caller("after-upgrade", true), &make_need(&local, true)));
+    let stored = FilesystemAgentGrantStorage::new(&path)
+        .load()
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.grants.len(), 1);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 /// Unreadable unified storage withholds all grants and is never overwritten.
 #[tokio::test]
 async fn a_corrupt_store_fails_closed_and_is_disclosed() {

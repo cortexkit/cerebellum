@@ -35,7 +35,7 @@ use crate::classification::canonical_grant_origin;
 use crate::computer_grants::{
     AppCode, ComputerGrants, ConsentContext, GrantNeed, NoIdentityReader,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::computer_grants::{AppIdentity, AppIdentityUnreadable};
 use crate::launch_recovery::{ClearFailure, ClearPreview, LaunchRecoveryRegistry};
 use crate::profile::{ProfileLifecycle, RebindProvenance, RebindRefusal, RebindReport};
@@ -246,6 +246,44 @@ impl AppCode for RunningCode {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) struct LinuxAppCode {
+    pub(crate) grant: ProcessGrant,
+    pub(crate) reader: Arc<cerebellum_linux::identity::IdentityReader>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxAppCode {
+    fn prove(&self) -> Result<cerebellum_linux::identity::VerifiedApp, AppIdentityUnreadable> {
+        self.reader
+            .reprove(
+                self.grant.pid,
+                &self.grant.process_generation_evidence,
+                &self.grant.bundle_identity,
+            )
+            .map_err(|reason| AppIdentityUnreadable::Failed {
+                detail: reason.reason().to_owned(),
+            })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AppCode for LinuxAppCode {
+    fn identity(&self) -> Result<AppIdentity, AppIdentityUnreadable> {
+        let app = self.prove()?;
+        Ok(AppIdentity {
+            team_id: None,
+            ad_hoc: !cerebellum_linux::identity::is_package_subject(&app.subject),
+            designated_requirement: app.subject,
+            apple_anchored: false,
+        })
+    }
+
+    fn satisfies(&self, designated_requirement: &str) -> Result<bool, AppIdentityUnreadable> {
+        Ok(self.prove()?.subject == designated_requirement)
+    }
+}
+
 /// Resolves application names against this machine.
 ///
 /// macOS and Windows each supply a window-owner reading to the platform-neutral
@@ -255,17 +293,28 @@ impl AppCode for RunningCode {
 #[derive(Debug, Default)]
 pub struct PlatformResolver {
     timeout: Duration,
+    #[cfg(target_os = "linux")]
+    linux_identity: Arc<cerebellum_linux::identity::IdentityReader>,
 }
 
 impl PlatformResolver {
     /// Whether the production resolver supplies an app-code identity reader.
     /// Keep this aligned with its `TargetResolver::app_code` implementation:
     /// the default reader refuses every identity, so it cannot mint app grants.
+    #[cfg(not(target_os = "linux"))]
     pub(crate) const HAS_APP_IDENTITY_READER: bool = cfg!(target_os = "macos");
+
+    #[cfg(target_os = "linux")]
+    pub(crate) const HAS_APP_IDENTITY_READER: bool =
+        cerebellum_computer::platform::linux_attestation_bound(
+            crate::computer_capability::linux::IDENTITY_REVIEW,
+        );
 
     pub fn new() -> Self {
         Self {
             timeout: Duration::from_secs(10),
+            #[cfg(target_os = "linux")]
+            linux_identity: Arc::default(),
         }
     }
 }
@@ -378,6 +427,18 @@ impl TargetResolver for PlatformResolver {
             Arc::new(crate::computer_capability::windows_identity::RunningCode(
                 grant.clone(),
             ))
+        } else {
+            Arc::new(NoIdentityReader)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn app_code(&self, grant: &ProcessGrant) -> Arc<dyn AppCode> {
+        if Self::HAS_APP_IDENTITY_READER {
+            Arc::new(LinuxAppCode {
+                grant: grant.clone(),
+                reader: Arc::clone(&self.linux_identity),
+            })
         } else {
             Arc::new(NoIdentityReader)
         }

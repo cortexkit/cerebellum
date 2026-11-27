@@ -18,6 +18,8 @@ pub mod eds;
 #[cfg(any(target_os = "linux", test))]
 mod exec_stop;
 #[cfg(target_os = "linux")]
+pub mod identity;
+#[cfg(target_os = "linux")]
 mod launch;
 #[cfg(target_os = "linux")]
 pub mod session;
