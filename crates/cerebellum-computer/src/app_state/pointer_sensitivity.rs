@@ -2,7 +2,7 @@
 //! without AX semantics cannot reveal a credential or payment form; readable
 //! canvases remain usable under takeover. This is not pixel classification.
 
-use super::source::{AppStateSource, ElementFacts, ElementHandle, HitScope};
+use super::source::{AppStateSource, ElementFacts, ElementHandle};
 use crate::platform::ProcessGrant;
 
 /// Exact window number, not just application identity: a same-application
@@ -50,13 +50,16 @@ pub fn pointer_target_check_until(
     Ok(())
 }
 
-fn hazardous(facts: &ElementFacts) -> bool {
+fn hazardous(facts: &ElementFacts, windows: bool) -> bool {
     facts.is_secure()
-        || (matches!(facts.role.as_deref(), Some("AXMenuItem" | "AXMenuBarItem"))
-            && facts
-                .title
-                .as_deref()
-                .is_some_and(super::render::is_session_ending_title))
+        || hazardous_role_title(facts.role.as_deref(), facts.title.as_deref(), windows)
+}
+
+pub(crate) fn hazardous_role_title(role: Option<&str>, title: Option<&str>, windows: bool) -> bool {
+    role == Some("AXSecureTextField")
+        || (matches!(role, Some("AXMenuItem" | "AXMenuBarItem"))
+            && title
+                .is_some_and(|title| super::render::is_session_ending_title_for(title, windows)))
 }
 
 /// A readable, non-sensitive path must reach the exact imaged window. A lost
@@ -71,7 +74,9 @@ fn safe_path(
         let Ok(facts) = source.element_facts(&element) else {
             return false;
         };
-        if facts.role.is_none() || facts.pid.is_some_and(|owner| owner != pid) || hazardous(&facts)
+        if facts.role.is_none()
+            || facts.pid.is_some_and(|owner| owner != pid)
+            || hazardous(&facts, element.uses_windows_menu_titles())
         {
             return false;
         }
@@ -96,9 +101,7 @@ pub fn pointer_target_safe(
     point: (f64, f64),
     window: u32,
 ) -> bool {
-    let Ok(Some((element, owner))) =
-        source.element_at(HitScope::Application { pid: target.pid }, point)
-    else {
+    let Ok(Some((element, owner))) = source.element_at_for_target(target, point) else {
         return false;
     };
     if owner.is_some_and(|owner| owner != target.pid)

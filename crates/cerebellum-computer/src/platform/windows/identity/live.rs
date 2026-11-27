@@ -1,16 +1,18 @@
 use super::{shell_image, version::image_version, Principal};
+use crate::platform::windows::app_state::windows::{eligible_state, is_default_desktop};
 use crate::platform::{ProcessGrant, TargetCandidate, TargetResolution, UnreadableReason};
 use cerebellum_windows::{
     child_window_numbers, desktop_window_numbers, lock_image_file, retain_image_process,
     window_identity_facts, windows_system_directory, AuthenticodeFacts, FileIdentity,
     ImageMappingReading, LockedImageFile, ProcessStartTime, RetainedProcessHandle,
-    SessionProvenance, WindowIdentityFacts,
+    WindowIdentityFacts,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
@@ -249,6 +251,21 @@ pub struct FrameProof {
     process_generation: u64,
 }
 
+impl FrameProof {
+    pub(crate) fn content_window_and_thread(&self) -> (u32, u32) {
+        let (window, _, thread) = self.hosted.unwrap_or(self.root);
+        (window, thread)
+    }
+}
+
+pub(crate) fn frame_target_pid(root: &WindowIdentityFacts) -> Result<u32, IdentityError> {
+    if root.class == "ApplicationFrameWindow" {
+        frame_parts(root).map(|(_, child)| child.pid)
+    } else {
+        Ok(root.pid)
+    }
+}
+
 fn window_key(window: &WindowIdentityFacts) -> (u32, u32, u32) {
     (window.number, window.pid, window.tid)
 }
@@ -331,14 +348,31 @@ pub struct IdentityInventory {
 }
 
 pub fn identity_inventory(deadline: Instant) -> Result<IdentityInventory, IdentityError> {
-    within_deadline(deadline, move || read_inventory(deadline))
+    within_deadline(deadline, move || read_inventory(deadline, None))
 }
 
-fn read_inventory(deadline: Instant) -> Result<IdentityInventory, IdentityError> {
-    if !matches!(
-        cerebellum_windows::current_session_provenance(),
-        SessionProvenance::Console { .. }
-    ) {
+type ListedIdentity = (u32, LiveIdentity, bool);
+
+/// Listing may omit unreadable identities; target resolution still needs the
+/// entire inventory to rule out another process with the same principal.
+pub(crate) fn running_list(deadline: Instant) -> Result<Vec<ListedIdentity>, IdentityError> {
+    let progress = Arc::new(Mutex::new(None));
+    let worker = Arc::clone(&progress);
+    let result = within_deadline(deadline, move || read_inventory(deadline, Some(&worker)));
+    if !matches!(result, Ok(_) | Err(IdentityError::Deadline)) || !is_default_desktop() {
+        return Err(IdentityError::ReadingUnavailable);
+    }
+    let mut progress = progress
+        .lock()
+        .map_err(|_| IdentityError::ReadingUnavailable)?;
+    progress.take().ok_or(IdentityError::ReadingUnavailable)
+}
+
+fn read_inventory(
+    deadline: Instant,
+    listing: Option<&Mutex<Option<Vec<ListedIdentity>>>>,
+) -> Result<IdentityInventory, IdentityError> {
+    if !is_default_desktop() {
         return Err(IdentityError::ReadingUnavailable);
     }
     let mut inventory = IdentityInventory::default();
@@ -350,8 +384,13 @@ fn read_inventory(deadline: Instant) -> Result<IdentityInventory, IdentityError>
             inventory.unattributed_windows += 1;
             continue;
         };
-        if !root.visible_style {
-            continue;
+        match eligible_state(&root) {
+            Ok(Some(_)) => (),
+            Ok(None) => continue,
+            Err(_) => {
+                inventory.unattributed_windows += 1;
+                continue;
+            }
         }
         let pid = if root.class == "ApplicationFrameWindow" {
             match frame_parts(&root) {
@@ -369,6 +408,12 @@ fn read_inventory(deadline: Instant) -> Result<IdentityInventory, IdentityError>
         };
         windows.entry(pid).or_default().push(root);
     }
+    let foreground = if let Some(list) = listing {
+        *list.lock().map_err(|_| IdentityError::ReadingUnavailable)? = Some(Vec::new());
+        cerebellum_windows::foreground_window_number()
+    } else {
+        None
+    };
     for (pid, roots) in windows {
         remaining(deadline)?;
         let process = retain_image_process(pid).ok();
@@ -400,26 +445,39 @@ fn read_inventory(deadline: Instant) -> Result<IdentityInventory, IdentityError>
                 continue;
             }
         };
+        let mut frontmost = false;
         let window_count = roots
             .iter()
             .filter(|root| {
-                if frames.contains(&root.number) {
-                    frame_proof(&process, pid, root.number).is_ok_and(|proof| proof.is_some())
-                } else {
-                    window_identity_facts(root.number)
-                        .is_ok_and(|now| window_key(&now) == window_key(root))
-                }
+                let bound = window_identity_facts(root.number).is_ok_and(|now| {
+                    window_key(&now) == window_key(root)
+                        && eligible_state(&now).is_ok_and(|s| s.is_some())
+                }) && (!frames.contains(&root.number)
+                    || frame_proof(&process, pid, root.number).is_ok_and(|proof| proof.is_some()));
+                frontmost |= bound && foreground == Some(root.number);
+                bound
             })
             .count();
         if window_count != roots.len() {
             inventory.unattributed_windows += roots.len() - window_count;
         }
         if window_count > 0 {
-            inventory.apps.push(RunningIdentity {
-                pid,
-                identity,
-                window_count,
-            });
+            remaining(deadline)?;
+            if let Some(list) = listing {
+                if let Some(apps) = list
+                    .lock()
+                    .map_err(|_| IdentityError::ReadingUnavailable)?
+                    .as_mut()
+                {
+                    apps.push((pid, identity, frontmost));
+                }
+            } else {
+                inventory.apps.push(RunningIdentity {
+                    pid,
+                    identity,
+                    window_count,
+                });
+            }
         }
     }
     remaining(deadline)?;

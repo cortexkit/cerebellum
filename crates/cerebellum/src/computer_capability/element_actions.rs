@@ -22,15 +22,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cerebellum_computer::app_state::person::{person_change, PersonChange, Reading, SeenMarks};
-use cerebellum_computer::app_state::render::is_session_ending_title;
+use cerebellum_computer::app_state::render::is_session_ending_title_for;
 use cerebellum_computer::app_state::session::{Adoption, AppStateSessions, SessionRead};
 
 // One reply field name for both planes, so a host lifts browser and computer
 // state into text by the same key.
 use crate::browser::state_text::STATE_TEXT_FIELD;
 use cerebellum_computer::app_state::source::{
-    AppStateSource, ElementActionError, ElementFacts, ElementHandle, HitScope, ReadBounds,
-    TextAttribute,
+    AppStateSource, ElementActionError, ElementFacts, ElementHandle, ReadBounds, TextAttribute,
 };
 use cerebellum_computer::audit::{
     AccessibilityReadScope, ActuationElementIdentity, ActuationIntent, AuditToken,
@@ -967,9 +966,11 @@ fn describe_actions(actions: &[String]) -> String {
 /// Whether an element, as it is now, is a session-ending menu item. Checked
 /// at press time as well as when the tree is rendered, because a hit test
 /// finds elements no rendered tree showed and a title can change after a read.
-fn is_blocked_menu_item(facts: &ElementFacts) -> bool {
+fn is_blocked_menu_item(facts: &ElementFacts, handle: &ElementHandle) -> bool {
     matches!(facts.role.as_deref(), Some("AXMenuItem" | "AXMenuBarItem"))
-        && facts.title.as_deref().is_some_and(is_session_ending_title)
+        && facts.title.as_deref().is_some_and(|title| {
+            is_session_ending_title_for(title, handle.uses_windows_menu_titles())
+        })
 }
 
 fn is_menu_bar_command(
@@ -1004,7 +1005,7 @@ fn press_available(
     handle: &ElementHandle,
     capability: ComputerCapability,
 ) -> Result<&'static str, Value> {
-    if is_blocked_menu_item(facts) {
+    if is_blocked_menu_item(facts, handle) {
         return Err(blocked_menu_item_reply());
     }
     // On ordinary content AXShowMenu opens a context menu, not the element's
@@ -1380,7 +1381,7 @@ pub(crate) fn hit_test(
     grant: &ProcessGrant,
     point: (f64, f64),
 ) -> PointHit {
-    match source.element_at(HitScope::Application { pid: grant.pid }, point) {
+    match source.element_at_for_target(grant, point) {
         Ok(Some((handle, owner))) if owner.is_none_or(|owner| owner == grant.pid) => {
             PointHit::Element(handle)
         }

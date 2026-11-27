@@ -737,6 +737,7 @@ fn invoke_accessibility_from<Source: InvokeSource>(
 
 #[cfg(target_os = "windows")]
 mod platform {
+    pub mod scoped;
     use std::ffi::c_void;
     use std::mem;
     use std::ptr::{self, NonNull};
@@ -1506,6 +1507,9 @@ mod platform {
         1
     }
 }
+
+#[cfg(windows)]
+pub use platform::scoped;
 
 #[cfg(target_os = "windows")]
 pub use platform::{invoke_accessibility_element, read_accessibility_tree};

@@ -28,9 +28,13 @@ mod token_facts;
 mod window_identity_facts;
 #[cfg(any(target_os = "windows", test))]
 mod window_list;
+#[cfg(windows)]
+mod window_state_facts;
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[cfg(windows)]
+pub use accessibility::scoped::{with_scoped_uia, ScopedUia, UiaElementRef, UiaPatterns};
 #[cfg(target_os = "windows")]
 pub use accessibility::{
     invoke_accessibility_element, read_accessibility_tree, AccessibilityInvokeBounds,
@@ -58,6 +62,11 @@ pub use token_facts::{
 pub use window_identity_facts::{
     child_window_numbers, desktop_window_numbers, window_identity_facts, windows_system_directory,
     WindowIdentityFacts,
+};
+#[cfg(windows)]
+pub use window_state_facts::{
+    desktop_z_order, foreground_window_number, gui_thread_windows, input_desktop_name,
+    root_window_number, window_owner, window_state_facts, GuiThreadWindows, WindowStateFacts,
 };
 #[cfg(target_os = "windows")]
 pub use windows::{

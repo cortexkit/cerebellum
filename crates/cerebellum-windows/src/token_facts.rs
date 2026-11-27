@@ -1,5 +1,6 @@
-//! Facts from the current process's primary access token.
+//! Facts from a process's primary access token.
 
+use crate::RetainedProcessHandle;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
@@ -30,10 +31,15 @@ struct Token(HANDLE);
 
 impl Token {
     fn current_process() -> Option<Self> {
+        // SAFETY: GetCurrentProcess returns the live process pseudo-handle.
+        Self::from_process(unsafe { GetCurrentProcess() })
+    }
+
+    fn from_process(process: HANDLE) -> Option<Self> {
         let mut token = null_mut();
-        // SAFETY: GetCurrentProcess returns a valid pseudo-handle, and `token`
+        // SAFETY: The caller supplies a live process handle, and `token`
         // receives an independently owned handle on success.
-        let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+        let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
         (opened != 0).then(|| Self(token))
     }
 }
@@ -48,7 +54,16 @@ impl Drop for Token {
 /// Read the elevation flag and mandatory integrity RID, or no reading if either
 /// query fails.
 pub fn current_process_token_facts() -> Option<TokenFacts> {
-    let token = Token::current_process()?;
+    token_facts(Token::current_process()?)
+}
+
+impl RetainedProcessHandle {
+    pub fn token_facts(&self) -> Option<TokenFacts> {
+        token_facts(Token::from_process(self.handle)?)
+    }
+}
+
+fn token_facts(token: Token) -> Option<TokenFacts> {
     let mut elevation = TOKEN_ELEVATION::default();
     let mut written = 0;
     // SAFETY: The token is live; the supplied buffer matches TokenElevation's
