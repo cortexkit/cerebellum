@@ -1,4 +1,4 @@
-//! Call-time permission admission from the plane's immutable startup readings.
+//! Call-time permission admission from the startup readings or Linux session epoch.
 
 use cerebellum_computer::audit::ComputerCapability;
 use cerebellum_computer::platform::{
@@ -36,7 +36,7 @@ pub(super) fn refusal(
         if state == PermissionLiveness::Live {
             return None;
         }
-        let (permission, label) = match service {
+        let (permission, _label) = match service {
             PermissionService::Accessibility | PermissionService::PostEvent => {
                 ("accessibility", "Accessibility")
             }
@@ -45,11 +45,14 @@ pub(super) fn refusal(
                 ("input_monitoring", "Input Monitoring")
             }
         };
+        #[cfg(not(target_os = "linux"))]
         let remedy = if state == PermissionLiveness::GrantedPendingRelaunch {
             "restart cerebellum to use the permission already granted to ck-cerebellum".to_string()
         } else {
-            missing_permission_remedy(label)
+            missing_permission_remedy(_label)
         };
+        #[cfg(target_os = "linux")]
+        let remedy = missing_permission_remedy(service);
         Some(json!({
             "outcome": "permission_missing",
             "detail": {"permission": permission, "state": state},
@@ -63,12 +66,25 @@ fn missing_permission_remedy(_label: &str) -> String {
     "On Windows, run cerebellum and the target app without administrator privileges in the same interactive desktop session, then restart cerebellum; if the permission is still unavailable, report it".to_string()
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn missing_permission_remedy(label: &str) -> String {
     format!(
         "On macOS, grant {label} to ck-cerebellum in System Settings > Privacy & Security, then \
          restart cerebellum; permission readings are taken only at startup"
     )
+}
+
+#[cfg(target_os = "linux")]
+fn missing_permission_remedy(service: PermissionService) -> String {
+    let facility = match service {
+        PermissionService::Accessibility => "the AT-SPI accessibility bus",
+        PermissionService::PostEvent => "XTEST",
+        PermissionService::ScreenRecording => "XComposite and XDamage",
+        PermissionService::InputMonitoring | PermissionService::RawHidObservation => {
+            "the XI2 raw input observer"
+        }
+    };
+    format!("Verify that {facility} is available in the active Linux desktop session")
 }
 
 #[cfg(test)]

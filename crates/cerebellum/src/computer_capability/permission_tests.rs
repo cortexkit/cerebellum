@@ -91,13 +91,16 @@ fn permission_states_never_change_serialized_tool_definitions() {
     assert!(live[1].is_some(), "browser_use must be offered");
     assert_eq!(
         live[0].is_some(),
-        cfg!(target_os = "macos"),
-        "computer_use is offered exactly where app grants can be minted"
+        !crate::computer_release_evidence(&context(PermissionLiveness::Live))
+            .advertised_capabilities
+            .is_empty(),
+        "computer_use is offered exactly when the admitted set is nonempty"
     );
     // Also build declarations with platform support enabled on every host. On
     // non-macOS hosts, the HELLO message the module sends the daemon offers no
     // computer plane at all, leaving every row untested there.
     let live_declarations = capability_declarations(&context(PermissionLiveness::Live), true);
+    #[cfg(not(target_os = "linux"))]
     assert_eq!(
         live_declarations
             .iter()
@@ -439,6 +442,7 @@ mod wire {
 
 /// A new platform row must not disappear in the module's second, explicit
 /// release gate table. Test on every host without borrowing its TCC readings.
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn every_advertised_platform_row_is_admitted_by_the_module_release_gate() {
     let context = context(PermissionLiveness::Live);
@@ -461,4 +465,141 @@ fn every_advertised_platform_row_is_admitted_by_the_module_release_gate() {
         missing.is_empty(),
         "platform-advertised capabilities missing a module release-gate arm: {missing:?}"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_reviews_admit_only_their_rows_independent_of_startup_readings() {
+    use cerebellum_computer::platform::LinuxReleaseInputs;
+    let fixture = context(PermissionLiveness::Live);
+    let reviewed = |mask: u32| {
+        let bound = |key: u32| ((mask & (1_u32 << key)) != 0_u32).then(|| "fixture".to_owned());
+        LinuxReleaseInputs {
+            app_identity: bound(0),
+            semantic: bound(1),
+            launch: bound(2),
+            x11_capture: bound(3),
+            x11_fronting: bound(4),
+            x11_takeover: bound(5),
+        }
+    };
+    for mask in 0..64 {
+        let mut fixture = fixture.clone();
+        fixture.inputs.linux = reviewed(mask);
+        let mut expected = Vec::new();
+        if mask & 3 == 3 {
+            expected.extend([
+                "read_state",
+                "wait",
+                "list_apps",
+                "press_element",
+                "write_text",
+            ]);
+            if mask & 16 != 0 {
+                expected.extend(["type", "keys"]);
+            }
+            if mask & 40 == 40 {
+                expected.extend(["takeover_move", "takeover_scroll"]);
+            }
+        }
+        if mask & 5 == 5 {
+            expected.push("open_app");
+        }
+        if mask == 63 {
+            for field in [
+                "attendance_contract_owner",
+                "attendance_contract_revision",
+                "release_signing_topology_revision",
+                "source_lock_digest",
+            ] {
+                let mut missing = fixture.clone();
+                let mut expected = expected.clone();
+                match field {
+                    "attendance_contract_owner" => missing.inputs.attendance_contract_owner = None,
+                    "attendance_contract_revision" => {
+                        missing.inputs.attendance_contract_revision = None
+                    }
+                    "release_signing_topology_revision" => {
+                        missing.inputs.release_signing_topology_revision = None
+                    }
+                    _ => {
+                        missing.inputs.vocabulary_digests.source_lock_digest =
+                            Some("mismatched".into())
+                    }
+                }
+                if field.starts_with("attendance") {
+                    expected.retain(|row| !["type", "keys"].contains(row));
+                } else {
+                    expected.clear();
+                }
+                assert_linux_advertisement(&missing, &expected);
+            }
+        }
+        assert_linux_advertisement(&fixture, &expected);
+        let before = crate::build_manifest_with_computer_plane("fixture", &fixture);
+        fixture.permissions = PermissionLivenessReport::default();
+        fixture.startup.permissions = PermissionLivenessReport::default();
+        assert_eq!(
+            serde_json::to_vec(&before).unwrap(),
+            serde_json::to_vec(&crate::build_manifest_with_computer_plane(
+                "fixture", &fixture
+            ))
+            .unwrap()
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_linux_advertisement(context: &CapabilityAdvertisementContext, expected: &[&str]) {
+    use std::collections::BTreeSet;
+    let expected = expected
+        .iter()
+        .map(|name| format!("computer.{name}"))
+        .collect::<BTreeSet<_>>();
+    let evidence = crate::computer_release_evidence(context);
+    assert_eq!(
+        evidence
+            .advertised_capabilities
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
+    assert_eq!(
+        evidence
+            .gate_admitted_capabilities
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
+    let manifest = crate::build_manifest_with_computer_plane("fixture", context);
+    let subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } = &manifest.provides[0]
+    else {
+        panic!("no tools in manifest");
+    };
+    assert_eq!(
+        tools.iter().any(|tool| tool.name == "computer_use"),
+        !expected.is_empty()
+    );
+    assert_eq!(
+        tools
+            .iter()
+            .filter(|tool| tool.name.starts_with("computer."))
+            .map(|tool| tool.name.clone())
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_down_gesture_measurement_does_not_require_fronting_for_drag() {
+    use cerebellum_computer::{audit::ComputerCapability::*, platform::LinuxReleaseInputs as Keys};
+    let bound = |gate: &str| gate != Keys::FRONTING;
+    for row in [TakeoverMove, TakeoverScroll] {
+        assert!(Keys::row_reviewed(row, bound, false));
+    }
+    assert!(!Keys::row_reviewed(TakeoverDrag, bound, false));
+    assert!(Keys::row_reviewed(TakeoverDrag, bound, true));
+    assert!(!Keys::row_reviewed(TakeoverClick, bound, true));
+    assert!(Keys::row_reviewed(TakeoverClick, |_| true, true));
 }

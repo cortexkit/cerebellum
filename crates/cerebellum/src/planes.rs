@@ -273,6 +273,15 @@ impl Planes {
         #[cfg(target_os = "macos")]
         let takeover_dispatch_review_revision =
             compiled_release_inputs().takeover_dispatch_review_revision;
+        #[cfg(target_os = "linux")]
+        let computer_context = default_computer_context();
+        #[cfg(target_os = "linux")]
+        let computer_admitted = Arc::new(
+            computer_release_evidence(&computer_context)
+                .advertised_capabilities
+                .into_iter()
+                .collect(),
+        );
         Self {
             health,
             agent_data: Arc::new(match journal {
@@ -365,6 +374,14 @@ impl Planes {
                     )),
                 )
             }),
+            #[cfg(target_os = "linux")]
+            computer: computer_capability::linux::plane(
+                &computer_context.inputs,
+                Arc::clone(&computer_admitted),
+                journal,
+            ),
+            #[cfg(target_os = "linux")]
+            computer_admitted,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             computer_admitted: Arc::new(
                 computer_release_evidence(&default_computer_context())
@@ -433,9 +450,9 @@ impl Clone for Planes {
             user_browser_cards: Arc::clone(&self.user_browser_cards),
             #[cfg(test)]
             consent_test: self.consent_test.clone(),
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             computer: self.computer.clone(),
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             computer_admitted: Arc::clone(&self.computer_admitted),
             capture: Arc::clone(&self.capture),
             calls: Arc::clone(&self.calls),

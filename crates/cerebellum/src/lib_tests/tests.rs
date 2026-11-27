@@ -1497,6 +1497,8 @@ async fn an_unsolicited_answer_is_dropped_without_closing_the_route() {
         browser_queue: Arc::new(call_queue::ConversationQueue::default()),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         computer_admitted: test_admitted_computer_capabilities(),
+        #[cfg(target_os = "linux")]
+        computer_admitted: Arc::default(),
         health: Arc::new(HealthState::default()),
         routes: Arc::new(RouteBindings::new()),
         browser: Arc::new(BrowserPlane::new()),
@@ -1516,6 +1518,8 @@ async fn an_unsolicited_answer_is_dropped_without_closing_the_route() {
         consent_test: None,
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
+        #[cfg(target_os = "linux")]
+        computer: Err(computer_capability::ComputerPlaneUnavailable::NoLinuxReviews),
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         drain_signal: Arc::new(tokio::sync::watch::channel(false).0),
         drain_notice: Arc::new(std::sync::OnceLock::new()),
@@ -3479,6 +3483,8 @@ async fn an_unsupported_surface_is_refused_by_name() {
         browser_queue: Arc::new(call_queue::ConversationQueue::default()),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         computer_admitted: test_admitted_computer_capabilities(),
+        #[cfg(target_os = "linux")]
+        computer_admitted: Arc::default(),
         health: Arc::new(HealthState::default()),
         routes: Arc::new(RouteBindings::new()),
         browser: Arc::new(BrowserPlane::new()),
@@ -3498,6 +3504,8 @@ async fn an_unsupported_surface_is_refused_by_name() {
         consent_test: None,
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
+        #[cfg(target_os = "linux")]
+        computer: Err(computer_capability::ComputerPlaneUnavailable::NoLinuxReviews),
         #[cfg(test)]
         route_test_handler: None,
         #[cfg(test)]
@@ -3578,6 +3586,8 @@ pub(super) fn management_bound_planes_with_admission_facts(
         browser_queue: Arc::new(call_queue::ConversationQueue::default()),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         computer_admitted: test_admitted_computer_capabilities(),
+        #[cfg(target_os = "linux")]
+        computer_admitted: Arc::default(),
         health: Arc::new(HealthState::default()),
         routes: Arc::new(RouteBindings::new()),
         browser: Arc::new(BrowserPlane::new()),
@@ -3597,6 +3607,8 @@ pub(super) fn management_bound_planes_with_admission_facts(
         consent_test: None,
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         computer: Err(computer_capability::ComputerPlaneUnavailable::CaptureCustody),
+        #[cfg(target_os = "linux")]
+        computer: Err(computer_capability::ComputerPlaneUnavailable::NoLinuxReviews),
         #[cfg(test)]
         route_test_handler: None,
         #[cfg(test)]
@@ -3829,6 +3841,17 @@ fn struck_gates_remain_recorded_and_are_not_evaluated() {
         startup: StartupCapabilityProbe::default(),
     };
     let outcomes = computer_gate_outcomes(&context);
+    #[cfg(target_os = "linux")]
+    let outcomes = {
+        let mut outcomes = outcomes;
+        for gate in computer::platform::LinuxReleaseInputs::GATES {
+            assert_eq!(
+                outcomes.remove(gate),
+                Some(ComputerGateOutcome::MissingExternalInput { gate: gate.into() })
+            );
+        }
+        outcomes
+    };
     assert_eq!(
         outcomes.into_values().collect::<Vec<_>>(),
         vec![ComputerGateOutcome::Pass; 16]
@@ -3838,6 +3861,25 @@ fn struck_gates_remain_recorded_and_are_not_evaluated() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
+    let historical = |manifest: Value| {
+        #[cfg(target_os = "linux")]
+        let manifest = {
+            let mut manifest = manifest;
+            let outcomes = manifest["computer_plane_release"]["gate_outcomes"]
+                .as_array_mut()
+                .unwrap();
+            for gate in computer::platform::LinuxReleaseInputs::GATES {
+                let expected = json!({"MissingExternalInput": {"gate": gate}});
+                let index = outcomes
+                    .iter()
+                    .position(|outcome| *outcome == expected)
+                    .expect("an unbound Linux review must be reported");
+                outcomes.remove(index);
+            }
+            manifest
+        };
+        manifest
+    };
     let context = ComputerCapabilityAdvertisementContext {
         inputs: release_inputs_from_build_bindings(fully_bound_release_bindings()),
         permissions: Default::default(),
@@ -3846,12 +3888,12 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
     let provenance = subc_protocol::manifest::ManifestProvenance::new()
         .with_build_git_sha(Some("0123456789abcdef0123456789abcdef01234567".to_string()))
         .with_wire_crate_version(Some("0.32.4".to_string()));
-    let value = compose_manifest(
+    let value = historical(compose_manifest(
         "manifest-fixture",
         &context,
         &BrowserSurface::NotConfigured,
         Some(provenance.clone()),
-    );
+    ));
     assert!(takeover_pointer_fronting_admitted(&context.inputs));
     let mut unbound_context = ComputerCapabilityAdvertisementContext {
         inputs: context.inputs.clone(),
@@ -3862,12 +3904,12 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
         .inputs
         .takeover_pointer_fronting_review_revision = None;
     assert!(!takeover_pointer_fronting_admitted(&unbound_context.inputs));
-    let unbound = compose_manifest(
+    let unbound = historical(compose_manifest(
         "manifest-fixture",
         &unbound_context,
         &BrowserSurface::NotConfigured,
         Some(provenance.clone()),
-    );
+    ));
     let digest = |manifest: &Value| manifest::sha256_hex(manifest.to_string().as_bytes());
     println!(
         "fixed HELLO bound={} unbound={}",
@@ -3896,7 +3938,12 @@ fn fixed_input_hello_manifest_bytes_match_pre_inspection_builder() {
         .unwrap()
         .unwrap(),
     );
-    let configured = compose_manifest("manifest-fixture", &context, &browser, Some(provenance));
+    let configured = historical(compose_manifest(
+        "manifest-fixture",
+        &context,
+        &browser,
+        Some(provenance),
+    ));
     let prior_configured = without_press_key(configured.clone());
     #[cfg(target_os = "linux")]
     let configured_pins = [
@@ -4150,6 +4197,7 @@ fn hello_manifest_declares_no_map_an_older_daemon_does_not_know() {
 
 /// Every external attestation bound, as a release build supplying all of
 /// them would compile it.
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn pointer_fronting_review_admits_measured_down_gestures_and_keeps_legacy_drag() {
     use std::collections::BTreeSet;
@@ -4253,6 +4301,16 @@ fn app_use_fronting_review_is_reported_and_gates_no_row() {
     assert_eq!(unbound.app_use_fronting_review_revision, None);
 
     let context = |inputs: ComputerReleaseInputs| ComputerCapabilityAdvertisementContext {
+        #[cfg(target_os = "linux")]
+        inputs: ComputerReleaseInputs {
+            linux: computer::platform::LinuxReleaseInputs {
+                app_identity: Some("identity-review".into()),
+                semantic: Some("semantic-review".into()),
+                ..Default::default()
+            },
+            ..inputs
+        },
+        #[cfg(not(target_os = "linux"))]
         inputs,
         permissions: Default::default(),
         startup: StartupCapabilityProbe::default(),
@@ -4432,6 +4490,7 @@ async fn the_built_plane_admits_fronting_and_preview_capture_only_as_its_release
 /// whatever the declaration says. Each review is left unbound in turn
 /// through the attestation path while the declarations are taken as
 /// advertised, so only the gate stands between the rows and the manifest.
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn the_release_gate_holds_the_takeover_rows_to_both_reviews() {
     let bindings = |global: Option<&'static str>, takeover: Option<&'static str>| {

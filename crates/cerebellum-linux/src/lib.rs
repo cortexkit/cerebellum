@@ -17,6 +17,8 @@ pub mod eds;
 mod exec_stop;
 #[cfg(target_os = "linux")]
 mod launch;
+#[cfg(target_os = "linux")]
+pub mod session;
 // Parsing procfs stays compiled under tests off Linux so the field-boundary
 // checks remain exercised where launching a Linux tracee is impossible.
 #[cfg(any(target_os = "linux", test))]

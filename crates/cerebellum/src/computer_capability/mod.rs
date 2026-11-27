@@ -60,6 +60,13 @@ pub(crate) type NativeComputerPlatformDriver = cerebellum_computer::platform::Ma
 pub(crate) mod turn_stop_driver;
 #[cfg(target_os = "windows")]
 pub(crate) type NativeComputerPlatformDriver = cerebellum_computer::platform::WindowsPlatformDriver;
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
+#[cfg(target_os = "linux")]
+use linux::{
+    LinuxCaptureBackend as NativeComputerCaptureBackend,
+    LinuxDriver as NativeComputerPlatformDriver,
+};
 #[cfg(target_os = "macos")]
 pub(crate) type NativeComputerCaptureBackend =
     cerebellum_computer::platform::native::NativeCaptureBackend;
@@ -75,6 +82,10 @@ pub(crate) fn native_capture_backend() -> NativeComputerCaptureBackend {
 #[cfg(target_os = "windows")]
 pub(crate) fn native_capture_backend() -> NativeComputerCaptureBackend {
     cerebellum_computer::platform::WindowsUnsupportedCaptureBackend
+}
+#[cfg(target_os = "linux")]
+pub(crate) fn native_capture_backend() -> NativeComputerCaptureBackend {
+    linux::LinuxCaptureBackend
 }
 use cerebellum_computer::platform::{
     blocked_chord, current_blocked_chord_platform, system_wide_chord, ActionKind, DispatchMode,
@@ -165,7 +176,7 @@ mod serialize;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 pub(crate) use permissions::live_for_test;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub(crate) use serialize::{arrive as computer_arrival, scope as serialized_call};
 mod takeover;
 mod target_resolution;
@@ -180,7 +191,7 @@ use crate::management::{AppRefusal, ManagementPlane};
 /// severity table, redaction policy and storage are decisions this module makes
 /// once, and spelling them at each use invites a caller substituting a different
 /// redaction policy without that reading as a change of policy.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub type RunningComputerPlane = ComputerPlane<
     NativeComputerCaptureBackend,
     cerebellum_computer::audit::redaction::ExcludeApplicationText,
@@ -192,6 +203,8 @@ pub type RunningComputerPlane = ComputerPlane<
 /// Why the computer plane cannot be assembled at boot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComputerPlaneUnavailable {
+    #[cfg(target_os = "linux")]
+    NoLinuxReviews,
     SeverityTaxonomy(cerebellum_computer::platform::severity::SeverityArtifactError),
     JournalStorage {
         path: PathBuf,
@@ -205,6 +218,8 @@ pub enum ComputerPlaneUnavailable {
 impl std::fmt::Display for ComputerPlaneUnavailable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::NoLinuxReviews => formatter.write_str("no Linux desktop review is bound"),
             Self::SeverityTaxonomy(error) => {
                 write!(formatter, "the severity taxonomy is unloadable: {error}")
             }
@@ -227,7 +242,7 @@ impl std::fmt::Display for ComputerPlaneUnavailable {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 #[allow(clippy::result_large_err)]
 fn reconcile_production_audit<R, T, S>(
     mut audit: ComputerAudit<R, T, S>,
@@ -257,7 +272,7 @@ where
 /// audit records are application data, not configuration. Initialization probes
 /// that directory before capabilities are offered and preserves the exact refusal
 /// reason instead of silently substituting process-local storage.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 #[allow(clippy::result_large_err)]
 pub fn production_audit() -> Result<RunningComputerAudit, ComputerPlaneUnavailable> {
     computer_audit(crate::JournalPersistence::Durable)
@@ -266,7 +281,7 @@ pub fn production_audit() -> Result<RunningComputerAudit, ComputerPlaneUnavailab
 /// The audit type a module's computer plane journals through: application text
 /// withheld, the pinned severity table, and a journal that is on disk or in
 /// memory as the plane's [`crate::JournalPersistence`] chose.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub type RunningComputerAudit = ComputerAudit<
     cerebellum_computer::audit::redaction::ExcludeApplicationText,
     cerebellum_core::journal::ValidatedSeverityTaxonomy,
@@ -279,7 +294,7 @@ pub type RunningComputerAudit = ComputerAudit<
 /// severity table, redaction, custody bounds, startup reconciliation -- and
 /// holds the journal in memory, so a test plane serves the same capabilities
 /// without creating, probing or reconciling the operator's `computer.json`.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 #[allow(clippy::result_large_err)]
 pub fn computer_audit(
     persistence: crate::JournalPersistence,
@@ -581,6 +596,8 @@ where
     /// Startup-only readings, retained so a grant made while running cannot
     /// silently enable dispatch before the module has restarted.
     permissions: cerebellum_computer::platform::PermissionLivenessReport,
+    #[cfg(target_os = "linux")]
+    linux_session: Option<Arc<linux::LinuxSession>>,
     /// The capture backend type a pixel-returning row will capture with. No
     /// served row captures today, so nothing is held; the type stays so the
     /// plane's shape does not change when the state read's image arrives.
@@ -714,6 +731,8 @@ where
             serializer: serialize::Serializer::default(),
             held_input: Arc::default(),
             permissions: crate::default_computer_context().startup.permissions,
+            #[cfg(target_os = "linux")]
+            linux_session: None,
             capture_backend: std::marker::PhantomData,
             app_state_source: native_app_state_source(),
             process_executable: Arc::new(operator_apps::native_executable),
@@ -1008,6 +1027,15 @@ where
         // served row that returns pixels.
         make_backend: impl FnOnce(&cerebellum_computer::platform::ProcessGrant) -> B,
     ) -> Result<Value, CapabilityResultValidationError> {
+        #[cfg(target_os = "linux")]
+        if let Some(session) = &self.linux_session {
+            if let Some(reply) = session.refusal(capability.capability()).await {
+                return self.finish_reply(
+                    capability.capability(),
+                    serialize::refused_in_queue(capability, reply),
+                );
+            }
+        }
         let settings = self.app_use.settings_for_call();
         let app_use = self.app_use.approved_mode(settings, &context.cancel).await;
         // Before target lookup, consent or any platform work: offering a tool
