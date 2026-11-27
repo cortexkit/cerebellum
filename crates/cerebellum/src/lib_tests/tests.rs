@@ -116,6 +116,7 @@ fn the_release_script_names_every_attestation_the_compiler_reads() {
         include_str!("../management_dispatch.rs"),
         include_str!("../tool_dispatch.rs"),
         include_str!("../planes.rs"),
+        include_str!("../release_inputs.rs"),
     );
     let script = include_str!("../../../../scripts/release-build.sh");
 
@@ -130,8 +131,8 @@ fn the_release_script_names_every_attestation_the_compiler_reads() {
     assert!(read_here.contains("CEREBELLUM_TAKEOVER_POINTER_FRONTING_REVIEW_REVISION"));
     assert_eq!(
         read_here.len(),
-        13,
-        "expected thirteen attestations, found {read_here:?}"
+        21,
+        "expected twenty-one attestations, found {read_here:?}"
     );
 
     for name in &read_here {
