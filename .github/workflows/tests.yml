@@ -45,17 +45,12 @@ jobs:
   # thin: code there is code no continuous build checks. Adding judgment to it
   # moves that judgment out of the verified half, silently.
   #
-  # DO NOT REACH FOR A macOS RUNNER TO CLOSE THE GAP: there is not one to reach
-  # for. Blacksmith offers no macOS machines, and GitHub-hosted macOS is billing-
-  # blocked for this organization (see the note on runners below). A job that
-  # requests a `macos-*` label is ACCEPTED AND NEVER SCHEDULED -- it renders as
-  # queued rather than failed, which reads as "still running" indefinitely and is
-  # a worse outcome than no job at all, since waiting is the one response that
-  # never resolves it.
-  #
-  # Making macOS runners available is the only thing that closes it: a public
-  # repository gets free GitHub-hosted minutes, an organization billing change
-  # gets private ones.
+  # This job runs the Linux and Windows halves only. The macOS half runs on the
+  # local Mac through scripts/fast-gate.sh, because the live desk tests need a
+  # signed binary and real permissions that a hosted runner cannot grant. Since
+  # the repository went public, GitHub-hosted macOS runners are free, so a
+  # macos-latest job is the way to add hosted coverage for the macOS seam's
+  # non-desk tests.
   #
   # Do NOT widen the `cfg` to compile the seam away on macOS too, and do not add
   # a stub implementation to make the untested half look covered. Both hide code
