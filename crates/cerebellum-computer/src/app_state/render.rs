@@ -420,6 +420,10 @@ const SESSION_ENDING_PREFIXES: [&str; 7] = [
 /// most of these live, is matched by position instead, so its items are
 /// caught whatever language names them.
 pub fn is_session_ending_title(title: &str) -> bool {
+    is_session_ending_title_for(title, false)
+}
+
+pub fn is_session_ending_title_for(title: &str, windows: bool) -> bool {
     let mut normalised = String::with_capacity(title.len());
     let mut pending_space = false;
     for character in title.trim().chars() {
@@ -446,6 +450,11 @@ pub fn is_session_ending_title(title: &str) -> bool {
     SESSION_ENDING_PREFIXES
         .iter()
         .any(|prefix| normalised.starts_with(prefix))
+        || (windows
+            && matches!(
+                normalised,
+                "sign out" | "lock" | "switch user" | "hibernate" | "disconnect"
+            ))
 }
 
 /// Whether an element's own title makes it a session-ending menu item.
@@ -453,10 +462,9 @@ pub fn is_session_ending_item(element: &RawElement) -> bool {
     matches!(
         element.role.as_deref(),
         Some("AXMenuItem" | "AXMenuBarItem")
-    ) && element
-        .title
-        .as_deref()
-        .is_some_and(is_session_ending_title)
+    ) && element.title.as_deref().is_some_and(|title| {
+        is_session_ending_title_for(title, element.handle.uses_windows_menu_titles())
+    })
 }
 
 /// One element of a read, as the element map numbered it.

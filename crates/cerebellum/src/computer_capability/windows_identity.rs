@@ -18,7 +18,7 @@ fn shell_target(target: &str) -> bool {
             .any(|name| target.eq_ignore_ascii_case(name))
 }
 
-fn blocked(identity: &LiveIdentity) -> bool {
+pub(super) fn blocked(identity: &LiveIdentity) -> bool {
     shell_image(&identity.image_name)
         || operator_apps::identity_blocked(&identity.image_name)
         || identity

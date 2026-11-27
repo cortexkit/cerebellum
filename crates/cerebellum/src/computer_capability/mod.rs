@@ -138,6 +138,8 @@ mod open_app;
 mod open_app_tests;
 mod operator_apps;
 mod web_replace;
+#[cfg(all(test, windows))]
+mod windows_app_state_tests;
 #[cfg(windows)]
 pub(crate) mod windows_identity;
 #[doc(hidden)]
@@ -656,6 +658,9 @@ where
     session_lock_for_test: Option<Option<bool>>,
     #[cfg(all(test, target_os = "windows"))]
     pub(crate) wire_dispatch_for_test: bool,
+    #[cfg(all(test, windows))]
+    windows_app_state_for_test:
+        Option<cerebellum_computer::platform::windows::app_state::WindowsAppStateSource>,
 }
 
 impl<B, R, T, S> ComputerPlane<B, R, T, S, UnsupportedPlatformDriver>
@@ -767,6 +772,8 @@ where
             session_lock_for_test: None,
             #[cfg(all(test, target_os = "windows"))]
             wire_dispatch_for_test: false,
+            #[cfg(all(test, windows))]
+            windows_app_state_for_test: None,
         }
     }
 
@@ -1048,6 +1055,33 @@ where
                     capability.capability(),
                     serialize::refused_in_queue(capability, reply),
                 );
+            }
+        }
+        #[cfg(windows)]
+        if matches!(capability.0, Served::Wait) {
+            #[cfg(test)]
+            let admitted = self.windows_app_state_for_test.is_some();
+            #[cfg(not(test))]
+            let admitted = false;
+            if !admitted {
+                if let Ok(parsed) = parse_wait_request(arguments) {
+                    if parsed.predicate.readback_attribute()
+                        == cerebellum_computer::platform::AccessibilityReadbackAttribute::Value
+                    {
+                        return self.finish_reply(
+                            capability.capability(),
+                            wait_wire_reply(WaitResult {
+                                outcome: WaitOutcome::Indeterminate,
+                                evidence: WaitEvidence::Indeterminate {
+                                    predicate: parsed.predicate,
+                                    readback: None,
+                                    reason: "scoped_read_unsupported".to_owned(),
+                                },
+                                attempts: 0,
+                            }),
+                        );
+                    }
+                }
             }
         }
         let settings = self.app_use.settings_for_call();
@@ -1450,6 +1484,8 @@ where
                 cursor::WindowChoice::Frontmost,
             );
             let timeout_ms = parsed.timeout_ms;
+            #[cfg(all(test, windows))]
+            let windows_app_state = self.windows_app_state_for_test.clone();
             let work = quarantine::CallWork::current();
             if let Some(busy) = work.bind(&self.serializer.quarantine, &grant).await {
                 return busy;
@@ -1460,6 +1496,11 @@ where
                 let _scope =
                     cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
                 token.record_accessibility_read(identity, ComputerCapability::Wait, &grant, || {
+                    #[cfg(all(test, windows))]
+                    if let Some(source) = windows_app_state {
+                        let mut poller = cerebellum_computer::platform::windows::app_state::WindowsAppStatePoller::new(source, grant.clone());
+                        return wait_until_predicate(&mut poller, predicate, timeout_ms, &|| cancel.is_cancelled());
+                    }
                     let mut poller = PlatformPredicatePoller::new(
                         NativeComputerPlatformDriver::default(),
                         grant.clone(),

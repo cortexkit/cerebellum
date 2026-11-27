@@ -6,6 +6,8 @@
 
 use super::*;
 
+#[cfg(windows)]
+pub mod app_state;
 pub mod identity;
 use crate::capture::{
     BackendError, BackendTeardownProgress, BroadDisplayCaptureRequest, CaptureArtifact,

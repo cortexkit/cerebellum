@@ -31,6 +31,11 @@ pub trait ElementToken: Send + Sync + fmt::Debug {
 
     /// For a reader to recognise its own tokens in `same_element`.
     fn as_any(&self) -> &dyn Any;
+
+    /// Whether the Windows-specific blocklist of session-ending menu titles applies.
+    fn uses_windows_menu_titles(&self) -> bool {
+        false
+    }
 }
 
 /// A shared handle on an element token.
@@ -657,6 +662,15 @@ pub trait AppStateSource: Send + Sync {
         _point: (f64, f64),
     ) -> Result<Option<(ElementHandle, Option<u32>)>, ElementActionError> {
         Err(ElementActionError::UnsupportedOnPlatform)
+    }
+
+    /// Hit-test the target process, checking its generation on platforms that support it.
+    fn element_at_for_target(
+        &self,
+        target: &ProcessGrant,
+        point: (f64, f64),
+    ) -> Result<Option<(ElementHandle, Option<u32>)>, ElementActionError> {
+        self.element_at(HitScope::Application { pid: target.pid }, point)
     }
 
     /// The window-server number of the window `element` sits in, the same
