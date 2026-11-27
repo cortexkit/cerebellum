@@ -45,6 +45,7 @@ fn context(state: PermissionLiveness) -> CapabilityAdvertisementContext {
                 source_lock_digest: digest.clone(),
                 computed_artifact_digest: digest,
             },
+            ..Default::default()
         },
         permissions: readings(state),
         startup: StartupCapabilityProbe {

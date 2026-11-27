@@ -34,6 +34,7 @@ fn valid_inputs() -> ComputerReleaseInputs {
             source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.into()),
             computed_artifact_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.into()),
         },
+        ..Default::default()
     }
 }
 
@@ -57,6 +58,7 @@ fn startup_with_accessibility(accessibility: PermissionLiveness) -> StartupCapab
                 off_main: true,
             }),
         ),
+        ..Default::default()
     }
 }
 
@@ -390,6 +392,7 @@ fn a_suppressed_capability_names_the_condition_that_suppressed_it() {
         os_major: 26,
         private_envelope_recognized: true,
         permissions: PermissionLivenessReport::default(),
+        ..Default::default()
     };
     permission_unresolved.permissions = unresolved.permissions.clone();
     permission_unresolved.startup = unresolved;

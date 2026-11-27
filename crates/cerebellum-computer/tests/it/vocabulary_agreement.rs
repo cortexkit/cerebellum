@@ -559,6 +559,7 @@ fn fully_bound_context() -> CapabilityAdvertisementContext {
             source_lock_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
             computed_artifact_digest: Some(COMPUTER_ACTION_VOCABULARY_SHA256.to_string()),
         },
+        ..Default::default()
     };
     let permissions = PermissionLivenessReport::from_results(
         [

@@ -1,0 +1,9 @@
+[test-groups]
+windows-actuation = { max-threads = 1 }
+
+[profile.windows-actuation]
+default-filter = 'binary(=native_windows_actuation)'
+
+[[profile.windows-actuation.overrides]]
+filter = 'binary(=native_windows_actuation)'
+test-group = 'windows-actuation'
