@@ -260,13 +260,17 @@ jobs:
     steps:
       - name: Require the declared compatible core floor
         env:
-          REQUIRES_CORE: ${{ vars.REQUIRES_CORE }}
+          # The oldest core this release runs against: the subc-core version
+          # that installs the message bus with Core. Committed here rather than
+          # kept as a repository variable, so the floor is reviewed and
+          # versioned with the code it describes.
+          REQUIRES_CORE: "0.24.8"
           RELEASE_COMMIT: ${{ needs.verify.outputs.commit }}
           HOST_VERSION: ${{ needs.verify.outputs.host_version }}
         shell: bash
         run: |
           if [[ ! "$REQUIRES_CORE" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo '::error::Set the REQUIRES_CORE repository variable to the confirmed MAJOR.MINOR.PATCH core floor before publishing.'
+            echo '::error::REQUIRES_CORE must be the confirmed MAJOR.MINOR.PATCH core floor.'
             exit 1
           fi
           mkdir manifest
