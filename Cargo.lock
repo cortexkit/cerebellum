@@ -364,6 +364,7 @@ dependencies = [
  "cerebellum-linux",
  "cerebellum-macos",
  "cerebellum-native-host",
+ "cerebellum-windows",
  "cortexkit-bus-client",
  "cortexkit-bus-naming",
  "cortexkit-bus-nats",

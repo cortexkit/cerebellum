@@ -385,11 +385,13 @@ impl fmt::Display for ProfileOutcome {
     }
 }
 
-/// Stable identity for a directory and the held descriptor within one process
-/// run.  Device and inode are the identity proof on Unix (the device cannot
-/// move while this process holds the directory open; the identity persisted
-/// across restarts is [`RootIdentityFacts`], which leaves the device out); metadata size is only a conservative fallback
-/// on other platforms and never authorizes a target outside the root.
+/// In-process directory identity is separate from the persisted [`RootIdentityFacts`].
+#[cfg(windows)]
+type StableIdentity = cerebellum_windows::FileIdentity;
+
+/// Device and inode identify a held directory on Unix. The persisted root
+/// identity leaves out the device, which can change across restarts.
+#[cfg(not(windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StableIdentity {
     #[cfg(unix)]
@@ -401,6 +403,7 @@ struct StableIdentity {
     readonly: bool,
 }
 
+#[cfg(not(windows))]
 fn stable_identity(metadata: &fs::Metadata) -> StableIdentity {
     #[cfg(unix)]
     {
@@ -664,18 +667,72 @@ fn open_directory_handle(path: &Path) -> io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        // CreateFileW requires this flag for directory handles, even for read access.
+        // CreateFileW requires this flag to open a directory. Open the leaf
+        // itself so it cannot redirect the identity read through a link.
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     }
     options.open(path)
+}
+
+#[cfg(windows)]
+fn held_directory_identity(
+    handle: &File,
+    _metadata: &fs::Metadata,
+) -> Result<StableIdentity, RootError> {
+    cerebellum_windows::file_identity(handle).map_err(|_| RootError::Unstable)
+}
+
+#[cfg(not(windows))]
+fn held_directory_identity(
+    _handle: &File,
+    metadata: &fs::Metadata,
+) -> Result<StableIdentity, RootError> {
+    Ok(stable_identity(metadata))
+}
+
+fn redirects_profile_path(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn revalidate_directory_identity(
+    path: &Path,
+    handle: &File,
+    identity: StableIdentity,
+) -> Result<(), RootError> {
+    let current = fs::symlink_metadata(path)?;
+    if redirects_profile_path(&current) || !current.is_dir() {
+        return Err(RootError::Unstable);
+    }
+    let held = handle.metadata()?;
+    #[cfg(windows)]
+    let observed = {
+        let fresh = open_directory_handle(path).map_err(|_| RootError::Unstable)?;
+        held_directory_identity(&fresh, &current)?
+    };
+    #[cfg(not(windows))]
+    let observed = stable_identity(&current);
+    if held_directory_identity(handle, &held)? != identity || observed != identity {
+        return Err(RootError::Unstable);
+    }
+    Ok(())
 }
 
 impl HeldManagedRoot {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RootError> {
         let supplied = path.as_ref();
         let link_meta = fs::symlink_metadata(supplied)?;
-        if link_meta.file_type().is_symlink() {
+        if redirects_profile_path(&link_meta) {
             return Err(RootError::SymlinkNotAllowed);
         }
         if !link_meta.is_dir() {
@@ -687,7 +744,7 @@ impl HeldManagedRoot {
         if !metadata.is_dir() {
             return Err(RootError::NotDirectory);
         }
-        let identity = stable_identity(&metadata);
+        let identity = held_directory_identity(&handle, &metadata)?;
         Ok(Self {
             path: canonical,
             handle,
@@ -704,15 +761,7 @@ impl HeldManagedRoot {
         if current_path != self.path {
             return Err(RootError::Unstable);
         }
-        let current = fs::symlink_metadata(&self.path)?;
-        if current.file_type().is_symlink() || !current.is_dir() {
-            return Err(RootError::Unstable);
-        }
-        let held = self.handle.metadata()?;
-        if stable_identity(&held) != self.identity || stable_identity(&current) != self.identity {
-            return Err(RootError::Unstable);
-        }
-        Ok(())
+        revalidate_directory_identity(&self.path, &self.handle, self.identity)
     }
 
     fn contained(&self, path: &Path) -> bool {
@@ -745,7 +794,7 @@ impl HeldManagedRoot {
             };
             cursor.push(name);
             match fs::symlink_metadata(&cursor) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
+                Ok(metadata) if redirects_profile_path(&metadata) => {
                     return Err(RootError::SymlinkNotAllowed)
                 }
                 Ok(_) => {}
@@ -766,7 +815,7 @@ impl HeldManagedRoot {
         }
         if target.exists() {
             let metadata = fs::symlink_metadata(&target)?;
-            if metadata.file_type().is_symlink() {
+            if redirects_profile_path(&metadata) {
                 return Err(RootError::SymlinkNotAllowed);
             }
             let canonical_target = fs::canonicalize(&target)?;
@@ -780,7 +829,7 @@ impl HeldManagedRoot {
     pub fn open_target(&self, relative: &Path) -> Result<TargetHandle, RootError> {
         let target = self.target_path(relative, false)?;
         let metadata = fs::symlink_metadata(&target).map_err(RootError::Io)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if redirects_profile_path(&metadata) || !metadata.is_dir() {
             return Err(RootError::InvalidTarget);
         }
         let canonical = fs::canonicalize(&target)?;
@@ -788,7 +837,7 @@ impl HeldManagedRoot {
             return Err(RootError::OutsideRoot);
         }
         let handle = open_directory_handle(&canonical)?;
-        let identity = stable_identity(&handle.metadata()?);
+        let identity = held_directory_identity(&handle, &handle.metadata()?)?;
         Ok(TargetHandle {
             path: canonical,
             handle,
@@ -808,15 +857,7 @@ impl TargetHandle {
         &self.path
     }
     pub fn revalidate(&self) -> Result<(), RootError> {
-        let current = fs::symlink_metadata(&self.path)?;
-        if current.file_type().is_symlink() || !current.is_dir() {
-            return Err(RootError::Unstable);
-        }
-        let held = self.handle.metadata()?;
-        if stable_identity(&held) != self.identity || stable_identity(&current) != self.identity {
-            return Err(RootError::Unstable);
-        }
-        Ok(())
+        revalidate_directory_identity(&self.path, &self.handle, self.identity)
     }
 
     /// Consume the validated target handle before recursive deletion.  The

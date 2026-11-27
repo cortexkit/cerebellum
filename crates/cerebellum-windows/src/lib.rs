@@ -1,4 +1,4 @@
-//! A narrow seam over Windows process and window primitives, and nothing else.
+//! A narrow seam over Windows process, window, and filesystem primitives.
 //!
 //! This crate exists so platform-neutral crates can keep their exact
 //! `#![forbid(unsafe_code)]` boundary. It reports raw operating-system readings
@@ -12,6 +12,8 @@
 // library rather than a pretend implementation.
 #[cfg(any(target_os = "windows", test))]
 mod accessibility;
+#[cfg(windows)]
+mod file_identity;
 #[cfg(any(target_os = "windows", test))]
 mod session;
 #[cfg(any(target_os = "windows", test))]
@@ -26,6 +28,8 @@ pub use accessibility::{
     AccessibilityReadFailure, UiaAccessibilityTree, UiaControlTypeAndName, UiaElement,
     UiaElementIdentity, UiaElementName, UiaRectangle, UiaTreeCompleteness,
 };
+#[cfg(windows)]
+pub use file_identity::{file_identity, FileIdentity};
 #[cfg(target_os = "windows")]
 pub use windows::{
     current_session_provenance, enumerate_top_level_windows, enumerated_window_visibility,

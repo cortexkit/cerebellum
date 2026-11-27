@@ -379,6 +379,27 @@ fn created_profile_target_parent_has_a_protected_owner_only_dacl() {
     fs::remove_dir_all(path).unwrap();
 }
 
+#[cfg(windows)]
+#[test]
+fn a_held_windows_root_survives_content_changes_but_rejects_a_replacement() {
+    let scratch = root();
+    let path = scratch.join("root");
+    fs::create_dir(&path).unwrap();
+    let managed = HeldManagedRoot::open(&path).unwrap();
+    for entry in 0..32 {
+        fs::write(path.join(format!("entry-{entry}")), b"example").unwrap();
+    }
+    managed
+        .revalidate()
+        .expect("adding entries does not change the directory identity");
+    let moved = scratch.join("original");
+    fs::rename(&path, &moved).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert!(matches!(managed.revalidate(), Err(RootError::Unstable)));
+    drop(managed);
+    fs::remove_dir_all(scratch).unwrap();
+}
+
 #[test]
 fn root_identity_decision_is_platform_neutral_and_ignores_the_device() {
     let birth_time = BirthTime {
