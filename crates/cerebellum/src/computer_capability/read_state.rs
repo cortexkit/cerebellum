@@ -564,10 +564,10 @@ where
                     "height_px": image.height_px,
                 });
             }
-            Ok((None, Some((reason, withholding)), fronting)) => {
+            Ok((None, Some((reason, detail)), fronting)) => {
                 reply["image_unavailable"] = json!({"reason": reason.as_str()});
-                if let Some(withholding) = withholding {
-                    reply["image_unavailable"]["detail"] = withholding.detail();
+                if let Some(detail) = detail {
+                    reply["image_unavailable"]["detail"] = detail;
                 }
                 if let Some(fronting) = fronting {
                     reply["image_fronting"] = json!(fronting);
@@ -623,10 +623,7 @@ where
     ) -> Result<
         (
             Option<ReleasedImage>,
-            Option<(
-                ImageUnavailable,
-                Option<image_withholding::ImageWithholding>,
-            )>,
+            Option<(ImageUnavailable, Option<Value>)>,
             Option<ImageFronting>,
         ),
         ImageUnavailable,
@@ -663,6 +660,7 @@ where
                     },
                 ),
                 withholding: std::cell::Cell::new(None),
+                fronting_bound_ms: std::cell::Cell::new(None),
             };
             let mut custody = AuditImageCustody {
                 audit: &audit,
@@ -715,8 +713,15 @@ where
             Ok(match image {
                 Ok(image) => (Some(image), None, fronting),
                 Err(reason) => {
-                    let withholding = image_withholding::record(reason, trace.withholding.get());
-                    (None, Some((reason, withholding)), fronting)
+                    let detail = match reason {
+                        ImageUnavailable::FrontingBoundExceeded => trace
+                            .fronting_bound_ms
+                            .get()
+                            .map(|bound_ms| json!({"bound_ms": bound_ms})),
+                        _ => image_withholding::record(reason, trace.withholding.get())
+                            .map(image_withholding::ImageWithholding::detail),
+                    };
+                    (None, Some((reason, detail)), fronting)
                 }
             })
         })
