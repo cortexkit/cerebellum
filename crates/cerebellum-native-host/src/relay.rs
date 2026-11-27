@@ -36,7 +36,7 @@ pub(crate) fn establish_session(
         &Frame::HostHello {
             protocol: PROTOCOL_VERSION,
             extension_origin,
-            parent,
+            parent: parent.into(),
         },
     )?;
     let epoch = match read_socket_control_frame(&mut socket)? {
@@ -280,7 +280,7 @@ mod tests {
             };
             assert_eq!(protocol, 1);
             assert_eq!(extension_origin, origin());
-            assert_eq!(attested_parent, parent().unwrap());
+            assert_eq!(attested_parent.as_legacy(), Some(&parent().unwrap()));
             write_socket_control_frame(
                 &mut server,
                 &Frame::HostAccepted {
@@ -528,7 +528,7 @@ mod tests {
         let hello = Frame::HostHello {
             protocol: PROTOCOL_VERSION,
             extension_origin: origin(),
-            parent: parent().unwrap(),
+            parent: parent().unwrap().into(),
         };
         let wire = cerebellum_bridge_protocol::encode(&hello).unwrap();
         assert_eq!(read_socket_control_frame(&mut &wire[..]).unwrap(), hello);

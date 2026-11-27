@@ -170,7 +170,7 @@ mod wire {
     use super::super::socket::{read_frame, test_listener, write_frame};
     use super::*;
     use cerebellum_bridge_protocol::{
-        Frame, ParentAttestation, EXTENSION_ORIGIN, PROTOCOL_VERSION,
+        Frame, HostParentAttestation, ParentAttestation, EXTENSION_ORIGIN, PROTOCOL_VERSION,
     };
     use std::path::PathBuf;
     use tokio::net::UnixStream;
@@ -233,7 +233,8 @@ mod wire {
                 probe_cdhash: None,
                 pid: 1,
                 start_time_micros: 2,
-            },
+            }
+            .into(),
         }
     }
     async fn bounded_read(stream: &mut UnixStream) -> Frame {
@@ -306,6 +307,35 @@ mod wire {
         assert_eq!(result.reason, Some(Reason::NotConnected));
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn socket_rejects_foreign_parent_attestations_as_protocol_errors() {
+        use tokio::io::AsyncWriteExt;
+
+        let fixture = Fixture::new(true);
+        for parent in [
+            r#"{"platform":"linux","v":1,"browser":"chromium","pid":1,"start_ticks":2,"package":{"manager":"dpkg","name":"chromium","version":"142.0"}}"#,
+            r#"{"platform":"windows","v":1,"chrome":{"pid":1,"creation_100ns":2},"launcher":{"pid":3,"creation_100ns":4}}"#,
+            r#"{"platform":"linux-test","v":1,"pid":1,"start_ticks":2}"#,
+            r#"{"platform":"windows-test","v":1,"parent":{"pid":1,"creation_100ns":2}}"#,
+        ] {
+            let body = format!(
+                r#"{{"type":"host_hello","protocol":1,"extension_origin":"{EXTENSION_ORIGIN}","parent":{parent}}}"#
+            );
+            let mut client = UnixStream::connect(&fixture.path).await.unwrap();
+            client.write_u32(body.len() as u32).await.unwrap();
+            client.write_all(body.as_bytes()).await.unwrap();
+            assert_eq!(
+                bounded_read(&mut client).await,
+                Frame::HostRefused {
+                    reason: "protocol_error".into()
+                },
+                "foreign parent: {parent}"
+            );
+        }
+        assert_eq!(fixture.bridge.connected_epoch(), None);
+    }
+
     #[tokio::test]
     async fn socket_requires_pinned_origin_and_exclusive_chrome_parent_attestation() {
         let fixture = Fixture::new(true);
@@ -332,7 +362,11 @@ mod wire {
         ] {
             let mut client = UnixStream::connect(&fixture.path).await.unwrap();
             let mut frame = hello();
-            if let Frame::HostHello { parent, .. } = &mut frame {
+            if let Frame::HostHello {
+                parent: HostParentAttestation::Legacy(parent),
+                ..
+            } = &mut frame
+            {
                 parent.team_id = team.map(str::to_owned);
                 parent.probe_cdhash = probe.map(str::to_owned);
             }

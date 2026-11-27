@@ -25,6 +25,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::io::{self, Read, Write};
 
+mod attestation;
+mod gate;
+mod paths;
+
+pub use attestation::{
+    AttestationV1, HostParentAttestation, LinuxBrowser, LinuxPackage, LinuxPackageManager,
+    ParentAttestation, PlatformParentAttestation, WindowsProcess,
+};
+pub use gate::classify_bridge_gate;
+pub use paths::{linux_socket_path, windows_pipe_name};
+
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const CEREBELLUM_REQUIREMENT: &str = "identifier \"ck-cerebellum\" and anchor apple generic and certificate leaf[subject.OU] = \"5R5846NBPW\"";
@@ -34,22 +45,13 @@ pub const EXTENSION_ID: &str = "bfmlflnlaflnibiellpjjifdbcifciei";
 pub const EXTENSION_ORIGIN: &str = "chrome-extension://bfmlflnlaflnibiellpjjifdbcifciei/";
 pub const EXTENSION_PUBLIC_KEY_B64: &str = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyHcwdQ6UQq9vCfCvfUtsoBzv2Nc6Tc0KX7tLbunrVjVO14a70w3gn2gn4ovsxPCO2QijT+7zRr+M/2EAPytHJOZPrqYlRsLJjKP4LqE9NXRI/nVnrZaDmDnqn29JBjnXRGNQ8fl0IXb3QKqOwrUh92w0TK8ZCMaOOHNv6o7ctl3HNor8iKnFR/v+YRTsaCXwzeYkcSN/LL4o4LJVFwAdM5iv2tfJDq3n1DAlHDNZVzsFDPFmLpiOfMphNIQpBopX8ZEH6RjQ4llYakTiYX/UlGX2eZe20e6lCbCt12s7arMA22OMYViKnrVTkMG27vAJRuRydze5SAUydLg3ngycqwIDAQAB";
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ParentAttestation {
-    pub team_id: Option<String>,
-    pub probe_cdhash: Option<String>,
-    pub pid: u32,
-    pub start_time_micros: u64,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Frame {
     HostHello {
         protocol: u32,
         extension_origin: String,
-        parent: ParentAttestation,
+        parent: HostParentAttestation,
     },
     HostAccepted {
         protocol: u32,

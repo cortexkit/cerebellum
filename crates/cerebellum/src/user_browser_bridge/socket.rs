@@ -204,7 +204,7 @@ async fn serve_peer(bridge: UserBrowserBridge, mut stream: UnixStream, verifier:
                 Some(Reason::ProtocolMismatch)
             } else if extension_origin != EXTENSION_ORIGIN {
                 Some(Reason::ExtensionOriginMismatch)
-            } else if !valid_parent(&parent) {
+            } else if !parent.as_legacy().is_some_and(valid_parent) {
                 Some(Reason::ParentAttestationInvalid)
             } else {
                 None

@@ -420,6 +420,8 @@ name = "cerebellum-bridge-protocol"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "cortexkit-paths",
+ "ed25519-dalek",
  "serde",
  "serde_json",
  "sha2",
