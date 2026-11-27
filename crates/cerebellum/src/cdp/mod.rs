@@ -4,6 +4,11 @@
 //! command correlation, identity checks, and bounded pending/event state.  It
 //! intentionally does not know about Chromium's page model or grant policy.
 
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::WindowsCdpPipe;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::time::{Duration, Instant};
