@@ -169,21 +169,38 @@ mod macos {
 
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn registration_on_an_unsupported_platform_prints_usage_and_exits_two() {
+fn registration_with_an_unbound_gate_prints_the_neutral_message_and_exits_two() {
+    #[cfg(target_os = "linux")]
+    let revision = option_env!("CEREBELLUM_LINUX_USER_BROWSER_REVIEW_REVISION");
+    #[cfg(target_os = "windows")]
+    let revision = option_env!("CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION");
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let revision = None;
+    if cerebellum_bridge_protocol::classify_bridge_gate(
+        revision,
+        option_env!("CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY"),
+    )
+    .is_some()
+    {
+        assert!(cerebellum_native_host::check_build_gate().is_ok());
+        return;
+    }
+    const MESSAGE: &str = "native messaging is not enabled in this build";
+    let error = cerebellum_native_host::run().unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(error.to_string(), MESSAGE);
     let home =
         std::env::temp_dir().join(format!("cknh-register-unsupported-{}", std::process::id()));
     let output = std::process::Command::new(cortexkit_test_support::ckdev_binary(env!(
         "CARGO_BIN_EXE_ck-cerebellum-native-host"
     )))
     .arg("--register")
-    .env("HOME", home)
+    .env("HOME", &home)
     .output()
     .unwrap();
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
-    assert_eq!(
-        output.stderr,
-        b"Usage: ck-cerebellum-native-host --register (macOS only)\n"
-    );
+    assert_eq!(output.stderr, format!("{MESSAGE}\n").as_bytes());
+    assert!(!home.exists());
 }

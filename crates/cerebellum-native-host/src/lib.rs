@@ -4,6 +4,9 @@
 //! The host never interprets action payloads. The cerebellum browser bridge owns
 //! action admission, epochs, deadlines, cancellation and chunking.
 
+use std::ffi::OsString;
+use std::io;
+
 pub mod browsers;
 #[cfg(any(target_os = "macos", test))]
 mod framing;
@@ -12,17 +15,83 @@ mod macos;
 pub mod registration;
 #[cfg(all(unix, any(target_os = "macos", test)))]
 mod relay;
+#[cfg(all(unix, any(target_os = "macos", test)))]
+mod transport;
 
-pub fn run() -> std::io::Result<()> {
+/// Check whether this build can enable the native-messaging bridge.
+pub fn check_build_gate() -> io::Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        #[cfg(target_os = "linux")]
+        const REVISION: Option<&str> = option_env!("CEREBELLUM_LINUX_USER_BROWSER_REVIEW_REVISION");
+        #[cfg(target_os = "windows")]
+        const REVISION: Option<&str> =
+            option_env!("CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION");
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        const REVISION: Option<&str> = None;
+
+        if cerebellum_bridge_protocol::classify_bridge_gate(
+            REVISION,
+            option_env!("CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY"),
+        )
+        .is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "native messaging is not enabled in this build",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn extension_origin(mut args: impl Iterator<Item = OsString>) -> io::Result<String> {
+    args.nth(1)
+        .and_then(|origin| origin.into_string().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing extension origin"))
+}
+
+pub fn run() -> io::Result<()> {
+    check_build_gate()?;
     #[cfg(target_os = "macos")]
     {
         macos::run()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "native messaging is supported on macOS only",
+        let _ = extension_origin(std::env::args_os())?;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native messaging transport is unavailable on this platform",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cerebellum_bridge_protocol::EXTENSION_ORIGIN;
+
+    #[test]
+    fn uses_argv_one_even_with_chromes_trailing_window_argument() {
+        let args = [
+            "ck-cerebellum-native-host",
+            EXTENSION_ORIGIN,
+            "--parent-window=1234",
+        ];
+        assert_eq!(
+            extension_origin(args.into_iter().map(OsString::from)).unwrap(),
+            EXTENSION_ORIGIN
+        );
+    }
+
+    #[test]
+    fn rejects_a_missing_origin() {
+        assert_eq!(
+            extension_origin([OsString::from("ck-cerebellum-native-host")].into_iter())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }
