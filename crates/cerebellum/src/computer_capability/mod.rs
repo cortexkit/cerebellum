@@ -3233,7 +3233,7 @@ fn parse_keys_request(object: &serde_json::Map<String, Value>) -> Result<ParsedS
             }
             _ => {
                 let Some(key) = synthetic_key_from_wire(name) else {
-                    return Err(invalid_synthetic_request("keys", "unknown_key"));
+                    return Err(unknown_key_refusal(name));
                 };
                 if chord_key.replace(key).is_some() {
                     // A chord is modifiers around ONE key. Two named keys are
@@ -3567,6 +3567,70 @@ fn synthetic_key_from_wire(name: &str) -> Option<SyntheticKey> {
         "up_arrow" => SyntheticKey::UpArrow,
         _ => return None,
     })
+}
+
+/// The refusal for a key name the wire table has no entry for, with a
+/// diagnostic remedy.
+///
+/// `outcome`, `field` and `reason` stay exactly what they were: only the
+/// added `remedy` is new, and the frozen computer action vocabulary already
+/// declares `remedy` on the `computer.keys` row. When a fixed lookup knows the likely intent the remedy names the
+/// accepted spelling; otherwise it says the name is not a key name and
+/// points at the tool description's key names. The suggestion accepts
+/// nothing: the caller must retry with the accepted spelling.
+fn unknown_key_refusal(name: &str) -> Value {
+    let mut refusal = invalid_synthetic_request("keys", "unknown_key");
+    let remedy = match unknown_key_suggestion(name) {
+        // The Windows modifier exists only on Windows, so naming it without
+        // saying so would send every other platform into a second refusal.
+        Some(suggestion) if suggestion == "windows" => {
+            format!(r#"unknown key "{name}"; use "windows" instead (Windows only)."#)
+        }
+        Some(suggestion) => format!(r#"unknown key "{name}"; use "{suggestion}" instead."#),
+        None => format!(
+            r#"unknown key "{name}" is not a key name; use one of the key names in the tool description."#
+        ),
+    };
+    refusal["remedy"] = json!(remedy);
+    refusal
+}
+
+/// The accepted spelling an unknown key name likely meant, if a fixed
+/// lookup knows one.
+///
+/// The table is lowercase-only, so the lookup lowercases first: that maps
+/// both the common aliases (`enter`, `cmd`, `down`) and a wrong-case
+/// accepted spelling (`Return`, `Command`). There is no `delete` entry in
+/// the wire table, so `del` gets no suggestion rather than a wrong one.
+fn unknown_key_suggestion(name: &str) -> Option<String> {
+    let lowered = name.to_lowercase();
+    let alias = match lowered.as_str() {
+        "enter" => Some("return"),
+        "esc" => Some("escape"),
+        "down" => Some("down_arrow"),
+        "up" => Some("up_arrow"),
+        "left" => Some("left_arrow"),
+        "right" => Some("right_arrow"),
+        "cmd" => Some("command"),
+        "ctrl" => Some("control"),
+        "alt" | "opt" => Some("option"),
+        "win" => Some("windows"),
+        "pageup" => Some("page_up"),
+        "pagedown" => Some("page_down"),
+        _ => None,
+    };
+    if let Some(alias) = alias {
+        return Some(alias.to_string());
+    }
+    // A wrong-case accepted spelling, such as `Return` or `Command`: the
+    // wire names are lowercase, and the suggestion is the name as written.
+    if lowered != name
+        && (synthetic_key_from_wire(&lowered).is_some()
+            || ["command", "shift", "option", "control", "windows"].contains(&lowered.as_str()))
+    {
+        return Some(lowered);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -4225,6 +4289,86 @@ mod synthetic_parse_tests {
         assert_eq!(keys.len(), deduped.len(), "the table has a duplicate");
         assert_eq!(synthetic_key_from_wire("cmd"), None);
         assert_eq!(synthetic_key_from_wire("S"), None);
+    }
+
+    /// An unknown key name is refused with a remedy naming the accepted
+    /// spelling when a fixed lookup knows the likely intent, and otherwise
+    /// saying the name is not a key name and pointing at the tool
+    /// description's key names. The outcome, field and reason are unchanged,
+    /// and the reply with its remedy still validates against the
+    /// `computer.keys` result schema.
+    #[test]
+    fn unknown_key_names_get_a_remedy_naming_the_accepted_spelling() {
+        for (name, remedy) in [
+            ("enter", r#"unknown key "enter"; use "return" instead."#),
+            ("down", r#"unknown key "down"; use "down_arrow" instead."#),
+            ("up", r#"unknown key "up"; use "up_arrow" instead."#),
+            ("left", r#"unknown key "left"; use "left_arrow" instead."#),
+            (
+                "right",
+                r#"unknown key "right"; use "right_arrow" instead."#,
+            ),
+            ("esc", r#"unknown key "esc"; use "escape" instead."#),
+            ("cmd", r#"unknown key "cmd"; use "command" instead."#),
+            ("ctrl", r#"unknown key "ctrl"; use "control" instead."#),
+            ("alt", r#"unknown key "alt"; use "option" instead."#),
+            ("opt", r#"unknown key "opt"; use "option" instead."#),
+            (
+                "win",
+                r#"unknown key "win"; use "windows" instead (Windows only)."#,
+            ),
+            ("pageup", r#"unknown key "pageup"; use "page_up" instead."#),
+            (
+                "pagedown",
+                r#"unknown key "pagedown"; use "page_down" instead."#,
+            ),
+        ] {
+            let refusal = parse(
+                ComputerCapability::Keys,
+                json!({"keys": [name], "target": "editor"}),
+            )
+            .expect_err("an unknown key name is refused");
+            assert_eq!(refusal["outcome"], "invalid_request", "{name}");
+            assert_eq!(refusal["field"], "keys", "{name}");
+            assert_eq!(refusal["reason"], "unknown_key", "{name}");
+            assert_eq!(refusal["remedy"], remedy, "{name}");
+            let reply = synthetic_wire_envelope(keystrokes::refused_before_posting(refusal));
+            assert_eq!(
+                validate_capability_result("computer.keys", &reply),
+                Ok(()),
+                "{name}: {reply}"
+            );
+        }
+    }
+
+    /// A name no lookup knows is refused as not a key name, pointing at the
+    /// tool description's key names rather than guessing. `del` has no
+    /// suggestion because the wire table has no `delete` entry.
+    #[test]
+    fn unknown_key_names_without_a_suggestion_say_so() {
+        for name in ["frobnicate", "del", "delete"] {
+            let refusal = parse(
+                ComputerCapability::Keys,
+                json!({"keys": [name], "target": "editor"}),
+            )
+            .expect_err("an unknown key name is refused");
+            assert_eq!(refusal["outcome"], "invalid_request", "{name}");
+            assert_eq!(refusal["field"], "keys", "{name}");
+            assert_eq!(refusal["reason"], "unknown_key", "{name}");
+            assert_eq!(
+                refusal["remedy"],
+                format!(
+                    r#"unknown key "{name}" is not a key name; use one of the key names in the tool description."#
+                ),
+                "{name}"
+            );
+            let reply = synthetic_wire_envelope(keystrokes::refused_before_posting(refusal));
+            assert_eq!(
+                validate_capability_result("computer.keys", &reply),
+                Ok(()),
+                "{name}: {reply}"
+            );
+        }
     }
 
     /// The Windows modifier has a neutral representation for Windows lock,
