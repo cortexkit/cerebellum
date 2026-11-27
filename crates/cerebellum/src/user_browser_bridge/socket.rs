@@ -22,24 +22,63 @@ pub(super) struct SocketListener {
     device: u64,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum SocketPermissions {
+    Private,
+    #[cfg(all(target_os = "linux", feature = "bridge-test-identities"))]
+    Permissive,
+}
+
 impl SocketListener {
     pub(super) fn bind(
         bridge: UserBrowserBridge,
         path: PathBuf,
         admission: Admission,
     ) -> io::Result<Self> {
+        Self::bind_with_permissions(bridge, path, admission, SocketPermissions::Private)
+    }
+
+    pub(super) fn bind_with_permissions(
+        bridge: UserBrowserBridge,
+        path: PathBuf,
+        admission: Admission,
+        permissions: SocketPermissions,
+    ) -> io::Result<Self> {
         let parent = path
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket has no parent"))?;
-        cerebellum_core::private_fs::create_dir_all(parent)?;
+        let (directory_mode, socket_mode, permission_error) = match permissions {
+            SocketPermissions::Private => {
+                cerebellum_core::private_fs::create_dir_all(parent)?;
+                (
+                    0o700,
+                    0o600,
+                    "bridge directory must be owned by the current user with mode 0700",
+                )
+            }
+            #[cfg(all(target_os = "linux", feature = "bridge-test-identities"))]
+            SocketPermissions::Permissive => {
+                // The fixture must supply its own directory; never widen an existing one.
+                (
+                    0o755,
+                    0o666,
+                    "test bridge directory must be owned by the current user with mode 0755",
+                )
+            }
+        };
         let directory = std::fs::symlink_metadata(parent)?;
+        let mode_mask = if cfg!(target_os = "linux") {
+            0o7777
+        } else {
+            0o777
+        };
         if !directory.is_dir()
             || directory.uid() != current_uid()
-            || directory.mode() & 0o777 != 0o700
+            || directory.mode() & mode_mask != directory_mode
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "bridge directory must be owned by the current user with mode 0700",
+                permission_error,
             ));
         }
         if let Ok(metadata) = std::fs::symlink_metadata(&path) {
@@ -63,7 +102,7 @@ impl SocketListener {
             }
         }
         let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(socket_mode))?;
         let metadata = std::fs::symlink_metadata(&path)?;
         let instance = bridge.clone();
         let task = tokio::spawn(async move {
@@ -139,16 +178,13 @@ fn current_uid() -> u32 {
 }
 
 fn peer_identity(stream: &UnixStream, admission: &Admission) -> Result<PeerIdentity, Reason> {
-    if stream
-        .peer_cred()
-        .map_or(true, |credentials| credentials.uid() != current_uid())
-    {
-        return Err(Reason::WrongUser);
-    }
     match admission {
+        #[cfg(target_os = "linux")]
+        Admission::Linux { .. } => super::linux::observe_peer(stream).map(PeerIdentity::Linux),
         #[cfg(target_os = "macos")]
         Admission::MacOs => {
             use std::os::fd::AsFd;
+            require_same_uid(stream)?;
             stream
                 .as_fd()
                 .try_clone_to_owned()
@@ -157,7 +193,22 @@ fn peer_identity(stream: &UnixStream, admission: &Admission) -> Result<PeerIdent
         }
         // The listener must be able to close the socket while a test check is stalled.
         #[cfg(test)]
-        Admission::Injected { .. } => Ok(PeerIdentity::Test),
+        Admission::Injected { .. } => {
+            require_same_uid(stream)?;
+            Ok(PeerIdentity::Test)
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn require_same_uid(stream: &UnixStream) -> Result<(), Reason> {
+    if stream
+        .peer_cred()
+        .is_ok_and(|credentials| credentials.uid() == current_uid())
+    {
+        Ok(())
+    } else {
+        Err(Reason::WrongUser)
     }
 }
 
