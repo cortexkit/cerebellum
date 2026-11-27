@@ -6,9 +6,11 @@
 //! exposes raw source objects without depending on cerebellum's ability policy.
 //! Callers decide what a path, digest, build ID, or missing reading means.
 //!
-//! Keep additions here small and mechanical. This crate is the auditable place
-//! for platform calls, not a place to move browser policy.
+//! The native-messaging bridge derives Linux peer and package evidence here;
+//! the callers own transport, deadlines, and the admission sequence.
 
+#[cfg(target_os = "linux")]
+pub mod bridge;
 #[cfg(target_os = "linux")]
 pub mod eds;
 // The exec-stop state machine has no syscalls, so its loop and bounds remain
