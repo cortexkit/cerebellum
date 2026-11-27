@@ -7,7 +7,6 @@ publish = false
 description = "Linux process readings, ptrace launch barrier and read-only EDS D-Bus transport for ck-cerebellum. One of two seam crates in the workspace permitted to contain unsafe code."
 
 [features]
-bridge-test-identities = ["cerebellum-bridge-protocol/bridge-test-identities"]
 desk-probe = []
 
 [lib]
@@ -18,8 +17,6 @@ path = "src/lib.rs"
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-cerebellum-bridge-protocol = { path = "../cerebellum-bridge-protocol" }
-ed25519-dalek = { version = "=2.2.0", default-features = false }
 sha2 = { workspace = true }
 serde = { workspace = true }
 # Pure Rust/MIT: no libdbus, GLib or EDS link-time dependency.

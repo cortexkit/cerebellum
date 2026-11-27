@@ -17,5 +17,8 @@ serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
 zeroize = "=1.9.1"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+cerebellum-linux = { path = "../cerebellum-linux" }
+
 [dev-dependencies]
 base64 = "0.22"

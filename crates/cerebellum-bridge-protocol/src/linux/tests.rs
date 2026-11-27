@@ -1,19 +1,23 @@
 use super::*;
+use std::os::unix::net::UnixStream;
 
 #[test]
-fn only_bind_probe_maps_unsupported_primitives_to_the_kernel_floor() {
-    for errno in [libc::ENOSYS, libc::ENOPROTOOPT, libc::EINVAL] {
-        let error = bind_probe::<()>(Err(io::Error::from_raw_os_error(errno))).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert_eq!(error.to_string(), "needs Linux 6.5+");
-        let observation = PeerObservationError::Observation(io::Error::from_raw_os_error(errno));
-        assert!(!observation.to_string().contains("needs Linux 6.5+"));
-    }
-    for errno in [libc::EPERM, libc::EACCES, libc::ESRCH, libc::ENOENT] {
-        let denied = bind_probe::<()>(Err(io::Error::from_raw_os_error(errno))).unwrap_err();
-        assert_eq!(denied.raw_os_error(), Some(errno));
-        assert!(!denied.to_string().contains("needs Linux 6.5+"));
-    }
+fn peer_observation_keeps_read_errors_distinct_from_wrong_user_and_kernel_floor() {
+    use std::error::Error;
+
+    let error = io::Error::new(io::ErrorKind::Unsupported, "unsupported peer pidfd");
+    let observation = PeerObservationError::Observation(error);
+    assert_eq!(
+        observation.to_string(),
+        "could not observe socket peer: unsupported peer pidfd"
+    );
+    assert!(!observation.to_string().contains("needs Linux 6.5+"));
+    assert!(observation.source().is_some());
+    assert_eq!(
+        PeerObservationError::WrongUser.to_string(),
+        "socket peer has a different UID"
+    );
+    assert!(PeerObservationError::WrongUser.source().is_none());
 }
 
 #[test]
@@ -22,9 +26,9 @@ fn socket_pidfd_names_the_credential_pid_not_a_substituted_pid() {
     let (socket, _other) = UnixStream::pair().unwrap();
     let peer = observe_peer(&socket).unwrap();
     assert_eq!(peer.pid, std::process::id());
-    assert!(peer.pidfd.require_pid(peer.pid).is_ok());
-    assert!(peer.pidfd.require_pid(peer.pid + 1).is_err());
-    assert!(peer.pidfd.require_live().is_ok());
+    assert!(require_pid(&peer.pidfd, peer.pid).is_ok());
+    assert!(require_pid(&peer.pidfd, peer.pid + 1).is_err());
+    assert!(require_live(&peer.pidfd).is_ok());
 }
 
 #[test]
@@ -39,9 +43,7 @@ fn deleted_exe_link_refuses_even_if_the_original_path_is_allowed() {
 
 #[test]
 fn post_hello_requires_all_native_parent_fields_to_match() {
-    use cerebellum_bridge_protocol::{
-        LinuxBrowser, LinuxPackage, LinuxPackageManager, ParentAttestation,
-    };
+    use crate::{LinuxBrowser, LinuxPackage, LinuxPackageManager, ParentAttestation};
 
     let native =
         |browser, pid, start_ticks, name: &str, version: &str| PlatformParentAttestation::Linux {
@@ -85,14 +87,25 @@ fn post_hello_requires_all_native_parent_fields_to_match() {
 #[test]
 fn signed_test_parent_is_admitted_only_with_the_test_feature_and_role() {
     use ed25519_dalek::SigningKey;
-    use std::os::fd::FromRawFd;
+    use std::fs::{self, OpenOptions};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn image_with_trailer(signer: &SigningKey, role: PeerRole) -> File {
-        // SAFETY: the name is a C string and the successful fd is newly owned.
-        let fd = unsafe { libc::memfd_create(c"bridge-image".as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(fd >= 0, "{}", io::Error::last_os_error());
-        // SAFETY: memfd_create succeeded and returned a new descriptor.
-        let mut file = unsafe { File::from_raw_fd(fd) };
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = Path::new("/tmp").join(format!(
+            "cerebellum-bridge-image-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        fs::remove_file(path).unwrap();
         peer_trailer::append(&mut file, signer, role, TARGET, "1.0.0").unwrap();
         file
     }
@@ -109,7 +122,7 @@ fn signed_test_parent_is_admitted_only_with_the_test_feature_and_role() {
     let pid = std::process::id();
     let mut candidate = ParentProcess {
         pid,
-        pidfd: PidFd::open(pid).unwrap(),
+        pidfd: PidFd::open_process(pid).unwrap(),
         start_ticks: 1234,
         image: image_with_trailer(&test_signer, PeerRole::TestParent),
         path: "/not/a/packaged/browser".into(),
