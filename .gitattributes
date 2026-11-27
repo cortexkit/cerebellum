@@ -1,0 +1,3 @@
+# Fixtures, resources, and some Rust source are embedded and hashed byte for
+# byte. Check out the committed bytes, even when Git autocrlf is enabled.
+* -text
