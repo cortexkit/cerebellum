@@ -1783,21 +1783,22 @@ pub(crate) fn add_diff_view(
 /// read, a name cannot be confirmed or denied and is let through, because
 /// the element already decides where the action lands. A bundle identity
 /// needs no list to compare.
-pub(crate) fn target_names_application(
+fn target_names_application(
+    syntax: super::TargetSyntax,
     source: &dyn AppStateSource,
     target: &str,
     bundle_identity: &str,
     pid: u32,
 ) -> bool {
     let wanted = target.trim();
-    if wanted.eq_ignore_ascii_case(bundle_identity) {
+    if syntax.matches_identity(wanted, bundle_identity) {
         return true;
     }
     match source.running_apps() {
         Ok(apps) => apps
             .iter()
             .any(|app| app.pid == pid && app.name.trim().eq_ignore_ascii_case(wanted)),
-        Err(_) => !super::looks_like_bundle_identity(wanted),
+        Err(_) => !syntax.is_identity(wanted),
     }
 }
 
@@ -2609,8 +2610,9 @@ where
         let source = self.app_state_source.clone();
         let bundle_identity = bundle_identity.to_string();
         let checked = target.clone();
+        let syntax = self.target_syntax();
         let matches = tokio::task::spawn_blocking(move || {
-            target_names_application(source.as_ref(), &checked, &bundle_identity, pid)
+            target_names_application(syntax, source.as_ref(), &checked, &bundle_identity, pid)
         })
         .await
         .unwrap_or(false);

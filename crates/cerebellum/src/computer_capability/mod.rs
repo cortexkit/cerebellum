@@ -186,7 +186,7 @@ pub(crate) use permissions::live_for_test;
 pub(crate) use serialize::{arrive as computer_arrival, scope as serialized_call};
 mod takeover;
 mod target_resolution;
-use target_resolution::{looks_like_bundle_identity, match_target_name, MATCHED_APP};
+use target_resolution::{match_target_name, TargetSyntax, MATCHED_APP};
 
 use crate::computer_grants::{ConsentContext, ConsentRefusal};
 use crate::management::{AppRefusal, ManagementPlane};
