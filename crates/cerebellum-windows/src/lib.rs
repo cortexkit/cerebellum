@@ -20,8 +20,12 @@ mod file_identity;
 mod image_file_facts;
 #[cfg(any(target_os = "windows", test))]
 mod session;
+#[cfg(windows)]
+mod signer_facts;
 #[cfg(target_os = "windows")]
 mod token_facts;
+#[cfg(windows)]
+mod window_identity_facts;
 #[cfg(any(target_os = "windows", test))]
 mod window_list;
 #[cfg(target_os = "windows")]
@@ -41,11 +45,19 @@ pub use file_identity::{file_identity, FileIdentity};
 #[cfg(windows)]
 pub use image_file_facts::{
     lock_image_file, retain_image_process, ImageMappingReading, LockedImageFile,
+    ProcessPackageFields,
 };
+#[cfg(windows)]
+pub use signer_facts::{AuthenticodeFacts, SignerFields};
 #[cfg(target_os = "windows")]
 pub use token_facts::{
     current_process_token_elevation_type, current_process_token_facts, TokenElevationType,
     TokenFacts,
+};
+#[cfg(windows)]
+pub use window_identity_facts::{
+    child_window_numbers, desktop_window_numbers, window_identity_facts, windows_system_directory,
+    WindowIdentityFacts,
 };
 #[cfg(target_os = "windows")]
 pub use windows::{

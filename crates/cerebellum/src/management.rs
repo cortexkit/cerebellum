@@ -132,6 +132,16 @@ pub(crate) const PHONE_CONSENT_DEADLINE: Duration = Duration::from_secs(30 * 60)
 pub trait TargetResolver: Send + Sync {
     fn resolve(&self, bundle_identity: &str) -> TargetResolution;
 
+    #[cfg(windows)]
+    fn resolve_with_policy(&self, target: &str) -> Result<TargetResolution, Value> {
+        Ok(self.resolve(target))
+    }
+
+    #[cfg(windows)]
+    fn resolves_windows_names(&self) -> bool {
+        false
+    }
+
     /// The name the resolved process runs under, for showing to a person.
     /// `None` where it cannot be read; the bundle identity is shown instead.
     fn display_name(&self, _grant: &ProcessGrant) -> Option<String> {
@@ -324,35 +334,53 @@ impl TargetResolver for PlatformResolver {
         })
     }
 
-    /// On macOS a caller names a bundle identifier (`com.apple.TextEdit`). On
-    /// Windows the same caller names an executable basename (`notepad.exe`).
-    /// Windows has no bundle identifier; the two identities are deliberately
-    /// asymmetric.
-    ///
-    /// Measured on Windows 11 ARM64, console session: one Notepad resolves,
-    /// two are refused as ambiguous with both pids and window counts, an
-    /// absent name is NotRunning over a complete 95-window reading, and the
-    /// same command from the service session refuses by provenance -- where
-    /// the reading SUCCEEDS with six service-desktop windows and would
-    /// otherwise have called two open Notepads not running.
-    ///
-    /// UWP applications resolve by their OWN executable basename, the same as
-    /// classic ones: Calculator running as the console user is
-    /// `calculatorapp.exe`, Resolved to its own pid, stable across repeated
-    /// reads. An earlier note here said the opposite; that run had never
-    /// launched Calculator (AppX activation is per-user and the launcher ran as
-    /// SYSTEM), so its NotRunning was true and proved nothing about UWP.
-    ///
-    /// Do not name `applicationframehost.exe` for a UWP app. It also resolves,
-    /// but to the frame host that owns the title bars of EVERY open UWP app --
-    /// two windows before Calculator, five after -- so it is the wrong process
-    /// for actuation and is ambiguous across apps in a way the count cannot
-    /// show. The app's content, and its accessibility tree, live in its own
-    /// process.
     #[cfg(target_os = "windows")]
-    fn resolve(&self, bundle_identity: &str) -> TargetResolution {
+    fn resolve(&self, target: &str) -> TargetResolution {
+        self.resolve_with_policy(target)
+            .unwrap_or(TargetResolution::Unreadable(
+                cerebellum_computer::platform::UnreadableReason::RunningAppListUnavailable,
+            ))
+    }
+
+    #[cfg(windows)]
+    fn resolve_with_policy(&self, target: &str) -> Result<TargetResolution, Value> {
         let _ = self.timeout;
-        cerebellum_computer::platform::windows::resolve_target(bundle_identity)
+        if !Self::HAS_APP_IDENTITY_READER {
+            return Ok(cerebellum_computer::platform::windows::resolve_target(
+                target,
+            ));
+        }
+        crate::computer_capability::windows_identity::resolve_target(target)
+    }
+
+    #[cfg(windows)]
+    fn resolves_windows_names(&self) -> bool {
+        Self::HAS_APP_IDENTITY_READER
+    }
+
+    #[cfg(windows)]
+    fn display_name(&self, grant: &ProcessGrant) -> Option<String> {
+        Self::HAS_APP_IDENTITY_READER
+            .then(|| crate::computer_capability::windows_identity::consent_name(grant))
+            .flatten()
+    }
+
+    #[cfg(windows)]
+    fn process_for_pid(&self, pid: u32) -> Option<ProcessGrant> {
+        Self::HAS_APP_IDENTITY_READER
+            .then(|| crate::computer_capability::windows_identity::grant_for_pid(pid))
+            .flatten()
+    }
+
+    #[cfg(windows)]
+    fn app_code(&self, grant: &ProcessGrant) -> Arc<dyn AppCode> {
+        if Self::HAS_APP_IDENTITY_READER {
+            Arc::new(crate::computer_capability::windows_identity::RunningCode(
+                grant.clone(),
+            ))
+        } else {
+            Arc::new(NoIdentityReader)
+        }
     }
 
     // No enumerator exists for these platforms, so the answer is that the
@@ -860,7 +888,11 @@ impl ManagementPlane {
     /// exited and had its identifier reused would otherwise inherit a grant
     /// made for something else.
     pub fn resolve_process(&self, bundle_identity: &str) -> Result<ProcessGrant, Value> {
-        match self.resolver.resolve(bundle_identity) {
+        #[cfg(windows)]
+        let resolved = self.resolver.resolve_with_policy(bundle_identity)?;
+        #[cfg(not(windows))]
+        let resolved = self.resolver.resolve(bundle_identity);
+        match resolved {
             TargetResolution::Resolved(grant) => Ok(grant),
             TargetResolution::NotRunning => Err(json!({
                 "outcome": "not_running",
@@ -888,6 +920,11 @@ impl ManagementPlane {
         }
     }
 
+    #[cfg(windows)]
+    pub(crate) fn resolves_windows_names(&self) -> bool {
+        self.resolver.resolves_windows_names()
+    }
+
     /// What the person sees an application called, for the consent question:
     /// its running name, or its bundle identity when no name can be read.
     pub fn application_name(&self, grant: &ProcessGrant) -> String {
@@ -905,6 +942,12 @@ impl ManagementPlane {
         grant: &ProcessGrant,
         display_name: String,
     ) -> GrantNeed {
+        #[cfg(windows)]
+        let bundle_identity = if self.resolves_windows_names() {
+            grant.bundle_identity.as_str()
+        } else {
+            bundle_identity
+        };
         GrantNeed::App {
             bundle_identity: bundle_identity.to_string(),
             display_name,
