@@ -25,9 +25,9 @@ use std::sync::OnceLock;
 // the format to /v2. A reviewer read the mismatch as a mistake before finding
 // both fields in the artifact, so it is stated here rather than re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v2";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v39";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v40";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v39.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v40.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "32cb9e4ea8197dd8f4ec5abd6085af47ee1812ba9e8908d903bada9263f154ea";
+    "d85ac37325ee0f2c38cf277584deb7ec8c35c64f675886f78ef92bbb21de4f12";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -1577,6 +1577,93 @@ mod tests {
             reply["image_unavailable"]["detail"] = detail;
             assert!(!withheld(id, &reply).is_empty(), "{reply}");
         }
+    }
+
+    #[test]
+    fn linux_desktop_results_keep_image_and_fronting_refusals_separate() {
+        use serde_json::json;
+
+        let id = "computer.read_state";
+        let mut reply = json!({
+            "outcome": "completed",
+            "state_text": "fixture",
+            "image_fronting": {
+                "attempted": false, "restored": false, "longest_fronted_interval_ms": 0,
+                "reason": "fronting_unavailable"
+            },
+        });
+        assert!(withheld(id, &reply).is_empty());
+        for reason in [
+            "picture_unattributable",
+            "route_not_reviewed",
+            "backend_unavailable",
+            "window_not_mapped",
+        ] {
+            reply["image_unavailable"] = json!({"reason": reason});
+            assert!(withheld(id, &reply).is_empty(), "{reply}");
+        }
+        reply["image_unavailable"]["reason"] = json!("unlisted_image_reason");
+        assert_eq!(
+            withheld(id, &reply),
+            vec![CapabilityResultViolation::EnumMismatch {
+                path: "$.image_unavailable.reason".into(),
+            }]
+        );
+        reply.as_object_mut().unwrap().remove("image_unavailable");
+        reply["image_fronting"]["reason"] = json!("unlisted_fronting_reason");
+        assert_eq!(
+            withheld(id, &reply),
+            vec![CapabilityResultViolation::EnumMismatch {
+                path: "$.image_fronting.reason".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn linux_desktop_results_report_secure_semantic_refusals_and_blocked_typing() {
+        use serde_json::json;
+
+        for id in ["computer.press_element", "computer.write_text"] {
+            for reason in ["secure_field_focused", "focus_unreadable"] {
+                let reply = json!({
+                    "outcome": "secure_field_refused", "reason": reason,
+                    "remedy": "Nothing was posted; ask the person to act.",
+                });
+                assert!(withheld(id, &reply).is_empty(), "{id}: {reply}");
+            }
+        }
+        for id in ["computer.type", "computer.keys"] {
+            let reply = json!({
+                "outcome": "chord_blocked", "reason": "lock", "chord": "command+l",
+                "containment_rung": "pid_structural", "target_fronted": false,
+                "effect_status": "not_dispatched", "posts_returned": 0,
+                "remedy": "Do this yourself.",
+            });
+            assert!(withheld(id, &reply).is_empty(), "{id}: {reply}");
+        }
+    }
+
+    #[test]
+    fn linux_desktop_results_report_launch_failures_without_claiming_success() {
+        use serde_json::json;
+
+        let id = "computer.open_app";
+        let mut reply = json!({"outcome": "launch_failed", "reason": "launch_child_exited"});
+        for detail in [json!({"exit_status": 0}), json!({"signal": 15})] {
+            reply["detail"] = detail;
+            assert!(withheld(id, &reply).is_empty(), "{reply}");
+        }
+        reply["detail"] = json!({"signal": "SIGTERM"});
+        assert_eq!(
+            withheld(id, &reply),
+            vec![CapabilityResultViolation::ExpectedType {
+                path: "$.detail.signal".into(),
+                expected: "integer".into(),
+            }]
+        );
+        reply.as_object_mut().unwrap().remove("detail");
+        reply["reason"] = json!("launch_status_unknown");
+        assert!(withheld(id, &reply).is_empty());
     }
 
     #[test]

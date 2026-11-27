@@ -971,9 +971,15 @@ fn the_session_floor_holds_every_chord_this_test_names() {
         );
     }
     assert_eq!(
-        BLOCKED_CHORDS.len(),
+        BLOCKED_CHORDS
+            .iter()
+            .filter(|row| matches!(
+                row.platform,
+                BlockedChordPlatform::MacOs | BlockedChordPlatform::Windows
+            ))
+            .count(),
         expected.len(),
-        "the constant and this list disagree on how many chords the floor holds"
+        "the macOS/Windows floor and this list disagree on chord count"
     );
 }
 
