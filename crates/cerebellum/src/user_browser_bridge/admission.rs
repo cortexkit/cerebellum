@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub(super) enum PeerIdentity {
     #[cfg(target_os = "macos")]
     MacOs(OwnedFd),
-    #[cfg(all(test, not(target_os = "macos")))]
+    #[cfg(test)]
     Test,
 }
 
@@ -148,8 +148,14 @@ impl Admission {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn verify_signed_host(identity: PeerIdentity) -> Result<PeerEvidence, Reason> {
+fn verify_signed_host(identity: PeerIdentity) -> Result<PeerEvidence, Reason> {
+    #[cfg(not(test))]
     let PeerIdentity::MacOs(socket) = identity;
+    #[cfg(test)]
+    let PeerIdentity::MacOs(socket) = identity
+    else {
+        return Err(Reason::UnsignedPeer);
+    };
     cerebellum_macos::peer_satisfies_requirement(
         &socket,
         cerebellum_bridge_protocol::HOST_REQUIREMENT,

@@ -112,7 +112,7 @@ where
                 let admission = admission.clone();
                 peers.spawn(async move {
                     let _slot = slot;
-                    let identity = peer_identity(&stream);
+                    let identity = peer_identity(&stream, &admission);
                     admit(bridge, stream, identity, admission).await;
                 });
             }
@@ -138,24 +138,27 @@ fn current_uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-fn peer_identity(stream: &UnixStream) -> Result<PeerIdentity, Reason> {
+fn peer_identity(stream: &UnixStream, admission: &Admission) -> Result<PeerIdentity, Reason> {
     if stream
         .peer_cred()
         .map_or(true, |credentials| credentials.uid() != current_uid())
     {
         return Err(Reason::WrongUser);
     }
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::fd::AsFd;
-        stream
-            .as_fd()
-            .try_clone_to_owned()
-            .map(PeerIdentity::MacOs)
-            .map_err(|_| Reason::UnsignedPeer)
+    match admission {
+        #[cfg(target_os = "macos")]
+        Admission::MacOs => {
+            use std::os::fd::AsFd;
+            stream
+                .as_fd()
+                .try_clone_to_owned()
+                .map(PeerIdentity::MacOs)
+                .map_err(|_| Reason::UnsignedPeer)
+        }
+        // The listener must be able to close the socket while a test check is stalled.
+        #[cfg(test)]
+        Admission::Injected { .. } => Ok(PeerIdentity::Test),
     }
-    #[cfg(not(target_os = "macos"))]
-    Ok(PeerIdentity::Test)
 }
 
 #[cfg(test)]
@@ -181,17 +184,16 @@ pub(super) fn test_listener(
     path: &Path,
     signed: bool,
 ) -> io::Result<BridgeListener> {
+    #[cfg(target_os = "macos")]
+    if !signed {
+        let socket = SocketListener::bind(bridge, path.to_path_buf(), Admission::MacOs)?;
+        return Ok(BridgeListener { _socket: socket });
+    }
+
     let verifier: VerifyPeer = if signed {
         Arc::new(|_| Ok(PeerEvidence::Test { _retained: None }))
     } else {
-        #[cfg(target_os = "macos")]
-        {
-            Arc::new(super::admission::verify_signed_host)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Arc::new(|_| Err(Reason::UnsignedPeer))
-        }
+        Arc::new(|_| Err(Reason::UnsignedPeer))
     };
     BridgeListener::bind_at(
         bridge,
