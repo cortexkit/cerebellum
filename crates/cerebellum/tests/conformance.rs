@@ -1191,6 +1191,34 @@ fn install_daemon_trace_subscriber() {
     });
 }
 
+fn live_module_binary() -> PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_ck-cerebellum")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ck-cerebellum")))
+}
+
+fn assert_fits_managed_settings_capture(binary: &Path) {
+    const CAPTURE_LIMIT: u64 = 512 * 1024 * 1024;
+    // Leave 25% headroom below subc-daemon's executable hash limit so growth
+    // fails here instead of leaving the module waiting for a settings view.
+    const FIXTURE_BUDGET: u64 = CAPTURE_LIMIT * 3 / 4;
+    let size = fs::metadata(binary)
+        .unwrap_or_else(|err| panic!("stat live module fixture {}: {err}", binary.display()))
+        .len();
+    assert!(
+        size <= FIXTURE_BUDGET,
+        "live module fixture {} is {size} bytes, above the 384 MiB budget for the daemon's \
+         512 MiB managed-settings capture limit; build tests with [profile.test] \
+         debug = \"line-tables-only\" and check for CARGO_PROFILE_TEST_DEBUG overrides",
+        binary.display()
+    );
+}
+
+#[test]
+fn managed_settings_fixture_fits_daemon_capture_limit() {
+    assert_fits_managed_settings_capture(&live_module_binary());
+}
+
 /// Start the real daemon, optionally giving the spawned module a browser
 /// configuration in its isolated home.
 ///
@@ -1215,11 +1243,10 @@ async fn start_live_daemon_with_browser(
     let config_home = cortexkit_test_support::fenced_subc_env_dir(&directory, "XDG_CONFIG_HOME");
     let data_home = cortexkit_test_support::fenced_subc_env_dir(&directory, "XDG_DATA_HOME");
     let connection_file_path = directory.join("subc-connection.json");
-    let binary = std::env::var_os("CARGO_BIN_EXE_ck-cerebellum")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ck-cerebellum")
-        });
+    let binary = live_module_binary();
+    if managed {
+        assert_fits_managed_settings_capture(&binary);
+    }
     let binary = cortexkit_test_support::ckdev_binary(binary);
     let binary = support::daemon_binary("ckdev-cerebellum", binary);
     // Pay the first-exec cost of a freshly built binary before the registration
