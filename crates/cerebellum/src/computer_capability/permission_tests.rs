@@ -124,7 +124,7 @@ fn permission_states_never_change_serialized_tool_definitions() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod wire {
     use super::*;
     use crate::computer_capability::permissions::live_for_test;
@@ -168,12 +168,21 @@ mod wire {
         // Missing-permission calls must be advertised before they can return a
         // permission refusal. Build the admitted set with the production
         // advertisement function rather than installing a test-only list.
-        planes.computer_admitted = Arc::new(
-            crate::computer_release_evidence(&context(PermissionLiveness::Unavailable))
-                .gate_admitted_capabilities
-                .into_iter()
-                .collect(),
-        );
+        #[cfg(target_os = "macos")]
+        {
+            planes.computer_admitted = Arc::new(
+                crate::computer_release_evidence(&context(PermissionLiveness::Unavailable))
+                    .gate_admitted_capabilities
+                    .into_iter()
+                    .collect(),
+            );
+        }
+        // Windows does not yet advertise type. Admit the fixture request to
+        // exercise the shared reply without changing production advertisement.
+        #[cfg(target_os = "windows")]
+        {
+            planes.computer_admitted = Arc::new([format!("computer.{action}")].into());
+        }
         planes.routes.insert(
             7,
             1,
@@ -276,15 +285,24 @@ mod wire {
                 "permission must be checked before target lookup"
             );
             let remedy = reply["remedy"].as_str().unwrap();
-            assert!(remedy.contains("restart cerebellum"), "{reply}");
             if state == PermissionLiveness::GrantedPendingRelaunch {
-                assert!(!remedy.contains("System Settings"), "{reply}");
-            } else {
-                assert!(remedy.starts_with("On macOS, grant "), "{reply}");
-                assert!(
-                    remedy.contains("System Settings") && remedy.contains("ck-cerebellum"),
-                    "{reply}"
+                assert_eq!(
+                    remedy,
+                    "restart cerebellum to use the permission already granted to ck-cerebellum"
                 );
+            } else {
+                #[cfg(target_os = "windows")]
+                assert_eq!(remedy, "On Windows, run cerebellum and the target app without administrator privileges in the same interactive desktop session, then restart cerebellum; if the permission is still unavailable, report it");
+                #[cfg(target_os = "macos")]
+                {
+                    let label = match permission {
+                        "accessibility" => "Accessibility",
+                        "input_monitoring" => "Input Monitoring",
+                        "screen_recording" => "Screen Recording",
+                        _ => panic!("unknown permission {permission}"),
+                    };
+                    assert_eq!(remedy, format!("On macOS, grant {label} to ck-cerebellum in System Settings > Privacy & Security, then restart cerebellum; permission readings are taken only at startup"));
+                }
             }
             if action == "type" || action == "keys" {
                 assert_eq!(reply["effect_status"], "not_dispatched", "{reply}");
@@ -322,6 +340,7 @@ mod wire {
         .await;
     }
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn permission_requirements_refuse_each_advertised_row_over_the_wire() {
         for action in [

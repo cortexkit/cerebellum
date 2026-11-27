@@ -48,10 +48,7 @@ pub(super) fn refusal(
         let remedy = if state == PermissionLiveness::GrantedPendingRelaunch {
             "restart cerebellum to use the permission already granted to ck-cerebellum".to_string()
         } else {
-            format!(
-                "On macOS, grant {label} to ck-cerebellum in System Settings > Privacy & Security, then \
-                 restart cerebellum; permission readings are taken only at startup"
-            )
+            missing_permission_remedy(label)
         };
         Some(json!({
             "outcome": "permission_missing",
@@ -59,6 +56,19 @@ pub(super) fn refusal(
             "remedy": remedy,
         }))
     })
+}
+
+#[cfg(target_os = "windows")]
+fn missing_permission_remedy(_label: &str) -> String {
+    "On Windows, run cerebellum and the target app without administrator privileges in the same interactive desktop session, then restart cerebellum; if the permission is still unavailable, report it".to_string()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn missing_permission_remedy(label: &str) -> String {
+    format!(
+        "On macOS, grant {label} to ck-cerebellum in System Settings > Privacy & Security, then \
+         restart cerebellum; permission readings are taken only at startup"
+    )
 }
 
 #[cfg(test)]

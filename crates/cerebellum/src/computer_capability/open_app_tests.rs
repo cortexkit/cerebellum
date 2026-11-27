@@ -1,9 +1,9 @@
 //! Real tool frames over a scripted desk: no OS launch or permission request.
 
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "windows"))]
 
 use super::*;
-use cerebellum_computer::app_state::source::InstalledApp;
+use cerebellum_computer::app_state::source::{InstalledApp, OpenAppError};
 use cerebellum_computer::platform::ProcessGrant;
 use cerebellum_core::journal::{InMemoryJournalStorage, JournalConfig};
 use std::time::Duration;
@@ -232,6 +232,10 @@ async fn open_app_unsigned_and_ad_hoc_bundles_refuse_before_consent() {
         }
         let (reply, questions) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
         assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
+        assert_eq!(reply["detail"]["reason"], "app_identity_unreadable");
+        #[cfg(target_os = "windows")]
+        assert_eq!(reply["remedy"], "On Windows, open_app requires an installed app with a verified publisher and program identity or a verified package identity");
+        #[cfg(target_os = "macos")]
         assert_eq!(reply["remedy"], "On macOS, the installed application must carry a valid, non-ad-hoc signature before it can be launched");
         assert_eq!(questions, 0);
         assert!(desk.state().opens.is_empty());
@@ -528,7 +532,7 @@ async fn open_app_first_action_refuses_a_differently_signed_older_process() {
             ResultSchemaEnforcement::Withhold,
             NativeComputerPlatformDriver::default,
         )
-        .with_permission_liveness(super::live_for_test())
+        .with_permission_liveness(super::permissions::live_for_test())
         .with_session_lock_for_test(Some(false))
         .with_app_state_source(desk.source()),
     ));
@@ -695,26 +699,67 @@ async fn open_app_partial_inventory_missing_match_discloses_unreadable_part() {
         desk.state().installed.complete = complete;
         let (reply, questions) = wire(&planes, "open_app", json!({"target":"Missing"})).await;
         assert_eq!(reply["outcome"], "no_installed_app_named", "{reply}");
-        assert!(reply["remedy"]
-            .as_str()
-            .unwrap()
-            .contains("app identity (a bundle id on macOS)"));
+        let remedy = reply["remedy"].as_str().unwrap();
         assert_eq!(
             reply["installed_list"],
             if complete { "complete" } else { "partial" }
         );
-        if !complete {
-            assert!(
-                reply["remedy"]
-                    .as_str()
-                    .unwrap()
-                    .contains("may be in the unreadable part"),
-                "{reply}"
-            );
+        if complete {
+            assert!(remedy.contains("app identity (a bundle id on macOS)"));
+        } else {
+            #[cfg(target_os = "windows")]
+            assert_eq!(remedy, "the installed inventory is incomplete; retry list_apps, or use the exact name or app identity of an app it shows");
+            #[cfg(target_os = "macos")]
+            assert_eq!(remedy, "the application may be in the unreadable part of the installed inventory; restore access and retry, or use the exact name or app identity (a bundle id on macOS) of an app shown by list_apps");
         }
         assert_eq!(questions, 0);
         assert!(desk.state().opens.is_empty());
     }
+}
+
+#[tokio::test]
+async fn list_apps_targets_unreadable_has_platform_remedy() {
+    let (planes, desk, _) = rig();
+    desk.state().running = None;
+    let (reply, questions) = wire(&planes, "list_apps", json!({})).await;
+    assert_eq!(reply["outcome"], "targets_unreadable", "{reply}");
+    assert_eq!(reply["unreadable"]["reason"], "window_list_unavailable");
+    #[cfg(target_os = "windows")]
+    assert_eq!(
+        reply["remedy"],
+        "the running applications could not be read; retry, or name an application by app identity"
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(reply["remedy"], "the running applications could not be read; retry, or name an application by app identity (a bundle id on macOS)");
+    assert_eq!(questions, 0);
+}
+
+async fn assert_launch_failed_remedy(error: OpenAppError, expected: &str) {
+    let (planes, desk, _) = rig();
+    desk.state().open_error = Some(error);
+    let (reply, questions) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(reply["outcome"], "launch_failed", "{reply}");
+    assert_eq!(reply["remedy"], expected);
+    assert_eq!(questions, 1);
+    assert_eq!(desk.state().opens.len(), 1);
+}
+
+#[tokio::test]
+async fn open_app_process_wait_timeout_has_platform_remedy() {
+    #[cfg(target_os = "windows")]
+    let expected = "The launcher did not return a process within its 30000 ms process wait; use list_apps before retrying because the application may still start";
+    #[cfg(target_os = "macos")]
+    let expected = "On macOS, LaunchServices did not return a process within its 30000 ms process wait; list_apps before retrying because the application may still start";
+    assert_launch_failed_remedy(OpenAppError::TimedOut, expected).await;
+}
+
+#[tokio::test]
+async fn open_app_launch_failure_has_platform_remedy() {
+    #[cfg(target_os = "windows")]
+    let expected = "The application could not be opened; use list_apps before retrying because the application may still start";
+    #[cfg(target_os = "macos")]
+    let expected = "On macOS, LaunchServices could not open the application; list_apps before retrying because the application may still start";
+    assert_launch_failed_remedy(OpenAppError::Failed, expected).await;
 }
 
 #[tokio::test]
