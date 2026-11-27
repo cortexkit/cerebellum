@@ -158,6 +158,7 @@ jobs:
             @($_.spans | Where-Object { $_.is_primary -and $_.file_name -like '*direct_call.rs' }).Count -eq 1
           })
           if ($refusals.Count -ne 1) { throw 'Expected one disallowed-methods error at the fixture call' }
+          exit 0
 
   macos-pins:
     name: macOS browser pins

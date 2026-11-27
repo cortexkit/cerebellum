@@ -2247,6 +2247,7 @@ fn prepare_module(
     }
     // After launch recovery has terminated any capture browser a previous
     // module process left running, remove the profiles it left.
+    #[cfg(not(windows))]
     planes.capture.sweep_at_startup();
     let idle_enforcer = browser_config.clone().map(|browser| {
         let sessions = planes.sessions.clone();
