@@ -148,3 +148,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Native Rust workspace tests
         run: cargo test --locked --workspace --no-fail-fast
+      - name: Native Windows browser image predicates
+        if: ${{ !cancelled() && matrix.runner == 'windows-latest' }}
+        timeout-minutes: 8
+        shell: pwsh
+        run: ./crates/cerebellum-windows/tests/windows-image-predicates.ps1

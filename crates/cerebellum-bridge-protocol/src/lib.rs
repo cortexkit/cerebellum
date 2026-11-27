@@ -31,6 +31,8 @@ mod gate;
 pub mod linux;
 mod paths;
 pub mod peer_trailer;
+#[cfg(windows)]
+pub mod windows;
 
 pub use attestation::{
     AttestationV1, HostParentAttestation, LinuxBrowser, LinuxPackage, LinuxPackageManager,

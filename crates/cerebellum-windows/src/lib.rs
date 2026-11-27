@@ -13,11 +13,15 @@
 #[cfg(any(target_os = "windows", test))]
 mod accessibility;
 #[cfg(windows)]
+mod browser_image;
+#[cfg(windows)]
 mod devtools_pipe;
 #[cfg(windows)]
 mod file_identity;
 #[cfg(windows)]
 mod image_file_facts;
+#[cfg(any(windows, test))]
+mod pe_product;
 #[cfg(any(target_os = "windows", test))]
 mod session;
 #[cfg(windows)]
@@ -37,6 +41,13 @@ pub use accessibility::{
     AccessibilityInvokeError, AccessibilityInvokeOutcome, AccessibilityReadBounds,
     AccessibilityReadFailure, UiaAccessibilityTree, UiaControlTypeAndName, UiaElement,
     UiaElementIdentity, UiaElementName, UiaRectangle, UiaTreeCompleteness,
+};
+#[cfg(windows)]
+pub use browser_image::{
+    image_status, read_authenticode, read_catalog_signer, read_embedded_root_status,
+    read_product_names, read_program_files_directory, read_system_directory, AuthenticodeReading,
+    ImageReadError, MicrosoftRootReading, OpenedMachineDirectory, OpenedProcessImage,
+    ProgramFilesDirectory, SignatureReading, SignerSubject,
 };
 #[cfg(windows)]
 pub use devtools_pipe::{spawn_with_devtools_pipe, DevToolsPipeReader, DevToolsProcess};
@@ -62,8 +73,8 @@ pub use window_identity_facts::{
 #[cfg(target_os = "windows")]
 pub use windows::{
     current_session_provenance, enumerate_top_level_windows, enumerated_window_visibility,
-    process_start_time, retain_process_handle, ProcessHandleError, ProcessStartTime,
-    RetainedProcessHandle, WindowVisibility,
+    process_start_time, retain_process_handle, retain_process_handle_for_image, ProcessHandleError,
+    ProcessStartTime, RetainedProcessHandle, WindowVisibility,
 };
 
 // Pure data, so it is reachable wherever the readers that carry it are.

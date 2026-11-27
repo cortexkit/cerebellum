@@ -385,6 +385,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "cerebellum-linux",
+ "cerebellum-windows",
  "cortexkit-paths",
  "ed25519-dalek",
  "serde",
