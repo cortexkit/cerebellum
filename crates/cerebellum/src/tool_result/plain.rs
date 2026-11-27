@@ -733,8 +733,10 @@ pub(super) fn facts(
     }
     if let Some(unavailable) = object.get("image_unavailable") {
         if let Some(reason) = text_of(unavailable, "reason") {
-            lines.push(image_unavailable_line(reason));
-            if let Some(detail) = unavailable.get("detail") {
+            let detail = unavailable.get("detail");
+            let bound_ms = detail.and_then(|detail| detail["bound_ms"].as_u64());
+            lines.push(image_unavailable_line(reason, bound_ms));
+            if let Some(detail) = detail {
                 if let Some(stage) = text_of(detail, "stage") {
                     lines.push(match text_of(detail, "prepare_error") {
                         Some(kind) => format!("Image withholding stage: {stage} ({kind})."),
@@ -940,22 +942,20 @@ fn refusal_lines(object: &Map<String, Value>, code: &str, lines: &mut Vec<String
     }
 }
 
-/// Why an image read returned no image. Most reasons read well as words; the
-/// fronting bound needs its number and the fact that it is per call, or an
-/// agent reads it as a quota and stops asking.
-fn image_unavailable_line(reason: &str) -> String {
+/// The fronting limit is per call, not a quota. Name it only when the read
+/// reports the limit it used.
+fn image_unavailable_line(reason: &str, bound_ms: Option<u64>) -> String {
     if reason == "fronting_bound_exceeded" {
-        let bound = cerebellum_computer::platform::vocabulary::frozen_row_bound_ms(
-            "computer.read_state",
-            "maximum_fronting_read_interval_ms",
-        );
-        if let Some(bound) = bound {
-            return format!(
+        return match bound_ms {
+            Some(bound) => format!(
                 "No image: the app took longer than {bound} ms to come to the front and be \
-                 captured, so the image was withheld and the previous app put back. Every call \
-                 gets the same {bound} ms; try again."
-            );
-        }
+                 captured, so the image was withheld and the previous app put back. This limit \
+                 applies per call; try again."
+            ),
+            None => "No image: the app took too long to come to the front and be captured, so \
+                     the image was withheld. Try again."
+                .into(),
+        };
     }
     format!("No image: {}.", words(reason))
 }
@@ -1054,16 +1054,36 @@ mod tests {
 
     #[test]
     fn an_overrun_fronting_bound_names_its_allowance_and_says_it_is_per_call() {
-        let line = image_unavailable_line("fronting_bound_exceeded");
+        for bound in [200, 175] {
+            let lines = fact_lines(json!({
+                "outcome": "completed",
+                "image_unavailable": {
+                    "reason": "fronting_bound_exceeded",
+                    "detail": {"bound_ms": bound}
+                }
+            }));
+            assert!(lines.contains(&format!(
+                "No image: the app took longer than {bound} ms to come to the front and be \
+                 captured, so the image was withheld and the previous app put back. This limit \
+                 applies per call; try again."
+            )));
+        }
         assert_eq!(
-            line,
-            "No image: the app took longer than 300 ms to come to the front and be captured, \
-             so the image was withheld and the previous app put back. Every call gets the same \
-             300 ms; try again."
-        );
-        assert_eq!(
-            image_unavailable_line("restore_failed"),
+            image_unavailable_line("restore_failed", None),
             "No image: restore failed."
         );
+    }
+
+    #[test]
+    fn an_overrun_without_an_applied_bound_names_no_time_limit() {
+        let lines = fact_lines(json!({
+            "outcome": "completed",
+            "image_unavailable": {"reason": "fronting_bound_exceeded"}
+        }));
+        assert!(lines.contains(
+            &"No image: the app took too long to come to the front and be captured, so the image \
+              was withheld. Try again."
+                .into()
+        ));
     }
 }

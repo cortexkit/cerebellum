@@ -25,9 +25,9 @@ use std::sync::OnceLock;
 // the format to /v2. A reviewer read the mismatch as a mistake before finding
 // both fields in the artifact, so it is stated here rather than re-derived.
 pub const COMPUTER_ACTION_VOCABULARY_SCHEMA_ID: &str = "ck-computer-action-vocabulary/v2";
-pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v37";
+pub const COMPUTER_ACTION_VOCABULARY_REVISION: &str = "computer_action_vocabulary-v38";
 pub const COMPUTER_ACTION_VOCABULARY_ARTIFACT: &[u8] =
-    include_bytes!("../../resources/computer_action_vocabulary-v37.json");
+    include_bytes!("../../resources/computer_action_vocabulary-v38.json");
 const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
     include_bytes!("../../../cerebellum/resources/implementation-source-lock.json");
 
@@ -35,7 +35,7 @@ const IMPLEMENTATION_SOURCE_LOCK: &[u8] =
 /// frozen. Keeping the value in the source-lock, rather than another lock file,
 /// makes the browser and computer artifacts share one release authority.
 pub const COMPUTER_ACTION_VOCABULARY_SHA256: &str =
-    "b667411568557ea5b58d2ef146d53734a91b6fb5495a6f4344ec4d511e2cfac1";
+    "ef93079a444aae23f5302d9ab72bee0b3a3cb22da729eec3c15123e786a4879a";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VocabularyValidationError {
@@ -1555,6 +1555,28 @@ mod tests {
             "detail": {"grant": "takeover", "grant_label": "take control", "scope": {"takeover": "machine"}}
         });
         assert!(withheld(id, &reply).is_empty(), "{reply}");
+    }
+
+    #[test]
+    fn fronted_image_bound_detail_is_optional_and_closed() {
+        use serde_json::json;
+
+        let id = "computer.read_state";
+        let mut reply = json!({"outcome": "completed", "image_unavailable": {
+            "reason": "fronting_bound_exceeded"
+        }});
+        assert!(withheld(id, &reply).is_empty());
+        reply["image_unavailable"]["detail"] = json!({"bound_ms": 200});
+        assert!(withheld(id, &reply).is_empty(), "{reply}");
+        for detail in [
+            json!({}),
+            json!({"bound_ms": "200"}),
+            json!({"bound_ms": 200, "stage": "covered_before_capture"}),
+            json!({"bound_ms": 200, "window_id": 17}),
+        ] {
+            reply["image_unavailable"]["detail"] = detail;
+            assert!(!withheld(id, &reply).is_empty(), "{reply}");
+        }
     }
 
     #[test]

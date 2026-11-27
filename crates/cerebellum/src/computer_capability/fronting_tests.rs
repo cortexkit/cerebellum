@@ -472,6 +472,7 @@ struct ScreenState {
     coverage_start_ms: u64,
     restore_started: Option<Arc<tokio::sync::Notify>>,
     restore_until: Option<Arc<std::sync::atomic::AtomicBool>>,
+    picture_read_ms: u64,
     after_picture_bracket: Option<support::DeskHook>,
     /// Isolated predictor evidence; ordinary scenarios start with a known
     /// zero-cost fake restore, while cold-start tests clear it explicitly.
@@ -585,6 +586,7 @@ impl Screen {
                 front_ignores_cap: false,
                 target_wait_until: None,
                 last_input_ms: None,
+                picture_read_ms: 0,
                 after_picture_bracket: None,
                 post_unknown: false,
                 post_cost_ms: 0,
@@ -1171,8 +1173,15 @@ impl PlatformDriver for FakeDriver {
         };
         let screen = self.screen.clone();
         let mut logged_read = || {
-            screen.state().log.push("read".into());
+            let elapsed_ms = {
+                let mut state = screen.state();
+                state.log.push("read".into());
+                state.picture_read_ms
+            };
             read();
+            if elapsed_ms != 0 {
+                screen.advance(elapsed_ms);
+            }
         };
         let mut host = FakeBracket(self.screen.clone());
         let mut estimator = UserIdleEstimator::new();
@@ -2637,6 +2646,44 @@ async fn a_bring_to_front_read_fronts_reads_and_restores_once() {
         "{reply}"
     );
     assert!(!rig.lock.held());
+}
+
+#[tokio::test]
+async fn a_bring_to_front_read_overrun_names_the_app_grants_200_ms_bound() {
+    let rig = rig(AppUse::Background, mail_desk()).await;
+    rig.screen.state().picture_read_ms = 201;
+    let reply = rig
+        .call_under(
+            &under_terminal(),
+            "computer.read_state",
+            json!({"target": support::TARGET_BUNDLE_ID, "include_image": true,
+                "bring_to_front": true}),
+        )
+        .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(
+        reply["image_unavailable"]["reason"], "fronting_bound_exceeded",
+        "{reply}"
+    );
+    assert!(reply.get("image").is_none(), "{reply}");
+    assert_eq!(rig.screen.log(), ["front:4242", "read", "restore:100"]);
+
+    let encoded: Value =
+        serde_json::from_slice(&crate::tool_result::encode(reply).unwrap()).unwrap();
+    assert!(
+        encoded["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("took longer than 200 ms to come to the front"))),
+        "{encoded}"
+    );
+    assert_eq!(
+        encoded["structuredContent"]["image_unavailable"]["detail"],
+        json!({"bound_ms": 200})
+    );
 }
 
 #[tokio::test]

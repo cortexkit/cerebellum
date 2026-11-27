@@ -19,6 +19,7 @@ use super::image_withholding::ImageWithholding;
 pub(super) struct ImageReadTrace {
     pub evidence: std::cell::RefCell<ImageReadEvidence>,
     pub withholding: std::cell::Cell<Option<ImageWithholding>>,
+    pub fronting_bound_ms: std::cell::Cell<Option<u64>>,
 }
 
 #[derive(Default)]
@@ -112,6 +113,7 @@ pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
                 && !gate.as_ref().is_some_and(|gate| gate.stopped())
         })
     };
+    trace.fronting_bound_ms.set(Some(bound));
     let bracket = driver.read_fronted(
         grant,
         bound,

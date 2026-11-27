@@ -2822,3 +2822,25 @@ pub fn v37_from_v36(previous: &Value, revision: &str) -> Value {
     detail["anyOf"] = json!([takeover, visibility, prepare]);
     next
 }
+
+/// When a picture takes too long, the reply can name the time limit the read used.
+pub fn v38_from_v37(previous: &Value, revision: &str) -> Value {
+    let mut next = previous.clone();
+    next["revision"] = json!(revision);
+    let read_state = next["rows"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["capability_id"] == "computer.read_state")
+        .unwrap();
+    let detail = read_state["result_schema"]
+        .pointer_mut("/properties/image_unavailable/properties/detail")
+        .unwrap();
+    let bound = json!({"type":"integer"});
+    detail["properties"]["bound_ms"] = bound.clone();
+    detail["anyOf"].as_array_mut().unwrap().push(json!({
+        "type":"object", "additionalProperties":false, "required":["bound_ms"],
+        "properties":{"bound_ms":bound}
+    }));
+    next
+}
