@@ -320,6 +320,7 @@ fn development_snapshot_preserves_both_signature_errors_even_when_identity_fails
     }
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn ckdesk_operator_refusal_reports_the_first_failed_development_check() {
     let rig = rig();
@@ -374,6 +375,7 @@ async fn ckdesk_operator_refusal_reports_the_first_failed_development_check() {
     assert!(rig.plane.result_schema_findings().is_empty());
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn unreadable_program_location_refuses_with_path_error_and_recovery() {
     const PATH: &str = "/Volumes/Example Disk/Review.app/Contents/MacOS/example-desktop";
@@ -400,6 +402,7 @@ async fn unreadable_program_location_refuses_with_path_error_and_recovery() {
     assert!(rig.plane.result_schema_findings().is_empty());
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn every_action_rechecks_the_same_development_build_evidence() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -460,6 +463,7 @@ async fn every_action_rechecks_the_same_development_build_evidence() {
     assert!(rig.plane.result_schema_findings().is_empty());
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn scroll_refusal_distinguishes_the_frontmost_app_and_the_app_under_the_pointer() {
     let mut rig = rig();
@@ -511,6 +515,7 @@ async fn scroll_refusal_distinguishes_the_frontmost_app_and_the_app_under_the_po
     }
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn ckdesk_operator_refusal_retains_a_short_signature_reader_error() {
     let mut rig = rig();
@@ -571,6 +576,7 @@ async fn other_callers_operator_refusals_remain_byte_identical() {
     }
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_release_requirement_read_error_stays_closed_and_names_the_error() {
     struct Code;
@@ -744,6 +750,7 @@ fn ckdesk_is_the_one_development_build_driver() {
     }
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn ckdesk_drives_a_development_build_with_no_card_and_no_stored_grant() {
     let rig = rig();
@@ -779,6 +786,24 @@ async fn ckdesk_drives_a_development_build_with_no_card_and_no_stored_grant() {
     assert!(!rig.management.computer_grants().holds(&ckdesk, &need));
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_never_exempts_even_ckdesk_from_the_operator_floor() {
+    let rig = rig();
+    let caller = head(CKDESK);
+    assert!(!drives_development_builds(&caller));
+    assert_target_refused(&rig, &caller, DEV).await;
+    let read = rig
+        .serve_as(&caller, "computer.read_state", json!({"target": DEV}))
+        .await;
+    assert!(
+        read["detail"].get("development_build_check").is_none(),
+        "{read}"
+    );
+    let list = rig.serve_as(&caller, "computer.list_apps", json!({})).await;
+    assert!(!rig.listed(&list).contains(&DEV.into()), "{list}");
+}
+
 #[tokio::test]
 async fn any_other_agent_is_refused_a_development_build() {
     let rig = rig();
@@ -802,6 +827,7 @@ async fn a_worker_acting_for_ckdesk_is_refused_a_development_build() {
 
 /// The caller a route's bind leads to, through the same derivation a live
 /// computer call takes.
+#[cfg(not(windows))]
 fn caller_from_scope(attributes: subc_protocol::scope::ScopeAttributes) -> ConsentContext {
     let core = crate::session_caller_principal_for_test().expect("the session caller");
     let stamp = subc_protocol::scope::ScopeStamp::new(
@@ -834,6 +860,7 @@ fn caller_from_scope(attributes: subc_protocol::scope::ScopeAttributes) -> Conse
     crate::consent_context(&planes, &facts, &writer, 7, 1)
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_scope_naming_ckdesk_only_on_behalf_of_it_is_refused() {
     // The control: a scope with the development agent identity and delegation is its head.
@@ -918,6 +945,7 @@ async fn ckdesk_is_refused_an_unidentified_app_titled_alfonso() {
     assert_refused(&reply, "Alfonso Beta");
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn list_apps_shows_development_builds_to_ckdesk_alone() {
     let rig = rig();

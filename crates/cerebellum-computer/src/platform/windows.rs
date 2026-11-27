@@ -5,6 +5,8 @@
 //! exercise the fail-closed policy.
 
 use super::*;
+
+pub mod identity;
 use crate::capture::{
     BackendError, BackendTeardownProgress, BroadDisplayCaptureRequest, CaptureArtifact,
     CaptureBackend, EnumeratedWindow, WindowCaptureFrame, WindowCaptureRequest, WindowChange,

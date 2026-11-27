@@ -127,6 +127,8 @@ mod open_app;
 mod open_app_tests;
 mod operator_apps;
 mod web_replace;
+#[cfg(windows)]
+pub(crate) mod windows_identity;
 #[doc(hidden)]
 pub use operator_apps::development_build_snapshot;
 pub use operator_apps::{ExecutableReader, ProgramLocationUnreadable};

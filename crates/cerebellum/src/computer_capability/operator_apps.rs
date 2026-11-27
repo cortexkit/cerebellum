@@ -179,7 +179,12 @@ const OPERATOR_APPS: &[OperatorApp] = &[
 /// identity.
 fn identity_class(identity: &str) -> Option<Class> {
     let identity = identity.trim();
-    let file_name = identity.rsplit(['/', '\\']).next().unwrap_or(identity);
+    use cerebellum_computer::platform::windows_principal::Principal;
+    let principal = identity.parse::<Principal>().ok();
+    let file_name = match principal.as_ref() {
+        Some(principal) => principal.executable().unwrap_or(""),
+        None => identity.rsplit(['/', '\\']).next().unwrap_or(identity),
+    };
     let mut matched = OPERATOR_APPS.iter().filter(|app| match app.identity {
         Identity::BundleIdentity(blocked) => {
             identity.eq_ignore_ascii_case(blocked)
@@ -221,6 +226,9 @@ pub(crate) fn title_names_operator_app(title: &str) -> bool {
 /// it works for a driver, and attribution to an agent is not that agent's
 /// authority.
 pub(crate) fn drives_development_builds(caller: &GrantCaller) -> bool {
+    if cfg!(windows) {
+        return false;
+    }
     caller.durable_identity_attested
         && matches!(
             &caller.holder,
@@ -586,8 +594,8 @@ pub type ExecutableReader =
 /// compared with the grant's, so a pid handed to another process meanwhile
 /// reads as unreadable rather than as that other process. A grant without
 /// start-time evidence, as `list_apps` builds one from a running-app entry,
-/// skips that comparison. On Windows the identity a grant carries already is
-/// the executable's file name. Elsewhere nothing can be read.
+/// skips that comparison. On Windows the current image filename is read
+/// separately from the canonical principal. Elsewhere nothing can be read.
 pub(crate) fn native_executable(grant: &ProcessGrant) -> Result<String, ProgramLocationUnreadable> {
     #[cfg(target_os = "macos")]
     {
@@ -624,7 +632,19 @@ pub(crate) fn native_executable(grant: &ProcessGrant) -> Result<String, ProgramL
     }
     #[cfg(target_os = "windows")]
     {
-        readable(&grant.bundle_identity).ok_or_else(ProgramLocationUnreadable::default)
+        use cerebellum_computer::platform::windows::identity::{
+            live_identity, Principal, IDENTITY_BOUND,
+        };
+        if grant.bundle_identity.parse::<Principal>().is_err() {
+            // The legacy resolver still returns image basenames.
+            return readable(&grant.bundle_identity).ok_or_else(ProgramLocationUnreadable::default);
+        }
+        let identity = live_identity(grant.pid, std::time::Instant::now() + IDENTITY_BOUND)
+            .map_err(|_| ProgramLocationUnreadable::default())?;
+        if !grant.process_generation_evidence.is_empty() && !identity.matches_grant(grant) {
+            return Err(ProgramLocationUnreadable::default());
+        }
+        Ok(identity.image_name)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -1241,6 +1261,28 @@ mod tests {
         ] {
             assert!(identity_blocked(identity), "{identity}");
         }
+    }
+
+    #[test]
+    fn windows_canonical_programs_keep_the_operator_floor() {
+        use cerebellum_computer::platform::windows_principal::Principal;
+        let signed = Principal::Signed {
+            root: [0xab; 32],
+            cn: "CortexKit/Operations".into(),
+            organization: "CortexKit".into(),
+            program: "Alfonso.exe".into(),
+        };
+        let unsigned = Principal::Unsigned {
+            sha256: [0xcd; 32],
+            image_name: "Alfonso.exe".into(),
+        };
+        let packaged = Principal::Packaged {
+            family: "CortexKit.alfonso_abcdef".into(),
+            application: "Alfonso.exe".into(),
+        };
+        assert_eq!(identity_class(&signed.to_string()), Some(Class::Always));
+        assert_eq!(identity_class(&unsigned.to_string()), Some(Class::Always));
+        assert_eq!(identity_class(&packaged.to_string()), None);
     }
 
     #[test]

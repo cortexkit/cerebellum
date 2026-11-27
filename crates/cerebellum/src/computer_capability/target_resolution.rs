@@ -29,6 +29,11 @@ where
         target: &str,
         hold: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     ) -> Result<String, Value> {
+        #[cfg(windows)]
+        if crate::management::PlatformResolver::HAS_APP_IDENTITY_READER {
+            // Resolve both forms against the same Windows principal inventory.
+            return Ok(target.trim().to_owned());
+        }
         if looks_like_bundle_identity(target) {
             crate::tool_display::app(target);
             return Ok(target.to_string());
@@ -85,7 +90,7 @@ tokio::task_local! {
 /// one or more whole words of the name in order ("Context Dashboard" in
 /// "Magic Context Dashboard"). Case is ignored. An empty `wanted` names
 /// nothing, so it can never match every application at once.
-fn names_in_part(name: &str, wanted: &str) -> bool {
+pub(super) fn names_in_part(name: &str, wanted: &str) -> bool {
     let name = name.trim().to_lowercase();
     let wanted = wanted.trim().to_lowercase();
     if wanted.is_empty() {

@@ -16,6 +16,8 @@ pub mod input_route;
 pub mod process_event;
 pub mod severity;
 pub mod synthetic;
+#[path = "windows/identity/principal.rs"]
+pub mod windows_principal;
 pub use blocked_chord::*;
 pub use containment::*;
 pub use process_event::*;
