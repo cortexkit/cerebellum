@@ -284,6 +284,14 @@ readonly ATTESTATIONS=(
   CEREBELLUM_WINDOWS_FRONTING_REVIEW_REVISION
   CEREBELLUM_WINDOWS_INPUT_BRACKET_REVIEW_REVISION
   CEREBELLUM_WINDOWS_TAKEOVER_REVIEW_REVISION
+  # Chrome handoff on Linux and Windows, each unbound until SUBC reviews it.
+  CEREBELLUM_LINUX_USER_BROWSER_REVIEW_REVISION
+  CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION
+  # The public half of the release key the Chrome helper and cerebellum use to
+  # recognise each other's signed binaries. Not a secret, but unbound until
+  # the release workflow signs with the vault key, so no build trusts a
+  # signature nothing produced.
+  CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY
   CEREBELLUM_APP_STATE_REVIEW_REVISION
   CEREBELLUM_ELEMENT_ADDRESSED_REVIEW_REVISION
   CEREBELLUM_TAKEOVER_DISPATCH_REVIEW_REVISION
