@@ -372,7 +372,7 @@ async fn health_check_returns_insulated_report() {
 /// When no browser session exists, `browser.status` returns only the flat
 /// no-session result and omits profile-related fields from older status responses.
 #[tokio::test]
-#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn browser_status_returns_flat_no_session_result() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
@@ -410,7 +410,7 @@ async fn browser_status_returns_flat_no_session_result() {
 }
 
 #[tokio::test]
-#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn tool_requests_serve_without_preset_and_refuse_named_presets() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
@@ -454,7 +454,7 @@ async fn tool_requests_serve_without_preset_and_refuse_named_presets() {
 /// browser.status with an unknown field returns `invalid_request` with the
 /// pinned detail shape (application-level rejection, not a transport Error).
 #[tokio::test]
-#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn browser_status_unknown_field_returns_invalid_request_in_body() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
@@ -532,7 +532,7 @@ async fn browser_status_rejects_management_envelope() {
 /// Missing and wrongly typed tool-route envelope members are application
 /// validation failures carried by normal Response frames.
 #[tokio::test]
-#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn browser_status_rejects_malformed_tool_envelopes() {
     let cases = [
         (Value::Null, "$", "wrong_type"),
@@ -576,7 +576,7 @@ async fn browser_status_rejects_malformed_tool_envelopes() {
 /// Every non-object capability arguments value is rejected as a wrong type
 /// in a normal Response frame, rather than being treated as a route error.
 #[tokio::test]
-#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn browser_status_top_level_wrong_types_return_response_frames() {
     let values = [
         Value::Null,
@@ -717,7 +717,7 @@ async fn hello_frame_is_channel_zero_epoch_zero() {
 /// Data-plane identity comes from the accepted bind facts. Fields added to the
 /// tool request cannot change the resolved session kind or profile boundary.
 #[tokio::test]
-#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn accepted_bind_facts_drive_profile_resolution() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
@@ -795,7 +795,7 @@ async fn accepted_bind_facts_drive_profile_resolution() {
 /// A bind with an explicit empty effective scope denies browser.status even
 /// for a valid canonical tool-route request.
 #[tokio::test]
-#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn accepted_effective_scope_is_not_widened_by_request_body() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());
@@ -1956,7 +1956,7 @@ async fn a_capability_the_release_gates_withhold_is_refused_at_dispatch() {
 /// Driven with a fully valid request so schema validation cannot satisfy the
 /// assertion before session admission is reached.
 #[tokio::test]
-#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn navigation_without_an_open_session_is_refused_at_the_wire() {
     let (tx, mut rx) = mpsc::channel::<Frame>(16);
     let health_state = std::sync::Arc::new(cerebellum_core::health::HealthState::new());

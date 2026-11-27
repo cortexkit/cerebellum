@@ -1,6 +1,15 @@
 //! The published role suite enters the production frame dispatcher with real
 //! route binds. A separate test checks catalog bytes through the real daemon.
 
+#![cfg_attr(
+    all(windows, not(feature = "windows-browser-release")),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "browser test routes need the Windows release key"
+    )
+)]
+
 use super::*;
 use crate::hang_guard::HANG_GUARD;
 use async_trait::async_trait;
@@ -294,7 +303,7 @@ impl ToolProviderSubject for Subject {
 }
 
 #[tokio::test]
-#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn tool_provider_role_conforms_on_production_handler() {
     let root = live_daemon_directory(0);
     let planes = Subject.spawn(&root).await.unwrap();
@@ -488,7 +497,7 @@ async fn live_daemon_catalog_admits_the_agent_browser_only_with_the_windows_key(
 }
 
 #[tokio::test]
-#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn tool_result_v1_requires_route_reader_declaration() {
     let root = live_daemon_directory(0);
     let planes = Subject.spawn(&root).await.unwrap();

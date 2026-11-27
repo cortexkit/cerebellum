@@ -5,6 +5,15 @@
 //! caller, and send real frames through `handle_frame_for_test`. An unauthorized
 //! caller must be refused before it can use that agent's permission.
 
+#![cfg_attr(
+    all(windows, not(feature = "windows-browser-release")),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "browser test routes need the Windows release key"
+    )
+)]
+
 use crate::support::HANG_GUARD;
 use std::sync::Arc;
 use std::time::Duration;
@@ -226,7 +235,7 @@ fn other_first_party_principals() -> Vec<(Option<Principal>, &'static str)> {
 }
 
 #[tokio::test]
-#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn prefrontal_dispatches_through_tool_and_management_routes() {
     for (principal, admitted, bind_allowed) in [
         (reserved("prefrontal"), true, true),
@@ -296,7 +305,7 @@ async fn retired_prefrontal_core_cannot_bind() {
 /// granted site passes authorization and stops only because no browser is
 /// running, while the ungranted site is put to the person instead.
 #[tokio::test]
-#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn the_session_caller_acts_on_its_agents_grant() {
     let service = super::support::computer::cingulate::ScriptedCarrier::default();
     let planes = service.install(planes_with_a_grant().await);
@@ -353,7 +362,7 @@ async fn the_session_caller_acts_on_its_agents_grant() {
 /// route's conversation's grant is not used: had the grant been read, the
 /// navigation would have got as far as the admitted caller's did.
 #[tokio::test]
-#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn other_first_party_callers_are_refused_before_their_conversations_grant() {
     for (principal, label) in other_first_party_principals() {
         let planes = planes_with_a_grant().await;
@@ -368,7 +377,7 @@ async fn other_first_party_callers_are_refused_before_their_conversations_grant(
 /// the refusal come after the site grant was looked up, the missing grant
 /// would have put a question to the person first.
 #[tokio::test]
-#[cfg(any(not(windows), feature = "windows-browser-release"))] // Needs the Windows browser release key.
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn a_refused_caller_is_never_asked_about_a_site() {
     for (principal, label) in other_first_party_principals() {
         let planes = planes_with_a_grant().await;

@@ -44,11 +44,19 @@ jobs:
           if (-not ((rustc -vV) -contains "host: $env:RUST_TARGET")) {
             throw "Expected a native Rust host: $env:RUST_TARGET"
           }
-          $installer = Join-Path $env:RUNNER_TEMP 'chrome-stable.msi'
-          Invoke-WebRequest $env:CHROME_MSI_URL -OutFile $installer
-          $install = Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /qn /norestart" -Wait -PassThru
-          if ($install.ExitCode -ne 0) { throw "Chrome MSI exited $($install.ExitCode)" }
           $chrome = Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'
+          if (Test-Path -LiteralPath $chrome -PathType Leaf) {
+            Write-Host "Checking the runner's preinstalled Chrome: $chrome"
+          } else {
+            $installer = Join-Path $env:RUNNER_TEMP 'chrome-stable.msi'
+            $msiLog = Join-Path $env:RUNNER_TEMP 'chrome-stable-install.log'
+            Invoke-WebRequest $env:CHROME_MSI_URL -OutFile $installer
+            $install = Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /qn /norestart /l*v `"$msiLog`"" -Wait -PassThru
+            if ($install.ExitCode -ne 0) {
+              if (Test-Path -LiteralPath $msiLog) { Get-Content -LiteralPath $msiLog }
+              throw "Chrome MSI exited $($install.ExitCode)"
+            }
+          }
           $reader = [IO.BinaryReader]::new([IO.File]::OpenRead($chrome))
           try {
             if ($reader.ReadUInt16() -ne 0x5a4d) { throw "Missing MZ signature: $chrome" }
@@ -62,6 +70,7 @@ jobs:
           } finally {
             $reader.Dispose()
           }
+          Write-Host "Verified Chrome $((Get-Item -LiteralPath $chrome).VersionInfo.ProductVersion), PE Machine $machine"
           if ($env:CI -ne 'true' -or $env:CK_WINDOWS_BROWSER_HEADFUL_CI -ne '1') {
             throw 'The CI-only headful browser gate is missing'
           }

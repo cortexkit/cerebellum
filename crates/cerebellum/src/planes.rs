@@ -20,10 +20,13 @@ impl Planes {
     #[cfg(windows)]
     pub(super) fn enforce_windows_browser_refusals(&self) -> bool {
         #[cfg(test)]
-        if self.synthetic_browser_dispatch {
-            return false;
+        {
+            !self.synthetic_browser_dispatch
         }
-        true
+        #[cfg(not(test))]
+        {
+            true
+        }
     }
 
     #[cfg(test)]

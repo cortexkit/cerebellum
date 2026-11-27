@@ -8,6 +8,15 @@
 //! DOM the driver reads; the owner-document regression also runs the production
 //! AX capture so the fill uses refs printed by a real outline snapshot.
 
+#![cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the fill fixtures need Windows fill_login"
+    )
+)]
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

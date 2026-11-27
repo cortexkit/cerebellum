@@ -50,12 +50,8 @@ fn binary() -> &'static Path {
             clippy::disallowed_methods,
             reason = "migrated by the spawn-wrapper slice"
         )]
-        assert!(Command::new(&binary)
-            .arg("--version")
-            .output()
-            .unwrap()
-            .status
-            .success());
+        let output = Command::new(&binary).arg("--version").output().unwrap();
+        assert!(output.status.success());
         binary
     })
 }
