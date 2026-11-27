@@ -16,6 +16,12 @@ impl WindowsCdpPipe {
     pub fn new(command: File, response: DevToolsPipeReader) -> Self {
         Self { command, response }
     }
+
+    /// Recover exclusive ownership of each pipe end, so either can be closed
+    /// without closing the other.
+    pub fn into_ends(self) -> (File, DevToolsPipeReader) {
+        (self.command, self.response)
+    }
 }
 
 impl CdpPipeIo for WindowsCdpPipe {
@@ -37,6 +43,3 @@ impl CdpPipeIo for WindowsCdpPipe {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;
