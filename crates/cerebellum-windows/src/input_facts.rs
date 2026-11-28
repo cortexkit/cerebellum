@@ -20,7 +20,8 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
             EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, HC_ACTION, KBDLLHOOKSTRUCT, MSG,
-            MSLLHOOKSTRUCT, PM_REMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT,
+            MSLLHOOKSTRUCT, PM_NOREMOVE, PM_REMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL,
+            WINEVENT_OUTOFCONTEXT,
         },
     },
 };
@@ -30,6 +31,7 @@ pub enum RawInputEvent {
     Keyboard {
         tag: usize,
         key: u32,
+        flags: u32,
         up: bool,
         injected: bool,
         event_tick: u32,
@@ -37,6 +39,7 @@ pub enum RawInputEvent {
     Mouse {
         tag: usize,
         message: u32,
+        flags: u32,
         injected: bool,
         event_tick: u32,
     },
@@ -68,6 +71,7 @@ unsafe extern "system" fn keyboard(code: i32, message: WPARAM, data: LPARAM) -> 
         if dispatch(RawInputEvent::Keyboard {
             tag: event.dwExtraInfo,
             key: event.vkCode,
+            flags: event.flags,
             up: event.flags & 0x80 != 0,
             injected: event.flags & 0x10 != 0,
             event_tick: event.time,
@@ -86,6 +90,7 @@ unsafe extern "system" fn mouse(code: i32, message: WPARAM, data: LPARAM) -> LRE
         if dispatch(RawInputEvent::Mouse {
             tag: event.dwExtraInfo,
             message: message as u32,
+            flags: event.flags,
             injected: event.flags & 1 != 0,
             event_tick: event.time,
         }) {
@@ -120,6 +125,8 @@ pub struct InputHooks {
 impl InputHooks {
     /// `focus_pid` installs the foreground hook and a process-filtered focus hook.
     /// The callback runs on the pump thread and must not block.
+    /// Success means the pump thread created its message queue and installed
+    /// every requested hook, not that any input has been observed yet.
     pub fn start(
         focus_pid: Option<u32>,
         wait: Duration,
@@ -135,6 +142,10 @@ impl InputHooks {
                 // SAFETY: All callbacks have the system ABI. LL hooks execute
                 // on this thread, with callbacks in the current executable.
                 unsafe {
+                    let mut message = MSG::default();
+                    // PeekMessage creates this thread's queue even when it is
+                    // empty. Create it before installing or reporting readiness.
+                    PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE);
                     let keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard), null_mut(), 0);
                     let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse), null_mut(), 0);
                     let mut events = [null_mut(); 2];
@@ -159,7 +170,6 @@ impl InputHooks {
                         && (focus_pid.is_none() || events.iter().all(|hook| !hook.is_null()));
                     if started.send(installed).is_ok() && installed {
                         while !stopping.load(Ordering::Acquire) {
-                            let mut message = MSG::default();
                             if PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
                                 DispatchMessageW(&message);
                             } else {
