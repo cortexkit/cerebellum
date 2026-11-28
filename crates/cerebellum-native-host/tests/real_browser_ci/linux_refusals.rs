@@ -58,6 +58,21 @@ pub(super) fn stop_after_browser_exec(child: u32) {
 
 #[test]
 #[ignore = "requires the runner's real packaged Chrome or Chromium files"]
+fn ubuntu_unprotected_opt_is_refused() {
+    let (browser, kind, _) = browser_under_test();
+    assert_eq!(kind, LinuxBrowser::GoogleChrome);
+    let mode = fs::metadata("/opt").unwrap().permissions().mode();
+    assert_ne!(mode & 0o022, 0, "unrepaired /opt has mode {mode:o}");
+    let profile = Scratch::new();
+    let fixture = Fixture::new(browser, &browser_args(&profile.0));
+    assert_eq!(
+        fixture.step1().unwrap_err(),
+        "package path is not protected by root ownership and mode"
+    );
+}
+
+#[test]
+#[ignore = "requires the runner's real packaged Chrome or Chromium files"]
 fn ubuntu_package_crashpad_image_is_refused() {
     let (browser, kind, _) = browser_under_test();
     assert_eq!(kind, LinuxBrowser::GoogleChrome);

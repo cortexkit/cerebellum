@@ -94,6 +94,10 @@ internal static class ParentFixture {
             uint status;
             Require(GetExitCodeProcess(process.process, out status));
             return (int)status;
+        } catch (Win32Exception error) {
+            Console.Error.WriteLine("Could not launch or wait for {0}: Win32 error {1}: {2}",
+                image, error.NativeErrorCode, error.Message);
+            return 1;
         } finally {
             if (process.thread != IntPtr.Zero) CloseHandle(process.thread);
             if (process.process != IntPtr.Zero) {
