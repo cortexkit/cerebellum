@@ -418,3 +418,40 @@ async fn native_changed_shortcut_after_consent_prompt_starts_no_fixture() {
     assert_eq!(reply["outcome"], "consent_unavailable", "{reply}");
     assert!(reply.get("pid").is_none() && !started.exists(), "{reply}");
 }
+
+#[tokio::test]
+#[ignore = "requires a running signed fixture with its Start-menu shortcut on the interactive Windows runner"]
+async fn windows_foreground_open_is_unavailable_with_all_windows_review_keys() {
+    let before = desktop();
+    let target = required("CK_WINDOWS_FRONTING_OPEN_RUNNING");
+    let mut context = reviewed();
+    all_fronting_inputs(&mut context);
+    let mut planes = rig(&context, Arc::new(FixtureResolver), None);
+    foreground_without_driver(&mut planes);
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let listed = list(&planes, &target).await;
+        if let Some(app) = entry(&listed, &target) {
+            assert_eq!(
+                app["running"], true,
+                "the fixture must already be running: {listed}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "installed fixture missing: {listed}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let reply = wire(&planes, "open_app", json!({"target":target})).await;
+    assert_eq!(reply["outcome"], "already_running", "{reply}");
+    assert_eq!(
+        reply["fronting"],
+        json!({
+            "mode":"foreground", "fronted":false, "purpose":"foreground_mode", "restore":"not_needed", "not_fronted_reason":"fronting_unavailable"
+        }),
+        "{reply}"
+    );
+    assert_eq!(cerebellum_windows::foreground_window_number(), Some(before));
+}

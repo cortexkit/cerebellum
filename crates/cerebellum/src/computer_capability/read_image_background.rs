@@ -5,18 +5,36 @@ use crate::CancelHandle;
 use cerebellum_computer::app_state::image::{ImageUnavailable, WindowImageCapture};
 use cerebellum_computer::capture::{AcquisitionFence, CaptureBackend};
 use cerebellum_computer::dispatch::{FrontingStop, MutationGate};
-use cerebellum_computer::platform::ProcessGrant;
+use cerebellum_computer::platform::{PlatformDriver, ProcessGrant};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(super) struct PicturePlan {
     end: Instant,
     fallback: Option<Result<(), FrontingStop>>,
+    #[cfg(windows)]
+    hooks: Option<fronting::CellHooks>,
 }
 
 impl PicturePlan {
     pub(super) fn new(end: Instant, fallback: Option<Result<(), FrontingStop>>) -> Self {
-        Self { end, fallback }
+        Self {
+            end,
+            fallback,
+            #[cfg(windows)]
+            hooks: None,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn prepare(
+        &mut self,
+        prepared: Result<fronting::ObligationParts, fronting::PrepareStop>,
+    ) {
+        match prepared {
+            Ok(parts) => self.hooks = Some(fronting::CellHooks::new(parts)),
+            Err(refusal) => self.fallback = Some(Err(refusal.stop)),
+        }
     }
 
     fn background_end(&self) -> Instant {
@@ -39,19 +57,19 @@ impl PicturePlan {
         {
             return None;
         }
-        // No Windows capture front has an input observer and bound HWND
-        // restore host yet. Admission alone must not activate a window.
+        // Admission alone is not proof that an observer is live.
         Some(admission.err().unwrap_or(FrontingStop::ObserverUnavailable))
     }
 }
 
-pub(super) fn capture<B: CaptureBackend>(
+pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
     mut backend: B,
     grant: &ProcessGrant,
     plan: &PicturePlan,
     cancel: Option<CancelHandle>,
     gate: Option<Arc<dyn MutationGate>>,
     trace: &ImageReadTrace,
+    _make_driver: &dyn Fn() -> D,
 ) -> Result<WindowImageCapture, ImageUnavailable> {
     let active: AcquisitionFence = Arc::new(move || {
         !cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled())
@@ -73,6 +91,10 @@ pub(super) fn capture<B: CaptureBackend>(
         _ => (),
     }
     if let Some(stop) = plan.fallback_stop(Instant::now()) {
+        #[cfg(windows)]
+        if let Some(hooks) = &plan.hooks {
+            return capture_fronted(backend, grant, plan.end, hooks, active, trace, _make_driver);
+        }
         let fronting = fronting::Fronting::stopped(
             cerebellum_core::config::AppUse::Background,
             fronting::Purpose::NeedsFront,
@@ -83,6 +105,84 @@ pub(super) fn capture<B: CaptureBackend>(
         return Err(ImageUnavailable::FrontingUnavailable);
     }
     Err(ImageUnavailable::CaptureFailed)
+}
+
+#[cfg(windows)]
+fn capture_fronted<B: CaptureBackend, D: PlatformDriver>(
+    mut backend: B,
+    grant: &ProcessGrant,
+    end: Instant,
+    hooks: &fronting::CellHooks,
+    active: AcquisitionFence,
+    trace: &ImageReadTrace,
+    make_driver: &dyn Fn() -> D,
+) -> Result<WindowImageCapture, ImageUnavailable> {
+    use cerebellum_computer::app_state::image::ImageFronting;
+    use cerebellum_computer::dispatch::{BracketStop, RestoreStatus};
+    use cerebellum_core::config::AppUse;
+
+    let bound = crate::budgets::FRONTING_READ_MS;
+    trace.fronting_bound_ms.set(Some(bound));
+    let mut driver = make_driver();
+    if !driver.accept_fronted_dispatch_hooks(fronting::boxed_hooks(hooks)) {
+        let refused = fronting::Fronting::stopped(
+            AppUse::Background,
+            fronting::Purpose::NeedsFront,
+            FrontingStop::ObserverUnavailable,
+        );
+        trace.background_fronting.set(Some(refused));
+        trace.evidence.borrow_mut().fronting_record = refused.row_record();
+        return Err(ImageUnavailable::FrontingUnavailable);
+    }
+    let mut captured = Err(ImageUnavailable::CaptureFailed);
+    let picture_hooks = hooks.clone();
+    let picture_active = Arc::clone(&active);
+    let fence: AcquisitionFence = Arc::new(move || {
+        picture_active() && Instant::now() < end && picture_hooks.picture_may_acquire()
+    });
+    let report = driver
+        .read_fronted(
+            grant,
+            bound,
+            &|| !active() || Instant::now() >= end,
+            &mut || {
+                let Some(_lock) = hooks.hold_lock_for_read() else {
+                    return;
+                };
+                let Some(until) = hooks.picture_wait_until() else {
+                    return;
+                };
+                let deadline = end.min(until);
+                if Instant::now() < deadline && fence() {
+                    captured = backend.capture_background_picture(grant, deadline, &fence);
+                    if Instant::now() >= deadline || !fence() {
+                        captured = Err(ImageUnavailable::FrontingBoundExceeded);
+                    }
+                }
+            },
+        )
+        .map_err(|_| ImageUnavailable::FrontingUnavailable)?;
+    trace.evidence.borrow_mut().fronting = Some(ImageFronting::from(&report));
+    let ending = hooks.peek();
+    let fronting =
+        fronting::hooked_fronting(AppUse::Background, fronting::Purpose::NeedsFront, &ending);
+    trace.background_fronting.set(Some(fronting));
+    trace.evidence.borrow_mut().fronting_record = fronting.row_record();
+    if report.stop == Some(BracketStop::BoundExceeded)
+        || (ending.refusal != Some(FrontingStop::FrontFailed)
+            && (hooks.cutoff_fired()
+                || report.restore_started_by_cutoff
+                || report.longest_fronted_interval_ms > bound))
+    {
+        return Err(ImageUnavailable::FrontingBoundExceeded);
+    }
+    if matches!(report.restore, RestoreStatus::Failed { .. }) {
+        return Err(ImageUnavailable::RestoreFailed);
+    }
+    if !report.held(bound) {
+        return Err(ImageUnavailable::FrontingUnavailable);
+    }
+    captured
 }
 
 #[cfg(test)]

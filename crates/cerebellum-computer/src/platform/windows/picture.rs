@@ -1,6 +1,7 @@
 //! Window selection, lifetime binding and release of one Windows picture.
 
 use super::app_state::{windows, WindowsAppStateSource};
+use super::fronting::Binding;
 use super::{
     validate_vocabulary_digests, ImmutableReleaseInputs, PermissionLiveness,
     PermissionLivenessReport, PermissionProbeResult, PermissionService, ProcessGrant,
@@ -9,6 +10,7 @@ use super::{
 use crate::app_state::image::{ImageUnavailable, WindowImageCapture};
 use crate::capture::AcquisitionFence;
 use cerebellum_windows::{FrameReadError, WindowCaptureProperties};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -62,7 +64,7 @@ fn startup_permissions_from(
     ])
 }
 
-fn common_keys(inputs: &ImmutableReleaseInputs, elevation: WindowsElevation) -> bool {
+pub(super) fn common_keys(inputs: &ImmutableReleaseInputs, elevation: WindowsElevation) -> bool {
     inputs.release_signing_topology_revision.is_some()
         && elevation == WindowsElevation::Medium
         && validate_vocabulary_digests(&inputs.vocabulary_digests).is_ok()
@@ -74,12 +76,28 @@ pub fn fronting_flags(
     inputs: &ImmutableReleaseInputs,
     elevation: WindowsElevation,
 ) -> (bool, bool, bool, bool) {
-    let fronting =
-        common_keys(inputs, elevation) && inputs.windows_fronting_review_revision.is_some();
+    let fronting = super::fronting::background_restore_admitted(inputs, elevation);
     let bracket = fronting && inputs.windows_input_bracket_review_revision.is_some();
     let pointer = bracket && inputs.windows_takeover_review_revision.is_some();
     let preview = fronting && inputs.windows_capture_review_revision.is_some();
     (bracket, false, pointer, preview)
+}
+
+thread_local! {
+    static FRONTED_WINDOW: RefCell<Option<Binding>> = const { RefCell::new(None) };
+}
+
+/// The bracket and its synchronous capture callback must name the same HWND.
+/// Copy the retained proof to the capture worker rather than reselecting there.
+pub(super) fn with_fronted_window(binding: &Binding, read: &mut dyn FnMut()) {
+    struct Reset(Option<Binding>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FRONTED_WINDOW.replace(self.0.take());
+        }
+    }
+    let _reset = Reset(FRONTED_WINDOW.replace(Some(binding.clone())));
+    read();
 }
 
 // D3D readback and COM teardown are synchronous OS calls. If one of them
@@ -115,10 +133,11 @@ pub(super) fn capture(
     let (ready, wait) = std::sync::mpsc::sync_channel(1);
     let target = target.clone();
     let fence = may_acquire.clone();
+    let fronted = FRONTED_WINDOW.with(|slot| slot.borrow().clone());
     std::thread::Builder::new()
         .name("windows-window-picture".into())
         .spawn(move || {
-            let result = capture_on_worker(&target, deadline, &fence);
+            let result = capture_on_worker(&target, deadline, &fence, fronted.as_ref());
             drop(slot);
             let _ = ready.send(result);
         })
@@ -152,10 +171,15 @@ fn window_properties(reading: WindowCaptureProperties) -> Result<(), ImageUnavai
     }
 }
 
+pub(super) fn permits_picture_front(number: u32) -> bool {
+    window_properties(cerebellum_windows::window_capture_properties(number)).is_ok()
+}
+
 fn capture_on_worker(
     target: &ProcessGrant,
     deadline: Instant,
     may_acquire: &AcquisitionFence,
+    fronted: Option<&Binding>,
 ) -> Result<WindowImageCapture, ImageUnavailable> {
     let failed = ImageUnavailable::CaptureFailed;
     if !cerebellum_windows::per_monitor_v2() {
@@ -166,14 +190,23 @@ fn capture_on_worker(
         .parse()
         .map_err(|_| failed)?;
     let retained = windows::retain(target.pid, generation).map_err(|_| failed)?;
-    let candidates = windows::windows(&retained, target.pid, deadline).map_err(|_| failed)?;
-    let chosen = windows::image_window(&candidates)
-        .map_err(|_| failed)?
-        .ok_or(ImageUnavailable::NoWindowCaptured)?;
+    let chosen = if let Some(binding) = fronted {
+        windows::bound_window(&retained, target.pid, binding.number)
+            .map_err(|_| failed)?
+            .filter(|window| window.proof == binding.proof && binding.is_foreground())
+            .ok_or(failed)?
+    } else {
+        let candidates = windows::windows(&retained, target.pid, deadline).map_err(|_| failed)?;
+        windows::image_window(&candidates)
+            .map_err(|_| failed)?
+            .cloned()
+            .ok_or(ImageUnavailable::NoWindowCaptured)?
+    };
     let hwnd = chosen.root.number;
     let frame = windows::frame(chosen.state.bounds);
     let confirm = || {
-        if !windows::is_default_desktop() {
+        if !windows::is_default_desktop() || fronted.is_some_and(|binding| !binding.is_foreground())
+        {
             return Err(failed);
         }
         windows::current(&retained, generation).map_err(|_| failed)?;

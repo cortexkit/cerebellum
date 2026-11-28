@@ -557,3 +557,65 @@ impl crate::management::TargetResolver for RestartingResolver {
         Arc::new(windows_identity::RunningCode(grant.clone()))
     }
 }
+
+#[tokio::test]
+async fn windows_foreground_read_is_unavailable_with_all_windows_review_keys() {
+    let grant = ProcessGrant {
+        pid: 4242,
+        bundle_identity: "Action fixture".into(),
+        process_generation_evidence: "42".into(),
+    };
+    let fixture = Arc::new(ActionFixture {
+        pid: grant.pid,
+        frontmost: false,
+        mutations: AtomicUsize::new(0),
+        value: Mutex::new("before".into()),
+    });
+    let mut context = inputs();
+    all_fronting_inputs(&mut context);
+    let mut planes = rig(&context, Arc::new(Resolver(grant.clone())), Some(fixture));
+    foreground_without_driver(&mut planes);
+    let reply = wire(
+        &planes,
+        "read_state",
+        json!({"target":grant.bundle_identity}),
+    )
+    .await;
+    assert_eq!(reply["outcome"], "completed", "{reply}");
+    assert_eq!(
+        reply["fronting"],
+        json!({
+            "mode":"foreground", "fronted":false, "purpose":"foreground_mode", "restore":"not_needed", "not_fronted_reason":"fronting_unavailable"
+        }),
+        "{reply}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a signed fixture control that activates its own HWND, and a restorable fixture foreground"]
+async fn windows_background_activation_restores_the_original_with_fronting_review() {
+    let (grant, foreground) = native();
+    let mut context = inputs();
+    // Background restoration needs only its own review, not input-bracket authority.
+    context.inputs.windows_fronting_review_revision = Some("restore-fixture".into());
+    let planes = rig(&context, Arc::new(NativeFixture(grant.clone())), None);
+    let read = wire(
+        &planes,
+        "read_state",
+        json!({"target":grant.bundle_identity}),
+    )
+    .await;
+    let ids = element_ids(&read, &required("CK_WINDOWS_S7_ACTIVATOR_TITLE"));
+    assert_eq!(ids.len(), 1, "{read}");
+    let press = wire(&planes, "press_element", json!({"element_id":ids[0]})).await;
+    assert_eq!(press["outcome"], "completed", "{press}");
+    assert_eq!(
+        press["fronting"],
+        json!({"mode":"background","fronted":false,"purpose":"none","restore":"restored"}),
+        "{press}"
+    );
+    assert_eq!(
+        cerebellum_windows::foreground_window_number(),
+        Some(foreground)
+    );
+}

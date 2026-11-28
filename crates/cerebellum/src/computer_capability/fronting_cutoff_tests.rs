@@ -546,3 +546,53 @@ fn a_picture_may_not_acquire_once_the_reserve_starts_whatever_the_owner_is_doing
         assert!(!hooks.picture_may_acquire());
     });
 }
+
+#[test]
+fn definitive_native_denial_completes_the_obligation_without_a_late_watch() {
+    let screen = cutoff_screen();
+    let (hooks, releases) = app_use_hooks();
+    let mut boxed = boxed_hooks(&hooks);
+    let gate = Arc::new(cerebellum_computer::dispatch::CutoffGate::new());
+    assert!(boxed.register(
+        PREVIOUS,
+        TARGET,
+        Box::new(FakeRestore(screen.clone())),
+        &gate
+    ));
+    assert!(boxed.begin_front_attempt(0));
+    boxed.front_attempt_denied();
+    boxed.front_attempt_returned();
+    assert_eq!(boxed.decide_restore().restore, RestoreStatus::NotNeeded);
+    assert_eq!(hooks.peek().refusal, Some(FrontingStop::FrontFailed));
+    assert!(!hooks.cell().unwrap().late_watch_pending());
+    assert_eq!(lock_releases(&releases), 1);
+    assert_eq!(restores(&screen), 0);
+}
+
+#[test]
+fn accepted_but_unconfirmed_native_request_keeps_pending_activation_cleanup() {
+    let screen = cutoff_screen();
+    FakeClock::frozen().run(|| {
+        let (hooks, releases) = app_use_hooks();
+        let mut boxed = boxed_hooks(&hooks);
+        let gate = Arc::new(cerebellum_computer::dispatch::CutoffGate::new());
+        let deadline = now() + Duration::from_millis(BOUND_MS);
+        gate.set_bound(deadline, deadline);
+        assert!(boxed.register(
+            PREVIOUS,
+            TARGET,
+            Box::new(FakeRestore(screen.clone())),
+            &gate
+        ));
+        assert!(boxed.begin_front_attempt(0));
+        boxed.front_attempt_returned();
+        assert!(advance(Duration::from_millis(BOUND_MS + 1)));
+        assert!(matches!(
+            boxed.decide_restore().restore,
+            RestoreStatus::Failed { .. }
+        ));
+        assert!(hooks.cell().unwrap().late_watch_pending());
+        assert_eq!(lock_releases(&releases), 0);
+        assert_eq!(restores(&screen), 0);
+    });
+}

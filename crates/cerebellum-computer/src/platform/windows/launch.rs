@@ -34,7 +34,3 @@ impl LaunchInventory {
 pub fn foreground_window() -> Option<u32> {
     cerebellum_windows::foreground_window_number()
 }
-
-pub fn foreground_sample() -> (Option<u32>, Option<u32>) {
-    (foreground_window(), cerebellum_windows::last_input_tick())
-}

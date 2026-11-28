@@ -10,7 +10,8 @@ use windows_sys::Win32::{
     },
     UI::WindowsAndMessaging::{
         GetAncestor, GetForegroundWindow, GetGUIThreadInfo, GetTopWindow, GetWindow,
-        GetWindowLongW, GetWindowThreadProcessId, GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, GW_HWNDNEXT,
+        GetWindowLongW, GetWindowThreadProcessId, SetForegroundWindow, GA_ROOT, GUITHREADINFO,
+        GWL_EXSTYLE, GW_HWNDNEXT,
     },
 };
 
@@ -107,6 +108,13 @@ pub fn gui_thread_windows(tid: u32) -> io::Result<GuiThreadWindows> {
 pub fn foreground_window_number() -> Option<u32> {
     // SAFETY: This call takes no input and returns a borrowed HWND value.
     number(unsafe { GetForegroundWindow() })
+}
+
+/// Return the result of the single Win32 foreground request. The caller must
+/// independently read which window is in the foreground.
+pub fn set_foreground_window(number: u32) -> bool {
+    // SAFETY: The HWND is an opaque value; the function borrows no memory.
+    unsafe { SetForegroundWindow(number as usize as HWND) != 0 }
 }
 
 pub fn root_window_number(window: u32) -> Option<u32> {

@@ -802,6 +802,15 @@ impl RestoreCell {
         }
     }
 
+    /// A native refusal with the original window still foreground leaves
+    /// nothing in flight for the owner or a late watcher to put back.
+    pub(crate) fn front_attempt_denied(&self) -> RestoreDecided {
+        self.gate.end_front();
+        let mut inner = self.inner();
+        inner.host.take();
+        self.complete(inner, Self::not_needed())
+    }
+
     /// The owner's decision without any restore, because a key or button may
     /// still be held and restoring would deliver it to the previous
     /// application. A front that may have happened is reported failed,

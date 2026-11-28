@@ -1,65 +1,26 @@
 use super::{ElementJournal, JournalStorage, Redactor, SeverityTaxonomy, Value};
-use crate::computer_capability::fronting::{Fronting, Restore};
-use cerebellum_core::config::AppUse;
-use cerebellum_windows::{
-    foreground_window_number, last_input_tick, process_start_time, window_owner, ProcessStartTime,
-};
+use crate::computer_capability::fronting::Fronting;
+use cerebellum_computer::platform::{windows::fronting::BackgroundForeground, ProcessGrant};
 
-#[derive(Clone, Copy, Debug, Default)]
-struct Sample {
-    hwnd: Option<u32>,
-    owner: Option<(u32, u64)>,
-    last_input: Option<u32>,
-}
-
-impl Sample {
-    fn now() -> Self {
-        let hwnd = foreground_window_number();
-        let last_input = last_input_tick();
-        let owner = hwnd.and_then(|hwnd| {
-            let (pid, _) = window_owner(hwnd).ok()?;
-            match process_start_time(pid) {
-                ProcessStartTime::Started(start) => Some((pid, start)),
-                _ => None,
-            }
-        });
-        Self {
-            hwnd,
-            owner,
-            last_input,
-        }
-    }
-
-    fn change_to(self, after: Self) -> Option<Fronting> {
-        let changed = self.hwnd != after.hwnd
-            || matches!((self.owner, after.owner), (Some(old), Some(new)) if old != new);
-        if !changed {
-            return None;
-        }
-        let person =
-            matches!((self.last_input, after.last_input), (Some(old), Some(new)) if old != new);
-        let mut report = Fronting::untouched(AppUse::Background);
-        report.person_input_during_fronting = person;
-        report.restore = if person {
-            Restore::SkippedPerson
-        } else {
-            Restore::LeftInFront
-        };
-        Some(report)
-    }
-}
-
-pub(super) fn sample_mutation<T>(mutate: impl FnOnce() -> T) -> (T, Option<Fronting>) {
-    sample_with(Sample::now, mutate)
-}
-
-fn sample_with<T>(
-    mut sample: impl FnMut() -> Sample,
+pub(super) fn sample_mutation<T>(
+    target: &ProcessGrant,
+    admitted: bool,
     mutate: impl FnOnce() -> T,
 ) -> (T, Option<Fronting>) {
-    let before = sample();
+    sample_with(BackgroundForeground::sample(), mutate, |before| {
+        before
+            .after_mutation(admitted, target)
+            .map(Fronting::windows_background)
+    })
+}
+
+fn sample_with<T, S>(
+    before: S,
+    mutate: impl FnOnce() -> T,
+    finish: impl FnOnce(S) -> Option<Fronting>,
+) -> (T, Option<Fronting>) {
     let result = mutate();
-    (result, before.change_to(sample()))
+    (result, finish(before))
 }
 
 pub(super) fn apply<R: Redactor, T: SeverityTaxonomy, S: JournalStorage>(
@@ -77,40 +38,32 @@ pub(super) fn apply<R: Redactor, T: SeverityTaxonomy, S: JournalStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cerebellum_computer::platform::windows::fronting::BackgroundRestore;
     use std::cell::Cell;
 
     #[test]
     fn addressed_error_still_discloses_foreground_change() {
         use serde_json::json;
 
-        let old = Sample {
-            hwnd: Some(1),
-            owner: Some((7, 100)),
-            last_input: Some(80),
-        };
-        for (after, expected) in [
+        for (status, expected) in [
+            (BackgroundRestore::Restored, "restored"),
+            (BackgroundRestore::LeftInFront, "left_in_front"),
+            (BackgroundRestore::Failed, "failed"),
             (
-                Sample {
-                    hwnd: Some(2),
-                    ..old
-                },
-                "left_in_front",
-            ),
-            (
-                Sample {
-                    owner: Some((7, 101)),
-                    last_input: Some(90),
-                    ..old
-                },
+                BackgroundRestore::SkippedPerson { input: true },
                 "skipped_person",
             ),
         ] {
-            let current = Cell::new(old);
+            let mutated = Cell::new(false);
             let (result, change) = sample_with(
-                || current.get(),
+                (),
                 || {
-                    current.set(after);
+                    mutated.set(true);
                     Err::<(), _>("provider returned an error")
+                },
+                |_| {
+                    assert!(mutated.get());
+                    Some(Fronting::windows_background(status))
                 },
             );
             assert_eq!(result, Err("provider returned an error"));
@@ -122,6 +75,6 @@ mod tests {
             assert_eq!(reply["fronting"]["purpose"], "none");
             assert_eq!(reply["fronting"]["restore"], expected);
         }
-        assert!(sample_with(|| old, || Ok::<_, ()>(())).1.is_none());
+        assert!(sample_with((), || Ok::<_, ()>(()), |_| None).1.is_none());
     }
 }
