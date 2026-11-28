@@ -71,13 +71,17 @@ impl fmt::Debug for HolderId {
 /// `boot_id` says which unit `start_time` carries. With a boot ID (Linux), the
 /// start time is clock ticks from that boot to the process's creation; without
 /// one (macOS, and Linux records written before the boot ID existed), it is
-/// microseconds since the Unix epoch.
+/// microseconds since the Unix epoch. Windows marks raw `FILETIME` ticks with
+/// `generation_unit` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisorGeneration {
     pub pid: u32,
     pub start_time: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<BootId>,
+    #[cfg(windows)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_unit: Option<crate::browser_launch::GenerationUnit>,
 }
 
 /// The kernel's identity for one boot, from `/proc/sys/kernel/random/boot_id`.
@@ -196,6 +200,9 @@ pub struct ProfileCustodyLockRecord {
     supervisor_start_time: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     supervisor_boot_id: Option<BootId>,
+    #[cfg(windows)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generation_unit: Option<crate::browser_launch::GenerationUnit>,
     profile_directory: Option<PathBuf>,
 }
 
@@ -207,6 +214,8 @@ impl ProfileCustodyLockRecord {
             supervisor_pid: supervisor.pid,
             supervisor_start_time: supervisor.start_time,
             supervisor_boot_id: supervisor.boot_id,
+            #[cfg(windows)]
+            generation_unit: supervisor.generation_unit,
             profile_directory: None,
         }
     }
@@ -216,6 +225,8 @@ impl ProfileCustodyLockRecord {
             pid: self.supervisor_pid,
             start_time: self.supervisor_start_time,
             boot_id: self.supervisor_boot_id,
+            #[cfg(windows)]
+            generation_unit: self.generation_unit,
         }
     }
 }
@@ -474,7 +485,12 @@ impl SupervisorLivenessProbe for KernelSupervisorLiveness {
             )
         }
 
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
+        {
+            crate::windows_launch::generation::observe_supervisor(generation)
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             let _ = generation;
             SupervisorLiveness::Unavailable
@@ -511,11 +527,21 @@ pub fn current_supervisor_generation() -> Result<SupervisorGeneration, ProfileCu
         }
     }
 
+    #[cfg(windows)]
+    {
+        match cerebellum_windows::process::current_process_creation_time() {
+            cerebellum_windows::ProcessStartTime::Started(ticks) => {
+                Ok(SupervisorGeneration::from_windows_filetime(pid, ticks))
+            }
+            _ => Err(ProfileCustodyLockError::SupervisorGenerationUnavailable),
+        }
+    }
+
     // A platform with no start-time reading cannot distinguish this supervisor
     // from a later process that inherited its PID, and custody depends on that
     // distinction. Refusing is correct here; it is only wrong when a reading
     // exists and goes uncalled.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = pid;
         Err(ProfileCustodyLockError::SupervisorGenerationUnavailable)
@@ -761,6 +787,12 @@ where
                     });
                 }
                 SupervisorLiveness::Unavailable => {
+                    return Err(ProfileCustodyLockError::SupervisorLivenessUnavailable);
+                }
+                // On Windows a dead holder is not by itself proof that its
+                // browser is gone. The journal-aware path must supply a basis.
+                #[cfg(windows)]
+                SupervisorLiveness::NotLive if installed.generation_unit.is_some() => {
                     return Err(ProfileCustodyLockError::SupervisorLivenessUnavailable);
                 }
                 SupervisorLiveness::NotLive => {
@@ -1123,6 +1155,8 @@ mod journal_tests {
                                     pid: writer,
                                     start_time: u64::from(event),
                                     boot_id: None,
+                                    #[cfg(windows)]
+                                    generation_unit: None,
                                 },
                                 profile_directory: Some(PathBuf::from(format!(
                                     "profiles/{writer}/{event}"
