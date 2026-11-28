@@ -1104,10 +1104,14 @@ where
         Err(refused) => return refused.reply(),
     };
     journal.effects = ActionEffects::before(source, grant);
-    let dispatched = match action {
+    let dispatch = || match action {
         "AXShowMenu" => source.show_menu(handle),
         _ => source.press(handle),
     };
+    #[cfg(windows)]
+    let (dispatched, background_change) = windows_background::sample_mutation(dispatch);
+    #[cfg(not(windows))]
+    let dispatched = dispatch();
     journal.effects.sample(source, grant);
     let (outcome, reply) = match dispatched {
         Ok(()) => ("completed", json!({"outcome": "completed"})),
@@ -1147,6 +1151,8 @@ where
     if journal.outcome(token, outcome).is_err() {
         return audit_unavailable_reply(true);
     }
+    #[cfg(windows)]
+    let reply = windows_background::apply(background_change, journal, reply);
     reply
 }
 
@@ -1280,7 +1286,11 @@ where
     // One attempt. Whether the application accepted the message or not, the
     // value read back is what decides, and nothing is retried as keystrokes.
     journal.effects = ActionEffects::before(source, grant);
-    let written = source.write_text(handle, attribute, text);
+    let write = || source.write_text(handle, attribute, text);
+    #[cfg(windows)]
+    let (written, background_change) = windows_background::sample_mutation(write);
+    #[cfg(not(windows))]
+    let written = write();
     journal.effects.sample(source, grant);
     let deadline = Instant::now() + readback_bound;
     let confirmed = written.is_ok()
@@ -1295,6 +1305,13 @@ where
             }
             std::thread::sleep(SETTLE_POLL.min(deadline - now));
         };
+    #[cfg(windows)]
+    if matches!(written, Err(ElementActionError::Gone)) {
+        if journal.outcome(token, "stale_element").is_err() {
+            return audit_unavailable_reply(true);
+        }
+        return windows_background::apply(background_change, journal, stale_element_reply());
+    }
     let (outcome, reply) = if confirmed {
         (
             "completed",
@@ -1315,8 +1332,14 @@ where
     if journal.outcome(token, outcome).is_err() {
         return audit_unavailable_reply(true);
     }
+    #[cfg(windows)]
+    let reply = windows_background::apply(background_change, journal, reply);
     reply
 }
+
+#[cfg(windows)]
+#[path = "element_actions/windows_background.rs"]
+mod windows_background;
 
 /// Follow only the addressed element's parents. Unlike a whole-app read,
 /// these reads do not enable renderer accessibility through AXManualAccessibility.
@@ -1947,6 +1970,8 @@ where
             .as_ref()
             .and_then(|grant| sessions.latest(conversation, grant));
         let mut steps = Vec::new();
+        #[cfg(windows)]
+        let mut background_change = None;
         let mut reply = json!({"outcome":"completed"});
         let mut acted = false;
         let mut unreadable = false;
@@ -2016,6 +2041,10 @@ where
             for (offset, step_reply) in std::iter::once(done.reply).chain(done.later).enumerate() {
                 let step = index + offset;
                 reply = step_reply;
+                #[cfg(windows)]
+                if let Some(fronting) = reply.get("fronting") {
+                    background_change = Some(fronting.clone());
+                }
                 let success = reply["outcome"] == "completed";
                 acted |= success;
                 unreadable |= success && reply[STATE_TEXT_FIELD] == DIFF_UNREADABLE;
@@ -2069,6 +2098,10 @@ where
             }
         }
         reply["steps"] = json!(steps);
+        #[cfg(windows)]
+        if let Some(fronting) = background_change {
+            reply["fronting"] = fronting;
+        }
         if let Some(ending) = &batch_ending {
             ending.apply(&mut reply);
         }

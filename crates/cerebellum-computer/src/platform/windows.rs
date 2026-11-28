@@ -296,14 +296,14 @@ pub fn resolve_target(executable_basename: &str) -> TargetResolution {
 /// say, and `invoke` must not have run. The platform calls arrive as closures
 /// so this ordering compiles and is tested on every host; the FFI that fills
 /// them compiles only on Windows.
-fn dispatch_semantic_in_order<R, I>(
+fn dispatch_semantic_in_order<G, R, I>(
     session: WindowsSessionProvenance,
     request: &SemanticDispatchRequest,
     retain: R,
     invoke: I,
 ) -> Result<DispatchResult, DriverError>
 where
-    R: FnOnce(&ProcessGrant) -> Result<(), DriverError>,
+    R: FnOnce(&ProcessGrant) -> Result<G, DriverError>,
     I: FnOnce(
         &ProcessGrant,
         &AccessibilityElementName,
@@ -311,7 +311,7 @@ where
     ) -> Result<DispatchResult, DriverError>,
 {
     require_console_session(session)?;
-    retain(&request.element.owning_process)?;
+    let _retained = retain(&request.element.owning_process)?;
     let intent = SemanticActionIntent::from_wire_name(&request.action).ok_or(
         DriverError::InvalidRequest("unknown semantic action intent"),
     )?;
@@ -573,7 +573,7 @@ fn retain_current_target(
                 WindowsGrantVerification::Unreadable
             }
         })?;
-    let reading = match cerebellum_windows::process_start_time(target.pid) {
+    let reading = match retained.creation_time() {
         ProcessStartTime::Started(started) => WindowsProcessStartReading::Started(started),
         ProcessStartTime::NoSuchProcess => WindowsProcessStartReading::Gone,
         ProcessStartTime::AccessDenied | ProcessStartTime::Unclassified(_) => {
@@ -1021,11 +1021,7 @@ impl PlatformDriver for WindowsPlatformDriver {
             dispatch_semantic_in_order(
                 cerebellum_windows::current_session_provenance().into(),
                 &request,
-                |target| {
-                    retain_current_target(target)
-                        .map(|_retained| ())
-                        .map_err(semantic_verification_error)
-                },
+                |target| retain_current_target(target).map_err(semantic_verification_error),
                 |target, element_name, _intent| {
                     let element_name = uia_element_name(element_name)?;
                     let bounds = cerebellum_windows::AccessibilityInvokeBounds::default();
@@ -1451,6 +1447,51 @@ mod tests {
             "the identical console actuation must proceed: {accepted:?}"
         );
         assert_eq!(*order.borrow(), ["retain", "invoke"]);
+    }
+
+    #[test]
+    fn retained_target_outlives_the_semantic_mutate_call() {
+        use std::cell::Cell;
+
+        struct Lease<'a>(&'a Cell<&'static str>);
+        impl Drop for Lease<'_> {
+            fn drop(&mut self) {
+                assert_eq!(self.0.replace("dropped"), "returning");
+            }
+        }
+
+        let target = grant();
+        let request = SemanticDispatchRequest {
+            element: ElementResolutionResult {
+                element_name: AccessibilityElementName::Identifier("owned-control".into()),
+                alternate_name: None,
+                owning_process: target,
+                semantic_actions: vec![SemanticActionIntent::Press.wire_name().to_owned()],
+                unreadable_subtrees: 0,
+            },
+            action: SemanticActionIntent::Press.wire_name().to_owned(),
+        };
+        for fails in [false, true] {
+            let state = Cell::new("new");
+            let result = dispatch_semantic_in_order(
+                WindowsSessionProvenance::Console { session_id: 1 },
+                &request,
+                |_| {
+                    state.set("retained");
+                    Ok(Lease(&state))
+                },
+                |_, _, _| {
+                    assert_eq!(state.replace("returning"), "retained");
+                    if fails {
+                        Err(DriverError::ElementNotFound)
+                    } else {
+                        Ok(accepted_invoke_result(0))
+                    }
+                },
+            );
+            assert_eq!(result.is_err(), fails);
+            assert_eq!(state.get(), "dropped");
+        }
     }
 
     #[test]

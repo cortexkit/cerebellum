@@ -1,9 +1,10 @@
 use super::{
-    contains, same_binding, BoundWindow, Element, ElementKey, Fingerprint, ReadError, ReadResult,
+    actions::PressPattern, contains, current, same_binding, BoundWindow, Element, ElementKey,
+    Fingerprint, ReadError, ReadResult,
 };
 use crate::app_state::source::{ElementFacts, ElementHandle, ElementValue, RawElement};
 use cerebellum_windows::{
-    root_window_number, window_owner, RetainedProcessHandle, ScopedUia, UiaElementRef, UiaPatterns,
+    root_window_number, window_owner, RetainedProcessHandle, ScopedUia, UiaElementRef,
 };
 use std::sync::Arc;
 
@@ -33,10 +34,6 @@ pub(super) fn role(control: i32, password: bool, root: bool, menu_bar_item: bool
         _ => return format!("uia_control_type:{control}"),
     }
     .into()
-}
-
-fn can_press(patterns: UiaPatterns) -> bool {
-    patterns.invoke || patterns.toggle || patterns.selection_item || patterns.expand_collapse
 }
 
 #[derive(Debug)]
@@ -164,7 +161,7 @@ impl<'a> UiWindow<'a> {
             pid: Some(self.pid),
             role: Some(node.role),
             title: Some(node.token.name),
-            actions: if can_press(patterns) {
+            actions: if PressPattern::first(patterns).is_some() {
                 vec!["AXPress".into()]
             } else {
                 Vec::new()
@@ -205,6 +202,41 @@ impl<'a> UiWindow<'a> {
             current = self.uia.parent(&parent)?;
         }
         Err(ReadError::Bound)
+    }
+
+    fn before_mutation(&self, found: &UiaElementRef, key: &ElementKey) -> ReadResult<()> {
+        self.contained(found)?;
+        if self.fingerprint(found)? != key.fingerprint {
+            return Err(ReadError::Gone);
+        }
+        if !self.safe_path(found)? || !self.enabled(found)? {
+            return Err(ReadError::Unsupported);
+        }
+        current(self.process, self.generation)?;
+        self.confirm()
+    }
+
+    pub fn press(&self, element: &UiaElementRef, key: &ElementKey) -> ReadResult<()> {
+        let pattern =
+            PressPattern::first(self.uia.patterns(element)?).ok_or(ReadError::Unsupported)?;
+        pattern.run(self.uia, self.window.content(), &key.runtime_id, |found| {
+            self.before_mutation(found, key)
+        })
+    }
+
+    pub fn set_value(&self, key: &ElementKey, text: &str) -> ReadResult<()> {
+        self.uia.set_value_at(
+            self.window.content(),
+            &key.runtime_id,
+            text,
+            |found, read_only| {
+                self.before_mutation(found, key)?;
+                if read_only {
+                    return Err(ReadError::Unsupported);
+                }
+                Ok(())
+            },
+        )
     }
 
     pub fn value(&self, element: &UiaElementRef) -> ReadResult<Option<String>> {
@@ -407,7 +439,7 @@ impl<'a> UiWindow<'a> {
         let deepest = self.node(&hit)?;
         for _ in 0..MAX_PATH {
             let node = self.node(&hit)?;
-            if node.hazard() || can_press(self.uia.patterns(&hit)?) {
+            if node.hazard() || PressPattern::first(self.uia.patterns(&hit)?).is_some() {
                 return Ok(Some(node.handle()));
             }
             if self.uia.same(&hit, &self.root)? {

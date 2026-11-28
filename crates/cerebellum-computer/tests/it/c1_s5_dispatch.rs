@@ -536,6 +536,88 @@ fn semantic_request_for_action(row: FrozenDispatchRow, action: &str) -> Dispatch
     .with_semantic(element, action)
 }
 
+fn addressed_attendance_refusals<D: PlatformDriver>(
+    dispatcher: &mut Dispatcher<'_, D>,
+    target: &ProcessGrant,
+) {
+    for action in ["press_element", "press_point", "write_text"] {
+        for (conversation, expires_at) in [("conversation-1", 10), ("other", 30)] {
+            dispatcher.clear_trace();
+            let row = FrozenDispatchRow::for_capability(&format!("computer.{action}")).unwrap();
+            assert!(row.semantic_supported);
+            assert!(!row.synthetic_background_supported && !row.synthetic_observed_supported);
+            let mut request = semantic_request(row);
+            request.target = target.clone();
+            request.semantic.as_mut().unwrap().element.owning_process = target.clone();
+            request.attendance = AttendanceContext::background(
+                "conversation-1",
+                target.clone(),
+                "process-1",
+                AttendanceLease::new(
+                    conversation,
+                    target.clone(),
+                    "process-1",
+                    1,
+                    expires_at,
+                    "lease-1",
+                    "monotonic-v1",
+                )
+                .unwrap(),
+                20,
+                20,
+                50,
+                50,
+                true,
+            );
+            assert_eq!(
+                dispatcher
+                    .dispatch(&mut audit(), audit_identity(), request)
+                    .unwrap_err(),
+                DispatchError::AttendanceUnavailable,
+                "{action}: {conversation}/{expires_at}",
+            );
+            assert_eq!(dispatcher.trace(), &[DispatchPhase::PredicateSerialized]);
+        }
+    }
+}
+
+#[test]
+fn addressed_rows_refuse_expired_and_wrong_conversation_dispatch_evidence_on_fixture_driver() {
+    let mut dispatcher = Dispatcher::new(RecordingDriver::default(), &|| false);
+    addressed_attendance_refusals(&mut dispatcher, &target());
+    assert_eq!(dispatcher.driver().semantic_calls, 0);
+    assert_eq!(dispatcher.driver().per_pid_calls, 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn addressed_rows_refuse_expired_and_wrong_conversation_dispatch_evidence_on_windows_driver() {
+    let pid = std::process::id();
+    let cerebellum_windows::ProcessStartTime::Started(generation) =
+        cerebellum_windows::process_start_time(pid)
+    else {
+        panic!("test process start time unavailable");
+    };
+    let target = ProcessGrant {
+        pid,
+        bundle_identity: "pid:addressed-attendance-test".into(),
+        process_generation_evidence: generation.to_string(),
+    };
+    let mut driver = windows::WindowsPlatformDriver::default();
+    assert!(
+        driver
+            .verify_attendance(AttendancePreconditionRequest {
+                target: target.clone(),
+                conversation_id: "conversation-1".into(),
+                maximum_lease_age_ms: 50,
+            })
+            .unwrap()
+            .valid
+    );
+    let mut dispatcher = Dispatcher::new(driver, &|| false);
+    addressed_attendance_refusals(&mut dispatcher, &target);
+}
+
 #[test]
 fn semantic_dispatch_is_first_and_effect_is_observed_even_when_no_effect_occurs() {
     let driver = RecordingDriver {

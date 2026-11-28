@@ -17,6 +17,7 @@ use std::{
 };
 use subc_protocol::{Flags, Frame, FrameType, Priority};
 
+mod actions;
 mod launch;
 mod picture;
 
@@ -58,6 +59,9 @@ fn rows(context: &CapabilityAdvertisementContext) -> BTreeSet<String> {
     }
     if launch::launch_block(context).is_none() {
         rows.insert("computer.open_app".into());
+    }
+    if actions::block(context).is_none() {
+        rows.extend(actions::ROWS.map(str::to_owned));
     }
     rows
 }
@@ -233,7 +237,17 @@ async fn wire_with_questions(
 async fn wire_with_consent_hook(
     planes: &crate::Planes,
     action: &str,
+    arguments: Value,
+    on_question: impl FnMut(),
+) -> (Value, usize) {
+    wire_with_decision(planes, action, arguments, "allow_30m", on_question).await
+}
+
+async fn wire_with_decision(
+    planes: &crate::Planes,
+    action: &str,
     mut arguments: Value,
+    decision: &str,
     mut on_question: impl FnMut(),
 ) -> (Value, usize) {
     arguments["action"] = json!(action);
@@ -258,7 +272,7 @@ async fn wire_with_consent_hook(
                 question = service.card(9, 3) => {
                     questions += 1;
                     on_question();
-                    assert!(service.answer(question.header.corr, crate::cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_30m"}))));
+                    assert!(service.answer(question.header.corr, crate::cingulate_client::ScriptedAnswer::Answered(json!({"decision":decision}))));
                 }
                 frame = rx.recv() => {
                     let frame = frame.unwrap();
