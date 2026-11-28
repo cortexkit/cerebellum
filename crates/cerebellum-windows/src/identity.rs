@@ -1,9 +1,12 @@
 //! Retain the executable and its ancestors across verification and process creation.
 
 use std::ffi::OsStr;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::os::windows::{
+    fs::OpenOptionsExt,
+    io::{AsRawHandle, BorrowedHandle, FromRawHandle},
+};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use windows_sys::Wdk::{
@@ -19,6 +22,9 @@ use windows_sys::Win32::{
     },
     Globalization::{CompareStringOrdinal, CSTR_EQUAL},
     Storage::FileSystem::*,
+    System::Threading::{
+        GetCurrentProcess, IsWow64Process2, QueryFullProcessImageNameW, PROCESS_NAME_NATIVE,
+    },
     System::IO::IO_STATUS_BLOCK,
 };
 
@@ -137,7 +143,7 @@ impl HeldExecutable {
 
     fn walk(
         path: &Path,
-        mut after_open_directory: impl FnMut(usize),
+        mut after_open_directory: impl FnMut(&str),
     ) -> Result<Self, OpenExecutableError> {
         let refuse = OpenExecutableError::UnstablePath;
         let requested = checked_path_forms(path.as_os_str())?;
@@ -170,7 +176,7 @@ impl HeldExecutable {
         check_attributes(&root, true)?;
         check_volume(&root)?;
         let mut ancestors = vec![root];
-        after_open_directory(0);
+        after_open_directory(drive);
         let mut names = rest.split('\\').peekable();
         while let Some(name) = names.next() {
             let is_dir = names.peek().is_some();
@@ -180,7 +186,7 @@ impl HeldExecutable {
             check_attributes(&file, is_dir)?;
             if is_dir {
                 ancestors.push(file);
-                after_open_directory(ancestors.len() - 1);
+                after_open_directory(name);
                 continue;
             }
             let actual = final_path(&file, VOLUME_NAME_DOS).map_err(|_| refuse)?;
@@ -332,6 +338,48 @@ fn ordinal_eq_ignore_case(a: &str, b: &str) -> bool {
         CompareStringOrdinal(a.as_ptr(), a.len() as i32, b.as_ptr(), b.len() as i32, 1)
             == CSTR_EQUAL
     }
+}
+
+pub fn native_pe_machine() -> io::Result<u16> {
+    let mut process = 0;
+    let mut native = 0;
+    // The current-process pseudohandle is valid for this query and both outputs are writable.
+    if unsafe { IsWow64Process2(GetCurrentProcess(), &mut process, &mut native) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(native)
+}
+
+/// Read the identity of the image path reported on the same process handle
+/// returned by creation. The caller must keep the originally opened image held.
+pub fn read_process_image_identity(process: BorrowedHandle<'_>) -> io::Result<crate::FileIdentity> {
+    let mut path = vec![0u16; 32768];
+    let mut len = path.len() as u32;
+    // The caller retains the live process object and the buffer is writable.
+    let ok = unsafe {
+        QueryFullProcessImageNameW(
+            process.as_raw_handle(),
+            PROCESS_NAME_NATIVE,
+            path.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let native = String::from_utf16(path.get(..len as usize).ok_or(io::ErrorKind::InvalidData)?)
+        .map_err(io::Error::other)?;
+    if !native.starts_with("\\Device\\") || native.contains('\0') {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    // Open the native device path without interpreting a DOS drive mapping.
+    let file = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(SHARE_ALL)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(format!("\\\\?\\GLOBALROOT{native}"))?;
+    check_attributes(&file, false).map_err(|_| io::ErrorKind::InvalidData)?;
+    crate::file_identity(&file)
 }
 
 use std::ffi::CStr;
@@ -550,10 +598,200 @@ fn hash_der(der: &[u8]) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::fs;
     use std::io::Write;
+    use std::os::windows::{
+        ffi::OsStringExt,
+        fs::{symlink_dir, symlink_file},
+    };
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use windows_sys::Wdk::Storage::FileSystem::{
         FileAccessInformation, NtQueryInformationFile, FILE_ACCESS_INFORMATION,
     };
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "ck-held-image-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).expect("create test-owned directory");
+            Self(fs::canonicalize(path).expect("resolve fixture directory"))
+        }
+
+        fn image(&self, parent: &str) -> PathBuf {
+            let path = self.0.join(parent).join("chrome.exe");
+            fs::create_dir_all(path.parent().unwrap()).expect("create fixture directory");
+            fs::write(&path, b"test fixture, not a runnable image")
+                .expect("write fixture executable");
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn windows_held_image_blocks_renaming_leaf_and_mutable_ancestors() {
+        let fixture = Scratch::new();
+        let image = fixture.image(r"install\Application");
+        let try_rename = |source: &Path| {
+            let renamed = source.with_extension("rename-control");
+            fs::rename(source, &renamed).map(|()| {
+                fs::rename(&renamed, source).expect("restore test-only rename");
+            })
+        };
+        let application = image.parent().unwrap();
+        let install = application.parent().unwrap();
+        for path in [&image, application, install, &fixture.0] {
+            try_rename(path).expect("unlocked control is renamable");
+        }
+        let held = HeldExecutable::open(&image).expect("hold image and ancestors");
+        for path in [&image, application, install, &fixture.0] {
+            assert!(
+                try_rename(path).is_err(),
+                "renamed while image held: {path:?}"
+            );
+        }
+        drop(held);
+        for path in [&image, application, install, &fixture.0] {
+            try_rename(path).expect("can rename once the last image handle closes");
+        }
+    }
+
+    #[test]
+    fn windows_walk_refuses_an_open_directory_swapped_before_the_leaf_open() {
+        let fixture = Scratch::new();
+        let original = fixture.image("checked-parent");
+        let replacement = fixture.image("replacement");
+        let elsewhere = fixture.0.join("moved-parent");
+        let mut swaps = 0;
+        let opened = HeldExecutable::walk(&original, |name| {
+            if name == "checked-parent" {
+                fs::rename(original.parent().unwrap(), &elsewhere)
+                    .expect("move still-renamable checked directory");
+                fs::rename(replacement.parent().unwrap(), original.parent().unwrap())
+                    .expect("replace directory before opening the leaf");
+                swaps += 1;
+            }
+        });
+        assert_eq!(swaps, 1);
+        assert_eq!(opened.unwrap_err(), OpenExecutableError::UnstablePath);
+    }
+
+    #[test]
+    fn windows_walker_reports_sharing_violation_as_unstable() {
+        let fixture = Scratch::new();
+        let image = fixture.image("Application");
+        let writer = OpenOptions::new()
+            .write(true)
+            .share_mode(SHARE_ALL)
+            .open(&image)
+            .unwrap();
+        assert_eq!(
+            HeldExecutable::open(&image).unwrap_err(),
+            OpenExecutableError::UnstablePath
+        );
+        drop(writer);
+        HeldExecutable::open(&image).expect("the same path is stable after the writer closes");
+    }
+
+    #[test]
+    fn windows_walker_never_follows_directory_or_leaf_reparse_points() {
+        let fixture = Scratch::new();
+        let image = fixture.image(r"real\Application");
+        let real = image.parent().unwrap().parent().unwrap();
+        let alias = fixture.0.join("dir-alias");
+        let leaf = fixture.0.join("file-alias.exe");
+        symlink_dir(real, &alias).expect("create test directory reparse point");
+        symlink_file(&image, &leaf).expect("create test file reparse point");
+        for path in [alias.join(r"Application\chrome.exe"), leaf] {
+            assert_eq!(
+                HeldExecutable::open(&path).unwrap_err(),
+                OpenExecutableError::ReparsePoint
+            );
+        }
+        HeldExecutable::open(&image).expect("the actual file is not a reparse point");
+    }
+
+    #[test]
+    fn windows_path_forms_preserve_exact_unicode() {
+        let path = r"C:\Signé\chrome.exe";
+        let stored = r"\\?\C:\Signé\chrome.exe";
+        for input in [path, stored] {
+            let forms = checked_path_forms(OsStr::new(input)).unwrap();
+            assert_eq!(forms.stored(), stored);
+            assert_eq!(forms.spawn(), path);
+        }
+    }
+
+    #[test]
+    fn windows_path_forms_reject_unc() {
+        for input in [
+            r"\\remote\share\chrome.exe",
+            r"\\?\UNC\remote\share\chrome.exe",
+        ] {
+            assert_eq!(
+                checked_path_forms(OsStr::new(input)).unwrap_err(),
+                OpenExecutableError::UnstablePath
+            );
+        }
+    }
+
+    #[test]
+    fn windows_path_forms_reject_max_path() {
+        let at_limit = format!("C:\\{}", "x".repeat(257));
+        assert_eq!(
+            checked_path_forms(OsStr::new(&at_limit)).unwrap_err(),
+            OpenExecutableError::UnstablePath
+        );
+    }
+
+    #[test]
+    fn windows_path_forms_reject_normalization() {
+        for input in [
+            r"\\?\C:\dir.\chrome.exe",
+            r"\\?\C:\dir\chrome.exe ",
+            r"C:\dir\NUL.txt",
+            r"C:\dir\..\chrome.exe",
+            "C:\\dir\\interior\0nul",
+        ] {
+            assert_eq!(
+                checked_path_forms(OsStr::new(input)).unwrap_err(),
+                OpenExecutableError::UnstablePath,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_path_forms_reject_invalid_unicode() {
+        let invalid = OsString::from_wide(&[b'C'.into(), b':'.into(), b'\\'.into(), 0xd800]);
+        assert_eq!(
+            checked_path_forms(&invalid).unwrap_err(),
+            OpenExecutableError::UnstablePath
+        );
+    }
+
+    #[test]
+    fn windows_process_image_reader_reads_file_id_from_a_retained_handle() {
+        // The current-process pseudohandle remains live for the entire test.
+        let process = unsafe { BorrowedHandle::borrow_raw(GetCurrentProcess()) };
+        let image = std::env::current_exe().unwrap();
+        let file = File::open(image).unwrap();
+        assert_eq!(
+            read_process_image_identity(process).unwrap(),
+            crate::file_identity(&file).unwrap()
+        );
+    }
 
     #[test]
     fn windows_installed_chrome_chain() {
@@ -674,10 +912,8 @@ mod tests {
 
     #[test]
     fn windows_chrome_handle_has_exact_access() {
-        let Some(path) = std::env::var_os("CK_WINDOWS_BROWSER_CHROME") else {
-            return;
-        };
-        let held = HeldExecutable::open(Path::new(&path)).expect("open installed Chrome");
+        let fixture = Scratch::new();
+        let held = HeldExecutable::open(&fixture.image("Application")).expect("open fixture image");
         let mut io = IO_STATUS_BLOCK::default();
         let mut info = FILE_ACCESS_INFORMATION::default();
         // The held file stays open and the buffer matches FileAccessInformation.

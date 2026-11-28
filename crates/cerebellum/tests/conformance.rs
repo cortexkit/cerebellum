@@ -1287,12 +1287,17 @@ async fn start_live_daemon_with_browser(
         let missing_browser = directory.join("nonexistent").join("Test Browser.exe");
         #[cfg(not(windows))]
         let missing_browser = Path::new("/nonexistent/Test Browser");
+        let expected_identity = if cfg!(all(windows, feature = "windows-browser-release")) {
+            json!({"windows_publisher": "Google LLC"})
+        } else {
+            json!("test.browser")
+        };
         fs::write(
             config_dir.join("cerebellum.jsonc"),
             serde_json::to_vec(&json!({
                 "browser": {
                     "executable_path": missing_browser,
-                    "expected_identity": "test.browser",
+                    "expected_identity": expected_identity,
                     "launch_handshake_deadline_ms": 10_000,
                     "termination_grace_period_ms": 5_000,
                     "browser_idle_timeout_ms": 60_000,

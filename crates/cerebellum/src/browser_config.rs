@@ -14,6 +14,11 @@ use serde_json::{Map, Value};
 pub(crate) const MAX_ACTION_DEADLINE_MS: u64 = 30_000;
 pub(crate) const MAX_LAUNCH_DEADLINE_MS: u64 = MAX_ACTION_DEADLINE_MS;
 pub(crate) const MAX_TERMINATION_DEADLINE_MS: u64 = 5_000;
+pub(crate) const WINDOWS_DISCOVERS_CHROME: bool =
+    cfg!(all(windows, feature = "windows-browser-release"));
+
+#[cfg(all(windows, feature = "windows-browser-release"))]
+pub(crate) use crate::windows_launch::discovery::CHROME_PUBLISHER;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserConfig {
@@ -354,16 +359,7 @@ fn parse_browser(value: &Value) -> Result<BrowserConfig, BrowserConfigError> {
             });
         }
     };
-    let expected_identity = match object.get("expected_identity") {
-        None => None,
-        Some(Value::String(identity)) if !identity.is_empty() => Some(identity.clone()),
-        Some(_) => {
-            return Err(BrowserConfigError {
-                field: "browser.expected_identity".to_string(),
-                reason: BrowserConfigReason::WrongType,
-            });
-        }
-    };
+    let expected_identity = parse_expected_identity(object.get("expected_identity"))?;
     if executable_path.is_some() && expected_identity.is_none() {
         return Err(BrowserConfigError {
             field: "browser.expected_identity".to_string(),
@@ -392,6 +388,50 @@ fn parse_browser(value: &Value) -> Result<BrowserConfig, BrowserConfigError> {
         )?,
         navigation_settle_deadline_ms: settle_deadline_ms(object)?,
     })
+}
+
+#[cfg(not(all(windows, feature = "windows-browser-release")))]
+fn parse_expected_identity(value: Option<&Value>) -> Result<Option<String>, BrowserConfigError> {
+    Ok(match value {
+        None => None,
+        Some(Value::String(identity)) if !identity.is_empty() => Some(identity.clone()),
+        Some(_) => {
+            return Err(BrowserConfigError {
+                field: "browser.expected_identity".to_string(),
+                reason: BrowserConfigReason::WrongType,
+            });
+        }
+    })
+}
+
+#[cfg(all(windows, feature = "windows-browser-release"))]
+fn parse_expected_identity(value: Option<&Value>) -> Result<Option<String>, BrowserConfigError> {
+    if let Some(value) = value {
+        let table = value.as_object().ok_or_else(|| BrowserConfigError {
+            field: "browser.expected_identity".into(),
+            reason: BrowserConfigReason::WrongType,
+        })?;
+        if let Some(key) = table.keys().filter(|key| *key != "windows_publisher").min() {
+            return Err(BrowserConfigError {
+                field: "browser.expected_identity".into(),
+                reason: BrowserConfigReason::UnknownMember(key.clone()),
+            });
+        }
+        match table.get("windows_publisher") {
+            Some(Value::String(name)) if name == CHROME_PUBLISHER => {}
+            invalid => {
+                return Err(BrowserConfigError {
+                    field: "browser.expected_identity.windows_publisher".into(),
+                    reason: if invalid.is_none() {
+                        BrowserConfigReason::MissingMember
+                    } else {
+                        BrowserConfigReason::WrongType
+                    },
+                })
+            }
+        }
+    }
+    Ok(Some(CHROME_PUBLISHER.into()))
 }
 
 /// The settle deadline, refused when it cannot reach the quiet window.
@@ -700,11 +740,24 @@ mod tests {
             "/Applications/Chrome"
         };
         value["browser"]["executable_path"] = serde_json::json!(absolute_executable);
-        assert_eq!(
-            parse_browser_config(&value.to_string()).unwrap_err().reason,
-            BrowserConfigReason::ExpectedIdentityRequired
-        );
-        value["browser"]["expected_identity"] = serde_json::json!("com.example.Chrome");
+        if WINDOWS_DISCOVERS_CHROME {
+            assert_eq!(
+                parse_browser_config(&value.to_string())
+                    .unwrap()
+                    .unwrap()
+                    .expected_identity
+                    .as_deref(),
+                Some("Google LLC")
+            );
+            value["browser"]["expected_identity"] =
+                serde_json::json!({"windows_publisher": "Google LLC"});
+        } else {
+            assert_eq!(
+                parse_browser_config(&value.to_string()).unwrap_err().reason,
+                BrowserConfigReason::ExpectedIdentityRequired
+            );
+            value["browser"]["expected_identity"] = serde_json::json!("com.example.Chrome");
+        }
         assert!(parse_browser_config(&value.to_string()).is_ok());
     }
 
