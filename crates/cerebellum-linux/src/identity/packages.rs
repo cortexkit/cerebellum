@@ -1,9 +1,11 @@
 use super::*;
-use std::process::{Child, Command, Stdio};
+use std::fmt;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 const PKG_FILE_LIMIT: u64 = 32 * 1024 * 1024;
 const RPM_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
+const RPM_DIAGNOSTIC_LIMIT: usize = 4096;
 const RPM_QUERY_LIMIT: Duration = Duration::from_secs(2);
 const DPKG: &str = "/var/lib/dpkg";
 const RPM_DBS: [&str; 2] = ["/usr/lib/sysimage/rpm", "/var/lib/rpm"];
@@ -47,15 +49,18 @@ impl Database {
         if let Some(record) = &rpm_from_dpkg {
             verify_rpm_install(host, record, &digest)?;
         }
-        let output = query_rpm(host, &db)?;
+        let output = query_rpm(host, &db).map_err(|_| AppIdentityUnproven)?;
         if rpm_from_dpkg.is_none() {
             // On an RPM system, trust the protected rpm path enough to run
             // it. Use its inventory only after checking the binary's own
             // installed checksum against that inventory.
-            let record = rpm_record(&output, &rpm_paths)?.ok_or(AppIdentityUnproven)?;
+            let record = rpm_record(&output, &rpm_paths)
+                .map_err(RpmOutputFailure::refusal)?
+                .ok_or(AppIdentityUnproven)?;
             verify_rpm_install(host, &record, &digest)?;
         }
-        let Some(matched) = rpm_record(&output, &candidates)? else {
+        let Some(matched) = rpm_record(&output, &candidates).map_err(RpmOutputFailure::refusal)?
+        else {
             return Ok(None);
         };
         verify_package_path(host, target, &matched.path, &image)?;
@@ -330,7 +335,8 @@ fn rpm_database(root: &File) -> Result<Option<PathBuf>, Refusal> {
         // A legacy path may be a symlink to the canonical path. Do not pick
         // one of two distinct databases and silently ignore the other.
         let actual = fs::read_link(fd_path(&directory)).map_err(|_| AppIdentityUnproven)?;
-        let populated = rpm_db_files(&directory)?;
+        let populated = rpm_db_files(&directory, "discover database", &path)
+            .map_err(|_| AppIdentityUnproven)?;
         if populated.iter().all(|(name, _)| name == ".rpm.lock") {
             continue;
         }
@@ -343,21 +349,205 @@ fn rpm_database(root: &File) -> Result<Option<PathBuf>, Refusal> {
     Ok(selected.map(|(_, path)| path))
 }
 
-fn rpm_db_files(dir: &File) -> Result<Vec<(OsString, ImageKey)>, Refusal> {
+type RpmDbEntry = (OsString, ImageKey);
+
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotChange {
+    Added {
+        name: OsString,
+        stamp: ImageKey,
+    },
+    Removed {
+        name: OsString,
+        stamp: ImageKey,
+    },
+    Changed {
+        name: OsString,
+        fields: Vec<&'static str>,
+        before: ImageKey,
+        after: ImageKey,
+    },
+}
+
+impl fmt::Display for SnapshotChange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Added { name, stamp } => write!(f, "added {name:?}: {stamp:?}"),
+            Self::Removed { name, stamp } => write!(f, "removed {name:?}: {stamp:?}"),
+            Self::Changed {
+                name,
+                fields,
+                before,
+                after,
+            } => write!(
+                f,
+                "{name:?} changed {} (before: {before:?}; after: {after:?})",
+                fields.join(", ")
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RpmQueryFailure {
+    Io {
+        stage: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+    Unprotected {
+        stage: &'static str,
+        path: PathBuf,
+        uid: u32,
+        mode: u32,
+    },
+    NoDatabaseFile(PathBuf),
+    DatabaseDirectoryReplaced(PathBuf),
+    SnapshotChanged(Box<SnapshotChange>),
+    Exited {
+        status: ExitStatus,
+        stderr: Vec<u8>,
+    },
+    Stderr {
+        status: ExitStatus,
+        stderr: Vec<u8>,
+    },
+    Deadline {
+        stderr: Vec<u8>,
+    },
+    OutputLimit,
+}
+
+impl fmt::Display for RpmQueryFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io {
+                stage,
+                path,
+                source,
+            } => write!(f, "{stage} at {}: {source}", path.display()),
+            Self::Unprotected {
+                stage,
+                path,
+                uid,
+                mode,
+            } => write!(
+                f,
+                "{stage} refused {} (uid {uid}, mode {mode:#o})",
+                path.display()
+            ),
+            Self::NoDatabaseFile(path) => {
+                write!(f, "no supported database file in {}", path.display())
+            }
+            Self::DatabaseDirectoryReplaced(path) => write!(
+                f,
+                "rpm exited 0 with empty stderr, but database directory {} changed device/inode",
+                path.display()
+            ),
+            Self::SnapshotChanged(change) => write!(
+                f,
+                "rpm exited 0 with empty stderr, but database snapshot changed: {change}"
+            ),
+            Self::Exited { status, stderr } | Self::Stderr { status, stderr } => write!(
+                f,
+                "rpm {status}; stderr: {:?}",
+                String::from_utf8_lossy(stderr)
+            ),
+            Self::Deadline { stderr } => write!(
+                f,
+                "rpm query passed its deadline; stderr: {:?}",
+                String::from_utf8_lossy(stderr)
+            ),
+            Self::OutputLimit => write!(f, "rpm stdout exceeded {RPM_OUTPUT_LIMIT} bytes"),
+        }
+    }
+}
+
+fn rpm_io<'a>(
+    stage: &'static str,
+    path: &'a Path,
+) -> impl FnOnce(io::Error) -> RpmQueryFailure + 'a {
+    move |source| RpmQueryFailure::Io {
+        stage,
+        path: path.to_owned(),
+        source,
+    }
+}
+
+fn protected_rpm_path(
+    root: &File,
+    stage: &'static str,
+    path: &Path,
+) -> Result<File, RpmQueryFailure> {
+    walk(root, path, true).map_err(rpm_io(stage, path))
+}
+
+fn rpm_db_files(
+    dir: &File,
+    stage: &'static str,
+    db: &Path,
+) -> Result<Vec<RpmDbEntry>, RpmQueryFailure> {
     let mut files = Vec::new();
-    for entry in fs::read_dir(fd_path(dir)).map_err(|_| AppIdentityUnproven)? {
-        let name = entry.map_err(|_| AppIdentityUnproven)?.file_name();
+    for entry in fs::read_dir(fd_path(dir)).map_err(rpm_io(stage, db))? {
+        let name = entry.map_err(rpm_io(stage, db))?.file_name();
+        let path = db.join(&name);
         let metadata = open_component(dir, &name)
             .and_then(|file| file.metadata())
-            .map_err(|_| AppIdentityUnproven)?;
+            .map_err(rpm_io(stage, &path))?;
         if !metadata.is_file() || !protected(&metadata) {
-            return Err(AppIdentityUnproven);
+            return Err(RpmQueryFailure::Unprotected {
+                stage,
+                path,
+                uid: metadata.uid(),
+                mode: metadata.mode(),
+            });
         }
         let stamp = rpm_file_stamp(&name, image_key(&metadata));
         files.push((name, stamp));
     }
     files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     Ok(files)
+}
+
+fn snapshot_change(before: &[RpmDbEntry], after: &[RpmDbEntry]) -> Option<SnapshotChange> {
+    for (name, old) in before {
+        let Ok(position) = after.binary_search_by(|(candidate, _)| candidate.cmp(name)) else {
+            return Some(SnapshotChange::Removed {
+                name: name.clone(),
+                stamp: *old,
+            });
+        };
+        let new = &after[position].1;
+        if old != new {
+            let fields = [
+                (old.dev != new.dev, "device"),
+                (old.ino != new.ino, "inode"),
+                (old.size != new.size, "size"),
+                (old.mtime != new.mtime, "mtime"),
+                (old.ctime != new.ctime, "ctime"),
+            ]
+            .into_iter()
+            .filter_map(|(changed, field)| changed.then_some(field))
+            .collect();
+            return Some(SnapshotChange::Changed {
+                name: name.clone(),
+                fields,
+                before: *old,
+                after: *new,
+            });
+        }
+    }
+    after
+        .iter()
+        .find(|(name, _)| {
+            before
+                .binary_search_by(|(candidate, _)| candidate.cmp(name))
+                .is_err()
+        })
+        .map(|(name, stamp)| SnapshotChange::Added {
+            name: name.clone(),
+            stamp: *stamp,
+        })
 }
 
 fn rpm_file_stamp(name: &OsStr, mut key: ImageKey) -> ImageKey {
@@ -371,11 +561,19 @@ fn rpm_file_stamp(name: &OsStr, mut key: ImageKey) -> ImageKey {
     key
 }
 
-fn query_rpm(root: &File, db: &Path) -> Result<Vec<u8>, Refusal> {
-    let image = walk(root, Path::new(RPM), true).map_err(|_| AppIdentityUnproven)?;
-    let metadata = image.metadata().map_err(|_| AppIdentityUnproven)?;
+fn query_rpm(root: &File, db: &Path) -> Result<Vec<u8>, RpmQueryFailure> {
+    let rpm = Path::new(RPM);
+    let image = protected_rpm_path(root, "verify rpm executable path ownership", rpm)?;
+    let metadata = image
+        .metadata()
+        .map_err(rpm_io("stat rpm executable", rpm))?;
     if !metadata.is_file() || metadata.mode() & 0o111 == 0 || metadata.mode() & 0o6000 != 0 {
-        return Err(AppIdentityUnproven);
+        return Err(RpmQueryFailure::Unprotected {
+            stage: "verify rpm executable type and mode",
+            path: rpm.to_owned(),
+            uid: metadata.uid(),
+            mode: metadata.mode(),
+        });
     }
     // No user macro, plugin, or HOME configuration. Read the system database
     // with one complete query: rpm's nonzero -qf status cannot distinguish
@@ -383,22 +581,31 @@ fn query_rpm(root: &File, db: &Path) -> Result<Vec<u8>, Refusal> {
     let rc = Path::new("/usr/lib/rpm/rpmrc");
     let macros = Path::new("/usr/lib/rpm/macros");
     for config in [rc, macros] {
-        if !walk(root, config, true)
-            .and_then(|file| file.metadata())
-            .is_ok_and(|meta| meta.is_file())
-        {
-            return Err(AppIdentityUnproven);
+        let meta = protected_rpm_path(root, "verify rpm configuration path ownership", config)?
+            .metadata()
+            .map_err(rpm_io("stat rpm configuration", config))?;
+        if !meta.is_file() {
+            return Err(RpmQueryFailure::Unprotected {
+                stage: "verify rpm configuration file type",
+                path: config.to_owned(),
+                uid: meta.uid(),
+                mode: meta.mode(),
+            });
         }
     }
-    let directory = walk(root, db, true).map_err(|_| AppIdentityUnproven)?;
-    let before = rpm_db_files(&directory)?;
+    let directory = protected_rpm_path(
+        root,
+        "verify database directory path ownership before rpm",
+        db,
+    )?;
+    let before = rpm_db_files(&directory, "read protected database files before rpm", db)?;
     if !before.iter().any(|(file, _)| {
         matches!(
             file.as_bytes(),
             b"rpmdb.sqlite" | b"Packages" | b"Packages.db"
         )
     }) {
-        return Err(AppIdentityUnproven);
+        return Err(RpmQueryFailure::NoDatabaseFile(db.to_owned()));
     }
     let mut child = Command::new(RPM)
         .env_clear()
@@ -417,60 +624,84 @@ fn query_rpm(root: &File, db: &Path) -> Result<Vec<u8>, Refusal> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|_| AppIdentityUnproven)?;
+        .map_err(rpm_io("spawn rpm", rpm))?;
     let output = match collect_rpm(&mut child) {
         Ok(output) => output,
-        Err(_) => {
+        Err(failure) => {
             let _ = child.kill();
             if child.try_wait().ok().flatten().is_none() {
                 // A killed child on stalled storage may not become waitable
                 // by the query deadline. Reap it without holding up dispatch.
                 let _ = std::thread::Builder::new().spawn(move || child.wait());
             }
-            return Err(AppIdentityUnproven);
+            return Err(failure);
         }
     };
-    let current = walk(root, db, true).map_err(|_| AppIdentityUnproven)?;
+    let current = protected_rpm_path(
+        root,
+        "verify database directory path ownership after rpm",
+        db,
+    )?;
     if !same_file(
-        &directory.metadata().map_err(|_| AppIdentityUnproven)?,
-        &current.metadata().map_err(|_| AppIdentityUnproven)?,
-    ) || before != rpm_db_files(&current)?
-    {
-        return Err(AppIdentityUnproven);
+        &directory
+            .metadata()
+            .map_err(rpm_io("stat original database directory after rpm", db))?,
+        &current
+            .metadata()
+            .map_err(rpm_io("stat current database directory after rpm", db))?,
+    ) {
+        return Err(RpmQueryFailure::DatabaseDirectoryReplaced(db.to_owned()));
+    }
+    let after = rpm_db_files(&current, "read protected database files after rpm", db)?;
+    if let Some(change) = snapshot_change(&before, &after) {
+        return Err(RpmQueryFailure::SnapshotChanged(Box::new(change)));
     }
     Ok(output)
 }
 
-fn collect_rpm(child: &mut Child) -> io::Result<Vec<u8>> {
+fn collect_rpm(child: &mut Child) -> Result<Vec<u8>, RpmQueryFailure> {
     let deadline = Instant::now() + RPM_QUERY_LIMIT;
-    let mut stdout = child.stdout.take().ok_or_else(invalid)?;
-    let mut stderr = child.stderr.take().ok_or_else(invalid)?;
+    let rpm = Path::new(RPM);
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| rpm_io("open rpm stdout", rpm)(invalid()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| rpm_io("open rpm stderr", rpm)(invalid()))?;
     for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
         // SAFETY: Both descriptors name owned pipes; fcntl changes only status flags.
         if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(rpm_io("configure nonblocking rpm pipe", rpm)(
+                io::Error::last_os_error(),
+            ));
         }
     }
     let mut output = Vec::new();
+    let mut diagnostics = Vec::new();
     let mut eof = false;
     let mut diagnostics_closed = false;
     let mut buffer = [0; 8192];
     loop {
-        let budget = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
+        let Some(budget) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(RpmQueryFailure::Deadline {
+                stderr: diagnostics,
+            });
+        };
         if !diagnostics_closed {
-            match stderr.read(&mut buffer[..1]) {
+            match stderr.read(&mut buffer) {
                 Ok(0) => diagnostics_closed = true,
-                // Some rpm builds can print database errors without changing
-                // the exit status. That is not evidence of an empty database.
-                Ok(_) => return Err(invalid()),
+                Ok(n) => {
+                    let remaining = RPM_DIAGNOSTIC_LIMIT - diagnostics.len();
+                    diagnostics.extend_from_slice(&buffer[..n.min(remaining)]);
+                }
                 Err(e)
                     if matches!(
                         e.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                     ) => {}
-                Err(e) => return Err(e),
+                Err(e) => return Err(rpm_io("read rpm stderr", rpm)(e)),
             }
         }
         if !eof {
@@ -480,57 +711,99 @@ fn collect_rpm(child: &mut Child) -> io::Result<Vec<u8>> {
                     output.extend_from_slice(&buffer[..n]);
                     continue;
                 }
-                Ok(_) => return Err(invalid()),
+                Ok(_) => return Err(RpmQueryFailure::OutputLimit),
                 Err(e)
                     if matches!(
                         e.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                     ) => {}
-                Err(e) => return Err(e),
+                Err(e) => return Err(rpm_io("read rpm stdout", rpm)(e)),
             }
         }
         if eof && diagnostics_closed {
-            if let Some(status) = child.try_wait()? {
-                return if status.success() {
-                    Ok(output)
-                } else {
-                    Err(invalid())
-                };
+            if let Some(status) = child
+                .try_wait()
+                .map_err(rpm_io("wait for rpm exit status", rpm))?
+            {
+                if !status.success() {
+                    return Err(RpmQueryFailure::Exited {
+                        status,
+                        stderr: diagnostics,
+                    });
+                }
+                // rpm can emit database errors without returning a nonzero status.
+                if !diagnostics.is_empty() {
+                    return Err(RpmQueryFailure::Stderr {
+                        status,
+                        stderr: diagnostics,
+                    });
+                }
+                return Ok(output);
             }
         }
         std::thread::sleep(budget.min(Duration::from_millis(2)));
     }
 }
 
-fn rpm_record(mut output: &[u8], candidates: &[PathBuf]) -> Result<Option<PackageFile>, Refusal> {
+#[derive(Debug)]
+enum RpmOutputFailure {
+    Malformed { offset: usize, field: &'static str },
+    MissingChecksum { path: PathBuf },
+}
+
+impl RpmOutputFailure {
+    fn refusal(self) -> Refusal {
+        match self {
+            Self::Malformed { .. } => AppIdentityUnproven,
+            Self::MissingChecksum { .. } => PackageChecksumUnavailable,
+        }
+    }
+}
+
+impl fmt::Display for RpmOutputFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Malformed { offset, field } => write!(f, "rpm exited 0 with empty stderr, but stdout has invalid {field} in the record at byte {offset}"),
+            Self::MissingChecksum { path } => write!(f, "rpm recorded {} without a file checksum", path.display()),
+        }
+    }
+}
+
+fn rpm_record(
+    mut output: &[u8],
+    candidates: &[PathBuf],
+) -> Result<Option<PackageFile>, RpmOutputFailure> {
     let mut package = None;
     let mut found = None;
+    let length = output.len();
     while !output.is_empty() {
+        let offset = length - output.len();
+        let malformed = |field| RpmOutputFailure::Malformed { offset, field };
         let path = if output.starts_with(b"'") {
-            Some(rpm_path(&mut output)?)
+            Some(rpm_path(&mut output).map_err(|_| malformed("quoted pathname"))?)
         } else {
             None
         };
-        let (line, rest) = split_byte(output, b'\n')?;
+        let (line, rest) = split_byte(output, b'\n').map_err(|_| malformed("record terminator"))?;
         output = rest;
-        let (left, right) = split_byte(line, b'\t')?;
+        let (left, right) = split_byte(line, b'\t').map_err(|_| malformed("field separator"))?;
         let Some(path) = path else {
-            let name = std::str::from_utf8(left).map_err(|_| AppIdentityUnproven)?;
+            let name = std::str::from_utf8(left).map_err(|_| malformed("package name"))?;
             if !package_name(name)
                 || (right != b"(none)"
                     && (right.is_empty() || !right.iter().all(u8::is_ascii_digit)))
             {
-                return Err(AppIdentityUnproven);
+                return Err(malformed("package name or digest algorithm"));
             }
             package = Some((name, right));
             continue;
         };
         if !left.is_empty() {
-            return Err(AppIdentityUnproven);
+            return Err(malformed("pathname separator"));
         }
-        let (name, algorithm) = package.ok_or(AppIdentityUnproven)?;
+        let (name, algorithm) = package.ok_or_else(|| malformed("missing package header"))?;
         if right != b"(none)" && !right.iter().all(u8::is_ascii_hexdigit) {
-            return Err(AppIdentityUnproven);
+            return Err(malformed("file checksum characters"));
         }
         let Some(path) = candidates
             .iter()
@@ -539,7 +812,7 @@ fn rpm_record(mut output: &[u8], candidates: &[PathBuf]) -> Result<Option<Packag
             continue;
         };
         if right.is_empty() || right == b"(none)" {
-            return Err(PackageChecksumUnavailable);
+            return Err(RpmOutputFailure::MissingChecksum { path: path.clone() });
         }
         let (algorithm, width) = match algorithm {
             b"(none)" | b"1" => (Algorithm::Md5, 32),
@@ -547,17 +820,18 @@ fn rpm_record(mut output: &[u8], candidates: &[PathBuf]) -> Result<Option<Packag
             b"9" => (Algorithm::Sha384, 96),
             b"10" => (Algorithm::Sha512, 128),
             b"11" => (Algorithm::Sha224, 56),
-            _ => return Err(AppIdentityUnproven),
+            _ => return Err(malformed("unsupported file digest algorithm")),
         };
         merge_record(
             &mut found,
             PackageFile {
                 path: path.clone(),
                 name: name.to_owned(),
-                sum: checksum(right, width)?,
+                sum: checksum(right, width).map_err(|_| malformed("file checksum width"))?,
                 algorithm,
             },
-        )?;
+        )
+        .map_err(|_| malformed("conflicting file record"))?;
     }
     Ok(found)
 }
@@ -661,7 +935,12 @@ mod tests {
             ("Example\t8\n'/bin/fi'\\''x\nture'\t", AppIdentityUnproven),
             ("broken stderr as stdout\n", AppIdentityUnproven),
         ] {
-            assert_eq!(rpm_record(output.as_bytes(), &paths).err(), Some(failure));
+            assert_eq!(
+                rpm_record(output.as_bytes(), &paths)
+                    .err()
+                    .map(RpmOutputFailure::refusal),
+                Some(failure)
+            );
         }
         assert!(rpm_record(b"Other\t8\n'/bin/other'\t\n", &paths)
             .unwrap()
@@ -711,12 +990,69 @@ mod tests {
 
     #[test]
     fn a_nonzero_rpm_exit_never_produces_an_unowned_result() {
-        let mut child = Command::new("/bin/false")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        assert!(collect_rpm(&mut child).is_err());
+        for code in [0, 7] {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", &format!("printf 'db error' >&2; exit {code}")])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            match collect_rpm(&mut child).unwrap_err() {
+                RpmQueryFailure::Exited { status, stderr } if code != 0 => {
+                    assert_eq!(status.code(), Some(code));
+                    assert_eq!(stderr, b"db error");
+                }
+                RpmQueryFailure::Stderr { status, stderr } if code == 0 => {
+                    assert!(status.success());
+                    assert_eq!(stderr, b"db error");
+                }
+                error => panic!("unexpected diagnostic: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rpm_snapshot_diagnostic_names_the_changed_file_and_fields() {
+        let key = ImageKey {
+            dev: 8,
+            ino: 42,
+            size: 0,
+            mtime: (10, 20),
+            ctime: (10, 20),
+        };
+        let name = OsString::from("rpmdb.sqlite-wal");
+        let before = vec![(name.clone(), key)];
+        let after = vec![(
+            name.clone(),
+            ImageKey {
+                size: 8192,
+                ctime: (10, 30),
+                ..key
+            },
+        )];
+        assert_eq!(
+            snapshot_change(&before, &after),
+            Some(SnapshotChange::Changed {
+                name: name.clone(),
+                fields: vec!["size", "ctime"],
+                before: key,
+                after: after[0].1
+            })
+        );
+        assert_eq!(
+            snapshot_change(&before, &[]),
+            Some(SnapshotChange::Removed {
+                name: name.clone(),
+                stamp: key
+            })
+        );
+        assert_eq!(
+            snapshot_change(&[], &after),
+            Some(SnapshotChange::Added {
+                name,
+                stamp: after[0].1
+            })
+        );
     }
 
     #[test]
@@ -760,13 +1096,16 @@ mod tests {
         checked(Command::new("mount").arg("--bind").arg(&db).arg("/mnt"));
         let _mount = crate::identity::tests::TestMount("/mnt");
         let root = open_path(Path::new("/")).unwrap();
-        let output = query_rpm(&root, Path::new("/mnt")).unwrap();
+        let output = query_rpm(&root, Path::new("/mnt")).unwrap_or_else(|cause| {
+            let files: Vec<_> = fs::read_dir(&db).unwrap().filter_map(Result::ok).map(|entry| entry.file_name()).collect();
+            panic!("querying the private RPM fixture database mounted at /mnt (uid {}): {cause}; database entries after query: {files:?}", crate::bridge::read_effective_uid());
+        });
         let record = rpm_record(
             &output,
             &candidates(Path::new("/usr/share/ck-fixture/proof")),
         )
-        .unwrap()
-        .unwrap();
+        .unwrap_or_else(|cause| panic!("reading the native fixture RPM record: {cause}"))
+        .expect("rpm exited 0 with empty stderr, but the populated fixture database did not list /usr/share/ck-fixture/proof");
         assert_eq!(record.name, "ck-fixture");
         assert_eq!(record.algorithm, Algorithm::Sha256);
         assert_eq!(

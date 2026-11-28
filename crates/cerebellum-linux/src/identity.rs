@@ -512,8 +512,11 @@ fn path_parts(path: &Path) -> VecDeque<OsString> {
 
 fn walk(root: &File, path: &Path, require_protected: bool) -> io::Result<File> {
     let root_meta = root.metadata()?;
-    if !path.is_absolute() || !root_meta.is_dir() || (require_protected && !protected(&root_meta)) {
+    if !path.is_absolute() || !root_meta.is_dir() {
         return Err(invalid());
+    }
+    if require_protected && !protected(&root_meta) {
+        return Err(unprotected_component(OsStr::new("/"), &root_meta));
     }
     let mut parents = vec![root.try_clone()?];
     let mut parts = path_parts(path);
@@ -531,15 +534,18 @@ fn walk(root: &File, path: &Path, require_protected: bool) -> io::Result<File> {
                 let leaf = open_component(parents.last().ok_or_else(invalid)?, &part)?;
                 let meta = leaf.metadata()?;
                 if meta.file_type().is_symlink() {
-                    if followed == 40 || (require_protected && meta.uid() != 0) {
+                    if followed == 40 {
                         return Err(invalid());
+                    }
+                    if require_protected && meta.uid() != 0 {
+                        return Err(unprotected_component(&part, &meta));
                     }
                     followed += 1;
                     let mut target = path_parts(&link_contents(&leaf)?);
                     target.append(&mut parts);
                     parts = target;
                 } else if require_protected && !protected(&meta) {
-                    return Err(invalid());
+                    return Err(unprotected_component(&part, &meta));
                 } else if parts.is_empty() {
                     return Ok(leaf);
                 } else if meta.is_dir() {
@@ -551,6 +557,17 @@ fn walk(root: &File, path: &Path, require_protected: bool) -> io::Result<File> {
         }
     }
     parents.pop().ok_or_else(invalid)
+}
+
+fn unprotected_component(component: &OsStr, metadata: &Metadata) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "unprotected path component {component:?} (uid {}, mode {:#o})",
+            metadata.uid(),
+            metadata.mode()
+        ),
+    )
 }
 
 type Device = (u32, u32);
