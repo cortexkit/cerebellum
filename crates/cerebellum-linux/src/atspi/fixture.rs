@@ -327,13 +327,28 @@ struct Text(Arc<Effects>);
 #[zbus::interface(name = "org.a11y.atspi.Text")]
 impl Text {
     #[zbus(property)]
-    fn caret_offset(&self) -> i32 {
+    fn character_count(&self) -> i32 {
         i32::try_from(self.0.text.lock().unwrap().chars().count()).unwrap()
+    }
+
+    #[zbus(property)]
+    fn caret_offset(&self) -> i32 {
+        self.character_count()
     }
     fn get_n_selections(&self) -> i32 {
         0
     }
-    fn get_text(&self, _start: i32, _end: i32) -> String {
-        self.0.text.lock().unwrap().clone()
+    fn get_text(&self, start: i32, end: i32) -> String {
+        // Match GtkEditable's treatment of negative offsets.
+        let start = usize::try_from(start.max(0)).unwrap();
+        let count = usize::try_from(end.max(0)).unwrap().saturating_sub(start);
+        self.0
+            .text
+            .lock()
+            .unwrap()
+            .chars()
+            .skip(start)
+            .take(count)
+            .collect()
     }
 }

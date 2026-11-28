@@ -422,7 +422,7 @@ async fn native_gtk_semantic_actions() {
     let blocked = wire(&planes, "read_state", json!({"target":"Semantic Operator"})).await;
     assert_eq!(blocked["reason"], "operator_app_blocked", "{blocked}");
     let target = "Semantic Target";
-    tokio::time::timeout(
+    let (bus, field) = tokio::time::timeout(
         Duration::from_secs(2),
         print_gtk_state_words(&selected, target),
     )
@@ -463,7 +463,9 @@ async fn native_gtk_semantic_actions() {
     .await;
     assert_eq!(refused["reason"], "secure_field_focused", "{refused}");
     let text = "owned GTK field 🦀";
+    print_gtk_field(&bus, &field, &target_file, "Before write").await;
     let write = wire(&planes, "write_text", json!({"element_id":element(&read, "Fixture Message"),"text":text,"write_mode":"replace_value"})).await;
+    print_gtk_field(&bus, &field, &target_file, "After write").await;
     assert_eq!(write["effect_status"], "effect_observed", "{write}");
     assert_eq!(
         std::fs::read_to_string(&target_file).unwrap(),
@@ -485,7 +487,16 @@ async fn native_gtk_semantic_actions() {
     assert_focus_unchanged();
 }
 
-async fn print_gtk_state_words(selected: &AccessibilityBus, target: &str) {
+async fn print_gtk_field(bus: &atspi::Bus, field: &atspi::Object, fixture_file: &str, phase: &str) {
+    let readback = tokio::time::timeout(Duration::from_secs(2), bus.text(field)).await;
+    let gtk_value = std::fs::read_to_string(fixture_file).unwrap();
+    println!("{phase}: AT-SPI text {readback:?}; GTK fixture record {gtk_value:?}");
+}
+
+async fn print_gtk_state_words(
+    selected: &AccessibilityBus,
+    target: &str,
+) -> (atspi::Bus, atspi::Object) {
     let bus = atspi::Bus::connect(selected).await.unwrap();
     let mut root = None;
     for app in bus.applications().await.unwrap() {
@@ -496,6 +507,7 @@ async fn print_gtk_state_words(selected: &AccessibilityBus, target: &str) {
     }
     let mut pending = vec![root.expect("GTK target on the accessibility bus")];
     let mut seen = std::collections::HashSet::new();
+    let mut field = None;
     while let Some(object) = pending.pop() {
         if !seen.insert(object.clone()) {
             continue;
@@ -505,6 +517,12 @@ async fn print_gtk_state_words(selected: &AccessibilityBus, target: &str) {
         let role = bus.role(&object).await.unwrap();
         let words = bus.state(&object).await.unwrap();
         println!("GTK GetState {name:?} ({role:?}): {words:#010x?}");
+        if name == "Fixture Message" {
+            assert!(
+                field.replace(object.clone()).is_none(),
+                "duplicate fixture field"
+            );
+        }
         pending.extend(
             bus.children(&object)
                 .await
@@ -514,4 +532,5 @@ async fn print_gtk_state_words(selected: &AccessibilityBus, target: &str) {
                 .filter(|child| child.peer == object.peer),
         );
     }
+    (bus, field.expect("ordinary GTK fixture entry"))
 }

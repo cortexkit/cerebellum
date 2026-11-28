@@ -278,7 +278,18 @@ impl Bus {
     }
 
     pub async fn text(&self, object: &Object) -> Result<String, Error> {
-        self.object(object, TEXT, "GetText", &(0_i32, -1_i32)).await
+        // GTK's editable-text reader clamps a negative end offset to zero.
+        // Ask for the actual character range on the same accessible object.
+        let end: i32 = self.property(object, TEXT, "CharacterCount").await?;
+        let length = usize::try_from(end).map_err(|_| Error::Unreadable)?;
+        let text: String = self.object(object, TEXT, "GetText", &(0_i32, end)).await?;
+        let current_end: i32 = self.property(object, TEXT, "CharacterCount").await?;
+        if current_end != end || text.chars().count() != length {
+            // A field that grew during the read might have returned only the
+            // old prefix. Do not use a partial string to confirm a write.
+            return Err(Error::Unreadable);
+        }
+        Ok(text)
     }
 
     pub async fn selection(&self, object: &Object) -> Result<(i32, i32), Error> {
