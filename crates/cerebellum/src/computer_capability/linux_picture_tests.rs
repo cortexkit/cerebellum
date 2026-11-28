@@ -75,7 +75,7 @@ fn decoded_pixel_frame(
         ))
     );
     let jpeg = cerebellum_core::serde_base64::decode(image["data_b64"].as_str().unwrap()).unwrap();
-    let mut decoder = Command::new("timeout")
+    let mut decoder = Command::new("/usr/bin/timeout")
         .args(["5s", &std::env::var("CK_X11_DECODE_PICTURE").unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
