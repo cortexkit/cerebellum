@@ -27,6 +27,12 @@ fn a_retained_handle_observes_exit_without_reopening_the_pid() {
     let cmd = cerebellum_windows::windows_system_directory()
         .unwrap()
         .join("cmd.exe");
+    // A throwaway System32 cmd.exe, not a browser: the test needs a real
+    // child to watch exit through a retained handle.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "spawns System32 cmd.exe as a plain child process, never a browser"
+    )]
     let mut child = Command::new(cmd)
         .args(["/d", "/q", "/k"])
         .stdin(Stdio::piped())

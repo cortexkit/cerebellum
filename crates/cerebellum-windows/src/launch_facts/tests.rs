@@ -27,6 +27,12 @@ fn shortcut_com_reads_target_and_unexpanded_arguments() {
     let powershell = crate::windows_system_directory()
         .unwrap()
         .join("WindowsPowerShell/v1.0/powershell.exe");
+    // System PowerShell only writes a scratch shortcut file; it never starts a
+    // browser.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "runs System32 PowerShell to create a scratch shortcut, never a browser"
+    )]
     let status = std::process::Command::new(powershell)
         .args(["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference = 'Stop'; $sh = New-Object -ComObject WScript.Shell; $link = $sh.CreateShortcut($env:CEREB_TEST_LINK); $link.TargetPath = $env:CEREB_TEST_IMAGE; $link.Arguments = 'fixture argument'; $link.Save()"])
         .env("CEREB_TEST_LINK", &link).env("CEREB_TEST_IMAGE", &target)
