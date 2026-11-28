@@ -37,10 +37,18 @@ pub enum ImageUnavailable {
     FrontingUnavailable,
     /// The previous frontmost application could not be restored.
     RestoreFailed,
+    #[cfg(target_os = "linux")]
+    PictureUnattributable,
+    #[cfg(target_os = "linux")]
+    RouteNotReviewed,
+    #[cfg(target_os = "linux")]
+    BackendUnavailable,
+    #[cfg(target_os = "linux")]
+    WindowNotMapped,
 }
 
 impl ImageUnavailable {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 15 + 4 * cfg!(target_os = "linux") as usize] = [
         Self::ScreenRecordingNotLive,
         Self::NoWindowCaptured,
         Self::CaptureUnavailable,
@@ -56,6 +64,14 @@ impl ImageUnavailable {
         Self::FrontingBoundExceeded,
         Self::FrontingUnavailable,
         Self::RestoreFailed,
+        #[cfg(target_os = "linux")]
+        Self::PictureUnattributable,
+        #[cfg(target_os = "linux")]
+        Self::RouteNotReviewed,
+        #[cfg(target_os = "linux")]
+        Self::BackendUnavailable,
+        #[cfg(target_os = "linux")]
+        Self::WindowNotMapped,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -75,6 +91,14 @@ impl ImageUnavailable {
             Self::FrontingBoundExceeded => "fronting_bound_exceeded",
             Self::FrontingUnavailable => "fronting_unavailable",
             Self::RestoreFailed => "restore_failed",
+            #[cfg(target_os = "linux")]
+            Self::PictureUnattributable => "picture_unattributable",
+            #[cfg(target_os = "linux")]
+            Self::RouteNotReviewed => "route_not_reviewed",
+            #[cfg(target_os = "linux")]
+            Self::BackendUnavailable => "backend_unavailable",
+            #[cfg(target_os = "linux")]
+            Self::WindowNotMapped => "window_not_mapped",
         }
     }
 }

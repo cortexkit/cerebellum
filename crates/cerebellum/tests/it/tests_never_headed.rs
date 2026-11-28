@@ -10,6 +10,14 @@ const BRIDGE_PROCESS_TEST: &str = "cerebellum/src/user_browser_bridge/linux/test
 const WINDOWS_LAUNCH_TEST: &str =
     "cerebellum/src/computer_capability/windows_app_state_tests/launch.rs";
 const LINUX_DESKTOP_LAUNCH_TEST: &str = "cerebellum/src/computer_capability/linux_launch_tests.rs";
+const LINUX_X11_PICTURE_TEST: &str = "cerebellum/src/computer_capability/linux_picture_tests.rs";
+const X11_DECODER_SPAWN: &str = r#"
+    Command::new("/usr/bin/timeout")
+        .args(["5s", &std::env::var("CK_X11_DECODE_PICTURE").unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn().unwrap()
+"#;
 
 fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(directory).expect("read browser test sources") {
@@ -493,12 +501,18 @@ fn violations(path: &str, source: &str) -> Vec<String> {
                         "/usr/bin/cc" | "/usr/bin/md5sum" | "/usr/bin/mount" | "/usr/bin/umount"
                     )
             });
+        // The private picture runner compiles decode-picture.c and supplies its
+        // path. Approve only that bounded stdin-to-stdout decoder invocation,
+        // not timeout itself or any other command it could wrap.
+        let x11_decoder = path == LINUX_X11_PICTURE_TEST
+            && token_positions(&tokens, X11_DECODER_SPAWN).eq([index]);
         if !fixed_cli
             && !self_reexec
             && !relocated_fixture
             && !bridge_fixture
             && !windows_fixture
             && !desktop_fixture
+            && !x11_decoder
         {
             found.push(format!(
                 "{}: Command executable must use a reviewed fixture or test_browser",
@@ -507,6 +521,25 @@ fn violations(path: &str, source: &str) -> Vec<String> {
         }
     }
     found
+}
+
+#[test]
+fn x11_decoder_fixture_approval_covers_only_the_bounded_decoder() {
+    assert!(violations(LINUX_X11_PICTURE_TEST, X11_DECODER_SPAWN).is_empty());
+    assert_eq!(
+        violations("cerebellum/tests/other.rs", X11_DECODER_SPAWN).len(),
+        1
+    );
+    let browser = X11_DECODER_SPAWN.replace(
+        r#"&std::env::var("CK_X11_DECODE_PICTURE").unwrap()"#,
+        r#""chromium""#,
+    );
+    assert_eq!(violations(LINUX_X11_PICTURE_TEST, &browser).len(), 1);
+    let appended_argument = X11_DECODER_SPAWN.replace(".spawn()", r#".arg("--headless").spawn()"#);
+    assert_eq!(
+        violations(LINUX_X11_PICTURE_TEST, &appended_argument).len(),
+        1
+    );
 }
 
 #[test]

@@ -40,6 +40,24 @@ fn rig(
     accessibility: AccessibilityBus,
     native_proof: bool,
 ) -> (crate::Planes, SessionControl) {
+    rig_with(
+        kind,
+        accessibility,
+        native_proof,
+        Environment::new(),
+        false,
+        |_| {},
+    )
+}
+
+fn rig_with(
+    kind: SessionKind,
+    accessibility: AccessibilityBus,
+    native_proof: bool,
+    environment: Environment,
+    fronting_reviewed: bool,
+    configure: impl FnOnce(&mut LinuxSession),
+) -> (crate::Planes, SessionControl) {
     let admitted = Arc::new(
         [
             "list_apps",
@@ -57,7 +75,7 @@ fn rig(
         id: "semantic-fixture".into(),
         kind,
         locked: false,
-        environment: Default::default(),
+        environment,
         accessibility: Some(accessibility),
     })));
     let reading = desktop.clone();
@@ -77,6 +95,7 @@ fn rig(
     } else {
         session.proof_for_test = Some(fixture_proof);
     }
+    configure(&mut session);
     let session = Arc::new(session);
     let driver_session = session.clone();
     let plane = ComputerPlane::with_synthetic_driver_and_result_schema_enforcement(
@@ -84,7 +103,9 @@ fn rig(
         ResultSchemaEnforcement::Withhold,
         move || driver_session.driver(),
     )
-    .with_app_state_source(Arc::new(Source(session.clone())));
+    .with_app_state_source(Arc::new(Source(session.clone())))
+    .with_fronting_bracket_admitted(fronting_reviewed)
+    .with_app_use_fronting_admitted(fronting_reviewed);
     let mut planes = crate::Planes::with_browser_config_journaling(
         Arc::default(),
         None,
@@ -101,6 +122,9 @@ fn rig(
         desktop,
     )
 }
+
+#[path = "linux_picture_tests.rs"]
+mod picture_tests;
 
 async fn wire(planes: &crate::Planes, action: &str, args: Value) -> Value {
     wire_observing_consent(planes, action, args, || {

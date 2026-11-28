@@ -525,6 +525,8 @@ pub enum BackendError {
     ScreenLocked,
     UnsupportedOnPlatform,
     Teardown(String),
+    #[cfg(target_os = "linux")]
+    LinuxImage(crate::app_state::image::ImageUnavailable),
 }
 
 impl fmt::Display for BackendError {
@@ -536,6 +538,8 @@ impl fmt::Display for BackendError {
             | Self::Teardown(reason) => f.write_str(reason),
             Self::ScreenLocked => f.write_str("screen is locked"),
             Self::UnsupportedOnPlatform => f.write_str("unsupported on this platform"),
+            #[cfg(target_os = "linux")]
+            Self::LinuxImage(reason) => f.write_str(reason.as_str()),
         }
     }
 }
@@ -546,6 +550,8 @@ impl From<BackendError> for CaptureError {
         match error {
             BackendError::ScreenLocked => Self::ScreenIsLocked,
             BackendError::UnsupportedOnPlatform => Self::UnsupportedOnPlatform,
+            #[cfg(target_os = "linux")]
+            BackendError::LinuxImage(reason) => Self::Backend(reason.as_str().into()),
             BackendError::Permission(reason)
             | BackendError::Enumeration(reason)
             | BackendError::Capture(reason)

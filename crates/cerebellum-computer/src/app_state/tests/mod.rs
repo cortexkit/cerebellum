@@ -1261,6 +1261,14 @@ fn every_image_unavailable_reason_is_reachable() {
         ImageUnavailable::FrontingBoundExceeded,
         ImageUnavailable::FrontingUnavailable,
         ImageUnavailable::RestoreFailed,
+        #[cfg(target_os = "linux")]
+        ImageUnavailable::PictureUnattributable,
+        #[cfg(target_os = "linux")]
+        ImageUnavailable::RouteNotReviewed,
+        #[cfg(target_os = "linux")]
+        ImageUnavailable::BackendUnavailable,
+        #[cfg(target_os = "linux")]
+        ImageUnavailable::WindowNotMapped,
     ] {
         assert_eq!(run(&mut ScriptedCustody::default(), Err(reason)), reason);
     }

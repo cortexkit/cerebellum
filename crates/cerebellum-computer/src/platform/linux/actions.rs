@@ -82,6 +82,10 @@ impl Source {
 }
 
 impl AppStateSource for Source {
+    fn frontmost_pid(&self) -> Option<u32> {
+        self.0.frontmost_pid()
+    }
+
     fn semantic_action_floor(
         &self,
         element: &ElementHandle,

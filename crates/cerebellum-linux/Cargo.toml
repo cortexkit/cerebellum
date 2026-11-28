@@ -9,6 +9,7 @@ description = "Linux process readings, ptrace launch barrier and read-only EDS D
 [features]
 desk-probe = []
 atspi-test-support = ["zbus/service"]
+x11-test-support = []
 
 [lib]
 name = "cerebellum_linux"
@@ -20,6 +21,8 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 sha2 = { workspace = true }
 md-5 = "=0.10.6"
+jpeg-encoder = "=0.6.1"
+x11rb = { version = "=0.13.2", default-features = false, features = ["composite", "damage", "res", "shape"] }
 serde = { workspace = true }
 # Pure Rust/MIT: no libdbus, GLib or EDS link-time dependency.
 zbus = { version = "=6.3.0", default-features = false, features = ["proxy", "tokio"] }

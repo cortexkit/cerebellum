@@ -27,6 +27,8 @@ pub use identity::desktop_entry;
 mod launch;
 #[cfg(target_os = "linux")]
 pub mod session;
+#[cfg(target_os = "linux")]
+pub mod x11;
 // Parsing procfs stays compiled under tests off Linux so the field-boundary
 // checks remain exercised where launching a Linux tracee is impossible.
 #[cfg(any(target_os = "linux", test))]

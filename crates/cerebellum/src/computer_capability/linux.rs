@@ -2,20 +2,23 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use cerebellum_computer::app_state::image::ImageUnavailable;
 use cerebellum_computer::app_state::source::{AppStateSource, ElementActionError, ElementHandle};
 use cerebellum_computer::audit::ComputerCapability;
 use cerebellum_computer::capture::*;
-use cerebellum_computer::platform::linux::{self as semantic, Source};
+use cerebellum_computer::platform::linux::{self as semantic, picture, Source};
 use cerebellum_computer::platform::*;
 use cerebellum_linux::atspi;
 use cerebellum_linux::desktop_entry::{self, LaunchRefusal};
 use cerebellum_linux::identity::{IdentityReader, Refusal as IdentityRefusal, VerifiedApp};
 use cerebellum_linux::session::{self, AccessibilityBus, DesktopSession, Environment, SessionKind};
+use cerebellum_linux::x11;
 use cerebellum_linux::{place_desktop_scope, DesktopExit, ProcessGeneration};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -63,6 +66,8 @@ pub(crate) fn plane(
         return Err(ComputerPlaneUnavailable::NoLinuxReviews);
     }
     let mut session = LinuxSession::new(reviews.bound(LinuxReleaseInputs::SEMANTIC), admitted);
+    session.connect_x11 = true;
+    session.capture_reviewed = reviews.bound(LinuxReleaseInputs::CAPTURE);
     if reviews.bound(LinuxReleaseInputs::IDENTITY) {
         session.identity = Some(Arc::default());
     }
@@ -79,10 +84,7 @@ pub(crate) fn plane(
     let plane = ComputerPlane::with_synthetic_driver_and_result_schema_enforcement(
         audit,
         ResultSchemaEnforcement::Withhold,
-        move || LinuxDriver {
-            session: Arc::clone(&driver_session),
-            resolved: None,
-        },
+        move || driver_session.driver(),
     )
     .with_app_state_source(Arc::new(Source(session.clone())))
     .with_fronting_bracket_admitted(app_use_fronting)
@@ -107,6 +109,23 @@ type ScopePlacer = dyn Fn(ProcessGeneration) -> Pin<Box<dyn Future<Output = Resu
     + Send
     + Sync;
 
+#[cfg(test)]
+type TestReadBracket = dyn Fn(
+        &ProcessGrant,
+        u64,
+        &mut dyn FrontedDispatchHooks,
+        &mut dyn FnMut(),
+    ) -> cerebellum_computer::dispatch::BracketReport
+    + Send
+    + Sync;
+
+#[cfg(test)]
+pub(super) struct PictureFrontTest {
+    pub observer: InputObserverLiveness,
+    pub bracket: Box<TestReadBracket>,
+    pub before_encode: Box<dyn Fn() + Send + Sync>,
+}
+
 struct SessionReading {
     desktop: DesktopSession,
     // A connection generation, not a DISPLAY string: a replacement X server
@@ -128,15 +147,110 @@ struct Epoch {
     key: EpochKey,
     permissions: PermissionLivenessReport,
     bus: Option<atspi::Bus>,
+    x11: Option<Arc<X11Epoch>>,
 }
 
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+static NEXT_X11_CONNECTION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(PartialEq, Eq)]
+struct X11Endpoint {
+    session: String,
+    display: String,
+    authority: Option<PathBuf>,
+}
+
+impl X11Endpoint {
+    fn read(session: &DesktopSession) -> Option<Self> {
+        let environment = &session.environment;
+        Some(Self {
+            session: session.id.clone(),
+            display: environment.get("DISPLAY")?.clone(),
+            authority: environment
+                .get("XAUTHORITY")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    environment
+                        .get("HOME")
+                        .map(|home| PathBuf::from(home).join(".Xauthority"))
+                }),
+        })
+    }
+}
+
+struct X11Epoch {
+    endpoint: X11Endpoint,
+    connection_id: u64,
+    desktop: Arc<picture::Desktop>,
+    active_pid: AtomicU32,
+}
+
+impl X11Epoch {
+    fn refresh(
+        endpoint: X11Endpoint,
+        previous: Option<Arc<Self>>,
+    ) -> Result<Arc<Self>, x11::Error> {
+        let current = if let Some(previous) = previous.filter(|x| x.endpoint == endpoint) {
+            previous.desktop.connection.check()?;
+            previous
+        } else {
+            let connection =
+                x11::Connection::open(&endpoint.display, endpoint.authority.as_deref())?;
+            Arc::new(Self {
+                endpoint,
+                connection_id: NEXT_X11_CONNECTION.fetch_add(1, AtomicOrdering::Relaxed),
+                desktop: Arc::new(picture::Desktop::new(connection)),
+                active_pid: AtomicU32::new(0),
+            })
+        };
+        current.active_pid.store(
+            current.desktop.active_pid().unwrap_or(0),
+            AtomicOrdering::Relaxed,
+        );
+        Ok(current)
+    }
+}
+
+fn x11_permissions(
+    base: &PermissionLivenessReport,
+    connection: &x11::Connection,
+) -> PermissionLivenessReport {
+    let x11::Facilities {
+        composite, damage, ..
+    } = connection.facilities();
+    PermissionLivenessReport::from_results(
+        [
+            PermissionService::Accessibility,
+            PermissionService::ScreenRecording,
+            PermissionService::PostEvent,
+            PermissionService::InputMonitoring,
+            PermissionService::RawHidObservation,
+        ]
+        .into_iter()
+        .map(|service| PermissionProbeResult {
+            service,
+            liveness: if service != PermissionService::ScreenRecording {
+                base.state(service)
+            } else if composite && damage {
+                PermissionLiveness::Live
+            } else {
+                PermissionLiveness::Unavailable
+            },
+            responsible_process: "ck-cerebellum".into(),
+            off_main: true,
+        }),
+    )
+}
 
 pub(super) struct LinuxSession {
     read: Box<SessionReader>,
     epoch: Mutex<Option<(Arc<Epoch>, bool)>>,
     admitted: Arc<BTreeSet<String>>,
     identity: Option<Arc<IdentityReader>>,
+    connect_x11: bool,
+    capture_reviewed: bool,
+    #[cfg(test)]
+    pub(super) picture_front_for_test: Option<Arc<PictureFrontTest>>,
     #[cfg(test)]
     proof_for_test: Option<fn(u32) -> Result<VerifiedApp, IdentityRefusal>>,
     #[cfg(test)]
@@ -185,9 +299,22 @@ impl LinuxSession {
             }
             if !verified.is_empty() { return Err(semantic_read_refusal("accessibility_tree_unavailable")); }
             if epoch.key.kind == SessionKind::X11 {
-                // Without the X Resource extension's client PID, a missing
-                // peer might be a running app with no accessibility tree.
-                return Err(semantic_read_refusal("backend_unavailable"));
+                let desktop = epoch.x11.as_ref().ok_or_else(|| semantic_read_refusal("backend_unavailable"))?;
+                let pids = desktop.desktop.window_owner_pids()
+                    .map_err(|_| semantic_read_refusal("backend_unavailable"))?;
+                for pid in pids {
+                    if let Ok(app) = source.0.prove(pid) {
+                        let matches = if qualified {
+                            app.subject == target
+                        } else {
+                            app.path.file_name().and_then(|name| name.to_str()).is_some_and(|name|
+                                name.eq_ignore_ascii_case(&target) || super::target_resolution::names_in_part(name, &target))
+                        };
+                        if matches {
+                            return Err(semantic_read_refusal("accessibility_tree_unavailable"));
+                        }
+                    }
+                }
             }
             Err(json!({"outcome": "not_running", "bundle_identity": target,
                 "remedy": "start the application, then retry"}))
@@ -230,10 +357,7 @@ impl LinuxSession {
                     .map_err(|reason| AppRefusal::Resolution(semantic_read_refusal(reason)))?
             }
         };
-        let driver = LinuxDriver {
-            session: self.clone(),
-            resolved: None,
-        };
+        let driver = self.driver();
         let need = GrantNeed::App {
             bundle_identity: grant.bundle_identity.clone(),
             display_name,
@@ -265,7 +389,35 @@ impl LinuxSession {
         LinuxDriver {
             session: self.clone(),
             resolved: None,
+            #[cfg(test)]
+            picture_hooks: None,
         }
+    }
+
+    pub(super) async fn picture_backend(self: &Arc<Self>) -> picture::Backend {
+        let desktop = match self.refresh().await {
+            Ok((epoch, false)) => match (epoch.key.kind, self.capture_reviewed, &epoch.x11) {
+                (SessionKind::Wayland, _, _) => Err(ImageUnavailable::PictureUnattributable),
+                (SessionKind::X11, false, _) => Err(ImageUnavailable::RouteNotReviewed),
+                (SessionKind::X11, true, Some(x)) => {
+                    let facilities = x.desktop.connection.facilities();
+                    if !facilities.composite || !facilities.damage || !facilities.resource {
+                        Err(ImageUnavailable::BackendUnavailable)
+                    } else if epoch.permissions.state(PermissionService::ScreenRecording)
+                        != PermissionLiveness::Live
+                    {
+                        Err(ImageUnavailable::ScreenRecordingNotLive)
+                    } else {
+                        Ok(x.desktop.clone())
+                    }
+                }
+                (SessionKind::X11, true, None) => Err(ImageUnavailable::BackendUnavailable),
+            },
+            Ok((_, true)) => Err(ImageUnavailable::PictureUnattributable),
+            Err(_) => Err(ImageUnavailable::BackendUnavailable),
+        };
+        let source = Source(self.clone());
+        picture::Backend::new(desktop, move |grant| source.verify(grant))
     }
 
     fn new(require_accessibility: bool, admitted: Arc<BTreeSet<String>>) -> Self {
@@ -293,6 +445,10 @@ impl LinuxSession {
             epoch: Mutex::new(None),
             admitted,
             identity: None,
+            connect_x11: false,
+            capture_reviewed: false,
+            #[cfg(test)]
+            picture_front_for_test: None,
             #[cfg(test)]
             proof_for_test: None,
             #[cfg(test)]
@@ -313,12 +469,37 @@ impl LinuxSession {
         let mut latch = timeout_at(deadline, self.epoch.lock())
             .await
             .map_err(|_| LinuxRefusal::NoSupportedSession)?;
-        let reading = match timeout_at(deadline, (self.read)()).await {
+        let mut reading = match timeout_at(deadline, (self.read)()).await {
             Ok(Ok(reading)) => reading,
             Ok(Err(_)) | Err(_) => {
                 *latch = None;
                 return Err(LinuxRefusal::NoSupportedSession);
             }
+        };
+        let x11 = if self.connect_x11 && reading.desktop.kind == SessionKind::X11 {
+            let Some(endpoint) = X11Endpoint::read(&reading.desktop) else {
+                *latch = None;
+                return Err(LinuxRefusal::NoSupportedSession);
+            };
+            let previous = latch
+                .as_ref()
+                .filter(|(epoch, _)| epoch.key.accessibility == reading.desktop.accessibility)
+                .and_then(|(epoch, _)| epoch.x11.clone());
+            let probe = tokio::task::spawn_blocking(move || X11Epoch::refresh(endpoint, previous));
+            match timeout_at(deadline, probe).await {
+                Ok(Ok(Ok(x11))) => {
+                    reading.x11_connection = Some(x11.connection_id);
+                    reading.permissions =
+                        x11_permissions(&reading.permissions, &x11.desktop.connection);
+                    Some(x11)
+                }
+                _ => {
+                    *latch = None;
+                    return Err(LinuxRefusal::NoSupportedSession);
+                }
+            }
+        } else {
+            None
         };
         let key = EpochKey {
             session: reading.desktop.id,
@@ -362,6 +543,7 @@ impl LinuxSession {
                     key,
                     permissions: reading.permissions,
                     bus,
+                    x11,
                 })
             });
         *latch = Some((epoch.clone(), reading.desktop.locked));
@@ -712,6 +894,13 @@ enum LinuxRefusal {
 }
 
 impl semantic::Session for LinuxSession {
+    fn frontmost_pid(&self) -> Option<u32> {
+        let latch = self.epoch.try_lock().ok()?;
+        let (epoch, locked) = latch.as_ref()?;
+        let pid = epoch.x11.as_ref()?.active_pid.load(AtomicOrdering::Relaxed);
+        (!locked && pid != 0).then_some(pid)
+    }
+
     fn current(&self) -> Result<semantic::Live, &'static str> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| "no_supported_session")?;
         let (epoch, locked) = runtime
@@ -798,6 +987,8 @@ impl LinuxRefusal {
 pub struct LinuxDriver {
     session: Arc<LinuxSession>,
     resolved: Option<(ElementResolutionResult, ElementHandle)>,
+    #[cfg(test)]
+    picture_hooks: Option<Box<dyn FrontedDispatchHooks>>,
 }
 
 impl LinuxDriver {
@@ -864,11 +1055,44 @@ impl PlatformDriver for LinuxDriver {
     }
 
     fn input_observer_liveness(&self) -> InputObserverLiveness {
+        #[cfg(test)]
+        if let Some(test) = &self.session.picture_front_for_test {
+            return test.observer.clone();
+        }
         InputObserverLiveness {
             session_tap_live: false,
             raw_hid_live: false,
             self_echo_filter_live: false,
         }
+    }
+
+    #[cfg(test)]
+    fn accept_fronted_dispatch_hooks(&mut self, hooks: Box<dyn FrontedDispatchHooks>) -> bool {
+        if self.session.picture_front_for_test.is_some() {
+            self.picture_hooks = Some(hooks);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn read_fronted(
+        &mut self,
+        target: &ProcessGrant,
+        maximum_interval_ms: u64,
+        _cancelled: &dyn Fn() -> bool,
+        read: &mut dyn FnMut(),
+    ) -> Result<cerebellum_computer::dispatch::BracketReport, DriverError> {
+        let mut hooks = self
+            .picture_hooks
+            .take()
+            .ok_or(DriverError::Unsupported("recording Linux picture hooks"))?;
+        self.session
+            .picture_front_for_test
+            .as_ref()
+            .map(|test| (test.bracket)(target, maximum_interval_ms, hooks.as_mut(), read))
+            .ok_or(DriverError::Unsupported("recording Linux picture bracket"))
     }
 
     fn verify_attendance(
@@ -1002,10 +1226,7 @@ mod tests {
             crate::management::PlatformResolver::HAS_APP_IDENTITY_READER,
             bound
         );
-        let driver = LinuxDriver {
-            session: Arc::new(LinuxSession::new(false, Arc::default())),
-            resolved: None,
-        };
+        let driver = Arc::new(LinuxSession::new(false, Arc::default())).driver();
         let placeholder = ProcessGrant {
             pid: 0,
             bundle_identity: "dpkg:fixture".into(),

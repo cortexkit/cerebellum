@@ -163,6 +163,18 @@ jobs:
           timeout 90s sudo -n apt-get install -qy --no-install-recommends at-spi2-core dbus-daemon libgtk-4-dev openbox weston x11-utils xvfb
           bash crates/cerebellum-computer/src/platform/linux/fixtures/run-semantic.sh
 
+      - name: Native X11 window pictures
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          if [[ ${GITHUB_ACTIONS:-} != true || ${RUNNER_ENVIRONMENT:-} != github-hosted ]]; then
+            echo 'Skipping X11 pictures outside GitHub-hosted Ubuntu.'
+            exit 0
+          fi
+          timeout 90s sudo -n apt-get install -qy --no-install-recommends xvfb xauth libjpeg-dev
+          bash crates/cerebellum-computer/src/platform/linux/fixtures/run-picture.sh
+
   test-windows:
     name: Test (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
