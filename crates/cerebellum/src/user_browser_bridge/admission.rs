@@ -2,12 +2,14 @@ use super::session::{read_frame, refuse, serve_session};
 use super::{Reason, UserBrowserBridge, HOST_HELLO_DEADLINE};
 #[cfg(target_os = "linux")]
 use cerebellum_bridge_protocol::linux;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(windows)]
+use cerebellum_bridge_protocol::windows;
+#[cfg(any(target_os = "macos", all(unix, test)))]
 use cerebellum_bridge_protocol::ParentAttestation;
 use cerebellum_bridge_protocol::{
     Frame, HostParentAttestation, EXTENSION_ORIGIN, PROTOCOL_VERSION,
 };
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 use std::os::fd::OwnedFd;
 #[cfg(test)]
 use std::sync::Arc;
@@ -18,7 +20,9 @@ pub(super) enum PeerIdentity {
     MacOs(OwnedFd),
     #[cfg(target_os = "linux")]
     Linux(linux::PeerIdentity),
-    #[cfg(test)]
+    #[cfg(windows)]
+    Windows(windows::PeerIdentity),
+    #[cfg(all(unix, test))]
     Test,
 }
 
@@ -27,8 +31,13 @@ pub(super) enum PeerEvidence {
     MacOs,
     #[cfg(target_os = "linux")]
     Linux(linux::VerifiedHost),
+    #[cfg(windows)]
+    Windows(windows::VerifiedHost),
     #[cfg(test)]
-    Test { _retained: Option<OwnedFd> },
+    Test {
+        #[cfg(unix)]
+        _retained: Option<OwnedFd>,
+    },
 }
 
 #[cfg(test)]
@@ -45,6 +54,11 @@ pub(super) enum Admission {
     #[cfg(target_os = "linux")]
     Linux {
         key: linux::VerifyingKey,
+        workers: blocking::VerificationWorkers,
+    },
+    #[cfg(windows)]
+    Windows {
+        key: windows::VerifyingKey,
         workers: blocking::VerificationWorkers,
     },
     #[cfg(test)]
@@ -113,6 +127,14 @@ impl Admission {
         }
     }
 
+    #[cfg(windows)]
+    pub(super) fn windows(key: windows::VerifyingKey) -> Self {
+        Self::Windows {
+            key,
+            workers: blocking::VerificationWorkers::new(),
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn injected(verify_peer: VerifyPeer, check_parent: CheckParent) -> Self {
         Self::Injected {
@@ -142,6 +164,16 @@ impl Admission {
                 workers
                     .run(Reason::UnsignedPeer, move || {
                         super::linux::verify_host(identity, &key).map(PeerEvidence::Linux)
+                    })
+                    .await
+            }
+            #[cfg(windows)]
+            Self::Windows { key, workers } => {
+                let PeerIdentity::Windows(identity) = identity;
+                let key = *key;
+                workers
+                    .run(Reason::UnsignedPeer, move || {
+                        super::windows::verify_host(identity, &key).map(PeerEvidence::Windows)
                     })
                     .await
             }
@@ -183,6 +215,22 @@ impl Admission {
                     })
                     .await
             }
+            #[cfg(windows)]
+            Self::Windows { key, workers } => {
+                #[cfg(not(test))]
+                let PeerEvidence::Windows(evidence) = evidence;
+                #[cfg(test)]
+                let PeerEvidence::Windows(evidence) = evidence
+                else {
+                    return Err(Reason::ParentAttestationInvalid.into());
+                };
+                let key = *key;
+                workers
+                    .run(Reason::ParentAttestationInvalid, move || {
+                        super::windows::check_parent(evidence, &parent, &key)
+                    })
+                    .await
+            }
             #[cfg(test)]
             Self::Injected {
                 check_parent,
@@ -218,7 +266,7 @@ fn verify_signed_host(identity: PeerIdentity) -> Result<PeerEvidence, Reason> {
     .map_err(|_| Reason::UnsignedPeer)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 pub(super) fn check_legacy_parent(
     _evidence: PeerEvidence,
     parent: HostParentAttestation,
@@ -230,7 +278,7 @@ pub(super) fn check_legacy_parent(
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 fn valid_parent(parent: &ParentAttestation) -> bool {
     if parent.pid == 0 || parent.start_time_micros == 0 {
         return false;
@@ -243,7 +291,7 @@ fn valid_parent(parent: &ParentAttestation) -> bool {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", windows, test))]
 mod blocking;
 
 #[cfg(test)]

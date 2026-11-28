@@ -2143,7 +2143,7 @@ fn prepare_module(
     prepare: impl FnOnce(&mut Planes),
     enable_user_bridge: bool,
 ) -> module_runtime::Prepared {
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     let _ = enable_user_bridge;
     let mut health_config = config.health;
     health_config.in_flight_age_stale_ms = budgets::IN_FLIGHT_AGE_STALE_MS;
@@ -2199,7 +2199,7 @@ fn prepare_module(
     // Test entry points never bind the operator's runtime socket. Failure to
     // bind the extension listener leaves the Chrome extension disconnected;
     // the daemon-owned browser and browser_use advertisement are unaffected.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     let user_browser_listener = if enable_user_bridge {
         user_browser_bridge::BridgeListener::bind(planes.user_browser.clone()).ok()
     } else {
@@ -2276,7 +2276,7 @@ fn prepare_module(
     module_runtime::Prepared {
         planes,
         teardown,
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         _user_browser_listener: user_browser_listener,
     }
 }

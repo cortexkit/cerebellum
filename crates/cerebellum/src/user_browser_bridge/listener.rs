@@ -8,7 +8,9 @@ use std::io;
 pub struct BridgeListener {
     #[cfg(any(target_os = "macos", target_os = "linux", all(unix, test)))]
     pub(super) _socket: super::socket::SocketListener,
-    #[cfg(not(any(target_os = "macos", target_os = "linux", all(unix, test))))]
+    #[cfg(windows)]
+    _pipe: super::windows::PipeListener,
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows, all(unix, test))))]
     _unavailable: std::convert::Infallible,
 }
 
@@ -30,53 +32,8 @@ impl BridgeListener {
     }
 
     #[cfg(windows)]
-    pub fn bind(_bridge: UserBrowserBridge) -> io::Result<Self> {
-        use cerebellum_bridge_protocol::classify_bridge_gate;
-
-        const REVISION: Option<&str> =
-            option_env!("CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION");
-        let Some(_key) =
-            classify_bridge_gate(REVISION, option_env!("CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY"))
-        else {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "native messaging is not enabled in this build",
-            ));
-        };
-
-        // A reviewed key cannot admit peers without native process checks.
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "native messaging peer verification is unavailable",
-        ))
-    }
-}
-
-#[cfg(all(test, windows))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unbound_build_refuses_to_bind() {
-        let error = match BridgeListener::bind(UserBrowserBridge::new()) {
-            Ok(_) => panic!("bound a production listener without native process checks"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        // CI also builds with a bound gate; that build still needs the native
-        // verifier before it can bind a listener.
-        let revision = option_env!("CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION");
-        let gate = cerebellum_bridge_protocol::classify_bridge_gate(
-            revision,
-            option_env!("CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY"),
-        );
-        assert_eq!(
-            error.to_string(),
-            if gate.is_some() {
-                "native messaging peer verification is unavailable"
-            } else {
-                "native messaging is not enabled in this build"
-            }
-        );
+    pub fn bind(bridge: UserBrowserBridge) -> io::Result<Self> {
+        let pipe = super::windows::bind(bridge)?;
+        Ok(Self { _pipe: pipe })
     }
 }

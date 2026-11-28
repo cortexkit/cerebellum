@@ -27,6 +27,8 @@ mod file_identity;
 mod image_file_facts;
 #[cfg(windows)]
 mod named_pipe;
+#[cfg(windows)]
+mod named_pipe_server;
 #[cfg(any(windows, test))]
 mod pe_product;
 #[cfg(windows)]
@@ -80,6 +82,8 @@ pub use named_pipe::{
     named_pipe_client_pid, named_pipe_server_pid, open_named_pipe_client, wait_named_pipe,
     OverlappedPipe, ERROR_PIPE_BUSY,
 };
+#[cfg(windows)]
+pub use named_pipe_server::create_named_pipe_instance;
 #[cfg(windows)]
 pub use process_readings::system_time_100ns;
 #[cfg(windows)]

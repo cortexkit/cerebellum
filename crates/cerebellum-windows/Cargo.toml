@@ -16,6 +16,7 @@ bridge-test-identities = []
 # Windows bindings are needed only where their APIs exist. On every other host
 # this crate compiles to an empty library, so the workspace stays portable.
 [target.'cfg(target_os = "windows")'.dependencies]
+tokio = { workspace = true }
 windows-sys = { version = "=0.61.2", features = [
     "Wdk_System_Threading",
     "Win32_Foundation",
