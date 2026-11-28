@@ -371,7 +371,9 @@ async fn native_gtk_semantic_actions() {
     let selected = atspi::Bus::identify(&required("AT_SPI_BUS_ADDRESS"))
         .await
         .unwrap();
-    let (planes, _) = rig(kind, selected.clone(), true);
+    let bus = atspi::Bus::connect(&selected).await.unwrap();
+    wait_for_gtk_registry(&bus, kind).await;
+    let (planes, _) = rig(kind, selected, true);
     let target_file = required("CK_SEMANTIC_TARGET");
     let other_file = required("CK_SEMANTIC_OTHER");
     let assert_focus_unchanged = || {
@@ -381,18 +383,12 @@ async fn native_gtk_semantic_actions() {
         assert_eq!(std::fs::read_to_string(&other_file).unwrap(), "1\t0\t\n");
     };
 
-    let listed = tokio::time::timeout(Duration::from_secs(8), async {
-        loop {
-            let listed = wire(&planes, "list_apps", json!({})).await;
-            let text = listed.to_string();
-            if text.contains("Semantic Target") && text.contains("Semantic Other") {
-                break listed;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("GTK fixtures did not register on the accessibility bus");
+    let listed = wire(&planes, "list_apps", json!({})).await;
+    let listed_text = listed.to_string();
+    assert!(
+        listed_text.contains("Semantic Target") && listed_text.contains("Semantic Other"),
+        "both GTK fixtures registered but were not listed on {kind:?}: {listed}"
+    );
     assert!(
         !listed.to_string().contains("Semantic Operator"),
         "{listed}"
@@ -422,12 +418,9 @@ async fn native_gtk_semantic_actions() {
     let blocked = wire(&planes, "read_state", json!({"target":"Semantic Operator"})).await;
     assert_eq!(blocked["reason"], "operator_app_blocked", "{blocked}");
     let target = "Semantic Target";
-    let (bus, field) = tokio::time::timeout(
-        Duration::from_secs(2),
-        print_gtk_state_words(&selected, target),
-    )
-    .await
-    .expect("reading GTK fixture state words timed out");
+    let field = tokio::time::timeout(Duration::from_secs(2), print_gtk_state_words(&bus, target))
+        .await
+        .expect("reading GTK fixture state words timed out");
     let read =
         wire_observing_consent(&planes, "read_state", json!({"target": target}), || {}).await;
     assert!(
@@ -487,17 +480,42 @@ async fn native_gtk_semantic_actions() {
     assert_focus_unchanged();
 }
 
+async fn wait_for_gtk_registry(bus: &atspi::Bus, kind: SessionKind) {
+    tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            let entries = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut entries = Vec::new();
+                for root in bus.applications().await? {
+                    let name = bus.name(&root).await;
+                    entries.push((root, name));
+                }
+                Ok::<_, atspi::Error>(entries)
+            })
+            .await;
+            println!("GTK {kind:?} registry GetChildren: {entries:?}");
+            if let Ok(Ok(entries)) = entries {
+                if ["Semantic Target", "Semantic Other"].iter().all(|wanted| {
+                    entries
+                        .iter()
+                        .any(|(_, name)| name.as_deref() == Ok(*wanted))
+                }) {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("GTK {kind:?} registry did not list both fixture apps within 35s"));
+}
+
 async fn print_gtk_field(bus: &atspi::Bus, field: &atspi::Object, fixture_file: &str, phase: &str) {
     let readback = tokio::time::timeout(Duration::from_secs(2), bus.text(field)).await;
     let gtk_value = std::fs::read_to_string(fixture_file).unwrap();
     println!("{phase}: AT-SPI text {readback:?}; GTK fixture record {gtk_value:?}");
 }
 
-async fn print_gtk_state_words(
-    selected: &AccessibilityBus,
-    target: &str,
-) -> (atspi::Bus, atspi::Object) {
-    let bus = atspi::Bus::connect(selected).await.unwrap();
+async fn print_gtk_state_words(bus: &atspi::Bus, target: &str) -> atspi::Object {
     let mut root = None;
     for app in bus.applications().await.unwrap() {
         if bus.name(&app).await.as_deref() == Ok(target) {
@@ -532,5 +550,5 @@ async fn print_gtk_state_words(
                 .filter(|child| child.peer == object.peer),
         );
     }
-    (bus, field.expect("ordinary GTK fixture entry"))
+    field.expect("ordinary GTK fixture entry")
 }

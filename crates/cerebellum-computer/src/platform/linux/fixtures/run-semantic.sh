@@ -63,6 +63,12 @@ wm_ready() {
     [[ $reply == *'window id # 0x'* ]]
 }
 
+registry_ready() {
+    timeout 2s busctl --address="$AT_SPI_BUS_ADDRESS" --auto-start=no --timeout=1s call \
+        org.a11y.atspi.Registry /org/a11y/atspi/accessible/root \
+        org.a11y.atspi.Accessible GetChildren
+}
+
 gtk_flags=$(pkg-config --cflags --libs gtk4)
 # pkg-config emits shell words for the fixed install under /usr.
 # shellcheck disable=SC2086
@@ -70,6 +76,7 @@ timeout 45s cc -Wall -Wextra -Werror "$fixture_dir/semantic.c" $gtk_flags -o "$r
 cp -- "$root/editor" "$root/pinentry-semantic-fixture"
 
 for kind in x11 wayland; do
+    printf '\nNative semantic fixture: %s\n' "$kind"
     dir=$root/$kind
     mkdir -m 0700 "$dir"
     export XDG_RUNTIME_DIR="$dir"
@@ -80,8 +87,7 @@ for kind in x11 wayland; do
     start "$dir/a11y-bus.log" dbus-daemon --session --nofork --address="$AT_SPI_BUS_ADDRESS"
     await test -S "$dir/user-bus"
     await test -S "$dir/a11y-bus"
-    start "$dir/registry.log" /usr/libexec/at-spi2-registryd
-    unset WAYLAND_DISPLAY
+    unset DISPLAY WAYLAND_DISPLAY
     start "$dir/xvfb.log" bash -c 'exec Xvfb -displayfd 3 -screen 0 1024x768x24 -nolisten tcp 3>"$1"' _ "$dir/display"
     await test -s "$dir/display"
     IFS= read -r display < "$dir/display"
@@ -89,6 +95,10 @@ for kind in x11 wayland; do
     export DISPLAY=:$display
     start "$dir/wm.log" openbox --sm-disable
     await wm_ready
+    # The packaged registry opens an X display at startup. Use this
+    # iteration's live display, not one torn down by the preceding test.
+    start "$dir/registry.log" /usr/libexec/at-spi2-registryd
+    await registry_ready
     if [[ $kind == wayland ]]; then
         # Weston's headless backend creates no seat. Nest it on Xvfb for a
         # virtual keyboard seat; the GTK clients use only native Wayland.
