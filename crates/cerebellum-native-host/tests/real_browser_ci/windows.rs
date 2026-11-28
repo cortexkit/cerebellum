@@ -1,0 +1,348 @@
+use super::*;
+use cerebellum_bridge_protocol::{windows, HostParentAttestation, PlatformParentAttestation};
+use cerebellum_windows::{
+    create_test_pipe_instance_default_security, open_named_pipe_client, system_time_100ns,
+    OverlappedPipe,
+};
+use std::ffi::{OsStr, OsString};
+use std::io::Write;
+use std::os::windows::io::AsHandle;
+use std::process::Stdio;
+
+const CHILD: &str = "windows::fixture_entry";
+
+fn env_path(name: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is not bound")))
+}
+
+fn pipe_name(root: &Path) -> OsString {
+    format!(r"\\.\pipe\{}", root.file_name().unwrap().to_str().unwrap()).into()
+}
+
+fn read_packet(pipe: &OverlappedPipe) -> Vec<u8> {
+    let until = Some(Instant::now() + READY_LIMIT);
+    let mut packet = Vec::new();
+    while packet.len() < 4096 {
+        let mut byte = [0];
+        assert_eq!(
+            pipe.read(&mut byte, until).unwrap(),
+            1,
+            "pipe closed without a packet"
+        );
+        if byte == *b"\n" {
+            return packet;
+        }
+        packet.push(byte[0]);
+    }
+    panic!("fixture packet exceeded its bound");
+}
+
+fn write_packet(pipe: &OverlappedPipe, packet: &impl std::fmt::Display) {
+    let bytes = format!("{packet}\n");
+    let written = pipe
+        .write(bytes.as_bytes(), Some(Instant::now() + READY_LIMIT))
+        .unwrap();
+    assert_eq!(written, bytes.len());
+}
+
+#[test]
+#[ignore = "subprocess entry point"]
+fn fixture_entry() {
+    let root = env_path("CK_IMAGE_TEST_ROOT");
+    let name = pipe_name(&root);
+    if std::env::var("CK_IMAGE_TEST_ENTRY").unwrap() == "server" {
+        run_server(&root, &name);
+    } else {
+        run_probe(&root, &name);
+    }
+}
+
+fn run_probe(root: &Path, name: &OsStr) {
+    let key = parse_public_key(TEST_PEER_PUBLIC_KEY_HEX).unwrap();
+    let started = Instant::now();
+    let evidence = windows::attest_parent(&parse_public_key(NATIVE_PARENT_KEY).unwrap());
+    let step1 = started.elapsed();
+    let evidence = match evidence {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            fs::write(root.join("refused"), error.to_string()).unwrap();
+            return;
+        }
+    };
+    evidence.check_before_connect().unwrap();
+    let (handle, connected_at) = open_named_pipe_client(name).unwrap();
+    let step2_start = Instant::now();
+    windows::observe_server_peer(&handle, connected_at)
+        .unwrap()
+        .verify_cerebellum(&key)
+        .unwrap();
+    let step2 = step2_start.elapsed();
+    let pipe = OverlappedPipe::new(handle);
+    let mut attestation = evidence.attestation().clone();
+    let HostParentAttestation::Platform(PlatformParentAttestation::Windows {
+        chrome,
+        launcher,
+        ..
+    }) = &mut attestation
+    else {
+        panic!("the real browser chain must produce a native attestation");
+    };
+    assert_eq!(
+        chrome.pid,
+        std::env::var("CK_IMAGE_TEST_CHROME_PID")
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+    );
+    assert_ne!(launcher.pid, chrome.pid);
+    if root.join("stale-generation").exists() {
+        chrome.creation_100ns = chrome.creation_100ns.checked_add(1).unwrap();
+    }
+    write_packet(&pipe, &1);
+    write_packet(&pipe, &serde_json::to_string(&attestation).unwrap());
+    let (step3, parent, refusal): (Duration, Duration, Option<String>) =
+        serde_json::from_slice(&read_packet(&pipe)).unwrap();
+    if let Some(refusal) = refusal {
+        fs::write(root.join("refused"), refusal).unwrap();
+    } else {
+        assert_budget([step1, step2, step3, parent]);
+        fs::write(root.join("accepted"), b"accepted").unwrap();
+    }
+}
+
+fn run_server(root: &Path, name: &OsStr) {
+    let key = parse_public_key(TEST_PEER_PUBLIC_KEY_HEX).unwrap();
+    let handle = create_test_pipe_instance_default_security(name, 4096).unwrap();
+    let pipe = OverlappedPipe::new(handle);
+    fs::write(root.join("listening"), []).unwrap();
+    // The pipe may not have a client yet. Poll only until the probe connects;
+    // the first packet is the barrier after its own peer verification.
+    let handle = pipe.handle().unwrap();
+    wait_for("the fixture pipe client", || {
+        cerebellum_windows::named_pipe_client_pid(handle.as_handle()).ok()
+    });
+    let connected_at = system_time_100ns();
+    assert_eq!(read_packet(&pipe), b"1");
+    let step3_start = Instant::now();
+    let signed_probe = windows::observe_client_peer(handle.as_ref(), connected_at)
+        .unwrap()
+        .verify_host(&key)
+        .unwrap();
+    let step3 = step3_start.elapsed();
+    let attestation = serde_json::from_slice(&read_packet(&pipe)).unwrap();
+    let parent_start = Instant::now();
+    let refusal = signed_probe
+        .recheck_parent(&attestation, &parse_public_key(NATIVE_PARENT_KEY).unwrap())
+        .err()
+        .map(|error| error.to_string());
+    let parent = parent_start.elapsed();
+    write_packet(
+        &pipe,
+        &serde_json::to_string(&(step3, parent, refusal)).unwrap(),
+    );
+    // Keep the server handle alive until the probe consumes the receipt.
+    wait_for("the probe result", || {
+        (root.join("accepted").exists() || root.join("refused").exists()).then_some(())
+    });
+}
+
+struct Browser(Running);
+
+impl Drop for Browser {
+    fn drop(&mut self) {
+        if self.0 .0.try_wait().is_ok_and(|status| status.is_none()) {
+            let _ = Command::new("taskkill.exe")
+                .args(["/T", "/F", "/PID"])
+                .arg(self.0 .0.id().to_string())
+                .output();
+        }
+    }
+}
+
+fn start_chrome(scratch: &Scratch) -> Browser {
+    let image = env_path("CK_IMAGE_TEST_WINDOWS_CHROME");
+    let profile = scratch.join("profile");
+    let mut browser = Browser(Running(
+        Command::new(image)
+            .args([
+                "--headless",
+                "--no-sandbox",
+                "--no-first-run",
+                "--disable-background-networking",
+                "--remote-debugging-port=0",
+            ])
+            .arg(format!("--user-data-dir={}", profile.display()))
+            .arg("about:blank")
+            .spawn()
+            .unwrap(),
+    ));
+    wait_for("Chrome's disposable profile", || {
+        assert!(
+            browser.0 .0.try_wait().unwrap().is_none(),
+            "Chrome exited before the predicate fixture"
+        );
+        profile.join("DevToolsActivePort").exists().then_some(())
+    });
+    browser
+}
+
+struct Suspended {
+    child: Running,
+    pid: u32,
+}
+
+impl Suspended {
+    fn image(root: &Scratch, path: &Path) -> Self {
+        // Holding the process before main lets the test inspect an actual
+        // mapped image that would immediately exit without browser arguments.
+        let report = root.join("suspended-pid");
+        let mut child = Running(
+            Command::new(env_path("CK_IMAGE_TEST_WINDOWS_LAUNCHER"))
+                .arg("suspend")
+                .arg(path)
+                .arg(&report)
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = wait_for("the suspended process", || {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "could not start {path:?}"
+            );
+            fs::read_to_string(&report).ok()?.parse().ok()
+        });
+        Self { child, pid }
+    }
+}
+
+impl Drop for Suspended {
+    fn drop(&mut self) {
+        if let Some(mut input) = self.child.0.stdin.take() {
+            let _ = writeln!(input);
+        }
+        assert!(self.child.wait("suspended image cleanup").success());
+    }
+}
+
+fn run_case(
+    parent_pid: u32,
+    launcher: Option<&Path>,
+    stale: bool,
+    overrides: &[(&str, &Path)],
+) -> Result<(), String> {
+    let scratch = Scratch::new();
+    let signed_probe = scratch.join("probe.exe");
+    let signed_server = scratch.join("server.exe");
+    let exe = std::env::current_exe().unwrap();
+    sign_copy(&exe, &signed_probe, "host");
+    sign_copy(&exe, &signed_server, "cerebellum");
+    if stale {
+        fs::write(scratch.join("stale-generation"), []).unwrap();
+    }
+    let test_args = format!("--exact {CHILD} --ignored --nocapture");
+    let mut server = Running(
+        Command::new(signed_server)
+            .args(["--exact", CHILD, "--ignored", "--nocapture"])
+            .env("CK_IMAGE_TEST_ROOT", &scratch.0)
+            .env("CK_IMAGE_TEST_ENTRY", "server")
+            .spawn()
+            .unwrap(),
+    );
+    wait_for("the fixture pipe", || {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "fixture server failed to bind"
+        );
+        scratch.join("listening").exists().then_some(())
+    });
+    let mut cmd = Command::new(env_path("CK_IMAGE_TEST_WINDOWS_LAUNCHER"));
+    cmd.arg(parent_pid.to_string());
+    if let Some(launcher) = launcher {
+        // cmd's /S removes the outer quotes, leaving the quoted probe path.
+        cmd.arg(launcher).arg(format!(
+            r#"/D /S /C ""{}" {test_args}""#,
+            signed_probe.display()
+        ));
+    } else {
+        cmd.arg(&signed_probe).arg(test_args);
+    }
+    let mut child = Running(
+        cmd.env("CK_IMAGE_TEST_ROOT", &scratch.0)
+            .env("CK_IMAGE_TEST_ENTRY", "probe")
+            .env("CK_IMAGE_TEST_CHROME_PID", parent_pid.to_string())
+            .envs(overrides.iter().copied())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        child.wait("the probe command").success(),
+        "Windows probe command failed"
+    );
+    if scratch.join("refused").exists() {
+        return Err(fs::read_to_string(scratch.join("refused")).unwrap());
+    }
+    assert_eq!(fs::read(scratch.join("accepted")).unwrap(), b"accepted");
+    assert!(server.wait("the verified fixture server").success());
+    Ok(())
+}
+
+fn wrong_path(result: Result<(), String>) {
+    assert_eq!(
+        result.unwrap_err(),
+        "Windows image verification refused: UnexpectedPath"
+    );
+}
+
+#[test]
+#[ignore = "requires installed Chrome Stable; run by the real-browser CI job"]
+fn chrome_cmd_and_probe_check_native_identity_and_deadlines() {
+    let scratch = Scratch::new();
+    let chrome = start_chrome(&scratch);
+    let cmd = env_path("CK_IMAGE_TEST_WINDOWS_CMD");
+    run_case(chrome.0 .0.id(), Some(&cmd), false, &[]).expect("Chrome / System32 cmd must pass");
+    let error = run_case(chrome.0 .0.id(), Some(&cmd), true, &[]).unwrap_err();
+    assert_eq!(
+        error,
+        "Windows parent attestation does not match observed evidence"
+    );
+    wrong_path(run_case(chrome.0 .0.id(), None, false, &[]));
+
+    let fake_root = scratch.join("system-root");
+    let fake_system32 = fake_root.join("System32");
+    fs::create_dir_all(&fake_system32).unwrap();
+    let fake_cmd = fake_system32.join("cmd.exe");
+    fs::copy(&cmd, &fake_cmd).unwrap();
+    wrong_path(run_case(chrome.0 .0.id(), Some(&fake_cmd), false, &[]));
+    wrong_path(run_case(
+        chrome.0 .0.id(),
+        Some(&fake_cmd),
+        false,
+        &[("SystemRoot", &fake_root)],
+    ));
+}
+
+#[test]
+#[ignore = "requires Chrome Stable files; run by the real-browser CI job"]
+fn signed_chrome_copies_fail_the_machine_path_predicate() {
+    let scratch = Scratch::new();
+    let native = env_path("CK_IMAGE_TEST_WINDOWS_CHROME");
+    let system_cmd = env_path("CK_IMAGE_TEST_WINDOWS_CMD");
+    let local_root = Scratch::new();
+    let local = local_root.join(r"Google\Chrome\Application\chrome.exe");
+    fs::create_dir_all(local.parent().unwrap()).unwrap();
+    fs::copy(&native, &local).unwrap();
+    let image = Suspended::image(&scratch, &local);
+    wrong_path(run_case(
+        image.pid,
+        Some(&system_cmd),
+        false,
+        &[("LOCALAPPDATA", &local_root.0)],
+    ));
+    wrong_path(run_case(
+        image.pid,
+        Some(&system_cmd),
+        false,
+        &[("ProgramFiles", &local_root.0)],
+    ));
+}

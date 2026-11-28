@@ -111,5 +111,8 @@ cursor movement alone), worker loss,
 per-plan detachment, Cancel/chunks/reconnect, SHA-256 Runtime function-pin rejection and both popup
 paths. `node --check` on shipped JS modules supplies syntax checking; this plain-JS
 slice has no TypeScript package/typecheck. The Rust repository gate is still required
-alongside these extension tests. Real Chrome probes require operator approval and
-local fixtures in a scratch Chrome for Testing profile.
+alongside these extension tests. For Linux and Windows browser image checks,
+see CI's **Real browser predicates** job (`real-browser`). It uses disposable
+profiles and checks parent and peer identity, not extension loading or a
+browser-initiated native-messaging session. The local Chrome for Testing probe
+is separate and still requires operator approval and a scratch profile.
