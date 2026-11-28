@@ -269,8 +269,18 @@ impl Bus {
         self.object(object, ACCESSIBLE, "GetInterfaces", &()).await
     }
 
-    pub async fn actions(&self, object: &Object) -> Result<Vec<(String, String, String)>, Error> {
-        self.object(object, ACTION, "GetActions", &()).await
+    pub async fn action_names(&self, object: &Object) -> Result<Vec<String>, Error> {
+        let count: i32 = self.property(object, ACTION, "NActions").await?;
+        if !(0..=64).contains(&count) {
+            return Err(Error::Unreadable);
+        }
+        // GTK localizes the bulk GetActions labels and may omit actions from
+        // that list. GetName reads the name at the index used by DoAction.
+        let mut names = Vec::new();
+        for index in 0..count {
+            names.push(self.object(object, ACTION, "GetName", &(index,)).await?);
+        }
+        Ok(names)
     }
 
     pub async fn action(&self, object: &Object, index: i32) -> Result<bool, Error> {

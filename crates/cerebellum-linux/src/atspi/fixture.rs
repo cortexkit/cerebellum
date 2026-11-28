@@ -300,11 +300,24 @@ impl Accessible {
 struct Action(Arc<Effects>);
 #[zbus::interface(name = "org.a11y.atspi.Action")]
 impl Action {
+    #[zbus(property)]
+    fn n_actions(&self) -> i32 {
+        2
+    }
+
+    fn get_name(&self, index: i32) -> fdo::Result<&str> {
+        match index {
+            0 => Ok("show help"),
+            1 => Ok("click"),
+            _ => Err(fdo::Error::InvalidArgs("no action at this index".into())),
+        }
+    }
+
     fn get_actions(&self) -> Vec<(&str, &str, &str)> {
-        vec![("click", "", "")]
+        vec![("Aide", "", ""), ("Cliquer", "", "")]
     }
     fn do_action(&self, index: i32) -> bool {
-        if index != 0 {
+        if index != 1 {
             return false;
         }
         self.0.posts.fetch_add(1, Ordering::SeqCst);

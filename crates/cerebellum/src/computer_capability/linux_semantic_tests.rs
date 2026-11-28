@@ -478,12 +478,12 @@ async fn native_gtk_semantic_actions() {
     )
     .await;
     assert_eq!(press["outcome"], "completed", "{press}");
+    let wait = wire(&planes, "wait", wait_args(target, 2000)).await;
+    assert_eq!(wait["outcome"], "predicate_satisfied", "{wait}");
     assert_eq!(
         std::fs::read_to_string(&target_file).unwrap(),
         format!("0\t1\t{text}\n")
     );
-    let wait = wire(&planes, "wait", wait_args(target, 2000)).await;
-    assert_eq!(wait["outcome"], "predicate_satisfied", "{wait}");
     assert_focus_unchanged();
 }
 

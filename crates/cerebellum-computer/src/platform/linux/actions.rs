@@ -26,10 +26,11 @@ fn byte_offset(text: &str, character: i32) -> Option<usize> {
         .nth(offset)
 }
 
-fn press_index(actions: &[(String, String, String)]) -> Option<i32> {
-    let mut choices = actions.iter().enumerate().filter(|(_, (name, _, _))| {
-        matches!(name.as_str(), "click" | "press" | "activate" | "toggle")
-    });
+fn press_index(actions: &[String]) -> Option<i32> {
+    let mut choices = actions
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| matches!(name.as_str(), "click" | "press" | "activate" | "toggle"));
     let (index, _) = choices.next()?;
     if choices.next().is_some() {
         return None;
@@ -143,7 +144,7 @@ impl AppStateSource for Source {
                 let bits = bus.state(object).await?;
                 let editable = tree::editable(&bits, &interfaces);
                 let actionable = tree::has(&interfaces, "Action")
-                    && press_index(&bus.actions(object).await?).is_some();
+                    && press_index(&bus.action_names(object).await?).is_some();
                 Ok(ElementFacts {
                     pid: Some(pid),
                     role: Some(
@@ -211,7 +212,7 @@ impl AppStateSource for Source {
         let (token, open) = self
             .resolve_token(element, deadline)
             .map_err(action_error)?;
-        let actions = atspi::bounded(deadline, open.live.bus.actions(&token.object))
+        let actions = atspi::bounded(deadline, open.live.bus.action_names(&token.object))
             .map_err(|e| action_error(reason(e)))?;
         let index = press_index(&actions).ok_or(ElementActionError::Unsupported)?;
         self.action_floor(element, false).map_err(action_error)?;
