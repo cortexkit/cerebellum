@@ -377,6 +377,11 @@ async fn native_unrelated_window_during_wait_does_not_receive_the_grant() {
         })
         .await
         .expect("windowless fixture startup marker");
+        // The unrelated executable is a signed GUI test fixture, never a browser.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "spawns the signed GUI fixture executable as an owned test child, never a browser"
+        )]
         OwnedChild(
             std::process::Command::new(executable)
                 .spawn()
