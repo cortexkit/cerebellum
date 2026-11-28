@@ -255,6 +255,20 @@ impl<'a> UiWindow<'a> {
         Ok(self.uia.text_selection(element)?)
     }
 
+    pub fn input_selection(
+        &self,
+        element: &UiaElementRef,
+        caret_limit: Option<u32>,
+    ) -> ReadResult<Option<(usize, usize)>> {
+        if !self.safe_path(element)? {
+            return Err(ReadError::Unsupported);
+        }
+        match caret_limit {
+            Some(limit) => Ok(self.uia.bounded_text_selection(element, limit)?),
+            None => Ok(None),
+        }
+    }
+
     pub fn focused(&self, native: Option<u32>) -> ReadResult<Option<ElementHandle>> {
         let Some(hwnd) = native else { return Ok(None) };
         if !window_owner(hwnd).is_ok_and(|(pid, _)| pid == self.pid)

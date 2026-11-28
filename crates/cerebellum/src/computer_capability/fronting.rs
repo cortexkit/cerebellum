@@ -791,6 +791,17 @@ impl ObligationParts {
         host: Box<dyn FrontingRestoreHost>,
         gate: Option<Arc<cerebellum_computer::dispatch::CutoffGate>>,
     ) -> Option<(Arc<RestoreCell>, bool)> {
+        self.register_with_previous(previous, target, host, gate, None)
+    }
+
+    fn register_with_previous(
+        &mut self,
+        previous: u32,
+        target: u32,
+        host: Box<dyn FrontingRestoreHost>,
+        gate: Option<Arc<cerebellum_computer::dispatch::CutoffGate>>,
+        replace: Option<&Arc<RestoreCell>>,
+    ) -> Option<(Arc<RestoreCell>, bool)> {
         let lock = self.lock.take()?;
         let mut host = host;
         // Every restore route checks it is still putting back this process,
@@ -805,22 +816,27 @@ impl ObligationParts {
                 gate.stop_front();
             }
         }
-        self.terminal
-            .register_restore(RestoreObligation {
-                previous_pid: previous,
-                target_pid: target,
-                target_name: self.target_name.clone(),
-                mode: self.mode,
-                purpose: self.purpose,
-                lock,
-                host: Box::new(PlatformRestoreHost {
-                    host,
-                    fallback: self.restore_fallback,
-                }),
-                gate,
-            })
-            .ok()
-            .map(|cell| (cell, bound))
+        let obligation = RestoreObligation {
+            previous_pid: previous,
+            target_pid: target,
+            target_name: self.target_name.clone(),
+            mode: self.mode,
+            purpose: self.purpose,
+            lock,
+            host: Box::new(PlatformRestoreHost {
+                host,
+                fallback: self.restore_fallback,
+            }),
+            gate,
+        };
+        let registered = match replace {
+            #[cfg(windows)]
+            Some(cell) => self.terminal.replace_windows_restore(cell, obligation),
+            #[cfg(not(windows))]
+            Some(_) => return None,
+            None => self.terminal.register_restore(obligation),
+        };
+        registered.ok().map(|cell| (cell, bound))
     }
 }
 
@@ -834,6 +850,10 @@ struct HooksState {
     finished: Option<(Option<DeferredRestore>, bool)>,
     /// The bracket's gate for this front, once registered.
     cutoff: Option<Arc<cerebellum_computer::dispatch::CutoffGate>>,
+    #[cfg(windows)]
+    piece_lock: Option<FrontingLock>,
+    #[cfg(windows)]
+    input_progress: Option<cerebellum_computer::platform::WindowsInputProgress>,
 }
 
 /// The hooks a fronted dispatch or read runs its obligation through, shared
@@ -862,6 +882,20 @@ impl CellHooks {
             parts: Some(parts),
             ..HooksState::default()
         })))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn windows_input(parts: ObligationParts, lock: FrontingLock) -> Self {
+        let hooks = Self::new(parts);
+        hooks.state().piece_lock = Some(lock);
+        hooks
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn input_progress(
+        &self,
+    ) -> Option<cerebellum_computer::platform::WindowsInputProgress> {
+        self.state().input_progress
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, HooksState> {
@@ -976,6 +1010,38 @@ impl CellHooks {
 }
 
 impl FrontedDispatchHooks for CellHooks {
+    #[cfg(windows)]
+    fn prepare_next_windows_piece(&mut self) -> bool {
+        let mut state = self.state();
+        if !state
+            .cell
+            .as_ref()
+            .is_some_and(|cell| cell.settled_windows_restore())
+        {
+            return false;
+        }
+        let Some(lock) = state
+            .piece_lock
+            .as_ref()
+            .and_then(|lock| lock.0.clone().try_lock_owned().ok())
+        else {
+            return false;
+        };
+        let Some(parts) = state.parts.as_mut() else {
+            return false;
+        };
+        parts.lock = Some(Box::new(lock));
+        true
+    }
+
+    #[cfg(windows)]
+    fn windows_input_progress(
+        &mut self,
+        progress: cerebellum_computer::platform::WindowsInputProgress,
+    ) {
+        self.state().input_progress = Some(progress);
+    }
+
     fn uses_needs_front_restore_predictor(&self) -> bool {
         self.state().parts.as_ref().is_some_and(|parts| {
             parts.restore_fallback && parts.purpose == FrontingPurpose::NeedsFront
@@ -990,13 +1056,30 @@ impl FrontedDispatchHooks for CellHooks {
         gate: &Arc<cerebellum_computer::dispatch::CutoffGate>,
     ) -> bool {
         let mut state = self.state();
+        #[cfg(windows)]
+        let replace = state.piece_lock.as_ref().and(state.cell.clone());
         let Some(parts) = state.parts.as_mut() else {
             return false;
         };
-        match parts.register(previous, target, host, Some(Arc::clone(gate))) {
+        #[cfg(windows)]
+        let registered = parts.register_with_previous(
+            previous,
+            target,
+            host,
+            Some(Arc::clone(gate)),
+            replace.as_ref(),
+        );
+        #[cfg(not(windows))]
+        let registered = parts.register(previous, target, host, Some(Arc::clone(gate)));
+        match registered {
             Some((cell, bound)) => {
                 state.cell = Some(cell);
                 state.cutoff = Some(Arc::clone(gate));
+                #[cfg(windows)]
+                if replace.is_some() {
+                    state.decided = None;
+                    state.finished = None;
+                }
                 if !bound {
                     state.refusal = Some(FrontingStop::PreviousUnknown);
                 }
@@ -1290,6 +1373,8 @@ enum TemporaryFrontAuthority<'a> {
     AppUse,
     AppRead(&'a crate::computer_grants::GrantAdmission, bool),
     Takeover(&'a crate::computer_grants::GrantAdmission),
+    #[cfg(windows)]
+    WindowsInput(&'a crate::computer_grants::GrantAdmission),
 }
 
 impl From<FrontingStop> for PrepareStop {
@@ -1366,6 +1451,21 @@ where
             purpose,
             guards,
             TemporaryFrontAuthority::AppUse,
+        ))
+        .await
+    }
+
+    #[cfg(windows)]
+    pub(super) async fn prepare_windows_input_front(
+        &self,
+        call: FrontCall<'_>,
+        admission: &crate::computer_grants::GrantAdmission,
+    ) -> Result<ObligationParts, PrepareStop> {
+        Box::pin(self.prepare_front_with_authority(
+            call,
+            FrontingPurpose::NeedsFront,
+            true,
+            TemporaryFrontAuthority::WindowsInput(admission),
         ))
         .await
     }
@@ -1466,6 +1566,18 @@ where
                 }
                 // Recheck the actual app admission, including one-time consent,
                 // rather than requiring a new standing app grant.
+                if !admission.commit() {
+                    return Err(FrontingStop::DispatchGateClosed.into());
+                }
+            }
+            #[cfg(windows)]
+            TemporaryFrontAuthority::WindowsInput(admission) => {
+                if call.consent.unattended {
+                    return Err(FrontingStop::Unattended.into());
+                }
+                if !self.fronting_bracket_admitted {
+                    return Err(FrontingStop::FrontingNotAdmitted.into());
+                }
                 if !admission.commit() {
                     return Err(FrontingStop::DispatchGateClosed.into());
                 }

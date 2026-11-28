@@ -23,6 +23,7 @@ pub fn startup_permissions(
         elevation,
         cerebellum_windows::capture_support,
         WindowsAppStateSource::client_available,
+        super::fronting::trial_install,
     )
 }
 
@@ -31,6 +32,7 @@ fn startup_permissions_from(
     elevation: WindowsElevation,
     capture_support: impl FnOnce() -> Option<bool>,
     uia_available: impl FnOnce() -> bool,
+    input_hooks: impl FnOnce() -> bool,
 ) -> PermissionLivenessReport {
     let app_state = inputs.windows_app_identity_review_revision.is_some()
         && inputs.windows_app_state_review_revision.is_some()
@@ -58,9 +60,24 @@ fn startup_permissions_from(
     } else {
         PermissionLiveness::Unresolved
     };
+    let (post, monitoring) = if inputs.windows_input_bracket_review_revision.is_some() {
+        let monitoring = if input_hooks() {
+            PermissionLiveness::Live
+        } else {
+            PermissionLiveness::Unavailable
+        };
+        (PermissionLiveness::Live, monitoring)
+    } else {
+        (
+            PermissionLiveness::Unresolved,
+            PermissionLiveness::Unresolved,
+        )
+    };
     PermissionLivenessReport::from_results([
         result(PermissionService::Accessibility, accessible),
         result(PermissionService::ScreenRecording, recording),
+        result(PermissionService::PostEvent, post),
+        result(PermissionService::InputMonitoring, monitoring),
     ])
 }
 
@@ -298,8 +315,13 @@ mod tests {
             (Some(false), PermissionLiveness::Unavailable),
             (None, PermissionLiveness::Unresolved),
         ] {
-            let report =
-                startup_permissions_from(&review, WindowsElevation::Medium, || reading, || true);
+            let report = startup_permissions_from(
+                &review,
+                WindowsElevation::Medium,
+                || reading,
+                || true,
+                || false,
+            );
             assert_eq!(report.state(PermissionService::ScreenRecording), expected);
             assert_eq!(
                 report.state(PermissionService::Accessibility),
@@ -323,12 +345,51 @@ mod tests {
                 elevation,
                 || panic!("unadmitted WGC probe"),
                 || true,
+                || false,
             );
             assert_ne!(
                 report.state(PermissionService::ScreenRecording),
                 PermissionLiveness::Live
             );
         }
+    }
+
+    #[test]
+    fn input_permissions_need_the_input_key_and_both_hooks_for_monitoring() {
+        let mut inputs = reviewed();
+        let read = |inputs: &ImmutableReleaseInputs, hooks: fn() -> bool| {
+            startup_permissions_from(
+                inputs,
+                WindowsElevation::Medium,
+                || Some(true),
+                || true,
+                hooks,
+            )
+        };
+        let report = read(&inputs, || panic!("unbound input key installed hooks"));
+        assert_eq!(
+            report.state(PermissionService::PostEvent),
+            PermissionLiveness::Unresolved
+        );
+        assert_eq!(
+            report.state(PermissionService::InputMonitoring),
+            PermissionLiveness::Unresolved
+        );
+        inputs.windows_input_bracket_review_revision = Some("test only".into());
+        let report = read(&inputs, || false);
+        assert_eq!(
+            report.state(PermissionService::PostEvent),
+            PermissionLiveness::Live
+        );
+        assert_eq!(
+            report.state(PermissionService::InputMonitoring),
+            PermissionLiveness::Unavailable
+        );
+        let report = read(&inputs, || true);
+        assert_eq!(
+            report.state(PermissionService::InputMonitoring),
+            PermissionLiveness::Live
+        );
     }
 
     #[test]

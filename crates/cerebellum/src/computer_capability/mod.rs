@@ -1599,6 +1599,10 @@ where
                     .await;
                 return unposted(chord_blocked_refusal(&chord, blocked.reason));
             }
+            #[cfg(windows)]
+            if let Some(refusal) = keystrokes::windows_chord_refusal::<D>(*key, *modifiers) {
+                return unposted(refusal);
+            }
             // The session floor is checked before anything is asked or
             // escalated, so no grant can make a session-ending chord valid.
             parsed.action_kind = chord_action_kind(*modifiers);
@@ -1773,7 +1777,7 @@ where
         let shortcut = matches!(&parsed.action,
             SyntheticAction::KeyCombination { modifiers, .. }
             if modifiers.command || modifiers.control || modifiers.option);
-        let route = fronting::chord_route(
+        let route = keystrokes::application_route::<D>(
             fronting_admission,
             frontmost == Some(grant.pid),
             shortcut,
@@ -1902,12 +1906,30 @@ where
             };
             let purpose = crate::terminal_arbiter::FrontingPurpose::NeedsFront;
             let prepared = if front_with_app_grant {
-                self.prepare_temporary_front(call, purpose, true).await
+                #[cfg(windows)]
+                let prepared = if D::uses_windows_input_bracket() {
+                    self.prepare_windows_input_front(call, &admission).await
+                } else {
+                    self.prepare_temporary_front(call, purpose, true).await
+                };
+                #[cfg(not(windows))]
+                let prepared = self.prepare_temporary_front(call, purpose, true).await;
+                prepared
             } else {
                 self.prepare_takeover_front(call, purpose, &admission).await
             };
             match prepared {
-                Ok(parts) => chord_hooks = Some(fronting::CellHooks::new(parts)),
+                Ok(parts) => {
+                    #[cfg(windows)]
+                    let hooks = if D::uses_windows_input_bracket() {
+                        fronting::CellHooks::windows_input(parts, self.fronting_lock.clone())
+                    } else {
+                        fronting::CellHooks::new(parts)
+                    };
+                    #[cfg(not(windows))]
+                    let hooks = fronting::CellHooks::new(parts);
+                    chord_hooks = Some(hooks);
+                }
                 Err(prepared) => {
                     let mut reply = match (prepared.change, prepared.stop) {
                         (Some(change), _) => element_actions::state_changed_by_person_reply(
@@ -2210,6 +2232,13 @@ where
         if unposted_refusal {
             reply = unposted(reply);
         }
+        #[cfg(windows)]
+        let typed_text = keystrokes::windows_input_reply::<D>(
+            &mut reply,
+            chord_hooks.as_ref(),
+            bracket.as_ref(),
+            typed_text,
+        );
         // The agent's turn ended while the badge was on its way: nothing was
         // posted, and the call reads as cancelled before it ran.
         if badge_gate.refused_for_end() {
@@ -3469,7 +3498,8 @@ fn synthetic_wire_envelope(mut reply: Value) -> Value {
                 | "target_busy"
                 | "blocking_capacity_exhausted"
         )
-    ) {
+    ) && !keystrokes::windows_input_detail(object)
+    {
         object.remove("detail");
     }
     reply

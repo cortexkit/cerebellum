@@ -32,6 +32,8 @@ pub mod identity;
 #[cfg(windows)]
 mod image_file_facts;
 #[cfg(windows)]
+mod input_facts;
+#[cfg(windows)]
 mod launch_facts;
 #[cfg(windows)]
 mod named_pipe;
@@ -96,6 +98,10 @@ pub use foreground_events::{ForegroundEvent, ForegroundEvents};
 pub use image_file_facts::{
     lock_image_file, retain_image_process, ImageMappingReading, LockedImageFile,
     ProcessPackageFields,
+};
+#[cfg(windows)]
+pub use input_facts::{
+    async_key_down, input_tick, post_input, InputHooks, RawInputEvent, RawInputPost,
 };
 #[cfg(windows)]
 pub use launch_facts::{

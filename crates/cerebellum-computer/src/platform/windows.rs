@@ -860,6 +860,11 @@ impl WindowsPlatformDriver {
 
 impl PlatformDriver for WindowsPlatformDriver {
     #[cfg(windows)]
+    fn uses_windows_input_bracket() -> bool {
+        true
+    }
+
+    #[cfg(windows)]
     fn accept_fronted_dispatch_hooks(&mut self, hooks: Box<dyn FrontedDispatchHooks>) -> bool {
         self.fronted_hooks.0 = Some(hooks);
         true
@@ -885,7 +890,7 @@ impl PlatformDriver for WindowsPlatformDriver {
             request.maximum_seize_detection_latency_ms,
             hooks.as_mut(),
             cancelled,
-            None,
+            fronting::NativeWork::Dispatch(&request.synthetic.action),
         )
     }
 
@@ -911,7 +916,7 @@ impl PlatformDriver for WindowsPlatformDriver {
             50,
             hooks.as_mut(),
             cancelled,
-            Some(read),
+            fronting::NativeWork::Read(read),
         )
     }
 
@@ -1132,11 +1137,16 @@ impl PlatformDriver for WindowsPlatformDriver {
         ))
     }
 
-    fn query_focus(
-        &mut self,
-        _request: FocusQueryRequest,
-    ) -> Result<FocusQueryResult, DriverError> {
-        Err(DriverError::Unsupported("Windows focus query"))
+    fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError> {
+        #[cfg(windows)]
+        {
+            fronting::query_focus(&request.target)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = request;
+            Err(DriverError::Unsupported("Windows focus query"))
+        }
     }
 
     fn fronting_snapshot(

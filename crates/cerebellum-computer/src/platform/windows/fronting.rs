@@ -14,8 +14,14 @@ use std::time::Instant;
 
 mod background;
 mod bracket;
+mod observer;
+mod pieces;
 pub use background::{BackgroundForeground, BackgroundRestore};
-pub(super) use bracket::{run_native, FrontedHookSlot};
+use bracket::Observer;
+pub(super) use bracket::{query_focus, run_native, FrontedHookSlot, NativeWork};
+pub(super) use observer::trial_install;
+use observer::NativeObserver;
+pub use pieces::chord_supported;
 
 pub fn background_restore_admitted(
     inputs: &ImmutableReleaseInputs,
@@ -69,6 +75,7 @@ pub(super) struct Binding {
     owner: Arc<RetainedProcessHandle>,
     owner_start: u64,
     target: Arc<RetainedProcessHandle>,
+    target_start: u64,
     pub(super) proof: FrameProof,
 }
 
@@ -85,6 +92,7 @@ impl Binding {
             Arc::new(retain_image_process(root.pid).ok()?)
         };
         let owner_start = generation(&owner)?;
+        let target_start = generation(&target)?;
         let proof = frame_proof(&target, target.pid(), number).ok()??;
         let bound = Self {
             number,
@@ -92,6 +100,7 @@ impl Binding {
             owner,
             owner_start,
             target,
+            target_start,
             proof,
         };
         bound.current().then_some(bound)
@@ -99,6 +108,7 @@ impl Binding {
 
     fn current(&self) -> bool {
         generation(&self.owner) == Some(self.owner_start)
+            && generation(&self.target) == Some(self.target_start)
             && window_identity_facts(self.number)
                 .is_ok_and(|root| root.pid == self.owner.pid() && root.class == self.class)
             && frame_proof(&self.target, self.pid(), self.number)
@@ -114,6 +124,10 @@ impl Binding {
 
     fn safe_integrity(&self) -> bool {
         readable_integrity(&self.owner) && readable_integrity(&self.target)
+    }
+
+    fn is_shell_desktop(&self) -> bool {
+        matches!(self.class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd")
     }
 
     pub(super) fn is_foreground(&self) -> bool {

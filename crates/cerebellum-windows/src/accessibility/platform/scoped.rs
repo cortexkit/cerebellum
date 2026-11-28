@@ -360,6 +360,25 @@ impl ScopedUia {
         &self,
         element: &UiaElementRef,
     ) -> Result<Option<(usize, usize)>, Failure> {
+        self.text_selection_with_limit(element, 64 * 1024, false)
+    }
+
+    /// Read the selection and check the full document against a caller's limit.
+    /// Only a missing TextPattern is reported as `None`.
+    pub fn bounded_text_selection(
+        &self,
+        element: &UiaElementRef,
+        maximum_utf16: u32,
+    ) -> Result<Option<(usize, usize)>, Failure> {
+        self.text_selection_with_limit(element, maximum_utf16.min(64 * 1024), true)
+    }
+
+    fn text_selection_with_limit(
+        &self,
+        element: &UiaElementRef,
+        maximum_utf16: u32,
+        check_document: bool,
+    ) -> Result<Option<(usize, usize)>, Failure> {
         let Some(text) = self.pattern(element, UIA_TextPatternId, Some(&IID_TEXT))? else {
             return Ok(None);
         };
@@ -370,16 +389,23 @@ impl ScopedUia {
         self.prepare()?;
         // IUIAutomationTextRangeArray::get_Length has an int out parameter.
         if self.source.element_i32(&selections, 3)? != 1 {
-            return Ok(None);
+            return if check_document {
+                Err(Failure::PlatformReadFailed)
+            } else {
+                Ok(None)
+            };
         }
         let selection = self.first_range(&selections)?;
         let document = self
             .interface(&text, 7)?
             .ok_or(Failure::PlatformReadFailed)?;
+        if check_document {
+            self.text_length(&document, maximum_utf16)?;
+        }
         self.move_end_to_start(&document, &selection)?;
         Ok(Some((
-            self.text_length(&document)?,
-            self.text_length(&selection)?,
+            self.text_length(&document, maximum_utf16)?,
+            self.text_length(&selection, maximum_utf16)?,
         )))
     }
 
@@ -414,8 +440,7 @@ impl ScopedUia {
         hresult(result).map_err(|code| self.map(code))
     }
 
-    fn text_length(&self, range: &ComPtr) -> Result<usize, Failure> {
-        const MAX_UTF16: u32 = 64 * 1024;
+    fn text_length(&self, range: &ComPtr, maximum_utf16: u32) -> Result<usize, Failure> {
         self.prepare()?;
         type Method = unsafe extern "system" fn(*mut c_void, i32, *mut BSTR) -> HRESULT;
         let mut value = ptr::null();
@@ -423,13 +448,13 @@ impl ScopedUia {
         // writable BSTR out pointer; its successful response transfers ownership.
         let result = unsafe {
             let method: Method = mem::transmute(range.slot(12));
-            method(range.as_raw(), (MAX_UTF16 + 1) as i32, &mut value)
+            method(range.as_raw(), (maximum_utf16 + 1) as i32, &mut value)
         };
         hresult(result).map_err(|code| self.map(code))?;
         let text = OwnedBstr(value);
         // SAFETY: The owned BSTR stays live for the call; null has length zero.
         let len = unsafe { SysStringLen(text.0) };
-        if len > MAX_UTF16 {
+        if len > maximum_utf16 {
             return Err(Failure::TreeExceedsBound);
         }
         Ok(len as usize)

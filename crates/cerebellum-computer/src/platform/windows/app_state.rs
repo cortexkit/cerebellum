@@ -164,6 +164,43 @@ fn operation<T: Send + 'static>(
     })
 }
 
+pub(super) struct InputFocus {
+    pub element: ElementHandle,
+    pub caret: Option<(usize, usize)>,
+}
+
+/// Resolve live Windows UI Automation focus inside the bound HWND. A
+/// protected or unclassifiable element never supplies document text.
+pub(super) fn input_focus(
+    pid: u32,
+    generation: u64,
+    hwnd: u32,
+    proof: FrameProof,
+    caret_limit: Option<u32>,
+    end: Instant,
+) -> ReadResult<InputFocus> {
+    operation(pid, generation, end, move |uia, process| {
+        let window = bound_window(process, pid, hwnd)?
+            .filter(|candidate| candidate.proof == proof)
+            .ok_or(ReadError::Gone)?;
+        let (_, thread) = window.proof.content_window_and_thread();
+        let native =
+            cerebellum_windows::gui_thread_windows(thread).map_err(|_| ReadError::Unreadable)?;
+        let scope = UiWindow::new(uia, process, pid, generation, &window)?;
+        let element = scope.focused(native.focus)?.ok_or(ReadError::Unreadable)?;
+        let found = scope.find(&element_token(&element)?.key)?;
+        let caret = scope.input_selection(&found, caret_limit)?;
+        scope.confirm()?;
+        if cerebellum_windows::gui_thread_windows(thread)
+            .is_ok_and(|current| current.focus == native.focus && current.active == native.active)
+        {
+            Ok(InputFocus { element, caret })
+        } else {
+            Err(ReadError::Unreadable)
+        }
+    })
+}
+
 #[derive(Clone)]
 pub struct WindowsAppStateSource {
     cache: Arc<Mutex<WindowCache>>,

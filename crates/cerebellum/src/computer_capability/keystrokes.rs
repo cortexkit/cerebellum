@@ -7,8 +7,247 @@ use cerebellum_computer::app_state::source::{
     AppStateSource, ElementHandle, RawElement, ReadBounds,
 };
 use cerebellum_computer::dispatch::{BracketReport, BracketStop, DispatchError, RestoreStatus};
-use cerebellum_computer::platform::{HeldStateDisposition, ProcessEventRefusal, ProcessGrant};
+use cerebellum_computer::platform::{
+    HeldStateDisposition, PlatformDriver, ProcessEventRefusal, ProcessGrant,
+};
 use serde_json::{json, Value};
+
+pub(super) fn application_route<D: PlatformDriver>(
+    admission: super::fronting::Admission,
+    frontmost: bool,
+    shortcut: bool,
+    system_wide: bool,
+) -> super::fronting::ChordRoute {
+    use super::fronting::chord_route;
+    if cfg!(windows) && D::uses_windows_input_bracket() {
+        // Windows cannot deliver per process. An attended app grant may
+        // use the temporary bracket, never app-use foreground mode.
+        return chord_route(
+            super::fronting::Admission {
+                app_use_fronting_admitted: admission.bracket_admitted,
+                ..admission
+            },
+            false,
+            true,
+            system_wide,
+        );
+    }
+    chord_route(admission, frontmost, shortcut, system_wide)
+}
+
+pub(super) fn windows_input_detail(object: &serde_json::Map<String, Value>) -> bool {
+    cfg!(windows)
+        && object
+            .get("detail")
+            .and_then(|detail| detail.get("reason"))
+            .and_then(Value::as_str)
+            .is_some_and(|reason| {
+                matches!(
+                    reason,
+                    "observer_lost"
+                        | "person_active"
+                        | "foreground_changed"
+                        | "target_elevated"
+                        | "secure_field_focused"
+                        | "focus_unreadable"
+                        | "focus_changed"
+                        | "caret_changed"
+                        | "caret_unavailable"
+                        | "caret_too_long"
+                        | "grapheme_too_long"
+                        | "held_input_unconfirmed"
+                        | "piece_uncertain"
+                        | "input_empty"
+                        | "input_unsupported"
+                        | "key_unsupported"
+                )
+            })
+}
+
+#[cfg(windows)]
+pub(super) fn windows_chord_refusal<D: PlatformDriver>(
+    key: cerebellum_computer::platform::synthetic::SyntheticKey,
+    modifiers: cerebellum_computer::platform::synthetic::SyntheticKeyModifiers,
+) -> Option<Value> {
+    (D::uses_windows_input_bracket() && !cerebellum_computer::platform::windows::fronting::chord_supported(key, modifiers)).then(|| json!({
+        "outcome": "synthetic_unavailable",
+        "reason": "key_unsupported",
+        "remedy": "Windows app-scoped input cannot deliver this chord. Use an application control instead.",
+    }))
+}
+
+#[cfg(windows)]
+pub(super) fn windows_input_reply<D: PlatformDriver>(
+    reply: &mut Value,
+    hooks: Option<&super::fronting::CellHooks>,
+    bracket: Option<&BracketReport>,
+    typed_text: Option<String>,
+) -> Option<String> {
+    if D::uses_windows_input_bracket()
+        && apply_windows_input_result(
+            reply,
+            hooks.and_then(super::fronting::CellHooks::input_progress),
+            bracket,
+        )
+    {
+        None
+    } else {
+        typed_text
+    }
+}
+
+#[cfg(windows)]
+fn apply_windows_input_result(
+    reply: &mut Value,
+    progress: Option<cerebellum_computer::platform::WindowsInputProgress>,
+    bracket: Option<&BracketReport>,
+) -> bool {
+    let failure = bracket.and_then(|report| match report.stop.as_ref()? {
+        BracketStop::PostFailed(failure) => Some(failure),
+        _ => None,
+    });
+    if let Some(cerebellum_computer::platform::process_event::SequencePostFailure {
+        refusal: ProcessEventRefusal::WindowServerUnreadable { reason },
+        held_state,
+        ..
+    }) = failure
+    {
+        let outcome = match reason.as_str() {
+            "secure_field_focused" | "focus_unreadable" => "secure_field_refused",
+            "person_active" => "state_changed_by_person",
+            "observer_lost" => "observer_unavailable",
+            "held_input_unconfirmed" => "held_state_unknown",
+            _ if *held_state == HeldStateDisposition::Unknown => "held_state_unknown",
+            _ => "dispatch_failed",
+        };
+        if reply["outcome"] != "restore_failed" {
+            reply["outcome"] = json!(outcome);
+        }
+        reply["reason"] = json!(reason);
+        reply["detail"] = json!({
+            "reason": reason,
+            "held_state": match held_state {
+                HeldStateDisposition::NoneHeld => "none_held",
+                HeldStateDisposition::Released { .. } => "released",
+                HeldStateDisposition::Unknown => "unknown",
+            },
+        });
+    }
+    let Some(progress) = progress else {
+        return false;
+    };
+    if reply["outcome"] == "delivery_unconfirmed"
+        && progress.confirmed != 0
+        && progress.unverified == 0
+        && progress.uncertain.is_none()
+    {
+        reply["outcome"] = json!("completed");
+        reply["effect_status"] = json!("effect_observed");
+    }
+    let mut summary = format!(
+        "Confirmed pieces: {}; unverified pieces: {}.",
+        progress.confirmed, progress.unverified
+    );
+    if let Some(piece) = progress.uncertain {
+        summary.push_str(&format!(
+            " Piece {piece} may have been partly delivered; do not replay it."
+        ));
+    }
+    if progress.person_input_swallowed {
+        summary.push_str(" A person's input event stopped the sequence and was not delivered.");
+        if reply["outcome"] != "restore_failed" {
+            reply["outcome"] = json!("state_changed_by_person");
+        }
+    }
+    if let Some(remedy) = reply["remedy"].as_str() {
+        summary.push(' ');
+        summary.push_str(remedy);
+    }
+    reply["remedy"] = json!(summary);
+    // Only the bracket's in-front caret check is consumption evidence. A
+    // later read from the background cannot upgrade a Windows input result.
+    true
+}
+
+#[cfg(all(windows, test))]
+mod windows_result_tests {
+    use super::*;
+    use cerebellum_computer::platform::{
+        vocabulary::validate_capability_result, WindowsInputProgress,
+    };
+
+    #[test]
+    fn windows_chord_refusal_is_selected_by_the_driver_not_the_host() {
+        use cerebellum_computer::platform::{
+            synthetic::{SyntheticKey, SyntheticKeyModifiers},
+            windows::WindowsPlatformDriver,
+            UnsupportedPlatformDriver,
+        };
+
+        let modifiers = SyntheticKeyModifiers {
+            command: true,
+            ..SyntheticKeyModifiers::NONE
+        };
+        let refusal = windows_chord_refusal::<WindowsPlatformDriver>(SyntheticKey::C, modifiers)
+            .expect("the native driver has no Windows mapping for Command");
+        assert_eq!(refusal["reason"], "key_unsupported");
+        assert!(
+            windows_chord_refusal::<UnsupportedPlatformDriver>(SyntheticKey::C, modifiers)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn windows_input_reports_only_confirmed_caret_consumption_as_completed() {
+        for (progress, outcome, capability) in [
+            (
+                WindowsInputProgress {
+                    confirmed: 2,
+                    ..Default::default()
+                },
+                "completed",
+                "computer.type",
+            ),
+            (
+                WindowsInputProgress {
+                    unverified: 1,
+                    ..Default::default()
+                },
+                "delivery_unconfirmed",
+                "computer.keys",
+            ),
+            (
+                WindowsInputProgress {
+                    person_input_swallowed: true,
+                    uncertain: Some(2),
+                    confirmed: 1,
+                    ..Default::default()
+                },
+                "state_changed_by_person",
+                "computer.type",
+            ),
+        ] {
+            let mut reply = super::super::synthetic_success_reply(
+                "global_none",
+                true,
+                "effect_indeterminate",
+                None,
+            );
+            assert!(apply_windows_input_result(&mut reply, Some(progress), None));
+            assert_eq!(reply["outcome"], outcome);
+            assert_eq!(
+                reply["effect_status"],
+                if outcome == "completed" {
+                    "effect_observed"
+                } else {
+                    "effect_indeterminate"
+                }
+            );
+            validate_capability_result(capability, &super::super::synthetic_wire_envelope(reply))
+                .unwrap();
+        }
+    }
+}
 
 /// Mark a keystroke refusal as one that made no post call at all.
 ///

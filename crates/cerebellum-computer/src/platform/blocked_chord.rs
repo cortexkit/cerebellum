@@ -49,8 +49,8 @@ pub struct BlockedChord {
 /// controls by role and title. A title list would be English-only coverage.
 ///
 /// macOS eject and power keys are intentionally absent because `SyntheticKey`
-/// has no neutral name for either key. Windows Ctrl+Alt+Delete is absent because
-/// user-mode synthesis cannot deliver the secure-attention sequence.
+/// has no neutral name for either key. Windows Ctrl+Alt+Delete is blocked at
+/// request admission even though user-mode synthesis cannot deliver it.
 pub const BLOCKED_CHORDS: &[BlockedChord] = &[
     // Ends the macOS session by locking the screen.
     BlockedChord {
@@ -150,6 +150,30 @@ pub const BLOCKED_CHORDS: &[BlockedChord] = &[
         },
         key: BlockedKey::Synthetic(SyntheticKey::L),
         reason: "lock",
+    },
+    BlockedChord {
+        platform: BlockedChordPlatform::Windows,
+        chord: &["control", "option", "forward_delete"],
+        modifiers: modifiers(false, true, true, false),
+        key: BlockedKey::Synthetic(SyntheticKey::ForwardDelete),
+        reason: "logout",
+    },
+    BlockedChord {
+        platform: BlockedChordPlatform::Windows,
+        chord: &["control", "option", "end"],
+        modifiers: modifiers(false, true, true, false),
+        key: BlockedKey::Synthetic(SyntheticKey::End),
+        reason: "logout",
+    },
+    BlockedChord {
+        platform: BlockedChordPlatform::Windows,
+        chord: &["windows", "x"],
+        modifiers: SyntheticKeyModifiers {
+            windows: true,
+            ..SyntheticKeyModifiers::NONE
+        },
+        key: BlockedKey::Synthetic(SyntheticKey::X),
+        reason: "logout",
     },
     linux_chord(
         &["option", "sysrq", "any"],
@@ -253,7 +277,8 @@ const fn linux_keysym(
     )
 }
 
-/// Return the session-ending chord that exactly matches a synthetic key and modifiers.
+/// Return the session-ending chord matching a synthetic key and modifiers.
+/// Windows blocks listed chords even with additional modifiers held.
 /// Linux delivery must use [`linux_blocked_chord`] to check keysyms and held keys too.
 pub fn blocked_chord(
     modifiers: SyntheticKeyModifiers,
@@ -262,9 +287,44 @@ pub fn blocked_chord(
 ) -> Option<&'static BlockedChord> {
     BLOCKED_CHORDS.iter().find(|blocked| {
         blocked.platform == platform
-            && blocked.modifiers == modifiers
             && blocked.key == BlockedKey::Synthetic(key)
+            && (if platform == BlockedChordPlatform::Windows {
+                includes_modifiers(modifiers, blocked.modifiers)
+            } else {
+                blocked.modifiers == modifiers
+            })
     })
+}
+
+fn includes_modifiers(actual: SyntheticKeyModifiers, required: SyntheticKeyModifiers) -> bool {
+    (!required.command || actual.command)
+        && (!required.control || actual.control)
+        && (!required.option || actual.option)
+        && (!required.shift || actual.shift)
+        && (!required.windows || actual.windows)
+}
+
+const WINDOWS_DESKTOP_CHORDS: &[(SyntheticKey, SyntheticKeyModifiers)] = &[
+    (SyntheticKey::Tab, modifiers(false, false, true, false)),
+    (SyntheticKey::Escape, modifiers(false, false, true, false)),
+    (SyntheticKey::Escape, modifiers(false, true, false, false)),
+];
+
+/// The Windows app bracket has no desktop-wide key route. Win by itself
+/// cannot be represented as a non-modifier key; a Win modifier never passes.
+pub fn windows_app_chord_supported(
+    modifiers: SyntheticKeyModifiers,
+    key: SyntheticKey,
+    is_desktop: bool,
+) -> bool {
+    !modifiers.windows
+        && !modifiers.command
+        && !(is_desktop && modifiers.option && key == SyntheticKey::F4)
+        && !WINDOWS_DESKTOP_CHORDS
+            .iter()
+            .any(|(desktop_key, required)| {
+                *desktop_key == key && includes_modifiers(modifiers, *required)
+            })
 }
 
 /// The key the Linux planner resolved, not the name in the request.
@@ -623,8 +683,7 @@ pub const SYSTEM_WIDE_CHORDS: &[SystemWideChord] = &[
 ];
 
 /// The system-wide chord that exactly matches this platform and input:
-/// the same exact-modifier matching as [`blocked_chord`], so Command-Shift-Tab
-/// is not taken for Command-Tab or the other way round.
+/// Command-Shift-Tab is not taken for Command-Tab or the other way round.
 pub fn system_wide_chord(
     modifiers: SyntheticKeyModifiers,
     key: SyntheticKey,
@@ -638,6 +697,93 @@ pub fn system_wide_chord(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const WIN: SyntheticKeyModifiers = SyntheticKeyModifiers {
+        windows: true,
+        ..SyntheticKeyModifiers::NONE
+    };
+
+    fn windows_floor(modifiers: SyntheticKeyModifiers, key: SyntheticKey) {
+        assert!(blocked_chord(modifiers, key, BlockedChordPlatform::Windows).is_some());
+        assert!(blocked_chord(
+            SyntheticKeyModifiers::NONE,
+            key,
+            BlockedChordPlatform::Windows
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn windows_floor_blocks_win_l() {
+        windows_floor(WIN, SyntheticKey::L);
+    }
+
+    #[test]
+    fn windows_floor_blocks_win_shift_l() {
+        windows_floor(
+            SyntheticKeyModifiers { shift: true, ..WIN },
+            SyntheticKey::L,
+        );
+    }
+
+    #[test]
+    fn windows_floor_blocks_ctrl_alt_delete() {
+        windows_floor(CONTROL_OPTION, SyntheticKey::ForwardDelete);
+    }
+
+    #[test]
+    fn windows_floor_blocks_ctrl_alt_end() {
+        windows_floor(CONTROL_OPTION, SyntheticKey::End);
+    }
+
+    #[test]
+    fn windows_floor_blocks_win_x() {
+        windows_floor(WIN, SyntheticKey::X);
+    }
+
+    #[test]
+    fn windows_app_scope_refuses_the_win_modifier_and_unmapped_command() {
+        assert!(!windows_app_chord_supported(WIN, SyntheticKey::R, false));
+        assert!(!windows_app_chord_supported(
+            COMMAND,
+            SyntheticKey::A,
+            false
+        ));
+    }
+
+    #[test]
+    fn windows_app_scope_refuses_alt_tab_and_alt_escape() {
+        let alt = modifiers(false, false, true, false);
+        assert!(!windows_app_chord_supported(alt, SyntheticKey::Tab, false));
+        assert!(!windows_app_chord_supported(
+            alt,
+            SyntheticKey::Escape,
+            false
+        ));
+        assert!(windows_app_chord_supported(alt, SyntheticKey::A, false));
+    }
+
+    #[test]
+    fn windows_app_scope_refuses_ctrl_escape_and_ctrl_shift_escape() {
+        assert!(!windows_app_chord_supported(
+            CONTROL,
+            SyntheticKey::Escape,
+            false
+        ));
+        let shifted = modifiers(false, true, false, true);
+        assert!(!windows_app_chord_supported(
+            shifted,
+            SyntheticKey::Escape,
+            false
+        ));
+    }
+
+    #[test]
+    fn windows_app_scope_refuses_alt_f4_on_the_desktop() {
+        let alt = modifiers(false, false, true, false);
+        assert!(!windows_app_chord_supported(alt, SyntheticKey::F4, true));
+        assert!(windows_app_chord_supported(alt, SyntheticKey::F4, false));
+    }
 
     #[test]
     fn every_listed_chord_is_found_only_on_its_platform() {

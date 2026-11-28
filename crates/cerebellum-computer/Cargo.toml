@@ -30,6 +30,7 @@ cerebellum-macos = { path = "../cerebellum-macos" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 cerebellum-windows = { path = "../cerebellum-windows" }
+unicode-segmentation = "=1.12.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cerebellum-linux = { path = "../cerebellum-linux" }
