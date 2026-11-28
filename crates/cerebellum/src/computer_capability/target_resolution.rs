@@ -8,6 +8,13 @@ where
     S: JournalStorage + Send + 'static,
     D: PlatformDriver + 'static,
 {
+    pub(super) fn uses_linux_semantics(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.linux_session.is_some();
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     pub(super) fn target_syntax(&self) -> TargetSyntax {
         #[cfg(target_os = "linux")]
         if self.linux_session.is_some() {

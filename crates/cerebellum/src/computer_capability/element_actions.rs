@@ -666,6 +666,95 @@ pub(crate) async fn admit_session_app(
     SessionAdmission::Admitted(grant, admission)
 }
 
+#[cfg(target_os = "linux")]
+fn addressed_floor<R: Redactor, T: SeverityTaxonomy, S: JournalStorage>(
+    source: &dyn AppStateSource,
+    journal: &mut ElementJournal<'_, R, T, S>,
+    handle: &ElementHandle,
+    writing: bool,
+) -> Option<Value> {
+    let reason = source.semantic_action_floor(handle, writing).err()?;
+    let reply = super::linux::semantic_element_refusal(reason);
+    Some(
+        if journal
+            .refused(
+                journal_role(None),
+                reply["outcome"].as_str().expect("refusal outcome"),
+            )
+            .is_ok()
+        {
+            reply
+        } else {
+            audit_unavailable_reply(false)
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn check_linux_semantic_state<R: Redactor, T: SeverityTaxonomy, S: JournalStorage>(
+    source: &dyn AppStateSource,
+    journal: &mut ElementJournal<'_, R, T, S>,
+    sessions: &AppStateSessions,
+    conversation: &str,
+    grant: &ProcessGrant,
+    handle: &ElementHandle,
+    writing: bool,
+) -> Option<Value> {
+    use cerebellum_computer::platform::linux::Source;
+    use sha2::{Digest, Sha256};
+
+    Source::token_grant(handle)?;
+    if let Some(reply) = addressed_floor(source, journal, handle, writing) {
+        return Some(reply);
+    }
+    let now = SeenMarks::read(source, grant);
+    let seen = sessions.last_seen(conversation, grant);
+    let readable = |marks: &SeenMarks| {
+        matches!(
+            (&marks.focused, &marks.window),
+            (Reading::Read(_), Reading::Read(_))
+        )
+    };
+    let reply = if !readable(&now) || seen.as_ref().is_none_or(|marks| !readable(marks)) {
+        super::linux::semantic_element_refusal("focus_unreadable")
+    } else if let Some(change) = seen.as_ref().and_then(|seen| person_change(seen, &now, false, None)) {
+        state_changed_by_person_reply(&grant.bundle_identity, change)
+    } else if writing && sessions.atspi_text_digest(conversation, grant, handle).is_some_and(|expected| {
+        !matches!(source.text_value(handle), Ok(Some(text)) if <[u8; 32]>::from(Sha256::digest(text.as_bytes())) == expected)
+    }) {
+        json!({"outcome": "state_changed_by_person", "reason": "readback_mismatch",
+            "remedy": "the element's value no longer matches the last read; read it again before writing"})
+    } else {
+        return None;
+    };
+    Some(
+        if journal
+            .refused(
+                journal_role(None),
+                reply["outcome"].as_str().expect("refusal outcome"),
+            )
+            .is_ok()
+        {
+            reply
+        } else {
+            audit_unavailable_reply(false)
+        },
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_linux_semantic_state<R: Redactor, T: SeverityTaxonomy, S: JournalStorage>(
+    _source: &dyn AppStateSource,
+    _journal: &mut ElementJournal<'_, R, T, S>,
+    _sessions: &AppStateSessions,
+    _conversation: &str,
+    _grant: &ProcessGrant,
+    _handle: &ElementHandle,
+    _writing: bool,
+) -> Option<Value> {
+    None
+}
+
 /// The role as the journal may record it: an accessibility role constant, or
 /// `AXUnknown`. A role is a string the application supplies, and the journal
 /// never records application text.
@@ -1059,6 +1148,10 @@ where
     T: SeverityTaxonomy,
     S: JournalStorage,
 {
+    #[cfg(target_os = "linux")]
+    if let Some(reply) = addressed_floor(source, journal, handle, false) {
+        return reply;
+    }
     let facts = match source.element_facts(handle) {
         Ok(facts) if facts.pid.is_none_or(|pid| pid == grant.pid) => facts,
         _ => return stale_element_reply(),
@@ -1133,6 +1226,17 @@ where
             }),
         ),
         Err(ElementActionError::Gone) => ("stale_element", stale_element_reply()),
+        #[cfg(target_os = "linux")]
+        Err(ElementActionError::PlatformRefused(reason)) => {
+            let reply = super::linux::semantic_element_refusal(reason);
+            if journal
+                .outcome(token, reply["outcome"].as_str().expect("refusal outcome"))
+                .is_err()
+            {
+                return audit_unavailable_reply(true);
+            }
+            return reply;
+        }
         Err(_) => (
             "no_press_action",
             json!({
@@ -1211,6 +1315,10 @@ where
         target: _,
     } = request;
     let (element_id, text, mode) = (element_id.as_str(), text.as_str(), *mode);
+    #[cfg(target_os = "linux")]
+    if let Some(reply) = addressed_floor(source, journal, handle, true) {
+        return reply;
+    }
     let facts = match source.element_facts(handle) {
         Ok(facts) if facts.pid.is_none_or(|pid| pid == grant.pid) => facts,
         _ => return stale_element_reply(),
@@ -1291,6 +1399,17 @@ where
     let (written, background_change) = windows_background::sample_mutation(write);
     #[cfg(not(windows))]
     let written = write();
+    #[cfg(target_os = "linux")]
+    if let Err(ElementActionError::PlatformRefused(reason)) = written {
+        let reply = super::linux::semantic_element_refusal(reason);
+        if journal
+            .outcome(token, reply["outcome"].as_str().expect("refusal outcome"))
+            .is_err()
+        {
+            return audit_unavailable_reply(true);
+        }
+        return reply;
+    }
     journal.effects.sample(source, grant);
     let deadline = Instant::now() + readback_bound;
     let confirmed = written.is_ok()
@@ -2145,20 +2264,17 @@ where
                     return PressDone::alone(previous_run_reply())
                 }
             };
-        if let Some(refusal) = self.check_target(target, &bundle_identity, pid).await {
+        let binding = ProcessGrant {
+            pid,
+            bundle_identity,
+            process_generation_evidence: generation,
+        };
+        if let Some(refusal) = self.check_element_target(target, &binding).await {
             return PressDone::alone(refusal);
         }
-        let (grant, admission) = match admit_session_app(
-            management,
-            &self.process_executable,
-            &consent,
-            &cancel,
-            &bundle_identity,
-            pid,
-            &generation,
-            false,
-        )
-        .await
+        let (grant, admission) = match self
+            .admit_element_session(management, &consent, &cancel, binding)
+            .await
         {
             SessionAdmission::Admitted(grant, admission) => (grant, admission),
             SessionAdmission::Gone => return PressDone::alone(stale_element_reply()),
@@ -2167,12 +2283,14 @@ where
         if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
             return PressDone::alone(locked);
         }
-        if let Some(mut refusal) = self
-            .refuse_if_person_changed(management, &conversation_key, &grant)
-            .await
-        {
-            admission.decorate(&mut refusal);
-            return PressDone::alone(refusal);
+        if !self.uses_linux_semantics() {
+            if let Some(mut refusal) = self
+                .refuse_if_person_changed(management, &conversation_key, &grant)
+                .await
+            {
+                admission.decorate(&mut refusal);
+                return PressDone::alone(refusal);
+            }
         }
         let mut done = self
             .press_and_diff(
@@ -2340,23 +2458,20 @@ where
                 // was never shown; it names nothing writable.
                 _ => return stale_element_reply(),
             };
+        let binding = ProcessGrant {
+            pid,
+            bundle_identity: bundle_identity.clone(),
+            process_generation_evidence: generation,
+        };
         if let Some(refusal) = self
-            .check_target(parsed.target.clone(), &bundle_identity, pid)
+            .check_element_target(parsed.target.clone(), &binding)
             .await
         {
             return refusal;
         }
-        let (grant, admission) = match admit_session_app(
-            management,
-            &self.process_executable,
-            &consent,
-            &cancel,
-            &bundle_identity,
-            pid,
-            &generation,
-            false,
-        )
-        .await
+        let (grant, admission) = match self
+            .admit_element_session(management, &consent, &cancel, binding)
+            .await
         {
             SessionAdmission::Admitted(grant, admission) => (grant, admission),
             SessionAdmission::Gone => return stale_element_reply(),
@@ -2365,19 +2480,21 @@ where
         if let Some(locked) = self.locked_after_wait(admission.waited, &admission) {
             return locked;
         }
-        if let Some(mut refusal) = self
-            .refuse_if_person_changed(management, &conversation_key, &grant)
-            .await
-        {
-            admission.decorate(&mut refusal);
-            return refusal;
+        if !self.uses_linux_semantics() {
+            if let Some(mut refusal) = self
+                .refuse_if_person_changed(management, &conversation_key, &grant)
+                .await
+            {
+                admission.decorate(&mut refusal);
+                return refusal;
+            }
         }
         let work = super::quarantine::CallWork::current();
         if let Some(mut busy) = work.bind(&self.serializer.quarantine, &grant).await {
             admission.decorate(&mut busy);
             return busy;
         }
-        if parsed.mode == WriteMode::ReplaceValue {
+        if parsed.mode == WriteMode::ReplaceValue && !self.uses_linux_semantics() {
             let source = self.app_state_source.clone();
             let check_grant = grant.clone();
             let check_handle = handle.clone();
@@ -2482,14 +2599,25 @@ where
             let _scope = AccessibilityReadScope::new(grant.pid, None);
             let mut journal =
                 ElementJournal::new(audit, identity, ComputerCapability::WriteText, &grant);
-            let written = write_blocking(
+            let refusal = check_linux_semantic_state(
                 source.as_ref(),
                 &mut journal,
+                &sessions,
+                &conversation_key,
                 &grant,
                 &handle,
-                &parsed,
-                settle,
+                true,
             );
+            let written = refusal.unwrap_or_else(|| {
+                write_blocking(
+                    source.as_ref(),
+                    &mut journal,
+                    &grant,
+                    &handle,
+                    &parsed,
+                    settle,
+                )
+            });
             let mut reply = if gate.refused_for_end() {
                 cancelled_before_dispatch_reply()
             } else {
@@ -2652,6 +2780,74 @@ where
         (!matches).then(|| target_mismatch_reply(&target))
     }
 
+    async fn check_element_target(
+        &self,
+        target: Option<String>,
+        binding: &ProcessGrant,
+    ) -> Option<Value> {
+        #[cfg(target_os = "linux")]
+        if let Some(session) = &self.linux_session {
+            if let Err(reason) = session.verify_bound(binding).await {
+                return Some(super::linux::semantic_element_refusal(reason));
+            }
+            let target = target?;
+            return match session.select(&target).await {
+                Ok((current, _)) if &current == binding => None,
+                Err(reply) if reply["reason"] == "operator_app_blocked" => Some(reply),
+                Err(reply) if reply["reason"] == "ambiguous_app" => Some(json!({
+                    "outcome": "target_mismatch", "reason": "ambiguous_app",
+                    "remedy": "choose an application name that matches just one running instance"})),
+                _ => Some(target_mismatch_reply(&target)),
+            };
+        }
+        self.check_target(target, &binding.bundle_identity, binding.pid)
+            .await
+    }
+
+    async fn admit_element_session(
+        &self,
+        management: &ManagementPlane,
+        consent: &ConsentContext,
+        cancel: &CancelHandle,
+        binding: ProcessGrant,
+    ) -> SessionAdmission {
+        #[cfg(target_os = "linux")]
+        if let Some(session) = &self.linux_session {
+            return match session
+                .admit_bound(management, binding, None, consent, cancel)
+                .await
+            {
+                Ok((grant, admission)) => SessionAdmission::Admitted(grant, admission),
+                Err(crate::management::AppRefusal::Resolution(reply)) => {
+                    let reason = match reply["reason"].as_str() {
+                        Some("no_supported_session") => "no_supported_session",
+                        Some("operator_app_blocked") => "operator_app_blocked",
+                        _ if reply["outcome"] == "screen_locked" => "screen_locked",
+                        _ => "stale_reference",
+                    };
+                    SessionAdmission::Refused(super::linux::semantic_element_refusal(reason))
+                }
+                Err(crate::management::AppRefusal::Consent(ConsentRefusal::Cancelled)) => {
+                    SessionAdmission::Refused(cancelled_before_dispatch_reply())
+                }
+                Err(crate::management::AppRefusal::Consent(refusal)) => {
+                    SessionAdmission::Refused(refusal.reply(None))
+                }
+            };
+        }
+        admit_session_app(
+            management,
+            &self.process_executable,
+            consent,
+            cancel,
+            &binding.bundle_identity,
+            binding.pid,
+            &binding.process_generation_evidence,
+            false,
+        )
+        .await
+    }
+
     /// Press an element and, when the press went through, wait for its effect
     /// and add the diff. The press waits for the agent's badge to reach the
     /// element first, so the badge's tap and the press happen together.
@@ -2776,6 +2972,15 @@ where
                 let _ax = work.bound_ax();
                 let _scope = AccessibilityReadScope::new(grant.pid, None);
                 let mut journal = ElementJournal::new(audit, identity, capability, &grant);
+                #[cfg(target_os = "linux")]
+                if let Some(reply) = addressed_floor(source.as_ref(), &mut journal, &handle, false)
+                {
+                    return Some(if journal.finish().is_ok() {
+                        reply
+                    } else {
+                        audit_unavailable_reply(false)
+                    });
+                }
                 let refusal = match source.element_facts(&handle) {
                     Ok(facts) if facts.pid.is_none_or(|pid| pid == grant.pid) => {
                         press_available(source.as_ref(), &facts, &handle, capability)
@@ -2952,14 +3157,25 @@ where
                 journal.set_fronting(record);
             }
             let press_at = Instant::now();
-            let mut reply = press_blocking(
+            let refusal = check_linux_semantic_state(
                 source.as_ref(),
                 &mut journal,
+                &sessions,
+                &identity.conversation_key,
                 &grant,
-                &element_id,
                 &handle,
-                imaged_window,
+                false,
             );
+            let mut reply = refusal.unwrap_or_else(|| {
+                press_blocking(
+                    source.as_ref(),
+                    &mut journal,
+                    &grant,
+                    &element_id,
+                    &handle,
+                    imaged_window,
+                )
+            });
             if gate.refused_for_end() {
                 reply = cancelled_before_dispatch_reply();
             }

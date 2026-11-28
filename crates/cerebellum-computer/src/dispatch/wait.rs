@@ -150,6 +150,10 @@ fn readback_failure_reason(error: &DriverError) -> &'static str {
         DriverError::WindowVisibilityUnknown { .. } => "window_visibility_unknown",
         DriverError::Unsupported(_) => "scoped_read_unsupported",
         DriverError::InvalidRequest(_) => "invalid_scoped_read",
+        #[cfg(target_os = "linux")]
+        DriverError::StartupRefused(
+            reason @ ("stale_reference" | "no_supported_session" | "screen_locked"),
+        ) => reason,
         DriverError::StartupRefused(_) => "platform_startup_refused",
         DriverError::EventConstructionFailed(_) => "event_construction_failed",
         DriverError::SyntheticDispatchFailed(_) => "synthetic_dispatch_failed",
@@ -225,6 +229,21 @@ pub fn wait_until_predicate<P: PredicatePoller>(
             // only a wait that reaches its deadline without ever completing a
             // read reports that it could not look.
             Err(reason) => {
+                #[cfg(target_os = "linux")]
+                if matches!(
+                    reason.as_str(),
+                    "stale_reference" | "no_supported_session" | "screen_locked"
+                ) {
+                    return WaitResult {
+                        outcome: WaitOutcome::Indeterminate,
+                        evidence: WaitEvidence::Indeterminate {
+                            predicate,
+                            readback: None,
+                            reason,
+                        },
+                        attempts,
+                    };
+                }
                 last_read_failure = Some(reason);
                 if poller.elapsed() >= timeout {
                     break;

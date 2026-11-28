@@ -408,6 +408,8 @@ impl ElementFacts {
 /// Why an action on an element did not happen or could not be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElementActionError {
+    /// A platform-specific safety check refused before posting.
+    PlatformRefused(&'static str),
     /// This process may not use the accessibility API.
     NotPermitted,
     /// The element or its application no longer exists.
@@ -470,6 +472,16 @@ pub trait CursorWindowWatch: Send {
 /// Everything but the read has a refusing default, so a platform or fixture
 /// that only reads still compiles and every action on it is refused by name.
 pub trait AppStateSource: Send + Sync {
+    /// Check whether this element can be acted on without touching a password,
+    /// payment field or other input the platform cannot classify safely.
+    fn semantic_action_floor(
+        &self,
+        _element: &ElementHandle,
+        _writing: bool,
+    ) -> Result<(), &'static str> {
+        Ok(())
+    }
+
     /// A title and secure-field flag, without reading the element's value.
     fn cursor_label(&self, element: &ElementHandle) -> Option<(Option<String>, bool)> {
         let facts = self.element_facts(element).ok()?;
