@@ -301,6 +301,7 @@ fn slowest(samples: &Mutex<VecDeque<u64>>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cerebellum_computer::fronting_clock::{advance, FakeClock};
 
     #[test]
     fn the_reserve_tail_counts_thread_setup_and_only_the_late_part_of_owner_work() {
@@ -315,39 +316,35 @@ mod tests {
 
     #[test]
     fn a_sample_covers_the_preparation_but_not_the_wait_before_it() {
-        let entered = Instant::now();
-        let deadline = entered + Duration::from_secs(60);
-        let mut guard = WriteDeadline::new(deadline, Some(deadline), entered, None);
-        // The decision waits for an unconfirmed activation first; that wait
-        // is not the restore's cost.
-        std::thread::sleep(Duration::from_millis(30));
-        guard.preparation_started();
-        let prepared_from = Instant::now();
-        // Its own reads and setup are.
-        std::thread::sleep(Duration::from_millis(15));
-        assert!(guard.permit(), "inside the deadline");
-        let sample = guard.sample_ms().expect("the write was reached");
-        let wait_and_preparation = Instant::now().duration_since(entered).as_millis() as u64;
-        assert!(sample >= 15, "the preparation counts: {sample}");
-        assert!(
-            sample < wait_and_preparation
-                && u128::from(sample)
-                    <= Instant::now().duration_since(prepared_from).as_millis() + 1,
-            "the wait before it does not: {sample} of {wait_and_preparation}"
-        );
+        let clock = FakeClock::frozen();
+        clock.run(|| {
+            let entered = clock.now();
+            let deadline = entered + Duration::from_secs(60);
+            let mut guard = WriteDeadline::new(deadline, Some(deadline), entered, None);
+            // Waiting for an unconfirmed activation is not the restore's
+            // cost. Its own reads and setup are.
+            assert!(advance(Duration::from_millis(30)));
+            guard.preparation_started();
+            assert!(advance(Duration::from_millis(15)));
+            assert!(guard.permit(), "inside the deadline");
+            assert_eq!(guard.sample_ms(), Some(15), "only preparation counts");
+        });
     }
 
     #[test]
     fn a_miss_found_before_the_write_counts_once_and_supplies_no_sample() {
-        let started = Instant::now();
-        let mut guard = WriteDeadline::new(started, Some(started), started, None);
-        std::thread::sleep(Duration::from_millis(2));
-        let before = expired_writes();
-        assert!(guard.missed(), "the deadline is behind the clock");
-        assert!(guard.missed(), "and stays missed");
-        assert!(!guard.permit(), "no write follows a miss");
-        assert!(expired_writes() > before);
-        assert_eq!(guard.sample_ms(), None, "no write was reached");
+        let clock = FakeClock::frozen();
+        clock.run(|| {
+            let started = clock.now();
+            let mut guard = WriteDeadline::new(started, Some(started), started, None);
+            assert!(advance(Duration::from_millis(2)));
+            let before = expired_writes();
+            assert!(guard.missed(), "the deadline is behind the clock");
+            assert!(guard.missed(), "and stays missed");
+            assert!(!guard.permit(), "no write follows a miss");
+            assert!(expired_writes() > before);
+            assert_eq!(guard.sample_ms(), None, "no write was reached");
+        });
     }
 
     #[test]

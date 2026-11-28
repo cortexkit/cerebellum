@@ -3,7 +3,7 @@
 //! calibration and be admitted, while the person's application is in fact
 //! slow to come back and the target's listing read stalls past the bound.
 //! The bound, stamped before the front, must still refuse the shortcut's key
-//! press, in real time, whatever the file said, and the bracket's one owner
+//! press, whatever the file said, and the bracket's one owner
 //! must restore as soon as the stalled read returns.
 
 use super::*;
@@ -13,6 +13,7 @@ use crate::dispatch::{
     RestoreStatus, SeizeWatcher, SourcedInputEvent, UnitPosted, UserIdleEstimator,
     OBSERVED_DISPATCH_IDLE_MS,
 };
+use crate::fronting_clock::{advance, now, FakeClock};
 use crate::platform::{
     post_event_sequence_fronted, PerProcessEventTransport, PostCallFailure, PostCallMade,
     ProcessEventTarget, ProcessGenerationReading, SyntheticStep, SyntheticStepRole, VisibilityMemo,
@@ -25,17 +26,14 @@ const PREVIOUS: u32 = 100;
 const TARGET: u32 = 200;
 const OUR_PID: i64 = 7;
 const GENERATION: u64 = 42;
-/// The bracket's bound, in real milliseconds.
+/// The bracket's bound, in milliseconds.
 const BOUND_MS: u64 = 200;
 /// The window server's listing of the target, read before the key press,
 /// takes longer than the whole bound.
 const LISTING_MS: u64 = 250;
 /// The person's application takes this long to come back once asked.
 const SLOW_RESTORE_MS: u64 = 150;
-/// What scheduling on a busy test machine may add to a real-time deadline.
-const SLACK_MS: u64 = 40;
-
-/// What the test watches, in real time.
+/// What the test watches on the bracket's clock.
 #[derive(Default)]
 struct Desk {
     frontmost: Option<u32>,
@@ -61,17 +59,17 @@ struct SlowRestorer {
 
 impl FrontingRestoreHost for SlowRestorer {
     fn now_ms(&mut self) -> u64 {
-        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+        u64::try_from(now().duration_since(self.started).as_millis()).unwrap()
     }
     fn pause_ms(&mut self, milliseconds: u64) {
-        std::thread::sleep(Duration::from_millis(milliseconds));
+        assert!(advance(Duration::from_millis(milliseconds)));
     }
     fn frontmost_pid(&mut self) -> Option<u32> {
         desk(&self.shared).frontmost
     }
     fn request_front(&mut self, pid: u32) -> bool {
-        desk(&self.shared).restore_requested_at.push(Instant::now());
-        std::thread::sleep(Duration::from_millis(SLOW_RESTORE_MS));
+        desk(&self.shared).restore_requested_at.push(now());
+        assert!(advance(Duration::from_millis(SLOW_RESTORE_MS)));
         desk(&self.shared).frontmost = Some(pid);
         true
     }
@@ -92,7 +90,7 @@ impl PerProcessEventTransport for Keyboard {
         ProcessGenerationReading::Started(GENERATION)
     }
     fn window_server_visibility(&mut self, _pid: u32) -> WindowServerVisibility {
-        std::thread::sleep(Duration::from_millis(LISTING_MS));
+        assert!(advance(Duration::from_millis(LISTING_MS)));
         WindowServerVisibility::Visible
     }
     fn post_to_pid(
@@ -100,13 +98,13 @@ impl PerProcessEventTransport for Keyboard {
         _pid: u32,
         event: &'static str,
     ) -> Result<PostCallMade, PostCallFailure> {
-        desk(&self.0).posted.push((event, Instant::now()));
+        desk(&self.0).posted.push((event, now()));
         Ok(PostCallMade::public_core_graphics())
     }
 }
 
-/// The macOS keystroke host's shape: real time, and a shortcut posted
-/// through the per-post checks with the bracket's cutoff.
+/// A shortcut posted through the per-post checks with the bracket's cutoff,
+/// with both the host and cutoff on the same test clock.
 struct ShortcutHost {
     shared: Shared,
     started: Instant,
@@ -127,10 +125,10 @@ impl RestoreHostSource for ShortcutHost {
 impl FrontingBracketHost for ShortcutHost {
     type Tap = ();
     fn now_ms(&mut self) -> u64 {
-        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+        u64::try_from(now().duration_since(self.started).as_millis()).unwrap()
     }
     fn pause_ms(&mut self, milliseconds: u64) {
-        std::thread::sleep(Duration::from_millis(milliseconds));
+        assert!(advance(Duration::from_millis(milliseconds)));
     }
     fn frontmost_pid(&mut self) -> Option<u32> {
         desk(&self.shared).frontmost
@@ -333,29 +331,31 @@ fn a_picture_capture_leaves_shared_idle_history_unlocked() {
         ..Desk::default()
     }));
     let mut read_ran = false;
-    let outcome = run_hooked_fronted_with_predictor(
-        &mut ShortcutHost {
-            shared,
-            started: Instant::now(),
-        },
-        crate::dispatch::BracketIdle::Shared(&idle),
-        BracketPlan {
-            target_pid: TARGET,
-            units: 1,
-            maximum_interval_ms: BOUND_MS,
-            maximum_seize_detection_latency_ms: 50,
-        },
-        &|| false,
-        &mut Hooks::default(),
-        Some(&mut || {
-            read_ran = true;
-            assert!(
-                idle.try_lock().is_ok(),
-                "native capture must not hold idle history"
-            );
-        }),
-        Some(&predictor),
-    );
+    let outcome = FakeClock::frozen().run(|| {
+        run_hooked_fronted_with_predictor(
+            &mut ShortcutHost {
+                shared,
+                started: now(),
+            },
+            crate::dispatch::BracketIdle::Shared(&idle),
+            BracketPlan {
+                target_pid: TARGET,
+                units: 1,
+                maximum_interval_ms: BOUND_MS,
+                maximum_seize_detection_latency_ms: 50,
+            },
+            &|| false,
+            &mut Hooks::default(),
+            Some(&mut || {
+                read_ran = true;
+                assert!(
+                    idle.try_lock().is_ok(),
+                    "native capture must not hold idle history"
+                );
+            }),
+            Some(&predictor),
+        )
+    });
     assert!(read_ran, "{:?}", outcome.report);
 }
 
@@ -369,24 +369,27 @@ fn a_shortcut_admitted_on_a_floor_history_posts_nothing_after_a_stall_past_the_b
         ..Desk::default()
     }));
     let mut hooks = Hooks::default();
-    let started = Instant::now();
-    let outcome = run_hooked_fronted_with_predictor(
-        &mut ShortcutHost {
-            shared: Arc::clone(&shared),
-            started,
-        },
-        &mut UserIdleEstimator::new(),
-        BracketPlan {
-            target_pid: TARGET,
-            units: 1,
-            maximum_interval_ms: BOUND_MS,
-            maximum_seize_detection_latency_ms: 50,
-        },
-        &|| false,
-        &mut hooks,
-        None,
-        Some(&predictor),
-    );
+    let clock = FakeClock::frozen();
+    let started = clock.now();
+    let outcome = clock.run(|| {
+        run_hooked_fronted_with_predictor(
+            &mut ShortcutHost {
+                shared: Arc::clone(&shared),
+                started,
+            },
+            &mut UserIdleEstimator::new(),
+            BracketPlan {
+                target_pid: TARGET,
+                units: 1,
+                maximum_interval_ms: BOUND_MS,
+                maximum_seize_detection_latency_ms: 50,
+            },
+            &|| false,
+            &mut hooks,
+            None,
+            Some(&predictor),
+        )
+    });
     let desk = desk(&shared);
     // Admitted on the file's word: the target was fronted without first
     // calibrating, so the shortcut was really attempted.
@@ -408,9 +411,9 @@ fn a_shortcut_admitted_on_a_floor_history_posts_nothing_after_a_stall_past_the_b
         .first()
         .map(|at| at.saturating_duration_since(started))
         .expect("the previous application was asked back");
-    assert!(
-        requested >= Duration::from_millis(LISTING_MS)
-            && requested < Duration::from_millis(LISTING_MS + SLACK_MS),
+    assert_eq!(
+        requested,
+        Duration::from_millis(LISTING_MS),
         "restore requested {requested:?} after the bracket began"
     );
     assert_eq!(desk.restore_requested_at.len(), 1, "one restore request");

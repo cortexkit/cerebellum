@@ -2997,12 +2997,28 @@ mod terminal_suffix_tests {
 }
 
 #[cfg(test)]
+impl RestoreCell {
+    /// Queue a watchdog that expires when the test runs it with the read still held.
+    pub(crate) fn hold_read_with_manual_watchdog(
+        self: &Arc<Self>,
+    ) -> Option<(ReadLockHold, impl FnOnce())> {
+        let mut watchdog = None;
+        let hold = self.hold_read_with_watchdog(Duration::ZERO, |run| {
+            watchdog = Some(run);
+            true
+        })?;
+        Some((hold, watchdog.unwrap()))
+    }
+}
+
+#[cfg(test)]
 mod restore_slot_tests {
     use super::*;
     use crate::computer::dispatch::{
         not_fronted_reason, HardwareInputSnapshot, NotFrontedReason, RestoreStatus,
     };
     use crate::{handle_frame, management, PROTOCOL_VERSION};
+    use cerebellum_computer::fronting_clock::{advance, FakeClock};
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::sync::Mutex;
 
@@ -3019,12 +3035,10 @@ mod restore_slot_tests {
         comes_forward: bool,
         snapshot: Option<HardwareInputSnapshot>,
         requests: Vec<u32>,
-        /// When each request was made, in real time.
+        /// When each request was made, on the same clock as the deadline.
         requested_at: Vec<std::time::Instant>,
         focus_delay: Option<Duration>,
         focus_gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
-        /// Pauses also sleep for real, so a real-time bound passes during them.
-        real_pause: bool,
         /// Release and restore steps in the order they happened.
         log: Vec<&'static str>,
     }
@@ -3046,7 +3060,6 @@ mod restore_slot_tests {
             requested_at: Vec::new(),
             focus_delay: None,
             focus_gate: None,
-            real_pause: false,
             log: Vec::new(),
         }))
     }
@@ -3058,14 +3071,8 @@ mod restore_slot_tests {
             self.0.lock().unwrap().now
         }
         fn pause_ms(&mut self, milliseconds: u64) {
-            let real = {
-                let mut screen = self.0.lock().unwrap();
-                screen.now += milliseconds;
-                screen.real_pause
-            };
-            if real {
-                std::thread::sleep(Duration::from_millis(milliseconds));
-            }
+            self.0.lock().unwrap().now += milliseconds;
+            advance(Duration::from_millis(milliseconds));
         }
         fn frontmost_pid(&mut self) -> Option<u32> {
             let (delay, gate) = {
@@ -3079,7 +3086,7 @@ mod restore_slot_tests {
                     .unwrap();
             }
             if let Some(delay) = delay {
-                std::thread::sleep(delay);
+                assert!(advance(delay));
             }
             self.0.lock().unwrap().frontmost
         }
@@ -3155,21 +3162,23 @@ mod restore_slot_tests {
     }
 
     /// Plays a worker's in-flight front request returning, with the target
-    /// now in front, once cleanup has taken the obligation. It returns a
-    /// moment later, or at once if a restore is requested first, so a
-    /// cleanup that wrongly decided without waiting for the front has its
-    /// restore logged before `front_returned`.
+    /// now in front, once cleanup has closed the gate to new work. The gate
+    /// has no deadline in these tests, so it closes only when cleanup runs.
     fn return_front_after_take(cell: &RestoreCell, shared: &SharedScreen) {
         let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
-        while !cell.cleanup_taken() && std::time::Instant::now() < give_up {
-            std::thread::yield_now();
-        }
-        let returns_at = std::time::Instant::now() + Duration::from_millis(50);
-        while shared.lock().unwrap().requests.is_empty() && std::time::Instant::now() < returns_at {
-            std::thread::yield_now();
+        while !cell.cleanup_taken() {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "cleanup never took the cell"
+            );
+            std::thread::sleep(Duration::from_millis(1));
         }
         {
             let mut screen = shared.lock().unwrap();
+            assert!(
+                screen.requests.is_empty(),
+                "cleanup restored under the front"
+            );
             screen.log.push("front_returned");
             screen.frontmost = Some(TARGET);
         }
@@ -3290,23 +3299,24 @@ mod restore_slot_tests {
         let shared = screen(true);
         let releases = Arc::new(AtomicUsize::new(0));
         let terminal = TerminalArbiter::new(request());
-        let (cell, _gate, _) = bounded_cell(
-            &terminal,
-            &shared,
-            &releases,
-            Duration::ZERO,
-            Duration::from_millis(10),
-        );
-        cell.front_confirmed();
-        // The owner's focus read, a native call nothing can cut short,
-        // stalls past the deadline.
-        shared.lock().unwrap().focus_delay = Some(Duration::from_millis(30));
-
-        // Terminal has stopped waiting before the deciding owner returns.
-        terminal.start_late_fronting(Some(&cell));
         let expired = restore_preparation::expired_writes();
         let os_delay = restore_preparation::expired_os_delay();
-        let decided = cell.decide();
+        let (cell, decided) = FakeClock::frozen().run(|| {
+            let (cell, _gate, _) = bounded_cell(
+                &terminal,
+                &shared,
+                &releases,
+                Duration::ZERO,
+                Duration::from_millis(10),
+            );
+            cell.front_confirmed();
+            // The owner's native focus read stalls past the deadline. The
+            // terminal has already stopped waiting for the owner to return.
+            shared.lock().unwrap().focus_delay = Some(Duration::from_millis(30));
+            terminal.start_late_fronting(Some(&cell));
+            let decided = cell.decide();
+            (cell, decided)
+        });
         assert_eq!(
             decided.restore,
             RestoreStatus::Failed {
@@ -3430,8 +3440,6 @@ mod restore_slot_tests {
 
     #[test]
     fn a_release_settling_at_150_of_200_ms_is_restored_by_the_owner_inside_the_deadline() {
-        use cerebellum_computer::fronting_clock::{advance, FakeClock};
-
         let shared = screen(true);
         let releases = Arc::new(AtomicUsize::new(0));
         let terminal = TerminalArbiter::new(request());
@@ -3474,24 +3482,23 @@ mod restore_slot_tests {
     fn an_owner_watching_an_unconfirmed_activation_requests_the_restore_at_the_reserve_by_the_deadline(
     ) {
         let shared = screen(true);
-        {
-            // The target has not yet become frontmost, so the owner watches
-            // for it with real poll sleeps until the reserve starts.
-            let mut screen = shared.lock().unwrap();
-            screen.frontmost = Some(PREVIOUS);
-            screen.real_pause = true;
-        }
+        // The target has not yet become frontmost, so the owner's polls
+        // advance the clock to the start of the reserve.
+        shared.lock().unwrap().frontmost = Some(PREVIOUS);
         let releases = Arc::new(AtomicUsize::new(0));
         let terminal = TerminalArbiter::new(request());
-        let (cell, gate, deadline) = bounded_cell(
-            &terminal,
-            &shared,
-            &releases,
-            Duration::from_millis(40),
-            Duration::from_millis(140),
-        );
-        let reserve_start = gate.reserve_start().unwrap();
-        let decided = cell.decide();
+        let (cell, decided, reserve_start, deadline) = FakeClock::frozen().run(|| {
+            let (cell, gate, deadline) = bounded_cell(
+                &terminal,
+                &shared,
+                &releases,
+                Duration::from_millis(40),
+                Duration::from_millis(140),
+            );
+            let reserve_start = gate.reserve_start().unwrap();
+            let decided = cell.decide();
+            (cell, decided, reserve_start, deadline)
+        });
         let screen = shared.lock().unwrap();
         assert_eq!(screen.requests, [PREVIOUS], "one write, the owner's own");
         assert!(
@@ -3533,13 +3540,10 @@ mod restore_slot_tests {
         let (_, total_before) = stalled_picture_reads();
         // The read's synchronous step never returns: its hold is never
         // dropped during the test's wait.
-        let hold = cell.hold_lock_for_read(Duration::from_millis(50)).unwrap();
+        let (hold, expire) = cell.hold_read_with_manual_watchdog().unwrap();
         cell.decide();
         assert_eq!(releases.load(SeqCst), 0, "kept while the read runs");
-        let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
-        while releases.load(SeqCst) == 0 && std::time::Instant::now() < give_up {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        expire();
         assert_eq!(releases.load(SeqCst), 1, "released at the read's lifetime");
         let (still_running, total) = stalled_picture_reads();
         assert!(still_running >= 1, "health shows the read still running");
@@ -3547,6 +3551,25 @@ mod restore_slot_tests {
         // The read returns at last: nothing is released twice.
         drop(hold);
         assert_eq!(releases.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn the_real_picture_watchdog_releases_a_stalled_read() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let terminal = TerminalArbiter::new(request());
+        let cell = terminal
+            .register_restore(obligation(&screen(true), &releases))
+            .unwrap();
+        // Exercise the actual timer and its thread rather than the manual
+        // watchdog. Only assert after expiry so descheduling cannot make an
+        // assertion about a still-live read fail.
+        let _hold = cell.hold_lock_for_read(Duration::from_secs(1)).unwrap();
+        cell.decide();
+        let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
+        while releases.load(SeqCst) == 0 && std::time::Instant::now() < give_up {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(releases.load(SeqCst), 1, "released at the read's lifetime");
     }
 
     #[test]
@@ -3991,7 +4014,7 @@ mod restore_slot_tests {
                 owner,
             ))
             .await;
-            let give_up = std::time::Instant::now() + Duration::from_millis(200);
+            let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
             while releases.load(SeqCst) < lock_releases && std::time::Instant::now() < give_up {
                 std::thread::sleep(Duration::from_millis(1));
             }
