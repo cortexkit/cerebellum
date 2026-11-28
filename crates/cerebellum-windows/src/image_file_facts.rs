@@ -11,7 +11,7 @@ use windows_sys::Win32::{
     },
     Storage::{
         FileSystem::{GetFinalPathNameByHandleW, FILE_EXECUTE, FILE_SHARE_READ, SYNCHRONIZE},
-        Packaging::Appx::{GetApplicationUserModelId, GetPackageFamilyName},
+        Packaging::Appx::{GetApplicationUserModelId, GetPackageFamilyName, GetPackageFullName},
     },
     System::Threading::{
         GetProcessId, QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_QUERY_INFORMATION,
@@ -94,6 +94,10 @@ pub struct ProcessPackageFields {
 }
 
 impl RetainedProcessHandle {
+    pub fn package_full_name(&self) -> io::Result<Option<String>> {
+        process_string(self.raw_handle(), GetPackageFullName)
+    }
+
     pub fn pid(&self) -> u32 {
         // This handle remains attached to one process object.
         unsafe { GetProcessId(self.raw_handle()) }

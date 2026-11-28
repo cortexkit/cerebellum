@@ -61,6 +61,10 @@ pub struct RetainedProcessHandle {
 }
 
 impl RetainedProcessHandle {
+    pub(crate) fn from_owned(handle: OwnedHandle) -> Self {
+        Self { handle }
+    }
+
     pub(crate) fn raw_handle(&self) -> HANDLE {
         self.handle.as_raw_handle()
     }

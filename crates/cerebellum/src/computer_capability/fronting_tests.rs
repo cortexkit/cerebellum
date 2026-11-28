@@ -2493,6 +2493,8 @@ fn installed_desk(already_running: bool) -> support::Desk {
             path: PathBuf::from("/Applications/Safari.app"),
             version: None,
             build_version: None,
+            #[cfg(windows)]
+            windows_entry: None,
         }];
         state.opened.already_running = already_running;
         state.opened.has_window = true;

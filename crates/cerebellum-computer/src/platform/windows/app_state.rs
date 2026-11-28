@@ -19,6 +19,7 @@ use super::identity::{
     frame_proof, frame_target_pid, identity_inventory, running_list, FrameProof, LiveIdentity,
     Principal, IDENTITY_BOUND,
 };
+use super::launch::LaunchInventory;
 
 mod uia;
 mod wait;
@@ -166,6 +167,7 @@ fn operation<T: Send + 'static>(
 pub struct WindowsAppStateSource {
     cache: Arc<Mutex<WindowCache>>,
     app_blocked: fn(&LiveIdentity) -> bool,
+    launch: Option<LaunchInventory>,
 }
 
 #[derive(Default)]
@@ -217,7 +219,17 @@ impl WindowsAppStateSource {
         Self {
             cache: Arc::default(),
             app_blocked,
+            launch: None,
         }
+    }
+
+    /// Start the inventory verifier after the serving layer admits launch.
+    pub fn with_launch_inventory(
+        mut self,
+        name_blocked: fn(&str) -> bool,
+    ) -> std::io::Result<Self> {
+        self.launch = Some(LaunchInventory::start(name_blocked)?);
+        Ok(self)
     }
     /// Test the same client setup used for reads, without opening an application window.
     pub fn client_available() -> bool {
@@ -602,6 +614,48 @@ impl AppStateSource for WindowsAppStateSource {
                 executable_path: app.identity.image_path,
             })
             .collect())
+    }
+
+    fn installed_apps(&self, timeout: Duration) -> InstalledApps {
+        self.launch
+            .as_ref()
+            .map(|launch| launch.listed(timeout))
+            .unwrap_or_default()
+    }
+
+    fn bundle_signature(&self, app: &InstalledApp) -> Result<BundleSignature, AppStateReadError> {
+        self.launch
+            .as_ref()
+            .ok_or(AppStateReadError::UnsupportedOnPlatform)?
+            .signature(app)
+    }
+
+    fn bundle_satisfies(&self, app: &InstalledApp, requirement: &str) -> bool {
+        self.bundle_signature(app)
+            .is_ok_and(|facts| facts.designated_requirement.as_deref() == Some(requirement))
+    }
+
+    fn open_app(
+        &self,
+        app: &InstalledApp,
+        bounds: OpenAppBounds,
+    ) -> Result<OpenedApp, OpenAppError> {
+        super::launch::open(
+            self.launch.as_ref().ok_or(OpenAppError::Failed)?,
+            app,
+            bounds,
+            self.app_blocked,
+        )
+    }
+
+    fn opened_running_app(
+        &self,
+        app: &InstalledApp,
+        grant: &ProcessGrant,
+    ) -> Result<OpenedApp, OpenAppError> {
+        self.bundle_signature(app)
+            .map_err(|_| OpenAppError::RunningChanged)?;
+        super::launch::observe_running(app, grant, self.app_blocked)
     }
 }
 

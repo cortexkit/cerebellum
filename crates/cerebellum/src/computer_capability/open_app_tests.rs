@@ -25,6 +25,8 @@ fn installed(name: &str, bundle: &str) -> InstalledApp {
         path: std::path::PathBuf::from(format!("/Applications/{name}.app")),
         version: None,
         build_version: None,
+        #[cfg(windows)]
+        windows_entry: None,
     }
 }
 
@@ -170,6 +172,38 @@ async fn scripted_inventory_serves_without_a_native_app_identity_reader() {
     let (reply, questions) = wire(&planes, "list_apps", json!({})).await;
     assert_eq!(reply["outcome"], "completed", "{reply}");
     assert_eq!(questions, 0);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_launch_elevation_required_survives_wire_validation() {
+    let (planes, desk, _) = rig();
+    desk.state().open_error = Some(OpenAppError::ElevationRequired);
+    let (reply, questions) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(questions, 1);
+    assert_eq!(reply["outcome"], "launch_failed", "{reply}");
+    assert_eq!(reply["detail"]["reason"], "target_elevated", "{reply}");
+    assert_eq!(
+        reply["remedy"],
+        "The application requires elevation. Nothing was started."
+    );
+    assert!(reply.get("pid").is_none(), "{reply}");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_launch_identity_mismatch_survives_wire_validation() {
+    let (planes, desk, _) = rig();
+    desk.state().open_error = Some(OpenAppError::IdentityMismatch);
+    let (reply, questions) = wire(&planes, "open_app", json!({"target":"Safari"})).await;
+    assert_eq!(questions, 1);
+    assert_eq!(reply["outcome"], "launch_failed", "{reply}");
+    assert_eq!(
+        reply["detail"]["reason"], "identity_indeterminate",
+        "{reply}"
+    );
+    assert_eq!(reply["remedy"], "The launched application identity could not be confirmed. A process may have started; use list_apps before retrying.");
+    assert!(reply.get("pid").is_none(), "{reply}");
 }
 
 #[tokio::test]

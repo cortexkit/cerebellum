@@ -836,8 +836,10 @@ pub trait AppStateSource: Send + Sync {
         Err(OpenAppError::Failed)
     }
 
-    /// Launch via the platform application service, not as our child. The
-    /// caller requests no activation and bounds both process and window waits.
+    /// Launch independently of this module's lifetime, without activation
+    /// requested. On Windows a Win32 child uses the user's environment but
+    /// inherits neither handles nor job membership. Bound the waits for the
+    /// process and its first eligible window.
     fn open_app(
         &self,
         _app: &InstalledApp,
@@ -883,6 +885,9 @@ pub struct InstalledApp {
     pub path: std::path::PathBuf,
     pub version: Option<String>,
     pub build_version: Option<String>,
+    #[cfg(windows)]
+    pub windows_entry:
+        Option<std::sync::Arc<crate::platform::windows::launch::InstalledWindowsEntry>>,
 }
 
 #[derive(Debug, Clone)]
@@ -944,6 +949,8 @@ pub enum OpenAppError {
     TimedOut,
     Failed,
     RunningChanged,
+    ElevationRequired,
+    IdentityMismatch,
 }
 
 /// The reader for a platform with none: every read is refused by name.
