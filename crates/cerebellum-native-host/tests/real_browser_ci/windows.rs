@@ -1,8 +1,8 @@
 use super::*;
 use cerebellum_bridge_protocol::{windows, HostParentAttestation, PlatformParentAttestation};
 use cerebellum_windows::{
-    create_test_pipe_instance_default_security, open_named_pipe_client, system_time_100ns,
-    OverlappedPipe,
+    create_test_pipe_instance_default_security, measure_image_check, open_named_pipe_client,
+    system_time_100ns, trace_image_checks, ImageCheckTrace, OverlappedPipe,
 };
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -10,6 +10,14 @@ use std::os::windows::io::AsHandle;
 use std::process::Stdio;
 
 const CHILD: &str = "windows::fixture_entry";
+const FIRST_PROBE: &str = "first-probe";
+
+// A cold Windows catalog and trust cache can delay the first parent check.
+// Run 46108328089 measured 53.7 ms for the cmd catalog hash, 271.2 ms for
+// CryptCATAdminEnumCatalogFromHash, and 50.8 ms and 203.3 ms for the two
+// WinVerifyTrust calls. The same-process repeat took 34 ms. Allow 1 s only
+// for the runner's first probe, not for each new child process.
+const FIRST_STEP1_LIMIT: Duration = Duration::from_millis(1_000);
 
 fn env_path(name: &str) -> PathBuf {
     PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is not bound")))
@@ -51,7 +59,8 @@ fn fixture_entry() {
     let root = env_path("CK_IMAGE_TEST_ROOT");
     match std::env::var("CK_IMAGE_TEST_ENTRY").unwrap().as_str() {
         "server" => run_server(&root, &pipe_name(&root)),
-        "probe" => run_probe(&root, &pipe_name(&root)),
+        FIRST_PROBE => run_probe(&root, &pipe_name(&root), FIRST_STEP1_LIMIT),
+        "probe" => run_probe(&root, &pipe_name(&root), CHECK_LIMIT),
         "cmd-roundtrip" => {
             println!("fixture probe reached stdout");
             eprintln!("fixture probe reached stderr");
@@ -60,15 +69,23 @@ fn fixture_entry() {
     }
 }
 
-fn run_probe(root: &Path, name: &OsStr) {
+fn run_probe(root: &Path, name: &OsStr, step1_limit: Duration) {
     let key = parse_public_key(TEST_PEER_PUBLIC_KEY_HEX).unwrap();
-    let started = Instant::now();
-    let evidence = windows::attest_parent(&parse_public_key(NATIVE_PARENT_KEY).unwrap());
-    let step1 = started.elapsed();
+    println!(
+        "step 1 parent starting: Unix epoch ms = {}, probe pid = {}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+        std::process::id(),
+    );
+    let attest = || windows::attest_parent(&native_parent_key());
+    let (step1, evidence) = time_parent_check("step 1 parent", attest);
     let evidence = match evidence {
         Ok(evidence) => evidence,
         Err(error) => {
             fs::write(root.join("refused"), error.to_string()).unwrap();
+            assert_sample_budget("step 1 parent", step1, step1_limit);
             return;
         }
     };
@@ -105,12 +122,129 @@ fn run_probe(root: &Path, name: &OsStr) {
     write_packet(&pipe, &serde_json::to_string(&attestation).unwrap());
     let (step3, parent, refusal): (Duration, Duration, Option<String>) =
         serde_json::from_slice(&read_packet(&pipe)).unwrap();
+    let checks = [step1, step2, step3, parent];
     if let Some(refusal) = refusal {
         fs::write(root.join("refused"), refusal).unwrap();
+        assert_budget(checks, step1_limit);
     } else {
-        assert_budget([step1, step2, step3, parent]);
+        // Repeat only after all four budgeted checks, in the original probe process.
+        let label = "step 1 parent same-process repeat";
+        let (warm, repeat) = time_parent_check(label, attest);
+        if let Err(error) = repeat {
+            println!("step 1 parent same-process repeat refused: {error}");
+        }
+        assert_budget(checks, step1_limit);
+        assert_sample_budget(label, warm, CHECK_LIMIT);
         fs::write(root.join("accepted"), b"accepted").unwrap();
     }
+}
+
+fn assert_sample_budget(name: &str, elapsed: Duration, limit: Duration) {
+    println!("{name}: {elapsed:?} (limit {limit:?})");
+    assert!(elapsed <= limit, "{name} took {elapsed:?}");
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_first_step_one_can_take_one_second() {
+        assert_budget(
+            [1_000, 500, 499, 1].map(Duration::from_millis),
+            FIRST_STEP1_LIMIT,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "step 1 parent took")]
+    fn cold_step_one_still_has_a_ceiling() {
+        assert_budget(
+            [1_001, 1, 1, 1].map(Duration::from_millis),
+            FIRST_STEP1_LIMIT,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "step 1 parent took")]
+    fn warm_step_one_keeps_the_regular_ceiling() {
+        assert_budget([501, 1, 1, 1].map(Duration::from_millis), CHECK_LIMIT);
+    }
+
+    #[test]
+    #[should_panic(expected = "step 3 parent took")]
+    fn step_three_parent_is_not_granted_the_cold_allowance() {
+        assert_budget(
+            [1_000, 1, 1, 501].map(Duration::from_millis),
+            FIRST_STEP1_LIMIT,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "four checks took")]
+    fn cold_sequence_keeps_the_two_second_ceiling() {
+        assert_budget(
+            [1_000, 500, 500, 1].map(Duration::from_millis),
+            FIRST_STEP1_LIMIT,
+        );
+    }
+}
+
+fn time_parent_check<T>(label: &str, check: impl FnOnce() -> T) -> (Duration, T) {
+    let ((elapsed, result), trace) = trace_image_checks(|| {
+        let started = Instant::now();
+        let result = check();
+        (started.elapsed(), result)
+    });
+    println!(
+        "{label} timing trace (pid {}): {elapsed:?}",
+        std::process::id()
+    );
+    let mut accounted = Duration::ZERO;
+    for item in trace {
+        match item {
+            ImageCheckTrace::Phase {
+                name,
+                depth,
+                elapsed,
+                children_elapsed,
+            } => {
+                if depth == 0 {
+                    accounted += elapsed;
+                }
+                let indent = 2 * (depth + 1);
+                if children_elapsed.is_zero() {
+                    println!("{:indent$}{name}: {elapsed:?}", "");
+                } else {
+                    let own = elapsed.saturating_sub(children_elapsed);
+                    println!(
+                        "{:indent$}{name}: {elapsed:?} ({own:?} outside nested phases)",
+                        ""
+                    );
+                }
+            }
+            ImageCheckTrace::TrustStatus {
+                depth,
+                status,
+                chain_errors,
+            } => {
+                println!(
+                    "{:indent$}WinVerifyTrust status: {status:#010x}, chain errors: {chain_errors:#010x}",
+                    "",
+                    indent = 2 * (depth + 1),
+                );
+            }
+        }
+    }
+    let outside = elapsed.saturating_sub(accounted);
+    println!("  accounted by top-level phases: {accounted:?}; outside phases: {outside:?}");
+    (elapsed, result)
+}
+
+fn native_parent_key() -> windows::VerifyingKey {
+    measure_image_check("fixture public key parse", || {
+        parse_public_key(NATIVE_PARENT_KEY).unwrap()
+    })
 }
 
 fn run_server(root: &Path, name: &OsStr) {
@@ -133,12 +267,12 @@ fn run_server(root: &Path, name: &OsStr) {
         .unwrap();
     let step3 = step3_start.elapsed();
     let attestation = serde_json::from_slice(&read_packet(&pipe)).unwrap();
-    let parent_start = Instant::now();
-    let refusal = signed_probe
-        .recheck_parent(&attestation, &parse_public_key(NATIVE_PARENT_KEY).unwrap())
-        .err()
-        .map(|error| error.to_string());
-    let parent = parent_start.elapsed();
+    let (parent, refusal) = time_parent_check("step 3 parent separate-process recheck", || {
+        signed_probe
+            .recheck_parent(&attestation, &native_parent_key())
+            .err()
+            .map(|error| error.to_string())
+    });
     write_packet(
         &pipe,
         &serde_json::to_string(&(step3, parent, refusal)).unwrap(),
@@ -311,10 +445,16 @@ fn launch_probe(
     );
 }
 
+enum ParentCase {
+    First,
+    StaleGeneration,
+    WrongPath,
+}
+
 fn run_case(
     parent_pid: u32,
     launcher: Option<&Path>,
-    stale: bool,
+    case: ParentCase,
     overrides: &[(&str, &Path)],
 ) -> Result<(), String> {
     let scratch = Scratch::new();
@@ -323,7 +463,7 @@ fn run_case(
     let exe = std::env::current_exe().unwrap();
     sign_copy(&exe, &signed_probe, "host");
     sign_copy(&exe, &signed_server, "cerebellum");
-    if stale {
+    if matches!(case, ParentCase::StaleGeneration) {
         fs::write(scratch.join("stale-generation"), []).unwrap();
     }
     let mut server = Running(
@@ -346,15 +486,21 @@ fn run_case(
         parent_pid,
         launcher,
         &signed_probe,
-        "probe",
+        if matches!(case, ParentCase::First) {
+            FIRST_PROBE
+        } else {
+            "probe"
+        },
         overrides,
     );
+    if launcher.is_some() {
+        print!("{}", diagnostic(&scratch.join("probe-stdout")));
+    }
     if scratch.join("refused").exists() {
         return Err(fs::read_to_string(scratch.join("refused")).unwrap());
     }
     assert_eq!(fs::read(scratch.join("accepted")).unwrap(), b"accepted");
     assert!(server.wait("the verified fixture server").success());
-    print!("{}", diagnostic(&scratch.join("probe-stdout")));
     Ok(())
 }
 
@@ -393,24 +539,25 @@ fn chrome_cmd_and_probe_check_native_identity_and_deadlines() {
     let scratch = Scratch::new();
     let chrome = start_chrome(&scratch);
     let cmd = env_path("CK_IMAGE_TEST_WINDOWS_CMD");
-    run_case(chrome.0 .0.id(), Some(&cmd), false, &[]).expect("Chrome / System32 cmd must pass");
-    let error = run_case(chrome.0 .0.id(), Some(&cmd), true, &[]).unwrap_err();
+    let pid = chrome.0 .0.id();
+    run_case(pid, Some(&cmd), ParentCase::First, &[]).expect("Chrome / System32 cmd must pass");
+    let error = run_case(pid, Some(&cmd), ParentCase::StaleGeneration, &[]).unwrap_err();
     assert_eq!(
         error,
         "Windows parent attestation does not match observed evidence"
     );
-    wrong_path(run_case(chrome.0 .0.id(), None, false, &[]));
+    wrong_path(run_case(pid, None, ParentCase::WrongPath, &[]));
 
     let fake_root = scratch.join("system-root");
     let fake_system32 = fake_root.join("System32");
     fs::create_dir_all(&fake_system32).unwrap();
     let fake_cmd = fake_system32.join("cmd.exe");
     fs::copy(&cmd, &fake_cmd).unwrap();
-    wrong_path(run_case(chrome.0 .0.id(), Some(&fake_cmd), false, &[]));
+    wrong_path(run_case(pid, Some(&fake_cmd), ParentCase::WrongPath, &[]));
     wrong_path(run_case(
-        chrome.0 .0.id(),
+        pid,
         Some(&fake_cmd),
-        false,
+        ParentCase::WrongPath,
         &[("SystemRoot", &fake_root)],
     ));
 }
@@ -447,13 +594,13 @@ fn signed_chrome_copies_fail_the_machine_path_predicate() {
     wrong_path(run_case(
         image.pid,
         Some(&system_cmd),
-        false,
+        ParentCase::WrongPath,
         &[("LOCALAPPDATA", &local_root.0)],
     ));
     wrong_path(run_case(
         image.pid,
         Some(&system_cmd),
-        false,
+        ParentCase::WrongPath,
         &[("ProgramFiles", &local_root.0)],
     ));
 }

@@ -24,7 +24,9 @@ use crate::RetainedProcessHandle;
 
 #[cfg(test)]
 mod tests;
+pub(crate) mod timing;
 mod trust;
+use timing::measure_image_check;
 pub use trust::{
     read_authenticode, read_catalog_signer, read_embedded_root_status, read_product_names,
     AuthenticodeReading, MicrosoftRootReading, SignatureReading, SignerSubject,
@@ -78,26 +80,30 @@ impl OpenedProcessImage {
     /// Query the retained process, then open the file Windows names. This does
     /// not prove that the named file is the image already mapped in the process.
     pub fn open(process: &RetainedProcessHandle) -> Result<Self, ImageReadError> {
-        let mut path = vec![0u16; PATH_CAPACITY];
-        let mut len = path.len() as u32;
-        // SAFETY: the process owns a live handle; path and len are writable.
-        let ok = unsafe {
-            QueryFullProcessImageNameW(process.raw_handle(), 0, path.as_mut_ptr(), &mut len)
-        };
-        if ok == 0 {
-            return Err(ImageReadError::QueryImage(last_error()));
-        }
-        let path = checked_path(&path, len)?;
+        let path = measure_image_check("QueryFullProcessImageNameW", || {
+            let mut path = vec![0u16; PATH_CAPACITY];
+            let mut len = path.len() as u32;
+            // SAFETY: the process owns a live handle; path and len are writable.
+            let ok = unsafe {
+                QueryFullProcessImageNameW(process.raw_handle(), 0, path.as_mut_ptr(), &mut len)
+            };
+            if ok == 0 {
+                return Err(ImageReadError::QueryImage(last_error()));
+            }
+            checked_path(&path, len)
+        })?;
         Self::open_path(&path)
     }
 
     /// Open a path for image readings without asserting it belongs to a process.
     pub fn open_path(path: &Path) -> Result<Self, ImageReadError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ)
-            .open(path)
-            .map_err(ImageReadError::OpenImage)?;
+        let file = measure_image_check("open image file", || {
+            OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(path)
+                .map_err(ImageReadError::OpenImage)
+        })?;
         let final_path = final_path(&file)?;
         Ok(Self { file, final_path })
     }
@@ -131,13 +137,16 @@ impl OpenedMachineDirectory {
 }
 
 pub fn read_system_directory() -> Result<OpenedMachineDirectory, ImageReadError> {
-    let mut path = vec![0u16; PATH_CAPACITY];
-    // SAFETY: path has the specified writable capacity in UTF-16 units.
-    let len = unsafe { GetSystemDirectoryW(path.as_mut_ptr(), path.len() as u32) };
-    if len == 0 {
-        return Err(ImageReadError::SystemDirectory(last_error()));
-    }
-    open_root(&checked_path(&path, len)?)
+    let path = measure_image_check("GetSystemDirectoryW", || {
+        let mut path = vec![0u16; PATH_CAPACITY];
+        // SAFETY: path has the specified writable capacity in UTF-16 units.
+        let len = unsafe { GetSystemDirectoryW(path.as_mut_ptr(), path.len() as u32) };
+        if len == 0 {
+            return Err(ImageReadError::SystemDirectory(last_error()));
+        }
+        checked_path(&path, len)
+    })?;
+    open_root(&path)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -157,7 +166,7 @@ pub fn read_program_files_directory(
     let mut bytes = (path.len() * size_of::<u16>()) as u32;
     // SAFETY: the key path and value name are static, terminated strings; path
     // and bytes are a writable buffer and its capacity in bytes.
-    let status = unsafe {
+    let status = measure_image_check("RegGetValueW (Program Files)", || unsafe {
         RegGetValueW(
             HKEY_LOCAL_MACHINE,
             w!(r"SOFTWARE\Microsoft\Windows\CurrentVersion"),
@@ -167,7 +176,7 @@ pub fn read_program_files_directory(
             path.as_mut_ptr().cast(),
             &mut bytes,
         )
-    };
+    });
     if status != ERROR_SUCCESS {
         return Err(ImageReadError::ProgramFilesRegistry(status));
     }
@@ -189,13 +198,18 @@ fn open_root(path: &Path) -> Result<OpenedMachineDirectory, ImageReadError> {
     }
     let mut global_path = OsString::from(r"\\?\GLOBALROOT\GLOBAL??\");
     global_path.push(path.as_os_str());
-    let root = OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(global_path)
-        .map_err(ImageReadError::OpenRoot)?;
-    if !root.metadata().map_err(ImageReadError::OpenRoot)?.is_dir() {
+    let root = measure_image_check("open machine directory", || {
+        OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(global_path)
+            .map_err(ImageReadError::OpenRoot)
+    })?;
+    if !measure_image_check("read machine directory metadata", || root.metadata())
+        .map_err(ImageReadError::OpenRoot)?
+        .is_dir()
+    {
         return Err(ImageReadError::InvalidPath);
     }
     let final_path = final_path(&root)?;
@@ -209,17 +223,20 @@ fn final_path(file: &File) -> Result<PathBuf, ImageReadError> {
     let mut path = vec![0u16; PATH_CAPACITY];
     // SAFETY: the file owns a live handle; path is writable for the specified size.
     // FILE_NAME_NORMALIZED is zero. Use the kernel volume name, not a drive alias.
-    let len = unsafe {
-        GetFinalPathNameByHandleW(
-            file.as_raw_handle(),
-            path.as_mut_ptr(),
-            path.len() as u32,
-            VOLUME_NAME_GUID,
-        )
-    };
-    if len == 0 {
-        return Err(ImageReadError::FinalPath(last_error()));
-    }
+    let len = measure_image_check("GetFinalPathNameByHandleW", || {
+        let len = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                path.as_mut_ptr(),
+                path.len() as u32,
+                VOLUME_NAME_GUID,
+            )
+        };
+        if len == 0 {
+            return Err(ImageReadError::FinalPath(last_error()));
+        }
+        Ok(len)
+    })?;
     checked_path(&path, len)
 }
 
