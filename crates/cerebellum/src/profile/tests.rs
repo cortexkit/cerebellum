@@ -47,7 +47,7 @@ fn tokens(
 struct AttachmentFixture {
     path: PathBuf,
     lifecycle: ProfileLifecycle,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     config: RegistryConfig,
 }
 
@@ -105,7 +105,7 @@ impl AttachmentFixture {
         Self {
             path,
             lifecycle,
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             config,
         }
     }
@@ -138,7 +138,7 @@ impl Drop for AttachmentFixture {
     }
 }
 
-fn dead_attachment_owner() -> crate::profile_custody::SupervisorGeneration {
+fn synthetic_attachment_owner() -> crate::profile_custody::SupervisorGeneration {
     crate::profile_custody::SupervisorGeneration {
         pid: u32::MAX,
         start_time: 1,
@@ -148,8 +148,20 @@ fn dead_attachment_owner() -> crate::profile_custody::SupervisorGeneration {
     }
 }
 
-// Profile custody reads native supervisor generations only on macOS and Linux.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn dead_attachment_owner() -> crate::profile_custody::SupervisorGeneration {
+    #[cfg(windows)]
+    {
+        let mut owner = crate::profile_custody::current_supervisor_generation().unwrap();
+        // A different process creation time for this PID models a generation that
+        // no longer owns the PID, without starting or stopping a process.
+        owner.start_time += 1;
+        owner
+    }
+    #[cfg(not(windows))]
+    synthetic_attachment_owner()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn attached_dead_supervisor_is_released_at_startup() {
     let mut fixture = AttachmentFixture::new(dead_attachment_owner());
@@ -163,7 +175,7 @@ fn attached_dead_supervisor_is_released_at_startup() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn attached_dead_supervisor_allows_a_later_launch() {
     let mut fixture = AttachmentFixture::new(dead_attachment_owner());
@@ -186,7 +198,7 @@ fn attached_dead_supervisor_allows_a_later_launch() {
     launch.rollback_opened(opened).unwrap();
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn attached_live_supervisor_stays_busy() {
     let mut fixture =
@@ -202,24 +214,6 @@ fn attached_live_supervisor_stays_busy() {
 
 #[cfg(windows)]
 #[test]
-fn an_attachment_stays_busy_when_windows_cannot_prove_supervisor_liveness() {
-    use crate::profile_custody::{current_supervisor_generation, ProfileCustodyLockError};
-
-    assert!(matches!(
-        current_supervisor_generation(),
-        Err(ProfileCustodyLockError::SupervisorGenerationUnavailable)
-    ));
-    let mut fixture = AttachmentFixture::new(dead_attachment_owner());
-    assert_eq!(fixture.lifecycle.recover_startup().unwrap(), 0);
-    assert!(matches!(
-        fixture.prepare(),
-        PrepareResult::Closed(ProfileOutcome::ProfileBusy { .. })
-    ));
-    assert_eq!(fixture.record().state, ProfileState::Attached);
-}
-
-#[cfg(windows)]
-#[test]
 fn windows_mints_and_persists_a_custody_holder_then_releases_the_slot() {
     use crate::profile_custody::{
         FilesystemProfileCustodyJournal, ProfileCustodyAcquisition, ProfileCustodyKey,
@@ -230,7 +224,7 @@ fn windows_mints_and_persists_a_custody_holder_then_releases_the_slot() {
     let journal = FilesystemProfileCustodyJournal::open(path.join("custody-journal")).unwrap();
     let mut locks = ProfileCustodyLocks::open(
         &path,
-        dead_attachment_owner(),
+        synthetic_attachment_owner(),
         journal,
         UnreadableAttachmentOwner,
     )
@@ -270,6 +264,8 @@ impl crate::profile_custody::SupervisorLivenessProbe for UnreadableAttachmentOwn
 
 #[test]
 fn attached_unreadable_supervisor_stays_busy() {
+    // The real liveness probe would report this owner dead. Inject an
+    // unreadable result to verify recovery leaves the attachment alone.
     let mut fixture = AttachmentFixture::new(dead_attachment_owner());
     fixture.lifecycle.attachment_liveness =
         AttachmentLiveness(std::sync::Arc::new(UnreadableAttachmentOwner));
@@ -278,12 +274,14 @@ fn attached_unreadable_supervisor_stays_busy() {
         fixture.prepare(),
         PrepareResult::Closed(ProfileOutcome::ProfileBusy { .. })
     ));
-    assert_eq!(fixture.record().state, ProfileState::Attached);
+    let record = fixture.record();
+    assert_eq!(record.state, ProfileState::Attached);
+    assert_eq!(record.seal_state, SealState::Available);
 }
 
 #[test]
 fn attached_missing_generation_evidence_stays_busy() {
-    let mut fixture = AttachmentFixture::new(dead_attachment_owner());
+    let mut fixture = AttachmentFixture::new(synthetic_attachment_owner());
     fs::remove_file(
         fixture
             .path
