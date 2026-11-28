@@ -6,18 +6,11 @@ use windows_sys::Win32::{
     Foundation::POINT, System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*,
 };
 
-static DELIVERED: AtomicUsize = AtomicUsize::new(0);
 static UNASSIGNED_UP: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn receiver(hwnd: HWND, message: u32, key: WPARAM, data: LPARAM) -> LRESULT {
-    match (message, key) {
-        (WM_KEYDOWN, 0x87) => {
-            DELIVERED.fetch_add(1, Ordering::Release);
-        }
-        (WM_KEYUP, 0xE8) => {
-            UNASSIGNED_UP.fetch_add(1, Ordering::Release);
-        }
-        _ => {}
+    if (message, key) == (WM_KEYUP, 0xE8) {
+        UNASSIGNED_UP.fetch_add(1, Ordering::Release);
     }
     // SAFETY: The default procedure receives the original system message.
     unsafe { DefWindowProcW(hwnd, message, key, data) }
@@ -110,15 +103,12 @@ impl Drop for RestorePointer {
 const TAG: usize = 0xC3B1_5A09;
 const MOUSE_CONTROL_TAG: usize = TAG ^ 1;
 const WAIT: Duration = Duration::from_secs(2);
+const PROBE_BOUND: Duration = Duration::from_millis(30);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Echo {
     ZeroMove,
     KeyboardMarker,
-    KeyDown,
-    KeyUp,
-    ForeignDown,
-    ForeignUp,
     NonzeroMove,
 }
 
@@ -143,26 +133,13 @@ fn echo(event: RawInputEvent) -> Option<Echo> {
             injected: true,
             ..
         } => Some(Echo::KeyboardMarker),
-        RawInputEvent::Keyboard {
-            tag: TAG,
-            key: 0x87,
-            up,
-            injected: true,
-            ..
-        } => Some(if up { Echo::KeyUp } else { Echo::KeyDown }),
-        RawInputEvent::Keyboard {
-            tag: 0,
-            key: 0x87,
-            up,
-            injected: true,
-            ..
-        } => Some(if up {
-            Echo::ForeignUp
-        } else {
-            Echo::ForeignDown
-        }),
         _ => None,
     }
+}
+
+struct Observation {
+    event: RawInputEvent,
+    at: Instant,
 }
 
 fn report_observed(event: RawInputEvent) {
@@ -179,11 +156,15 @@ fn report_observed(event: RawInputEvent) {
 }
 
 fn wait_for_echoes(
-    events: &mpsc::Receiver<RawInputEvent>,
+    events: &mpsc::Receiver<Observation>,
     deadline: Instant,
-    ready: impl Fn(&[Echo]) -> bool,
-) -> Vec<Echo> {
+    ready: impl Fn(&[(Echo, Instant)]) -> bool,
+) -> Vec<(Echo, Instant)> {
     let mut echoes = Vec::new();
+    let record = |echoes: &mut Vec<_>, observation: Observation| {
+        report_observed(observation.event);
+        echoes.extend(echo(observation.event).map(|echo| (echo, observation.at)));
+    };
     loop {
         // Dispatch the receiver's own key messages while the hook thread
         // independently records low-level observations.
@@ -196,22 +177,21 @@ fn wait_for_echoes(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() || ready(&echoes) {
+            for observation in events.try_iter().take(128) {
+                record(&mut echoes, observation);
+            }
             return echoes;
         }
         match events.recv_timeout(remaining.min(Duration::from_millis(2))) {
-            Ok(event) => {
-                report_observed(event);
-                echoes.extend(echo(event));
-            }
+            Ok(observation) => record(&mut echoes, observation),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return echoes,
         }
     }
 }
 
-fn nonzero_mouse_control(window: &Receiver, events: &mpsc::Receiver<RawInputEvent>) {
+fn nonzero_mouse_control(window: &Receiver, events: &mpsc::Receiver<Observation>) {
     let original = cursor_position();
-    let mut out = std::io::stdout().lock();
     use std::io::Write;
     // Windows can apply up to four times the requested relative delta.
     // Require even the longest possible move to stay wholly in this client.
@@ -223,15 +203,13 @@ fn nonzero_mouse_control(window: &Receiver, events: &mpsc::Receiver<RawInputEven
             })
         })
     });
-    let Some(dx) = dx.filter(|_| {
-        let now = cursor_position();
-        (now.x, now.y) == (original.x, original.y)
-            && foreground_window_number() == Some(window.0 as usize as u32)
-    }) else {
-        writeln!(out, "S9 nonzero mouse control unavailable: pointer and full move not in the owned foreground client").unwrap();
-        return;
-    };
-    drop(out);
+    let dx = dx
+        .filter(|_| {
+            let now = cursor_position();
+            (now.x, now.y) == (original.x, original.y)
+                && foreground_window_number() == Some(window.0 as usize as u32)
+        })
+        .expect("the pointer and full mouse control move must be in the owned foreground client");
     let restore = RestorePointer(original);
     let started = Instant::now();
     let accepted = post_input(
@@ -239,7 +217,7 @@ fn nonzero_mouse_control(window: &Receiver, events: &mpsc::Receiver<RawInputEven
         &[RawInputPost::RelativeMouseMove { x: dx, y: 0 }],
     );
     let observed = wait_for_echoes(events, started + WAIT, |echoes| {
-        echoes.contains(&Echo::NonzeroMove)
+        echoes.iter().any(|(echo, _)| *echo == Echo::NonzeroMove)
     });
     drop(restore);
     let now = cursor_position();
@@ -253,10 +231,15 @@ fn nonzero_mouse_control(window: &Receiver, events: &mpsc::Receiver<RawInputEven
         "S9 one-pixel mouse control dx={dx} accepted={accepted} echoes={observed:?}"
     )
     .unwrap();
+    assert_eq!(accepted, 1, "SendInput accepted the nonzero fixture move");
+    assert!(
+        observed.iter().any(|(echo, _)| *echo == Echo::NonzeroMove),
+        "the nonzero move did not reach the mouse hook"
+    );
 }
 
 #[test]
-fn github_hosted_input_hooks_observe_both_probes_and_route_only_the_owned_fixture_key() {
+fn github_hosted_zero_move_has_no_echo_but_nonzero_move_reaches_hook() {
     if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
         || std::env::var("RUNNER_ENVIRONMENT").as_deref() != Ok("github-hosted")
         || std::env::var("RUNNER_ARCH").as_deref() != Ok("X64")
@@ -274,15 +257,15 @@ fn github_hosted_input_hooks_observe_both_probes_and_route_only_the_owned_fixtur
         Some(std::process::id()),
         Duration::from_secs(1),
         move |event| {
-            // Never wait for a logger inside the system callback.
-            if report.try_send(event).is_err() {
+            // Timestamp the callback, not the later read from the test thread.
+            let observation = Observation {
+                event,
+                at: Instant::now(),
+            };
+            if report.try_send(observation).is_err() {
                 overflow_on_pump.store(true, Ordering::Release);
             }
-            match echo(event) {
-                Some(Echo::KeyDown | Echo::KeyUp) => foreground_window_number() != Some(hwnd),
-                Some(_) => true,
-                None => false,
-            }
+            echo(event).is_some()
         },
     )
     .expect("pump ready with keyboard, mouse and WinEvent hooks installed");
@@ -291,80 +274,51 @@ fn github_hosted_input_hooks_observe_both_probes_and_route_only_the_owned_fixtur
         "S9 pump ready; starting dual probe"
     )
     .unwrap();
-    let key = |key, up| RawInputPost::VirtualKey {
-        key,
-        up,
-        extended: false,
-    };
-    let post = |tag, events: &[RawInputPost]| {
-        assert_eq!(foreground_window_number(), Some(hwnd));
-        assert_eq!(
-            post_input(tag, events),
-            events.len(),
-            "SendInput accepted the fixture batch"
-        );
-    };
+    assert_eq!(foreground_window_number(), Some(hwnd));
     let start = Instant::now();
-    post(
-        TAG,
-        &[
-            RawInputPost::RelativeMouseMove { x: 0, y: 0 },
-            key(0xE8, true),
-        ],
+    assert_eq!(
+        post_input(
+            TAG,
+            &[
+                RawInputPost::RelativeMouseMove { x: 0, y: 0 },
+                RawInputPost::VirtualKey {
+                    key: 0xE8,
+                    up: true,
+                    extended: false
+                },
+            ]
+        ),
+        2,
+        "SendInput accepted the fixture probe batch"
     );
-    let probes = wait_for_echoes(&events, start + WAIT, |echoes| {
-        echoes.contains(&Echo::ZeroMove) && echoes.contains(&Echo::KeyboardMarker)
-    });
-    let probe = start.elapsed();
-    assert!(
-        !overflow.load(Ordering::Acquire),
-        "hook diagnostic queue overflowed"
-    );
-    if !probes.contains(&Echo::ZeroMove) {
-        // Test whether any move reaches the mouse hook. A successful control
-        // cannot permit keyboard payload when either original echo is missing.
-        nonzero_mouse_control(&window, &events);
-    }
-    assert!(
-        !overflow.load(Ordering::Acquire),
-        "hook diagnostic queue overflowed"
-    );
-    assert!(
-        probes.len() == 2
-            && probes.contains(&Echo::ZeroMove)
-            && probes.contains(&Echo::KeyboardMarker),
-        "expected one zero move and one key-up, observed {probes:?}"
-    );
-
-    let start_key = Instant::now();
-    post(TAG, &[key(0x87, false), key(0x87, true), key(0xE8, true)]);
-    post(0, &[key(0x87, false), key(0x87, true)]);
-    let payload = wait_for_echoes(&events, start_key + WAIT, |echoes| {
-        echoes.len() >= 5 && DELIVERED.load(Ordering::Acquire) != 0
+    let probe_cutoff = start + PROBE_BOUND;
+    let keyboard_cutoff = start + WAIT;
+    let probes = wait_for_echoes(&events, keyboard_cutoff, |echoes| {
+        Instant::now() >= probe_cutoff
+            && echoes.iter().any(|(echo, _)| *echo == Echo::KeyboardMarker)
     });
     assert!(
         !overflow.load(Ordering::Acquire),
         "hook diagnostic queue overflowed"
     );
-    assert_eq!(
-        payload,
-        [
-            Echo::KeyDown,
-            Echo::KeyUp,
-            Echo::KeyboardMarker,
-            Echo::ForeignDown,
-            Echo::ForeignUp
-        ]
+    // GitHub Actions run 46120211536 saw both the keyboard marker and the
+    // nonzero control, but no callback for the original zero-distance move.
+    assert!(
+        probes
+            .iter()
+            .any(|(echo, at)| *echo == Echo::KeyboardMarker && *at <= keyboard_cutoff),
+        "the keyboard probe did not echo: {probes:?}"
     );
-    assert_eq!(
-        DELIVERED.load(Ordering::Acquire),
-        1,
-        "only our tagged key reached the receiver"
+    assert!(!probes.iter().any(|(echo, at)| *echo == Echo::ZeroMove && *at <= probe_cutoff),
+        "the Windows zero-distance move now echoes within {PROBE_BOUND:?}; review the production probe: {probes:?}");
+    nonzero_mouse_control(&window, &events);
+    assert!(
+        !overflow.load(Ordering::Acquire),
+        "hook diagnostic queue overflowed"
     );
     assert_eq!(
         UNASSIGNED_UP.load(Ordering::Acquire),
         0,
-        "no marker should reach the receiver"
+        "no keyboard marker should reach the owned receiver"
     );
-    writeln!(std::io::stdout().lock(), "Hosted S9 smoke, not bracket timing: two probes {probe:?}; tagged key and foreign-event observation {:?}", start_key.elapsed()).unwrap();
 }

@@ -324,6 +324,53 @@ fn observer_absence_refuses_before_desktop_reads_or_writes() {
 }
 
 #[test]
+fn a_keyboard_probe_without_mouse_echo_refuses_before_front_or_payload() {
+    crate::fronting_clock::FakeClock::frozen().run(|| {
+        let desk = Arc::new(Desk {
+            screen: Mutex::new(Screen::default()),
+            start: crate::fronting_clock::now(),
+        });
+        let probes = Arc::new(AtomicUsize::new(0));
+        let observer = NativeObserver::keyboard_only_probe_for_test(Arc::clone(&probes));
+        let report = run(
+            Arc::clone(&desk),
+            || Ok(TARGET),
+            Some(observer.clone()),
+            BracketPlan {
+                target_pid: desk.pid(&TARGET),
+                units: 1,
+                maximum_interval_ms: 300,
+                maximum_seize_detection_latency_ms: 50,
+            },
+            &mut Hooks::default(),
+            &|| false,
+            Work::Dispatch(&mut |_, _| panic!("keyboard echo alone admitted payload")),
+        )
+        .unwrap();
+        assert!(matches!(
+            report.stop,
+            Some(BracketStop::Aborted(abort))
+                if abort.reason == crate::dispatch::AbortReason::ObserverUnavailable
+        ));
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            2,
+            "the original probe pair was posted once"
+        );
+        assert!(
+            observer.lost(),
+            "a keyboard echo alone cannot prove both hooks live"
+        );
+        assert_eq!(report.posts_returned, 0, "no payload was posted");
+        assert_eq!(report.restore, RestoreStatus::NotNeeded);
+        assert!(
+            desk.screen.lock().unwrap().writes.is_empty(),
+            "no front was requested"
+        );
+    });
+}
+
+#[test]
 fn previous_window_missing_or_a_same_pid_sibling_refuses_without_probes() {
     for front in [None, Some(SIBLING)] {
         let echo = Arc::new(Echo::default());

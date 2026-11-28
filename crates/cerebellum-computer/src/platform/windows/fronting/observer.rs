@@ -148,7 +148,12 @@ impl Record {
 
 pub(super) struct NativeObserver {
     record: Arc<Record>,
+    #[cfg(not(test))]
     _hooks: InputHooks,
+    #[cfg(test)]
+    _hooks: Option<InputHooks>,
+    #[cfg(test)]
+    keyboard_only_probe_posts: Option<Arc<AtomicUsize>>,
     idle: IdleReading,
     held_at_start: bool,
     echo_at: OnceLock<Option<u64>>,
@@ -181,13 +186,38 @@ impl NativeObserver {
         let held_at_start = (1..=254).any(async_key_down);
         Some(Arc::new(Self {
             record,
+            #[cfg(not(test))]
             _hooks: hooks,
+            #[cfg(test)]
+            _hooks: Some(hooks),
+            #[cfg(test)]
+            keyboard_only_probe_posts: None,
             idle,
             held_at_start,
             echo_at: OnceLock::new(),
             lost: AtomicBool::new(false),
             drained: AtomicBool::new(false),
         }))
+    }
+
+    #[cfg(test)]
+    pub(super) fn keyboard_only_probe_for_test(posts: Arc<AtomicUsize>) -> Arc<Self> {
+        assert_eq!(
+            ECHO_MS, 30,
+            "keep the hosted mouse check on the observer's deadline"
+        );
+        let record = Arc::new(Record::new());
+        record.armed.store(true, Release);
+        Arc::new(Self {
+            record,
+            _hooks: None,
+            keyboard_only_probe_posts: Some(posts),
+            idle: IdleReading::Milliseconds(crate::dispatch::OBSERVED_DISPATCH_IDLE_MS + 1),
+            held_at_start: false,
+            echo_at: OnceLock::new(),
+            lost: AtomicBool::new(false),
+            drained: AtomicBool::new(false),
+        })
     }
 
     pub(super) fn person(&self) -> bool {
@@ -224,6 +254,26 @@ impl NativeObserver {
     }
 
     pub(super) fn post(&self, events: &[RawInputPost]) -> usize {
+        #[cfg(test)]
+        if let Some(posts) = &self.keyboard_only_probe_posts {
+            assert_eq!(
+                events,
+                [RawInputPost::RelativeMouseMove { x: 0, y: 0 }, MARKER]
+            );
+            posts.fetch_add(events.len(), Relaxed);
+            assert!(self.record.observe(
+                RawInputEvent::Keyboard {
+                    tag: self.record.tag,
+                    key: u32::from(UNASSIGNED),
+                    flags: 0x90,
+                    up: true,
+                    injected: true,
+                    event_tick: 0,
+                },
+                &std::cell::RefCell::new(Vec::new())
+            ));
+            return events.len();
+        }
         post_input(self.record.tag, events)
     }
 
@@ -256,6 +306,10 @@ fn wait_until(until_ms: u64, read: impl Fn() -> bool) -> bool {
         }
         if read() {
             return true;
+        }
+        #[cfg(test)]
+        if crate::fronting_clock::advance(Duration::from_millis(1)) {
+            continue;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
