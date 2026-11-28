@@ -123,7 +123,6 @@ impl Drop for Controls {
 
 fn exercise_owned_controls() {
     let controls = Controls::new();
-    let foreground = crate::foreground_window_number();
     let pid = std::process::id();
     let ProcessStartTime::Started(generation) = process_start_time(pid) else {
         panic!("test process has no creation time");
@@ -132,6 +131,14 @@ fn exercise_owned_controls() {
     let [first, second] = controls.buttons;
     let (window, checkbox, edit) = (controls.window, controls.checkbox, controls.edit);
     with_scoped_uia(pid, generation, end, move |uia| -> Result<(), Failure> {
+        // Foreground belongs to the desktop, not to an addressed UIA call.
+        // Check the refound child and its effects, not the runner's foreground.
+        let check_target = |found: &UiaElementRef, child| -> Result<(), Failure> {
+            assert_eq!(crate::root_window_number(child), Some(window));
+            assert_eq!(uia.pid(found)?, pid);
+            assert!(uia.same(found, &uia.at_window(child)?)?);
+            Ok(())
+        };
         let id = |window| {
             uia.runtime_id(&uia.at_window(window)?)
                 .map(|id| id.unwrap())
@@ -144,12 +151,14 @@ fn exercise_owned_controls() {
             .toggle_at(window, &right, |_| Ok::<_, Failure>(()))
             .is_err());
         assert_eq!(PRESSED.load(Ordering::Acquire), 0);
-        uia.invoke_at(window, &right, |_| Ok(()))?;
+        uia.invoke_at(window, &right, |found| check_target(found, second))?;
         while PRESSED.load(Ordering::Acquire) == 0 && Instant::now() < end {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(PRESSED.load(Ordering::Acquire), 2);
-        uia.toggle_at(window, &id(checkbox)?, |_| Ok(()))?;
+        uia.toggle_at(window, &id(checkbox)?, |found| {
+            check_target(found, checkbox)
+        })?;
         let mut checked = 0;
         // SAFETY: BM_GETCHECK takes no input pointers; checked is writable and
         // the test retains the checkbox HWND until this callback returns.
@@ -168,9 +177,9 @@ fn exercise_owned_controls() {
             0
         );
         assert_eq!(checked, 1);
-        uia.set_value_at(window, &id(edit)?, "after λ", |_, read_only| {
+        uia.set_value_at(window, &id(edit)?, "after λ", |found, read_only| {
             assert!(!read_only);
-            Ok(())
+            check_target(found, edit)
         })?;
         assert_eq!(
             uia.current_value(&uia.at_window(edit)?)?.as_deref(),
@@ -179,7 +188,6 @@ fn exercise_owned_controls() {
         Ok(())
     })
     .unwrap();
-    assert_eq!(crate::foreground_window_number(), foreground);
 }
 
 #[test]
