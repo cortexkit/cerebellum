@@ -64,6 +64,11 @@ pub use accessibility::{
     UiaElementIdentity, UiaElementName, UiaRectangle, UiaTreeCompleteness,
 };
 #[cfg(windows)]
+#[doc(hidden)]
+pub use browser_image::timing::measure_image_check;
+#[cfg(all(windows, feature = "bridge-test-identities"))]
+pub use browser_image::timing::{trace_image_checks, ImageCheckTrace};
+#[cfg(windows)]
 pub use browser_image::{
     image_status, read_authenticode, read_catalog_signer, read_embedded_root_status,
     read_product_names, read_program_files_directory, read_system_directory, AuthenticodeReading,

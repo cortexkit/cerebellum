@@ -5,7 +5,8 @@ use super::{
 use crate::peer_trailer::{self, PeerRole};
 use crate::{AttestationV1, HostParentAttestation, PlatformParentAttestation, WindowsProcess};
 use cerebellum_windows::{
-    current_process_token_user_sid, named_pipe_client_pid, named_pipe_server_pid, ProcessStartTime,
+    current_process_token_user_sid, measure_image_check, named_pipe_client_pid,
+    named_pipe_server_pid, ProcessStartTime,
 };
 use std::{fmt, io, os::windows::io::AsHandle};
 
@@ -151,12 +152,13 @@ impl ParentEvidence {
 }
 
 pub fn attest_parent(key: &VerifyingKey) -> io::Result<ParentEvidence> {
-    attest_chain(&Process::open(std::process::id())?, key)
+    let host = measure_image_check("host process open", || Process::open(std::process::id()))?;
+    attest_chain(&host, key)
 }
 
 fn attest_chain(host: &Process, _key: &VerifyingKey) -> io::Result<ParentEvidence> {
-    let launcher = host.parent()?;
-    let launcher_image = launcher.open_image()?;
+    let launcher = measure_image_check("cmd process open", || host.parent())?;
+    let launcher_image = measure_image_check("cmd image open", || launcher.open_image())?;
     #[cfg(feature = "bridge-test-identities")]
     let launcher_image = if peer_trailer::is_test_peer_key(_key) {
         use std::io::{Seek, SeekFrom};
@@ -174,8 +176,8 @@ fn attest_chain(host: &Process, _key: &VerifyingKey) -> io::Result<ParentEvidenc
         launcher_image
     };
     verify_system_cmd(&launcher_image).map_err(io::Error::other)?;
-    let chrome = launcher.parent()?;
-    let chrome_image = chrome.open_image()?;
+    let chrome = measure_image_check("Chrome process open", || launcher.parent())?;
+    let chrome_image = measure_image_check("Chrome image open", || chrome.open_image())?;
     verify_installed_chrome(&chrome_image).map_err(io::Error::other)?;
     let attestation = PlatformParentAttestation::Windows {
         v: AttestationV1,
@@ -196,8 +198,10 @@ fn finish_chain(
         chrome,
         attestation: attestation.into(),
     };
-    evidence.check_before_connect()?;
-    host.require_live()?;
+    measure_image_check("parent chain liveness", || {
+        evidence.check_before_connect()?;
+        host.require_live()
+    })?;
     Ok(evidence)
 }
 

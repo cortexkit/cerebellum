@@ -15,6 +15,7 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 use windows_sys::Win32::Security::WinTrust::*;
 
+use super::timing::measure_image_check;
 use super::{last_error, wide_z, ImageReadError, OpenedProcessImage};
 
 #[derive(Debug)]
@@ -46,33 +47,39 @@ pub struct SignerSubject {
 pub fn read_catalog_signer(
     image: &OpenedProcessImage,
 ) -> Result<MicrosoftRootReading, ImageReadError> {
-    let admin = CatalogAdmin::open()?;
+    let admin = measure_image_check("cmd catalog acquire", CatalogAdmin::open)?;
     let mut hash = [0; 32]; // SHA-256, selected by the admin context.
     let mut bytes = hash.len() as u32;
     let file = image.file.as_raw_handle();
-    // SAFETY: the context and file handle remain live; the hash buffer is writable.
-    let ok = unsafe {
-        CryptCATAdminCalcHashFromFileHandle2(admin.0, file, &mut bytes, hash.as_mut_ptr(), 0)
-    };
-    if ok == 0 {
-        return Err(ImageReadError::CatalogHash(last_error()));
-    }
-    if bytes != hash.len() as u32 {
-        return Err(ImageReadError::CatalogHash(0));
-    }
+    measure_image_check("cmd catalog signature hash", || {
+        // SAFETY: the context and file handle remain live; the hash buffer is writable.
+        let ok = unsafe {
+            CryptCATAdminCalcHashFromFileHandle2(admin.0, file, &mut bytes, hash.as_mut_ptr(), 0)
+        };
+        if ok == 0 {
+            return Err(ImageReadError::CatalogHash(last_error()));
+        }
+        if bytes != hash.len() as u32 {
+            return Err(ImageReadError::CatalogHash(0));
+        }
+        Ok(())
+    })?;
 
-    let catalog = admin.lookup(&hash)?;
+    let catalog = measure_image_check("cmd catalog lookup", || admin.lookup(&hash))?;
     let mut info = CATALOG_INFO {
         cbStruct: size_of::<CATALOG_INFO>() as u32,
         ..Default::default()
     };
-    // SAFETY: catalog is retained and info is writable for its declared size.
-    if unsafe { CryptCATCatalogInfoFromContext(catalog.context, &mut info, 0) } == 0 {
-        return Err(ImageReadError::CatalogInfo(last_error()));
-    }
-    if info.wszCatalogFile[0] == 0 || !info.wszCatalogFile.contains(&0) {
-        return Err(ImageReadError::CatalogInfo(0));
-    }
+    measure_image_check("cmd catalog info", || {
+        // SAFETY: catalog is retained and info is writable for its declared size.
+        if unsafe { CryptCATCatalogInfoFromContext(catalog.context, &mut info, 0) } == 0 {
+            return Err(ImageReadError::CatalogInfo(last_error()));
+        }
+        if info.wszCatalogFile[0] == 0 || !info.wszCatalogFile.contains(&0) {
+            return Err(ImageReadError::CatalogInfo(0));
+        }
+        Ok(())
+    })?;
 
     // A catalog member tag is the uppercase hexadecimal catalog hash.
     let member: Vec<u16> = hash
@@ -108,7 +115,9 @@ pub fn read_catalog_signer(
             },
             |signature, _, chain| MicrosoftRootReading {
                 signature,
-                policy_status: microsoft_root_status(chain),
+                policy_status: measure_image_check("cmd Microsoft root chain policy", || {
+                    microsoft_root_status(chain)
+                }),
             },
         )
     }
@@ -251,10 +260,18 @@ unsafe fn read_from_provider<T>(
             ..Default::default()
         },
     };
-    // SAFETY: session is writable, and subject's pointers satisfy the contract above.
-    let status = unsafe { session.run() };
-    let result = session.read(status, read_signer);
-    let close = session.close();
+    // WinVerifyTrust verifies the signature and builds/checks the chain in one call.
+    let status = measure_image_check(
+        "WinVerifyTrust signature + chain/revocation (cache-only)",
+        || {
+            // SAFETY: session is writable, and subject's pointers satisfy the contract above.
+            unsafe { session.run() }
+        },
+    );
+    let result = measure_image_check("WinVerifyTrust chain and signer readout", || {
+        session.read(status, read_signer)
+    });
+    let close = measure_image_check("WinVerifyTrust close", || session.close());
     let reading = result?;
     close?;
     Ok(reading)
@@ -305,6 +322,8 @@ impl TrustSession {
             chain_errors: chain.TrustStatus.dwErrorStatus,
             root_thumbprint: root_thumbprint(signer),
         };
+        #[cfg(feature = "bridge-test-identities")]
+        super::timing::record_trust_status(signature.status, signature.chain_errors);
         Ok(read_signer(signature, signer, chain))
     }
 

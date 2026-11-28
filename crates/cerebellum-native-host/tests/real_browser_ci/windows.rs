@@ -2,7 +2,7 @@ use super::*;
 use cerebellum_bridge_protocol::{windows, HostParentAttestation, PlatformParentAttestation};
 use cerebellum_windows::{
     create_test_pipe_instance_default_security, open_named_pipe_client, system_time_100ns,
-    OverlappedPipe,
+    trace_image_checks, ImageCheckTrace, OverlappedPipe,
 };
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -62,9 +62,16 @@ fn fixture_entry() {
 
 fn run_probe(root: &Path, name: &OsStr) {
     let key = parse_public_key(TEST_PEER_PUBLIC_KEY_HEX).unwrap();
-    let started = Instant::now();
-    let evidence = windows::attest_parent(&parse_public_key(NATIVE_PARENT_KEY).unwrap());
-    let step1 = started.elapsed();
+    println!(
+        "step 1 parent starting: Unix epoch ms = {}, probe pid = {}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+        std::process::id(),
+    );
+    let attest = || windows::attest_parent(&parse_public_key(NATIVE_PARENT_KEY).unwrap());
+    let (step1, evidence) = time_parent_check("step 1 parent", attest);
     let evidence = match evidence {
         Ok(evidence) => evidence,
         Err(error) => {
@@ -108,9 +115,40 @@ fn run_probe(root: &Path, name: &OsStr) {
     if let Some(refusal) = refusal {
         fs::write(root.join("refused"), refusal).unwrap();
     } else {
+        // Repeat only after all four budgeted checks, in the original probe process.
+        let (_, repeat) = time_parent_check("step 1 parent same-process repeat", attest);
+        if let Err(error) = repeat {
+            println!("step 1 parent same-process repeat refused: {error}");
+        }
         assert_budget([step1, step2, step3, parent]);
         fs::write(root.join("accepted"), b"accepted").unwrap();
     }
+}
+
+fn time_parent_check<T>(label: &str, check: impl FnOnce() -> T) -> (Duration, T) {
+    let ((elapsed, result), trace) = trace_image_checks(|| {
+        let started = Instant::now();
+        let result = check();
+        (started.elapsed(), result)
+    });
+    println!(
+        "{label} timing trace (pid {}): {elapsed:?}",
+        std::process::id()
+    );
+    for item in trace {
+        match item {
+            ImageCheckTrace::Phase(name, duration) => println!("  {name}: {duration:?}"),
+            ImageCheckTrace::TrustStatus {
+                status,
+                chain_errors,
+            } => {
+                println!(
+                    "  WinVerifyTrust status: {status:#010x}, chain errors: {chain_errors:#010x}"
+                );
+            }
+        }
+    }
+    (elapsed, result)
 }
 
 fn run_server(root: &Path, name: &OsStr) {
@@ -133,12 +171,12 @@ fn run_server(root: &Path, name: &OsStr) {
         .unwrap();
     let step3 = step3_start.elapsed();
     let attestation = serde_json::from_slice(&read_packet(&pipe)).unwrap();
-    let parent_start = Instant::now();
-    let refusal = signed_probe
-        .recheck_parent(&attestation, &parse_public_key(NATIVE_PARENT_KEY).unwrap())
-        .err()
-        .map(|error| error.to_string());
-    let parent = parent_start.elapsed();
+    let (parent, refusal) = time_parent_check("step 3 parent separate-process recheck", || {
+        signed_probe
+            .recheck_parent(&attestation, &parse_public_key(NATIVE_PARENT_KEY).unwrap())
+            .err()
+            .map(|error| error.to_string())
+    });
     write_packet(
         &pipe,
         &serde_json::to_string(&(step3, parent, refusal)).unwrap(),
@@ -349,12 +387,14 @@ fn run_case(
         "probe",
         overrides,
     );
+    if launcher.is_some() {
+        print!("{}", diagnostic(&scratch.join("probe-stdout")));
+    }
     if scratch.join("refused").exists() {
         return Err(fs::read_to_string(scratch.join("refused")).unwrap());
     }
     assert_eq!(fs::read(scratch.join("accepted")).unwrap(), b"accepted");
     assert!(server.wait("the verified fixture server").success());
-    print!("{}", diagnostic(&scratch.join("probe-stdout")));
     Ok(())
 }
 

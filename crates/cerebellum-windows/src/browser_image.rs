@@ -24,6 +24,7 @@ use crate::RetainedProcessHandle;
 
 #[cfg(test)]
 mod tests;
+pub(crate) mod timing;
 mod trust;
 pub use trust::{
     read_authenticode, read_catalog_signer, read_embedded_root_status, read_product_names,

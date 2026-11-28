@@ -10,9 +10,9 @@ use cerebellum_windows::image_status::{
     ERROR_SERVICE_NOT_ACTIVE,
 };
 use cerebellum_windows::{
-    read_authenticode, read_catalog_signer, read_product_names, read_program_files_directory,
-    read_system_directory, OpenedMachineDirectory, ProgramFilesDirectory, SignatureReading,
-    SignerSubject,
+    measure_image_check, read_authenticode, read_catalog_signer, read_product_names,
+    read_program_files_directory, read_system_directory, OpenedMachineDirectory,
+    ProgramFilesDirectory, SignatureReading, SignerSubject,
 };
 pub use cerebellum_windows::{
     retain_process_handle_for_image, ImageReadError, OpenedProcessImage, ProcessHandleError,
@@ -70,23 +70,29 @@ impl From<ImageReadError> for ImageRefusal {
 
 /// Require the system-directory cmd.exe and its Microsoft-rooted SHA-256 catalog.
 pub fn verify_system_cmd(image: &OpenedProcessImage) -> Result<(), ImageRefusal> {
-    let root = read_system_directory()?;
-    if !path_matches(image, &root, "cmd.exe") {
-        return Err(ImageRefusal::UnexpectedPath);
-    }
+    measure_image_check("cmd path identity", || -> Result<(), ImageRefusal> {
+        let root = read_system_directory()?;
+        if !path_matches(image, &root, "cmd.exe") {
+            return Err(ImageRefusal::UnexpectedPath);
+        }
+        Ok(())
+    })?;
     verify_cmd_signer(image)
 }
 
 /// Require a machine-installed Chrome Stable image and its Google signature.
 pub fn verify_installed_chrome(image: &OpenedProcessImage) -> Result<(), ImageRefusal> {
-    let native = read_program_files_directory(ProgramFilesDirectory::Native)?;
-    // A native install does not depend on the x86 registry value being present.
-    if !path_matches(image, &native, CHROME_RELATIVE) {
-        let x86 = read_program_files_directory(ProgramFilesDirectory::X86)?;
-        if !path_matches(image, &x86, CHROME_RELATIVE) {
-            return Err(ImageRefusal::UnexpectedPath);
+    measure_image_check("Chrome path identity", || -> Result<(), ImageRefusal> {
+        let native = read_program_files_directory(ProgramFilesDirectory::Native)?;
+        // A native install does not depend on the x86 registry value being present.
+        if !path_matches(image, &native, CHROME_RELATIVE) {
+            let x86 = read_program_files_directory(ProgramFilesDirectory::X86)?;
+            if !path_matches(image, &x86, CHROME_RELATIVE) {
+                return Err(ImageRefusal::UnexpectedPath);
+            }
         }
-    }
+        Ok(())
+    })?;
     verify_chrome_signer(image)
 }
 
@@ -114,8 +120,12 @@ fn require_catalog(
 fn verify_chrome_signer(image: &OpenedProcessImage) -> Result<(), ImageRefusal> {
     let reading = read_authenticode(image)?;
     require_signature(reading.signature)?;
-    require_google_subject(&reading.subject?)?;
-    require_product(read_product_names(image), "Google Chrome")
+    measure_image_check("Chrome signer identity", || {
+        require_google_subject(&reading.subject?)
+    })?;
+    measure_image_check("Chrome product identity", || {
+        require_product(read_product_names(image), "Google Chrome")
+    })
 }
 
 fn require_google_subject(subject: &SignerSubject) -> Result<(), ImageRefusal> {

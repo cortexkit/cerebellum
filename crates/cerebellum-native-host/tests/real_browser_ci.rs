@@ -115,19 +115,21 @@ fn sign_copy(source: &Path, destination: &Path, role: &str) {
 }
 
 fn assert_budget(checks: [Duration; 4]) {
-    for (name, elapsed) in [
+    let named_checks = [
         "step 1 parent",
         "step 2 peer",
         "step 3 peer",
         "step 3 parent",
     ]
     .into_iter()
-    .zip(checks)
-    {
+    .zip(checks);
+    for (name, elapsed) in named_checks.clone() {
         println!("{name}: {elapsed:?} (limit {CHECK_LIMIT:?})");
-        assert!(elapsed <= CHECK_LIMIT, "{name} took {elapsed:?}");
     }
     let sum: Duration = checks.into_iter().sum();
     println!("four checks: {sum:?} (limit {SEQUENCE_LIMIT:?})");
+    for (name, elapsed) in named_checks {
+        assert!(elapsed <= CHECK_LIMIT, "{name} took {elapsed:?}");
+    }
     assert!(sum <= SEQUENCE_LIMIT, "four checks took {sum:?}");
 }
