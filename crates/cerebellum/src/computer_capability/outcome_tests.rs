@@ -299,9 +299,17 @@ fn replies(capability: ComputerCapability) -> Vec<Value> {
         pid,
         frontmost: false,
     };
-    replies.push(match_target_name("Nobody", &[editor("com.example.Editor", 1)]).unwrap_err());
     replies.push(
         match_target_name(
+            TargetSyntax::Bundle,
+            "Nobody",
+            &[editor("com.example.Editor", 1)],
+        )
+        .unwrap_err(),
+    );
+    replies.push(
+        match_target_name(
+            TargetSyntax::Bundle,
             "Editor",
             &[
                 editor("com.example.Editor", 1),

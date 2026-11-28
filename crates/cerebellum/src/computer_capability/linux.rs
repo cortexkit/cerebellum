@@ -9,6 +9,7 @@ use std::time::Duration;
 use cerebellum_computer::audit::ComputerCapability;
 use cerebellum_computer::capture::*;
 use cerebellum_computer::platform::*;
+use cerebellum_linux::identity::{IdentityReader, Refusal as IdentityRefusal, VerifiedApp};
 use cerebellum_linux::session::{self, AccessibilityBus, DesktopSession, SessionKind};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -20,10 +21,12 @@ use super::{
 };
 use crate::{ComputerReleaseInputs, JournalPersistence};
 
+pub(crate) const IDENTITY_REVIEW: Option<&str> =
+    option_env!("CEREBELLUM_LINUX_APP_IDENTITY_REVIEW_REVISION");
+
 pub(crate) fn compiled_reviews() -> LinuxReleaseInputs {
     LinuxReleaseInputs {
-        app_identity: option_env!("CEREBELLUM_LINUX_APP_IDENTITY_REVIEW_REVISION")
-            .map(str::to_owned),
+        app_identity: IDENTITY_REVIEW.map(str::to_owned),
         semantic: option_env!("CEREBELLUM_LINUX_SEMANTIC_REVIEW_REVISION").map(str::to_owned),
         launch: option_env!("CEREBELLUM_LINUX_LAUNCH_REVIEW_REVISION").map(str::to_owned),
         x11_capture: option_env!("CEREBELLUM_LINUX_X11_CAPTURE_REVIEW_REVISION").map(str::to_owned),
@@ -47,10 +50,11 @@ pub(crate) fn plane(
     {
         return Err(ComputerPlaneUnavailable::NoLinuxReviews);
     }
-    let session = Arc::new(LinuxSession::new(
-        reviews.bound(LinuxReleaseInputs::SEMANTIC),
-        admitted,
-    ));
+    let mut session = LinuxSession::new(reviews.bound(LinuxReleaseInputs::SEMANTIC), admitted);
+    if reviews.bound(LinuxReleaseInputs::IDENTITY) {
+        session.identity = Some(Arc::default());
+    }
+    let session = Arc::new(session);
     let audit = computer_audit(journal)?;
     let driver_session = Arc::clone(&session);
     let app_use_fronting = [
@@ -110,6 +114,7 @@ pub(super) struct LinuxSession {
     read: Box<SessionReader>,
     epoch: Mutex<Option<(Arc<Epoch>, bool)>>,
     admitted: Arc<BTreeSet<String>>,
+    identity: Option<Arc<IdentityReader>>,
 }
 
 impl LinuxSession {
@@ -129,6 +134,7 @@ impl LinuxSession {
             }),
             epoch: Mutex::new(None),
             admitted,
+            identity: None,
         }
     }
 
@@ -247,6 +253,39 @@ pub struct LinuxDriver {
     session: Arc<LinuxSession>,
 }
 
+impl LinuxDriver {
+    /// Only authenticated desktop peer PIDs may be submitted by a backend.
+    pub fn prove_app(&self, pid: u32) -> Result<VerifiedApp, IdentityRefusal> {
+        self.session
+            .identity
+            .as_ref()
+            .ok_or(IdentityRefusal::AppIdentityUnproven)?
+            .prove(pid)
+    }
+
+    pub fn app_code(&self, grant: &ProcessGrant) -> Arc<dyn crate::computer_grants::AppCode> {
+        match &self.session.identity {
+            Some(reader) => Arc::new(crate::management::LinuxAppCode {
+                grant: grant.clone(),
+                reader: Arc::clone(reader),
+            }),
+            None => Arc::new(crate::computer_grants::NoIdentityReader),
+        }
+    }
+
+    pub fn verify_target(&self, grant: &ProcessGrant) -> Result<VerifiedApp, IdentityRefusal> {
+        self.session
+            .identity
+            .as_ref()
+            .ok_or(IdentityRefusal::AppIdentityUnproven)?
+            .reprove(
+                grant.pid,
+                &grant.process_generation_evidence,
+                &grant.bundle_identity,
+            )
+    }
+}
+
 macro_rules! unsupported {
     ($error:expr; $(fn $name:ident($($parameter:ident: $input:ty),*) -> $output:ty;)*) => {
         $(fn $name(&mut self, $($parameter: $input),*) -> $output { Err($error) })*
@@ -274,6 +313,21 @@ impl PlatformDriver for LinuxDriver {
         }
     }
 
+    fn verify_attendance(
+        &mut self,
+        request: AttendancePreconditionRequest,
+    ) -> Result<AttendancePreconditionResult, DriverError> {
+        self.verify_target(&request.target)
+            .map_err(|reason| DriverError::StartupRefused(reason.reason()))?;
+        // A verified app and unlocked desktop are not enough to post input.
+        // An observer must also attest that the person is not using the seat.
+        Err(DriverError::StartupRefused(match self.session_locked() {
+            Some(true) => "screen_locked",
+            None => "no_supported_session",
+            Some(false) => "backend_unavailable",
+        }))
+    }
+
     unsupported!(DriverError::Unsupported("Linux desktop backend");
         fn read_accessibility_tree(_request: AccessibilityTreeRequest) -> Result<AccessibilityTreeResult, DriverError>;
         fn resolve_element(_request: ElementResolutionRequest) -> Result<ElementResolutionResult, DriverError>;
@@ -284,7 +338,6 @@ impl PlatformDriver for LinuxDriver {
         fn fronting_snapshot(_target: &ProcessGrant) -> Result<FrontingSnapshot, DriverError>;
         fn observe_input(_request: InputObservationRequest) -> Result<InputObservationResult, DriverError>;
         fn observe_effect(_request: EffectObservationRequest) -> Result<EffectObservationResult, DriverError>;
-        fn verify_attendance(_request: AttendancePreconditionRequest) -> Result<AttendancePreconditionResult, DriverError>;
     );
 }
 
@@ -315,6 +368,31 @@ mod tests {
     use cerebellum_computer::platform::vocabulary::validate_capability_result;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use subc_protocol::{Frame, FrameType};
+
+    #[test]
+    fn linux_identity_reader_binds_exactly_with_k1() {
+        let bound = compiled_reviews().bound(LinuxReleaseInputs::IDENTITY);
+        assert_eq!(
+            crate::management::PlatformResolver::HAS_APP_IDENTITY_READER,
+            bound
+        );
+        let driver = LinuxDriver {
+            session: Arc::new(LinuxSession::new(false, Arc::default())),
+        };
+        let placeholder = ProcessGrant {
+            pid: 0,
+            bundle_identity: "dpkg:fixture".into(),
+            process_generation_evidence: "fixture".into(),
+        };
+        assert_eq!(
+            driver.prove_app(placeholder.pid),
+            Err(IdentityRefusal::AppIdentityUnproven)
+        );
+        assert_eq!(
+            driver.app_code(&placeholder).identity().unwrap_err(),
+            crate::computer_grants::AppIdentityUnreadable::NoReader
+        );
+    }
 
     fn read_with(
         kind: SessionKind,

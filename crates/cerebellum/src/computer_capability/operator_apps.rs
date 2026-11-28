@@ -659,6 +659,7 @@ pub(super) struct Lookup {
     pub(super) management: Arc<ManagementPlane>,
     pub(super) source: Arc<dyn AppStateSource>,
     pub(super) executable: ExecutableReader,
+    target_syntax: super::TargetSyntax,
     /// Whether the caller is one of [`DEV_BUILD_DRIVERS`].
     pub(super) drives_development_builds: bool,
 }
@@ -868,7 +869,7 @@ impl Lookup {
             );
         }
         let mut titles = vec![target.to_string()];
-        let bundle_identity = if super::looks_like_bundle_identity(target) {
+        let bundle_identity = if self.target_syntax.is_identity(target) {
             target.trim().to_string()
         } else {
             let apps = match self.source.running_apps() {
@@ -886,7 +887,7 @@ impl Lookup {
                     });
                 }
             };
-            let Ok(matched) = super::match_target_name(target, &apps) else {
+            let Ok(matched) = super::match_target_name(self.target_syntax, target, &apps) else {
                 return None;
             };
             titles.extend(
@@ -958,6 +959,7 @@ where
             management: Arc::clone(management),
             source: Arc::clone(&self.app_state_source),
             executable: Arc::clone(&self.process_executable),
+            target_syntax: self.target_syntax(),
             drives_development_builds: drives_development_builds(caller),
         }
     }

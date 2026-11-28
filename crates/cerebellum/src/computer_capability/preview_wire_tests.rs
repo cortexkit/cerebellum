@@ -1077,7 +1077,10 @@ async fn a_cancel_frame_hides_the_preview_its_call_showed() {
     )
     .await
     .unwrap();
-    read.recv().await.unwrap();
+    tokio::time::timeout(crate::test_support::HANG_GUARD, read.recv())
+        .await
+        .expect("the wire read did not show its preview")
+        .unwrap();
     rig.until_captured(1).await;
     // A correlation nobody is running cancels nothing.
     crate::handle_frame(
@@ -1122,7 +1125,10 @@ async fn a_goodbye_frame_hides_the_previews_its_route_showed() {
     )
     .await
     .unwrap();
-    read.recv().await.unwrap();
+    tokio::time::timeout(crate::test_support::HANG_GUARD, read.recv())
+        .await
+        .expect("the wire read did not show its preview")
+        .unwrap();
     rig.until_captured(1).await;
     crate::handle_frame(
         wire_frame(subc_protocol::FrameType::Goodbye, 7, 2, 0),

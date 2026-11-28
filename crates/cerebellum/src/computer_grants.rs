@@ -466,11 +466,16 @@ pub struct AppIdentity {
 impl AppIdentity {
     /// Whether a grant bound to this identity can be offered "always".
     ///
-    /// Only for a signature another developer cannot produce and the next
-    /// release of the same application keeps: a team's certificate, or
-    /// Apple's own anchor. An ad-hoc signature names a single build, and
-    /// unsigned code names nothing, so neither can carry a standing answer.
+    /// Only for an identity that survives the next installed version: a
+    /// verified Linux package, a team's certificate, or Apple's own anchor.
+    /// A single-build digest or ad-hoc signature cannot carry a standing answer.
     pub fn names_a_lasting_signer(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if !self.ad_hoc
+            && cerebellum_linux::identity::is_package_subject(&self.designated_requirement)
+        {
+            return true;
+        }
         !self.ad_hoc && (self.team_id.is_some() || self.apple_anchored)
     }
 }
@@ -1175,8 +1180,8 @@ impl ComputerGrants {
     ///
     /// All four must hold: a daemon-attested identity to key the record by, a
     /// machine identity to bind it to, a store that was read, so that writing
-    /// does not overwrite one that could not be, and a signature naming a
-    /// signer that lasts beyond this one build.
+    /// does not overwrite one that could not be, and an app identity that
+    /// lasts beyond this one build.
     fn offers_always(&self, caller: &GrantCaller, identity: Option<&AppIdentity>) -> bool {
         matches!(
             caller.holder,
