@@ -6,7 +6,6 @@ const ACTIVE: usize = 1;
 const CHECKED: usize = 4;
 const DEFUNCT: usize = 6;
 const EDITABLE: usize = 7;
-pub(super) const ENABLED: usize = 8;
 const EXPANDABLE: usize = 9;
 const EXPANDED: usize = 10;
 pub(super) const FOCUSED: usize = 12;
@@ -20,7 +19,9 @@ pub(super) fn state(bits: &[u32], index: usize) -> Option<bool> {
 }
 
 pub(super) fn enabled(bits: &[u32]) -> Option<bool> {
-    Some(state(bits, ENABLED)? && state(bits, SENSITIVE)?)
+    // SENSITIVE describes whether the control responds to interaction.
+    // GTK 4 reports it without setting the separate ENABLED bit.
+    state(bits, SENSITIVE)
 }
 
 pub(super) fn editable(bits: &[u32], interfaces: &[String]) -> bool {
@@ -253,6 +254,17 @@ impl Reader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gtk4_sensitive_state_marks_actionable_widgets_without_enabled_bit() {
+        // GTK 4.14 emits VISIBLE | SHOWING | SENSITIVE for a normal window,
+        // adds FOCUSABLE for a button, and clears SENSITIVE when disabled.
+        assert_eq!(enabled(&[0x4300_0000, 0]), Some(true));
+        assert_eq!(enabled(&[0x4300_0800, 0]), Some(true));
+        assert_eq!(enabled(&[0x4200_0800, 0]), Some(false));
+        assert_eq!(enabled(&[0x4200_0900, 0]), Some(false));
+        assert_eq!(enabled(&[]), None);
+    }
 
     #[test]
     fn atspi_roles_and_payment_tokens() {

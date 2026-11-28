@@ -108,6 +108,6 @@ for kind in x11 wayland; do
     start "$dir/other.log" "$root/editor" 'Semantic Other' "$dir/other"
     await owns_focus "$dir/other"
     timeout --kill-after=10s 6m cargo test --locked -p cerebellum --lib \
-        computer_capability::linux::semantic_tests::native_gtk_semantic_actions -- --ignored --exact
+        computer_capability::linux::semantic_tests::native_gtk_semantic_actions -- --ignored --exact --nocapture
     cleanup_children
 done

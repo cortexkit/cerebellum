@@ -360,7 +360,7 @@ async fn linux_semantic_wait_and_element_do_not_rebind_after_epoch_change() {
 }
 
 #[tokio::test]
-#[ignore = "requires the hosted GTK fixture, a private AT-SPI bus, and Xvfb/Openbox or headless Weston"]
+#[ignore = "requires the hosted GTK fixture, a private AT-SPI bus, and Xvfb/Openbox or Weston with a virtual seat"]
 async fn native_gtk_semantic_actions() {
     let required = |key| std::env::var(key).unwrap_or_else(|_| panic!("fixture requires {key}"));
     let kind = match required("CK_SEMANTIC_KIND").as_str() {
@@ -371,7 +371,7 @@ async fn native_gtk_semantic_actions() {
     let selected = atspi::Bus::identify(&required("AT_SPI_BUS_ADDRESS"))
         .await
         .unwrap();
-    let (planes, _) = rig(kind, selected, true);
+    let (planes, _) = rig(kind, selected.clone(), true);
     let target_file = required("CK_SEMANTIC_TARGET");
     let other_file = required("CK_SEMANTIC_OTHER");
     let assert_focus_unchanged = || {
@@ -422,6 +422,12 @@ async fn native_gtk_semantic_actions() {
     let blocked = wire(&planes, "read_state", json!({"target":"Semantic Operator"})).await;
     assert_eq!(blocked["reason"], "operator_app_blocked", "{blocked}");
     let target = "Semantic Target";
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        print_gtk_state_words(&selected, target),
+    )
+    .await
+    .expect("reading GTK fixture state words timed out");
     let read =
         wire_observing_consent(&planes, "read_state", json!({"target": target}), || {}).await;
     assert!(
@@ -477,4 +483,35 @@ async fn native_gtk_semantic_actions() {
     let wait = wire(&planes, "wait", wait_args(target, 2000)).await;
     assert_eq!(wait["outcome"], "predicate_satisfied", "{wait}");
     assert_focus_unchanged();
+}
+
+async fn print_gtk_state_words(selected: &AccessibilityBus, target: &str) {
+    let bus = atspi::Bus::connect(selected).await.unwrap();
+    let mut root = None;
+    for app in bus.applications().await.unwrap() {
+        if bus.name(&app).await.as_deref() == Ok(target) {
+            root = Some(app);
+            break;
+        }
+    }
+    let mut pending = vec![root.expect("GTK target on the accessibility bus")];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(object) = pending.pop() {
+        if !seen.insert(object.clone()) {
+            continue;
+        }
+        assert!(seen.len() <= 32, "unexpected GTK test tree size");
+        let name = bus.name(&object).await.unwrap_or_default();
+        let role = bus.role(&object).await.unwrap();
+        let words = bus.state(&object).await.unwrap();
+        println!("GTK GetState {name:?} ({role:?}): {words:#010x?}");
+        pending.extend(
+            bus.children(&object)
+                .await
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .filter(|child| child.peer == object.peer),
+        );
+    }
 }
