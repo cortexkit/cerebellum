@@ -91,8 +91,11 @@ fn sign_copy(source: &Path, destination: &Path, role: &str) {
     let trailer = std::env::var_os("CK_IMAGE_TEST_TRAILER")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            Path::new(env!("CARGO_BIN_EXE_ck-cerebellum-native-host"))
-                .with_file_name(format!("peer-trailer{suffix}"))
+            // The signer is built beside the profile's binaries; this test
+            // executable runs from that profile's deps/ directory.
+            let exe = std::env::current_exe().unwrap();
+            let profile = exe.parent().and_then(Path::parent).unwrap();
+            profile.join(format!("peer-trailer{suffix}"))
         });
     fs::copy(source, destination).unwrap();
     let output = Command::new(trailer)
