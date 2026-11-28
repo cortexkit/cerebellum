@@ -119,6 +119,7 @@ pub struct Application {
 struct Open {
     live: Live,
     root: Object,
+    app: VerifiedApp,
 }
 
 impl Source {
@@ -191,15 +192,26 @@ impl Source {
         if actual_pid != grant.pid {
             return Err(STALE);
         }
-        self.0
+        let app = self
+            .0
             .reprove(grant.pid, &binding.generation, &grant.bundle_identity)
             .map_err(|e| e.reason())?;
-        Ok(Open { live, root })
+        Ok(Open { live, root, app })
     }
 
     pub fn verify(&self, grant: &ProcessGrant) -> Result<(), &'static str> {
         let open = self.open(grant, Instant::now() + QUERY_LIMIT)?;
         self.same_epoch(open.live.epoch)
+    }
+
+    pub fn bound_display_name(&self, grant: &ProcessGrant) -> Result<String, &'static str> {
+        let deadline = Instant::now() + QUERY_LIMIT;
+        let open = self.open(grant, deadline)?;
+        let name = atspi::bounded(deadline, open.live.bus.name(&open.root))
+            .ok()
+            .filter(|name| !name.trim().is_empty());
+        self.same_epoch(open.live.epoch)?;
+        Ok(open.app.display_name(name.as_deref()))
     }
 
     pub fn token_grant(element: &ElementHandle) -> Option<&ProcessGrant> {

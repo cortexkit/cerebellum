@@ -2780,9 +2780,8 @@ where
     ) -> SessionAdmission {
         #[cfg(target_os = "linux")]
         if let Some(session) = &self.linux_session {
-            let display_name = binding.bundle_identity.clone();
             return match session
-                .admit_bound(management, binding, display_name, consent, cancel)
+                .admit_bound(management, binding, None, consent, cancel)
                 .await
             {
                 Ok((grant, admission)) => SessionAdmission::Admitted(grant, admission),

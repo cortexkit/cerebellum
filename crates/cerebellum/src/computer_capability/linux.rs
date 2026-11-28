@@ -190,7 +190,7 @@ impl LinuxSession {
         cancel: &CancelHandle,
     ) -> Result<(ProcessGrant, GrantAdmission), AppRefusal> {
         let (grant, display_name) = self.select(target).await.map_err(AppRefusal::Resolution)?;
-        self.admit_bound(management, grant, display_name, consent, cancel)
+        self.admit_bound(management, grant, Some(display_name), consent, cancel)
             .await
     }
 
@@ -198,13 +198,26 @@ impl LinuxSession {
         self: &Arc<Self>,
         management: &ManagementPlane,
         grant: ProcessGrant,
-        display_name: String,
+        display_name: Option<String>,
         consent: &ConsentContext,
         cancel: &CancelHandle,
     ) -> Result<(ProcessGrant, GrantAdmission), AppRefusal> {
-        self.verify_bound(&grant)
-            .await
-            .map_err(|reason| AppRefusal::Resolution(semantic_read_refusal(reason)))?;
+        let display_name = match display_name {
+            Some(name) => {
+                self.verify_bound(&grant)
+                    .await
+                    .map_err(|reason| AppRefusal::Resolution(semantic_read_refusal(reason)))?;
+                name
+            }
+            None => {
+                let source = Source(self.clone());
+                let selected = grant.clone();
+                tokio::task::spawn_blocking(move || source.bound_display_name(&selected))
+                    .await
+                    .unwrap_or(Err("backend_unavailable"))
+                    .map_err(|reason| AppRefusal::Resolution(semantic_read_refusal(reason)))?
+            }
+        };
         let driver = LinuxDriver {
             session: self.clone(),
             resolved: None,

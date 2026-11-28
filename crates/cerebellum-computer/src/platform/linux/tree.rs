@@ -37,6 +37,17 @@ pub(super) fn role(raw: &(u32, String)) -> &str {
     if password(raw) {
         return "AXSecureTextField";
     }
+    // GTK4's GetRoleName returns a toolkit role name (for example "button"
+    // or "text box"). GetRole carries the AT-SPI enum even in that case.
+    match raw.0 {
+        2 | 16 | 19 | 23 | 69 => return "AXWindow", // alert, dialog, file chooser, frame, window
+        43 | 62 => return "AXButton",               // push button, toggle button
+        61 | 79 => return "AXTextField",            // text, entry
+        35 => return "AXMenuItem",
+        7 => return "AXCheckBox",
+        44 => return "AXRadioButton",
+        _ => {}
+    }
     match raw.1.as_str() {
         "frame" | "dialog" | "window" | "file chooser" | "alert" => "AXWindow",
         "push button" | "toggle button" => "AXButton",
@@ -258,6 +269,8 @@ mod tests {
             assert_eq!(role(&(1, raw.into())), translated);
         }
         assert_eq!(role(&(40, "entry".into())), "AXSecureTextField");
+        assert_eq!(role(&(43, "button".into())), "AXButton");
+        assert_eq!(role(&(61, "text box".into())), "AXTextField");
         for (value, blocked) in [
             ("SECTION-A shipping CC-number", true),
             ("cc-csc\tusername", true),

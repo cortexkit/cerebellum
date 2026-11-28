@@ -35,8 +35,16 @@ impl Registry {
 
 impl TestAtspiBus {
     pub async fn start() -> Self {
-        let mut daemon = Command::new("dbus-daemon")
-            .args(["--session", "--nofork", "--print-address=1"])
+        Self::start_at(None).await
+    }
+
+    pub async fn start_at(socket: Option<&str>) -> Self {
+        let mut command = Command::new("dbus-daemon");
+        command.args(["--session", "--nofork", "--print-address=1"]);
+        if let Some(socket) = socket {
+            command.arg(format!("--address={socket}"));
+        }
+        let mut daemon = command
             .stdout(Stdio::piped())
             .spawn()
             .expect("start a private dbus-daemon");
@@ -44,7 +52,7 @@ impl TestAtspiBus {
         BufReader::new(daemon.stdout.take().unwrap())
             .read_line(&mut address)
             .unwrap();
-        let address = address.trim();
+        let address = socket.unwrap_or_else(|| address.trim());
         let registry = Arc::default();
         let connection = Builder::address(address)
             .name(REGISTRY)
@@ -159,6 +167,10 @@ pub struct TestAtspiApp {
 }
 
 impl TestAtspiApp {
+    pub fn peer(&self) -> &str {
+        &self.own
+    }
+
     pub async fn close(self) {
         self.registry
             .lock()

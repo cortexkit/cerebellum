@@ -33,7 +33,7 @@ fn fixture_proof(pid: u32) -> Result<VerifiedApp, IdentityRefusal> {
     })
 }
 
-type SessionControl = Arc<std::sync::Mutex<Option<DesktopSession>>>;
+type SessionControl = Arc<Mutex<Option<DesktopSession>>>;
 
 fn rig(
     kind: SessionKind,
@@ -53,7 +53,7 @@ fn rig(
         .collect(),
     );
     let mut session = LinuxSession::new(true, Arc::clone(&admitted));
-    let desktop = Arc::new(std::sync::Mutex::new(Some(DesktopSession {
+    let desktop = Arc::new(Mutex::new(Some(DesktopSession {
         id: "semantic-fixture".into(),
         kind,
         locked: false,
@@ -62,8 +62,9 @@ fn rig(
     })));
     let reading = desktop.clone();
     session.read = Box::new(move || {
-        let desktop = reading.lock().unwrap().clone();
+        let reading = reading.clone();
         Box::pin(async move {
+            let desktop = reading.lock().await.clone();
             Ok(SessionReading {
                 desktop: desktop.ok_or(session::NoSupportedSession)?,
                 x11_connection: None,
@@ -316,8 +317,13 @@ async fn linux_semantic_owner_loss_does_not_rebind_on_the_same_bus() {
 #[tokio::test]
 async fn linux_semantic_wait_and_element_do_not_rebind_after_epoch_change() {
     for kind in [SessionKind::X11, SessionKind::Wayland] {
-        let bus = TestAtspiBus::start().await;
+        let address = format!(
+            "unix:abstract=ck-atspi-restart-{}-{kind:?}",
+            std::process::id()
+        );
+        let bus = TestAtspiBus::start_at(Some(&address)).await;
         let editor = bus.app("Semantic Editor").await;
+        let initial = bus.selected.clone();
         let (planes, desktop) = rig(kind, bus.selected.clone(), false);
         let read = wire_observing_consent(
             &planes,
@@ -328,15 +334,20 @@ async fn linux_semantic_wait_and_element_do_not_rebind_after_epoch_change() {
         .await;
         let button = element(&read, "Apply");
         let baseline = editor.effects.polls.load(Ordering::SeqCst);
-        let replacement_bus = TestAtspiBus::start().await;
-        let replacement = replacement_bus.app("Semantic Editor").await;
-        replacement.effects.ready.store(true, Ordering::SeqCst);
         let replace = async {
             poll_started(&editor.effects, baseline).await;
-            desktop.lock().unwrap().as_mut().unwrap().accessibility =
-                Some(replacement_bus.selected.clone());
+            let mut reading = desktop.lock().await;
+            drop(bus);
+            let replacement_bus = TestAtspiBus::start_at(Some(&address)).await;
+            let replacement = replacement_bus.app("Semantic Editor").await;
+            assert_eq!(initial.address, replacement_bus.selected.address);
+            assert_ne!(initial.id, replacement_bus.selected.id);
+            assert_eq!(editor.peer(), replacement.peer());
+            replacement.effects.ready.store(true, Ordering::SeqCst);
+            reading.as_mut().unwrap().accessibility = Some(replacement_bus.selected.clone());
+            (replacement_bus, replacement)
         };
-        let (waited, ()) = tokio::join!(
+        let (waited, (_replacement_bus, replacement)) = tokio::join!(
             wire(&planes, "wait", wait_args("Semantic Editor", 2000)),
             replace
         );

@@ -81,20 +81,21 @@ for kind in x11 wayland; do
     await test -S "$dir/user-bus"
     await test -S "$dir/a11y-bus"
     start "$dir/registry.log" /usr/libexec/at-spi2-registryd
-    if [[ $kind == x11 ]]; then
-        unset WAYLAND_DISPLAY
-        start "$dir/xvfb.log" bash -c 'exec Xvfb -displayfd 3 -screen 0 1024x768x24 -nolisten tcp 3>"$1"' _ "$dir/display"
-        await test -s "$dir/display"
-        IFS= read -r display < "$dir/display"
-        [[ $display =~ ^[0-9]+$ ]]
-        export DISPLAY=:$display
-        start "$dir/wm.log" openbox --sm-disable
-        await wm_ready
-    else
-        unset DISPLAY
+    unset WAYLAND_DISPLAY
+    start "$dir/xvfb.log" bash -c 'exec Xvfb -displayfd 3 -screen 0 1024x768x24 -nolisten tcp 3>"$1"' _ "$dir/display"
+    await test -s "$dir/display"
+    IFS= read -r display < "$dir/display"
+    [[ $display =~ ^[0-9]+$ ]]
+    export DISPLAY=:$display
+    start "$dir/wm.log" openbox --sm-disable
+    await wm_ready
+    if [[ $kind == wayland ]]; then
+        # Weston's headless backend creates no seat. Nest it on Xvfb for a
+        # virtual keyboard seat; the GTK clients use only native Wayland.
         export WAYLAND_DISPLAY=wayland-semantic
-        start "$dir/weston.log" weston --backend=headless-backend.so --socket="$WAYLAND_DISPLAY" --idle-time=0
+        start "$dir/weston.log" weston --backend=x11-backend.so --use-pixman --socket="$WAYLAND_DISPLAY" --idle-time=0
         await test -S "$dir/$WAYLAND_DISPLAY"
+        unset DISPLAY
     fi
     export GDK_BACKEND=$kind GTK_A11Y=atspi
     export CK_SEMANTIC_KIND=$kind CK_SEMANTIC_TARGET="$dir/target" CK_SEMANTIC_OTHER="$dir/other"
