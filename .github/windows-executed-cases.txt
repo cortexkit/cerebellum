@@ -15,3 +15,5 @@ bound windows_withheld::tests::windows_browser_bound_refuses_user_before_the_bri
 bound windows_withheld::tests::windows_browser_bound_withheld_table_never_dispatches
 bound identity::tests::windows_chrome_handle_has_exact_access
 bound identity::tests::windows_installed_chrome_chain
+bound identity::tests::windows_machine_root_store_reports_self_signed_g4
+bound windows_launch::discovery::tests::windows_chrome_signature_is_checked_against_root_table

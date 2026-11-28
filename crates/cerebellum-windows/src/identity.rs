@@ -23,36 +23,17 @@ use windows_sys::Win32::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdentityCheck {
-    PathReparse,
-    PathUnstable,
-    Signature,
-    Digest,
-    Revoked,
-    Chain,
-    Publisher,
-    Eku,
-    Root,
-    ImageMismatch,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenExecutableError {
     Missing,
-    Refused(IdentityCheck),
-}
-
-impl From<IdentityCheck> for OpenExecutableError {
-    fn from(check: IdentityCheck) -> Self {
-        Self::Refused(check)
-    }
+    ReparsePoint,
+    UnstablePath,
 }
 
 impl OpenExecutableError {
     fn from_open(error: io::Error) -> Self {
         match error.raw_os_error().map(|code| code as u32) {
             Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => Self::Missing,
-            _ => IdentityCheck::PathUnstable.into(),
+            _ => OpenExecutableError::UnstablePath,
         }
     }
 }
@@ -80,8 +61,8 @@ impl PathForms {
 }
 
 /// A local DOS path exactly representable with and without the verbatim prefix.
-pub fn checked_path_forms(path: &OsStr) -> Result<PathForms, IdentityCheck> {
-    let refuse = IdentityCheck::PathUnstable;
+pub fn checked_path_forms(path: &OsStr) -> Result<PathForms, OpenExecutableError> {
+    let refuse = OpenExecutableError::UnstablePath;
     let path = path.to_str().ok_or(refuse)?;
     let spawn = path.strip_prefix(VERBATIM).unwrap_or(path);
     let wide: Vec<u16> = spawn.encode_utf16().chain([0]).collect();
@@ -158,11 +139,11 @@ impl HeldExecutable {
         path: &Path,
         mut after_open_directory: impl FnMut(usize),
     ) -> Result<Self, OpenExecutableError> {
-        let refuse = IdentityCheck::PathUnstable;
+        let refuse = OpenExecutableError::UnstablePath;
         let requested = checked_path_forms(path.as_os_str())?;
         let (drive, rest) = requested.spawn.split_at(3);
         if rest.is_empty() {
-            return Err(refuse.into());
+            return Err(refuse);
         }
         let root_name: Vec<u16> = VERBATIM
             .encode_utf16()
@@ -204,7 +185,7 @@ impl HeldExecutable {
             }
             let actual = final_path(&file, VOLUME_NAME_DOS).map_err(|_| refuse)?;
             if !ordinal_eq_ignore_case(&requested.stored, &actual) {
-                return Err(refuse.into());
+                return Err(refuse);
             }
             let paths = checked_path_forms(OsStr::new(&actual))?;
             return Ok(Self {
@@ -213,7 +194,7 @@ impl HeldExecutable {
                 _ancestors: ancestors,
             });
         }
-        Err(refuse.into())
+        Err(refuse)
     }
 }
 
@@ -266,7 +247,7 @@ fn open_component(parent: &File, component: &str, directory: bool) -> io::Result
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 
-fn check_attributes(file: &File, directory: bool) -> Result<(), IdentityCheck> {
+fn check_attributes(file: &File, directory: bool) -> Result<(), OpenExecutableError> {
     let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
     // FileAttributeTagInfo writes a FILE_ATTRIBUTE_TAG_INFO into the buffer.
     let ok = unsafe {
@@ -278,19 +259,19 @@ fn check_attributes(file: &File, directory: bool) -> Result<(), IdentityCheck> {
         )
     };
     if ok == 0 {
-        return Err(IdentityCheck::PathUnstable);
+        return Err(OpenExecutableError::UnstablePath);
     }
     if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(IdentityCheck::PathReparse);
+        return Err(OpenExecutableError::ReparsePoint);
     }
     if (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
-        return Err(IdentityCheck::PathUnstable);
+        return Err(OpenExecutableError::UnstablePath);
     }
     Ok(())
 }
 
-fn check_volume(root: &File) -> Result<(), IdentityCheck> {
-    let refuse = IdentityCheck::PathUnstable;
+fn check_volume(root: &File) -> Result<(), OpenExecutableError> {
+    let refuse = OpenExecutableError::UnstablePath;
     // Remote shares have no mount-manager volume GUID. Check the held object,
     // not the drive letter, which can be remapped between two by-name queries.
     if !final_path(root, VOLUME_NAME_GUID)
@@ -355,91 +336,55 @@ fn ordinal_eq_ignore_case(a: &str, b: &str) -> bool {
 
 use std::ffi::CStr;
 use std::marker::PhantomData;
-use windows_sys::Win32::{
+use windows_sys::Win32::Security::{Cryptography::*, WinTrust::*};
+
+pub use windows_sys::Win32::{
     Foundation::{CERT_E_REVOKED, CRYPT_E_REVOCATION_OFFLINE, CRYPT_E_REVOKED, TRUST_E_BAD_DIGEST},
-    Security::{Cryptography::*, WinTrust::*},
+    Security::Cryptography::{
+        CERT_TRUST_IS_OFFLINE_REVOCATION, CERT_TRUST_IS_REVOKED,
+        CERT_TRUST_REVOCATION_STATUS_UNKNOWN,
+    },
 };
 
-pub const CHROME_PUBLISHER: &str = "Google LLC";
-const CHROME_ROOTS: &[[u8; 32]] = &[];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Revocation {
-    Checked,
-    OfflineOrUnknown,
+#[derive(Debug)]
+pub struct SignatureStatus {
+    pub provider_status: i32,
+    pub chain_errors: Option<u32>,
+    pub signer: Option<SignatureSigner>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct VerifiedSignature {
-    pub root_sha256: [u8; 32],
-    pub revocation: Revocation,
-}
-
-const OFFLINE_BITS: u32 = CERT_TRUST_REVOCATION_STATUS_UNKNOWN | CERT_TRUST_IS_OFFLINE_REVOCATION;
-
-fn trust_gate(provider: i32, chain: Option<u32>) -> Result<Revocation, IdentityCheck> {
-    if matches!(provider, CERT_E_REVOKED | CRYPT_E_REVOKED)
-        || chain.is_some_and(|status| status & CERT_TRUST_IS_REVOKED != 0)
-    {
-        return Err(IdentityCheck::Revoked);
-    }
-    let provider_offline = match provider {
-        0 => false,
-        CRYPT_E_REVOCATION_OFFLINE => true,
-        TRUST_E_BAD_DIGEST => return Err(IdentityCheck::Digest),
-        _ => return Err(IdentityCheck::Signature),
-    };
-    let chain = chain.ok_or(IdentityCheck::Chain)?;
-    if chain & !OFFLINE_BITS != 0 {
-        return Err(IdentityCheck::Chain);
-    }
-    Ok(if provider_offline || chain != 0 {
-        Revocation::OfflineOrUnknown
-    } else {
-        Revocation::Checked
-    })
-}
-
-fn signer_gate(
-    cn: Option<&str>,
-    org: Option<&str>,
-    eku: bool,
-    publisher: &str,
-) -> Result<(), IdentityCheck> {
-    if cn != Some(publisher) || org != Some(publisher) {
-        return Err(IdentityCheck::Publisher);
-    }
-    if !eku {
-        return Err(IdentityCheck::Eku);
-    }
-    Ok(())
-}
-
-fn root_gate(root: &[u8; 32]) -> Result<(), IdentityCheck> {
-    if !CHROME_ROOTS.contains(root) {
-        return Err(IdentityCheck::Root);
-    }
-    Ok(())
+#[derive(Debug)]
+pub struct SignatureSigner {
+    pub common_name: Option<String>,
+    pub organization: Option<String>,
+    pub code_signing_eku: bool,
+    pub root_sha256: Option<[u8; 32]>,
 }
 
 impl HeldExecutable {
-    pub fn verify_signature(&self, publisher: &str) -> Result<VerifiedSignature, IdentityCheck> {
-        self.with_trust(publisher, |certificates, revocation| {
-            let root_sha256 = cert_hash(certificates.last().ok_or(IdentityCheck::Chain)?)
-                .ok_or(IdentityCheck::Root)?;
-            root_gate(&root_sha256)?;
-            Ok(VerifiedSignature {
-                root_sha256,
-                revocation,
-            })
+    /// Read the provider status, the selected chain's status, and signer facts.
+    /// The provider state closes before this owned snapshot leaves the call.
+    pub fn read_signature_status(&self) -> SignatureStatus {
+        self.with_signature_state(|state, provider_status| {
+            let chain = state.chain();
+            let signer = chain.and_then(chain_certificates).and_then(|certificates| {
+                let leaf = certificates.first()?;
+                Some(SignatureSigner {
+                    common_name: cert_name(leaf, c"2.5.4.3"),
+                    organization: cert_name(leaf, c"2.5.4.10"),
+                    code_signing_eku: code_signing_eku(leaf),
+                    root_sha256: certificates.last().and_then(|root| cert_hash(root)),
+                })
+            });
+            SignatureStatus {
+                provider_status,
+                chain_errors: chain.map(|c| c.TrustStatus.dwErrorStatus),
+                signer,
+            }
         })
     }
 
-    fn with_trust<T>(
-        &self,
-        publisher: &str,
-        read: impl FnOnce(&[&CERT_CONTEXT], Revocation) -> Result<T, IdentityCheck>,
-    ) -> Result<T, IdentityCheck> {
+    fn with_signature_state<T>(&self, read: impl FnOnce(&TrustState<'_>, i32) -> T) -> T {
         let path: Vec<u16> = self.paths.stored.encode_utf16().chain([0]).collect();
         let mut target = WINTRUST_FILE_INFO {
             cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
@@ -448,21 +393,7 @@ impl HeldExecutable {
             pgKnownSubject: null_mut(),
         };
         let (state, provider) = TrustState::verify(&mut target);
-        let chain = state.chain();
-        let revocation = trust_gate(provider, chain.map(|c| c.TrustStatus.dwErrorStatus))?;
-        let certificates = chain
-            .and_then(chain_certificates)
-            .ok_or(IdentityCheck::Chain)?;
-        let leaf = certificates.first().ok_or(IdentityCheck::Chain)?;
-        let cn = cert_name(leaf, c"2.5.4.3");
-        let org = cert_name(leaf, c"2.5.4.10");
-        signer_gate(
-            cn.as_deref(),
-            org.as_deref(),
-            code_signing_eku(leaf),
-            publisher,
-        )?;
-        read(&certificates, revocation)
+        read(&state, provider)
     }
 }
 
@@ -633,20 +564,23 @@ mod tests {
             None => return,
         };
         let held = HeldExecutable::open(Path::new(&path)).expect("open installed Chrome");
-        held.with_trust(CHROME_PUBLISHER, |certs, revocation| {
+        held.with_signature_state(|state, provider| {
+            let chain = state.chain().expect("provider did not supply its chain");
+            let certs =
+                chain_certificates(chain).expect("provider did not supply its certificates");
             let mut log = io::stderr().lock();
             writeln!(
                 log,
-                "Chrome Authenticode: {:?}, {revocation:?}",
-                held.paths().stored()
+                "Chrome Authenticode: {:?}; provider={provider:#010x}; chain={:#010x}",
+                held.paths().stored(),
+                chain.TrustStatus.dwErrorStatus
             )
             .unwrap();
             for (index, cert) in certs.iter().enumerate() {
-                let info = certificate_info(cert).ok_or(IdentityCheck::Chain)?;
-                let subject =
-                    distinguished_name(cert, &info.Subject).ok_or(IdentityCheck::Chain)?;
-                let issuer = distinguished_name(cert, &info.Issuer).ok_or(IdentityCheck::Chain)?;
-                let thumbprint = cert_hash(cert).ok_or(IdentityCheck::Chain)?;
+                let info = certificate_info(cert).expect("certificate info");
+                let subject = distinguished_name(cert, &info.Subject).expect("subject");
+                let issuer = distinguished_name(cert, &info.Issuer).expect("issuer");
+                let thumbprint = cert_hash(cert).expect("certificate SHA-256");
                 writeln!(
                     log,
                     "Chrome certificate {index}: subject={subject:?}; issuer={issuer:?}; SHA256={}",
@@ -654,16 +588,88 @@ mod tests {
                 )
                 .unwrap();
             }
-            let root = certs.last().ok_or(IdentityCheck::Chain)?;
-            let spki = spki_hash(root).ok_or(IdentityCheck::Chain)?;
+            let spki = spki_hash(certs.last().unwrap()).expect("root SPKI SHA-256");
             writeln!(log, "Chrome root SPKI SHA256={}", hex(&spki)).unwrap();
-            Ok(())
-        })
-        .expect("verify installed Chrome before applying the root pin");
-        assert_eq!(
-            held.verify_signature(CHROME_PUBLISHER),
-            Err(IdentityCheck::Root)
+        });
+    }
+
+    #[test]
+    fn windows_machine_root_store_reports_self_signed_g4() {
+        if std::env::var_os("CK_WINDOWS_BROWSER_CHROME").is_none() {
+            return;
+        }
+        let root: Vec<u16> = "Root".encode_utf16().chain([0]).collect();
+        // Open the machine's existing Root store read-only, with no user store or network lookup.
+        let handle = unsafe {
+            CertOpenStore(
+                CERT_STORE_PROV_SYSTEM_W,
+                0,
+                0,
+                CERT_SYSTEM_STORE_LOCAL_MACHINE
+                    | CERT_STORE_OPEN_EXISTING_FLAG
+                    | CERT_STORE_READONLY_FLAG,
+                root.as_ptr().cast(),
+            )
+        };
+        assert!(
+            !handle.is_null(),
+            "open LocalMachine\\Root: {}",
+            io::Error::last_os_error()
         );
+        struct Store(HCERTSTORE);
+        impl Drop for Store {
+            fn drop(&mut self) {
+                // This guard owns the open store.
+                unsafe { CertCloseStore(self.0, 0) };
+            }
+        }
+        let store = Store(handle);
+        let mut last = null_mut();
+        let mut roots = Vec::new();
+        loop {
+            // The store is open. Each enumeration call releases its preceding context.
+            last = unsafe { CertEnumCertificatesInStore(store.0, last) };
+            // Copy the matching facts inside this iteration, before advancing.
+            let Some(cert) = (unsafe { last.as_ref() }) else {
+                break;
+            };
+            if cert_name(cert, c"2.5.4.3").as_deref() != Some("DigiCert Trusted Root G4") {
+                continue;
+            }
+            let info = certificate_info(cert).expect("certificate info");
+            let subject = distinguished_name(cert, &info.Subject).expect("subject");
+            let issuer = distinguished_name(cert, &info.Issuer).expect("issuer");
+            if subject != issuer {
+                continue;
+            }
+            // A self-issued name alone does not establish a self-signed certificate.
+            let self_signed = unsafe {
+                CryptVerifyCertificateSignatureEx(
+                    0,
+                    X509_ASN_ENCODING,
+                    CRYPT_VERIFY_CERT_SIGN_SUBJECT_CERT,
+                    last.cast(),
+                    CRYPT_VERIFY_CERT_SIGN_ISSUER_CERT,
+                    last.cast(),
+                    0,
+                    null_mut(),
+                )
+            } != 0;
+            if self_signed {
+                roots.push((
+                    subject,
+                    cert_hash(cert).expect("certificate SHA-256"),
+                    spki_hash(cert).expect("root SPKI SHA-256"),
+                ));
+            }
+        }
+        assert_eq!(
+            roots.len(),
+            1,
+            "unique self-signed Trusted Root G4: {roots:?}"
+        );
+        let (subject, der, spki) = &roots[0];
+        writeln!(io::stderr().lock(), "LocalMachine\\Root self-signed certificate: subject={subject:?}; DER SHA256={}; SPKI SHA256={}", hex(der), hex(spki)).unwrap();
     }
 
     #[test]
