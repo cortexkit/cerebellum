@@ -7,10 +7,39 @@ const RT_VERSION: u32 = 16;
 const DIRECTORY: u32 = 1 << 31;
 
 pub(crate) fn read_product_names(
-    mut read_at: impl FnMut(u64, &mut [u8]) -> std::io::Result<()>,
+    read_at: impl FnMut(u64, &mut [u8]) -> std::io::Result<()>,
 ) -> Option<Vec<String>> {
-    let (table, rva) = resource_table(&mut read_at)?;
-    version_products(&table, rva)
+    version_values(read_at, version_strings)
+}
+
+pub(crate) fn read_file_version(
+    read_at: impl FnMut(u64, &mut [u8]) -> std::io::Result<()>,
+) -> Option<[u16; 4]> {
+    let versions = version_values(read_at, fixed_file_version)?;
+    let first = *versions.first()?;
+    versions
+        .iter()
+        .all(|version| *version == first)
+        .then_some(first)
+}
+
+fn fixed_file_version(buf: &[u8]) -> Option<Vec<[u16; 4]>> {
+    let root = Block::read(buf)?;
+    if !wide_eq(root.key, "VS_VERSION_INFO")
+        || root.text
+        || root.value.len() != 52
+        || u32_at(root.value, 0)? != 0xfeef_04bd
+    {
+        return None;
+    }
+    // VS_FIXEDFILEINFO has separate file and product versions. Chrome's
+    // sibling directory is named by the four components of the file version.
+    Some(vec![[
+        u16_at(root.value, 10)?,
+        u16_at(root.value, 8)?,
+        u16_at(root.value, 14)?,
+        u16_at(root.value, 12)?,
+    ]])
 }
 
 fn resource_table(
@@ -85,34 +114,38 @@ fn resource_table(
     Some((table, rva))
 }
 
-fn version_products(table: &[u8], rva: u32) -> Option<Vec<String>> {
-    let mut versions = directory_entries(table, 0)?.filter(|&(id, _)| id == RT_VERSION);
+fn version_values<T>(
+    mut read_at: impl FnMut(u64, &mut [u8]) -> std::io::Result<()>,
+    mut values_in_resource: impl FnMut(&[u8]) -> Option<Vec<T>>,
+) -> Option<Vec<T>> {
+    let (table, rva) = resource_table(&mut read_at)?;
+    let mut versions = directory_entries(&table, 0)?.filter(|&(id, _)| id == RT_VERSION);
     let version = versions.next()?.1;
     if versions.next().is_some() {
         return None;
     }
     let mut names = 0;
     let mut resources = 0;
-    let mut products = Vec::new();
-    for (_, name) in directory_entries(table, directory_offset(version)?)? {
+    let mut values = Vec::new();
+    for (_, name) in directory_entries(&table, directory_offset(version)?)? {
         names += 1;
         if names > 64 {
             return None;
         }
-        for (_, lang) in directory_entries(table, directory_offset(name)?)? {
+        for (_, lang) in directory_entries(&table, directory_offset(name)?)? {
             resources += 1;
             if resources > 64 || lang & DIRECTORY != 0 {
                 return None;
             }
             let entry = lang as usize;
-            let start = u32_at(table, entry)?.checked_sub(rva)? as usize;
-            let size = u32_at(table, entry + 4)? as usize;
-            products.extend(version_strings(
+            let start = u32_at(&table, entry)?.checked_sub(rva)? as usize;
+            let size = u32_at(&table, entry + 4)? as usize;
+            values.extend(values_in_resource(
                 table.get(start..start.checked_add(size)?)?,
             )?);
         }
     }
-    (!products.is_empty()).then_some(products)
+    (!values.is_empty()).then_some(values)
 }
 
 fn directory_offset(entry: u32) -> Option<usize> {
@@ -248,4 +281,4 @@ fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

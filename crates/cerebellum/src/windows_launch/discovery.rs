@@ -1,5 +1,6 @@
 //! Select and attest the Windows Chrome image before taking a launch profile.
 
+use super::writability::{inspect_install, InstallWritability};
 use cerebellum_windows::identity::{
     checked_path_forms, native_pe_machine, read_process_image_identity, HeldExecutable,
     OpenExecutableError, SignatureStatus, CERT_E_REVOKED, CERT_TRUST_IS_OFFLINE_REVOCATION,
@@ -117,6 +118,7 @@ pub struct PreparedExecutable {
     pub image_sha256: [u8; 32],
     pub image_id: FileIdentity,
     pub token_elevated: bool,
+    pub install_writable_by_user: InstallWritability,
     pub skipped: Vec<SkippedCandidate>,
 }
 
@@ -192,6 +194,7 @@ impl DiscoveryRoots {
         let token_elevated = current_process_token_facts()
             .ok_or(DiscoveryError::TokenElevationUnavailable)?
             .elevated;
+        let install_writable_by_user = inspect_install(&held);
         Ok(PreparedExecutable {
             held,
             publisher: publisher.to_owned(),
@@ -199,6 +202,7 @@ impl DiscoveryRoots {
             image_sha256,
             image_id,
             token_elevated,
+            install_writable_by_user,
             skipped,
         })
     }
