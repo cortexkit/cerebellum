@@ -1,4 +1,4 @@
-//! Windows reads of application state. AppStateSessions assigns the public element IDs.
+//! Windows application state and addressed actions. AppStateSessions assigns the public element IDs.
 
 use crate::app_state::source::*;
 use crate::platform::ProcessGrant;
@@ -21,6 +21,7 @@ use super::identity::{
 };
 use super::launch::LaunchInventory;
 
+mod actions;
 mod uia;
 mod wait;
 pub(super) mod windows;
@@ -482,6 +483,31 @@ impl AppStateSource for WindowsAppStateSource {
     fn element_enabled(&self, element: &ElementHandle) -> Option<bool> {
         self.with_element(element, read_deadline(), |ui, found| ui.enabled(found))
             .ok()
+    }
+
+    fn press(&self, element: &ElementHandle) -> Result<(), ElementActionError> {
+        let key = element_token(element)?.key.clone();
+        self.with_element(element, read_deadline(), move |ui, found| {
+            ui.press(found, &key)
+        })
+        .map_err(actions::mutation_error)
+    }
+
+    fn write_text(
+        &self,
+        element: &ElementHandle,
+        attribute: TextAttribute,
+        text: &str,
+    ) -> Result<(), ElementActionError> {
+        if !matches!(attribute, TextAttribute::Value) {
+            return Err(ElementActionError::Unsupported);
+        }
+        let text = text.to_owned();
+        let key = element_token(element)?.key.clone();
+        self.with_element(element, read_deadline(), move |ui, _| {
+            ui.set_value(&key, &text)
+        })
+        .map_err(actions::mutation_error)
     }
 
     fn focused_window(

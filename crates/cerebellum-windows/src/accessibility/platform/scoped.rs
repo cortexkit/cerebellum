@@ -13,6 +13,8 @@ use windows_sys::Win32::UI::Accessibility::{
     UIA_TogglePatternId, UIA_ValuePatternId, UIA_E_ELEMENTNOTAVAILABLE, UIA_E_NOTSUPPORTED,
 };
 
+mod actuators;
+
 type Failure = AccessibilityReadFailure;
 
 const UIA_GET_FOCUSED_ELEMENT: usize = 8;
