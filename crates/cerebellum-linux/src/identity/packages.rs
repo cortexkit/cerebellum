@@ -66,11 +66,12 @@ impl Database {
             return Ok(Some(format!("dpkg:{}", matched.name)));
         }
         let Some(db) = rpm_database(host)? else {
+            // A readable dpkg inventory can establish that the path is
+            // unowned. An optional rpm executable does not make a dpkg host
+            // an RPM host, even when that executable has no dpkg record.
             if mismatch.is_ok()
+                && self.dpkg.is_none()
                 && optional_owned(host, Path::new(RPM))?.is_some()
-                && self
-                    .dpkg_record(host, &self::candidates(Path::new(RPM)))?
-                    .is_none()
             {
                 return Err(AppIdentityUnproven);
             }

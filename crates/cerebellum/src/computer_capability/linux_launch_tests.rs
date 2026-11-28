@@ -574,6 +574,8 @@ async fn entry_refusals(rig: &mut Rig, working: &str) {
     fs::write(wrapper, "#!/bin/sh\nexit 0\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    // Leave this ELF outside the private dpkg inventory. The hosted runner
+    // also installs rpm for another fixture; the tool alone is not a database.
     fs::copy(PROGRAM, unowned).unwrap();
     for exec in [
         "sh -c ignored",
