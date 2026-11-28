@@ -453,6 +453,8 @@ use cerebellum_computer::platform::{
 };
 use cerebellum_core::journal::{InMemoryJournalStorage, ValidatedSeverityTaxonomy};
 
+mod background_pictures;
+
 const TARGET: u32 = 4242;
 const PREVIOUS: u32 = 100;
 const THIRD: u32 = 300;

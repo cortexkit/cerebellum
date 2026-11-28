@@ -42,6 +42,8 @@ fn main() -> Result<std::process::ExitCode, cerebellum::ModuleError> {
         agent_cursor();
         return Ok(std::process::ExitCode::SUCCESS);
     }
+    #[cfg(windows)]
+    cerebellum_windows::set_process_per_monitor_v2();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

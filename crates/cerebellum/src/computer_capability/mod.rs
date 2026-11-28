@@ -71,8 +71,7 @@ use linux::{
 pub(crate) type NativeComputerCaptureBackend =
     cerebellum_computer::platform::native::NativeCaptureBackend;
 #[cfg(target_os = "windows")]
-pub(crate) type NativeComputerCaptureBackend =
-    cerebellum_computer::platform::WindowsUnsupportedCaptureBackend;
+pub(crate) type NativeComputerCaptureBackend = cerebellum_computer::platform::WindowsCaptureBackend;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn native_capture_backend() -> NativeComputerCaptureBackend {
@@ -81,7 +80,7 @@ pub(crate) fn native_capture_backend() -> NativeComputerCaptureBackend {
 
 #[cfg(target_os = "windows")]
 pub(crate) fn native_capture_backend() -> NativeComputerCaptureBackend {
-    cerebellum_computer::platform::WindowsUnsupportedCaptureBackend
+    cerebellum_computer::platform::WindowsCaptureBackend
 }
 #[cfg(target_os = "linux")]
 pub(crate) fn native_capture_backend() -> NativeComputerCaptureBackend {
@@ -125,6 +124,7 @@ pub(crate) mod operator_confirm;
 mod settle_tests;
 use image_freshness::{ImageFreshnessSource, NativeImageFreshnessSource};
 mod read_image;
+mod read_image_background;
 mod read_state;
 #[cfg(target_os = "macos")]
 mod select_all;

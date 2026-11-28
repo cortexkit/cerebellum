@@ -275,6 +275,24 @@ impl Planes {
             compiled_release_inputs().takeover_dispatch_review_revision;
         #[cfg(target_os = "linux")]
         let computer_context = default_computer_context();
+        #[cfg(target_os = "macos")]
+        let (fronting, app_use_fronting, pointer_fronting, preview_capture) = {
+            let inputs = compiled_release_inputs();
+            (
+                fronting_bracket_admitted(&inputs),
+                app_use_fronting_admitted(&inputs),
+                takeover_pointer_fronting_admitted(&inputs),
+                preview_capture_admitted(&inputs),
+            )
+        };
+        #[cfg(target_os = "windows")]
+        let (fronting, app_use_fronting, pointer_fronting, preview_capture) = {
+            let context = default_computer_context();
+            computer::platform::windows::picture::fronting_flags(
+                &context.inputs,
+                context.startup.windows_elevation,
+            )
+        };
         #[cfg(target_os = "linux")]
         let computer_admitted = Arc::new(
             computer_release_evidence(&computer_context)
@@ -354,24 +372,16 @@ impl Planes {
                     })
                     // The fronting bracket is served only by a build carrying
                     // its review; without it a background target is refused.
-                    .with_fronting_bracket_admitted(fronting_bracket_admitted(
-                        &compiled_release_inputs(),
-                    ))
-                    .with_takeover_pointer_fronting_admitted(takeover_pointer_fronting_admitted(
-                        &compiled_release_inputs(),
-                    ))
+                    .with_fronting_bracket_admitted(fronting)
+                    .with_takeover_pointer_fronting_admitted(pointer_fronting)
                     // Fronting outside that bracket needs the app-use review
                     // as well; without it every such front is unavailable.
-                    .with_app_use_fronting_admitted(app_use_fronting_admitted(
-                        &compiled_release_inputs(),
-                    ))
+                    .with_app_use_fronting_admitted(app_use_fronting)
                     // The plane's one preview worker captures with the
                     // platform's capture, and only when the capture review
                     // and the app-use review both bind; otherwise every
                     // preview shows the application's icon.
-                    .with_native_preview_capture(preview_capture_admitted(
-                        &compiled_release_inputs(),
-                    )),
+                    .with_native_preview_capture(preview_capture),
                 )
             }),
             #[cfg(target_os = "linux")]

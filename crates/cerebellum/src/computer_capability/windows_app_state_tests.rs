@@ -18,6 +18,7 @@ use std::{
 use subc_protocol::{Flags, Frame, FrameType, Priority};
 
 mod launch;
+mod picture;
 
 fn app_state_block(context: &CapabilityAdvertisementContext) -> Option<&'static str> {
     if context
@@ -191,6 +192,14 @@ fn rig(
             responsible_process: "ck-cerebellum".into(),
             off_main: true,
         }]);
+        let permissions = if context.inputs.windows_capture_review_revision.is_some() {
+            cerebellum_computer::platform::windows::picture::startup_permissions(
+                &context.inputs,
+                context.startup.windows_elevation,
+            )
+        } else {
+            permissions
+        };
         plane.windows_app_state_for_test = app_state_admitted.then(|| source.clone());
         plane = plane
             .with_app_state_source(Arc::new(source))

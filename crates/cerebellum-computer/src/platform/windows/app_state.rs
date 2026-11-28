@@ -30,7 +30,7 @@ pub use wait::WindowsAppStatePoller;
 mod tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReadError {
+pub(super) enum ReadError {
     Gone,
     Replaced,
     Permission,
