@@ -37,11 +37,11 @@ mod linux;
 // as unused code.
 #[cfg(target_os = "linux")]
 pub use launch::{
-    executed_image_identity, place_desktop_scope, process_descriptors, spawn_barred,
-    spawn_desktop_barred, terminate_exact_generation, BarredChild, DesktopBarredChild,
-    DesktopChild, DesktopExit, DesktopReaper, ExecutedImageIdentity, GenerationMatch,
-    ImageIdentityError, ProcessControlError, ProcessGeneration, ReleasedChild, ScopeUnavailable,
-    SpawnError, TerminationOutcome,
+    desktop_reaper_wait_failures, executed_image_identity, place_desktop_scope,
+    process_descriptors, spawn_barred, spawn_desktop_barred, terminate_exact_generation,
+    BarredChild, DesktopBarredChild, DesktopChild, DesktopExit, DesktopReaper,
+    ExecutedImageIdentity, GenerationMatch, ImageIdentityError, ProcessControlError,
+    ProcessGeneration, ReleasedChild, ScopeUnavailable, SpawnError, TerminationOutcome,
 };
 #[cfg(any(target_os = "linux", all(test, unix)))]
 pub use linux::process_start_time;

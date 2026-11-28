@@ -9,6 +9,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -295,6 +296,12 @@ pub struct DesktopReaper {
     status: oneshot::Receiver<io::Result<DesktopExit>>,
 }
 
+static DESKTOP_REAPER_WAIT_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+pub fn desktop_reaper_wait_failures() -> u64 {
+    DESKTOP_REAPER_WAIT_FAILURES.load(Ordering::Relaxed)
+}
+
 impl DesktopReaper {
     fn start(
         generation: ProcessGeneration,
@@ -307,8 +314,8 @@ impl DesktopReaper {
             .spawn(move || {
                 if ready.blocking_recv().is_ok() {
                     let result = wait(generation.pid);
-                    if let Err(error) = &result {
-                        eprintln!("desktop child reaper failed: {error}");
+                    if result.is_err() {
+                        DESKTOP_REAPER_WAIT_FAILURES.fetch_add(1, Ordering::Relaxed);
                     }
                     let _ = report.send(result);
                 }
@@ -1568,6 +1575,7 @@ mod tests {
         fn failed_wait(_: u32) -> io::Result<DesktopExit> {
             Err(io::Error::from_raw_os_error(libc::ECHILD))
         }
+        let failures_before = desktop_reaper_wait_failures();
         for fail in [false, true] {
             let child = spawn_desktop_barred(
                 Path::new("/usr/bin/sleep"),
@@ -1601,6 +1609,7 @@ mod tests {
                 wait_for_pid(generation.pid as c_int).unwrap();
             }
         }
+        assert_eq!(desktop_reaper_wait_failures(), failures_before + 1);
     }
 
     fn pipe() -> (OwnedFd, OwnedFd) {

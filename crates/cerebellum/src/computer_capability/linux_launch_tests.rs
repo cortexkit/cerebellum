@@ -154,13 +154,17 @@ fn update_package(package: &str, paths: &[&str]) {
         let sum = text.split_ascii_whitespace().next().unwrap();
         sums.push_str(&format!("{sum}  {}\n", path.trim_start_matches('/')));
     }
-    let info = "/var/lib/dpkg/info";
-    fs::write(
-        format!("{info}/{package}.list"),
-        format!("{}\n", paths.join("\n")),
-    )
-    .unwrap();
-    fs::write(format!("{info}/{package}.md5sums"), sums).unwrap();
+    // Install each record by rename so the package reader sees the same
+    // directory change that invalidates its index on a dpkg update.
+    for (suffix, bytes) in [
+        ("list", format!("{}\n", paths.join("\n"))),
+        ("md5sums", sums),
+    ] {
+        let record = format!("/var/lib/dpkg/info/{package}.{suffix}");
+        let incoming = format!("{record}.new");
+        fs::write(&incoming, bytes).unwrap();
+        fs::rename(incoming, record).unwrap();
+    }
 }
 
 fn set_exec(exec: &str) {
@@ -186,7 +190,7 @@ impl Drop for Scratch {
 struct Mount(&'static str);
 impl Drop for Mount {
     fn drop(&mut self) {
-        let _ = Command::new("umount").arg(self.0).status();
+        let _ = Command::new("/usr/bin/umount").arg(self.0).status();
     }
 }
 
@@ -215,7 +219,7 @@ fn fixture() -> Fixture {
     assert_eq!(fs::metadata(&scratch.0).unwrap().uid(), 0);
     fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).unwrap();
     checked(
-        Command::new("mount")
+        Command::new("/usr/bin/mount")
             .arg("--bind")
             .arg(&scratch.0)
             .arg("/mnt"),
@@ -235,7 +239,11 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     fs::write("/mnt/ck-launch-fixture/dpkg/status", "").unwrap();
-    checked(Command::new("mount").args(["--bind", "/mnt/ck-launch-fixture/dpkg", "/var/lib/dpkg"]));
+    checked(Command::new("/usr/bin/mount").args([
+        "--bind",
+        "/mnt/ck-launch-fixture/dpkg",
+        "/var/lib/dpkg",
+    ]));
     let db = Mount("/var/lib/dpkg");
     let source = "/mnt/ck-launch-fixture/program.c";
     fs::write(
@@ -243,7 +251,7 @@ fn fixture() -> Fixture {
         include_str!("../../../cerebellum-computer/src/platform/linux/fixtures/launch.c"),
     )
     .unwrap();
-    checked(Command::new("cc").args(["-static", "-o", PROGRAM, source]));
+    checked(Command::new("/usr/bin/cc").args(["-static", "-o", PROGRAM, source]));
     fs::copy(PROGRAM, "/mnt/ck-launch-fixture/home/.local/bin/true").unwrap();
     fs::write(
         "/mnt/ck-launch-fixture/user/applications/org.example.Fixture.desktop",
@@ -267,8 +275,13 @@ const SWITCH: usize = 2;
 const LOST: usize = 3;
 const SCOPE_ERROR: usize = 4;
 const UPDATE_ENTRY: usize = 5;
-const CANCEL: usize = 6;
+const CANCEL_IN_SCOPE: usize = 6;
 const REPLACE_PROGRAM: usize = 7;
+
+enum Consent {
+    Approve,
+    Cancel,
+}
 
 struct Rig {
     planes: crate::Planes,
@@ -311,7 +324,7 @@ impl Rig {
                         fs::rename(PROGRAM, &saved).unwrap();
                         fs::copy(saved, PROGRAM).unwrap();
                     }
-                    CANCEL => std::future::pending::<()>().await,
+                    CANCEL_IN_SCOPE => std::future::pending::<()>().await,
                     _ => (),
                 }
                 Ok(())
@@ -345,7 +358,22 @@ impl Rig {
         }
     }
 
-    async fn call(&mut self, target: &str, mut question_seen: impl FnMut()) -> Value {
+    async fn cancel(&self, tx: &tokio::sync::mpsc::Sender<Frame>) {
+        let cancel = Frame::build(
+            FrameType::Cancel,
+            Flags::new(false, Priority::Interactive, true),
+            7,
+            1,
+            self.next,
+            b"{}".to_vec(),
+        )
+        .unwrap();
+        crate::handle_frame_for_test(cancel, tx, &self.planes)
+            .await
+            .unwrap();
+    }
+
+    async fn call(&mut self, target: &str, mut on_question: impl FnMut() -> Consent) -> Value {
         self.stopped_pid.store(0, Ordering::Release);
         self.next += 1;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -356,7 +384,7 @@ impl Rig {
         )
         .await
         .unwrap();
-        let mut cancel_pending = self.scope.load(Ordering::Acquire) == CANCEL;
+        let mut cancel_pending = self.scope.load(Ordering::Acquire) == CANCEL_IN_SCOPE;
         tokio::time::timeout(crate::test_support::HANG_GUARD, async {
             loop {
                 let service = self.planes.consent_test.as_ref().unwrap();
@@ -364,13 +392,14 @@ impl Rig {
                     question = service.card(7, 1) => {
                         assert_eq!(self.stopped_pid.load(Ordering::Acquire), 0, "spawn before consent");
                         assert!(!Path::new(MARKER).exists());
-                        question_seen();
-                        assert!(service.answer(question.header.corr, crate::cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_30m"}))));
+                        match on_question() {
+                            Consent::Approve => assert!(service.answer(question.header.corr, crate::cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_30m"})))),
+                            Consent::Cancel => self.cancel(&tx).await,
+                        }
                     }
                     () = wait_for(|| self.stopped_pid.load(Ordering::Acquire) != 0), if cancel_pending => {
                         cancel_pending = false;
-                        let cancel = Frame::build(FrameType::Cancel, Flags::new(false, Priority::Interactive, true), 7, 1, self.next, b"{}".to_vec()).unwrap();
-                        crate::handle_frame_for_test(cancel, &tx, &self.planes).await.unwrap();
+                        self.cancel(&tx).await;
                     }
                     frame = rx.recv() => {
                         let frame = frame.unwrap();
@@ -413,15 +442,23 @@ async fn native_open_app_checks_package_grant_scope_lock_and_release() {
     let _fixture = fixture();
     let command = format!("{PROGRAM} check %U %%");
     set_exec(&command);
+    {
+        let mut awaiting_consent = Rig::new();
+        let reply = awaiting_consent.call(TARGET, || Consent::Cancel).await;
+        assert_eq!(reply["outcome"], "cancelled", "{reply}");
+        assert_eq!(awaiting_consent.stopped_pid.load(Ordering::Acquire), 0);
+        assert!(!Path::new(MARKER).exists());
+    }
     let mut rig = Rig::new();
 
-    // Select a dotted ID despite the earlier writable entry. The entry is
-    // belongs to the entry package, but the grant must name the program package.
+    // Select the system desktop file by ID, ignoring the shadow file in the
+    // writable data directory. Grant the program's package, not the entry's.
     let mut asked = false;
     let reply = rig
         .call(TARGET, || {
             asked = true;
             fs::write(ENTRY, entry_text(&format!("{PROGRAM} exit"))).unwrap();
+            Consent::Approve
         })
         .await;
     assert!(asked);
@@ -448,7 +485,6 @@ async fn native_open_app_checks_package_grant_scope_lock_and_release() {
         (SCOPE_ERROR, "launch_scope_unavailable"),
         (UPDATE_ENTRY, "stale_reference"),
         (REPLACE_PROGRAM, "image_replaced_since_launch"),
-        (CANCEL, "cancelled"),
     ] {
         rig.scope.store(mode, Ordering::Release);
         let reply = rig.no_question(TARGET).await;
@@ -462,6 +498,22 @@ async fn native_open_app_checks_package_grant_scope_lock_and_release() {
         }
         set_exec(&command);
     }
+    // The scope request comes after dispatch was committed. The terminal
+    // reply cannot promise the worker has already stopped the barred child.
+    rig.scope.store(CANCEL_IN_SCOPE, Ordering::Release);
+    let cancelled = rig.no_question(TARGET).await;
+    assert_eq!(
+        cancelled["outcome"], "dispatch_outcome_unknown",
+        "{cancelled}"
+    );
+    assert_eq!(cancelled["detail"]["reason"], "cancelled", "{cancelled}");
+    assert_eq!(cancelled["detail"]["dispatched"], true, "{cancelled}");
+    assert_eq!(cancelled["detail"]["step"], "dispatch", "{cancelled}");
+    rig.reaped().await;
+    assert!(
+        !Path::new(MARKER).exists(),
+        "cancelled scope released its child"
+    );
     rig.scope.store(NORMAL, Ordering::Release);
 
     for (exec, detail) in [
