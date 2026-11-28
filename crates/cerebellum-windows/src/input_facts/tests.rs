@@ -6,7 +6,6 @@ use windows_sys::Win32::{
     Foundation::POINT, System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*,
 };
 
-#[path = "mouse_probe_measurement.rs"]
 mod mouse_probe_measurement;
 
 static UNASSIGNED_UP: AtomicUsize = AtomicUsize::new(0);
