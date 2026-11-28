@@ -239,18 +239,16 @@ fn diagnostic(path: &Path) -> String {
     }
 }
 
-fn launch_probe(
+fn probe_command(
     scratch: &Scratch,
     parent_pid: u32,
     launcher: Option<&Path>,
     probe: &Path,
     entry: &str,
-    overrides: &[(&str, &Path)],
-) {
+) -> Command {
     let test_args = format!("--exact {CHILD} --ignored --nocapture");
     let probe_stdout = scratch.join("probe-stdout");
     let probe_stderr = scratch.join("probe-stderr");
-    let launcher_stderr = scratch.join("launcher-stderr");
     let tail = if launcher.is_some() {
         // cmd strips the outer quotes and redirects the probe itself because
         // parent-fixture.exe launches cmd without passing its stdio handles.
@@ -265,16 +263,22 @@ fn launch_probe(
     } else {
         test_args.into()
     };
+    let mut command = Command::new(env_path("CK_IMAGE_TEST_WINDOWS_LAUNCHER"));
+    command
+        .arg(parent_pid.to_string())
+        .arg(launcher.unwrap_or(probe))
+        // Carry cmd's quotes as data until the fixture calls CreateProcessW.
+        .env("CK_IMAGE_TEST_WINDOWS_CHILD_TAIL", tail)
+        .env("CK_IMAGE_TEST_ROOT", &scratch.0)
+        .env("CK_IMAGE_TEST_ENTRY", entry)
+        .env("CK_IMAGE_TEST_CHROME_PID", parent_pid.to_string());
+    command
+}
+
+fn probe_status(scratch: &Scratch, command: &mut Command) -> ExitStatus {
+    let launcher_stderr = scratch.join("launcher-stderr");
     let mut child = Running(
-        Command::new(env_path("CK_IMAGE_TEST_WINDOWS_LAUNCHER"))
-            .arg(parent_pid.to_string())
-            .arg(launcher.unwrap_or(probe))
-            // Carry cmd's quotes as data until the fixture calls CreateProcessW.
-            .env("CK_IMAGE_TEST_WINDOWS_CHILD_TAIL", tail)
-            .env("CK_IMAGE_TEST_ROOT", &scratch.0)
-            .env("CK_IMAGE_TEST_ENTRY", entry)
-            .env("CK_IMAGE_TEST_CHROME_PID", parent_pid.to_string())
-            .envs(overrides.iter().copied())
+        command
             .stderr(fs::File::create(&launcher_stderr).unwrap())
             .spawn()
             .unwrap(),
@@ -284,11 +288,26 @@ fn launch_probe(
         "Windows probe launcher status: {status}\n{}",
         diagnostic(&launcher_stderr)
     );
+    status
+}
+
+fn launch_probe(
+    scratch: &Scratch,
+    parent_pid: u32,
+    launcher: Option<&Path>,
+    probe: &Path,
+    entry: &str,
+    overrides: &[(&str, &Path)],
+) {
+    let status = probe_status(
+        scratch,
+        probe_command(scratch, parent_pid, launcher, probe, entry).envs(overrides.iter().copied()),
+    );
     assert!(
         status.success(),
         "Windows probe launcher ({status}) failed\nprobe stdout: {}\nprobe stderr: {}",
-        diagnostic(&probe_stdout),
-        diagnostic(&probe_stderr)
+        diagnostic(&scratch.join("probe-stdout")),
+        diagnostic(&scratch.join("probe-stderr"))
     );
 }
 
@@ -354,16 +373,48 @@ fn cmd_launch_preserves_quoted_probe_path_and_redirection() {
     let cmd = env_path("CK_IMAGE_TEST_WINDOWS_CMD");
     let probe = scratch.join("probe with spaces.exe");
     fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
-    launch_probe(
-        &scratch,
-        chrome.0 .0.id(),
-        Some(&cmd),
-        &probe,
-        "cmd-roundtrip",
-        &[],
-    );
-    let stdout = diagnostic(&scratch.join("probe-stdout"));
-    let stderr = diagnostic(&scratch.join("probe-stderr"));
+    let probe_stdout = scratch.join("probe-stdout");
+    let probe_stderr = scratch.join("probe-stderr");
+    let results = [
+        "no-parent",
+        "self-parent",
+        "chrome-parent",
+        "chrome-desktop",
+        "chrome-new-console",
+        "chrome-desktop-new-console",
+    ]
+    .map(|mode| {
+        // Reuse the exact command line without carrying output from a prior launch.
+        for output in [&probe_stdout, &probe_stderr] {
+            match fs::remove_file(output) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => panic!("cannot clear {output:?}: {error}"),
+            }
+        }
+        println!("cmd parent comparison: {mode}");
+        let status = probe_status(
+            &scratch,
+            probe_command(
+                &scratch,
+                chrome.0 .0.id(),
+                Some(&cmd),
+                &probe,
+                "cmd-roundtrip",
+            )
+            .arg(mode),
+        );
+        let stdout = diagnostic(&probe_stdout);
+        let stderr = diagnostic(&probe_stderr);
+        println!("{mode}: {status}\nprobe stdout: {stdout}\nprobe stderr: {stderr}");
+        (mode, status, stdout, stderr)
+    });
+    // Report all launches before checking the Chrome-parent case.
+    let (_, status, stdout, stderr) = results
+        .into_iter()
+        .find(|(mode, ..)| *mode == "chrome-parent")
+        .unwrap();
+    assert!(status.success(), "Chrome-parent cmd failed: {status}");
     assert!(stdout.contains("fixture probe reached stdout"), "{stdout}");
     assert!(stderr.contains("fixture probe reached stderr"), "{stderr}");
 }
