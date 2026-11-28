@@ -10,6 +10,14 @@ use std::os::windows::io::AsHandle;
 use std::process::Stdio;
 
 const CHILD: &str = "windows::fixture_entry";
+const FIRST_PROBE: &str = "first-probe";
+
+// A cold Windows catalog and trust cache can delay the first parent check.
+// Run 46108328089 measured 53.7 ms for the cmd catalog hash, 271.2 ms for
+// CryptCATAdminEnumCatalogFromHash, and 50.8 ms and 203.3 ms for the two
+// WinVerifyTrust calls. The same-process repeat took 34 ms. Allow 1 s only
+// for the runner's first probe, not for each new child process.
+const FIRST_STEP1_LIMIT: Duration = Duration::from_millis(1_000);
 
 fn env_path(name: &str) -> PathBuf {
     PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is not bound")))
@@ -51,7 +59,8 @@ fn fixture_entry() {
     let root = env_path("CK_IMAGE_TEST_ROOT");
     match std::env::var("CK_IMAGE_TEST_ENTRY").unwrap().as_str() {
         "server" => run_server(&root, &pipe_name(&root)),
-        "probe" => run_probe(&root, &pipe_name(&root)),
+        FIRST_PROBE => run_probe(&root, &pipe_name(&root), FIRST_STEP1_LIMIT),
+        "probe" => run_probe(&root, &pipe_name(&root), CHECK_LIMIT),
         "cmd-roundtrip" => {
             println!("fixture probe reached stdout");
             eprintln!("fixture probe reached stderr");
@@ -60,7 +69,7 @@ fn fixture_entry() {
     }
 }
 
-fn run_probe(root: &Path, name: &OsStr) {
+fn run_probe(root: &Path, name: &OsStr, step1_limit: Duration) {
     let key = parse_public_key(TEST_PEER_PUBLIC_KEY_HEX).unwrap();
     println!(
         "step 1 parent starting: Unix epoch ms = {}, probe pid = {}",
@@ -76,6 +85,7 @@ fn run_probe(root: &Path, name: &OsStr) {
         Ok(evidence) => evidence,
         Err(error) => {
             fs::write(root.join("refused"), error.to_string()).unwrap();
+            assert_sample_budget("step 1 parent", step1, step1_limit);
             return;
         }
     };
@@ -112,16 +122,71 @@ fn run_probe(root: &Path, name: &OsStr) {
     write_packet(&pipe, &serde_json::to_string(&attestation).unwrap());
     let (step3, parent, refusal): (Duration, Duration, Option<String>) =
         serde_json::from_slice(&read_packet(&pipe)).unwrap();
+    let checks = [step1, step2, step3, parent];
     if let Some(refusal) = refusal {
         fs::write(root.join("refused"), refusal).unwrap();
+        assert_budget(checks, step1_limit);
     } else {
         // Repeat only after all four budgeted checks, in the original probe process.
-        let (_, repeat) = time_parent_check("step 1 parent same-process repeat", attest);
+        let label = "step 1 parent same-process repeat";
+        let (warm, repeat) = time_parent_check(label, attest);
         if let Err(error) = repeat {
             println!("step 1 parent same-process repeat refused: {error}");
         }
-        assert_budget([step1, step2, step3, parent]);
+        assert_budget(checks, step1_limit);
+        assert_sample_budget(label, warm, CHECK_LIMIT);
         fs::write(root.join("accepted"), b"accepted").unwrap();
+    }
+}
+
+fn assert_sample_budget(name: &str, elapsed: Duration, limit: Duration) {
+    println!("{name}: {elapsed:?} (limit {limit:?})");
+    assert!(elapsed <= limit, "{name} took {elapsed:?}");
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_first_step_one_can_take_one_second() {
+        assert_budget(
+            [1_000, 500, 499, 1].map(Duration::from_millis),
+            FIRST_STEP1_LIMIT,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "step 1 parent took")]
+    fn cold_step_one_still_has_a_ceiling() {
+        assert_budget(
+            [1_001, 1, 1, 1].map(Duration::from_millis),
+            FIRST_STEP1_LIMIT,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "step 1 parent took")]
+    fn warm_step_one_keeps_the_regular_ceiling() {
+        assert_budget([501, 1, 1, 1].map(Duration::from_millis), CHECK_LIMIT);
+    }
+
+    #[test]
+    #[should_panic(expected = "step 3 parent took")]
+    fn step_three_parent_is_not_granted_the_cold_allowance() {
+        assert_budget(
+            [1_000, 1, 1, 501].map(Duration::from_millis),
+            FIRST_STEP1_LIMIT,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "four checks took")]
+    fn cold_sequence_keeps_the_two_second_ceiling() {
+        assert_budget(
+            [1_000, 500, 500, 1].map(Duration::from_millis),
+            FIRST_STEP1_LIMIT,
+        );
     }
 }
 
@@ -380,10 +445,16 @@ fn launch_probe(
     );
 }
 
+enum ParentCase {
+    First,
+    StaleGeneration,
+    WrongPath,
+}
+
 fn run_case(
     parent_pid: u32,
     launcher: Option<&Path>,
-    stale: bool,
+    case: ParentCase,
     overrides: &[(&str, &Path)],
 ) -> Result<(), String> {
     let scratch = Scratch::new();
@@ -392,7 +463,7 @@ fn run_case(
     let exe = std::env::current_exe().unwrap();
     sign_copy(&exe, &signed_probe, "host");
     sign_copy(&exe, &signed_server, "cerebellum");
-    if stale {
+    if matches!(case, ParentCase::StaleGeneration) {
         fs::write(scratch.join("stale-generation"), []).unwrap();
     }
     let mut server = Running(
@@ -415,7 +486,11 @@ fn run_case(
         parent_pid,
         launcher,
         &signed_probe,
-        "probe",
+        if matches!(case, ParentCase::First) {
+            FIRST_PROBE
+        } else {
+            "probe"
+        },
         overrides,
     );
     if launcher.is_some() {
@@ -464,24 +539,25 @@ fn chrome_cmd_and_probe_check_native_identity_and_deadlines() {
     let scratch = Scratch::new();
     let chrome = start_chrome(&scratch);
     let cmd = env_path("CK_IMAGE_TEST_WINDOWS_CMD");
-    run_case(chrome.0 .0.id(), Some(&cmd), false, &[]).expect("Chrome / System32 cmd must pass");
-    let error = run_case(chrome.0 .0.id(), Some(&cmd), true, &[]).unwrap_err();
+    let pid = chrome.0 .0.id();
+    run_case(pid, Some(&cmd), ParentCase::First, &[]).expect("Chrome / System32 cmd must pass");
+    let error = run_case(pid, Some(&cmd), ParentCase::StaleGeneration, &[]).unwrap_err();
     assert_eq!(
         error,
         "Windows parent attestation does not match observed evidence"
     );
-    wrong_path(run_case(chrome.0 .0.id(), None, false, &[]));
+    wrong_path(run_case(pid, None, ParentCase::WrongPath, &[]));
 
     let fake_root = scratch.join("system-root");
     let fake_system32 = fake_root.join("System32");
     fs::create_dir_all(&fake_system32).unwrap();
     let fake_cmd = fake_system32.join("cmd.exe");
     fs::copy(&cmd, &fake_cmd).unwrap();
-    wrong_path(run_case(chrome.0 .0.id(), Some(&fake_cmd), false, &[]));
+    wrong_path(run_case(pid, Some(&fake_cmd), ParentCase::WrongPath, &[]));
     wrong_path(run_case(
-        chrome.0 .0.id(),
+        pid,
         Some(&fake_cmd),
-        false,
+        ParentCase::WrongPath,
         &[("SystemRoot", &fake_root)],
     ));
 }
@@ -518,13 +594,13 @@ fn signed_chrome_copies_fail_the_machine_path_predicate() {
     wrong_path(run_case(
         image.pid,
         Some(&system_cmd),
-        false,
+        ParentCase::WrongPath,
         &[("LOCALAPPDATA", &local_root.0)],
     ));
     wrong_path(run_case(
         image.pid,
         Some(&system_cmd),
-        false,
+        ParentCase::WrongPath,
         &[("ProgramFiles", &local_root.0)],
     ));
 }

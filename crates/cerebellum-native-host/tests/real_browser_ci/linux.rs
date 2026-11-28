@@ -88,7 +88,7 @@ fn run_probe(root: &Path) {
     if let Some(refusal) = refusal {
         fs::write(root.join("refused"), refusal).unwrap();
     } else {
-        assert_budget([step1, step2, step3, step3_parent]);
+        assert_budget([step1, step2, step3, step3_parent], CHECK_LIMIT);
         fs::write(root.join("accepted"), b"accepted").unwrap();
     }
 }
