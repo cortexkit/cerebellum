@@ -16,6 +16,7 @@ use crate::app_state::source::{ElementHandle, ElementToken, RawAppState, RawElem
 
 mod actions;
 pub mod launch;
+pub mod picture;
 mod scoped;
 mod tree;
 
@@ -29,6 +30,9 @@ pub struct Live {
 /// executable. An accessibility peer's UI reports cannot prove its identity.
 pub trait Session: Send + Sync {
     fn current(&self) -> Result<Live, &'static str>;
+    fn frontmost_pid(&self) -> Option<u32> {
+        None
+    }
     fn prove(&self, pid: u32) -> Result<VerifiedApp, identity::Refusal>;
     fn reprove(
         &self,

@@ -1,5 +1,32 @@
 use super::*;
 
+enum ReadBackend<B> {
+    Legacy(B),
+    #[cfg(target_os = "linux")]
+    Linux(LinuxReadBackend),
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxReadBackend {
+    backend: cerebellum_computer::platform::linux::picture::Backend,
+    #[cfg(test)]
+    front_test: Option<std::sync::Arc<super::linux::PictureFrontTest>>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxReadBackend {
+    fn finish(
+        &mut self,
+        pending: cerebellum_computer::capture::PendingVisionWindowFrame,
+    ) -> Result<cerebellum_computer::app_state::image::WindowImageCapture, ImageUnavailable> {
+        #[cfg(test)]
+        if let Some(test) = &self.front_test {
+            (test.before_encode)();
+        }
+        self.backend.finish(pending)
+    }
+}
+
 impl<B, R, T, S, D> ComputerPlane<B, R, T, S, D>
 where
     B: CaptureBackend + Send + 'static,
@@ -25,7 +52,8 @@ where
             Ok(parsed) => parsed,
             Err(refusal) => return refusal,
         };
-        if !self.uses_linux_semantics() {
+        let linux_read = self.uses_linux_semantics();
+        if !linux_read {
             parsed.target = match self.resolve_target_name(&parsed.target).await {
                 Ok(bundle_identity) => bundle_identity,
                 Err(refusal) => return refusal,
@@ -62,8 +90,10 @@ where
         // read. A front that stops for a reason the person or the platform
         // caused falls back to an unfronted read; one that stops because the
         // call is ending reads nothing at all.
-        let foreground = self
-            .front_for_foreground(fronting::FrontCall {
+        let foreground = if linux_read {
+            None
+        } else {
+            self.front_for_foreground(fronting::FrontCall {
                 grant: &grant,
                 consent: &consent,
                 cancel: &cancel,
@@ -71,7 +101,8 @@ where
                 conversation_key: &identity.conversation_key,
                 input_follows: false,
             })
-            .await;
+            .await
+        };
         if let Some(stop) = foreground.and_then(|front| front.stop) {
             if fronting::stop_ends_call(stop) {
                 let mut reply = if stop == cerebellum_computer::dispatch::FrontingStop::Cancelled {
@@ -87,7 +118,8 @@ where
             }
         }
         let fronting_admission = self.fronting_admission(&consent, false);
-        let bring_to_front = parsed.include_image
+        let bring_to_front = !linux_read
+            && parsed.include_image
             && parsed.bring_to_front
             && fronting_admission.mode == cerebellum_core::config::AppUse::Background;
         if !B::BACKGROUND_WINDOW_PICTURE
@@ -493,7 +525,37 @@ where
         // mode temporarily brings an app forward for its picture and restores.
         let mut image_hooks = None;
         let mut image_fronting = None;
-        let background_picture = (B::BACKGROUND_WINDOW_PICTURE
+        #[cfg(target_os = "linux")]
+        let linux_backend =
+            if let Some(session) = self.linux_session.as_ref().filter(|_| parsed.include_image) {
+                let backend = Box::pin(session.picture_backend()).await;
+                if parsed.bring_to_front
+                    && backend.can_capture()
+                    && fronting_admission.may_front_image().is_ok()
+                    && linux_observer_live((self.make_synthetic_driver)().input_observer_liveness())
+                {
+                    let call = fronting::FrontCall {
+                        grant: &grant,
+                        consent: &consent,
+                        cancel: &cancel,
+                        management,
+                        conversation_key: &conversation_key,
+                        input_follows: false,
+                    };
+                    if let Ok(parts) = self.prepare_image_front(call, &admission).await {
+                        image_hooks = Some(fronting::CellHooks::new(parts));
+                    }
+                }
+                Some(ReadBackend::Linux(LinuxReadBackend {
+                    backend,
+                    #[cfg(test)]
+                    front_test: session.picture_front_for_test.clone(),
+                }))
+            } else {
+                None
+            };
+        let background_picture = (!linux_read
+            && B::BACKGROUND_WINDOW_PICTURE
             && parsed.include_image
             && image_permission_live)
             .then(|| {
@@ -576,13 +638,17 @@ where
                 |front| front.fronting,
             ),
         };
+        let backend = (!linux_read && parsed.include_image && image_permission_live)
+            .then(|| ReadBackend::Legacy(make_backend(&grant)));
+        #[cfg(target_os = "linux")]
+        let backend = linux_backend.or(backend);
         match self
             .journal_state_read(
                 identity,
                 summary,
                 manual_accessibility,
                 now_ms,
-                (parsed.include_image && image_permission_live).then(|| make_backend(&grant)),
+                backend,
                 ImageReadPlan {
                     requested: parsed.include_image,
                     bring_to_front,
@@ -663,6 +729,12 @@ where
                 &end,
             ));
         }
+        if linux_read && parsed.bring_to_front && reply.get("image_fronting").is_none() {
+            reply["image_fronting"] = json!({
+                "attempted": false, "restored": false, "longest_fronted_interval_ms": 0,
+                "reason": "fronting_unavailable",
+            });
+        }
         let fronting = image_fronting.or(foreground.map(|front| front.fronting));
         if let Some(fronting) = fronting {
             fronting.apply(&mut reply);
@@ -687,7 +759,7 @@ where
         summary: cerebellum_computer::app_state::ReadStateSummary,
         manual_accessibility: Option<&'static str>,
         now_ms: u64,
-        backend: Option<B>,
+        backend: Option<ReadBackend<B>>,
         image_plan: ImageReadPlan,
     ) -> Result<
         (
@@ -751,6 +823,30 @@ where
                 return Ok((None, None, None, None));
             };
             let image = release_through_custody(&mut custody, || {
+                #[cfg(not(target_os = "linux"))]
+                let ReadBackend::Legacy(backend) = backend;
+                #[cfg(target_os = "linux")]
+                let backend = match backend {
+                    ReadBackend::Legacy(backend) => backend,
+                    ReadBackend::Linux(backend) => {
+                        return capture_linux_image(
+                            backend,
+                            &mut make_driver(),
+                            &grant,
+                            &image_plan,
+                            &trace,
+                            &work,
+                            || {
+                                let posting = own_input.begin_posting(person::last_input_instant(
+                                    input_source.as_ref(),
+                                ));
+                                work.publish_posting(&own_input, &posting);
+                                let own_input = own_input.clone();
+                                move || own_input.end_posting(posting)
+                            },
+                        );
+                    }
+                };
                 if let Some(plan) = &image_plan.background_picture {
                     return read_image_background::capture(
                         backend,
@@ -811,4 +907,135 @@ where
         .await
         .unwrap_or(Err(ImageUnavailable::CaptureFailed))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_observer_live(live: cerebellum_computer::platform::InputObserverLiveness) -> bool {
+    live.session_tap_live && live.raw_hid_live && live.self_echo_filter_live
+}
+
+#[cfg(target_os = "linux")]
+fn capture_linux_image<D: PlatformDriver, F: FnOnce()>(
+    mut backend: LinuxReadBackend,
+    driver: &mut D,
+    grant: &cerebellum_computer::platform::ProcessGrant,
+    plan: &ImageReadPlan,
+    trace: &read_image::ImageReadTrace,
+    work: &quarantine::CallWork,
+    begin_posting: impl FnOnce() -> F,
+) -> Result<cerebellum_computer::app_state::image::WindowImageCapture, ImageUnavailable> {
+    use cerebellum_computer::app_state::image::ImageDecision;
+    use cerebellum_computer::dispatch::{BracketStop, RestoreStatus};
+    use cerebellum_computer::platform::linux::picture::unavailable;
+    use std::time::{Duration, Instant};
+
+    let call_end = work.deadline();
+    let capture_end = call_end
+        .checked_sub(Duration::from_millis(crate::budgets::STORE_MS))
+        .unwrap_or(call_end)
+        .min(Instant::now() + Duration::from_millis(crate::budgets::CAPTURE_IMAGE_MS));
+    let make_fence =
+        |hooks: Option<fronting::CellHooks>| -> cerebellum_computer::capture::AcquisitionFence {
+            let cancel = plan.cancel.clone();
+            let gate = plan.gate.clone();
+            std::sync::Arc::new(move || {
+                Instant::now() < capture_end
+                    && !cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled())
+                    && !gate.as_ref().is_some_and(|gate| gate.stopped())
+                    && hooks
+                        .as_ref()
+                        .is_none_or(|hooks| hooks.picture_may_acquire())
+            })
+        };
+    let capture_without_front = |backend: &mut LinuxReadBackend| {
+        let pending = backend
+            .backend
+            .select_and_acquire(grant, plan.now_ms, &make_fence(None))
+            .map_err(unavailable);
+        trace.evidence.borrow_mut().decision = Some(backend.backend.decision());
+        backend.finish(pending?)
+    };
+    let Some(hooks) = plan.hooks.as_ref().filter(|_| {
+        backend.backend.can_capture() && linux_observer_live(driver.input_observer_liveness())
+    }) else {
+        return capture_without_front(&mut backend);
+    };
+    if plan
+        .gate
+        .as_ref()
+        .is_some_and(|gate| !gate.begin_mutation())
+    {
+        return Err(ImageUnavailable::FrontingUnavailable);
+    }
+    if !driver.accept_fronted_dispatch_hooks(fronting::boxed_hooks(hooks)) {
+        return capture_without_front(&mut backend);
+    }
+    let bound = crate::budgets::FRONTING_BRACKET_MS;
+    trace.fronting_bound_ms.set(Some(bound));
+    let fence = make_fence(Some(hooks.clone()));
+    let mut captured = Err(ImageUnavailable::FrontingUnavailable);
+    let end_posting = begin_posting();
+    let report = driver.read_fronted(
+        grant,
+        bound,
+        &|| {
+            plan.cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.is_cancelled())
+                || plan.gate.as_ref().is_some_and(|gate| gate.stopped())
+        },
+        &mut || {
+            let Some(_lock_hold) = hooks.hold_lock_for_read() else {
+                return;
+            };
+            if !fence() {
+                captured = Err(ImageUnavailable::FrontingBoundExceeded);
+                return;
+            }
+            captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                backend
+                    .backend
+                    .select_and_acquire(grant, plan.now_ms, &fence)
+            }))
+            .map_err(|_| ImageUnavailable::CaptureFailed)
+            .and_then(|result| result.map_err(unavailable));
+            if !fence() {
+                captured = Err(ImageUnavailable::FrontingBoundExceeded);
+            }
+        },
+    );
+    end_posting();
+    let report = report.map_err(|_| ImageUnavailable::FrontingUnavailable)?;
+    let mut evidence = trace.evidence.borrow_mut();
+    evidence.fronting = Some(ImageFronting::from(&report));
+    let mode = plan
+        .fronting
+        .map_or(cerebellum_core::config::AppUse::Background, |front| {
+            front.mode
+        });
+    evidence.fronting_record =
+        fronting::hooked_fronting(mode, fronting::Purpose::NeedsFront, &hooks.peek()).row_record();
+    if matches!(report.restore, RestoreStatus::Failed { .. }) {
+        return Err(ImageUnavailable::RestoreFailed);
+    }
+    if hooks.cutoff_fired()
+        || report.restore_started_by_cutoff
+        || report.longest_fronted_interval_ms > bound
+        || report.stop == Some(BracketStop::BoundExceeded)
+    {
+        return Err(ImageUnavailable::FrontingBoundExceeded);
+    }
+    if !report.held(bound) {
+        return Err(ImageUnavailable::FrontingUnavailable);
+    }
+    let pending = captured?;
+    evidence.decision = Some(if report.previous_frontmost == Some(grant.pid) {
+        backend.backend.decision()
+    } else {
+        ImageDecision::FrontedThenVisible
+    });
+    drop(evidence);
+    // read_fronted has completed the restore; the encoder only sees the
+    // captured bytes, never the now-background window.
+    backend.finish(pending)
 }
