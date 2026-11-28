@@ -97,6 +97,16 @@ fn within_deadline<T: Send + 'static>(
     result
 }
 
+pub(in crate::platform::windows) fn retained_identity(
+    process: RetainedProcessHandle,
+    deadline: Instant,
+) -> Result<(RetainedProcessHandle, LiveIdentity), IdentityError> {
+    within_deadline(deadline, move || {
+        let identity = read_identity(&process, deadline)?;
+        Ok((process, identity))
+    })
+}
+
 pub fn live_identity(pid: u32, deadline: Instant) -> Result<LiveIdentity, IdentityError> {
     within_deadline(deadline, move || {
         let process = retain_image_process(pid).map_err(|_| IdentityError::ReadingUnavailable)?;
@@ -149,38 +159,10 @@ fn read_identity(
         return Err(IdentityError::Shell);
     }
 
-    let mut reader = file.read_only_handle();
-    let metadata = reader
-        .metadata()
-        .map_err(|_| IdentityError::ReadingUnavailable)?;
-    if metadata.len() > MAX_IMAGE_BYTES {
-        return Err(IdentityError::ReadingUnavailable);
-    }
-    let mut image = Vec::new();
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|_| IdentityError::ReadingUnavailable)?;
-    reader
-        .take(MAX_IMAGE_BYTES + 1)
-        .read_to_end(&mut image)
-        .map_err(|_| IdentityError::ReadingUnavailable)?;
-    if image.len() as u64 != metadata.len() {
-        return Err(IdentityError::ReadingUnavailable);
-    }
-    let version = image_version(&image).map_err(|()| IdentityError::ReadingUnavailable)?;
-    let original_filename = version.original_filename;
-    if original_filename.as_deref().is_some_and(shell_image) {
-        return Err(IdentityError::Shell);
-    }
-    remaining(deadline)?;
-
-    let unsigned = || Principal::Unsigned {
-        sha256: Sha256::digest(&image).into(),
-        image_name: image_name.clone(),
-    };
     let package = process
         .package_fields()
         .map_err(|_| IdentityError::ReadingUnavailable)?;
+    let mut image = read_image(&file)?;
     let principal = if let Some(package) = package {
         let (family, application) = package
             .aumid
@@ -194,46 +176,121 @@ fn read_identity(
             application: application.to_owned(),
         }
     } else {
-        match file
-            .authenticode_facts(&image_path)
-            .map_err(|_| IdentityError::ReadingUnavailable)?
-        {
-            AuthenticodeFacts::Signer(signer) => {
-                if signer.common_name.is_empty() && signer.organization.is_empty() {
-                    return Err(IdentityError::ReadingUnavailable);
-                }
-                match &original_filename {
-                    Some(program) => Principal::Signed {
-                        root: Sha256::digest(&signer.root_der).into(),
-                        cn: signer.common_name,
-                        organization: signer.organization,
-                        program: program.clone(),
-                    },
-                    None => unsigned(),
-                }
-            }
-            AuthenticodeFacts::EmbeddedAndCatalogAbsent if !version.has_certificate_table => {
-                unsigned()
-            }
-            AuthenticodeFacts::Status(status) => {
-                return Err(IdentityError::AuthenticodeStatus(status))
-            }
-            _ => return Err(IdentityError::ReadingUnavailable),
-        }
+        file_principal(&file, &image_path, &image_name, &image, deadline)?
     };
     remaining(deadline)?;
     if mapped_id(process, &file)? != file_id || current_generation(process)? != generation {
         return Err(IdentityError::ProcessChanged);
     }
-    let display_name = version.description.unwrap_or_else(|| image_name.clone());
+    let display_name = image
+        .version
+        .description
+        .take()
+        .unwrap_or_else(|| image_name.clone());
     Ok(LiveIdentity {
         principal,
         image_path,
         image_name,
-        original_filename,
+        original_filename: image.version.original_filename,
         display_name,
         generation,
     })
+}
+
+struct ReadImage {
+    bytes: Vec<u8>,
+    version: super::version::VersionFacts,
+}
+
+fn read_image(file: &LockedImageFile) -> Result<ReadImage, IdentityError> {
+    let mut reader = file.read_only_handle();
+    let metadata = reader
+        .metadata()
+        .map_err(|_| IdentityError::ReadingUnavailable)?;
+    if metadata.len() > MAX_IMAGE_BYTES {
+        return Err(IdentityError::ReadingUnavailable);
+    }
+    let mut bytes = Vec::new();
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| IdentityError::ReadingUnavailable)?;
+    reader
+        .take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| IdentityError::ReadingUnavailable)?;
+    if bytes.len() as u64 != metadata.len() {
+        return Err(IdentityError::ReadingUnavailable);
+    }
+    let version = image_version(&bytes).map_err(|()| IdentityError::ReadingUnavailable)?;
+    if version
+        .original_filename
+        .as_deref()
+        .is_some_and(shell_image)
+    {
+        return Err(IdentityError::Shell);
+    }
+    Ok(ReadImage { bytes, version })
+}
+
+fn file_principal(
+    file: &LockedImageFile,
+    image_path: &Path,
+    image_name: &str,
+    image: &ReadImage,
+    deadline: Instant,
+) -> Result<Principal, IdentityError> {
+    remaining(deadline)?;
+    let unsigned = || Principal::Unsigned {
+        sha256: Sha256::digest(&image.bytes).into(),
+        image_name: image_name.to_owned(),
+    };
+    let principal = match file
+        .authenticode_facts(image_path)
+        .map_err(|_| IdentityError::ReadingUnavailable)?
+    {
+        AuthenticodeFacts::Signer(signer) => {
+            if signer.common_name.is_empty() && signer.organization.is_empty() {
+                return Err(IdentityError::ReadingUnavailable);
+            }
+            match &image.version.original_filename {
+                Some(program) => Principal::Signed {
+                    root: Sha256::digest(&signer.root_der).into(),
+                    cn: signer.common_name,
+                    organization: signer.organization,
+                    program: program.clone(),
+                },
+                None => unsigned(),
+            }
+        }
+        AuthenticodeFacts::EmbeddedAndCatalogAbsent if !image.version.has_certificate_table => {
+            unsigned()
+        }
+        AuthenticodeFacts::Status(status) => return Err(IdentityError::AuthenticodeStatus(status)),
+        _ => return Err(IdentityError::ReadingUnavailable),
+    };
+    remaining(deadline)?;
+    Ok(principal)
+}
+
+pub(in crate::platform::windows) fn installed_file_principal(
+    file: &LockedImageFile,
+    final_path: &Path,
+    deadline: Instant,
+) -> Result<(Principal, Option<String>), IdentityError> {
+    remaining(deadline)?;
+    let name = image_name(final_path)?;
+    if shell_image(&name) {
+        return Err(IdentityError::Shell);
+    }
+    let image = read_image(file)?;
+    let principal = file_principal(file, final_path, &name, &image, deadline)?;
+    Ok((principal, image.version.original_filename))
+}
+
+pub(in crate::platform::windows) fn installed_original_filename(
+    file: &LockedImageFile,
+) -> Result<Option<String>, IdentityError> {
+    Ok(read_image(file)?.version.original_filename)
 }
 
 fn image_name(path: &Path) -> Result<String, IdentityError> {

@@ -20,6 +20,8 @@ mod devtools_pipe;
 mod file_identity;
 #[cfg(windows)]
 mod image_file_facts;
+#[cfg(windows)]
+mod launch_facts;
 #[cfg(any(windows, test))]
 mod pe_product;
 #[cfg(any(target_os = "windows", test))]
@@ -61,6 +63,12 @@ pub use file_identity::{file_identity, FileIdentity};
 pub use image_file_facts::{
     lock_image_file, retain_image_process, ImageMappingReading, LockedImageFile,
     ProcessPackageFields,
+};
+#[cfg(windows)]
+pub use launch_facts::{
+    activate_application, last_input_tick, package_applications, process_parents, read_shortcut,
+    registered_packages, start_menu_directories, suspended_process, PackageApplication,
+    RegisteredPackage, ShortcutFields, SuspendedProcess,
 };
 #[cfg(windows)]
 pub use signer_facts::{AuthenticodeFacts, SignerFields};

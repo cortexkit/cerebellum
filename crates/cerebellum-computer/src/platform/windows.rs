@@ -9,6 +9,8 @@ use super::*;
 #[cfg(windows)]
 pub mod app_state;
 pub mod identity;
+#[cfg(windows)]
+pub mod launch;
 use crate::capture::{
     BackendError, BackendTeardownProgress, BroadDisplayCaptureRequest, CaptureArtifact,
     CaptureBackend, EnumeratedWindow, WindowCaptureFrame, WindowCaptureRequest, WindowChange,

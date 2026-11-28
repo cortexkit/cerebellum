@@ -75,6 +75,8 @@ fn installed(name: &str, bundle_identity: &str) -> InstalledApp {
         path: std::path::PathBuf::from(format!("/Applications/{name}.app")),
         version: None,
         build_version: None,
+        #[cfg(windows)]
+        windows_entry: None,
     }
 }
 

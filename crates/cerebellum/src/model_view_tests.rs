@@ -238,6 +238,8 @@ mod computer {
             path: format!("/Applications/{name}.app").into(),
             version: None,
             build_version: None,
+            #[cfg(windows)]
+            windows_entry: None,
         }
     }
 

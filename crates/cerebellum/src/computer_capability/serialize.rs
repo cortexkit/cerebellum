@@ -972,6 +972,8 @@ mod tests {
             path: std::path::PathBuf::from(format!("/fixture/{name}.app")),
             version: None,
             build_version: None,
+            #[cfg(windows)]
+            windows_entry: None,
         }
     }
     fn bind(planes: &Planes, channel: u16, session: &str) {

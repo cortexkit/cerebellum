@@ -1,5 +1,6 @@
 //! Launch admission binds the same per-app consent to the selected bundle's
-//! signer before LaunchServices receives its URL. No process must already exist.
+//! signer before the platform receives the launch request. No process must
+//! already exist.
 
 use super::*;
 use crate::computer_grants::{AppCode, AppIdentity, AppIdentityUnreadable, GrantNeed};
@@ -7,8 +8,12 @@ use crate::open_app_history::{AppKey, Observation, Outcome};
 use cerebellum_computer::app_state::source::OpenAppError;
 use cerebellum_computer::app_state::source::{InstalledApp, InstalledApps};
 use cerebellum_computer::platform::ProcessGrant;
+use cerebellum_core::config::AppUse;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+#[cfg(windows)]
+mod windows;
 
 struct BundleCode {
     source: Arc<dyn AppStateSource>,
@@ -149,7 +154,16 @@ where
         let history_key = AppKey::verified(&app.bundle_identity, &identity);
         let need = GrantNeed::App {
             bundle_identity: app.bundle_identity.clone(),
-            display_name: app.name.clone(),
+            display_name: {
+                #[cfg(windows)]
+                {
+                    windows::consent_name(&app)
+                }
+                #[cfg(not(windows))]
+                {
+                    app.name.clone()
+                }
+            },
             code: code.clone(),
         };
         let admission = match context
@@ -222,36 +236,47 @@ where
         let launch_work = work.clone();
         let opened = tokio::task::spawn_blocking(move || {
             let _ax = launch_work.bound_ax();
-            if let Some(url) = url.as_deref() {
-                // Consent can outlive a bundle update. Re-read the declarations
-                // immediately before dispatch, just as the signer is rechecked.
-                let schemes = source.bundle_url_schemes(&launching).unwrap_or_default();
-                if admit_url(url, &schemes, &launching.bundle_identity).is_err() {
-                    return Err(OpenAppError::Failed);
+            #[cfg(windows)]
+            let foreground = launching.windows_entry.as_ref().map(|_| windows::sample());
+            let launch = || {
+                if let Some(url) = url.as_deref() {
+                    // Consent can outlive a bundle update. Re-read the declarations
+                    // immediately before dispatch, just as the signer is rechecked.
+                    let schemes = source.bundle_url_schemes(&launching).unwrap_or_default();
+                    if admit_url(url, &schemes, &launching.bundle_identity).is_err() {
+                        return Err(OpenAppError::Failed);
+                    }
                 }
-            }
-            if let Some(process) = running {
-                // A URL is still an instruction when the app is running. Bind
-                // delivery to the selected path and generation, and disclose
-                // any replacement instead of claiming it was already running.
-                return if let Some(url) = url {
-                    source.open_running_app_url(&launching, &process, &url, bounds)
+                if let Some(process) = running {
+                    // A URL is still an instruction when the app is running. Bind
+                    // delivery to the selected path and generation, and disclose
+                    // any replacement instead of claiming it was already running.
+                    return if let Some(url) = url {
+                        source.open_running_app_url(&launching, &process, &url, bounds)
+                    } else {
+                        source.opened_running_app(&launching, &process)
+                    };
+                }
+                // URL revalidation can refuse before any launch call. Keep that
+                // out of history, while still counting a worker failure after the
+                // platform was asked to open the app as a real launch attempt.
+                launch_started.store(true, Ordering::Release);
+                if let Some(url) = url {
+                    source.open_app_url(&launching, &url, bounds)
                 } else {
-                    source.opened_running_app(&launching, &process)
-                };
-            }
-            // URL revalidation can refuse before any launch call. Keep that
-            // out of history, while still counting a worker failure after the
-            // platform was asked to open the app as a real launch attempt.
-            launch_started.store(true, Ordering::Release);
-            if let Some(url) = url {
-                source.open_app_url(&launching, &url, bounds)
-            } else {
-                source.open_app(&launching, bounds)
-            }
+                    source.open_app(&launching, bounds)
+                }
+            };
+            let opened = launch();
+            #[cfg(windows)]
+            let changed = foreground.and_then(windows::foreground_change);
+            #[cfg(not(windows))]
+            let changed: Option<super::fronting::Fronting> = None;
+            (opened, changed)
         })
         .await
-        .unwrap_or(Err(OpenAppError::Failed));
+        .unwrap_or((Err(OpenAppError::Failed), None));
+        let (opened, foreground_change) = opened;
         let mut observation = Observation::default();
         match &opened {
             Ok(opened) => {
@@ -272,7 +297,12 @@ where
             Err(OpenAppError::TimedOut) => {
                 observation.timeout_floor_ms = Some(bounds.ready_timeout.as_millis() as u64);
             }
-            Err(OpenAppError::Failed | OpenAppError::RunningChanged) => {}
+            Err(
+                OpenAppError::Failed
+                | OpenAppError::RunningChanged
+                | OpenAppError::ElevationRequired
+                | OpenAppError::IdentityMismatch,
+            ) => {}
         }
         let mut reply = match opened {
             Ok(opened) => json!({
@@ -295,15 +325,39 @@ where
                 json!({"outcome":"launch_failed", "remedy":remedy})
             }
             Err(OpenAppError::RunningChanged) => {
-                json!({"outcome":"launch_failed", "remedy":"The running application changed or an additional process appeared while delivering the URL. The URL may have been delivered and another copy may have started; use list_apps and read_state before retrying."})
+                let mut remedy = "The running application changed or an additional process appeared while delivering the URL. The URL may have been delivered and another copy may have started; use list_apps and read_state before retrying.";
+                if native_windows_app(&app) {
+                    remedy = "The running application changed; use list_apps before retrying.";
+                }
+                json!({"outcome":"launch_failed", "remedy":remedy})
             }
+            Err(OpenAppError::ElevationRequired) => json!({
+                "outcome":"launch_failed", "detail":{"reason":"target_elevated"},
+                "remedy":"The application requires elevation. Nothing was started."
+            }),
+            Err(OpenAppError::IdentityMismatch) => json!({
+                "outcome":"launch_failed", "detail":{"reason":"identity_indeterminate"},
+                "remedy":"The launched application identity could not be confirmed. A process may have started; use list_apps before retrying."
+            }),
         };
         // Foreground mode brings the opened application to the front through
         // the same one-way front and guards every action uses: once a running
         // application is found, or a launch reports its first window. The
         // launch itself never activates. A front that stops leaves the launch
         // result standing and says why.
-        if let Ok(opened) = &opened {
+        if native_windows_app(&app) {
+            // Do not resolve a bare launch pid into an action grant. Windows
+            // never admits the app-use foreground path, even for a proven window.
+            let admission = self.fronting_admission(&context.consent, false);
+            if let (AppUse::Foreground, Err(stop)) = (admission.mode, admission.may_front()) {
+                super::fronting::Fronting::stopped(
+                    AppUse::Foreground,
+                    super::fronting::Purpose::ForegroundMode,
+                    stop,
+                )
+                .apply(&mut reply);
+            }
+        } else if let Ok(opened) = &opened {
             if opened.already_running || opened.has_window {
                 if let Some(grant) = context.management.process_for_pid(opened.pid) {
                     let front = self
@@ -331,6 +385,9 @@ where
                     }
                 }
             }
+        }
+        if let Some(change) = foreground_change {
+            change.apply(&mut reply);
         }
         if let (true, Some(key), Some(outcome)) = (
             attempted.load(Ordering::Acquire),
@@ -363,6 +420,17 @@ where
         }
         admission.decorate(&mut reply);
         reply
+    }
+}
+
+fn native_windows_app(_app: &InstalledApp) -> bool {
+    #[cfg(windows)]
+    {
+        _app.windows_entry.is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -432,6 +500,10 @@ pub(super) fn resolve_installed(
     apps: &[InstalledApp],
     source: &dyn AppStateSource,
 ) -> Result<ResolvedInstalled, Value> {
+    #[cfg(windows)]
+    if apps.iter().any(|app| app.windows_entry.is_some()) {
+        return windows::resolve(target, apps, source);
+    }
     let wanted = target.trim();
     let by_id: Vec<_> = apps
         .iter()

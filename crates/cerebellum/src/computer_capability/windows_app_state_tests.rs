@@ -17,6 +17,8 @@ use std::{
 };
 use subc_protocol::{Flags, Frame, FrameType, Priority};
 
+mod launch;
+
 fn app_state_block(context: &CapabilityAdvertisementContext) -> Option<&'static str> {
     if context
         .inputs
@@ -52,6 +54,9 @@ fn rows(context: &CapabilityAdvertisementContext) -> BTreeSet<String> {
         .collect();
     if app_state_block(context).is_none() {
         rows.extend(["computer.read_state".into(), "computer.list_apps".into()]);
+    }
+    if launch::launch_block(context).is_none() {
+        rows.insert("computer.open_app".into());
     }
     rows
 }
@@ -167,8 +172,15 @@ fn rig(
     )
     .with_wire_dispatch_for_test()
     .with_session_lock_for_test(Some(false));
-    if app_state_block(context).is_none() {
-        let source = WindowsAppStateSource::new(windows_identity::blocked);
+    let app_state_admitted = app_state_block(context).is_none();
+    let launch_admitted = launch::launch_block(context).is_none();
+    if app_state_admitted || launch_admitted {
+        let mut source = WindowsAppStateSource::new(windows_identity::blocked);
+        if launch_admitted {
+            source = source
+                .with_launch_inventory(launch::operator_name)
+                .expect("start fixture inventory workers");
+        }
         let permissions = PermissionLivenessReport::from_results([PermissionProbeResult {
             service: PermissionService::Accessibility,
             liveness: if WindowsAppStateSource::client_available() {
@@ -179,7 +191,7 @@ fn rig(
             responsible_process: "ck-cerebellum".into(),
             off_main: true,
         }]);
-        plane.windows_app_state_for_test = Some(source.clone());
+        plane.windows_app_state_for_test = app_state_admitted.then(|| source.clone());
         plane = plane
             .with_app_state_source(Arc::new(source))
             .with_permission_liveness(permissions);
@@ -197,7 +209,24 @@ fn rig(
     crate::computer_grants::tests::CardService::install(planes, 9, 3)
 }
 
-async fn wire(planes: &crate::Planes, action: &str, mut arguments: Value) -> Value {
+async fn wire(planes: &crate::Planes, action: &str, arguments: Value) -> Value {
+    wire_with_questions(planes, action, arguments).await.0
+}
+
+async fn wire_with_questions(
+    planes: &crate::Planes,
+    action: &str,
+    arguments: Value,
+) -> (Value, usize) {
+    wire_with_consent_hook(planes, action, arguments, || {}).await
+}
+
+async fn wire_with_consent_hook(
+    planes: &crate::Planes,
+    action: &str,
+    mut arguments: Value,
+    mut on_question: impl FnMut(),
+) -> (Value, usize) {
     arguments["action"] = json!(action);
     let request = Frame::build(
         FrameType::Request,
@@ -213,16 +242,19 @@ async fn wire(planes: &crate::Planes, action: &str, mut arguments: Value) -> Val
         .await
         .unwrap();
     tokio::time::timeout(crate::test_support::HANG_GUARD, async {
+        let mut questions = 0;
         loop {
             let service = planes.consent_test.as_ref().unwrap();
             tokio::select! {
                 question = service.card(9, 3) => {
+                    questions += 1;
+                    on_question();
                     assert!(service.answer(question.header.corr, crate::cingulate_client::ScriptedAnswer::Answered(json!({"decision":"allow_30m"}))));
                 }
                 frame = rx.recv() => {
                     let frame = frame.unwrap();
                     assert_eq!(frame.header.ty, FrameType::Response);
-                    return serde_json::from_slice(&frame.body).unwrap();
+                    return (serde_json::from_slice(&frame.body).unwrap(), questions);
                 }
             }
         }
