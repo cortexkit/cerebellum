@@ -238,7 +238,27 @@ jobs:
           test "$(rustc --print host-tuple)" = "$TARGET"
 
       - name: Test workspace on the native target
+        if: runner.os != 'macOS'
         run: cargo test --locked --workspace
+
+      - name: Test workspace on the native macOS target
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset CEREBELLUM_DESK_TESTS CEREBELLUM_DESK_TEST_SKIP_OK
+          # Filter only the real-display checks in the desk suites listed by fast-gate.sh.
+          # The cursor run-loop checks and preview skip-policy check still run.
+          skips=()
+          for suite_test in \
+            preview_hide:a_preview_is_a_click_through_panel_and_hiding_takes_it_off_the_screen \
+            cursor_motion:cursor_glides_with_unthrottled_frames_and_rests_with_no_activity \
+            cursor_hide:hiding_a_cursor_picture_takes_its_window_off_the_screen \
+            source_rect_pattern:a_source_rect_returns_the_region_rather_than_the_whole_window; do
+            printf 'NOT VERIFIED on hosted macOS: %s (real-display timing; verified by the operator-Mac gate)\n' "${suite_test%%:*}"
+            skips+=(--skip "${suite_test#*:}")
+          done
+          cargo test --locked --workspace -- "${skips[@]}"
 
       - name: Verify the release dependency graph excludes the fronting test clock
         shell: bash
