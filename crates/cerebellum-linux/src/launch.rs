@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
 
 use crate::exec_stop::{
     continue_to_exec_stop, ExecStopLoopError, ExecStopObservation, ExecStopOutcome,
@@ -174,13 +175,18 @@ impl BarredChild {
 
     /// Detach from the exact stopped generation and let it execute.
     pub fn release(mut self) -> Result<ReleasedChild, ProcessControlError> {
-        ensure_generation(self.generation)?;
-        ptrace_detach(self.generation.pid as c_int)?;
-        self.active = false;
+        self.detach()?;
         Ok(ReleasedChild {
             generation: self.generation,
             reaped: false,
         })
+    }
+
+    fn detach(&mut self) -> Result<(), ProcessControlError> {
+        ensure_generation(self.generation)?;
+        ptrace_detach(self.generation.pid as c_int)?;
+        self.active = false;
+        Ok(())
     }
 
     /// Kill and reap the stopped target without allowing it to execute.
@@ -256,6 +262,243 @@ impl Drop for ReleasedChild {
     }
 }
 
+/// Desktop launch has no browser command or response descriptors, and its
+/// released owner never signals the child. Ptrace stays on the spawning thread.
+pub struct DesktopBarredChild(BarredChild, std::marker::PhantomData<std::rc::Rc<()>>);
+
+impl DesktopBarredChild {
+    pub fn generation(&self) -> ProcessGeneration {
+        self.0.generation()
+    }
+
+    pub fn prepare_reaper(&self) -> io::Result<DesktopReaper> {
+        DesktopReaper::start(self.generation(), wait_for_exit)
+    }
+
+    pub fn release(mut self, reaper: DesktopReaper) -> Result<DesktopChild, ProcessControlError> {
+        if reaper.generation != self.generation() {
+            return Err(ProcessControlError::GenerationChanged);
+        }
+        self.0.detach()?;
+        let _ = reaper.released.send(());
+        Ok(DesktopChild {
+            status: reaper.status,
+        })
+    }
+}
+
+/// A prestarted waiter sits idle until detach succeeds. If the launch is
+/// refused, the barred owner alone kills and reaps the child.
+pub struct DesktopReaper {
+    generation: ProcessGeneration,
+    released: oneshot::Sender<()>,
+    status: oneshot::Receiver<io::Result<DesktopExit>>,
+}
+
+impl DesktopReaper {
+    fn start(
+        generation: ProcessGeneration,
+        wait: fn(u32) -> io::Result<DesktopExit>,
+    ) -> io::Result<Self> {
+        let (released, ready) = oneshot::channel();
+        let (report, status) = oneshot::channel();
+        std::thread::Builder::new()
+            .name("desktop-child-reaper".into())
+            .spawn(move || {
+                if ready.blocking_recv().is_ok() {
+                    let result = wait(generation.pid);
+                    if let Err(error) = &result {
+                        eprintln!("desktop child reaper failed: {error}");
+                    }
+                    let _ = report.send(result);
+                }
+            })?;
+        Ok(Self {
+            generation,
+            released,
+            status,
+        })
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum DesktopExit {
+    Code(i32),
+    Signal(i32),
+}
+
+/// Dropping the receiver neither signals the detached process nor joins its
+/// reaper. There is no second path that can wait for the child.
+pub struct DesktopChild {
+    status: oneshot::Receiver<io::Result<DesktopExit>>,
+}
+
+impl DesktopChild {
+    pub async fn exit(self) -> io::Result<DesktopExit> {
+        self.status
+            .await
+            .map_err(|_| io::Error::other("desktop child reaper ended without status"))?
+    }
+
+    pub async fn exit_within(self, settle: Duration) -> io::Result<Option<DesktopExit>> {
+        match tokio::time::timeout(settle, self.exit()).await {
+            Ok(result) => result.map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+fn wait_for_exit(pid: u32) -> io::Result<DesktopExit> {
+    loop {
+        // SAFETY: waitid initializes info on success, and never reads the buffer.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        if unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        return match info.si_code {
+            // SAFETY: these SIGCHLD codes carry a status in siginfo_t.
+            libc::CLD_EXITED => Ok(DesktopExit::Code(unsafe { info.si_status() })),
+            libc::CLD_KILLED | libc::CLD_DUMPED => {
+                Ok(DesktopExit::Signal(unsafe { info.si_status() }))
+            }
+            _ => Err(io::Error::other("unexpected desktop child wait status")),
+        };
+    }
+}
+
+pub fn spawn_desktop_barred(
+    executable: &Path,
+    arguments: &[OsString],
+    session: &crate::session::Environment,
+) -> Result<DesktopBarredChild, SpawnError> {
+    let mut environment = vec![("PATH".into(), "/usr/bin:/bin".into())];
+    environment.extend(
+        session
+            .iter()
+            .filter(|(name, _)| desktop_variable(name))
+            .map(|(name, value)| (name.into(), value.into())),
+    );
+    spawn(executable, arguments, &environment, None)
+        .map(|child| DesktopBarredChild(child, std::marker::PhantomData))
+}
+
+fn desktop_variable(name: &str) -> bool {
+    name.starts_with("LC_")
+        || matches!(
+            name,
+            "DISPLAY"
+                | "XAUTHORITY"
+                | "WAYLAND_DISPLAY"
+                | "XDG_RUNTIME_DIR"
+                | "XDG_SESSION_TYPE"
+                | "XDG_CURRENT_DESKTOP"
+                | "XDG_DATA_DIRS"
+                | "XDG_CONFIG_DIRS"
+                | "HOME"
+                | "DBUS_SESSION_BUS_ADDRESS"
+                | "AT_SPI_BUS_ADDRESS"
+                | "LANG"
+                | "GTK_IM_MODULE"
+                | "QT_IM_MODULE"
+                | "XMODIFIERS"
+        )
+}
+
+#[derive(Debug)]
+pub struct ScopeUnavailable;
+
+/// Wait for the systemd user manager to finish the scope's start job, not
+/// merely to accept it. Until then the caller retains the stopped child.
+pub async fn place_desktop_scope(generation: ProcessGeneration) -> Result<(), ScopeUnavailable> {
+    // SAFETY: geteuid has no arguments and returns the effective uid.
+    let uid = unsafe { libc::geteuid() };
+    let address = format!("unix:path=/run/user/{uid}/bus");
+    let connection = zbus::connection::Builder::address(address.as_str())
+        .build()
+        .await
+        .map_err(|_| ScopeUnavailable)?;
+    let name = scope_name(generation);
+    place_scope_on(&connection, &name, generation.pid)
+        .await
+        .map_err(|_| ScopeUnavailable)?;
+    // A completed job is not enough if the child did not actually move. Read
+    // the kernel's systemd cgroup rather than trusting a user-bus reply alone.
+    let cgroups = fs::read_to_string(format!("/proc/{}/cgroup", generation.pid))
+        .map_err(|_| ScopeUnavailable)?;
+    if has_scope_membership(&cgroups, &name) {
+        Ok(())
+    } else {
+        Err(ScopeUnavailable)
+    }
+}
+
+fn scope_name(generation: ProcessGeneration) -> String {
+    format!(
+        "app-cerebellum-{}-{}.scope",
+        generation.pid, generation.start_ticks
+    )
+}
+
+fn has_scope_membership(cgroups: &str, name: &str) -> bool {
+    cgroups.lines().any(|line| {
+        let Some((hierarchy, path)) = line.rsplit_once(':') else {
+            return false;
+        };
+        (hierarchy == "0:" || hierarchy.ends_with(":name=systemd"))
+            && Path::new(path).file_name() == Some(OsStr::new(name))
+    })
+}
+
+async fn place_scope_on(connection: &zbus::Connection, name: &str, pid: u32) -> zbus::Result<()> {
+    use std::future::poll_fn;
+    use std::pin::Pin;
+    use zbus::export::futures_core::Stream;
+    use zbus::proxy::{CacheProperties, MethodFlags};
+    use zbus::{OwnedObjectPath, Proxy, Variant};
+
+    type Properties<'a> = Vec<(&'a str, Variant<'a>)>;
+
+    let manager = zbus::proxy::Builder::<Proxy<'_>>::new(connection)
+        .destination("org.freedesktop.systemd1")
+        .path("/org/freedesktop/systemd1")
+        .interface("org.freedesktop.systemd1.Manager")
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await?;
+    let mut jobs = manager.receive_signal("JobRemoved").await?;
+    let _: Option<()> = manager
+        .call_with_flags("Subscribe", MethodFlags::NO_AUTO_START, &())
+        .await?;
+    let properties = vec![("PIDs", Variant::new(vec![pid]))];
+    let auxiliary: Vec<(&str, Properties<'_>)> = Vec::new();
+    let job: OwnedObjectPath = manager
+        .call_with_flags(
+            "StartTransientUnit",
+            MethodFlags::NO_AUTO_START,
+            &(name, "fail", properties, auxiliary),
+        )
+        .await?
+        .ok_or_else(|| zbus::Error::Failure("scope start returned no job".into()))?;
+    while let Some(signal) = poll_fn(|cx| Pin::new(&mut jobs).poll_next(cx)).await {
+        let (_, path, unit, result): (u32, OwnedObjectPath, String, String) =
+            signal.body().deserialize()?;
+        if path == job && unit == name {
+            return if result == "done" {
+                Ok(())
+            } else {
+                Err(zbus::Error::Failure(
+                    "scope start job did not succeed".into(),
+                ))
+            };
+        }
+    }
+    Err(zbus::Error::Failure("scope job signal stream ended".into()))
+}
+
 /// Spawn an executable stopped after exec, with CDP descriptors at 3 and 4.
 ///
 /// Descriptors 0 (read-only), 1 and 2 (write-only) point at `/dev/null`
@@ -276,13 +519,24 @@ pub fn spawn_barred(
     cdp_command_read_fd: RawFd,
     cdp_response_write_fd: RawFd,
 ) -> Result<BarredChild, SpawnError> {
+    spawn(
+        executable,
+        arguments,
+        environment,
+        Some((cdp_command_read_fd, cdp_response_write_fd)),
+    )
+}
+
+fn spawn(
+    executable: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+    cdp: Option<(RawFd, RawFd)>,
+) -> Result<BarredChild, SpawnError> {
     if !executable.is_absolute() {
         return Err(SpawnError::InvalidExecutable);
     }
-    if cdp_command_read_fd < 0
-        || cdp_response_write_fd < 0
-        || cdp_command_read_fd == cdp_response_write_fd
-    {
+    if cdp.is_some_and(|(command, response)| command < 0 || response < 0 || command == response) {
         return Err(SpawnError::InvalidDescriptor);
     }
 
@@ -316,13 +570,18 @@ pub fn spawn_barred(
 
     // Sources above fd 4 avoid a dup2 ordering collision when callers happen
     // to provide descriptors 3 and 4 in the opposite order.
-    let command_source = duplicate_descriptor(cdp_command_read_fd)?;
-    let response_source = match duplicate_descriptor(cdp_response_write_fd) {
-        Ok(fd) => fd,
-        Err(error) => {
-            close_descriptors(&[command_source]);
-            return Err(error);
-        }
+    let (command_source, response_source) = if let Some((command, response)) = cdp {
+        let command = duplicate_descriptor(command)?;
+        let response = match duplicate_descriptor(response) {
+            Ok(fd) => fd,
+            Err(error) => {
+                close_descriptors(&[command]);
+                return Err(error);
+            }
+        };
+        (command, response)
+    } else {
+        (-1, -1)
     };
     // Opened here rather than in the child, which may make only
     // async-signal-safe calls between fork and exec. Like the CDP sources they
@@ -471,7 +730,14 @@ pub fn spawn_barred(
     }
     #[cfg(test)]
     test_parent_death_checkpoint(ParentDeathCheckpoint::AfterExecStop, pid);
-    let (boot_id, start_ticks) = start_time_for_spawn(pid as u32)?;
+    let (boot_id, start_ticks) = match start_time_for_spawn(pid as u32) {
+        Ok(generation) => generation,
+        Err(error) => {
+            let _ = signal_kill(pid);
+            let _ = wait_for_pid(pid);
+            return Err(error);
+        }
+    };
     Ok(BarredChild {
         generation: ProcessGeneration {
             pid: pid as u32,
@@ -599,7 +865,12 @@ fn child_exec(
 ) -> ! {
     // SAFETY: the descriptors and C-string pointers were checked before fork.
     unsafe {
-        if libc::dup2(command_source, CDP_COMMAND_FD) < 0
+        let desktop = command_source < 0;
+        if desktop {
+            if libc::setsid() < 0 {
+                libc::_exit(117);
+            }
+        } else if libc::dup2(command_source, CDP_COMMAND_FD) < 0
             || libc::dup2(response_source, CDP_RESPONSE_FD) < 0
         {
             libc::_exit(110);
@@ -612,8 +883,16 @@ fn child_exec(
         {
             libc::_exit(116);
         }
-        for fd in 5..descriptor_limit {
-            libc::close(fd);
+        if desktop {
+            // A descriptor can be above a lowered RLIMIT_NOFILE. Close the
+            // whole range or fail before exec rather than inherit one.
+            if libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 0_u32) != 0 {
+                libc::_exit(118);
+            }
+        } else {
+            for fd in 5..descriptor_limit {
+                libc::close(fd);
+            }
         }
         // Orphaned stopped groups receive SIGHUP then SIGCONT. execve resets caught
         // dispositions but preserves ignored ones, so clear application ignores
@@ -1099,6 +1378,230 @@ mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::process::Command;
     use std::sync::{Mutex, OnceLock};
+
+    #[tokio::test]
+    async fn desktop_launch_scope_waits_for_the_matching_systemd_job() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Child, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use zbus::connection::Builder;
+        use zbus::object_server::SignalEmitter;
+        use zbus::{OwnedObjectPath, OwnedVariant};
+
+        struct Bus(Child);
+        impl Drop for Bus {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        type Properties = Vec<(String, OwnedVariant)>;
+        struct Manager(AtomicBool);
+        #[zbus::interface(name = "org.freedesktop.systemd1.Manager")]
+        impl Manager {
+            fn subscribe(&self) {
+                self.0.store(true, Ordering::Release);
+            }
+
+            async fn start_transient_unit(
+                &self,
+                unit: &str,
+                mode: &str,
+                properties: Properties,
+                auxiliary: Vec<(String, Properties)>,
+                #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+            ) -> OwnedObjectPath {
+                assert!(self.0.swap(false, Ordering::AcqRel));
+                assert_eq!(mode, "fail");
+                assert!(auxiliary.is_empty());
+                let [(key, pids)] = properties.try_into().unwrap();
+                assert_eq!(key, "PIDs");
+                assert_eq!(Vec::<u32>::try_from(pids).unwrap(), [42]);
+                let job = OwnedObjectPath::try_from("/org/freedesktop/systemd1/job/9").unwrap();
+                let other = OwnedObjectPath::try_from("/org/freedesktop/systemd1/job/7").unwrap();
+                Self::job_removed(&emitter, 7, &other, unit, "failed")
+                    .await
+                    .unwrap();
+                Self::job_removed(&emitter, 9, &job, "other.scope", "failed")
+                    .await
+                    .unwrap();
+                let result = if unit == "test-good.scope" {
+                    "done"
+                } else {
+                    "failed"
+                };
+                Self::job_removed(&emitter, 9, &job, unit, result)
+                    .await
+                    .unwrap();
+                job
+            }
+
+            #[zbus(signal)]
+            async fn job_removed(
+                emitter: &SignalEmitter<'_>,
+                id: u32,
+                path: &OwnedObjectPath,
+                unit: &str,
+                result: &str,
+            ) -> zbus::Result<()>;
+        }
+
+        let address = format!("unix:abstract=ck-desktop-scope-{}", std::process::id());
+        let mut bus = Bus(Command::new("dbus-daemon")
+            .args([
+                "--session",
+                "--nofork",
+                "--print-address=1",
+                &format!("--address={address}"),
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap());
+        let mut active = String::new();
+        BufReader::new(bus.0.stdout.take().unwrap())
+            .read_line(&mut active)
+            .unwrap();
+        assert!(!active.is_empty());
+        let address = address.as_str();
+        let _service = Builder::address(address)
+            .name("org.freedesktop.systemd1")
+            .serve_at("/org/freedesktop/systemd1", Manager(AtomicBool::new(false)))
+            .build()
+            .await
+            .unwrap();
+        let client = Builder::address(address).build().await.unwrap();
+        for (unit, ok) in [("test-good.scope", true), ("test-bad.scope", false)] {
+            let result =
+                tokio::time::timeout(Duration::from_secs(2), place_scope_on(&client, unit, 42))
+                    .await
+                    .unwrap();
+            assert_eq!(result.is_ok(), ok, "{result:?}");
+        }
+        assert!(has_scope_membership(
+            "0::/user.slice/test-good.scope\n",
+            "test-good.scope"
+        ));
+        assert!(has_scope_membership(
+            "1:name=systemd:/user.slice/test-good.scope\n",
+            "test-good.scope"
+        ));
+        assert!(!has_scope_membership(
+            "2:cpu:/test-good.scope\n0::/user.slice/daemon.service\n",
+            "test-good.scope"
+        ));
+    }
+
+    #[tokio::test]
+    async fn desktop_launch_uses_a_new_session_and_only_the_desktop_environment_and_stdio() {
+        let (read, _) = pipe();
+        // SAFETY: duplicate a valid fd without CLOEXEC, so exec alone cannot
+        // account for the extra descriptor being absent.
+        let inherited = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_DUPFD, 100) };
+        assert!(inherited >= 100);
+        let _inherited = unsafe { OwnedFd::from_raw_fd(inherited) };
+        let environment = [
+            ("PATH", "/home/fixture/.local/bin:/usr/bin"),
+            ("XDG_CURRENT_DESKTOP", "Fixture"),
+            ("XMODIFIERS", "@im=fixture"),
+            ("LC_MESSAGES", "C.UTF-8"),
+            ("LD_PRELOAD", "/not-passed.so"),
+            ("GTK_MODULES", "not-passed"),
+            ("QT_PLUGIN_PATH", "/not-passed"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+        let child = spawn_desktop_barred(Path::new("/usr/bin/true"), &[], &environment).unwrap();
+        let pid = child.generation().pid;
+        assert_eq!(unsafe { libc::getsid(pid as c_int) }, pid as c_int);
+        assert_eq!(process_descriptors(pid).unwrap(), vec![0, 1, 2]);
+        for fd in 0..3 {
+            assert_eq!(
+                fs::read_link(format!("/proc/{pid}/fd/{fd}")).unwrap(),
+                Path::new("/dev/null")
+            );
+        }
+        let actual = fs::read(format!("/proc/{pid}/environ")).unwrap();
+        let mut vars: Vec<_> = actual
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        vars.sort_unstable();
+        assert_eq!(
+            vars,
+            [
+                b"LC_MESSAGES=C.UTF-8".as_slice(),
+                b"PATH=/usr/bin:/bin",
+                b"XDG_CURRENT_DESKTOP=Fixture",
+                b"XMODIFIERS=@im=fixture"
+            ]
+        );
+        let reaper = child.prepare_reaper().unwrap();
+        let running = child.release(reaper).unwrap();
+        assert_eq!(
+            running.exit_within(Duration::from_secs(2)).await.unwrap(),
+            Some(DesktopExit::Code(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_launch_reports_signals_instead_of_a_successful_launch() {
+        // Use a shell only to test raw child-wait behavior; the desktop entry
+        // resolver separately refuses shell-based entries before spawning.
+        let args = ["-c".into(), "ulimit -c 0; kill -SEGV $$".into()];
+        let child = spawn_desktop_barred(Path::new("/bin/sh"), &args, &Default::default()).unwrap();
+        let reaper = child.prepare_reaper().unwrap();
+        assert_eq!(
+            child
+                .release(reaper)
+                .unwrap()
+                .exit_within(Duration::from_secs(2))
+                .await
+                .unwrap(),
+            Some(DesktopExit::Signal(libc::SIGSEGV))
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_launch_failed_wait_and_receiver_drop_never_kill_a_detached_child() {
+        fn failed_wait(_: u32) -> io::Result<DesktopExit> {
+            Err(io::Error::from_raw_os_error(libc::ECHILD))
+        }
+        for fail in [false, true] {
+            let child = spawn_desktop_barred(
+                Path::new("/usr/bin/sleep"),
+                &["30".into()],
+                &Default::default(),
+            )
+            .unwrap();
+            let generation = child.generation();
+            let reaper = if fail {
+                DesktopReaper::start(generation, failed_wait).unwrap()
+            } else {
+                child.prepare_reaper().unwrap()
+            };
+            let detached = child.release(reaper).unwrap();
+            if fail {
+                assert_eq!(
+                    detached
+                        .exit_within(Duration::from_secs(2))
+                        .await
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(libc::ECHILD)
+                );
+            } else {
+                drop(detached);
+            }
+            assert_eq!(own_generation_match(generation), GenerationMatch::Exact);
+            // A test-owned cleanup signal, not part of the detached owner.
+            signal_kill(generation.pid as c_int).unwrap();
+            if fail {
+                wait_for_pid(generation.pid as c_int).unwrap();
+            }
+        }
+    }
 
     fn pipe() -> (OwnedFd, OwnedFd) {
         let mut descriptors = [-1; 2];

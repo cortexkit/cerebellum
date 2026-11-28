@@ -17,6 +17,8 @@ use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 
 use crate::{process_generation, ProcessGeneration, ProcessGenerationReading};
 
+#[path = "desktop_entry.rs"]
+pub mod desktop_entry;
 mod packages;
 #[cfg(test)]
 mod tests;

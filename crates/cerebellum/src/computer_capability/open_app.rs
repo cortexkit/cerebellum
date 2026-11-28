@@ -67,6 +67,10 @@ where
             Ok(target) => target,
             Err(reply) => return reply,
         };
+        #[cfg(target_os = "linux")]
+        if let Some(session) = &self.linux_session {
+            return Box::pin(self.serve_linux_open_app(session, request, context)).await;
+        }
         let source = self.app_state_source.clone();
         let listed =
             tokio::task::spawn_blocking(move || source.installed_apps(Duration::from_secs(2)))

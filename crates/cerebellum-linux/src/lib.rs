@@ -22,6 +22,8 @@ mod exec_stop;
 #[cfg(target_os = "linux")]
 pub mod identity;
 #[cfg(target_os = "linux")]
+pub use identity::desktop_entry;
+#[cfg(target_os = "linux")]
 mod launch;
 #[cfg(target_os = "linux")]
 pub mod session;
@@ -35,9 +37,11 @@ mod linux;
 // as unused code.
 #[cfg(target_os = "linux")]
 pub use launch::{
-    executed_image_identity, process_descriptors, spawn_barred, terminate_exact_generation,
-    BarredChild, ExecutedImageIdentity, GenerationMatch, ImageIdentityError, ProcessControlError,
-    ProcessGeneration, ReleasedChild, SpawnError, TerminationOutcome,
+    executed_image_identity, place_desktop_scope, process_descriptors, spawn_barred,
+    spawn_desktop_barred, terminate_exact_generation, BarredChild, DesktopBarredChild,
+    DesktopChild, DesktopExit, DesktopReaper, ExecutedImageIdentity, GenerationMatch,
+    ImageIdentityError, ProcessControlError, ProcessGeneration, ReleasedChild, ScopeUnavailable,
+    SpawnError, TerminationOutcome,
 };
 #[cfg(any(target_os = "linux", all(test, unix)))]
 pub use linux::process_start_time;
