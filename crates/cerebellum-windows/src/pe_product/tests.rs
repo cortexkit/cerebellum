@@ -28,7 +28,17 @@ fn product(name: &str) -> Vec<u8> {
 fn version(products: &[Vec<u8>]) -> Vec<u8> {
     let table = block("040904b0", true, &[], products);
     let strings = block("StringFileInfo", true, &[], &[table]);
-    block("VS_VERSION_INFO", false, &[0; 52], &[strings])
+    let mut fixed = [0; 52];
+    for (offset, value) in [
+        (0, 0xfeef_04bdu32),
+        (8, (143 << 16) | 1),
+        (12, (55 << 16) | 706),
+        (16, 123),
+        (20, 456),
+    ] {
+        fixed[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    block("VS_VERSION_INFO", false, &fixed, &[strings])
 }
 
 #[test]
@@ -49,8 +59,7 @@ fn reads_product_name_without_normalizing_and_reports_ambiguous_metadata() {
     assert_eq!(version_strings(&duplicate), None);
 }
 
-#[test]
-fn reads_product_from_resource_section_not_certificate_table() {
+pub(crate) fn fixture_versioned_image() -> Vec<u8> {
     fn set(buf: &mut [u8], offset: usize, value: u32) {
         buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
@@ -87,18 +96,37 @@ fn reads_product_from_resource_section_not_certificate_table() {
     set(&mut image, section + 12, 0x1000);
     set(&mut image, section + 16, 0x200);
     set(&mut image, section + 20, 0x400);
-    let check = |image: &[u8]| {
-        read_product_names(|offset, buf| {
-            let i = offset as usize;
-            let bytes = image
-                .get(i..i + buf.len())
-                .ok_or(std::io::ErrorKind::UnexpectedEof)?;
-            buf.copy_from_slice(bytes);
-            Ok(())
-        })
-    };
+    image
+}
+
+fn read_image(image: &[u8]) -> impl FnMut(u64, &mut [u8]) -> std::io::Result<()> + '_ {
+    |offset, buf| {
+        let i = offset as usize;
+        let bytes = image
+            .get(i..i + buf.len())
+            .ok_or(std::io::ErrorKind::UnexpectedEof)?;
+        buf.copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
+#[test]
+fn reads_product_from_resource_section_not_certificate_table() {
+    let mut image = fixture_versioned_image();
+    let check = |image: &[u8]| read_product_names(read_image(image));
     assert_eq!(check(&image), Some(vec!["Google Chrome".into()]));
     assert_eq!(check(&image[..0x5ff]), None);
-    set(&mut image, optional + 144, 0x450);
+    image[232..236].copy_from_slice(&0x450u32.to_le_bytes());
     assert_eq!(check(&image), None);
+}
+
+#[test]
+fn uses_the_fixed_file_version_not_the_product_version() {
+    let mut image = fixture_versioned_image();
+    assert_eq!(
+        read_file_version(read_image(&image)),
+        Some([143, 1, 55, 706])
+    );
+    image[0x400 + 88 + 40] ^= 1; // Corrupt the VS_FIXEDFILEINFO signature.
+    assert_eq!(read_file_version(read_image(&image)), None);
 }

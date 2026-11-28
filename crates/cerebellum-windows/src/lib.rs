@@ -57,6 +57,8 @@ mod window_list;
 mod window_state_facts;
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg(windows)]
+pub mod writability;
 
 #[cfg(windows)]
 pub use accessibility::scoped::{with_scoped_uia, ScopedUia, UiaElementRef, UiaPatterns};

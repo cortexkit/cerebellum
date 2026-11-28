@@ -125,7 +125,7 @@ fn ambiguous_component(name: &str) -> bool {
 pub struct HeldExecutable {
     image: File,
     paths: PathForms,
-    _ancestors: Vec<File>,
+    ancestors: Vec<File>,
 }
 
 impl HeldExecutable {
@@ -139,6 +139,10 @@ impl HeldExecutable {
 
     pub fn image(&self) -> &File {
         &self.image
+    }
+
+    pub(crate) fn install_directory(&self) -> &File {
+        self.ancestors.last().expect("the drive root is retained")
     }
 
     fn walk(
@@ -197,7 +201,7 @@ impl HeldExecutable {
             return Ok(Self {
                 image: file,
                 paths,
-                _ancestors: ancestors,
+                ancestors,
             });
         }
         Err(refuse)

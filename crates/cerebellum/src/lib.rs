@@ -44,6 +44,7 @@ pub mod browser_launch_service;
 #[cfg(all(windows, feature = "windows-browser-release"))]
 pub mod windows_launch {
     pub mod discovery;
+    pub mod writability;
 }
 mod browser_queue;
 pub mod browser_session;
