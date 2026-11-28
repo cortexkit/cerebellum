@@ -189,7 +189,12 @@ fn browser_advertisement_depends_on_the_build_not_configuration() {
                     })
                 })
             }),
-        cfg!(any(target_os = "macos", target_os = "linux"))
+        cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            all(windows, feature = "windows-browser-release"),
+        )),
+        "browser advertisement follows the build's enabled browser support"
     );
     assert!(manifest.get("browser_surface_refused").is_none());
     assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
