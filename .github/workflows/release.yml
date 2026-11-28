@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      rehearsal:
+        description: Rehearse the release lane without release credentials or publication
+        type: choice
+        required: true
+        options: [linux, windows, unbound]
 
 permissions:
   contents: read
@@ -12,8 +19,15 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  # SHA-256 of the raw Ed25519 public key. An empty pin permits only unbound releases.
+  BRIDGE_PEER_SIGNING_FINGERPRINT: ""
+  # Oldest core that installs the message bus; review this floor with the release.
+  REQUIRES_CORE: "0.24.8"
+
 jobs:
   gate:
+    if: github.event_name == 'push'
     name: CI gate (tests.yml green on this commit)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -34,10 +48,12 @@ jobs:
   verify:
     name: Verify tag matches crate version
     needs: gate
+    if: ${{ !cancelled() && (needs.gate.result == 'success' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     outputs:
       commit: ${{ steps.version.outputs.commit }}
       host_version: ${{ steps.version.outputs.host_version }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -50,42 +66,147 @@ jobs:
           versions=$(cargo metadata --locked --no-deps --format-version 1)
           crate=$(jq -er '.packages[] | select(.name == "cerebellum") | .version' <<< "$versions")
           host_version=$(jq -er '.packages[] | select(.name == "cerebellum-native-host") | .version' <<< "$versions")
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || "$GITHUB_REF_NAME" != "v$crate" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == push && (! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || "$GITHUB_REF_NAME" != "v$crate") ]]; then
             echo "::error::Expected tag v$crate in vMAJOR.MINOR.PATCH form, got $GITHUB_REF_NAME"
             exit 1
           fi
-          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "host_version=$host_version" >> "$GITHUB_OUTPUT"
+          commit=$(git rev-parse HEAD)
+          printf '%s\n' "commit=$commit" "host_version=$host_version" "version=$crate" >> "$GITHUB_OUTPUT"
+
+  preflight:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      open_platforms: ${{ steps.inputs.outputs.open_platforms }}
+      key: ${{ steps.inputs.outputs.key }}
+      regular_matrix: ${{ steps.inputs.outputs.regular_matrix }}
+      signed_matrix: ${{ steps.inputs.outputs.signed_matrix }}
+      signing_required: ${{ steps.inputs.outputs.signing_required }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.verify.outputs.commit }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate release inputs and select the matrix before any target builds
+        id: inputs
+        env:
+          REHEARSAL: ${{ inputs.rehearsal }}
+          CEREBELLUM_LINUX_USER_BROWSER_REVIEW_REVISION: ${{ github.event_name == 'push' && vars.CEREBELLUM_LINUX_USER_BROWSER_REVIEW_REVISION || '' }}
+          CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION: ${{ github.event_name == 'push' && vars.CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION || '' }}
+          CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY: ${{ github.event_name == 'push' && vars.CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY || '' }}
+          CARGO_FEATURE_BRIDGE_TEST_IDENTITIES: ${{ vars.CARGO_FEATURE_BRIDGE_TEST_IDENTITIES }}
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            case "$REHEARSAL" in
+              linux) CEREBELLUM_LINUX_USER_BROWSER_REVIEW_REVISION=release-rehearsal ;;
+              windows) CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION=release-rehearsal ;;
+              unbound) ;;
+              *) echo '::error::Unknown release rehearsal'; exit 1 ;;
+            esac
+            if [[ "$REHEARSAL" != unbound ]]; then
+              # Validate a disposable public key here. Each open entry generates its own pair.
+              der=$(openssl genpkey -algorithm ED25519 | openssl pkey -pubout -outform DER | od -An -v -tx1)
+              der=${der//[[:space:]]/}
+              CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY=${der:24}
+            fi
+          fi
+          bash scripts/release-build.sh --preflight
+          open=$(jq -nc \
+            --arg linux "$CEREBELLUM_LINUX_USER_BROWSER_REVIEW_REVISION" \
+            --arg windows "$CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION" \
+            '{linux: $linux, windows: $windows} | with_entries(select(.value != ""))')
+          signing_required=false
+          key=''
+          signed='{"include":[]}'
+          matrix=$(bash scripts/release/verify-assets.sh --matrix)
+          regular=$matrix
+          if [[ "$open" != '{}' && "$GITHUB_EVENT_NAME" == push ]]; then
+            if [[ "$GITHUB_RUN_ATTEMPT" != 1 ]]; then
+              echo '::error::A candidate build needs a new release run ID for a new attended review; do not rerun a candidate'
+              exit 1
+            fi
+            signing_required=true
+            key=$CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY
+            fingerprint=$(python3 -c 'import hashlib, sys; print(hashlib.sha256(bytes.fromhex(sys.argv[1])).hexdigest())' "$key")
+            if [[ ! "$BRIDGE_PEER_SIGNING_FINGERPRINT" =~ ^[a-f0-9]{64}$ || "$fingerprint" != "$BRIDGE_PEER_SIGNING_FINGERPRINT" ]]; then
+              echo '::error::BRIDGE_PEER_SIGNING_FINGERPRINT is missing or does not match the bridge public key'
+              exit 1
+            fi
+            signed=$(jq -c --argjson open "$open" '.include |= map(select(.os as $os | $open | has($os)))' <<< "$matrix")
+            regular=$(jq -c --argjson open "$open" '.include |= map(select(.os as $os | $open | has($os) | not))' <<< "$matrix")
+          fi
+          printf '%s\n' "open_platforms=$open" "key=$key" "signing_required=$signing_required" \
+            "regular_matrix=$regular" "signed_matrix=$signed" >> "$GITHUB_OUTPUT"
+
+  signing-preflight:
+    if: needs.preflight.outputs.signing_required == 'true'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release-signing
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require the configured signing environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNING_READY: ${{ vars.CEREBELLUM_RELEASE_SIGNING_READY }}
+        shell: bash
+        run: |
+          if [[ "$SIGNING_READY" != 1 ]] || ! gh api "repos/$GITHUB_REPOSITORY/environments/release-signing" \
+            | jq -e '.deployment_branch_policy == {protected_branches: false, custom_branch_policies: true}' >/dev/null || \
+            ! gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/environments/release-signing/deployment-branch-policies" \
+            | jq -e '[.[].branch_policies[] | {name, type}] == [{name: "v*", type: "tag"}]' >/dev/null; then
+            echo '::error::Missing or unconfigured release-signing environment (requires CEREBELLUM_RELEASE_SIGNING_READY=1 and only the v* tag policy)'
+            exit 1
+          fi
+      - name: Validate the signing key before any target builds
+        env:
+          CEREBELLUM_RELEASE_SIGNING_KEY_PEM: ${{ secrets.CEREBELLUM_RELEASE_SIGNING_KEY_PEM }}
+          BOUND_PUBLIC_KEY: ${{ needs.preflight.outputs.key }}
+        shell: bash
+        run: |
+          : "${CEREBELLUM_RELEASE_SIGNING_KEY_PEM:?Missing signing secret CEREBELLUM_RELEASE_SIGNING_KEY_PEM}"
+          pem=$CEREBELLUM_RELEASE_SIGNING_KEY_PEM
+          unset CEREBELLUM_RELEASE_SIGNING_KEY_PEM
+          while IFS= read -r line; do [[ -z "$line" ]] || printf '::add-mask::%s\n' "$line"; done <<< "$pem"
+          pem=${pem%$'\n'}
+          if [[ ${#pem} -ge 4096 || "$pem" != $'-----BEGIN PRIVATE KEY-----\n'*$'\n-----END PRIVATE KEY-----' ]] ||
+            ! der=$(printf '%s\n' "$pem" | openssl pkey -pubout -outform DER | od -An -v -tx1); then
+            echo '::error::CEREBELLUM_RELEASE_SIGNING_KEY_PEM must contain a PKCS#8 Ed25519 private key in PEM'
+            exit 1
+          fi
+          unset pem
+          der=${der//[[:space:]]/}
+          expected=$(tr 'A-F' 'a-f' <<< "$BOUND_PUBLIC_KEY")
+          if [[ "$der" != "302a300506032b6570032100$expected" ]]; then
+            echo '::error::Signing key does not derive the bound Ed25519 public key'
+            exit 1
+          fi
+          printf 'Validated signing key fingerprint: %s\n' "$BRIDGE_PEER_SIGNING_FINGERPRINT"
 
   build:
     name: Build ${{ matrix.platform }}
-    needs: [gate, verify]
+    needs: [verify, preflight, signing-preflight]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && (needs.signing-preflight.result == 'success' || needs.signing-preflight.result == 'skipped') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - platform: darwin-arm64
-            runner: macos-latest
-            target: aarch64-apple-darwin
-          - platform: linux-x64
-            runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - platform: linux-arm64
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - platform: windows-x64
-            runner: windows-latest
-            target: x86_64-pc-windows-msvc
-          - platform: windows-arm64
-            runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
-    env:
+      matrix: ${{ fromJSON(needs.preflight.outputs.regular_matrix) }}
+    env: &build-env
       PLATFORM: ${{ matrix.platform }}
+      TARGET: ${{ matrix.target }}
       RELEASE_COMMIT: ${{ needs.verify.outputs.commit }}
       HOST_VERSION: ${{ needs.verify.outputs.host_version }}
-    steps:
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+      BRIDGE_REVIEW: ${{ fromJSON(needs.preflight.outputs.open_platforms)[matrix.os] }}
+      BRIDGE_PUBLIC_KEY: ${{ fromJSON(needs.preflight.outputs.open_platforms)[matrix.os] && needs.preflight.outputs.key || '' }}
+    steps: &build-steps
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.verify.outputs.commit }}
@@ -116,16 +237,79 @@ jobs:
       - name: Test workspace on the native target
         run: cargo test --locked --workspace
 
+      - name: Prepare the open-platform key and trailer tool
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          cargo build --locked --release -p cerebellum-bridge-protocol --bin peer-trailer
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && -n "$BRIDGE_REVIEW" ]]; then
+            umask 077
+            ephemeral="$RUNNER_TEMP/bridge-rehearsal.pem"
+            openssl genpkey -algorithm ED25519 -out "$ephemeral"
+            der=$(openssl pkey -in "$ephemeral" -pubout -outform DER | od -An -v -tx1)
+            der=${der//[[:space:]]/}
+            [[ "$der" =~ ^302a300506032b6570032100[0-9a-f]{64}$ ]]
+            public=${der:24}
+            pin=$(printf '%s' "$public" | python -c 'import hashlib,sys; print(hashlib.sha256(bytes.fromhex(sys.stdin.read())).hexdigest())')
+            printf '%s\n' "BRIDGE_PUBLIC_KEY=$public" "BRIDGE_PEER_SIGNING_FINGERPRINT=$pin" >> "$GITHUB_ENV"
+          fi
+
       # No private checkout credential belongs in the public release build.
       - name: Build attested module
         shell: bash
-        run: bash scripts/release-build.sh
+        run: |
+          if [[ -n "$BRIDGE_REVIEW" ]]; then
+            case "$RUNNER_OS" in
+              Linux) export CEREBELLUM_LINUX_USER_BROWSER_REVIEW_REVISION="$BRIDGE_REVIEW" ;;
+              Windows) export CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION="$BRIDGE_REVIEW" ;;
+              *) echo '::error::Bridge release inputs cannot be bound on macOS'; exit 1 ;;
+            esac
+            export CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY="$BRIDGE_PUBLIC_KEY"
+          fi
+          bash scripts/release-build.sh
       - name: Build macOS native messaging host
         if: runner.os == 'macOS'
         run: cargo build --locked --release -p cerebellum-native-host --bin ck-cerebellum-native-host
 
+      - name: Sign reviewed Linux or Windows executables
+        if: github.event_name == 'push' && env.BRIDGE_REVIEW != ''
+        env:
+          SIGNING_READY: ${{ vars.CEREBELLUM_RELEASE_SIGNING_READY }}
+          CEREBELLUM_RELEASE_SIGNING_KEY_PEM: ${{ secrets.CEREBELLUM_RELEASE_SIGNING_KEY_PEM }}
+          CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY: ${{ env.BRIDGE_PUBLIC_KEY }}
+        shell: bash
+        run: |
+          [[ "$SIGNING_READY" == 1 ]] || { echo '::error::Missing CEREBELLUM_RELEASE_SIGNING_READY in release-signing'; exit 1; }
+          : "${CEREBELLUM_RELEASE_SIGNING_KEY_PEM:?Missing signing secret CEREBELLUM_RELEASE_SIGNING_KEY_PEM}"
+          pem=$CEREBELLUM_RELEASE_SIGNING_KEY_PEM
+          unset CEREBELLUM_RELEASE_SIGNING_KEY_PEM
+          while IFS= read -r line; do [[ -z "$line" ]] || printf '::add-mask::%s\n' "$line"; done <<< "$pem"
+          suffix=
+          if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
+          signer="target/release/peer-trailer$suffix"
+          printf '%s\n' "$pem" | "$signer" sign "target/release/ck-cerebellum$suffix" cerebellum "$TARGET" "$RELEASE_VERSION"
+          printf '%s\n' "$pem" | "$signer" sign "target/release/ck-cerebellum-native-host$suffix" host "$TARGET" "$RELEASE_VERSION"
+          unset pem
+
+      - name: Sign rehearsal executables with the disposable key
+        if: github.event_name == 'workflow_dispatch' && env.BRIDGE_REVIEW != ''
+        shell: bash
+        run: |
+          export CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY="$BRIDGE_PUBLIC_KEY"
+          ephemeral="$RUNNER_TEMP/bridge-rehearsal.pem"
+          suffix=
+          if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
+          signer="target/release/peer-trailer$suffix"
+          "$signer" sign "target/release/ck-cerebellum$suffix" cerebellum "$TARGET" "$RELEASE_VERSION" < "$ephemeral"
+          "$signer" sign "target/release/ck-cerebellum-native-host$suffix" host "$TARGET" "$RELEASE_VERSION" < "$ephemeral"
+
+      - name: Remove the disposable key
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && env.BRIDGE_REVIEW != '' }}
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/bridge-rehearsal.pem"
+
       - name: Import Developer ID certificate
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && github.event_name == 'push'
         env:
           DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64 }}
           DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD }}
@@ -149,7 +333,7 @@ jobs:
             -k "$keychain_password" "$keychain_path" >/dev/null
 
       - name: Write App Store Connect API key
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && github.event_name == 'push'
         env:
           APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
@@ -163,7 +347,7 @@ jobs:
           printf '%s' "$APP_STORE_CONNECT_API_KEY" > "$RUNNER_TEMP/AuthKey.p8"
 
       - name: Sign, notarize, and package (darwin)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && github.event_name == 'push'
         env:
           APP_STORE_CONNECT_API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
@@ -174,12 +358,9 @@ jobs:
           for binary in ck-cerebellum ck-cerebellum-native-host; do
             bash scripts/release/macos-sign-notarize.sh "target/release/$binary" "assets/$binary-$PLATFORM.zip"
           done
-          extension_stage="$RUNNER_TEMP/ck-cerebellum-extension"
-          CEREBELLUM_EXTENSION_DIR="$extension_stage" bash scripts/install-extension.sh
-          (cd "$extension_stage" && zip -q -X -r "$GITHUB_WORKSPACE/assets/ck-cerebellum-extension-$PLATFORM.zip" .)
 
       - name: Remove temporary macOS signing credentials
-        if: ${{ always() && runner.os == 'macOS' }}
+        if: ${{ always() && runner.os == 'macOS' && github.event_name == 'push' }}
         shell: bash
         run: |
           rm -f "$RUNNER_TEMP/AuthKey.p8"
@@ -187,24 +368,44 @@ jobs:
             security delete-keychain "$RUNNER_TEMP/developer-id.keychain-db"
           fi
 
-      - name: Package (linux)
-        if: runner.os == 'Linux'
+      # The bridge verifies the appended Ed25519 trailer; it is not an Authenticode signature.
+      - name: Package unsigned darwin rehearsal or Linux and Windows executables
+        if: runner.os != 'macOS' || github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           mkdir assets
-          zip -q -j "assets/ck-cerebellum-$PLATFORM.zip" target/release/ck-cerebellum
+          binaries=(ck-cerebellum)
+          if [[ "$RUNNER_OS" == macOS || -n "$BRIDGE_REVIEW" ]]; then
+            binaries+=(ck-cerebellum-native-host)
+          fi
+          for binary in "${binaries[@]}"; do
+            archive="assets/$binary-$PLATFORM.zip"
+            if [[ "$RUNNER_OS" == Windows ]]; then
+              python -m zipfile -c "$archive" "target/release/$binary.exe"
+            else
+              zip -q -j "$archive" "target/release/$binary"
+            fi
+          done
 
-      # TODO(windows-signing): Add Authenticode once CortexKit has a Windows signing process for its modules.
-      - name: Package unsigned executable (Windows)
-        if: runner.os == 'Windows'
+      - name: Package extension for macOS and each open platform
+        if: runner.os == 'macOS' || env.BRIDGE_REVIEW != ''
         shell: bash
         run: |
-          mkdir assets
-          python -m zipfile -c "assets/ck-cerebellum-$PLATFORM.zip" target/release/ck-cerebellum.exe
+          temp=$(cd "$RUNNER_TEMP" && pwd)
+          extension_stage="$temp/ck-cerebellum-extension"
+          CEREBELLUM_EXTENSION_DIR="$extension_stage" bash scripts/install-extension.sh
+          archive="$GITHUB_WORKSPACE/assets/ck-cerebellum-extension-$PLATFORM.zip"
+          cd "$extension_stage"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            python -m zipfile -c "$archive" .
+          else
+            zip -q -X -r "$archive" .
+          fi
 
       - name: Verify archived files and write checksums
         shell: bash
         run: |
+          export CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY="$BRIDGE_PUBLIC_KEY"
           cd assets
           for archive in *.zip; do
             wrapper=$(mktemp -d "$RUNNER_TEMP/cerebellum-release.XXXXXX")
@@ -217,23 +418,32 @@ jobs:
             fi
             if [[ "$archive" == "ck-cerebellum-extension-$PLATFORM.zip" ]]; then
               diff -r "$RUNNER_TEMP/ck-cerebellum-extension" "$wrapper"
-              shasum -a 256 "$archive" > "$archive.sha256"
-              rm -r "$wrapper"
-              continue
-            fi
-            binary=${archive%"-$PLATFORM.zip"}
-            case "$binary" in
-              ck-cerebellum) expected="ck-cerebellum ($RELEASE_COMMIT) tree=clean" ;;
-              ck-cerebellum-native-host) expected="ck-cerebellum-native-host $HOST_VERSION" ;;
-              *) echo "::error::Unexpected archive: $archive"; exit 1 ;;
-            esac
-            if [[ "$RUNNER_OS" == macOS ]]; then
-              bash ../scripts/check-placed-hardening.sh "$wrapper/$binary"
-            fi
-            reported=$("$wrapper/$binary$suffix" --version)
-            if [[ "$reported" != "$expected" ]]; then
-              echo "::error::$archive reports '$reported', expected '$expected'"
-              exit 1
+            else
+              binary=${archive%"-$PLATFORM.zip"}
+              case "$binary" in
+                ck-cerebellum) role=cerebellum; expected="ck-cerebellum ($RELEASE_COMMIT) tree=clean" ;;
+                ck-cerebellum-native-host) role=host; expected="ck-cerebellum-native-host $HOST_VERSION" ;;
+                *) echo "::error::Unexpected archive: $archive"; exit 1 ;;
+              esac
+              image="$wrapper/$binary$suffix"
+              if [[ "$RUNNER_OS" == macOS ]]; then
+                if [[ "$GITHUB_EVENT_NAME" == push ]]; then bash ../scripts/check-placed-hardening.sh "$image"; fi
+              elif [[ -n "$BRIDGE_REVIEW" ]]; then
+                verifier="../target/release/peer-trailer$suffix"
+                if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+                  python -c 'import subprocess, sys; subprocess.run(sys.argv[1:], check=True, timeout=0.5)' \
+                    "$verifier" verify "$image" "$role" "$TARGET"
+                else
+                  "$verifier" verify "$image" "$role" "$TARGET"
+                fi
+              else
+                ../target/release/peer-trailer"$suffix" assert-unsigned "$image"
+              fi
+              reported=$("$image" --version)
+              if [[ "$reported" != "$expected" ]]; then
+                echo "::error::$archive reports '$reported', expected '$expected'"
+                exit 1
+              fi
             fi
             if [[ "$RUNNER_OS" == Windows ]]; then
               checksum=$(sha256sum -b "$archive")
@@ -244,45 +454,117 @@ jobs:
             rm -r "$wrapper"
           done
 
+      - name: Record the disposable public key for independent rehearsal checks
+        if: github.event_name == 'workflow_dispatch' && env.BRIDGE_REVIEW != ''
+        shell: bash
+        run: printf '%s\n' "$BRIDGE_PUBLIC_KEY" > assets/bridge-public-key.txt
+
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.platform }}
+          name: ${{ github.event_name == 'push' && needs.preflight.outputs.open_platforms == '{}' && matrix.platform || format('platform-{0}-{1}', github.run_attempt, matrix.platform) }}
           path: assets/
+          if-no-files-found: error
+
+  build-signed:
+    name: Build and sign ${{ matrix.platform }}
+    needs: [verify, preflight, signing-preflight]
+    if: needs.preflight.outputs.signing_required == 'true'
+    environment: release-signing
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.signed_matrix) }}
+    env: *build-env
+    steps: *build-steps
+
+  candidate:
+    name: Record the complete candidate inventory (never publish)
+    needs: [verify, preflight, build, build-signed]
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.build-signed.result == 'success' || (github.event_name == 'workflow_dispatch' && needs.build-signed.result == 'skipped')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.verify.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: platform-${{ github.run_attempt }}-*
+          path: platform-assets
+      - name: Verify all packages and record the hashes before review
+        env:
+          RELEASE_COMMIT: ${{ needs.verify.outputs.commit }}
+          HOST_VERSION: ${{ needs.verify.outputs.host_version }}
+          OPEN_PLATFORMS: ${{ needs.preflight.outputs.open_platforms }}
+          BRIDGE_PUBLIC_KEY: ${{ needs.preflight.outputs.key }}
+        shell: bash
+        run: |
+          shopt -s nullglob dotglob
+          mkdir -p candidate/assets
+          rehearsal_keys='{}'
+          for dir in platform-assets/*; do
+            platform=${dir#"platform-assets/platform-$GITHUB_RUN_ATTEMPT-"}
+            [[ -d "$dir" && "$platform" != "$dir" ]]
+            for item in "$dir"/*; do
+              name=${item##*/}
+              [[ -f "$item" && ! -L "$item" && ! -e "candidate/assets/$name" ]]
+              if [[ "$name" == bridge-public-key.txt && "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+                public=$(< "$item")
+                [[ "$public" =~ ^[0-9a-f]{64}$ ]]
+                jq -e --arg os "${platform%%-*}" 'has($os)' <<< "$OPEN_PLATFORMS" >/dev/null
+                rehearsal_keys=$(jq -c --arg platform "$platform" --arg public "$public" '.[$platform] = $public' <<< "$rehearsal_keys")
+                continue
+              fi
+              [[ "$name" == *-"$platform".zip || "$name" == *-"$platform".zip.sha256 ]]
+              mv -- "$item" "candidate/assets/$name"
+            done
+          done
+          bash scripts/release/verify-assets.sh --release-manifest "$RELEASE_COMMIT" "$HOST_VERSION" "$REQUIRES_CORE" > candidate/release-manifest.json
+          cp candidate/release-manifest.json candidate/assets/
+          bash scripts/release/verify-assets.sh candidate/assets candidate/release-manifest.json "$OPEN_PLATFORMS"
+          rm candidate/release-manifest.json
+          inventory=$(bash scripts/release/verify-assets.sh --inventory candidate/assets)
+          executables=$(bash scripts/release/verify-assets.sh --executables "$OPEN_PLATFORMS")
+          exempt=false
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then exempt=true; fi
+          jq -n --arg run_id "$GITHUB_RUN_ID" --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg source_revision "$RELEASE_COMMIT" --arg tag "$GITHUB_REF_NAME" \
+            --arg public_key "$BRIDGE_PUBLIC_KEY" --argjson exempt "$exempt" \
+            --argjson open_platforms "$OPEN_PLATFORMS" --argjson inventory "$inventory" \
+            --argjson executables "$executables" --argjson rehearsal_keys "$rehearsal_keys" \
+            '{$run_id, $run_attempt, $source_revision, $tag, $public_key, $exempt, $open_platforms, $inventory, $executables, $rehearsal_keys}' \
+            > candidate/candidate-manifest.json
+          jq '{run_id, source_revision, open_platforms, inventory}' candidate/candidate-manifest.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-${{ github.run_attempt }}
+          path: candidate/
           if-no-files-found: error
 
   publish:
     name: Verify draft and publish release
-    needs: [gate, verify, build]
+    needs: [gate, verify, preflight, build]
+    if: github.event_name == 'push' && needs.preflight.outputs.open_platforms == '{}'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - name: Require the declared compatible core floor
-        env:
-          # The oldest core this release runs against: the subc-core version
-          # that installs the message bus with Core. Committed here rather than
-          # kept as a repository variable, so the floor is reviewed and
-          # versioned with the code it describes.
-          REQUIRES_CORE: "0.24.8"
-          RELEASE_COMMIT: ${{ needs.verify.outputs.commit }}
-          HOST_VERSION: ${{ needs.verify.outputs.host_version }}
-        shell: bash
-        run: |
-          if [[ ! "$REQUIRES_CORE" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo '::error::REQUIRES_CORE must be the confirmed MAJOR.MINOR.PATCH core floor.'
-            exit 1
-          fi
-          mkdir manifest
-          jq -n --arg floor "$REQUIRES_CORE" --arg module "$RELEASE_COMMIT" --arg host "$HOST_VERSION" \
-            '{requires_core: $floor, binaries: {"ck-cerebellum": {reports: $module}, "ck-cerebellum-native-host": {reports: $host}}}' \
-            > manifest/release-manifest.json
-
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.verify.outputs.commit }}
           path: cerebellum
           persist-credentials: false
+      - name: Require the declared compatible core floor
+        env:
+          RELEASE_COMMIT: ${{ needs.verify.outputs.commit }}
+          HOST_VERSION: ${{ needs.verify.outputs.host_version }}
+        shell: bash
+        run: |
+          mkdir manifest
+          bash cerebellum/scripts/release/verify-assets.sh --release-manifest "$RELEASE_COMMIT" "$HOST_VERSION" "$REQUIRES_CORE" > manifest/release-manifest.json
       - name: Check curated release notes
         shell: bash
         run: |
