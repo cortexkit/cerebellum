@@ -98,7 +98,9 @@ pub fn verify_installed_chrome(image: &OpenedProcessImage) -> Result<(), ImageRe
 
 fn path_matches(image: &OpenedProcessImage, root: &OpenedMachineDirectory, relative: &str) -> bool {
     // Compare exact normalized names, including in case-sensitive directories.
-    image.final_path().as_os_str() == root.final_path().join(relative).as_os_str()
+    measure_image_check("normalized image path comparison", || {
+        image.final_path().as_os_str() == root.final_path().join(relative).as_os_str()
+    })
 }
 
 fn verify_cmd_signer(image: &OpenedProcessImage) -> Result<(), ImageRefusal> {
@@ -145,15 +147,17 @@ fn require_product(products: Option<Vec<String>>, expected: &str) -> Result<(), 
 }
 
 fn require_signature(reading: SignatureReading) -> Result<(), ImageRefusal> {
-    if !trust_status_ok(reading.status, reading.chain_errors) {
-        return Err(ImageRefusal::Trust {
-            status: reading.status,
-            chain_errors: reading.chain_errors,
-        });
-    }
-    // A missing observation refuses; neither predicate pins the thumbprint.
-    reading.root_thumbprint?;
-    Ok(())
+    measure_image_check("signature and chain status policy", || {
+        if !trust_status_ok(reading.status, reading.chain_errors) {
+            return Err(ImageRefusal::Trust {
+                status: reading.status,
+                chain_errors: reading.chain_errors,
+            });
+        }
+        // Both cmd and Chrome require a readable root thumbprint, but neither pins its value.
+        reading.root_thumbprint?;
+        Ok(())
+    })
 }
 
 fn trust_status_ok(status: i32, chain_errors: u32) -> bool {

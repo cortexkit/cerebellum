@@ -109,7 +109,9 @@ impl VerifiedHost {
         attestation: &HostParentAttestation,
         key: &VerifyingKey,
     ) -> io::Result<()> {
-        let evidence = attest_chain(&self.0, key)?;
+        let evidence = measure_image_check("native parent launch-chain walk", || {
+            attest_chain(&self.0, key)
+        })?;
         require_matching_parent(attestation, evidence.attestation())?;
         evidence.check_before_connect()?;
         self.0.require_live()
@@ -153,11 +155,13 @@ impl ParentEvidence {
 
 pub fn attest_parent(key: &VerifyingKey) -> io::Result<ParentEvidence> {
     let host = measure_image_check("host process open", || Process::open(std::process::id()))?;
-    attest_chain(&host, key)
+    measure_image_check("native parent launch-chain walk", || {
+        attest_chain(&host, key)
+    })
 }
 
 fn attest_chain(host: &Process, _key: &VerifyingKey) -> io::Result<ParentEvidence> {
-    let launcher = measure_image_check("cmd process open", || host.parent())?;
+    let launcher = measure_image_check("host to cmd", || host.parent())?;
     let launcher_image = measure_image_check("cmd image open", || launcher.open_image())?;
     #[cfg(feature = "bridge-test-identities")]
     let launcher_image = if peer_trailer::is_test_peer_key(_key) {
@@ -175,10 +179,14 @@ fn attest_chain(host: &Process, _key: &VerifyingKey) -> io::Result<ParentEvidenc
     } else {
         launcher_image
     };
-    verify_system_cmd(&launcher_image).map_err(io::Error::other)?;
-    let chrome = measure_image_check("Chrome process open", || launcher.parent())?;
+    measure_image_check("cmd verification", || verify_system_cmd(&launcher_image))
+        .map_err(io::Error::other)?;
+    let chrome = measure_image_check("cmd to Chrome", || launcher.parent())?;
     let chrome_image = measure_image_check("Chrome image open", || chrome.open_image())?;
-    verify_installed_chrome(&chrome_image).map_err(io::Error::other)?;
+    measure_image_check("Chrome verification", || {
+        verify_installed_chrome(&chrome_image)
+    })
+    .map_err(io::Error::other)?;
     let attestation = PlatformParentAttestation::Windows {
         v: AttestationV1,
         chrome: chrome.generation,
@@ -215,12 +223,14 @@ impl Process {
     fn open(pid: u32) -> io::Result<Self> {
         Self::observe(
             pid,
-            retain_process_handle_for_image(pid).map_err(handle_error)?,
+            measure_image_check("OpenProcess", || retain_process_handle_for_image(pid))
+                .map_err(handle_error)?,
         )
     }
 
     fn observe(pid: u32, handle: RetainedProcessHandle) -> io::Result<Self> {
-        let creation_100ns = match handle.creation_time() {
+        let creation_100ns = match measure_image_check("GetProcessTimes", || handle.creation_time())
+        {
             ProcessStartTime::Started(time) => time,
             other => {
                 return Err(io::Error::other(format!(
@@ -238,11 +248,16 @@ impl Process {
     }
 
     fn parent(&self) -> io::Result<Self> {
-        let parent = Self::open(self.handle.parent_pid()?)?;
-        require_earlier(
-            parent.generation.creation_100ns,
-            self.generation.creation_100ns,
-        )?;
+        let pid = measure_image_check("NtQueryInformationProcess (parent PID)", || {
+            self.handle.parent_pid()
+        })?;
+        let parent = Self::open(pid)?;
+        measure_image_check("parent generation comparison", || {
+            require_earlier(
+                parent.generation.creation_100ns,
+                self.generation.creation_100ns,
+            )
+        })?;
         Ok(parent)
     }
 

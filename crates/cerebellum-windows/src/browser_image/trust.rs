@@ -51,21 +51,33 @@ pub fn read_catalog_signer(
     let mut hash = [0; 32]; // SHA-256, selected by the admin context.
     let mut bytes = hash.len() as u32;
     let file = image.file.as_raw_handle();
-    measure_image_check("cmd catalog signature hash", || {
-        // SAFETY: the context and file handle remain live; the hash buffer is writable.
-        let ok = unsafe {
-            CryptCATAdminCalcHashFromFileHandle2(admin.0, file, &mut bytes, hash.as_mut_ptr(), 0)
-        };
-        if ok == 0 {
-            return Err(ImageReadError::CatalogHash(last_error()));
-        }
-        if bytes != hash.len() as u32 {
-            return Err(ImageReadError::CatalogHash(0));
-        }
-        Ok(())
-    })?;
+    measure_image_check(
+        "cmd catalog hash (CryptCATAdminCalcHashFromFileHandle2)",
+        || {
+            // SAFETY: the context and file handle remain live; the hash buffer is writable.
+            let ok = unsafe {
+                CryptCATAdminCalcHashFromFileHandle2(
+                    admin.0,
+                    file,
+                    &mut bytes,
+                    hash.as_mut_ptr(),
+                    0,
+                )
+            };
+            if ok == 0 {
+                return Err(ImageReadError::CatalogHash(last_error()));
+            }
+            if bytes != hash.len() as u32 {
+                return Err(ImageReadError::CatalogHash(0));
+            }
+            Ok(())
+        },
+    )?;
 
-    let catalog = measure_image_check("cmd catalog lookup", || admin.lookup(&hash))?;
+    let catalog = measure_image_check(
+        "cmd catalog lookup (CryptCATAdminEnumCatalogFromHash)",
+        || admin.lookup(&hash),
+    )?;
     let mut info = CATALOG_INFO {
         cbStruct: size_of::<CATALOG_INFO>() as u32,
         ..Default::default()
@@ -129,7 +141,9 @@ pub fn read_authenticode(
 ) -> Result<AuthenticodeReading, ImageReadError> {
     read_embedded(image, |signature, signer, _| AuthenticodeReading {
         signature,
-        subject: signer_certificate(signer, 0).and_then(read_subject),
+        subject: measure_image_check("embedded signer subject decode", || {
+            signer_certificate(signer, 0).and_then(read_subject)
+        }),
     })
 }
 
@@ -223,8 +237,10 @@ impl CatalogAdmin {
 
 impl Drop for CatalogAdmin {
     fn drop(&mut self) {
-        // SAFETY: this is the successful acquisition's only owner.
-        unsafe { CryptCATAdminReleaseContext(self.0, 0) };
+        measure_image_check("cmd catalog admin release", || {
+            // SAFETY: this is the successful acquisition's only owner.
+            unsafe { CryptCATAdminReleaseContext(self.0, 0) };
+        });
     }
 }
 
@@ -235,8 +251,10 @@ struct CatalogMatch<'a> {
 
 impl Drop for CatalogMatch<'_> {
     fn drop(&mut self) {
-        // SAFETY: context belongs to the retained admin and is released once.
-        unsafe { CryptCATAdminReleaseCatalogContext(self.admin.0, self.context, 0) };
+        measure_image_check("cmd catalog match release", || {
+            // SAFETY: context belongs to the retained admin and is released once.
+            unsafe { CryptCATAdminReleaseCatalogContext(self.admin.0, self.context, 0) };
+        });
     }
 }
 

@@ -1,8 +1,8 @@
 use super::*;
 use cerebellum_bridge_protocol::{windows, HostParentAttestation, PlatformParentAttestation};
 use cerebellum_windows::{
-    create_test_pipe_instance_default_security, open_named_pipe_client, system_time_100ns,
-    trace_image_checks, ImageCheckTrace, OverlappedPipe,
+    create_test_pipe_instance_default_security, measure_image_check, open_named_pipe_client,
+    system_time_100ns, trace_image_checks, ImageCheckTrace, OverlappedPipe,
 };
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -70,7 +70,7 @@ fn run_probe(root: &Path, name: &OsStr) {
             .as_millis(),
         std::process::id(),
     );
-    let attest = || windows::attest_parent(&parse_public_key(NATIVE_PARENT_KEY).unwrap());
+    let attest = || windows::attest_parent(&native_parent_key());
     let (step1, evidence) = time_parent_check("step 1 parent", attest);
     let evidence = match evidence {
         Ok(evidence) => evidence,
@@ -135,20 +135,51 @@ fn time_parent_check<T>(label: &str, check: impl FnOnce() -> T) -> (Duration, T)
         "{label} timing trace (pid {}): {elapsed:?}",
         std::process::id()
     );
+    let mut accounted = Duration::ZERO;
     for item in trace {
         match item {
-            ImageCheckTrace::Phase(name, duration) => println!("  {name}: {duration:?}"),
+            ImageCheckTrace::Phase {
+                name,
+                depth,
+                elapsed,
+                children_elapsed,
+            } => {
+                if depth == 0 {
+                    accounted += elapsed;
+                }
+                let indent = 2 * (depth + 1);
+                if children_elapsed.is_zero() {
+                    println!("{:indent$}{name}: {elapsed:?}", "");
+                } else {
+                    let own = elapsed.saturating_sub(children_elapsed);
+                    println!(
+                        "{:indent$}{name}: {elapsed:?} ({own:?} outside nested phases)",
+                        ""
+                    );
+                }
+            }
             ImageCheckTrace::TrustStatus {
+                depth,
                 status,
                 chain_errors,
             } => {
                 println!(
-                    "  WinVerifyTrust status: {status:#010x}, chain errors: {chain_errors:#010x}"
+                    "{:indent$}WinVerifyTrust status: {status:#010x}, chain errors: {chain_errors:#010x}",
+                    "",
+                    indent = 2 * (depth + 1),
                 );
             }
         }
     }
+    let outside = elapsed.saturating_sub(accounted);
+    println!("  accounted by top-level phases: {accounted:?}; outside phases: {outside:?}");
     (elapsed, result)
+}
+
+fn native_parent_key() -> windows::VerifyingKey {
+    measure_image_check("fixture public key parse", || {
+        parse_public_key(NATIVE_PARENT_KEY).unwrap()
+    })
 }
 
 fn run_server(root: &Path, name: &OsStr) {
@@ -173,7 +204,7 @@ fn run_server(root: &Path, name: &OsStr) {
     let attestation = serde_json::from_slice(&read_packet(&pipe)).unwrap();
     let (parent, refusal) = time_parent_check("step 3 parent separate-process recheck", || {
         signed_probe
-            .recheck_parent(&attestation, &parse_public_key(NATIVE_PARENT_KEY).unwrap())
+            .recheck_parent(&attestation, &native_parent_key())
             .err()
             .map(|error| error.to_string())
     });
