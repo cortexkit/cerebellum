@@ -148,8 +148,65 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Native Rust workspace tests
         run: cargo test --locked --workspace --no-fail-fast
-      - name: Native Windows browser image predicates
-        if: ${{ !cancelled() && matrix.runner == 'windows-latest' }}
-        timeout-minutes: 8
+
+  real-browser:
+    name: Real browser predicates (${{ matrix.image }})
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: Ubuntu Chrome Stable
+            runner: ubuntu-24.04
+          - image: Debian Chromium
+            runner: ubuntu-24.04
+            container: debian:bookworm
+          - image: Windows Chrome Stable
+            runner: windows-latest
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY: d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+      CEREBELLUM_LINUX_USER_BROWSER_REVIEW_REVISION: ci-unreviewed
+      CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION: ci-unreviewed
+    steps:
+      - name: Install Debian Chromium and build tools
+        if: ${{ matrix.container != '' }}
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates chromium curl gcc git libc6-dev pkg-config python3
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Ubuntu browser packages
+        if: ${{ runner.os == 'Linux' && matrix.container == '' }}
+        shell: bash
+        run: |
+          chrome_deb="$RUNNER_TEMP/google-chrome-stable.deb"
+          curl --fail --location --retry 3 -o "$chrome_deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get update
+          sudo apt-get install -y "$chrome_deb" chromium-browser
+      - name: Linux release image predicates
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: bash crates/cerebellum-native-host/tests/real_browser_ci/linux.sh
+      - name: Linux signed release process boundaries
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        shell: bash
+        run: bash crates/cerebellum-native-host/tests/real_browser_ci/release-linux.sh
+      - name: Windows signer isolation and revocation predicates
+        if: ${{ runner.os == 'Windows' }}
         shell: pwsh
         run: ./crates/cerebellum-windows/tests/windows-image-predicates.ps1
+      - name: Windows release image predicates
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        shell: pwsh
+        run: ./crates/cerebellum-native-host/tests/real_browser_ci/windows.ps1
+      - name: Windows signed release process boundaries
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        shell: pwsh
+        run: ./crates/cerebellum-native-host/tests/real_browser_ci/windows.ps1 -ReleaseTests
