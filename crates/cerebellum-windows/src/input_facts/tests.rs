@@ -6,6 +6,9 @@ use windows_sys::Win32::{
     Foundation::POINT, System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*,
 };
 
+#[path = "mouse_probe_measurement.rs"]
+mod mouse_probe_measurement;
+
 static UNASSIGNED_UP: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn receiver(hwnd: HWND, message: u32, key: WPARAM, data: LPARAM) -> LRESULT {

@@ -178,6 +178,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Native Rust workspace tests
         run: ./scripts/windows-cargo-test.ps1 -CargoArgs @('--locked', '--workspace', '--no-fail-fast')
+      - name: Measure native mouse hook probes
+        if: ${{ !cancelled() && runner.environment == 'github-hosted' }}
+        timeout-minutes: 20
+        run: cargo test --locked -p cerebellum-windows --lib input_facts::tests::mouse_probe_measurement::github_hosted_mouse_hook_probe_measurement -- --ignored --exact --nocapture
 
   real-browser:
     name: Real browser predicates (${{ matrix.image }})
