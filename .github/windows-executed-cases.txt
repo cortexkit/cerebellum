@@ -13,3 +13,5 @@ bound own_replies_are_byte_identical_to_the_pre_user_build
 bound browser_advertisement_depends_on_the_build_not_configuration
 bound windows_withheld::tests::windows_browser_bound_refuses_user_before_the_bridge
 bound windows_withheld::tests::windows_browser_bound_withheld_table_never_dispatches
+bound identity::tests::windows_chrome_handle_has_exact_access
+bound identity::tests::windows_installed_chrome_chain
