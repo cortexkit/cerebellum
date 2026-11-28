@@ -10,6 +10,11 @@ pub mod capture_custody;
 pub mod cursor;
 mod cursor_timeline;
 pub mod dispatch;
+#[cfg(not(feature = "test-support"))]
+mod fronting_clock;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod fronting_clock;
 pub mod grounding;
 pub mod platform;
 pub mod preview_layout;

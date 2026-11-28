@@ -14,6 +14,14 @@ use crate::{
     RequestCancellationGuard,
 };
 
+#[cfg(test)]
+pub(crate) use cerebellum_computer::fronting_clock::now as fronting_now;
+
+#[cfg(not(test))]
+pub(crate) fn fronting_now() -> std::time::Instant {
+    std::time::Instant::now()
+}
+
 /// When each fronting lock still held for a held-key release that had not
 /// settled by its call's reply began to be held that way, in wall-clock
 /// milliseconds. Such a lock is the one fronting lock with no time bound
@@ -573,7 +581,7 @@ impl RestoreCell {
     /// with the host that carries the previous application's identity as it was
     /// bound before the front.
     pub fn decide(&self) -> RestoreDecided {
-        self.decide_entered(std::time::Instant::now())
+        self.decide_entered(fronting_now())
     }
 
     pub(crate) fn decide_entered(&self, entered: std::time::Instant) -> RestoreDecided {
@@ -601,7 +609,7 @@ impl RestoreCell {
             Ok(claim) => claim,
             Err(decided) => return decided,
         };
-        let started = std::time::Instant::now();
+        let started = fronting_now();
         let deadline = self.gate.deadline();
         let native_overrun = self.gate.native_overrun_until();
         if !timed && deadline.is_some() {
@@ -1096,10 +1104,10 @@ impl crate::computer::dispatch::FrontingBracketHost for RestoreDecisionHost<'_> 
         }
     }
     fn frontmost_pid(&mut self) -> Option<u32> {
-        let started = std::time::Instant::now();
+        let started = fronting_now();
         let frontmost = self.host.frontmost_pid();
         if let Some(guard) = &mut self.write_deadline {
-            guard.os_read(started, std::time::Instant::now());
+            guard.os_read(started, fronting_now());
         }
         #[cfg(all(feature = "desk-probe", target_os = "macos"))]
         self.probe_timing.frontmost_observed(frontmost);
@@ -3078,7 +3086,7 @@ mod restore_slot_tests {
         fn request_front(&mut self, pid: u32) -> bool {
             let mut screen = self.0.lock().unwrap();
             screen.requests.push(pid);
-            screen.requested_at.push(std::time::Instant::now());
+            screen.requested_at.push(fronting_now());
             screen.log.push("restore");
             if screen.comes_forward {
                 screen.frontmost = Some(pid);
@@ -3195,7 +3203,7 @@ mod restore_slot_tests {
         cell.front_attempt_returned();
         // Bound once the front was requested, so even a reserve already
         // started has a front to restore.
-        let now = std::time::Instant::now();
+        let now = fronting_now();
         let deadline = now + deadline_in;
         gate.set_bound(now + reserve_in, deadline);
         (cell, gate, deadline)
@@ -3422,40 +3430,44 @@ mod restore_slot_tests {
 
     #[test]
     fn a_release_settling_at_150_of_200_ms_is_restored_by_the_owner_inside_the_deadline() {
+        use cerebellum_computer::fronting_clock::{advance, FakeClock};
+
         let shared = screen(true);
         let releases = Arc::new(AtomicUsize::new(0));
         let terminal = TerminalArbiter::new(request());
-        let started = std::time::Instant::now();
-        let (cell, gate, deadline) = bounded_cell(
-            &terminal,
-            &shared,
-            &releases,
-            Duration::from_millis(150),
-            Duration::from_millis(200),
-        );
-        cell.front_confirmed();
-        assert!(
-            gate.begin_post(true),
-            "a press whose release has not settled"
-        );
-        std::thread::sleep(Duration::from_millis(150).saturating_sub(started.elapsed()));
-        let released = std::time::Instant::now();
-        let samples = restore_preparation::samples_recorded_on_this_thread();
-        let decided = cell.decide_after_release(true, released, std::time::Instant::now());
-        let screen = shared.lock().unwrap();
-        assert_eq!(screen.requests, [PREVIOUS], "the owner restored at once");
-        assert!(screen.requested_at[0] >= released, "never under the hold");
-        assert!(
-            screen.requested_at[0] <= deadline,
-            "the release settled in time, so the restore is still bound by the deadline"
-        );
-        assert_eq!(decided.restore, RestoreStatus::Restored);
-        assert!(
-            restore_preparation::samples_recorded_on_this_thread() > samples,
-            "the write ran under the original write deadline and trained the reserve"
-        );
-        assert!(!gate.input_held());
-        assert_eq!(releases.load(SeqCst), 1);
+        FakeClock::frozen().run(|| {
+            let (cell, gate, deadline) = bounded_cell(
+                &terminal,
+                &shared,
+                &releases,
+                Duration::from_millis(150),
+                Duration::from_millis(200),
+            );
+            cell.front_confirmed();
+            assert!(
+                gate.begin_post(true),
+                "a press whose release has not settled"
+            );
+            // Settle exactly at the reserve start, with 50 ms left to restore.
+            assert!(advance(Duration::from_millis(150)));
+            let released = fronting_now();
+            let samples = restore_preparation::samples_recorded_on_this_thread();
+            let decided = cell.decide_after_release(true, released, released);
+            let screen = shared.lock().unwrap();
+            assert_eq!(screen.requests, [PREVIOUS], "the owner restored at once");
+            assert!(screen.requested_at[0] >= released, "never under the hold");
+            assert!(
+                screen.requested_at[0] <= deadline,
+                "the release settled in time, so the restore is still bound by the deadline"
+            );
+            assert_eq!(decided.restore, RestoreStatus::Restored);
+            assert!(
+                restore_preparation::samples_recorded_on_this_thread() > samples,
+                "the write ran under the original write deadline and trained the reserve"
+            );
+            assert!(!gate.input_held());
+            assert_eq!(releases.load(SeqCst), 1);
+        });
     }
 
     #[test]

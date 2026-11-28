@@ -847,7 +847,7 @@ pub(crate) fn run_fronting_bracket_with_predictor<'a, H: FrontingBracketHost>(
                 || (),
             );
             let posted = posted.map(|_| {
-                let started = Instant::now();
+                let started = crate::fronting_clock::now();
                 let posted = host.borrow_mut().post_observed_unit(
                     index,
                     ObservedUnit {
@@ -863,7 +863,7 @@ pub(crate) fn run_fronting_bracket_with_predictor<'a, H: FrontingBracketHost>(
                 // A unit is a run of posts, identity and focus reads, or a
                 // capture: a stall in it is a native one.
                 if let Some(gate) = cutoff.as_deref() {
-                    gate.native_call(started, Instant::now());
+                    gate.native_call(started, crate::fronting_clock::now());
                 }
                 posted
             });

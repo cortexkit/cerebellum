@@ -2322,14 +2322,14 @@ fn background_read(
     })
 }
 
-/// The platform's Reduce Motion reader; the full animation where there is
-/// no setting to read.
+/// The platform's Reduce Motion reader. Tests use the full animation by
+/// default and can supply their own reader instead of touching System Settings.
 fn platform_reduce_motion() -> ReduceMotionReader {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(test)))]
     {
         Arc::new(cerebellum_macos::reduce_motion)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(not(target_os = "macos"), test))]
     {
         Arc::new(|| false)
     }
@@ -4475,8 +4475,26 @@ mod tests {
     /// first appearance again.
     #[tokio::test(start_paused = true)]
     async fn frames_never_restart_the_idle_clock() {
+        for reduce_motion in [false, true] {
+            assert_frames_leave_the_badge_idle(reduce_motion).await;
+        }
+    }
+
+    async fn assert_frames_leave_the_badge_idle(reduce_motion: bool) {
         let pipe = FakePipe::default();
         let cursor = Coordinator::piped_for_test(pipe.deliver());
+        cursor.with_reduce_motion_reader(move || reduce_motion);
+        cursor.refresh_reduce_motion();
+        // Start both motions with a known setting, not the cache's unread
+        // default while the background reader starts.
+        until_read(|| {
+            cursor
+                .0
+                .reduce_motion
+                .value
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+        });
         let idle = Duration::from_millis(IDLE_FADE_AFTER_MS + IDLE_FADE_MS);
         cursor.schedule_preview_motion(preview_motion(AGENT, 77, [0.5, 0.5]), THUMBNAIL);
         let mut elapsed = Duration::ZERO;
@@ -4500,7 +4518,7 @@ mod tests {
                 .collect()
         };
         until_read(|| motions().len() == 2);
-        let entry = PictureMotion::chosen(0.0, true, false);
+        let entry = PictureMotion::chosen(0.0, true, reduce_motion);
         assert_eq!(motions(), [entry, entry]);
     }
 }

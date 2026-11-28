@@ -240,6 +240,17 @@ jobs:
       - name: Test workspace on the native target
         run: cargo test --locked --workspace
 
+      - name: Verify the release dependency graph excludes the fronting test clock
+        shell: bash
+        run: |
+          features=$(cargo tree --locked -p cerebellum --target "$TARGET" \
+            --edges normal,build --invert cerebellum-computer --depth 0 --format 'features=[{f}]')
+          printf 'cerebellum-computer release %s\n' "$features"
+          if [[ "$features" == *test-support* ]]; then
+            echo '::error::cerebellum-computer test-support must not ship in a release'
+            exit 1
+          fi
+
       - name: Prepare the open-platform key and trailer tool
         if: runner.os != 'macOS'
         shell: bash

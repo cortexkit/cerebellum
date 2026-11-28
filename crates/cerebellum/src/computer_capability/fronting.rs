@@ -711,7 +711,9 @@ fn with_restore_budget(
     cell: &RestoreCell,
     decide: impl Fn(&RestoreCell, Instant) -> RestoreDecided + Sync,
 ) -> RestoreDecided {
-    let entered = Instant::now();
+    let entered = crate::terminal_arbiter::fronting_now();
+    #[cfg(test)]
+    let clock = cerebellum_computer::fronting_clock::FakeClock::current();
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -723,7 +725,12 @@ fn with_restore_budget(
                 );
                 #[cfg(not(target_os = "macos"))]
                 let _ = RESTORE_AX_MS;
-                decide(cell, entered)
+                let decide = || decide(cell, entered);
+                #[cfg(test)]
+                if let Some(clock) = &clock {
+                    return clock.run(decide);
+                }
+                decide()
             })
             .join()
             .unwrap_or_else(|_| cell.forgo())

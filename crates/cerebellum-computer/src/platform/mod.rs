@@ -2256,7 +2256,7 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             // The bound is stamped first, as the bracket stamps the start of
             // the bounded interval just before this request: registration
             // can take time, and none of it may move the deadline later.
-            let stamped = std::time::Instant::now();
+            let stamped = crate::fronting_clock::now();
             let deadline = stamped + std::time::Duration::from_millis(self.bound_ms);
             // The restore reserve starts early by the time the restore takes
             // to prepare, so the restore request itself is made by the
@@ -2306,14 +2306,15 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
             if let Some(reserve_start) = reserve_start {
                 self.target_cap = self.inner.cap_target_waits_until(reserve_start);
             }
-            let started = std::time::Instant::now();
+            let started = crate::fronting_clock::now();
             let cutoff = std::sync::Arc::clone(&self.cutoff);
             let hooks = &*self.hooks;
             // The write itself starts only before the reserve does.
             let requested = self.inner.request_front_while(pid, &mut || {
                 hooks.target_front_permitted() && !cutoff.closed()
             });
-            self.cutoff.native_call(started, std::time::Instant::now());
+            self.cutoff
+                .native_call(started, crate::fronting_clock::now());
             // A platform can complete activation before its request returns.
             // Preserve that observation even if input aborts the next poll.
             if requested && self.inner.frontmost_pid() == Some(pid) {
@@ -2338,7 +2339,8 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
         if !self.picture {
             return true;
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(self.bound_ms);
+        let deadline =
+            crate::fronting_clock::now() + std::time::Duration::from_millis(self.bound_ms);
         // Without an absolute deadline nothing would bound the read's hold.
         let bounded = self.hooks.restore_reserve_ms().is_some();
         if bounded {

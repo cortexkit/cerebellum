@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use cerebellum_computer::platform::RestoreWriteCheck;
 
+use super::fronting_now;
+
 /// How many recent preparations count.
 const SAMPLES: usize = 8;
 
@@ -143,13 +145,13 @@ impl WriteDeadline {
     /// request: zero once the reserve has started.
     pub(super) fn wait_left(&self) -> Option<Duration> {
         self.reserve_start
-            .map(|at| at.saturating_duration_since(Instant::now()))
+            .map(|at| at.saturating_duration_since(fronting_now()))
     }
 
     /// The decision stopped waiting: what follows is its preparation.
     pub(super) fn preparation_started(&mut self) {
         if self.boundary_at.is_none() {
-            self.started = Instant::now();
+            self.started = fronting_now();
             self.os_reads = Duration::ZERO;
         }
     }
@@ -160,7 +162,7 @@ impl WriteDeadline {
         if self.boundary_at.is_some() {
             return !self.expired;
         }
-        let now = Instant::now();
+        let now = fronting_now();
         self.boundary_at = Some(now);
         self.reached_write = true;
         if now > self.deadline {
@@ -177,7 +179,7 @@ impl WriteDeadline {
         if self.boundary_at.is_some() {
             return self.expired;
         }
-        let now = Instant::now();
+        let now = fronting_now();
         if now > self.deadline {
             self.boundary_at = Some(now);
             self.expire(now);

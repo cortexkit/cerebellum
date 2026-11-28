@@ -6,9 +6,10 @@
 
 use super::*;
 use cerebellum_computer::dispatch::BracketPlan;
+use cerebellum_computer::fronting_clock::{now, FakeClock};
 use std::time::Instant;
 
-/// The bracket's bound, in real milliseconds.
+/// The production bracket bound, in milliseconds.
 const BOUND_MS: u64 = crate::budgets::FRONTING_BRACKET_MS;
 
 fn app_use_hooks() -> (CellHooks, Arc<std::sync::atomic::AtomicUsize>) {
@@ -61,6 +62,15 @@ fn block_past_reserve_start(hooks: &CellHooks) {
     std::thread::sleep(until.saturating_duration_since(Instant::now()) + Duration::from_millis(2));
 }
 
+/// Model a read that returns just into the reserve, leaving the owner time
+/// to request its restore. Charge the read to the fake screen as well, so
+/// its elapsed time would show up if it were included in the restore sample.
+fn finish_read_just_inside_reserve(screen: &Screen, hooks: &CellHooks) {
+    let reserve = hooks.picture_wait_until().expect("bounded read");
+    let wait = reserve.duration_since(now());
+    screen.advance(u64::try_from(wait.as_millis()).unwrap() + 2);
+}
+
 #[test]
 fn a_picture_read_blocked_past_the_reserve_start_is_restored_by_its_owner_exactly_once() {
     let screen = Screen::new(&mail_desk());
@@ -70,17 +80,19 @@ fn a_picture_read_blocked_past_the_reserve_start_is_restored_by_its_owner_exactl
     let blocked = hooks.clone();
     let mut restored_while_reading = None;
     let mut read = || {
-        block_past_reserve_start(&blocked);
+        finish_read_just_inside_reserve(&reader, &blocked);
         restored_while_reading = Some(restores(&reader) > 0);
     };
-    let outcome = cerebellum_computer::platform::run_hooked_fronted(
-        &mut FakeBracket(screen.clone()),
-        &mut UserIdleEstimator::new(),
-        plan(),
-        &|| false,
-        boxed.as_mut(),
-        Some(&mut read),
-    );
+    let outcome = FakeClock::frozen().run(|| {
+        cerebellum_computer::platform::run_hooked_fronted(
+            &mut FakeBracket(screen.clone()),
+            &mut UserIdleEstimator::new(),
+            plan(),
+            &|| false,
+            boxed.as_mut(),
+            Some(&mut read),
+        )
+    });
     assert_eq!(
         restored_while_reading,
         Some(false),
@@ -167,25 +179,33 @@ fn first_restore_after(screen: &Screen, started: Instant) -> Duration {
 #[test]
 fn a_slow_registration_does_not_move_the_cutoff_past_the_bound() {
     let screen = Screen::new(&mail_desk());
-    // Registration takes most of the bound. The reserve counts from the
+    // Registration takes 80 ms of the 200 ms bound. The reserve counts from the
     // stamp made before it, not from when registration returned.
     screen.state().register_blocks_ms = BOUND_MS * 2 / 5;
     let (hooks, _releases) = app_use_hooks();
     let mut boxed = boxed_hooks(&hooks);
     let blocked = hooks.clone();
-    let mut read = || block_past_reserve_start(&blocked);
-    let started = Instant::now();
-    let outcome = cerebellum_computer::platform::run_hooked_fronted(
-        &mut FakeBracket(screen.clone()),
-        &mut UserIdleEstimator::new(),
-        plan(),
-        &|| false,
-        boxed.as_mut(),
-        Some(&mut read),
+    let mut read = || finish_read_just_inside_reserve(&screen, &blocked);
+    let clock = FakeClock::frozen();
+    let started = clock.now();
+    let outcome = clock.run(|| {
+        cerebellum_computer::platform::run_hooked_fronted(
+            &mut FakeBracket(screen.clone()),
+            &mut UserIdleEstimator::new(),
+            plan(),
+            &|| false,
+            boxed.as_mut(),
+            Some(&mut read),
+        )
+    });
+    assert_eq!(
+        hooks.cutoff().and_then(|gate| gate.deadline()),
+        Some(started + Duration::from_millis(BOUND_MS)),
+        "the deadline is stamped before registration"
     );
     let restored_after = first_restore_after(&screen, started);
     assert!(
-        restored_after < Duration::from_millis(BOUND_MS + BOUND_MS / 2),
+        restored_after <= Duration::from_millis(BOUND_MS),
         "the restore was requested {restored_after:?} after the bracket began, past the bound"
     );
     assert!(outcome.report.restore_started_by_cutoff);
@@ -447,21 +467,33 @@ fn a_restore_after_a_long_read_is_sampled_at_its_own_cost_not_the_readers_wait()
     let (hooks, _releases) = app_use_hooks();
     let mut boxed = boxed_hooks(&hooks);
     let blocked = hooks.clone();
-    let mut read = || block_past_reserve_start(&blocked);
-    let outcome = cerebellum_computer::platform::run_hooked_fronted(
-        &mut FakeBracket(screen.clone()),
-        &mut UserIdleEstimator::new(),
-        plan(),
-        &|| false,
-        boxed.as_mut(),
-        Some(&mut read),
-    );
+    let mut read_returned_at = None;
+    let mut read = || {
+        finish_read_just_inside_reserve(&screen, &blocked);
+        read_returned_at = Some(now());
+    };
+    let clock = FakeClock::frozen();
+    let outcome = clock.run(|| {
+        cerebellum_computer::platform::run_hooked_fronted(
+            &mut FakeBracket(screen.clone()),
+            &mut UserIdleEstimator::new(),
+            plan(),
+            &|| false,
+            boxed.as_mut(),
+            Some(&mut read),
+        )
+    });
     assert!(outcome.report.restore_started_by_cutoff);
     assert_eq!(outcome.report.restore, RestoreStatus::Restored);
     let sampled = screen.state().measured_restore_ms;
     assert!(
         sampled >= Some(cerebellum_computer::dispatch::RESTORE_FALLBACK_AFTER_MS),
         "the restore took at least the fallback delay, but was sampled at {sampled:?}"
+    );
+    assert_eq!(
+        sampled.map(Duration::from_millis),
+        Some(clock.now() - read_returned_at.expect("the picture read returned")),
+        "the sample starts after the read's wait"
     );
 }
 
