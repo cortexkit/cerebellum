@@ -12,6 +12,16 @@ pub struct FileIdentity {
     file_id: [u8; 16],
 }
 
+impl FileIdentity {
+    pub fn volume_serial_number(&self) -> u64 {
+        self.volume_serial_number
+    }
+
+    pub fn file_id(&self) -> [u8; 16] {
+        self.file_id
+    }
+}
+
 /// Read the kernel's identity for an open file or directory, without walking a path.
 pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
     let mut info = MaybeUninit::<FILE_ID_INFO>::uninit();

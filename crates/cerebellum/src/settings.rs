@@ -64,6 +64,27 @@ fn schema_declaration() -> Value {
     use ApplyKind::{Live, ModuleRestart};
     let mut app_use = field("string", "How the agent uses apps", "Whether the agent works in apps from the background or brings them to the front. Bringing apps to the front needs your confirmation on this computer.", json!("background"), Live);
     app_use["enum"] = json!(AppUse::ALLOWED);
+    #[cfg(not(all(windows, feature = "windows-browser-release")))]
+    let (executable_path, expected_identity) = (
+        field("string", "Browser program", "Full path to the browser program the agent uses. Leave empty to turn the agent browser off; a path also needs the expected identity.", json!(""), ModuleRestart),
+        field("string", "Expected browser identity", "The signature the browser program must carry before the agent starts it. Leave empty when no browser program is set.", json!(""), ModuleRestart),
+    );
+    #[cfg(all(windows, feature = "windows-browser-release"))]
+    let (executable_path, expected_identity) = {
+        let publisher = browser_config::CHROME_PUBLISHER;
+        let mut identity = field(
+            "string",
+            "Browser publisher",
+            "The publisher that must sign the browser program before the agent starts it.",
+            json!(publisher),
+            ModuleRestart,
+        );
+        identity["enum"] = json!([publisher]);
+        (
+            field("string", "Browser program", "Full path to the browser program the agent uses. Omit it to search the standard install locations.", json!(""), ModuleRestart),
+            group("Expected browser identity", json!({"windows_publisher": identity})),
+        )
+    };
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "Browser and desktop control",
@@ -78,8 +99,8 @@ fn schema_declaration() -> Value {
                 "app_use": app_use
             })),
             "browser": group("Agent browser", json!({
-                "executable_path": field("string", "Browser program", "Full path to the browser program the agent uses. Leave empty to turn the agent browser off; a path also needs the expected identity.", json!(""), ModuleRestart),
-                "expected_identity": field("string", "Expected browser identity", "The signature the browser program must carry before the agent starts it. Leave empty when no browser program is set.", json!(""), ModuleRestart),
+                "executable_path": executable_path,
+                "expected_identity": expected_identity,
                 "launch_handshake_deadline_ms": integer("Browser start time limit", "Milliseconds the browser may take to start, including the system's first check of its signature.", 10_000, 1, MAX_LAUNCH_DEADLINE_MS),
                 "termination_grace_period_ms": integer("Browser close time limit", "Milliseconds the browser gets to close by itself. A shorter time can force it closed before it saves its profile.", 5_000, 1, MAX_TERMINATION_DEADLINE_MS),
                 "browser_idle_timeout_ms": integer("Close an unused browser after", "Milliseconds without agent activity before the agent browser closes.", 600_000, 1, MAX_STALE_OR_IDLE_MS),
@@ -296,12 +317,7 @@ impl StartupSettings {
         }
         let browser = browser_config::parse_browser_config_value(&value)
             .map_err(|error| error.to_string())?;
-        let browser = match browser {
-            Some(browser) if browser.executable_path.is_some() => {
-                BrowserSurface::Available(browser)
-            }
-            _ => BrowserSurface::NotConfigured,
-        };
+        let browser = browser_surface(view, browser);
         Ok(Self {
             health: core.health,
             agent_cursor: core.computer_use.agent_cursor,
@@ -332,6 +348,25 @@ impl StartupSettings {
             }
         }
         applied
+    }
+}
+
+fn browser_surface(
+    view: &ConfigView,
+    browser: Option<browser_config::BrowserConfig>,
+) -> BrowserSurface {
+    let available = |browser: &browser_config::BrowserConfig| {
+        if browser_config::WINDOWS_DISCOVERS_CHROME {
+            view.sources.iter().any(|(path, layer)| {
+                *layer != Layer::Default && (path == "/browser" || path.starts_with("/browser/"))
+            })
+        } else {
+            browser.executable_path.is_some()
+        }
+    };
+    match browser {
+        Some(browser) if available(&browser) => BrowserSurface::Available(browser),
+        _ => BrowserSurface::NotConfigured,
     }
 }
 

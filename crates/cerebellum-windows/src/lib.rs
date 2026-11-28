@@ -28,6 +28,8 @@ mod file_identity;
 #[cfg(windows)]
 mod foreground_events;
 #[cfg(windows)]
+pub mod identity;
+#[cfg(windows)]
 mod image_file_facts;
 #[cfg(windows)]
 mod launch_facts;

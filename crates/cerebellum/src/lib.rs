@@ -41,6 +41,10 @@ pub mod browser_launch;
 pub mod browser_launch_readiness;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod browser_launch_service;
+#[cfg(all(windows, feature = "windows-browser-release"))]
+pub mod windows_launch {
+    pub mod discovery;
+}
 mod browser_queue;
 pub mod browser_session;
 pub mod browser_signed_in;

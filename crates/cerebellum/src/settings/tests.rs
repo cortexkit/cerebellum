@@ -113,9 +113,14 @@ fn absolute_path() -> &'static str {
 
 #[test]
 fn review_reports_every_changed_field_and_source() {
+    let identity = if browser_config::WINDOWS_DISCOVERS_CHROME {
+        json!({"windows_publisher":"Google LLC"})
+    } else {
+        json!("fixture")
+    };
     let value = json!({"health":{"dispatch_heartbeat_stale_ms": 12,"queue_age_stale_ms": 24},
         "computer_use":{"agent_cursor":false,"app_use":"foreground"},
-        "browser":{"executable_path": absolute_path(), "expected_identity":"fixture",
+        "browser":{"executable_path": absolute_path(), "expected_identity":identity,
             "launch_handshake_deadline_ms": 1234, "termination_grace_period_ms": 2345,
             "browser_idle_timeout_ms": 3456, "browser_exit_observation_deadline_ms": 4567,
             "navigation_settle_deadline_ms": crate::browser::QUIET_MS + 1}});
@@ -218,8 +223,12 @@ fn review_refuses_invalid_values_with_legacy_reasons() {
         &json!({"browser":{"executable_path":absolute_path()}}).to_string(),
         None,
     );
-    assert_eq!(reply.refusals[0].paths, [PATH, IDENTITY]);
-    assert_eq!(reply.refusals[0].reasons, ["expected_identity_required"]);
+    if browser_config::WINDOWS_DISCOVERS_CHROME {
+        assert!(reply.refusals.is_empty());
+    } else {
+        assert_eq!(reply.refusals[0].paths, [PATH, IDENTITY]);
+        assert_eq!(reply.refusals[0].reasons, ["expected_identity_required"]);
+    }
 }
 
 #[test]
@@ -269,6 +278,7 @@ fn effective_app_use_tracks_delivery_status() {
     }
 }
 
+#[cfg(not(all(windows, feature = "windows-browser-release")))]
 #[test]
 fn invalid_browser_pairing_refuses_the_whole_unstamped_view() {
     let mut view = defaults(ConfigStatus::Unstamped);
@@ -278,4 +288,53 @@ fn invalid_browser_pairing_refuses_the_whole_unstamped_view() {
     assert!(config_apply(&view)
         .unwrap_err()
         .contains("required when browser.executable_path is set"));
+}
+
+#[cfg(all(windows, feature = "windows-browser-release"))]
+#[test]
+fn windows_bound_browser_settings_require_table_and_nondefault_source_for_discovery() {
+    let review = |browser: Value| review_text(&json!({"browser": browser}).to_string(), None);
+    for invalid in [
+        json!("Google LLC"),
+        json!({}),
+        json!({"windows_publisher": "Other"}),
+        json!({"windows_publisher": 1}),
+        json!({"windows_publisher":"Google LLC", "extra":true}),
+    ] {
+        let reply = review(json!({"expected_identity": invalid}));
+        assert_eq!(reply.refusals[0].code, "value_invalid", "{invalid}");
+    }
+
+    let publisher = json!({"expected_identity": {"windows_publisher":"Google LLC"}});
+    assert!(review(publisher.clone()).refusals.is_empty());
+    let base = defaults(ConfigStatus::Active);
+    assert!(matches!(
+        StartupSettings::from_view(&base).unwrap().browser,
+        BrowserSurface::NotConfigured
+    ));
+    let mut legacy = defaults(ConfigStatus::Active);
+    legacy.effective["browser"]["expected_identity"] = json!("Google LLC");
+    assert!(StartupSettings::from_view(&legacy).is_err());
+    for browser in [publisher, json!({"launch_handshake_deadline_ms": 10_000})] {
+        let tuple = SCHEMA
+            .1
+            .review_tuple(
+                &[LayerValue::new(Layer::User, json!({"browser": browser}))],
+                &ValidationContext::new("cerebellum", None),
+            )
+            .unwrap();
+        let view = ConfigView::new(
+            0,
+            tuple.effective,
+            tuple.sources,
+            vec![],
+            ConfigStatus::Active,
+        );
+        let BrowserSurface::Available(config) = StartupSettings::from_view(&view).unwrap().browser
+        else {
+            panic!("operator browser setting must enable discovery");
+        };
+        assert_eq!(config.executable_path, None);
+        assert_eq!(config.expected_identity.as_deref(), Some("Google LLC"));
+    }
 }
