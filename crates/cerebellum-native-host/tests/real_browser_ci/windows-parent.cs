@@ -29,8 +29,6 @@ internal static class ParentFixture {
 
     [DllImport("kernel32", SetLastError = true)]
     private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
-    [DllImport("kernel32")]
-    private static extern uint GetCurrentProcessId();
     [DllImport("kernel32", SetLastError = true)]
     private static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size);
     [DllImport("kernel32", SetLastError = true)]
@@ -65,14 +63,6 @@ internal static class ParentFixture {
         const int StartfUseShowWindow = 0x00000001;
         const short SwHide = 0;
         var suspend = args[0] == "suspend";
-        var mode = !suspend && args.Length > 2 ? args[2] : "chrome-parent";
-        bool useParent = !suspend && mode != "no-parent";
-        bool useDesktop = mode == "chrome-desktop" || mode == "chrome-desktop-new-console";
-        bool useNewConsole = mode == "chrome-new-console" || mode == "chrome-desktop-new-console";
-        if (mode != "chrome-parent" && mode != "no-parent" && mode != "self-parent" && !useDesktop && !useNewConsole) {
-            Console.Error.WriteLine("Unknown launch mode: {0}", mode);
-            return 1;
-        }
         var image = args[1];
         var line = "\"" + image + "\"";
         if (!suspend) {
@@ -93,9 +83,9 @@ internal static class ParentFixture {
         uint flags = suspend ? CreateSuspended : 0u;
         try {
             startup.startup.cb = Marshal.SizeOf(typeof(StartupInfo));
-            if (useParent) {
-                var pid = mode == "self-parent" ? GetCurrentProcessId() : UInt32.Parse(args[0]);
-                Console.Error.WriteLine("{0}: synthetic parent PID {1}", mode, pid);
+            if (!suspend) {
+                var pid = UInt32.Parse(args[0]);
+                Console.Error.WriteLine("Synthetic Chrome parent PID: {0}", pid);
                 parent = OpenProcess(ProcessCreateProcess, false, pid);
                 Require(parent != IntPtr.Zero);
                 var size = IntPtr.Zero;
@@ -107,18 +97,21 @@ internal static class ParentFixture {
                     ref parent, new IntPtr(IntPtr.Size), IntPtr.Zero, IntPtr.Zero));
                 startup.startup.cb = Marshal.SizeOf(typeof(StartupInfoEx));
                 startup.attributes = list;
-                flags |= ExtendedStartupInfoPresent;
-            }
-            if (useDesktop) startup.startup.desktop = Marshal.StringToHGlobalUni(@"winsta0\default");
-            if (useNewConsole) flags |= CreateNewConsole;
-            if (!suspend) {
+                // Windows creates a console for a console child of a GUI process with no console.
+                // Request it explicitly here because the launcher is a console process and Chrome is only the attributed parent.
+                // https://learn.microsoft.com/en-us/windows/console/creation-of-a-console
+                // In https://github.com/cortexkit/cerebellum/actions/runs/46101578642/job/140845058992,
+                // no-parent and self-parent exited 0. Chrome parent exited 0xc0000142 with or without
+                // an explicit desktop; both Chrome-parent cases exited 0 with a new console.
+                flags |= ExtendedStartupInfoPresent | CreateNewConsole;
+
                 // Chrome sets start_hidden for cmd and direct console hosts, which
                 // sets STARTF_USESHOWWINDOW with SW_HIDE, not CREATE_NO_WINDOW.
                 // https://github.com/chromium/chromium/blob/main/chrome/browser/extensions/api/messaging/launch_context_win.cc#L260-L285
                 // https://github.com/chromium/chromium/blob/main/base/process/launch_win.cc#L360-L386
                 startup.startup.flags = StartfUseShowWindow;
                 startup.startup.show = SwHide;
-                Console.Error.WriteLine("{0}: CreateProcessW command line: {1}", mode, line);
+                Console.Error.WriteLine("CreateProcessW command line: {0}", line);
             }
             Require(CreateProcessW(image, new StringBuilder(line), IntPtr.Zero, IntPtr.Zero, false,
                 flags, IntPtr.Zero, IntPtr.Zero, ref startup, out process));
@@ -127,7 +120,7 @@ internal static class ParentFixture {
                 Console.ReadLine();
                 return 0;
             }
-            // Return in time for the Rust harness to collect the result and try the next mode.
+            // Report a hung probe before the Rust harness times out waiting for the launcher.
             uint waited = WaitForSingleObject(process.process, 10000);
             if (waited == WaitTimeout) {
                 Console.Error.WriteLine("Child PID {0} did not exit within 10 seconds", process.pid);
@@ -154,7 +147,6 @@ internal static class ParentFixture {
             if (initialized) DeleteProcThreadAttributeList(list);
             if (list != IntPtr.Zero) Marshal.FreeHGlobal(list);
             if (parent != IntPtr.Zero) CloseHandle(parent);
-            if (startup.startup.desktop != IntPtr.Zero) Marshal.FreeHGlobal(startup.startup.desktop);
         }
     }
 }

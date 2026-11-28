@@ -373,48 +373,16 @@ fn cmd_launch_preserves_quoted_probe_path_and_redirection() {
     let cmd = env_path("CK_IMAGE_TEST_WINDOWS_CMD");
     let probe = scratch.join("probe with spaces.exe");
     fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
-    let probe_stdout = scratch.join("probe-stdout");
-    let probe_stderr = scratch.join("probe-stderr");
-    let results = [
-        "no-parent",
-        "self-parent",
-        "chrome-parent",
-        "chrome-desktop",
-        "chrome-new-console",
-        "chrome-desktop-new-console",
-    ]
-    .map(|mode| {
-        // Reuse the exact command line without carrying output from a prior launch.
-        for output in [&probe_stdout, &probe_stderr] {
-            match fs::remove_file(output) {
-                Ok(()) => (),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-                Err(error) => panic!("cannot clear {output:?}: {error}"),
-            }
-        }
-        println!("cmd parent comparison: {mode}");
-        let status = probe_status(
-            &scratch,
-            probe_command(
-                &scratch,
-                chrome.0 .0.id(),
-                Some(&cmd),
-                &probe,
-                "cmd-roundtrip",
-            )
-            .arg(mode),
-        );
-        let stdout = diagnostic(&probe_stdout);
-        let stderr = diagnostic(&probe_stderr);
-        println!("{mode}: {status}\nprobe stdout: {stdout}\nprobe stderr: {stderr}");
-        (mode, status, stdout, stderr)
-    });
-    // Report all launches before checking the Chrome-parent case.
-    let (_, status, stdout, stderr) = results
-        .into_iter()
-        .find(|(mode, ..)| *mode == "chrome-parent")
-        .unwrap();
-    assert!(status.success(), "Chrome-parent cmd failed: {status}");
+    launch_probe(
+        &scratch,
+        chrome.0 .0.id(),
+        Some(&cmd),
+        &probe,
+        "cmd-roundtrip",
+        &[],
+    );
+    let stdout = diagnostic(&scratch.join("probe-stdout"));
+    let stderr = diagnostic(&scratch.join("probe-stderr"));
     assert!(stdout.contains("fixture probe reached stdout"), "{stdout}");
     assert!(stderr.contains("fixture probe reached stderr"), "{stderr}");
 }
