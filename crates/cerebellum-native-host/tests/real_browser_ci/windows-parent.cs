@@ -58,9 +58,21 @@ internal static class ParentFixture {
         const int ProcThreadAttributeParentProcess = 0x00020000;
         const uint ExtendedStartupInfoPresent = 0x00080000;
         const uint CreateSuspended = 0x00000004;
+        const int StartfUseShowWindow = 0x00000001;
+        const short SwHide = 0;
         var suspend = args[0] == "suspend";
         var image = args[1];
-        var commandLine = new StringBuilder("\"" + image + "\" " + (suspend ? "" : args[2]));
+        var line = "\"" + image + "\"";
+        if (!suspend) {
+            const string tailVariable = "CK_IMAGE_TEST_WINDOWS_CHILD_TAIL";
+            var tail = Environment.GetEnvironmentVariable(tailVariable);
+            if (tail == null) {
+                Console.Error.WriteLine("Missing {0}.", tailVariable);
+                return 1;
+            }
+            Environment.SetEnvironmentVariable(tailVariable, null);
+            line += " " + tail;
+        }
         var startup = new StartupInfoEx();
         var process = new ProcessInfo();
         var parent = IntPtr.Zero;
@@ -81,8 +93,15 @@ internal static class ParentFixture {
                     ref parent, new IntPtr(IntPtr.Size), IntPtr.Zero, IntPtr.Zero));
                 startup.startup.cb = Marshal.SizeOf(typeof(StartupInfoEx));
                 startup.attributes = list;
+                // Chrome sets start_hidden for cmd and direct console hosts, which
+                // sets STARTF_USESHOWWINDOW with SW_HIDE, not CREATE_NO_WINDOW.
+                // https://github.com/chromium/chromium/blob/main/chrome/browser/extensions/api/messaging/launch_context_win.cc#L260-L285
+                // https://github.com/chromium/chromium/blob/main/base/process/launch_win.cc#L360-L386
+                startup.startup.flags = StartfUseShowWindow;
+                startup.startup.show = SwHide;
             }
-            Require(CreateProcessW(image, commandLine, IntPtr.Zero, IntPtr.Zero, false,
+            if (!suspend) Console.Error.WriteLine("CreateProcessW command line: {0}", line);
+            Require(CreateProcessW(image, new StringBuilder(line), IntPtr.Zero, IntPtr.Zero, false,
                 suspend ? CreateSuspended : ExtendedStartupInfoPresent, IntPtr.Zero, IntPtr.Zero,
                 ref startup, out process));
             if (suspend) {
@@ -93,7 +112,8 @@ internal static class ParentFixture {
             Require(WaitForSingleObject(process.process, 20000) == 0);
             uint status;
             Require(GetExitCodeProcess(process.process, out status));
-            return (int)status;
+            Console.Error.WriteLine("Child PID {0} exit code: 0x{1:X8}", process.pid, status);
+            return unchecked((int)status);
         } catch (Win32Exception error) {
             Console.Error.WriteLine("Could not launch or wait for {0}: Win32 error {1}: {2}",
                 image, error.NativeErrorCode, error.Message);
