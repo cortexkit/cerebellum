@@ -170,14 +170,27 @@ fn rig(
     );
     planes.management = Arc::new(crate::management::ManagementPlane::new(resolver));
     let audit = computer_audit(crate::JournalPersistence::Isolated).expect("isolated audit");
+    let (bracket, app_use_fronting, pointer, _) =
+        cerebellum_computer::platform::windows::picture::fronting_flags(
+            &context.inputs,
+            context.startup.windows_elevation,
+        );
     let mut plane = ComputerPlane::with_synthetic_driver_and_result_schema_enforcement(
         audit,
         ResultSchemaEnforcement::Withhold,
         NativeComputerPlatformDriver::default,
     )
     .with_wire_dispatch_for_test()
+    .with_fronting_bracket_admitted(bracket)
+    .with_app_use_fronting_admitted(app_use_fronting)
+    .with_takeover_pointer_fronting_admitted(pointer)
     .with_session_lock_for_test(Some(false));
     let app_state_admitted = app_state_block(context).is_none();
+    plane.windows_background_restore_admitted =
+        cerebellum_computer::platform::windows::fronting::background_restore_admitted(
+            &context.inputs,
+            context.startup.windows_elevation,
+        );
     let launch_admitted = launch::launch_block(context).is_none();
     if let Some(source) = override_source {
         plane = plane
@@ -221,6 +234,27 @@ fn rig(
         Some(&["elicitation".into()]), &subc_protocol::RouteTarget::ToolProvider { module_id: "cerebellum".into() },
     ));
     crate::computer_grants::tests::CardService::install(planes, 9, 3)
+}
+
+fn all_fronting_inputs(context: &mut CapabilityAdvertisementContext) {
+    let review = || Some("fronting-fixture".into());
+    context.inputs.windows_app_launch_review_revision = review();
+    context.inputs.windows_capture_review_revision = review();
+    context.inputs.windows_element_addressed_review_revision = review();
+    context.inputs.windows_fronting_review_revision = review();
+    context.inputs.windows_input_bracket_review_revision = review();
+    context.inputs.windows_takeover_review_revision = review();
+}
+
+fn foreground_without_driver(planes: &mut crate::Planes) {
+    let plane = Arc::get_mut(planes.computer.as_mut().expect("fixture plane"))
+        .expect("fixture owns its computer plane");
+    plane.app_use.apply(crate::settings::LiveSettings {
+        app_use: cerebellum_core::config::AppUse::Foreground,
+        approved: true,
+    });
+    plane.make_synthetic_driver =
+        Arc::new(|| panic!("foreground mode must not construct a driver"));
 }
 
 async fn wire(planes: &crate::Planes, action: &str, arguments: Value) -> Value {

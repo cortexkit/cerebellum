@@ -8,6 +8,8 @@ use super::*;
 
 #[cfg(windows)]
 pub mod app_state;
+#[cfg(windows)]
+pub mod fronting;
 pub mod identity;
 #[cfg(windows)]
 pub mod launch;
@@ -776,6 +778,8 @@ pub struct WindowsPlatformDriver {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     accessibility_trees: BTreeMap<String, CachedWindowsTree>,
     expected_post_condition_available: bool,
+    #[cfg(windows)]
+    fronted_hooks: fronting::FrontedHookSlot,
 }
 
 impl Default for WindowsPlatformDriver {
@@ -783,6 +787,8 @@ impl Default for WindowsPlatformDriver {
         Self {
             accessibility_trees: BTreeMap::new(),
             expected_post_condition_available: true,
+            #[cfg(windows)]
+            fronted_hooks: Default::default(),
         }
     }
 }
@@ -853,6 +859,62 @@ impl WindowsPlatformDriver {
 }
 
 impl PlatformDriver for WindowsPlatformDriver {
+    #[cfg(windows)]
+    fn accept_fronted_dispatch_hooks(&mut self, hooks: Box<dyn FrontedDispatchHooks>) -> bool {
+        self.fronted_hooks.0 = Some(hooks);
+        true
+    }
+
+    #[cfg(windows)]
+    fn dispatch_fronted(
+        &mut self,
+        request: FrontedDispatchRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<crate::dispatch::BracketReport, DriverError> {
+        let mut hooks = self
+            .fronted_hooks
+            .0
+            .take()
+            .ok_or(DriverError::InvalidRequest(
+                "fronted operation requires restore hooks",
+            ))?;
+        Self::bounded_duration(request.maximum_interval_ms)?;
+        fronting::run_native(
+            &request.synthetic.target,
+            request.maximum_interval_ms,
+            request.maximum_seize_detection_latency_ms,
+            hooks.as_mut(),
+            cancelled,
+            None,
+        )
+    }
+
+    #[cfg(windows)]
+    fn read_fronted(
+        &mut self,
+        target: &ProcessGrant,
+        maximum_interval_ms: u64,
+        cancelled: &dyn Fn() -> bool,
+        read: &mut dyn FnMut(),
+    ) -> Result<crate::dispatch::BracketReport, DriverError> {
+        let mut hooks = self
+            .fronted_hooks
+            .0
+            .take()
+            .ok_or(DriverError::InvalidRequest(
+                "fronted operation requires restore hooks",
+            ))?;
+        Self::bounded_duration(maximum_interval_ms)?;
+        fronting::run_native(
+            target,
+            maximum_interval_ms,
+            50,
+            hooks.as_mut(),
+            cancelled,
+            Some(read),
+        )
+    }
+
     fn capability_declarations(
         &self,
         context: &CapabilityAdvertisementContext,
@@ -1079,9 +1141,17 @@ impl PlatformDriver for WindowsPlatformDriver {
 
     fn fronting_snapshot(
         &mut self,
-        _target: &ProcessGrant,
+        target: &ProcessGrant,
     ) -> Result<FrontingSnapshot, DriverError> {
-        Err(DriverError::Unsupported("Windows fronting snapshot"))
+        #[cfg(windows)]
+        {
+            fronting::snapshot(target)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = target;
+            Err(DriverError::Unsupported("Windows fronting snapshot"))
+        }
     }
 
     fn input_observer_liveness(&self) -> InputObserverLiveness {

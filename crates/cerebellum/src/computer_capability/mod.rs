@@ -627,12 +627,11 @@ where
     takeover_pointer_fronting_admitted: bool,
     #[cfg(test)]
     down_gesture_recovery_measured: bool,
-    /// Whether this build's release carries both the takeover review and the
-    /// app-use review, which alone admit fronting outside the keystroke
-    /// bracket: foreground mode's one-way front, fronting a disabled press or
-    /// a modifier chord under the app grant alone, and the restore rules that
-    /// go with them. Without it the plane behaves as it did before app use.
+    /// Whether takeover and app-use reviews admit foreground mode and fronts
+    /// for a disabled press or a modifier chord under the app grant alone.
     app_use_fronting_admitted: bool,
+    #[cfg(windows)]
+    windows_background_restore_admitted: bool,
     /// The process-wide fronting lock every fronting path takes, after the
     /// call's app lane, so two calls never front applications over each other.
     fronting_lock: fronting::FrontingLock,
@@ -761,6 +760,8 @@ where
             #[cfg(test)]
             down_gesture_recovery_measured: false,
             app_use_fronting_admitted: false,
+            #[cfg(windows)]
+            windows_background_restore_admitted: fronting::windows_background_restore_admitted(),
             fronting_lock: fronting::FrontingLock::process_wide(),
             own_input: Arc::new(OwnInputLedger::new()),
             cursor: cursor::Coordinator::default(),

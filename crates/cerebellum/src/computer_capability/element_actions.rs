@@ -860,6 +860,8 @@ where
     held_refusal: Option<(String, String)>,
     hold_refusals: bool,
     pub(super) effects: ActionEffects,
+    #[cfg(windows)]
+    windows_background_restore_admitted: bool,
 }
 
 impl<'a, R, T, S> ElementJournal<'a, R, T, S>
@@ -885,6 +887,8 @@ where
             held_refusal: None,
             hold_refusals: false,
             effects: ActionEffects::default(),
+            #[cfg(windows)]
+            windows_background_restore_admitted: false,
         }
     }
 
@@ -1202,7 +1206,11 @@ where
         _ => source.press(handle),
     };
     #[cfg(windows)]
-    let (dispatched, background_change) = windows_background::sample_mutation(dispatch);
+    let (dispatched, background_change) = windows_background::sample_mutation(
+        grant,
+        journal.windows_background_restore_admitted,
+        dispatch,
+    );
     #[cfg(not(windows))]
     let dispatched = dispatch();
     journal.effects.sample(source, grant);
@@ -1252,11 +1260,11 @@ where
             }),
         ),
     };
+    #[cfg(windows)]
+    let reply = windows_background::apply(background_change, journal, reply);
     if journal.outcome(token, outcome).is_err() {
         return audit_unavailable_reply(true);
     }
-    #[cfg(windows)]
-    let reply = windows_background::apply(background_change, journal, reply);
     reply
 }
 
@@ -1396,7 +1404,11 @@ where
     journal.effects = ActionEffects::before(source, grant);
     let write = || source.write_text(handle, attribute, text);
     #[cfg(windows)]
-    let (written, background_change) = windows_background::sample_mutation(write);
+    let (written, background_change) = windows_background::sample_mutation(
+        grant,
+        journal.windows_background_restore_admitted,
+        write,
+    );
     #[cfg(not(windows))]
     let written = write();
     #[cfg(target_os = "linux")]
@@ -1426,10 +1438,11 @@ where
         };
     #[cfg(windows)]
     if matches!(written, Err(ElementActionError::Gone)) {
+        let reply = windows_background::apply(background_change, journal, stale_element_reply());
         if journal.outcome(token, "stale_element").is_err() {
             return audit_unavailable_reply(true);
         }
-        return windows_background::apply(background_change, journal, stale_element_reply());
+        return reply;
     }
     let (outcome, reply) = if confirmed {
         (
@@ -1448,11 +1461,11 @@ where
             }),
         )
     };
+    #[cfg(windows)]
+    let reply = windows_background::apply(background_change, journal, reply);
     if journal.outcome(token, outcome).is_err() {
         return audit_unavailable_reply(true);
     }
-    #[cfg(windows)]
-    let reply = windows_background::apply(background_change, journal, reply);
     reply
 }
 
@@ -2594,11 +2607,17 @@ where
         let audit = AuditToken::new(self.audit.clone(), gate.clone());
         // The write's own row records any front this call made.
         super::fronting::action_row_started();
+        #[cfg(windows)]
+        let restore_admitted = self.windows_background_restore_admitted;
         let mut reply = tokio::task::spawn_blocking(move || {
             let _ax = work.bound_ax();
             let _scope = AccessibilityReadScope::new(grant.pid, None);
             let mut journal =
                 ElementJournal::new(audit, identity, ComputerCapability::WriteText, &grant);
+            #[cfg(windows)]
+            {
+                journal.windows_background_restore_admitted = restore_admitted;
+            }
             let refusal = check_linux_semantic_state(
                 source.as_ref(),
                 &mut journal,
@@ -3149,10 +3168,16 @@ where
             || super::fronting::Fronting::untouched(admission.mode),
             |front| front.fronting,
         );
+        #[cfg(windows)]
+        let restore_admitted = self.windows_background_restore_admitted;
         let (mut reply, effects) = tokio::task::spawn_blocking(move || {
             let _ax = work.bound_ax();
             let _scope = AccessibilityReadScope::new(grant.pid, reads);
             let mut journal = ElementJournal::new(audit, identity.clone(), capability, &grant);
+            #[cfg(windows)]
+            {
+                journal.windows_background_restore_admitted = restore_admitted;
+            }
             if let Some(record) = fronting.row_record() {
                 journal.set_fronting(record);
             }

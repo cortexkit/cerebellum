@@ -26,6 +26,8 @@ mod devtools_pipe;
 #[cfg(windows)]
 mod file_identity;
 #[cfg(windows)]
+mod foreground_events;
+#[cfg(windows)]
 mod image_file_facts;
 #[cfg(windows)]
 mod launch_facts;
@@ -85,6 +87,8 @@ pub use devtools_pipe::{spawn_with_devtools_pipe, DevToolsPipeReader, DevToolsPr
 #[cfg(windows)]
 pub use file_identity::{file_identity, FileIdentity};
 #[cfg(windows)]
+pub use foreground_events::{ForegroundEvent, ForegroundEvents};
+#[cfg(windows)]
 pub use image_file_facts::{
     lock_image_file, retain_image_process, ImageMappingReading, LockedImageFile,
     ProcessPackageFields,
@@ -123,7 +127,8 @@ pub use window_identity_facts::{
 #[cfg(windows)]
 pub use window_state_facts::{
     desktop_z_order, foreground_window_number, gui_thread_windows, input_desktop_name,
-    root_window_number, window_owner, window_state_facts, GuiThreadWindows, WindowStateFacts,
+    root_window_number, set_foreground_window, window_owner, window_state_facts, GuiThreadWindows,
+    WindowStateFacts,
 };
 #[cfg(target_os = "windows")]
 pub use windows::{

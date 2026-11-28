@@ -2134,6 +2134,8 @@ pub trait FrontedDispatchHooks: Send {
     }
     /// The front request and its wait returned.
     fn front_attempt_returned(&mut self);
+    /// The native host ruled out an outstanding activation after a denial.
+    fn front_attempt_denied(&mut self) {}
     /// The action observed its target frontmost, not merely a request return.
     fn front_confirmed(&mut self) {}
     /// Run the one restore decision, on the bracket's thread: the bracket
@@ -2324,6 +2326,9 @@ impl<H: crate::dispatch::FrontingBracketHost + RestoreHostSource>
                 self.hooks.front_confirmed();
             }
             if !requested {
+                if self.inner.front_request_definitively_denied() {
+                    self.hooks.front_attempt_denied();
+                }
                 self.returned();
             }
             return requested;

@@ -177,6 +177,24 @@ pub(crate) struct Fronting {
 }
 
 impl Fronting {
+    #[cfg(windows)]
+    pub(super) fn windows_background(
+        status: cerebellum_computer::platform::windows::fronting::BackgroundRestore,
+    ) -> Self {
+        use cerebellum_computer::platform::windows::fronting::BackgroundRestore;
+        let mut report = Self::untouched(AppUse::Background);
+        report.restore = match status {
+            BackgroundRestore::Restored => Restore::Restored,
+            BackgroundRestore::LeftInFront => Restore::LeftInFront,
+            BackgroundRestore::Failed => Restore::Failed,
+            BackgroundRestore::SkippedPerson { input } => {
+                report.person_input_during_fronting = input;
+                Restore::SkippedPerson
+            }
+        };
+        report
+    }
+
     /// Nothing was, or needed to be, fronted: background mode with no
     /// needs-front action, or a target that was already frontmost.
     pub(crate) fn untouched(mode: AppUse) -> Self {
@@ -301,6 +319,15 @@ impl Fronting {
             preview_frames: 0,
         }
     }
+}
+
+#[cfg(windows)]
+pub(super) fn windows_background_restore_admitted() -> bool {
+    let context = crate::default_computer_context();
+    cerebellum_computer::platform::windows::fronting::background_restore_admitted(
+        &context.inputs,
+        context.startup.windows_elevation,
+    )
 }
 
 /// A foreground one-way front this call made whose action has not yet
@@ -875,7 +902,12 @@ impl CellHooks {
                 restore_ms: None,
             };
         };
+        #[cfg(not(windows))]
         let decided = decide_with_restore_budget(&cell);
+        // Windows has no thread-local accessibility budget to reset. The
+        // bracket's owner can restore on the thread that requested the front.
+        #[cfg(windows)]
+        let decided = cell.decide_entered(crate::terminal_arbiter::fronting_now());
         self.state().decided = Some(decided);
         HookedRestore {
             restore: decided.restore,
@@ -904,7 +936,7 @@ impl CellHooks {
     /// When a picture read's waits for the system must end: the start of the
     /// restore reserve, when the front has one. The bracket's own cap on its
     /// waits on the target ends them there in production.
-    #[cfg(test)]
+    #[cfg(any(test, windows))]
     pub(crate) fn picture_wait_until(&self) -> Option<Instant> {
         self.state()
             .cutoff
@@ -992,6 +1024,15 @@ impl FrontedDispatchHooks for CellHooks {
         }
     }
 
+    fn front_attempt_denied(&mut self) {
+        if let Some(cell) = self.cell() {
+            let decided = cell.front_attempt_denied();
+            let mut state = self.state();
+            state.decided = Some(decided);
+            state.refusal = Some(FrontingStop::FrontFailed);
+        }
+    }
+
     fn front_confirmed(&mut self) {
         if let Some(cell) = self.cell() {
             cell.front_confirmed();
@@ -1009,6 +1050,17 @@ impl FrontedDispatchHooks for CellHooks {
     }
 
     fn finished(&mut self, outcome: &BracketOutcome) {
+        #[cfg(windows)]
+        {
+            let mut state = self.state();
+            if state.refusal.is_none() && state.cell.is_none() {
+                state.refusal = outcome
+                    .report
+                    .stop
+                    .as_ref()
+                    .and_then(FrontingStop::from_bracket_stop);
+            }
+        }
         self.state().report = Some(outcome.report.clone());
         self.state().finished = Some((
             outcome.deferred_restore,
@@ -1236,7 +1288,7 @@ pub(crate) struct PrepareStop {
 /// waiting for focus ownership.
 enum TemporaryFrontAuthority<'a> {
     AppUse,
-    AppRead(&'a crate::computer_grants::GrantAdmission),
+    AppRead(&'a crate::computer_grants::GrantAdmission, bool),
     Takeover(&'a crate::computer_grants::GrantAdmission),
 }
 
@@ -1328,7 +1380,22 @@ where
             call,
             FrontingPurpose::NeedsFront,
             true,
-            TemporaryFrontAuthority::AppRead(admission),
+            TemporaryFrontAuthority::AppRead(admission, false),
+        ))
+        .await
+    }
+
+    #[cfg(windows)]
+    pub(super) async fn prepare_windows_image_front(
+        &self,
+        call: FrontCall<'_>,
+        admission: &crate::computer_grants::GrantAdmission,
+    ) -> Result<ObligationParts, PrepareStop> {
+        Box::pin(self.prepare_front_with_authority(
+            call,
+            FrontingPurpose::NeedsFront,
+            true,
+            TemporaryFrontAuthority::AppRead(admission, true),
         ))
         .await
     }
@@ -1373,9 +1440,13 @@ where
             TemporaryFrontAuthority::AppUse => {
                 self.fronting_admission(call.consent, false).may_front()?;
             }
-            TemporaryFrontAuthority::AppRead(admission) => {
-                self.fronting_admission(call.consent, false)
-                    .may_front_image()?;
+            TemporaryFrontAuthority::AppRead(admission, windows_bracket) => {
+                let fronting = self.fronting_admission(call.consent, false);
+                if windows_bracket {
+                    fronting.may_front_image_with_release(self.fronting_bracket_admitted)?;
+                } else {
+                    fronting.may_front_image()?;
+                }
                 if !admission.commit() {
                     return Err(FrontingStop::DispatchGateClosed.into());
                 }

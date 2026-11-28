@@ -185,6 +185,11 @@ pub trait FrontingBracketHost {
     fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
         permitted() && self.request_front(pid)
     }
+    /// The native request failed and readback still shows the saved window.
+    /// A host that cannot prove both facts must keep the activation pending.
+    fn front_request_definitively_denied(&self) -> bool {
+        false
+    }
     /// Start a bounded interval without switching focus. Hooked picture
     /// reads still need a deadline and a lock owner on this path.
     fn begin_without_switch(&mut self, _pid: u32) -> bool {

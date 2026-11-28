@@ -234,10 +234,16 @@ where
         let attempted = Arc::new(AtomicBool::new(false));
         let launch_started = attempted.clone();
         let launch_work = work.clone();
+        #[cfg(windows)]
+        let background =
+            self.fronting_admission(&context.consent, false).mode == AppUse::Background;
+        #[cfg(windows)]
+        let restore_admitted = self.windows_background_restore_admitted;
         let opened = tokio::task::spawn_blocking(move || {
             let _ax = launch_work.bound_ax();
             #[cfg(windows)]
-            let foreground = launching.windows_entry.as_ref().map(|_| windows::sample());
+            let foreground =
+                (background && launching.windows_entry.is_some()).then(windows::sample);
             let launch = || {
                 if let Some(url) = url.as_deref() {
                     // Consent can outlive a bundle update. Re-read the declarations
@@ -269,7 +275,15 @@ where
             };
             let opened = launch();
             #[cfg(windows)]
-            let changed = foreground.and_then(windows::foreground_change);
+            let changed = foreground.and_then(|before| {
+                windows::foreground_change(
+                    before,
+                    restore_admitted,
+                    opened.as_ref().ok().map(|app| app.pid),
+                    &launching.bundle_identity,
+                    launch_work.deadline(),
+                )
+            });
             #[cfg(not(windows))]
             let changed: Option<super::fronting::Fronting> = None;
             (opened, changed)

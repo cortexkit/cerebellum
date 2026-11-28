@@ -510,6 +510,28 @@ where
                 });
                 read_image_background::PicturePlan::new(end, fallback)
             });
+        #[cfg(windows)]
+        let background_picture = if let Some(mut picture) = background_picture {
+            if bring_to_front
+                && work.terminal.is_some()
+                && fronting_admission
+                    .may_front_image_with_release(self.fronting_bracket_admitted)
+                    .is_ok()
+            {
+                let call = fronting::FrontCall {
+                    grant: &grant,
+                    consent: &consent,
+                    cancel: &cancel,
+                    management,
+                    conversation_key: &conversation_key,
+                    input_follows: false,
+                };
+                picture.prepare(self.prepare_windows_image_front(call, &admission).await);
+            }
+            Some(picture)
+        } else {
+            None
+        };
         if !B::BACKGROUND_WINDOW_PICTURE
             && bring_to_front
             && image_permission_live
@@ -574,7 +596,8 @@ where
             )
             .await
         {
-            Ok((Some(image), _, fronting, _)) => {
+            Ok((Some(image), _, fronting, background_fronting)) => {
+                image_fronting = background_fronting.or(image_fronting);
                 if let Some(fronting) = fronting {
                     reply["image_fronting"] = json!(fronting);
                 }
@@ -736,6 +759,7 @@ where
                         image_plan.cancel.clone(),
                         image_plan.gate.clone(),
                         &trace,
+                        make_driver.as_ref(),
                     );
                 }
                 // The observed bracket posts a heartbeat, just as keys does;

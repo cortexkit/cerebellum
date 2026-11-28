@@ -1,10 +1,8 @@
-use super::{AppStateSource, AppUse, InstalledApp, ResolvedInstalled, Value};
-use crate::computer_capability::{
-    fronting::{Fronting, Restore},
-    target_resolution::names_in_part,
-};
-use cerebellum_computer::platform::windows::{identity::Principal, launch::foreground_sample};
+use super::{AppStateSource, InstalledApp, ResolvedInstalled, Value};
+use crate::computer_capability::{fronting::Fronting, target_resolution::names_in_part};
+use cerebellum_computer::platform::windows::{fronting::BackgroundForeground, identity::Principal};
 use serde_json::json;
+use std::time::Instant;
 
 pub(super) fn consent_name(app: &InstalledApp) -> String {
     match app.bundle_identity.parse::<Principal>() {
@@ -28,25 +26,20 @@ pub(super) fn consent_name(app: &InstalledApp) -> String {
     }
 }
 
-pub(super) fn sample() -> (Option<u32>, Option<u32>) {
-    foreground_sample()
+pub(super) fn sample() -> BackgroundForeground {
+    BackgroundForeground::sample()
 }
 
-pub(super) fn foreground_change(before: (Option<u32>, Option<u32>)) -> Option<Fronting> {
-    let (after, last_input) = sample();
-    if before.0 == after {
-        return None;
-    }
-    let person = matches!((before.1, last_input), (Some(old), Some(now)) if old != now);
-    let mut report = Fronting::untouched(AppUse::Background);
-    report.person_input_during_fronting = person;
-    // It is safe to report the change without asking Windows to restore focus.
-    report.restore = if person {
-        Restore::SkippedPerson
-    } else {
-        Restore::LeftInFront
-    };
-    Some(report)
+pub(super) fn foreground_change(
+    before: BackgroundForeground,
+    admitted: bool,
+    pid: Option<u32>,
+    principal: &str,
+    deadline: Instant,
+) -> Option<Fronting> {
+    before
+        .after_launch(admitted, pid, principal, deadline)
+        .map(Fronting::windows_background)
 }
 
 pub(super) fn resolve(
