@@ -808,6 +808,9 @@ pub const DOWN_GESTURE_RECOVERY_MEASURED: bool = true;
 
 /// Platform-neutral semantic action intents a semantic dispatch may carry.
 pub const SEMANTIC_PRESS_ACTION: &str = "press";
+
+#[cfg(target_os = "linux")]
+pub mod linux;
 pub const SEMANTIC_CANCEL_ACTION: &str = "cancel";
 
 /// The closed action intents a platform semantic driver may receive.

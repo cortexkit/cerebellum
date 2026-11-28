@@ -400,6 +400,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "cerebellum-core",
+ "cerebellum-linux",
  "cerebellum-macos",
  "cerebellum-windows",
  "objc2-core-graphics",

@@ -975,6 +975,12 @@ where
         consent: &ConsentContext,
         cancel: &CancelHandle,
     ) -> Result<(ProcessGrant, GrantAdmission), AppRefusal> {
+        #[cfg(target_os = "linux")]
+        if let Some(session) = &self.linux_session {
+            return session
+                .admit_named(management, bundle_identity, consent, cancel)
+                .await;
+        }
         if drives_development_builds(&consent.caller) {
             if let Ok(grant) = management.resolve_process(bundle_identity) {
                 if admits_development_build(

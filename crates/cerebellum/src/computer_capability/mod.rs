@@ -37,18 +37,14 @@ use cerebellum_computer::audit::{
 };
 use cerebellum_computer::capture::CaptureBackend;
 use cerebellum_computer::dispatch::post_condition::PostCondition;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use cerebellum_computer::dispatch::{wait_until_predicate, PlatformPredicatePoller};
 use cerebellum_computer::dispatch::{
     AttendanceContext, AttendanceLease, DispatchError, DispatchRequest, Dispatcher,
     ExpectedPostCondition, FrozenDispatchRow,
 };
-// Evidence is shaped on every platform: the indeterminate reply is not gated.
-use cerebellum_computer::dispatch::WaitEvidence;
-// The outcome and result types belong to a completed poll, which only the macOS
-// handler performs -- and to the tests that shape its reply on any platform.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use cerebellum_computer::dispatch::{wait_until_predicate, PlatformPredicatePoller};
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
-use cerebellum_computer::dispatch::{WaitOutcome, WaitResult};
+#[cfg(test)]
+use cerebellum_computer::dispatch::{WaitEvidence, WaitOutcome, WaitResult};
 use cerebellum_computer::platform::containment::ContainmentRung as DispatchContainmentRung;
 use cerebellum_computer::platform::vocabulary::{
     validate_capability_result, CapabilityResultValidationError,
@@ -111,6 +107,8 @@ pub(crate) fn late_fronting_journal_failures() -> u64 {
 }
 
 mod action_effects;
+mod wait_reply;
+use wait_reply::*;
 mod app_use;
 mod app_use_approval;
 pub mod cursor;
@@ -1058,7 +1056,13 @@ where
         let app_use = self.app_use.approved_mode(settings, &context.cancel).await;
         // Before target lookup, consent or any platform work: offering a tool
         // does not imply the startup permission readings allow it to execute.
-        if let Some(reply) = permissions::refusal(capability.capability(), &self.permissions) {
+        let startup_refusal = if self.uses_linux_semantics() {
+            // Linux already checked permissions against the current session.
+            None
+        } else {
+            permissions::refusal(capability.capability(), &self.permissions)
+        };
+        if let Some(reply) = startup_refusal {
             let reply = match capability.0 {
                 Served::Type | Served::Keys => {
                     synthetic_wire_envelope(keystrokes::refused_before_posting(reply))
@@ -1495,6 +1499,25 @@ where
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
+            #[cfg(target_os = "linux")]
+            if let Some(session) = self.linux_session.clone() {
+                let work = quarantine::CallWork::current();
+                if let Some(busy) = work.bind(&self.serializer.quarantine, &grant).await {
+                    return busy;
+                }
+                return linux::poll_wait(
+                    session,
+                    self.audit.clone(),
+                    work,
+                    identity,
+                    grant,
+                    parsed.predicate,
+                    parsed.timeout_ms,
+                    cancel,
+                    admission,
+                )
+                .await;
+            }
             let _ = (grant, cancel, identity);
             let mut reply = wait_indeterminate_reply(
                 Some(parsed.predicate),
@@ -2448,6 +2471,10 @@ where
                 apps.extend(inactive.iter().map(|app| json!({"name":app.name,"bundle_identity":app.bundle_identity,"running":false,"frontmost":false})));
                 json!({"outcome":"completed", STATE_TEXT_FIELD:text, "apps":apps, "truncated":truncated,"installed_list":if installed.complete {"complete"} else {"partial"}})
             }
+            #[cfg(target_os = "linux")]
+            Err(_) if self.linux_session.is_some() => {
+                linux::semantic_read_refusal("backend_unavailable")
+            }
             Err(_) => {
                 #[cfg(target_os = "windows")]
                 let remedy = "the running applications could not be read; retry, or name an application by app identity";
@@ -3040,67 +3067,6 @@ fn invalid_wait_request(field: &str, reason: &str) -> Value {
         "outcome": "invalid_request",
         "field": field,
         "reason": reason,
-    })
-}
-
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
-fn wait_wire_reply(result: WaitResult) -> Value {
-    let outcome = match result.outcome {
-        WaitOutcome::Settled => "predicate_satisfied",
-        WaitOutcome::TimedOut => "timeout",
-        WaitOutcome::Indeterminate => "indeterminate",
-        WaitOutcome::Cancelled => "cancelled",
-    };
-    json!({
-        "outcome": outcome,
-        // Every polled outcome reports the engine's actual scoped-read count.
-        "attempts": result.attempts,
-        "evidence": serde_json::to_string(&result.evidence)
-            .expect("the closed wait evidence type serializes"),
-        "settle_path": "poll_with_deadline",
-    })
-}
-
-fn wait_indeterminate_reply(predicate: Option<PostCondition>, reason: Value) -> Value {
-    let evidence = match predicate {
-        Some(predicate) => serde_json::to_string(&WaitEvidence::Indeterminate {
-            predicate,
-            readback: None,
-            reason: reason.to_string(),
-        })
-        .expect("the closed wait evidence type serializes"),
-        None => json!({
-            "status": "indeterminate",
-            "predicate": null,
-            "readback": null,
-            "reason": reason,
-        })
-        .to_string(),
-    };
-    json!({
-        "outcome": "indeterminate",
-        "evidence": evidence,
-        "settle_path": "poll_with_deadline",
-    })
-}
-
-/// The reply to a wait cancelled while it waited on the person, before any
-/// poll: the same `cancelled` outcome a wait cancelled mid-poll returns, with
-/// no reads attempted.
-fn cancelled_before_polling_reply(predicate: PostCondition) -> Value {
-    // No readback exists before polling. The evidence type already permits a
-    // plain reason string; serializing a diagnostic object here would encode
-    // JSON a second time inside that string.
-    let evidence = WaitEvidence::Indeterminate {
-        predicate,
-        readback: None,
-        reason: "cancelled_while_awaiting_consent".to_string(),
-    };
-    json!({
-        "outcome": "cancelled", "attempts": 0,
-        "evidence": serde_json::to_string(&evidence)
-            .expect("the closed wait evidence type serializes"),
-        "settle_path": "poll_with_deadline",
     })
 }
 

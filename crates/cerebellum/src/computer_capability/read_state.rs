@@ -25,10 +25,12 @@ where
             Ok(parsed) => parsed,
             Err(refusal) => return refusal,
         };
-        parsed.target = match self.resolve_target_name(&parsed.target).await {
-            Ok(bundle_identity) => bundle_identity,
-            Err(refusal) => return refusal,
-        };
+        if !self.uses_linux_semantics() {
+            parsed.target = match self.resolve_target_name(&parsed.target).await {
+                Ok(bundle_identity) => bundle_identity,
+                Err(refusal) => return refusal,
+            };
+        }
         let ServeContext {
             cancel,
             grantee: _,
@@ -231,6 +233,24 @@ where
         };
         let mut raw = match raw {
             Ok(raw) => raw,
+            #[cfg(target_os = "linux")]
+            Err(error) if self.linux_session.is_some() => {
+                let session = self.linux_session.as_ref().expect("Linux semantic session");
+                let reason = session
+                    .verify_bound(&grant)
+                    .await
+                    .err()
+                    .unwrap_or(match error {
+                        StateReadFailure::ZoomGone
+                        | StateReadFailure::Application(AppStateReadError::TargetGone) => {
+                            "stale_reference"
+                        }
+                        _ => "accessibility_tree_unavailable",
+                    });
+                let mut reply = super::linux::semantic_read_refusal(reason);
+                admission.decorate(&mut reply);
+                return reply;
+            }
             Err(StateReadFailure::Application(AppStateReadError::TargetGone)) => {
                 let mut reply = json!({
                     "outcome": "not_running",

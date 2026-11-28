@@ -3,12 +3,16 @@
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use cerebellum_computer::app_state::source::{AppStateSource, ElementActionError, ElementHandle};
 use cerebellum_computer::audit::ComputerCapability;
 use cerebellum_computer::capture::*;
+use cerebellum_computer::platform::linux::{self as semantic, Source};
 use cerebellum_computer::platform::*;
+use cerebellum_linux::atspi;
 use cerebellum_linux::identity::{IdentityReader, Refusal as IdentityRefusal, VerifiedApp};
 use cerebellum_linux::session::{self, AccessibilityBus, DesktopSession, SessionKind};
 use serde_json::{json, Value};
@@ -19,7 +23,9 @@ use super::{
     computer_audit, permissions, ComputerPlane, ComputerPlaneUnavailable, ResultSchemaEnforcement,
     RunningComputerPlane,
 };
-use crate::{ComputerReleaseInputs, JournalPersistence};
+use crate::computer_grants::{ConsentContext, GrantAdmission, GrantNeed};
+use crate::management::{AppRefusal, ManagementPlane};
+use crate::{CancelHandle, ComputerReleaseInputs, JournalPersistence};
 
 pub(crate) const IDENTITY_REVIEW: Option<&str> =
     option_env!("CEREBELLUM_LINUX_APP_IDENTITY_REVIEW_REVISION");
@@ -69,8 +75,10 @@ pub(crate) fn plane(
         ResultSchemaEnforcement::Withhold,
         move || LinuxDriver {
             session: Arc::clone(&driver_session),
+            resolved: None,
         },
     )
+    .with_app_state_source(Arc::new(Source(session.clone())))
     .with_fronting_bracket_admitted(app_use_fronting)
     .with_app_use_fronting_admitted(app_use_fronting)
     .with_takeover_pointer_fronting_admitted(
@@ -106,35 +114,162 @@ struct EpochKey {
 }
 
 struct Epoch {
+    serial: u64,
     key: EpochKey,
     permissions: PermissionLivenessReport,
+    bus: Option<atspi::Bus>,
 }
+
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 pub(super) struct LinuxSession {
     read: Box<SessionReader>,
     epoch: Mutex<Option<(Arc<Epoch>, bool)>>,
     admitted: Arc<BTreeSet<String>>,
     identity: Option<Arc<IdentityReader>>,
+    #[cfg(test)]
+    proof_for_test: Option<fn(u32) -> Result<VerifiedApp, IdentityRefusal>>,
 }
 
 impl LinuxSession {
+    pub(super) async fn select(
+        self: &Arc<Self>,
+        target: &str,
+    ) -> Result<(ProcessGrant, String), Value> {
+        let source = Source(self.clone());
+        let target = target.trim().to_owned();
+        let (epoch, _) = self
+            .refresh()
+            .await
+            .map_err(|failure| failure.reply(ComputerCapability::ReadState))?;
+        tokio::task::spawn_blocking(move || {
+            let apps = source.inventory().map_err(semantic_read_refusal)?;
+            let qualified = cerebellum_linux::identity::is_subject(&target);
+            let mut matches: Vec<_> = apps.iter().filter(|app| {
+                if qualified {
+                    app.grant.as_ref().is_some_and(|grant| grant.bundle_identity == target)
+                } else {
+                    app.name.eq_ignore_ascii_case(&target)
+                }
+            }).collect();
+            if matches.is_empty() && !qualified {
+                matches.extend(apps.iter().filter(|app| super::target_resolution::names_in_part(&app.name, &target)));
+            }
+            if matches.iter().any(|app| app.proof == Err(IdentityRefusal::OperatorAppBlocked)) {
+                return Err(semantic_read_refusal("operator_app_blocked"));
+            }
+            let verified: Vec<_> = matches.iter().filter_map(|app| app.grant.as_ref().map(|grant| (*app, grant))).collect();
+            if verified.iter().any(|(_, first)| verified.iter().any(|(_, other)| first.pid != other.pid)) {
+                return Err(json!({"outcome": "ambiguous", "reason": "ambiguous_app", "bundle_identity": target,
+                    "remedy": "quit all but one matching instance, then retry"}));
+            }
+            if let [(app, grant)] = verified.as_slice() {
+                source.verify(grant).map_err(semantic_read_refusal)?;
+                let proof = app.proof.as_ref().expect("a semantic grant has a proof");
+                return Ok(((*grant).clone(), proof.display_name(Some(&app.name))));
+            }
+            if let Some(reason) = matches.iter().find_map(|app| app.proof.as_ref().err()) {
+                return Err(semantic_read_refusal(reason.reason()));
+            }
+            if !verified.is_empty() { return Err(semantic_read_refusal("accessibility_tree_unavailable")); }
+            if epoch.key.kind == SessionKind::X11 {
+                // Without the X Resource extension's client PID, a missing
+                // peer might be a running app with no accessibility tree.
+                return Err(semantic_read_refusal("backend_unavailable"));
+            }
+            Err(json!({"outcome": "not_running", "bundle_identity": target,
+                "remedy": "start the application, then retry"}))
+        }).await.unwrap_or_else(|_| Err(semantic_read_refusal("backend_unavailable")))
+    }
+
+    pub(super) async fn admit_named(
+        self: &Arc<Self>,
+        management: &ManagementPlane,
+        target: &str,
+        consent: &ConsentContext,
+        cancel: &CancelHandle,
+    ) -> Result<(ProcessGrant, GrantAdmission), AppRefusal> {
+        let (grant, display_name) = self.select(target).await.map_err(AppRefusal::Resolution)?;
+        self.admit_bound(management, grant, display_name, consent, cancel)
+            .await
+    }
+
+    pub(super) async fn admit_bound(
+        self: &Arc<Self>,
+        management: &ManagementPlane,
+        grant: ProcessGrant,
+        display_name: String,
+        consent: &ConsentContext,
+        cancel: &CancelHandle,
+    ) -> Result<(ProcessGrant, GrantAdmission), AppRefusal> {
+        self.verify_bound(&grant)
+            .await
+            .map_err(|reason| AppRefusal::Resolution(semantic_read_refusal(reason)))?;
+        let driver = LinuxDriver {
+            session: self.clone(),
+            resolved: None,
+        };
+        let need = GrantNeed::App {
+            bundle_identity: grant.bundle_identity.clone(),
+            display_name,
+            code: driver.app_code(&grant),
+        };
+        let admission = management
+            .computer_grants()
+            .require(&need, consent, cancel)
+            .await
+            .map_err(AppRefusal::Consent)?;
+        self.verify_bound(&grant)
+            .await
+            .map_err(|reason| AppRefusal::Resolution(semantic_read_refusal(reason)))?;
+        Ok((grant, admission))
+    }
+
+    pub(super) async fn verify_bound(
+        self: &Arc<Self>,
+        grant: &ProcessGrant,
+    ) -> Result<(), &'static str> {
+        let grant = grant.clone();
+        let source = Source(self.clone());
+        tokio::task::spawn_blocking(move || source.verify(&grant))
+            .await
+            .unwrap_or(Err("backend_unavailable"))
+    }
+
+    pub(super) fn driver(self: &Arc<Self>) -> LinuxDriver {
+        LinuxDriver {
+            session: self.clone(),
+            resolved: None,
+        }
+    }
+
     fn new(require_accessibility: bool, admitted: Arc<BTreeSet<String>>) -> Self {
         Self {
             read: Box::new(move || {
                 Box::pin(async move {
                     let desktop = session::resolve(require_accessibility).await?;
-                    // Finding the accessibility bus is not evidence that a
-                    // driver can read it. DISPLAY alone proves no X facilities.
+                    // Session discovery has asked the bus daemon for its ID.
+                    // DISPLAY alone proves none of the X11 facilities.
+                    let permissions = PermissionLivenessReport::from_results(
+                        desktop.accessibility.iter().map(|_| PermissionProbeResult {
+                            service: PermissionService::Accessibility,
+                            liveness: PermissionLiveness::Live,
+                            responsible_process: "ck-cerebellum".into(),
+                            off_main: true,
+                        }),
+                    );
                     Ok(SessionReading {
                         desktop,
                         x11_connection: None,
-                        permissions: Default::default(),
+                        permissions,
                     })
                 })
             }),
             epoch: Mutex::new(None),
             admitted,
             identity: None,
+            #[cfg(test)]
+            proof_for_test: None,
         }
     }
 
@@ -160,13 +295,40 @@ impl LinuxSession {
             },
             accessibility: reading.desktop.accessibility,
         };
-        let epoch = match latch.as_ref() {
-            Some((epoch, _)) if epoch.key == key => Arc::clone(epoch),
-            _ => Arc::new(Epoch {
-                key,
-                permissions: reading.permissions,
-            }),
+        let previous = latch
+            .as_ref()
+            .filter(|(epoch, _)| epoch.key == key)
+            .map(|(epoch, _)| epoch.clone());
+        let bus = match (
+            &key.accessibility,
+            previous.as_ref().and_then(|epoch| epoch.bus.as_ref()),
+        ) {
+            (Some(accessibility), Some(bus)) => {
+                if !matches!(
+                    timeout_at(deadline, bus.check_id(&accessibility.id)).await,
+                    Ok(Ok(()))
+                ) {
+                    *latch = None;
+                    return Err(LinuxRefusal::NoSupportedSession);
+                }
+                Some(bus.clone())
+            }
+            (Some(accessibility), None) => timeout_at(deadline, atspi::Bus::connect(accessibility))
+                .await
+                .ok()
+                .and_then(Result::ok),
+            (None, _) => None,
         };
+        let epoch = previous
+            .filter(|epoch| epoch.bus.is_some() == bus.is_some())
+            .unwrap_or_else(|| {
+                Arc::new(Epoch {
+                    serial: NEXT_EPOCH.fetch_add(1, AtomicOrdering::Relaxed),
+                    key,
+                    permissions: reading.permissions,
+                    bus,
+                })
+            });
         *latch = Some((epoch.clone(), reading.desktop.locked));
         Ok((epoch, reading.desktop.locked))
     }
@@ -192,6 +354,12 @@ impl LinuxSession {
                 )
             {
                 LinuxRefusal::WaylandSeatInputUnverifiable
+            } else if matches!(
+                capability,
+                ListApps | Wait | ReadState | PressElement | WriteText
+            ) && epoch.bus.is_some()
+            {
+                return None;
             } else if epoch.key.kind == SessionKind::X11 && epoch.key.x11_connection.is_none() {
                 LinuxRefusal::BackendUnavailable
             } else if let Some(reply) = permissions::refusal(capability, &epoch.permissions) {
@@ -205,6 +373,83 @@ impl LinuxSession {
     }
 }
 
+pub(super) fn semantic_read_refusal(reason: &'static str) -> Value {
+    match reason {
+        "screen_locked" => super::screen_locked_reply(),
+        "operator_app_blocked" => json!({"outcome": "authorization_denied", "reason": reason,
+            "remedy": "choose a different application"}),
+        _ => json!({"outcome": "targets_unreadable", "reason": reason,
+            "remedy": "read the application again after the desktop and accessibility tree are available"}),
+    }
+}
+
+pub(super) fn semantic_element_refusal(reason: &'static str) -> Value {
+    match reason {
+        "screen_locked" | "operator_app_blocked" => semantic_read_refusal(reason),
+        "secure_field_focused" | "focus_unreadable" => json!({
+            "outcome": "secure_field_refused", "reason": reason,
+            "remedy": "use a readable non-sensitive element or ask the person to act directly"}),
+        "web_content_needs_type" => json!({"outcome": "web_content_needs_type", "reason": reason,
+            "remedy": "edit this web field directly; this semantic action does not send keystrokes"}),
+        _ => json!({"outcome": "stale_element", "reason": reason,
+            "remedy": "read the application's state again before retrying"}),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn poll_wait<R, T, S>(
+    session: Arc<LinuxSession>,
+    audit: super::SharedAudit<R, T, S>,
+    work: super::quarantine::CallWork,
+    identity: cerebellum_core::journal::JournalIdentity,
+    grant: ProcessGrant,
+    predicate: cerebellum_computer::dispatch::post_condition::PostCondition,
+    timeout_ms: u64,
+    cancel: CancelHandle,
+    admission: GrantAdmission,
+) -> Value
+where
+    R: cerebellum_core::journal::Redactor + Send + 'static,
+    T: cerebellum_core::journal::SeverityTaxonomy + Send + 'static,
+    S: cerebellum_core::journal::JournalStorage + Send + 'static,
+{
+    use cerebellum_computer::dispatch::{wait_until_predicate, PlatformPredicatePoller};
+    let mut token = super::AuditToken::new(audit, work.gate());
+    match tokio::task::spawn_blocking(move || {
+        let _ax = work.bound_ax();
+        let _scope = cerebellum_computer::audit::AccessibilityReadScope::new(grant.pid, None);
+        token.record_accessibility_read(identity, ComputerCapability::Wait, &grant, || {
+            let mut poller = PlatformPredicatePoller::new(session.driver(), grant.clone());
+            wait_until_predicate(&mut poller, predicate, timeout_ms, &|| {
+                cancel.is_cancelled()
+            })
+        })
+    })
+    .await
+    {
+        Ok(Ok(result)) => {
+            let terminal_reason = match &result.evidence {
+                cerebellum_computer::dispatch::WaitEvidence::Indeterminate { reason, .. }
+                    if matches!(
+                        reason.as_str(),
+                        "stale_reference" | "no_supported_session" | "screen_locked"
+                    ) =>
+                {
+                    Some(reason.clone())
+                }
+                _ => None,
+            };
+            let mut reply = super::wait_wire_reply(result);
+            if let Some(reason) = terminal_reason {
+                reply["reason"] = json!(reason);
+            }
+            admission.decorate(&mut reply);
+            reply
+        }
+        _ => super::wait_indeterminate_reply(None, json!({"reason": "polling_task_unavailable"})),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LinuxRefusal {
     NoSupportedSession,
@@ -212,6 +457,55 @@ enum LinuxRefusal {
     PointHitTestUnsupported,
     WaylandSeatInputUnverifiable,
     BackendUnavailable,
+}
+
+impl semantic::Session for LinuxSession {
+    fn current(&self) -> Result<semantic::Live, &'static str> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| "no_supported_session")?;
+        let (epoch, locked) = runtime
+            .block_on(self.refresh())
+            .map_err(|_| "no_supported_session")?;
+        if locked {
+            return Err("screen_locked");
+        }
+        let bus = epoch.bus.clone().ok_or("accessibility_tree_unavailable")?;
+        Ok(semantic::Live {
+            epoch: epoch.serial,
+            bus,
+        })
+    }
+
+    fn prove(&self, pid: u32) -> Result<VerifiedApp, IdentityRefusal> {
+        #[cfg(test)]
+        if let Some(prove) = self.proof_for_test {
+            return prove(pid);
+        }
+        self.identity
+            .as_ref()
+            .ok_or(IdentityRefusal::AppIdentityUnproven)?
+            .prove(pid)
+    }
+
+    fn reprove(
+        &self,
+        pid: u32,
+        generation: &str,
+        subject: &str,
+    ) -> Result<VerifiedApp, IdentityRefusal> {
+        #[cfg(test)]
+        if let Some(prove) = self.proof_for_test {
+            let app = prove(pid)?;
+            return if app.generation_evidence() == generation && app.subject == subject {
+                Ok(app)
+            } else {
+                Err(IdentityRefusal::StaleReference)
+            };
+        }
+        self.identity
+            .as_ref()
+            .ok_or(IdentityRefusal::AppIdentityUnproven)?
+            .reprove(pid, generation, subject)
+    }
 }
 
 impl LinuxRefusal {
@@ -251,6 +545,7 @@ impl LinuxRefusal {
 
 pub struct LinuxDriver {
     session: Arc<LinuxSession>,
+    resolved: Option<(ElementResolutionResult, ElementHandle)>,
 }
 
 impl LinuxDriver {
@@ -264,9 +559,16 @@ impl LinuxDriver {
     }
 
     pub fn app_code(&self, grant: &ProcessGrant) -> Arc<dyn crate::computer_grants::AppCode> {
+        #[cfg(test)]
+        if self.session.proof_for_test.is_some() {
+            return Arc::new(crate::computer_grants::SignedByFixtureTeam);
+        }
+        let mut grant = grant.clone();
+        grant.process_generation_evidence =
+            semantic::kernel_generation(&grant.process_generation_evidence);
         match &self.session.identity {
             Some(reader) => Arc::new(crate::management::LinuxAppCode {
-                grant: grant.clone(),
+                grant,
                 reader: Arc::clone(reader),
             }),
             None => Arc::new(crate::computer_grants::NoIdentityReader),
@@ -280,9 +582,13 @@ impl LinuxDriver {
             .ok_or(IdentityRefusal::AppIdentityUnproven)?
             .reprove(
                 grant.pid,
-                &grant.process_generation_evidence,
+                &semantic::kernel_generation(&grant.process_generation_evidence),
                 &grant.bundle_identity,
             )
+    }
+
+    fn source(&self) -> Source {
+        Source(self.session.clone())
     }
 }
 
@@ -328,16 +634,76 @@ impl PlatformDriver for LinuxDriver {
         }))
     }
 
+    fn read_accessibility_tree(
+        &mut self,
+        request: AccessibilityTreeRequest,
+    ) -> Result<AccessibilityTreeResult, DriverError> {
+        self.source().accessibility_tree(request)
+    }
+
+    fn read_accessibility_element(
+        &mut self,
+        request: AccessibilityElementReadRequest,
+    ) -> Result<AccessibilityElementReadResult, DriverError> {
+        self.source().scoped_read(request)
+    }
+
+    fn resolve_element(
+        &mut self,
+        request: ElementResolutionRequest,
+    ) -> Result<ElementResolutionResult, DriverError> {
+        self.resolved = None;
+        let (resolution, handle) = self.source().resolve(request)?;
+        self.resolved = Some((resolution.clone(), handle));
+        Ok(resolution)
+    }
+
+    fn dispatch_semantic(
+        &mut self,
+        request: SemanticDispatchRequest,
+    ) -> Result<DispatchResult, DriverError> {
+        let (resolved, handle) = self
+            .resolved
+            .take()
+            .filter(|(resolved, _)| *resolved == request.element)
+            .ok_or(DriverError::StartupRefused("stale_reference"))?;
+        if request.action != SEMANTIC_PRESS_ACTION
+            || !resolved.semantic_actions.contains(&request.action)
+        {
+            return Err(DriverError::Unsupported("AT-SPI action"));
+        }
+        self.source().press(&handle).map_err(|error| match error {
+            ElementActionError::PlatformRefused(reason) => DriverError::StartupRefused(reason),
+            _ => DriverError::Semantic(SemanticDriverError::PathUnavailable),
+        })?;
+        Ok(DispatchResult {
+            accepted_by_platform: true,
+            effect_status: EffectStatus::EffectIndeterminate,
+            unreadable_subtrees: 0,
+            delivery_posts_returned: 1,
+            delivery_generation_verifications: 1,
+        })
+    }
+
+    fn observe_effect(
+        &mut self,
+        request: EffectObservationRequest,
+    ) -> Result<EffectObservationResult, DriverError> {
+        Ok(self.source().effect(request))
+    }
+
+    fn query_focus(&mut self, request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError> {
+        // AT-SPI focus is reported by the app. Never use it as evidence that
+        // seat input would reach a particular process or surface.
+        let _ = self.source().focused_element(&request.target);
+        Err(DriverError::StartupRefused("focus_unreadable"))
+    }
+
     unsupported!(DriverError::Unsupported("Linux desktop backend");
-        fn read_accessibility_tree(_request: AccessibilityTreeRequest) -> Result<AccessibilityTreeResult, DriverError>;
-        fn resolve_element(_request: ElementResolutionRequest) -> Result<ElementResolutionResult, DriverError>;
-        fn dispatch_semantic(_request: SemanticDispatchRequest) -> Result<DispatchResult, DriverError>;
         fn dispatch_per_pid(_request: SyntheticDispatchRequest, _cancelled: &dyn Fn() -> bool) -> Result<DispatchResult, DriverError>;
         fn dispatch_global(_request: GlobalDispatchRequest, _cancelled: &dyn Fn() -> bool) -> Result<DispatchResult, DriverError>;
-        fn query_focus(_request: FocusQueryRequest) -> Result<FocusQueryResult, DriverError>;
         fn fronting_snapshot(_target: &ProcessGrant) -> Result<FrontingSnapshot, DriverError>;
         fn observe_input(_request: InputObservationRequest) -> Result<InputObservationResult, DriverError>;
-        fn observe_effect(_request: EffectObservationRequest) -> Result<EffectObservationResult, DriverError>;
     );
 }
 
@@ -363,6 +729,10 @@ impl CaptureBackend for LinuxCaptureBackend {
 }
 
 #[cfg(test)]
+#[path = "linux_semantic_tests.rs"]
+mod semantic_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use cerebellum_computer::platform::vocabulary::validate_capability_result;
@@ -378,6 +748,7 @@ mod tests {
         );
         let driver = LinuxDriver {
             session: Arc::new(LinuxSession::new(false, Arc::default())),
+            resolved: None,
         };
         let placeholder = ProcessGrant {
             pid: 0,
@@ -477,7 +848,7 @@ mod tests {
         assert!(session.epoch.lock().await.is_none());
     }
 
-    fn bind_fixture(planes: &crate::Planes) {
+    pub(super) fn bind_fixture(planes: &crate::Planes) {
         planes.routes.insert(7, 1, crate::AcceptedBindFacts::from_bind(
             &subc_protocol::BindIdentity::new("test", "session".to_string()),
             crate::session_caller_principal_for_test(),
@@ -487,7 +858,7 @@ mod tests {
         ));
     }
 
-    fn request(corr: u64, name: &str, arguments: Value) -> Frame {
+    pub(super) fn request(corr: u64, name: &str, arguments: Value) -> Frame {
         Frame::build(
             FrameType::Request,
             subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, true),

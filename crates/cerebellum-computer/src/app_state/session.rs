@@ -89,6 +89,8 @@ struct Entry {
     number: u64,
     handle: ElementHandle,
     signature: String,
+    #[cfg(target_os = "linux")]
+    atspi_text_digest: Option<[u8; 32]>,
     /// Whether the element was seen by the last read that could tell,
     /// which is what a diff compares against and what `resolve` requires.
     in_baseline: bool,
@@ -157,6 +159,8 @@ impl Session {
                 number,
                 handle,
                 signature,
+                #[cfg(target_os = "linux")]
+                atspi_text_digest: None,
                 in_baseline: false,
                 absent_reads: 0,
                 refusing,
@@ -851,6 +855,24 @@ impl AppStateSessions {
         self.lock().sessions.get(&key)?.seen.clone()
     }
 
+    /// Compare the full readable text, not the renderer's folded or clipped label.
+    #[cfg(target_os = "linux")]
+    pub fn atspi_text_digest(
+        &self,
+        conversation_key: &str,
+        target: &ProcessGrant,
+        handle: &ElementHandle,
+    ) -> Option<[u8; 32]> {
+        let state = self.lock();
+        let session = state
+            .sessions
+            .get(&SessionKey::new(conversation_key, target))?;
+        let entry = session.entries.get(&session.find(handle)?)?;
+        entry
+            .atspi_text_digest
+            .filter(|_| entry.in_baseline && !entry.refusing)
+    }
+
     /// Where an element id leads, for the conversation holding it.
     pub fn resolve(&self, conversation_key: &str, element_id: &str) -> ElementResolution {
         let Some((tag, number)) = parse_element_id(element_id) else {
@@ -1142,6 +1164,16 @@ impl Walk<'_> {
             entry.in_apple_menu = in_apple_menu;
             entry.is_apple_menu = is_apple_menu;
             entry.selected_menu = selected_menu;
+            #[cfg(target_os = "linux")]
+            if crate::platform::linux::Source::token_grant(&element.handle).is_some() {
+                entry.atspi_text_digest = match &element.value {
+                    super::source::ElementValue::Text(text) => {
+                        use sha2::{Digest, Sha256};
+                        Some(Sha256::digest(text.as_bytes()).into())
+                    }
+                    _ => None,
+                };
+            }
             if element.closed_menu_children > 0 {
                 self.closed_menus.insert(number);
             }

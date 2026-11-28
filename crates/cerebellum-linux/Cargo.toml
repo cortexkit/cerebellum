@@ -8,6 +8,7 @@ description = "Linux process readings, ptrace launch barrier and read-only EDS D
 
 [features]
 desk-probe = []
+atspi-test-support = ["zbus/service"]
 
 [lib]
 name = "cerebellum_linux"

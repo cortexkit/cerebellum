@@ -10,6 +10,8 @@
 //! the callers own transport, deadlines, and the admission sequence.
 
 #[cfg(target_os = "linux")]
+pub mod atspi;
+#[cfg(target_os = "linux")]
 pub mod bridge;
 #[cfg(target_os = "linux")]
 pub mod eds;
