@@ -494,15 +494,13 @@ fn rpm_db_files(
         let metadata = open_component(dir, &name)
             .and_then(|file| file.metadata())
             .map_err(rpm_io(stage, &path))?;
-        if !metadata.is_file() || !protected(&metadata) {
-            return Err(RpmQueryFailure::Unprotected {
-                stage,
-                path,
-                uid: metadata.uid(),
-                mode: metadata.mode(),
-            });
-        }
-        let stamp = rpm_file_stamp(&name, image_key(&metadata));
+        let stamp = checked_rpm_file_stamp(
+            stage,
+            path,
+            metadata.uid(),
+            metadata.mode(),
+            image_key(&metadata),
+        )?;
         files.push((name, stamp));
     }
     files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -550,15 +548,31 @@ fn snapshot_change(before: &[RpmDbEntry], after: &[RpmDbEntry]) -> Option<Snapsh
         })
 }
 
-fn rpm_file_stamp(name: &OsStr, mut key: ImageKey) -> ImageKey {
-    if name == "rpmdb.sqlite-shm" {
-        // SQLite updates its shared-memory index and reader locks during a
-        // query. Keep exact stamps for the database and its write-ahead log,
-        // where package records live; still check this sidecar's identity and size.
-        key.mtime = (0, 0);
+fn checked_rpm_file_stamp(
+    stage: &'static str,
+    path: PathBuf,
+    uid: u32,
+    mode: u32,
+    mut key: ImageKey,
+) -> Result<ImageKey, RpmQueryFailure> {
+    if mode & libc::S_IFMT != libc::S_IFREG || !protected_ownership(uid, mode) {
+        return Err(RpmQueryFailure::Unprotected {
+            stage,
+            path,
+            uid,
+            mode,
+        });
+    }
+    if matches!(
+        path.file_name().map(OsStrExt::as_bytes),
+        Some(b"rpmdb.sqlite-wal" | b"rpmdb.sqlite-shm")
+    ) {
+        // Opening a SQLite database can reapply permissions to its sidecars.
+        // Only ctime may differ, and only after verifying ownership and mode.
+        // Keep size and mtime checks for writes and all checks on the database.
         key.ctime = (0, 0);
     }
-    key
+    Ok(key)
 }
 
 fn query_rpm(root: &File, db: &Path) -> Result<Vec<u8>, RpmQueryFailure> {
@@ -947,44 +961,116 @@ mod tests {
             .is_none());
     }
 
+    const EMPTY_WAL: ImageKey = ImageKey {
+        dev: 8,
+        ino: 42,
+        size: 0,
+        mtime: (10, 20),
+        ctime: (10, 20),
+    };
+    const CTIME_CHANGED: ImageKey = ImageKey {
+        ctime: (10, 30),
+        ..EMPTY_WAL
+    };
+    const PROTECTED_FILE: u32 = libc::S_IFREG | 0o644;
+
+    fn entry(name: &str, stamp: ImageKey) -> RpmDbEntry {
+        let path = Path::new("/var/lib/rpm").join(name);
+        let stamp = checked_rpm_file_stamp(
+            "read protected database files",
+            path,
+            0,
+            PROTECTED_FILE,
+            stamp,
+        )
+        .unwrap();
+        (name.into(), stamp)
+    }
+
     #[test]
-    fn rpm_snapshot_distinguishes_sqlite_reader_bookkeeping_from_database_changes() {
-        let before = ImageKey {
-            dev: 8,
-            ino: 42,
-            size: 32768,
-            mtime: (10, 20),
-            ctime: (10, 20),
-        };
-        let after_read = ImageKey {
-            mtime: (10, 30),
-            ctime: (10, 30),
-            ..before
-        };
-        let shared_memory = OsStr::new("rpmdb.sqlite-shm");
-        assert_eq!(
-            rpm_file_stamp(shared_memory, before),
-            rpm_file_stamp(shared_memory, after_read),
-            "a query may update the SQLite read-lock index"
-        );
-        for filename in ["rpmdb.sqlite", "rpmdb.sqlite-wal", "Packages", "other-shm"] {
-            let path = OsStr::new(filename);
-            assert_ne!(
-                rpm_file_stamp(path, before),
-                rpm_file_stamp(path, after_read),
-                "{filename} must retain its timestamp evidence"
+    fn rpm_wal_ctime_only_change_is_bookkeeping() {
+        for name in ["rpmdb.sqlite-wal", "rpmdb.sqlite-shm"] {
+            assert_eq!(
+                snapshot_change(&[entry(name, EMPTY_WAL)], &[entry(name, CTIME_CHANGED)]),
+                None,
+                "{name}"
             );
         }
-        for changed in [
-            ImageKey { dev: 9, ..before },
-            ImageKey { ino: 43, ..before },
-            ImageKey { size: 0, ..before },
-        ] {
-            assert_ne!(
-                rpm_file_stamp(shared_memory, before),
-                rpm_file_stamp(shared_memory, changed),
-                "the shared-memory file must not be replaced or resized"
+    }
+
+    #[test]
+    fn rpm_wal_size_change_invalidates_the_snapshot() {
+        let name = "rpmdb.sqlite-wal";
+        let after = ImageKey {
+            size: 4096,
+            ..CTIME_CHANGED
+        };
+        assert!(
+            matches!(snapshot_change(&[entry(name, EMPTY_WAL)], &[entry(name, after)]), Some(SnapshotChange::Changed { fields, .. }) if fields == ["size"])
+        );
+    }
+
+    #[test]
+    fn rpm_sidecar_mtime_change_invalidates_the_snapshot() {
+        let after = ImageKey {
+            mtime: (10, 30),
+            ..CTIME_CHANGED
+        };
+        for name in ["rpmdb.sqlite-wal", "rpmdb.sqlite-shm"] {
+            assert!(
+                matches!(snapshot_change(&[entry(name, EMPTY_WAL)], &[entry(name, after)]), Some(SnapshotChange::Changed { fields, .. }) if fields == ["mtime"]),
+                "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn rpm_main_database_ctime_change_invalidates_the_snapshot() {
+        for name in ["rpmdb.sqlite", "Packages", "other-shm", "other-wal"] {
+            assert!(
+                matches!(snapshot_change(&[entry(name, EMPTY_WAL)], &[entry(name, CTIME_CHANGED)]), Some(SnapshotChange::Changed { fields, .. }) if fields == ["ctime"]),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rpm_sidecars_must_still_be_root_owned_and_protected_after_the_query() {
+        let stage = "read protected database files after rpm";
+        for name in ["rpmdb.sqlite-wal", "rpmdb.sqlite-shm"] {
+            let _before = entry(name, EMPTY_WAL);
+            let path = Path::new("/var/lib/rpm").join(name);
+            for (uid, mode) in [
+                (1000, PROTECTED_FILE),
+                (0, PROTECTED_FILE | 0o020),
+                (0, PROTECTED_FILE | 0o002),
+            ] {
+                let refusal = checked_rpm_file_stamp(stage, path.clone(), uid, mode, CTIME_CHANGED);
+                assert!(
+                    matches!(refusal, Err(RpmQueryFailure::Unprotected { stage: "read protected database files after rpm", path: rejected, uid: owner, mode: flags }) if rejected == path && owner == uid && flags == mode)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rpm_sidecar_replacement_invalidates_the_snapshot() {
+        for name in ["rpmdb.sqlite-wal", "rpmdb.sqlite-shm"] {
+            for after in [
+                ImageKey {
+                    dev: 9,
+                    ..CTIME_CHANGED
+                },
+                ImageKey {
+                    ino: 43,
+                    ..CTIME_CHANGED
+                },
+            ] {
+                assert!(
+                    snapshot_change(&[entry(name, EMPTY_WAL)], &[entry(name, after)]).is_some(),
+                    "{name}"
+                );
+            }
         }
     }
 

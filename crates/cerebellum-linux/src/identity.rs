@@ -432,7 +432,11 @@ fn same_file(a: &Metadata, b: &Metadata) -> bool {
 }
 
 fn protected(meta: &Metadata) -> bool {
-    meta.uid() == 0 && meta.mode() & 0o022 == 0
+    protected_ownership(meta.uid(), meta.mode())
+}
+
+fn protected_ownership(uid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o022 == 0
 }
 
 fn open_path(path: &Path) -> io::Result<File> {
