@@ -334,10 +334,17 @@ if [[ ${1:-} == --preflight ]]; then
   shift
 fi
 
-# Feature flags may come from a direct caller as well as the workflow.
+# A release build takes no feature switches from its caller: the shipped
+# feature set is the crates' defaults, and test-only features (the bridge test
+# identities, the Chrome-for-Testing parent probe) must never ride in through
+# "$@". Refusing every feature argument covers all of them, including ones
+# added later.
 for arg in "$@"; do
   case "$arg" in
-    *bridge-test-identities*|--all-features)
+    --*features* | -F | -F*)
+      echo "error: release builds accept no feature arguments (got: $arg)." >&2
+      exit 1 ;;
+    *bridge-test-identities*)
       echo 'error: bridge-test-identities is forbidden in a release build.' >&2
       exit 1 ;;
   esac
