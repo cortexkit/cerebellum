@@ -73,6 +73,9 @@ impl SessionCleanup for Cleanup {
     }
 }
 
+const UNBOUND_WINDOWS: bool = cfg!(all(windows, not(feature = "windows-browser-release")));
+const UNBOUND_WINDOWS_REPLY: &str = r#"{"code":"tool_disabled","message":"browser_use is disabled since this session started","detail":{"tool":"browser_use"}}"#;
+
 async fn reply(args: Value, ready: bool) -> Vec<u8> {
     let config = BrowserConfig {
         executable_path: None,
@@ -166,8 +169,12 @@ async fn reply(args: Value, ready: bool) -> Vec<u8> {
     handle_tool_request_for_test_with_planes(frame(args, 2), &writer, &planes)
         .await
         .unwrap();
-    let response = output.recv().await.unwrap().body;
-    if ready {
+    let response = output.recv().await.unwrap();
+    if UNBOUND_WINDOWS {
+        assert_eq!(response.header.ty, FrameType::Error);
+    }
+    let response = response.body;
+    if ready && !UNBOUND_WINDOWS {
         assert_eq!(
             serde_json::from_slice::<Value>(&response).unwrap()["outcome"],
             "ok",
@@ -282,16 +289,30 @@ async fn own_replies_are_byte_identical_to_the_pre_user_build() {
     let goldens: Vec<String> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(goldens.len(), cases.len());
     for ((args, ready), golden) in cases.into_iter().zip(goldens) {
+        // Even a ready synthetic browser must be unreachable with the key off.
+        // The withheld reply has no snapshot ID, so its bytes are not rewritten.
+        let golden = if UNBOUND_WINDOWS {
+            UNBOUND_WINDOWS_REPLY
+        } else {
+            golden.as_str()
+        };
         assert_eq!(
-            with_golden_snapshot_id(reply(args.clone(), ready).await, &golden),
+            with_golden_snapshot_id(reply(args.clone(), ready).await, golden),
             golden.as_bytes()
         );
         let mut own = args;
         own["browser"] = json!("own");
         assert_eq!(
-            with_golden_snapshot_id(reply(own, ready).await, &golden),
+            with_golden_snapshot_id(reply(own, ready).await, golden),
             golden.as_bytes()
         );
     }
-    println!("compared 10 own replies against 5 pre-user-build byte goldens");
+    println!(
+        "compared 10 own replies against {}",
+        if UNBOUND_WINDOWS {
+            "the unbound Windows refusal bytes"
+        } else {
+            "5 pre-user-build byte goldens"
+        }
+    );
 }
