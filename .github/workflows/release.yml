@@ -75,6 +75,9 @@ jobs:
 
   preflight:
     needs: verify
+    # The gate job is skipped on a manual rehearsal, and a skipped ancestor
+    # skips every job below it unless the job tests its own needs.
+    if: ${{ !cancelled() && needs.verify.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
