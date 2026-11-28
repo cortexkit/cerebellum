@@ -328,18 +328,70 @@ for exported in $(compgen -v | grep '^CEREBELLUM_' || true); do
   fi
 done
 
+preflight_only=false
+if [[ ${1:-} == --preflight ]]; then
+  preflight_only=true
+  shift
+fi
+
+# Feature flags may come from a direct caller as well as the workflow.
+for arg in "$@"; do
+  case "$arg" in
+    *bridge-test-identities*|--all-features)
+      echo 'error: bridge-test-identities is forbidden in a release build.' >&2
+      exit 1 ;;
+  esac
+done
+if [[ -n ${CARGO_FEATURE_BRIDGE_TEST_IDENTITIES:-} || ${RUSTFLAGS:-} == *bridge-test-identities* ||
+      ${CARGO_ENCODED_RUSTFLAGS:-} == *bridge-test-identities* ]]; then
+  echo 'error: bridge-test-identities is forbidden in a release build.' >&2
+  exit 1
+fi
+
+linux_review=${CEREBELLUM_LINUX_USER_BROWSER_REVIEW_REVISION:-}
+windows_review=${CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION:-}
+if [[ $linux_review == ci-unreviewed || $windows_review == ci-unreviewed ]]; then
+  echo 'error: ci-unreviewed is forbidden in a release build.' >&2
+  exit 1
+fi
+
+# The verifier checks the decoded Ed25519 key, including the test-key ban.
+# Refuse Cargo path dependencies outside this checkout before compiling the tool.
+scripts/check-repo-path-deps.sh
+if [[ -n $linux_review || -n $windows_review || -n ${CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY:-} ]]; then
+  cargo run --locked -q -p cerebellum-bridge-protocol --bin peer-trailer -- preflight
+fi
+if $preflight_only; then
+  exit 0
+fi
+
+build_host=false
+target=$(rustc --print host-tuple)
+case "$target" in
+  *-linux-*)   [[ -z $linux_review ]] || build_host=true; unset CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION ;;
+  *-windows-*) [[ -z $windows_review ]] || build_host=true; unset CEREBELLUM_LINUX_USER_BROWSER_REVIEW_REVISION ;;
+  *) unset CEREBELLUM_LINUX_USER_BROWSER_REVIEW_REVISION CEREBELLUM_WINDOWS_USER_BROWSER_REVIEW_REVISION ;;
+esac
+if ! $build_host; then
+  unset CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY
+fi
+
 echo "==> building with the attestations that exist"
 for name in "${ATTESTATIONS[@]}"; do
-  printf '    %-48s %s\n' "$name" "${!name:-<unbound>}"
+  value=${!name:-<unbound>}
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+    printf -v value '%q' "$value"
+  fi
+  printf '    %-48s %s\n' "$name" "$value"
 done
 
-# Registry checksums and pinned git revisions identify the dependency source.
-# Refuse external paths before building, and refuse lockfile re-resolution.
-scripts/check-repo-path-deps.sh
 cargo build --release --locked -p cerebellum --bin ck-cerebellum "$@"
+if $build_host; then
+  cargo build --release --locked -p cerebellum-native-host --bin ck-cerebellum-native-host "$@"
+fi
 
 echo
 echo "==> what this build advertises"
 # Read from the production path rather than restated here, so this cannot claim
 # a capability the build does not actually offer.
-cargo run --release -q -p cerebellum --example what_ships
+cargo run --release --locked -q -p cerebellum --example what_ships
