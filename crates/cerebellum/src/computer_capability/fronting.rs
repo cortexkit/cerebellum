@@ -517,9 +517,13 @@ impl Admission {
     /// review (which a build binds only together with the bracket review),
     /// an attended session, and a caller that is not an older agent run.
     pub(super) fn may_front_image(self) -> Result<(), FrontingStop> {
+        self.may_front_image_with_release(self.app_use_fronting_admitted && self.bracket_admitted)
+    }
+
+    pub(super) fn may_front_image_with_release(self, reviewed: bool) -> Result<(), FrontingStop> {
         if !self.attended || self.agent_run {
             Err(FrontingStop::Unattended)
-        } else if !self.app_use_fronting_admitted || !self.bracket_admitted {
+        } else if !reviewed {
             Err(FrontingStop::FrontingNotAdmitted)
         } else {
             Ok(())

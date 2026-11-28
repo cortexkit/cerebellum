@@ -42,7 +42,7 @@ pub use macos::{
     MacOs26PlatformDriver, PrivateEnvelopeStartupProbe, StartupProbeInput, MACOS_MAJOR_VERSION,
 };
 #[cfg(target_os = "windows")]
-pub use windows::{WindowsPlatformDriver, WindowsUnsupportedCaptureBackend};
+pub use windows::{WindowsCaptureBackend, WindowsPlatformDriver};
 
 pub mod vocabulary;
 pub use vocabulary::{

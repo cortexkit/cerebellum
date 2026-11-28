@@ -579,6 +579,22 @@ pub fn open_fence() -> AcquisitionFence {
 /// non-blocking.  In particular, teardown is split into begin/poll so a revoked
 /// stream cannot wedge the health lane while the window-server releases it.
 pub trait CaptureBackend {
+    /// A background-only picture backend uses target-bound window pixels, not
+    /// the legacy visibility and fronted-capture controller.
+    const BACKGROUND_WINDOW_PICTURE: bool = false;
+
+    fn capture_background_picture(
+        &mut self,
+        _target: &ProcessGrant,
+        _deadline: std::time::Instant,
+        _may_acquire: &AcquisitionFence,
+    ) -> Result<
+        crate::app_state::image::WindowImageCapture,
+        crate::app_state::image::ImageUnavailable,
+    > {
+        Err(crate::app_state::image::ImageUnavailable::CaptureUnavailable)
+    }
+
     /// Whether this operating system has a capture implementation at all.
     ///
     /// This precedes permission checks so a platform with no backend is never

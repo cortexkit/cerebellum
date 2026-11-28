@@ -1,4 +1,4 @@
-//! Windows UI Automation driver and an explicitly unsupported capture backend.
+//! Windows UI Automation driver and window picture backend.
 //!
 //! Operating-system calls are confined to `cfg(target_os = "windows")` blocks.
 //! The decisions made from their readings remain ordinary Rust so every host can
@@ -11,6 +11,8 @@ pub mod app_state;
 pub mod identity;
 #[cfg(windows)]
 pub mod launch;
+#[cfg(windows)]
+pub mod picture;
 use crate::capture::{
     BackendError, BackendTeardownProgress, BroadDisplayCaptureRequest, CaptureArtifact,
     CaptureBackend, EnumeratedWindow, WindowCaptureFrame, WindowCaptureRequest, WindowChange,
@@ -42,11 +44,28 @@ impl WindowsElevation {
     }
 }
 
-/// A capture backend whose type makes Windows capture absence explicit.
+/// Use Windows Graphics Capture for a single window picture. The legacy
+/// display and streaming entry points remain unsupported.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct WindowsUnsupportedCaptureBackend;
+pub struct WindowsCaptureBackend;
 
-impl CaptureBackend for WindowsUnsupportedCaptureBackend {
+impl CaptureBackend for WindowsCaptureBackend {
+    #[cfg(windows)]
+    const BACKGROUND_WINDOW_PICTURE: bool = true;
+
+    #[cfg(windows)]
+    fn capture_background_picture(
+        &mut self,
+        target: &ProcessGrant,
+        deadline: std::time::Instant,
+        may_acquire: &crate::capture::AcquisitionFence,
+    ) -> Result<
+        crate::app_state::image::WindowImageCapture,
+        crate::app_state::image::ImageUnavailable,
+    > {
+        picture::capture(target, deadline, may_acquire)
+    }
+
     fn platform_support(&self) -> Result<(), BackendError> {
         Err(BackendError::UnsupportedOnPlatform)
     }
@@ -1586,7 +1605,7 @@ mod tests {
 
     #[test]
     fn windows_declares_no_capture_capability() {
-        let backend = WindowsUnsupportedCaptureBackend;
+        let backend = WindowsCaptureBackend;
         assert_eq!(
             backend.platform_support(),
             Err(BackendError::UnsupportedOnPlatform)

@@ -2126,6 +2126,7 @@ mod tests {
             crop_origin_y: 0.0,
             scale: 1.0,
             backing_scale: 2.0,
+            desktop_per_image_y: None,
         };
         assert_eq!(desktop_to_image(&mapping, (93.0, 92.0)).unwrap(), (26, 24));
         assert_eq!(

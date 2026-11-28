@@ -20,6 +20,7 @@ pub(super) struct ImageReadTrace {
     pub evidence: std::cell::RefCell<ImageReadEvidence>,
     pub withholding: std::cell::Cell<Option<ImageWithholding>>,
     pub fronting_bound_ms: std::cell::Cell<Option<u64>>,
+    pub background_fronting: std::cell::Cell<Option<super::fronting::Fronting>>,
 }
 
 #[derive(Default)]
@@ -36,6 +37,7 @@ pub(super) struct ImageReadPlan {
     pub hooks: Option<super::fronting::CellHooks>,
     /// What the read's row records of the front, as known before the image.
     pub fronting: Option<super::fronting::Fronting>,
+    pub background_picture: Option<super::read_image_background::PicturePlan>,
 }
 
 pub(super) fn capture<B: CaptureBackend, D: PlatformDriver>(
@@ -383,6 +385,7 @@ fn window_image(captured: SingleWindowCapture, grant: &ProcessGrant) -> WindowIm
             captured.frame.captured_width_px,
             captured.frame.captured_height_px,
         ),
+        exact_axes: false,
         jpeg: captured.frame.jpeg,
     }
 }

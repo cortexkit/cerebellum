@@ -20,6 +20,8 @@ mod accessibility;
 #[cfg(windows)]
 mod browser_image;
 #[cfg(windows)]
+mod capture_facts;
+#[cfg(windows)]
 mod devtools_pipe;
 #[cfg(windows)]
 mod file_identity;
@@ -69,6 +71,11 @@ pub use browser_image::{
     ProgramFilesDirectory, SignatureReading, SignerSubject,
 };
 #[cfg(windows)]
+pub use capture_facts::{
+    capture_support, first_window_jpeg, per_monitor_v2, set_process_per_monitor_v2,
+    window_capture_properties, FrameReadError, WindowCaptureProperties, WindowFrameMetadata,
+};
+#[cfg(windows)]
 pub use devtools_pipe::{spawn_with_devtools_pipe, DevToolsPipeReader, DevToolsProcess};
 #[cfg(windows)]
 pub use file_identity::{file_identity, FileIdentity};
@@ -76,6 +83,12 @@ pub use file_identity::{file_identity, FileIdentity};
 pub use image_file_facts::{
     lock_image_file, retain_image_process, ImageMappingReading, LockedImageFile,
     ProcessPackageFields,
+};
+#[cfg(windows)]
+pub use launch_facts::{
+    activate_application, last_input_tick, package_applications, process_parents, read_shortcut,
+    registered_packages, start_menu_directories, suspended_process, PackageApplication,
+    RegisteredPackage, ShortcutFields, SuspendedProcess,
 };
 #[cfg(all(windows, feature = "bridge-test-identities"))]
 pub use named_pipe::create_test_pipe_instance_default_security;
@@ -90,12 +103,6 @@ pub use named_pipe_server::create_named_pipe_instance;
 pub use process_readings::system_time_100ns;
 #[cfg(windows)]
 pub use registry_values::set_current_user_default_string;
-#[cfg(windows)]
-pub use launch_facts::{
-    activate_application, last_input_tick, package_applications, process_parents, read_shortcut,
-    registered_packages, start_menu_directories, suspended_process, PackageApplication,
-    RegisteredPackage, ShortcutFields, SuspendedProcess,
-};
 #[cfg(windows)]
 pub use signer_facts::{AuthenticodeFacts, SignerFields};
 #[cfg(target_os = "windows")]

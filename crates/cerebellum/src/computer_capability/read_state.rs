@@ -88,7 +88,10 @@ where
         let bring_to_front = parsed.include_image
             && parsed.bring_to_front
             && fronting_admission.mode == cerebellum_core::config::AppUse::Background;
-        if bring_to_front && fronting_admission.may_front_image().is_ok() {
+        if !B::BACKGROUND_WINDOW_PICTURE
+            && bring_to_front
+            && fronting_admission.may_front_image().is_ok()
+        {
             if let Some(mut refusal) = self
                 .refuse_if_person_changed(management, &identity.conversation_key, &grant)
                 .await
@@ -470,7 +473,28 @@ where
         // mode temporarily brings an app forward for its picture and restores.
         let mut image_hooks = None;
         let mut image_fronting = None;
-        if bring_to_front && image_permission_live && fronting_admission.may_front_image().is_ok() {
+        let background_picture = (B::BACKGROUND_WINDOW_PICTURE
+            && parsed.include_image
+            && image_permission_live)
+            .then(|| {
+                use std::time::{Duration, Instant};
+                let phase_end =
+                    Instant::now() + Duration::from_millis(crate::budgets::CAPTURE_IMAGE_MS);
+                let call_end = work.deadline();
+                let capture_end = call_end
+                    .checked_sub(Duration::from_millis(crate::budgets::STORE_MS))
+                    .unwrap_or(call_end);
+                let end = phase_end.min(capture_end);
+                let fallback = bring_to_front.then(|| {
+                    fronting_admission.may_front_image_with_release(self.fronting_bracket_admitted)
+                });
+                read_image_background::PicturePlan::new(end, fallback)
+            });
+        if !B::BACKGROUND_WINDOW_PICTURE
+            && bring_to_front
+            && image_permission_live
+            && fronting_admission.may_front_image().is_ok()
+        {
             let call = fronting::FrontCall {
                 grant: &grant,
                 consent: &consent,
@@ -525,11 +549,12 @@ where
                     gate: None,
                     hooks: image_hooks.clone(),
                     fronting: Some(planned_fronting),
+                    background_picture,
                 },
             )
             .await
         {
-            Ok((Some(image), _, fronting)) => {
+            Ok((Some(image), _, fronting, _)) => {
                 if let Some(fronting) = fronting {
                     reply["image_fronting"] = json!(fronting);
                 }
@@ -564,7 +589,8 @@ where
                     "height_px": image.height_px,
                 });
             }
-            Ok((None, Some((reason, detail)), fronting)) => {
+            Ok((None, Some((reason, detail)), fronting, background_fronting)) => {
+                image_fronting = background_fronting.or(image_fronting);
                 reply["image_unavailable"] = json!({"reason": reason.as_str()});
                 if let Some(detail) = detail {
                     reply["image_unavailable"]["detail"] = detail;
@@ -573,7 +599,7 @@ where
                     reply["image_fronting"] = json!(fronting);
                 }
             }
-            Ok((None, None, _)) => {
+            Ok((None, None, _, _)) => {
                 if parsed.include_image && !image_permission_live {
                     reply["image_unavailable"] = json!({
                         "reason": ImageUnavailable::ScreenRecordingNotLive.as_str(),
@@ -625,6 +651,7 @@ where
             Option<ReleasedImage>,
             Option<(ImageUnavailable, Option<Value>)>,
             Option<ImageFronting>,
+            Option<fronting::Fronting>,
         ),
         ImageUnavailable,
     > {
@@ -661,6 +688,7 @@ where
                 ),
                 withholding: std::cell::Cell::new(None),
                 fronting_bound_ms: std::cell::Cell::new(None),
+                background_fronting: std::cell::Cell::new(None),
             };
             let mut custody = AuditImageCustody {
                 audit: &audit,
@@ -677,9 +705,19 @@ where
                 custody
                     .finalize_read(reservation, false)
                     .map_err(|_| ImageUnavailable::AuditUnavailable)?;
-                return Ok((None, None, None));
+                return Ok((None, None, None, None));
             };
             let image = release_through_custody(&mut custody, || {
+                if let Some(plan) = &image_plan.background_picture {
+                    return read_image_background::capture(
+                        backend,
+                        &grant,
+                        plan,
+                        image_plan.cancel.clone(),
+                        image_plan.gate.clone(),
+                        &trace,
+                    );
+                }
                 // The observed bracket posts a heartbeat, just as keys does;
                 // do not mistake that input for the person's next action.
                 let mut posting = image_plan.hooks.as_ref().map(|_| {
@@ -710,8 +748,9 @@ where
                 return Err(ImageUnavailable::AuditUnavailable);
             }
             let fronting = trace.evidence.into_inner().fronting;
+            let background_fronting = trace.background_fronting.get();
             Ok(match image {
-                Ok(image) => (Some(image), None, fronting),
+                Ok(image) => (Some(image), None, fronting, background_fronting),
                 Err(reason) => {
                     let detail = match reason {
                         ImageUnavailable::FrontingBoundExceeded => trace
@@ -721,7 +760,7 @@ where
                         _ => image_withholding::record(reason, trace.withholding.get())
                             .map(image_withholding::ImageWithholding::detail),
                     };
-                    (None, Some((reason, detail)), fronting)
+                    (None, Some((reason, detail)), fronting, background_fronting)
                 }
             })
         })
