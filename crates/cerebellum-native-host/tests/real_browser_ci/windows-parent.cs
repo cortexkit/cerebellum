@@ -58,19 +58,35 @@ internal static class ParentFixture {
         const int ProcThreadAttributeParentProcess = 0x00020000;
         const uint ExtendedStartupInfoPresent = 0x00080000;
         const uint CreateSuspended = 0x00000004;
+        const uint CreateNewConsole = 0x00000010;
+        const uint WaitTimeout = 0x00000102;
+        const int StartfUseShowWindow = 0x00000001;
+        const short SwHide = 0;
         var suspend = args[0] == "suspend";
         var image = args[1];
-        var commandLine = new StringBuilder("\"" + image + "\" " + (suspend ? "" : args[2]));
+        var line = "\"" + image + "\"";
+        if (!suspend) {
+            const string tailVariable = "CK_IMAGE_TEST_WINDOWS_CHILD_TAIL";
+            var tail = Environment.GetEnvironmentVariable(tailVariable);
+            if (tail == null) {
+                Console.Error.WriteLine("Missing {0}.", tailVariable);
+                return 1;
+            }
+            Environment.SetEnvironmentVariable(tailVariable, null);
+            line += " " + tail;
+        }
         var startup = new StartupInfoEx();
         var process = new ProcessInfo();
         var parent = IntPtr.Zero;
         var list = IntPtr.Zero;
         var initialized = false;
+        uint flags = suspend ? CreateSuspended : 0u;
         try {
-            if (suspend) {
-                startup.startup.cb = Marshal.SizeOf(typeof(StartupInfo));
-            } else {
-                parent = OpenProcess(ProcessCreateProcess, false, UInt32.Parse(args[0]));
+            startup.startup.cb = Marshal.SizeOf(typeof(StartupInfo));
+            if (!suspend) {
+                var pid = UInt32.Parse(args[0]);
+                Console.Error.WriteLine("Synthetic Chrome parent PID: {0}", pid);
+                parent = OpenProcess(ProcessCreateProcess, false, pid);
                 Require(parent != IntPtr.Zero);
                 var size = IntPtr.Zero;
                 InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
@@ -81,19 +97,44 @@ internal static class ParentFixture {
                     ref parent, new IntPtr(IntPtr.Size), IntPtr.Zero, IntPtr.Zero));
                 startup.startup.cb = Marshal.SizeOf(typeof(StartupInfoEx));
                 startup.attributes = list;
+                // Windows creates a console for a console child of a GUI process with no console.
+                // Request it explicitly here because the launcher is a console process and Chrome is only the attributed parent.
+                // https://learn.microsoft.com/en-us/windows/console/creation-of-a-console
+                // In https://github.com/cortexkit/cerebellum/actions/runs/46101578642/job/140845058992,
+                // no-parent and self-parent exited 0. Chrome parent exited 0xc0000142 with or without
+                // an explicit desktop; both Chrome-parent cases exited 0 with a new console.
+                flags |= ExtendedStartupInfoPresent | CreateNewConsole;
+
+                // Chrome sets start_hidden for cmd and direct console hosts, which
+                // sets STARTF_USESHOWWINDOW with SW_HIDE, not CREATE_NO_WINDOW.
+                // https://github.com/chromium/chromium/blob/main/chrome/browser/extensions/api/messaging/launch_context_win.cc#L260-L285
+                // https://github.com/chromium/chromium/blob/main/base/process/launch_win.cc#L360-L386
+                startup.startup.flags = StartfUseShowWindow;
+                startup.startup.show = SwHide;
+                Console.Error.WriteLine("CreateProcessW command line: {0}", line);
             }
-            Require(CreateProcessW(image, commandLine, IntPtr.Zero, IntPtr.Zero, false,
-                suspend ? CreateSuspended : ExtendedStartupInfoPresent, IntPtr.Zero, IntPtr.Zero,
-                ref startup, out process));
+            Require(CreateProcessW(image, new StringBuilder(line), IntPtr.Zero, IntPtr.Zero, false,
+                flags, IntPtr.Zero, IntPtr.Zero, ref startup, out process));
             if (suspend) {
                 File.WriteAllText(args[2], process.pid.ToString());
                 Console.ReadLine();
                 return 0;
             }
-            Require(WaitForSingleObject(process.process, 20000) == 0);
+            // Report a hung probe before the Rust harness times out waiting for the launcher.
+            uint waited = WaitForSingleObject(process.process, 10000);
+            if (waited == WaitTimeout) {
+                Console.Error.WriteLine("Child PID {0} did not exit within 10 seconds", process.pid);
+                return 1;
+            }
+            Require(waited == 0);
             uint status;
             Require(GetExitCodeProcess(process.process, out status));
-            return (int)status;
+            Console.Error.WriteLine("Child PID {0} exit code: 0x{1:X8}", process.pid, status);
+            return unchecked((int)status);
+        } catch (Win32Exception error) {
+            Console.Error.WriteLine("Could not launch or wait for {0}: Win32 error {1}: {2}",
+                image, error.NativeErrorCode, error.Message);
+            return 1;
         } finally {
             if (process.thread != IntPtr.Zero) CloseHandle(process.thread);
             if (process.process != IntPtr.Zero) {

@@ -49,11 +49,14 @@ fn write_packet(pipe: &OverlappedPipe, packet: &impl std::fmt::Display) {
 #[ignore = "subprocess entry point"]
 fn fixture_entry() {
     let root = env_path("CK_IMAGE_TEST_ROOT");
-    let name = pipe_name(&root);
-    if std::env::var("CK_IMAGE_TEST_ENTRY").unwrap() == "server" {
-        run_server(&root, &name);
-    } else {
-        run_probe(&root, &name);
+    match std::env::var("CK_IMAGE_TEST_ENTRY").unwrap().as_str() {
+        "server" => run_server(&root, &pipe_name(&root)),
+        "probe" => run_probe(&root, &pipe_name(&root)),
+        "cmd-roundtrip" => {
+            println!("fixture probe reached stdout");
+            eprintln!("fixture probe reached stderr");
+        }
+        entry => panic!("unknown fixture entry: {entry}"),
     }
 }
 
@@ -196,20 +199,24 @@ impl Suspended {
         // Holding the process before main lets the test inspect an actual
         // mapped image that would immediately exit without browser arguments.
         let report = root.join("suspended-pid");
+        let stderr = root.join("suspended-stderr");
         let mut child = Running(
             Command::new(env_path("CK_IMAGE_TEST_WINDOWS_LAUNCHER"))
                 .arg("suspend")
                 .arg(path)
                 .arg(&report)
                 .stdin(Stdio::piped())
+                .stderr(fs::File::create(&stderr).unwrap())
                 .spawn()
                 .unwrap(),
         );
         let pid = wait_for("the suspended process", || {
-            assert!(
-                child.0.try_wait().unwrap().is_none(),
-                "could not start {path:?}"
-            );
+            if let Some(status) = child.0.try_wait().unwrap() {
+                panic!(
+                    "could not start {path:?}: launcher {status}\nstderr: {}",
+                    diagnostic(&stderr)
+                );
+            }
             fs::read_to_string(&report).ok()?.parse().ok()
         });
         Self { child, pid }
@@ -223,6 +230,85 @@ impl Drop for Suspended {
         }
         assert!(self.child.wait("suspended image cleanup").success());
     }
+}
+
+fn diagnostic(path: &Path) -> String {
+    match fs::read(path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) => format!("could not read {path:?}: {error}"),
+    }
+}
+
+fn probe_command(
+    scratch: &Scratch,
+    parent_pid: u32,
+    launcher: Option<&Path>,
+    probe: &Path,
+    entry: &str,
+) -> Command {
+    let test_args = format!("--exact {CHILD} --ignored --nocapture");
+    let probe_stdout = scratch.join("probe-stdout");
+    let probe_stderr = scratch.join("probe-stderr");
+    let tail = if launcher.is_some() {
+        // cmd strips the outer quotes and redirects the probe itself because
+        // parent-fixture.exe launches cmd without passing its stdio handles.
+        let mut tail = OsString::from("/D /S /C \"\"");
+        tail.push(probe);
+        tail.push(format!("\" {test_args} > \""));
+        tail.push(&probe_stdout);
+        tail.push("\" 2> \"");
+        tail.push(&probe_stderr);
+        tail.push("\"\"");
+        tail
+    } else {
+        test_args.into()
+    };
+    let mut command = Command::new(env_path("CK_IMAGE_TEST_WINDOWS_LAUNCHER"));
+    command
+        .arg(parent_pid.to_string())
+        .arg(launcher.unwrap_or(probe))
+        // Carry cmd's quotes as data until the fixture calls CreateProcessW.
+        .env("CK_IMAGE_TEST_WINDOWS_CHILD_TAIL", tail)
+        .env("CK_IMAGE_TEST_ROOT", &scratch.0)
+        .env("CK_IMAGE_TEST_ENTRY", entry)
+        .env("CK_IMAGE_TEST_CHROME_PID", parent_pid.to_string());
+    command
+}
+
+fn probe_status(scratch: &Scratch, command: &mut Command) -> ExitStatus {
+    let launcher_stderr = scratch.join("launcher-stderr");
+    let mut child = Running(
+        command
+            .stderr(fs::File::create(&launcher_stderr).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let status = child.wait("the probe command");
+    print!(
+        "Windows probe launcher status: {status}\n{}",
+        diagnostic(&launcher_stderr)
+    );
+    status
+}
+
+fn launch_probe(
+    scratch: &Scratch,
+    parent_pid: u32,
+    launcher: Option<&Path>,
+    probe: &Path,
+    entry: &str,
+    overrides: &[(&str, &Path)],
+) {
+    let status = probe_status(
+        scratch,
+        probe_command(scratch, parent_pid, launcher, probe, entry).envs(overrides.iter().copied()),
+    );
+    assert!(
+        status.success(),
+        "Windows probe launcher ({status}) failed\nprobe stdout: {}\nprobe stderr: {}",
+        diagnostic(&scratch.join("probe-stdout")),
+        diagnostic(&scratch.join("probe-stderr"))
+    );
 }
 
 fn run_case(
@@ -240,7 +326,6 @@ fn run_case(
     if stale {
         fs::write(scratch.join("stale-generation"), []).unwrap();
     }
-    let test_args = format!("--exact {CHILD} --ignored --nocapture");
     let mut server = Running(
         Command::new(signed_server)
             .args(["--exact", CHILD, "--ignored", "--nocapture"])
@@ -256,34 +341,20 @@ fn run_case(
         );
         scratch.join("listening").exists().then_some(())
     });
-    let mut cmd = Command::new(env_path("CK_IMAGE_TEST_WINDOWS_LAUNCHER"));
-    cmd.arg(parent_pid.to_string());
-    if let Some(launcher) = launcher {
-        // cmd's /S removes the outer quotes, leaving the quoted probe path.
-        cmd.arg(launcher).arg(format!(
-            r#"/D /S /C ""{}" {test_args}""#,
-            signed_probe.display()
-        ));
-    } else {
-        cmd.arg(&signed_probe).arg(test_args);
-    }
-    let mut child = Running(
-        cmd.env("CK_IMAGE_TEST_ROOT", &scratch.0)
-            .env("CK_IMAGE_TEST_ENTRY", "probe")
-            .env("CK_IMAGE_TEST_CHROME_PID", parent_pid.to_string())
-            .envs(overrides.iter().copied())
-            .spawn()
-            .unwrap(),
-    );
-    assert!(
-        child.wait("the probe command").success(),
-        "Windows probe command failed"
+    launch_probe(
+        &scratch,
+        parent_pid,
+        launcher,
+        &signed_probe,
+        "probe",
+        overrides,
     );
     if scratch.join("refused").exists() {
         return Err(fs::read_to_string(scratch.join("refused")).unwrap());
     }
     assert_eq!(fs::read(scratch.join("accepted")).unwrap(), b"accepted");
     assert!(server.wait("the verified fixture server").success());
+    print!("{}", diagnostic(&scratch.join("probe-stdout")));
     Ok(())
 }
 
@@ -292,6 +363,28 @@ fn wrong_path(result: Result<(), String>) {
         result.unwrap_err(),
         "Windows image verification refused: UnexpectedPath"
     );
+}
+
+#[test]
+#[ignore = "requires installed Chrome Stable; run by the real-browser CI job"]
+fn cmd_launch_preserves_quoted_probe_path_and_redirection() {
+    let scratch = Scratch::new();
+    let chrome = start_chrome(&scratch);
+    let cmd = env_path("CK_IMAGE_TEST_WINDOWS_CMD");
+    let probe = scratch.join("probe with spaces.exe");
+    fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
+    launch_probe(
+        &scratch,
+        chrome.0 .0.id(),
+        Some(&cmd),
+        &probe,
+        "cmd-roundtrip",
+        &[],
+    );
+    let stdout = diagnostic(&scratch.join("probe-stdout"));
+    let stderr = diagnostic(&scratch.join("probe-stderr"));
+    assert!(stdout.contains("fixture probe reached stdout"), "{stdout}");
+    assert!(stderr.contains("fixture probe reached stderr"), "{stderr}");
 }
 
 #[test]
@@ -322,6 +415,20 @@ fn chrome_cmd_and_probe_check_native_identity_and_deadlines() {
     ));
 }
 
+fn copy_chrome_application(source: &Path, target: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let destination = target.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_chrome_application(&entry.path(), &destination)?;
+        } else {
+            fs::copy(entry.path(), destination)?;
+        }
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires Chrome Stable files; run by the real-browser CI job"]
 fn signed_chrome_copies_fail_the_machine_path_predicate() {
@@ -330,8 +437,12 @@ fn signed_chrome_copies_fail_the_machine_path_predicate() {
     let system_cmd = env_path("CK_IMAGE_TEST_WINDOWS_CMD");
     let local_root = Scratch::new();
     let local = local_root.join(r"Google\Chrome\Application\chrome.exe");
-    fs::create_dir_all(local.parent().unwrap()).unwrap();
-    fs::copy(&native, &local).unwrap();
+    // Windows resolves Chrome's side-by-side assemblies when creating the
+    // process, even when the new process stays suspended.
+    let source = native.parent().unwrap();
+    let target = local.parent().unwrap();
+    copy_chrome_application(source, target)
+        .unwrap_or_else(|error| panic!("copy Chrome from {source:?} to {target:?}: {error}"));
     let image = Suspended::image(&scratch, &local);
     wrong_path(run_case(
         image.pid,
