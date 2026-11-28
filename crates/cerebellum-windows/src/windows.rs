@@ -102,7 +102,7 @@ impl RetainedProcessHandle {
     }
 }
 
-fn creation_time(handle: HANDLE) -> ProcessStartTime {
+pub(crate) fn creation_time(handle: HANDLE) -> ProcessStartTime {
     let mut creation = empty_file_time();
     let mut exit = empty_file_time();
     let mut kernel = empty_file_time();

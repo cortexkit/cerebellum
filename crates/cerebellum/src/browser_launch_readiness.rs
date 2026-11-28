@@ -987,6 +987,8 @@ pub(crate) mod tests {
             environment: vec![],
             verified_executable_identity: verified_executable_identity(),
             pre_spawn_identity_verification: PreSpawnIdentityVerification::Established,
+            #[cfg(windows)]
+            windows_journal: None,
         }
     }
 
@@ -1006,11 +1008,15 @@ pub(crate) mod tests {
                         &request.arguments,
                         &request.environment,
                     ),
+                    #[cfg(windows)]
+                    supervisor_generation: None,
                 },
                 process_generation: BrowserProcessGeneration {
                     pid: 42,
                     start_time_micros: 77,
                     boot_id: None,
+                    #[cfg(windows)]
+                    generation_unit: None,
                 },
             },
             observed_executable_identity: executable_identity(),
@@ -1367,6 +1373,8 @@ pub(crate) mod tests {
                 pid: 42,
                 start_time_micros: 77,
                 boot_id: None,
+                #[cfg(windows)]
+                generation_unit: None,
             }
         }
 
@@ -1516,6 +1524,8 @@ mod live_chrome_test {
             environment: Vec::new(),
             verified_executable_identity: identity,
             pre_spawn_identity_verification: PreSpawnIdentityVerification::Established,
+            #[cfg(windows)]
+            windows_journal: None,
         }
     }
 

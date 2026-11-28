@@ -1072,6 +1072,24 @@ where
     /// terminalized durably. Unlike `recover_one`, which recovers every active
     /// record and reports one, this consumes only the named record.
     pub fn recover_record(&mut self, sequence: u64) -> Option<CoreRecoveryOutcome> {
+        self.recover_record_with_cancelled_evidence(sequence, false)
+    }
+
+    /// Recover one reservation without discarding the audit evidence of a
+    /// pre-dispatch cancellation. The reservation is still cancelled: this
+    /// does not claim it reached dispatch. Other recovery paths are unchanged.
+    pub fn recover_record_preserving_cancelled_evidence(
+        &mut self,
+        sequence: u64,
+    ) -> Option<CoreRecoveryOutcome> {
+        self.recover_record_with_cancelled_evidence(sequence, true)
+    }
+
+    fn recover_record_with_cancelled_evidence(
+        &mut self,
+        sequence: u64,
+        preserve_cancelled_evidence: bool,
+    ) -> Option<CoreRecoveryOutcome> {
         let record = self.state.reservations.get(&sequence).cloned()?;
         let classification = if record.state == LifecycleState::Dispatched {
             RecoveryClassification::ProvisionalDispatched
@@ -1091,6 +1109,11 @@ where
                 self.recover_dispatched(sequence, record)
             }
             RecoveryClassification::FailedRejection => self.recover_rejection(sequence, record),
+            RecoveryClassification::UnmarkedOrphan | RecoveryClassification::FailedCommitment
+                if preserve_cancelled_evidence =>
+            {
+                self.cancel_recovery_preserving_evidence(sequence, record, classification)
+            }
             RecoveryClassification::UnmarkedOrphan | RecoveryClassification::FailedCommitment => {
                 self.cancel_recovery(sequence, record, classification)
             }
@@ -1351,6 +1374,37 @@ where
             terminal_kind: TerminalKind::RecoveryCancelled,
             recovery_action: RecoveryAction::Cancelled,
             attachments: attachments_from(&record.attachments),
+        })
+    }
+
+    fn cancel_recovery_preserving_evidence(
+        &mut self,
+        sequence: u64,
+        record: ReservationRecord,
+        classification: RecoveryClassification,
+    ) -> Option<CoreRecoveryOutcome> {
+        let mut candidate = self.state.clone();
+        let attachments = attachments_from(&record.attachments);
+        let kind = TerminalKind::RecoveryCancelled;
+        self.insert_terminal(
+            &mut candidate,
+            TerminalCommit {
+                sequence,
+                encoded: record.provisional.clone(),
+                record,
+                kind,
+                reason: None,
+                recovered: true,
+            },
+        )
+        .ok()?;
+        self.commit_state(candidate).ok()?;
+        Some(CoreRecoveryOutcome {
+            action_obligation_id: sequence,
+            classification,
+            terminal_kind: kind,
+            recovery_action: RecoveryAction::Cancelled,
+            attachments,
         })
     }
 
@@ -2243,5 +2297,32 @@ mod tests {
         let remaining = reopened.recover_active();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].action_obligation_id, first);
+    }
+
+    #[test]
+    fn ordinary_recovery_cancellation_still_writes_only_the_cancellation_transition() {
+        let storage = InMemoryJournalStorage::new();
+        let mut journal = JournalBinding::new_without_policies(
+            FixtureCodec,
+            JournalConfig {
+                journal_retention_bytes: 4096,
+                journal_max_entry_bytes: 1024,
+            },
+            storage.clone(),
+        )
+        .unwrap();
+        let handle = journal.reserve(identity(), b"intent".to_vec()).unwrap();
+        journal
+            .attach_obligation_material(handle, "proof", 0, b"evidence".to_vec())
+            .unwrap();
+        let outcome = journal.recover_record(handle.sequence()).unwrap();
+        assert_eq!(outcome.recovery_action, RecoveryAction::Cancelled);
+        assert_eq!(
+            serde_json::to_string(&storage.load().unwrap()).unwrap(),
+            concat!(
+                r#"{"next_sequence":2,"next_cursor":2,"entries":{},"reservations":{},"#,
+                r#""transitions":[{"cursor":1,"action_obligation_id":1,"kind":"recovery_cancelled"}],"oversize_flag":false}"#
+            )
+        );
     }
 }

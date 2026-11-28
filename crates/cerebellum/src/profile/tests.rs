@@ -143,6 +143,8 @@ fn dead_attachment_owner() -> crate::profile_custody::SupervisorGeneration {
         pid: u32::MAX,
         start_time: 1,
         boot_id: None,
+        #[cfg(windows)]
+        generation_unit: None,
     }
 }
 

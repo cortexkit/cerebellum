@@ -40,6 +40,8 @@ mod named_pipe_server;
 #[cfg(any(windows, test))]
 mod pe_product;
 #[cfg(windows)]
+pub mod process;
+#[cfg(windows)]
 mod process_readings;
 #[cfg(windows)]
 mod registry_values;

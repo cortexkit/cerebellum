@@ -41,9 +41,12 @@ pub mod browser_launch;
 pub mod browser_launch_readiness;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod browser_launch_service;
-#[cfg(all(windows, feature = "windows-browser-release"))]
+#[cfg(windows)]
 pub mod windows_launch {
+    #[cfg(feature = "windows-browser-release")]
     pub mod discovery;
+    pub mod generation;
+    #[cfg(feature = "windows-browser-release")]
     pub mod writability;
 }
 mod browser_queue;

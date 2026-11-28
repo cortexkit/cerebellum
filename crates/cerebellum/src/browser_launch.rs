@@ -386,63 +386,21 @@ impl PreSpawnIdentityVerification {
     }
 }
 
-/// The bytes of an `OsStr` as this platform represents them.
-///
-/// Deliberately platform-specific rather than normalised. These bytes are
-/// attested: they record what was handed to the platform launcher, so a
-/// conversion that made every platform agree would be recording a translation
-/// rather than the submission. Unix hands the kernel bytes; Windows hands it
-/// UTF-16 code units, and encoding those little-endian preserves the argument
-/// exactly, including the unpaired surrogates a lossy conversion would destroy.
-///
-/// A reader therefore needs to know which platform produced a record before
-/// interpreting its bytes. Nothing ships on Windows yet, so no ambiguous record
-/// can exist; declaring the encoding in the record itself is a format change to
-/// settle before one can.
-fn os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        value.as_bytes().to_vec()
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        value.encode_wide().flat_map(u16::to_le_bytes).collect()
-    }
+mod journal_format;
+use journal_format::{refuse_newer_launch_record, windows_launch_descriptor};
+mod launch_vector;
+pub use launch_vector::VerifiedLaunchVector;
+#[cfg(windows)]
+pub use launch_vector::WindowsLaunchJournalInput;
+mod journal_vocabulary {
+    use serde::{Deserialize, Serialize};
+    include!("browser_launch/journal_vocabulary_generated.rs");
 }
-
-/// The exact executable and argument bytes submitted to the platform launcher.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VerifiedLaunchVector {
-    #[serde(with = "cerebellum_core::serde_base64::bytes_compat")]
-    pub executable: Vec<u8>,
-    #[serde(with = "cerebellum_core::serde_base64::byte_strings_compat")]
-    pub arguments: Vec<Vec<u8>>,
-    #[serde(with = "cerebellum_core::serde_base64::byte_string_pairs_compat")]
-    pub environment: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-impl VerifiedLaunchVector {
-    pub fn new(
-        executable: &Path,
-        arguments: &[OsString],
-        environment: &[(OsString, OsString)],
-    ) -> Self {
-        Self {
-            executable: os_bytes(executable.as_os_str()),
-            arguments: arguments
-                .iter()
-                .map(|argument| os_bytes(argument.as_os_str()))
-                .collect(),
-            environment: environment
-                .iter()
-                .map(|(name, value)| (os_bytes(name.as_os_str()), os_bytes(value.as_os_str())))
-                .collect(),
-        }
-    }
-}
+pub use journal_vocabulary::{GenerationUnit, LaunchByteEncoding, WindowsRecoveryBasis};
+#[cfg(test)]
+mod journal_vocabulary_mint;
+#[cfg(windows)]
+pub mod windows_recovery;
 
 /// Durable pre-effect record. This is committed before process creation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,6 +413,9 @@ pub struct AuthorizedLaunchIntent {
     pub profile: LaunchProfileIdentity,
     pub verified_executable_identity: VerifiedExecutableIdentity,
     pub launch_vector: VerifiedLaunchVector,
+    #[cfg(windows)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_generation: Option<crate::profile_custody::SupervisorGeneration>,
 }
 
 /// Exact process generation obtained from the kernel after suspended creation.
@@ -462,7 +423,8 @@ pub struct AuthorizedLaunchIntent {
 /// The field keeps its historical name, but `boot_id` decides its unit: with a
 /// boot ID (Linux, from format version 4) it is clock ticks from that boot to
 /// the process's creation; without one (macOS, and every earlier record) it is
-/// microseconds since the Unix epoch. Readers only compare it for equality.
+/// microseconds since the Unix epoch. Windows instead marks raw `FILETIME`
+/// ticks explicitly. Readers only compare it for equality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserProcessGeneration {
@@ -470,6 +432,19 @@ pub struct BrowserProcessGeneration {
     pub start_time_micros: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<crate::profile_custody::BootId>,
+    #[cfg(windows)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_unit: Option<GenerationUnit>,
+}
+
+impl BrowserProcessGeneration {
+    fn unix_epoch_time(self) -> bool {
+        #[cfg(windows)]
+        if self.generation_unit.is_some() {
+            return false;
+        }
+        self.boot_id.is_none()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -866,11 +841,13 @@ pub struct AttestedLaunchRequest {
     pub environment: Vec<(OsString, OsString)>,
     pub verified_executable_identity: VerifiedExecutableIdentity,
     pub pre_spawn_identity_verification: PreSpawnIdentityVerification,
+    #[cfg(windows)]
+    pub windows_journal: Option<WindowsLaunchJournalInput>,
 }
 
 impl AttestedLaunchRequest {
     fn durable_intent(&self) -> AuthorizedLaunchIntent {
-        AuthorizedLaunchIntent {
+        let intent = AuthorizedLaunchIntent {
             format_version: LAUNCH_CODEC_VERSION.to_string(),
             launch_attempt_id: self.launch_attempt_id.clone(),
             holder_id: self.holder_id.clone(),
@@ -882,7 +859,12 @@ impl AttestedLaunchRequest {
                 &self.arguments,
                 &self.environment,
             ),
-        }
+            #[cfg(windows)]
+            supervisor_generation: None,
+        };
+        #[cfg(windows)]
+        let intent = launch_vector::with_windows_input(intent, self.windows_journal.as_ref());
+        intent
     }
 }
 
@@ -1384,7 +1366,7 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
         let browser_started_at_micros = attempt
             .attested_generation
             .or(attempt.recorded_generation)
-            .filter(|generation| generation.boot_id.is_none())
+            .filter(|generation| generation.unix_epoch_time())
             .map(|generation| generation.start_time_micros);
         Ok(Some(ActiveLaunchRecord {
             sequence,
@@ -1443,6 +1425,10 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
                 .read_obligation_audit(sequence)
                 .map_err(|_| BrowserLaunchRecoveryFailure::JournalRead { sequence })?;
             refuse_newer_launch_record(sequence, &audit)?;
+            // Foreign records must not fall through to legacy invalid-intent cleanup.
+            if windows_launch_descriptor(&audit.descriptor_bytes) {
+                return Err(BrowserLaunchRecoveryFailure::InvalidIntent { sequence });
+            }
             let intent = serde_json::from_slice::<AuthorizedLaunchIntent>(&audit.descriptor_bytes)
                 .ok()
                 .filter(|intent| match intent.format_version.as_str() {
@@ -1534,49 +1520,6 @@ impl<S: JournalStorage> DurableLaunchJournal<S> {
             }))
         }
     }
-}
-
-/// Refuse, by name, an active launch record a newer build wrote: its entry,
-/// its intent, or a recovery clear attached to it.
-///
-/// Checked before the intent is parsed, because a newer intent may not parse
-/// at all. Without this a newer intent read as "no intent this module wrote",
-/// and recovery consumed the record: the launch it described vanished from
-/// the journal while its browser might still be running on that profile.
-fn refuse_newer_launch_record(
-    sequence: u64,
-    audit: &cerebellum_core::journal::ObligationAuditRecord,
-) -> Result<(), BrowserLaunchRecoveryFailure> {
-    let refuse = |newer| BrowserLaunchRecoveryFailure::NewerWriter { sequence, newer };
-    let version_of = |bytes: &[u8]| {
-        serde_json::from_slice::<serde_json::Value>(bytes)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("format_version")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
-    };
-    LAUNCH_ENTRY_FORMAT
-        .refuse_newer_tag(&audit.codec_id, LAUNCH_CODEC_VERSION)
-        .map_err(refuse)?;
-    if let Some(found) = version_of(&audit.descriptor_bytes) {
-        LAUNCH_ENTRY_FORMAT
-            .refuse_newer_tag(&found, LAUNCH_CODEC_VERSION)
-            .map_err(refuse)?;
-    }
-    if let Some(found) = audit
-        .attachment_slots
-        .iter()
-        .find(|attachment| attachment.slot == RECOVERY_CLEAR_SLOT)
-        .and_then(|attachment| version_of(&attachment.opaque_bytes))
-    {
-        LAUNCH_RECOVERY_CLEAR_FORMAT
-            .refuse_newer_tag(&found, RECOVERY_CLEAR_FORMAT_VERSION)
-            .map_err(refuse)?;
-    }
-    Ok(())
 }
 
 /// Reclaim every launch record left active by an earlier module process.
@@ -2747,6 +2690,8 @@ mod tests {
                     pid: 42,
                     start_time_micros: 77,
                     boot_id: None,
+                    #[cfg(windows)]
+                    generation_unit: None,
                 },
             })
         }
@@ -2821,6 +2766,8 @@ mod tests {
             environment: vec![],
             verified_executable_identity: verified_identity(),
             pre_spawn_identity_verification: PreSpawnIdentityVerification::Established,
+            #[cfg(windows)]
+            windows_journal: None,
         }
     }
 
@@ -2840,6 +2787,12 @@ mod tests {
             LaunchProfile::Registry(cerebellum_core::identity::ProfileDisposition::Durable)
         );
         assert_eq!(serde_json::to_string(&intent).unwrap(), fixture);
+        let mut current = intent;
+        current.format_version = LAUNCH_CODEC_VERSION.into();
+        assert_eq!(
+            serde_json::to_string(&current).unwrap(),
+            fixture.replacen(V4_LAUNCH_CODEC_VERSION, LAUNCH_CODEC_VERSION, 1)
+        );
     }
 
     #[test]
@@ -2956,6 +2909,8 @@ mod tests {
                 pid: 42,
                 start_time_micros: sequence,
                 boot_id,
+                #[cfg(windows)]
+                generation_unit: None,
             },
         };
         journal
@@ -3076,6 +3031,8 @@ mod tests {
                         pid: 42,
                         start_time_micros: 77,
                         boot_id: None,
+                        #[cfg(windows)]
+                        generation_unit: None,
                     }
                 );
                 assert_eq!(
@@ -3375,6 +3332,8 @@ mod tests {
                 pid: 42,
                 start_time_micros: 77,
                 boot_id: None,
+                #[cfg(windows)]
+                generation_unit: None,
             },
         };
         journal

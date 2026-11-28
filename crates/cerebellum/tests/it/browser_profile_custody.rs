@@ -143,6 +143,8 @@ fn generation(pid: u32, start_time: u64) -> SupervisorGeneration {
         pid,
         start_time,
         boot_id: None,
+        #[cfg(windows)]
+        generation_unit: None,
     }
 }
 
@@ -1447,6 +1449,8 @@ fn a_v1_custody_lock_still_loads_and_takes_the_legacy_arm() {
         pid: 62,
         start_time: 99,
         boot_id: Some(BOOT),
+        #[cfg(windows)]
+        generation_unit: None,
     };
     let mut contender = ProfileCustodyLocks::open(
         root.path(),
