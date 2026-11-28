@@ -1204,6 +1204,7 @@ fn captured() -> WindowImageCapture {
         window_origin: (0.0, 0.0),
         window_points: (1000.0, 600.0),
         captured_px: (2000, 1200),
+        exact_axes: false,
         jpeg: jpeg(1250, 750),
     }
 }
@@ -1253,6 +1254,7 @@ fn every_image_unavailable_reason_is_reachable() {
         ImageUnavailable::ScreenRecordingNotLive,
         ImageUnavailable::NoWindowCaptured,
         ImageUnavailable::CaptureUnavailable,
+        ImageUnavailable::CaptureExcluded,
         ImageUnavailable::CaptureFailed,
         ImageUnavailable::WindowCoveredMayBeStale,
         ImageUnavailable::ImageNeedsTakeover,

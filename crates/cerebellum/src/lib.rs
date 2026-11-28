@@ -1303,10 +1303,7 @@ fn release_attestation_bound(gate: &'static str, value: Option<&str>) -> bool {
 /// at most 100 ms, post, always restore, under the takeover grant. It also
 /// admits a `bring_to_front` image read under held takeover. Only the takeover
 /// review covers it, and the app-use review changes nothing here.
-#[cfg_attr(
-    not(any(test, target_os = "macos", target_os = "windows")),
-    allow(dead_code)
-)]
+#[cfg(any(test, target_os = "macos"))]
 fn fronting_bracket_admitted(inputs: &ComputerReleaseInputs) -> bool {
     inputs.takeover_dispatch_review_revision.is_some()
 }
@@ -1337,10 +1334,7 @@ pub fn takeover_pointer_fronting_admitted(inputs: &ComputerReleaseInputs) -> boo
 /// as the takeover review's bracket does, but under rules that review never
 /// covered, so both the takeover review and the app-use review must bind.
 /// The vocabulary digests play no part.
-#[cfg_attr(
-    not(any(test, target_os = "macos", target_os = "windows")),
-    allow(dead_code)
-)]
+#[cfg(any(test, target_os = "macos"))]
 fn app_use_fronting_admitted(inputs: &ComputerReleaseInputs) -> bool {
     release_attestation_bound(
         "takeover_dispatch_review_revision",
@@ -1356,10 +1350,7 @@ fn app_use_fronting_admitted(inputs: &ComputerReleaseInputs) -> bool {
 /// the app-use review, whose scope names this exception, must bind. Without
 /// it the preview shows the application's icon instead of a frame. The
 /// vocabulary digests play no part.
-#[cfg_attr(
-    not(any(test, target_os = "macos", target_os = "windows")),
-    allow(dead_code)
-)]
+#[cfg(any(test, target_os = "macos"))]
 fn preview_capture_admitted(inputs: &ComputerReleaseInputs) -> bool {
     release_attestation_bound(
         "capture_review_revision",
@@ -1385,6 +1376,7 @@ pub fn default_computer_context() -> ComputerCapabilityAdvertisementContext {
 }
 
 fn probe_computer_context() -> ComputerCapabilityAdvertisementContext {
+    let inputs = compiled_release_inputs();
     let readings = computer_permission_readings();
     let probe_panicked = readings.is_err();
     // A panicked probe contributes no readings; the report below is then
@@ -1409,12 +1401,16 @@ fn probe_computer_context() -> ComputerCapabilityAdvertisementContext {
     #[cfg(target_os = "windows")]
     {
         startup.windows_elevation = computer::platform::WindowsElevation::read_current_process();
+        startup.permissions = computer::platform::windows::picture::startup_permissions(
+            &inputs,
+            startup.windows_elevation,
+        );
     }
     if probe_panicked {
         startup.permissions = PermissionLivenessReport::probe_failed();
     }
     ComputerCapabilityAdvertisementContext {
-        inputs: compiled_release_inputs(),
+        inputs,
         permissions: startup.permissions.clone(),
         startup,
     }

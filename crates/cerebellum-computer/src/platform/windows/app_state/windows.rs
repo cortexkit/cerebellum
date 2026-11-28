@@ -35,7 +35,10 @@ fn desktop_admission(
     }
 }
 
-pub(super) fn retain(pid: u32, generation: u64) -> ReadResult<RetainedProcessHandle> {
+pub(in crate::platform::windows) fn retain(
+    pid: u32,
+    generation: u64,
+) -> ReadResult<RetainedProcessHandle> {
     require_default_desktop()?;
     let process = retain_image_process(pid).map_err(|err| match err {
         ProcessHandleError::NoSuchProcess => ReadError::Gone,
@@ -53,7 +56,10 @@ pub(super) fn retain(pid: u32, generation: u64) -> ReadResult<RetainedProcessHan
     Ok(process)
 }
 
-pub(super) fn current(process: &RetainedProcessHandle, expected: u64) -> ReadResult<()> {
+pub(in crate::platform::windows) fn current(
+    process: &RetainedProcessHandle,
+    expected: u64,
+) -> ReadResult<()> {
     if !process.process_wait_pending() {
         return Err(ReadError::Gone);
     }
@@ -94,7 +100,7 @@ pub(in crate::platform::windows) fn eligible_state(
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct BoundWindow {
+pub(in crate::platform::windows) struct BoundWindow {
     pub root: WindowIdentityFacts,
     pub state: WindowStateFacts,
     pub proof: FrameProof,
@@ -109,7 +115,7 @@ impl BoundWindow {
     }
 }
 
-pub(super) fn bound_window(
+pub(in crate::platform::windows) fn bound_window(
     process: &RetainedProcessHandle,
     pid: u32,
     number: u32,
@@ -147,12 +153,12 @@ pub(super) fn same_binding(
     }
 }
 
-pub(super) struct Windows {
+pub(in crate::platform::windows) struct Windows {
     pub eligible: Vec<BoundWindow>,
     pub unreadable: usize,
 }
 
-pub(super) fn windows(
+pub(in crate::platform::windows) fn windows(
     process: &RetainedProcessHandle,
     pid: u32,
     end: Instant,
@@ -174,7 +180,7 @@ pub(super) fn windows(
     Ok(result)
 }
 
-pub(super) fn active_window(
+pub(in crate::platform::windows) fn active_window(
     windows: &Windows,
 ) -> ReadResult<Option<(&BoundWindow, GuiThreadWindows)>> {
     if windows.unreadable != 0 {
@@ -189,6 +195,42 @@ pub(super) fn active_window(
         gui_thread_windows(tid).map_err(|_| ReadError::Unreadable)
     })?
     .map(|(index, info)| (&windows.eligible[index], info)))
+}
+
+pub(in crate::platform::windows) fn image_window(
+    windows: &Windows,
+) -> ReadResult<Option<&BoundWindow>> {
+    if windows.unreadable != 0 {
+        return Err(ReadError::Unreadable);
+    }
+    let mut active = None;
+    let threads: BTreeSet<_> = windows.eligible.iter().map(BoundWindow::thread).collect();
+    for tid in threads {
+        let info = gui_thread_windows(tid).map_err(|_| ReadError::Unreadable)?;
+        if let Some(window) = windows.eligible.iter().find(|window| {
+            window.thread() == tid
+                && (info.active == Some(window.root.number)
+                    || info.active == Some(window.content()))
+        }) {
+            if active.replace(window).is_some() {
+                return Err(ReadError::Unreadable);
+            }
+        }
+    }
+    if active.is_some() || windows.eligible.is_empty() {
+        return Ok(active);
+    }
+    let stack = cerebellum_windows::desktop_z_order().map_err(|_| ReadError::Unreadable)?;
+    stack
+        .into_iter()
+        .find_map(|number| {
+            windows
+                .eligible
+                .iter()
+                .find(|window| window.root.number == number)
+        })
+        .map(Some)
+        .ok_or(ReadError::Unreadable)
 }
 
 fn active_binding(
@@ -219,7 +261,7 @@ pub(super) fn contains(rect: UiaRectangle, point: (f64, f64)) -> bool {
         && y < f64::from(rect.bottom)
 }
 
-pub(super) fn frame(rect: UiaRectangle) -> [f64; 4] {
+pub(in crate::platform::windows) fn frame(rect: UiaRectangle) -> [f64; 4] {
     [
         f64::from(rect.left),
         f64::from(rect.top),

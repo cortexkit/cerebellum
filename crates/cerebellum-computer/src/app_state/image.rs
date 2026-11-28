@@ -13,6 +13,8 @@ pub enum ImageUnavailable {
     NoWindowCaptured,
     /// This host has no capture backend, or it could not be set up.
     CaptureUnavailable,
+    /// The window has a display-affinity restriction on capture.
+    CaptureExcluded,
     /// The window server refused or failed the capture.
     CaptureFailed,
     /// Custody refused to prepare for the capture before it was taken.
@@ -38,10 +40,11 @@ pub enum ImageUnavailable {
 }
 
 impl ImageUnavailable {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::ScreenRecordingNotLive,
         Self::NoWindowCaptured,
         Self::CaptureUnavailable,
+        Self::CaptureExcluded,
         Self::CaptureFailed,
         Self::CaptureNotAdmitted,
         Self::CaptureNotRetained,
@@ -60,6 +63,7 @@ impl ImageUnavailable {
             Self::ScreenRecordingNotLive => "screen_recording_not_live",
             Self::NoWindowCaptured => "no_window_captured",
             Self::CaptureUnavailable => "capture_unavailable",
+            Self::CaptureExcluded => "capture_excluded",
             Self::CaptureFailed => "capture_failed",
             Self::CaptureNotAdmitted => "capture_not_admitted",
             Self::CaptureNotRetained => "capture_not_retained",
@@ -185,6 +189,9 @@ pub struct ImageMapping {
     pub crop_origin_y: f64,
     pub scale: f64,
     pub backing_scale: f64,
+    /// Desktop units per returned vertical pixel, when the two axes round
+    /// independently during resampling.
+    pub desktop_per_image_y: Option<f64>,
 }
 
 impl ImageMapping {
@@ -207,6 +214,7 @@ impl ImageMapping {
             crop_origin_y: 0.0,
             scale: f64::from(image_px.0) / f64::from(captured_px.0),
             backing_scale: f64::from(captured_px.0) / window_points.0,
+            desktop_per_image_y: None,
         })
     }
 
@@ -214,7 +222,15 @@ impl ImageMapping {
     pub fn pixel_to_desktop(&self, x_px: f64, y_px: f64) -> (f64, f64) {
         (
             self.window_origin_x + (self.crop_origin_x + x_px / self.scale) / self.backing_scale,
-            self.window_origin_y + (self.crop_origin_y + y_px / self.scale) / self.backing_scale,
+            self.desktop_per_image_y.map_or_else(
+                || {
+                    self.window_origin_y
+                        + (self.crop_origin_y + y_px / self.scale) / self.backing_scale
+                },
+                |scale| {
+                    self.window_origin_y + self.crop_origin_y / self.backing_scale + y_px * scale
+                },
+            ),
         )
     }
 }
@@ -229,6 +245,8 @@ pub struct WindowImageCapture {
     pub window_points: (f64, f64),
     /// The size the window was captured at, before scaling.
     pub captured_px: (u32, u32),
+    /// Map the JPEG height to the captured window height independently of its width.
+    pub exact_axes: bool,
     /// The scaled image, JPEG-encoded.
     pub jpeg: Vec<u8>,
 }
@@ -325,7 +343,7 @@ pub fn release_through_custody<C: ImageCustody>(
         custody.reject(reservation, ImageUnavailable::CaptureFailed);
         return Err(ImageUnavailable::CaptureFailed);
     };
-    let Some(mapping) = ImageMapping::for_window(
+    let Some(mut mapping) = ImageMapping::for_window(
         captured.window_origin,
         captured.window_points,
         captured.captured_px,
@@ -334,6 +352,9 @@ pub fn release_through_custody<C: ImageCustody>(
         custody.reject(reservation, ImageUnavailable::ImageNotScalable);
         return Err(ImageUnavailable::ImageNotScalable);
     };
+    if captured.exact_axes {
+        mapping.desktop_per_image_y = Some(captured.window_points.1 / f64::from(height_px));
+    }
     if let Err(failure) = custody.retain(admission, &captured, width_px, height_px) {
         let reason = match failure {
             RetainFailure::NotRetained => ImageUnavailable::CaptureNotRetained,

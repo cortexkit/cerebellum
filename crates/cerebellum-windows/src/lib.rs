@@ -20,6 +20,8 @@ mod accessibility;
 #[cfg(windows)]
 mod browser_image;
 #[cfg(windows)]
+mod capture_facts;
+#[cfg(windows)]
 mod devtools_pipe;
 #[cfg(windows)]
 mod file_identity;
@@ -67,6 +69,11 @@ pub use browser_image::{
     read_product_names, read_program_files_directory, read_system_directory, AuthenticodeReading,
     ImageReadError, MicrosoftRootReading, OpenedMachineDirectory, OpenedProcessImage,
     ProgramFilesDirectory, SignatureReading, SignerSubject,
+};
+#[cfg(windows)]
+pub use capture_facts::{
+    capture_support, first_window_jpeg, per_monitor_v2, set_process_per_monitor_v2,
+    window_capture_properties, FrameReadError, WindowCaptureProperties, WindowFrameMetadata,
 };
 #[cfg(windows)]
 pub use devtools_pipe::{spawn_with_devtools_pipe, DevToolsPipeReader, DevToolsProcess};

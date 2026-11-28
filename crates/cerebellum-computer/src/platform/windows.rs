@@ -1,4 +1,4 @@
-//! Windows UI Automation driver and an explicitly unsupported capture backend.
+//! Windows UI Automation driver and window picture backend.
 //!
 //! Operating-system calls are confined to `cfg(target_os = "windows")` blocks.
 //! The decisions made from their readings remain ordinary Rust so every host can
@@ -11,6 +11,8 @@ pub mod app_state;
 pub mod identity;
 #[cfg(windows)]
 pub mod launch;
+#[cfg(windows)]
+pub mod picture;
 use crate::capture::{
     BackendError, BackendTeardownProgress, BroadDisplayCaptureRequest, CaptureArtifact,
     CaptureBackend, EnumeratedWindow, WindowCaptureFrame, WindowCaptureRequest, WindowChange,
@@ -42,11 +44,28 @@ impl WindowsElevation {
     }
 }
 
-/// A capture backend whose type makes Windows capture absence explicit.
+/// Use Windows Graphics Capture for a single window picture. The legacy
+/// display and streaming entry points remain unsupported.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct WindowsUnsupportedCaptureBackend;
+pub struct WindowsCaptureBackend;
 
-impl CaptureBackend for WindowsUnsupportedCaptureBackend {
+impl CaptureBackend for WindowsCaptureBackend {
+    #[cfg(windows)]
+    const BACKGROUND_WINDOW_PICTURE: bool = true;
+
+    #[cfg(windows)]
+    fn capture_background_picture(
+        &mut self,
+        target: &ProcessGrant,
+        deadline: std::time::Instant,
+        may_acquire: &crate::capture::AcquisitionFence,
+    ) -> Result<
+        crate::app_state::image::WindowImageCapture,
+        crate::app_state::image::ImageUnavailable,
+    > {
+        picture::capture(target, deadline, may_acquire)
+    }
+
     fn platform_support(&self) -> Result<(), BackendError> {
         Err(BackendError::UnsupportedOnPlatform)
     }
@@ -90,6 +109,25 @@ impl CaptureBackend for WindowsUnsupportedCaptureBackend {
     fn poll_teardown(&mut self, _elapsed_ms: u64) -> Result<BackendTeardownProgress, BackendError> {
         Err(BackendError::UnsupportedOnPlatform)
     }
+}
+
+#[cfg(any(windows, test))]
+fn wgc_failure_reason(
+    hresult: u32,
+    reread_window: impl FnOnce() -> Result<(), crate::app_state::image::ImageUnavailable>,
+) -> crate::app_state::image::ImageUnavailable {
+    use crate::app_state::image::ImageUnavailable;
+
+    // On windows-latest (GitHub Actions run 46094374143), a nonlayered HWND
+    // returned WDA_NONE. A second HWND returned WDA_EXCLUDEFROMCAPTURE, and
+    // Windows Graphics Capture refused it with E_INVALIDARG. The HRESULT is
+    // generic: only a fresh check of the bound HWND can establish exclusion.
+    if hresult == 0x8007_0057 {
+        return reread_window()
+            .err()
+            .unwrap_or(ImageUnavailable::CaptureFailed);
+    }
+    ImageUnavailable::CaptureFailed
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -1586,7 +1624,7 @@ mod tests {
 
     #[test]
     fn windows_declares_no_capture_capability() {
-        let backend = WindowsUnsupportedCaptureBackend;
+        let backend = WindowsCaptureBackend;
         assert_eq!(
             backend.platform_support(),
             Err(BackendError::UnsupportedOnPlatform)
@@ -1606,5 +1644,29 @@ mod tests {
                             | "computer.write_text"
                     ) && declaration.advertised)
             ));
+    }
+
+    #[test]
+    fn wgc_invalid_argument_uses_the_bound_windows_current_affinity() {
+        use crate::app_state::image::ImageUnavailable;
+
+        assert_eq!(
+            wgc_failure_reason(0x8007_0057, || Err(ImageUnavailable::CaptureExcluded)),
+            ImageUnavailable::CaptureExcluded,
+        );
+        assert_eq!(
+            wgc_failure_reason(0x8007_0057, || Ok(())),
+            ImageUnavailable::CaptureFailed
+        );
+        assert_eq!(
+            wgc_failure_reason(0x8007_0057, || Err(ImageUnavailable::CaptureUnavailable)),
+            ImageUnavailable::CaptureUnavailable,
+        );
+        assert_eq!(
+            wgc_failure_reason(0x8000_4005, || panic!(
+                "unrelated HRESULT must not trigger a recheck"
+            )),
+            ImageUnavailable::CaptureFailed,
+        );
     }
 }
