@@ -65,8 +65,7 @@ fn the_pointer_dispatch_token_is_minted_only_by_the_takeover_grant_check() {
             // The field is private, so only the defining file can fill it in;
             // a second constructor there would bypass the call-site check.
             if relative == ALLOWED_LITERALS[0].0
-                && code.contains("_private: ()")
-                && !code.contains("_private: (),")
+                && (code.contains("Self { action") || code.contains("OnceDispatchToken { action"))
             {
                 literals.push((relative.clone(), line_number, code.to_string()));
             }

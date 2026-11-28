@@ -210,6 +210,17 @@ pub enum SyntheticAction {
 }
 
 impl SyntheticAction {
+    pub fn takeover_action(&self) -> Option<cerebellum_core::consent::TakeoverAction> {
+        use cerebellum_core::consent::TakeoverAction;
+        Some(match self {
+            Self::MovePointer { .. } => TakeoverAction::Move,
+            Self::ClickPointer { .. } => TakeoverAction::Click,
+            Self::DragPointer { .. } => TakeoverAction::Drag,
+            Self::Scroll { .. } => TakeoverAction::Scroll,
+            Self::TypeText { .. } | Self::KeyCombination { .. } => return None,
+        })
+    }
+
     pub fn type_text(text: impl Into<String>) -> Self {
         Self::TypeText { text: text.into() }
     }

@@ -55,7 +55,6 @@ fn windows_shared_defaults_expose_no_input_or_installed_state() {
         Err(ElementActionError::UnsupportedOnPlatform)
     ));
     assert!(source.cursor_window(&target, None).is_none());
-    assert!(source.cursor_position().is_none());
     let installed = source.installed_apps(Duration::from_secs(2));
     assert!(!installed.complete);
     assert!(installed.apps.is_empty());

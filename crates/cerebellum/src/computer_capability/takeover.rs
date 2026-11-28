@@ -96,6 +96,18 @@ pub(crate) enum TakeoverRequest {
     },
 }
 
+impl TakeoverRequest {
+    fn action_scope(&self) -> cerebellum_core::consent::TakeoverAction {
+        use cerebellum_core::consent::TakeoverAction;
+        match self {
+            Self::Click { .. } => TakeoverAction::Click,
+            Self::Move { .. } => TakeoverAction::Move,
+            Self::Drag { .. } => TakeoverAction::Drag,
+            Self::Scroll { .. } => TakeoverAction::Scroll,
+        }
+    }
+}
+
 fn invalid(field: &str, reason: &str) -> Value {
     json!({"outcome": "invalid_request", "field": field, "reason": reason})
 }
@@ -271,8 +283,15 @@ fn application_under(
     management: &ManagementPlane,
     image: &RegisteredImage,
     point: SyntheticPoint,
+    exact_windows_dispatch: bool,
 ) -> Result<ProcessGrant, Value> {
     let at = (point.x, point.y);
+    if exact_windows_dispatch {
+        return match source.element_at_for_target(&image_grant(image), at) {
+            Ok(Some((_, Some(owner)))) if owner == image.pid => Ok(image_grant(image)),
+            _ => Err(nothing_identifiable_at_point()),
+        };
+    }
     if let Ok(Some((_, owner))) = source.element_at(HitScope::Application { pid: image.pid }, at) {
         if owner.is_none_or(|owner| owner == image.pid) {
             return Ok(image_grant(image));
@@ -319,6 +338,31 @@ fn scroll_recipient(
         return Err("scroll pointer recipient window changed or unavailable");
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_scroll_recipient(
+    source: &dyn AppStateSource,
+    target: &ProcessGrant,
+    expected: Option<u32>,
+) -> Result<u32, &'static str> {
+    let point = source
+        .cursor_position()
+        .ok_or("scroll real cursor location unavailable")?;
+    let window = source
+        .pointer_recipient(point)?
+        .ok_or("scroll pointer recipient unreadable")?;
+    if expected.is_some_and(|bound| bound != window)
+        || (expected.is_none()
+            && !cerebellum_computer::app_state::pointer_sensitivity::pointer_target_safe(
+                source, target, point, window,
+            ))
+    {
+        return Err("scroll pointer recipient window or sensitivity changed");
+    }
+    // The driver separately proves the exact wheel recipient from Windows'
+    // routing setting; the topmost pointed-at root alone cannot authorize it.
+    Ok(window)
 }
 
 /// Refuse, without asking anyone, when the application the pointer would
@@ -432,6 +476,37 @@ fn cancelled_before_posting() -> Value {
     })
 }
 
+#[cfg(any(windows, test))]
+fn windows_pointer_refusal(refusal: &DispatchError) -> Value {
+    use cerebellum_computer::platform::process_event::ProcessEventRefusal;
+    let DispatchError::SyntheticSequenceFailed {
+        posts_returned,
+        refusal: ProcessEventRefusal::PostCallFailed(failure),
+        held_state,
+    } = refusal
+    else {
+        return refusal_reply(refusal);
+    };
+    let (outcome, observation) = if failure.reason == "state_changed_by_person" {
+        (
+            "user_seized_control",
+            "The person's input was not delivered. ",
+        )
+    } else {
+        ("dispatch_failed", "")
+    };
+    let disposition = match held_state {
+        HeldStateDisposition::NoneHeld => "no automation-held button",
+        HeldStateDisposition::Released { .. } => "the automation-held button was released",
+        HeldStateDisposition::Unknown => "the automation-held button state could not be confirmed",
+    };
+    json!({
+        "outcome": outcome,
+        "reason": failure.reason,
+        "remedy": format!("{observation}Windows stopped posting after {posts_returned} accepted pointer posts; {disposition}. Read state before retrying"),
+    })
+}
+
 impl<B, R, T, S, D> super::ComputerPlane<B, R, T, S, D>
 where
     B: cerebellum_computer::capture::CaptureBackend + Send + 'static,
@@ -440,6 +515,17 @@ where
     S: JournalStorage + Send + 'static,
     D: PlatformDriver + 'static,
 {
+    fn windows_pointer_for_takeover() -> bool {
+        #[cfg(windows)]
+        return D::uses_windows_pointer_dispatch();
+        #[cfg(not(windows))]
+        false
+    }
+
+    fn pointer_fronting_for_takeover(&self) -> bool {
+        !Self::windows_pointer_for_takeover() && self.takeover_pointer_fronting_admitted
+    }
+
     /// Serve one takeover action: find its containment target, hold the
     /// takeover grant, and post under the observed-mode gates.
     pub(super) async fn serve_takeover<C: MonotonicClock>(
@@ -448,7 +534,14 @@ where
         arguments: &Value,
         context: super::ServeContext<'_, C>,
     ) -> Value {
-        if self.takeover_pointer_fronting_admitted
+        #[cfg(windows)]
+        if Self::windows_pointer_for_takeover()
+            && matches!(capability, ComputerCapability::TakeoverClick | ComputerCapability::TakeoverDrag)
+            && !cerebellum_computer::platform::windows::fronting::WINDOWS_DOWN_GESTURE_RECOVERY_MEASURED
+        {
+            return invalid("action", "unknown_value");
+        }
+        if self.pointer_fronting_for_takeover()
             && matches!(
                 capability,
                 ComputerCapability::TakeoverClick | ComputerCapability::TakeoverDrag
@@ -467,8 +560,9 @@ where
         {
             return invalid("action", "unknown_value");
         }
-        if capability == ComputerCapability::TakeoverClick
-            && !self.takeover_pointer_fronting_admitted
+        if !Self::windows_pointer_for_takeover()
+            && capability == ComputerCapability::TakeoverClick
+            && !self.pointer_fronting_for_takeover()
         {
             return invalid("action", "unknown_value");
         }
@@ -494,7 +588,7 @@ where
             now_ms: _,
         } = context;
 
-        if self.takeover_pointer_fronting_admitted
+        if self.pointer_fronting_for_takeover()
             && matches!(
                 capability,
                 ComputerCapability::TakeoverMove | ComputerCapability::TakeoverScroll
@@ -533,7 +627,7 @@ where
         };
         let takeover = match management
             .computer_grants()
-            .require_takeover_dispatch(&consent, &cancel)
+            .require_takeover_dispatch(request.action_scope(), &consent, &cancel)
             .await
         {
             Ok(takeover) => takeover,
@@ -678,7 +772,7 @@ where
                     window,
                     deadline,
                 )?;
-                if application_under(source.as_ref(), &management, &image, point).is_ok_and(
+                if application_under(source.as_ref(), &management, &image, point, false).is_ok_and(
                     |owner| {
                         owner.pid == image.pid
                             && owner.process_generation_evidence == image.process_generation
@@ -708,8 +802,30 @@ where
                 lines,
             } => {
                 let grant = management.resolve_process(target)?;
+                #[cfg(windows)]
+                if Self::windows_pointer_for_takeover() {
+                    if let Some(refusal) = self
+                        .operator_lookup(management, caller)
+                        .pointer_refusal(&grant, "the scroll target")
+                    {
+                        return Err(refusal);
+                    }
+                    let source = Arc::clone(&self.app_state_source);
+                    let target = grant.clone();
+                    let window = tokio::task::spawn_blocking(move || windows_scroll_recipient(source.as_ref(), &target, None))
+                        .await.unwrap_or(Err("scroll placement worker failed")).map_err(|step| json!({
+                            "outcome": "target_not_frontmost",
+                            "reason": "point_in_another_window",
+                            "remedy": format!("{step}; nothing was posted. Put the pointer over the named app's window before retrying"),
+                        }))?;
+                    return Ok((
+                        grant,
+                        SyntheticAction::scroll_along(*axis, SyntheticScrollUnit::Line, *lines),
+                        Some(window),
+                    ));
+                }
                 let mut scroll_window = None;
-                if self.takeover_pointer_fronting_admitted {
+                if self.pointer_fronting_for_takeover() {
                     let source = Arc::clone(&self.app_state_source);
                     let target = grant.clone();
                     scroll_window = Some(tokio::task::spawn_blocking(move || {
@@ -766,7 +882,7 @@ where
             .image_window(conversation_key, image_id);
         let desktop_points: Vec<SyntheticPoint> =
             points.iter().map(|point| desktop(&image, *point)).collect();
-        if self.takeover_pointer_fronting_admitted {
+        if self.pointer_fronting_for_takeover() {
             // A covered image is admitted by its own process identity, not
             // by the covering window. Exact containment is checked after the
             // front and before every post, including the paired release.
@@ -834,16 +950,22 @@ where
                         // under the point, so that application is refused
                         // here if no agent may use it, before its grant is
                         // looked up.
-                        application_under(source.as_ref(), &hit_management, &hit_image, *point)
-                            .and_then(|owner| {
-                                if let Some(refusal) =
-                                    lookup.pointer_refusal(&owner, "the app under the pointer")
-                                {
-                                    Err(refusal)
-                                } else {
-                                    Ok(owner)
-                                }
-                            })
+                        application_under(
+                            source.as_ref(),
+                            &hit_management,
+                            &hit_image,
+                            *point,
+                            Self::windows_pointer_for_takeover(),
+                        )
+                        .and_then(|owner| {
+                            if let Some(refusal) =
+                                lookup.pointer_refusal(&owner, "the app under the pointer")
+                            {
+                                Err(refusal)
+                            } else {
+                                Ok(owner)
+                            }
+                        })
                     })
                     .collect::<Vec<_>>()
             })
@@ -888,13 +1010,20 @@ where
                 Ok((
                     target,
                     SyntheticAction::drag_pointer(desktop_points[0], desktop_points[1]),
-                    None,
+                    window_number.filter(|_| Self::windows_pointer_for_takeover()),
                 ))
             }
+            TakeoverRequest::Click { .. } => Ok((
+                target,
+                SyntheticAction::ClickPointer {
+                    point: desktop_points[0],
+                },
+                window_number,
+            )),
             _ => Ok((
                 target,
                 SyntheticAction::move_pointer(desktop_points[0]),
-                None,
+                window_number.filter(|_| Self::windows_pointer_for_takeover()),
             )),
         }
     }
@@ -942,7 +1071,7 @@ where
                 element: AccessibilityElementName::Identifier(target.bundle_identity.clone()),
             },
         );
-        let held_press = if self.takeover_pointer_fronting_admitted {
+        let held_press = if self.pointer_fronting_for_takeover() {
             Some(super::held_input::HeldPress::global_send(&target, &action))
         } else {
             super::held_input::HeldPress::global(&target, &action)
@@ -976,7 +1105,27 @@ where
         let mode =
             super::app_use::call_mode().unwrap_or(cerebellum_core::config::AppUse::Background);
         let pointer_failure = Arc::new(std::sync::Mutex::new(None));
-        let (hooks, exclusion, pointer_guard) = if self.takeover_pointer_fronting_admitted {
+        #[cfg(windows)]
+        let windows_lock = if Self::windows_pointer_for_takeover() {
+            match self.fronting_lock.take(&cancel).await {
+                Ok(lock) => Some(Arc::new(lock)),
+                Err(stop) => {
+                    let refusal = if stop == cerebellum_computer::dispatch::FrontingStop::Cancelled
+                    {
+                        DispatchError::DispatchStopped
+                    } else {
+                        DispatchError::SyntheticUnavailable
+                    };
+                    if audit.release_unused(&refusal).is_err() {
+                        return refusal_reply(&DispatchError::AuditUnavailable);
+                    }
+                    return refusal_reply(&refusal);
+                }
+            }
+        } else {
+            None
+        };
+        let (hooks, exclusion, pointer_guard) = if self.pointer_fronting_for_takeover() {
             let mut stopped = |stop| {
                 let reason = match stop {
                     cerebellum_computer::dispatch::FrontingStop::Cancelled => {
@@ -1053,6 +1202,8 @@ where
             (None, None, None)
         };
         let ticket = if let Some(press) = held_press {
+            #[cfg(windows)]
+            let exclusion = exclusion.or_else(|| windows_lock.clone());
             let ticket = if let Some(exclusion) = exclusion {
                 self.held_input.begin_global_send_under_lock(
                     press,
@@ -1093,13 +1244,20 @@ where
         // Posting blocks for as long as the sequence takes. Run it off the
         // runtime so a cancel frame can still be read and set the signal.
         let make_driver = self.make_synthetic_driver.clone();
-        let scroll_guard = (!self.takeover_pointer_fronting_admitted
+        let scroll_guard = (!self.pointer_fronting_for_takeover()
             && matches!(takeover_request, TakeoverRequest::Scroll { .. }))
         .then(|| {
             let source = Arc::clone(&self.app_state_source);
             let target = target.clone();
             let failure = Arc::clone(&pointer_failure);
             cerebellum_computer::platform::GlobalScrollGuard(Arc::new(move || {
+                #[cfg(windows)]
+                let result = if Self::windows_pointer_for_takeover() {
+                    windows_scroll_recipient(source.as_ref(), &target, scroll_window).map(|_| ())
+                } else {
+                    scroll_recipient(source.as_ref(), &target)
+                };
+                #[cfg(not(windows))]
                 let result = scroll_recipient(source.as_ref(), &target);
                 if let Err(step) = result {
                     *failure
@@ -1117,6 +1275,8 @@ where
         let worker_hooks = hooks.clone();
         let record_hooks = hooks.clone();
         let dispatched = tokio::task::spawn_blocking(move || {
+            #[cfg(windows)]
+            let _windows_lock = windows_lock;
             let _ax = work.bound_ax();
             let _fronting_record = record_hooks.map(|hooks| {
                 cerebellum_computer::audit::FrontingRecordScope::new(move || {
@@ -1125,7 +1285,14 @@ where
             });
             let cancelled = || cancel.is_cancelled();
             let mut driver = make_driver();
-            if scroll_guard.is_some_and(|guard| !driver.accept_global_scroll_guard(guard)) {
+            #[cfg(not(windows))]
+            let exact_window_admitted = true;
+            #[cfg(windows)]
+            let exact_window_admitted = !Self::windows_pointer_for_takeover()
+                || scroll_window.is_some_and(|window| driver.accept_windows_pointer_window(window));
+            if !exact_window_admitted
+                || scroll_guard.is_some_and(|guard| !driver.accept_global_scroll_guard(guard))
+            {
                 return if audit
                     .release_unused(&DispatchError::SyntheticUnavailable)
                     .is_err()
@@ -1173,6 +1340,10 @@ where
         .unwrap_or(Err(DispatchError::Platform));
         let mut reply = match dispatched {
             Ok(_) => json!({"outcome": "completed"}),
+            #[cfg(windows)]
+            Err(refusal) if Self::windows_pointer_for_takeover() => {
+                windows_pointer_refusal(&refusal)
+            }
             Err(refusal) => refusal_reply(&refusal),
         };
         if let Some(hooks) = &hooks {
@@ -1334,6 +1505,37 @@ mod tests {
         let platform = refusal_reply(&DispatchError::Platform);
         assert_eq!(platform["outcome"], "dispatch_failed");
         assert_eq!(platform["reason"], "platform_error");
+    }
+
+    #[test]
+    fn windows_pointer_interruption_keeps_the_button_disposition_in_a_declared_reply() {
+        use cerebellum_computer::platform::process_event::{PostCallFailure, ProcessEventRefusal};
+        use cerebellum_computer::platform::vocabulary::validate_capability_result;
+        for (reason, outcome, held_state, message) in [
+            (
+                "state_changed_by_person",
+                "user_seized_control",
+                HeldStateDisposition::Released { posts_returned: 1 },
+                "the automation-held button was released",
+            ),
+            (
+                "observer_lost",
+                "dispatch_failed",
+                HeldStateDisposition::Unknown,
+                "the automation-held button state could not be confirmed",
+            ),
+        ] {
+            let refusal = DispatchError::SyntheticSequenceFailed {
+                posts_returned: 2,
+                refusal: ProcessEventRefusal::PostCallFailed(PostCallFailure::new(reason)),
+                held_state,
+            };
+            let reply = windows_pointer_refusal(&refusal);
+            assert_eq!(reply["outcome"], outcome);
+            assert_eq!(reply["reason"], reason);
+            assert!(reply["remedy"].as_str().unwrap().contains(message));
+            validate_capability_result("computer.takeover_drag", &reply).unwrap();
+        }
     }
 
     #[test]

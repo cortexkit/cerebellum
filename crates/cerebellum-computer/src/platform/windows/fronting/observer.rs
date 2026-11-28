@@ -12,7 +12,7 @@ use cerebellum_windows::{
 };
 use std::hash::{BuildHasher, RandomState};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub(super) const PUMP_START: Duration = Duration::from_millis(150);
@@ -47,6 +47,15 @@ struct Record {
     route_hwnd: AtomicU32,
     automation_held: AtomicUsize,
     callback_slow: AtomicBool,
+    pointer: Mutex<Option<PointerEcho>>,
+    pointer_passed: AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PointerEcho {
+    pub(super) message: u32,
+    pub(super) point: (i32, i32),
+    pub(super) release: bool,
 }
 
 impl Record {
@@ -68,6 +77,8 @@ impl Record {
             route_hwnd: AtomicU32::new(0),
             automation_held: AtomicUsize::new(0),
             callback_slow: AtomicBool::new(false),
+            pointer: Mutex::new(None),
+            pointer_passed: AtomicBool::new(false),
         }
     }
 
@@ -115,16 +126,36 @@ impl Record {
             RawInputEvent::Mouse {
                 tag,
                 message,
+                point,
                 injected,
                 ..
             } if tag == self.tag && injected => {
+                let Ok(mut pointer) = self.pointer.try_lock() else {
+                    // A hook callback must never wait on the posting thread.
+                    self.callback_slow.store(true, Release);
+                    return true;
+                };
+                if let Some(expected) = pointer.take() {
+                    let foreground = self.route_hwnd.load(Acquire);
+                    let matches = message == expected.message
+                        && point == expected.point
+                        && foreground != 0
+                        && foreground_window_number() == Some(foreground);
+                    if !matches {
+                        self.route_changed.store(true, Release);
+                    }
+                    let pass = matches
+                        && (expected.release
+                            || (self.person.load(Acquire) == NEVER
+                                && !self.route_changed.load(Acquire)));
+                    self.pointer_passed.store(pass, Release);
+                    self.payload.fetch_add(1, Release);
+                    return !pass;
+                }
                 if message == WM_MOUSEMOVE {
                     self.mouse.fetch_add(1, Release);
-                    true
-                } else {
-                    self.payload.fetch_add(1, Release);
-                    false
                 }
+                true
             }
             RawInputEvent::Foreground { event_tick } | RawInputEvent::Focus { event_tick } => {
                 if self.watching_route.load(Acquire)
@@ -282,6 +313,21 @@ impl NativeObserver {
             self.record.marker.load(Acquire),
             self.record.payload.load(Acquire),
         )
+    }
+
+    pub(super) fn post_pointer(&self, event: RawInputPost, echo: PointerEcho) -> bool {
+        self.record.pointer_passed.store(false, Relaxed);
+        {
+            let Ok(mut pointer) = self.record.pointer.lock() else {
+                return false;
+            };
+            *pointer = Some(echo);
+        }
+        self.post(&[event]) == 1
+    }
+
+    pub(super) fn pointer_passed(&self) -> bool {
+        self.record.pointer_passed.load(Acquire)
     }
 
     pub(super) fn fence(&self, before: (usize, usize), posted: usize, until_ms: u64) -> bool {

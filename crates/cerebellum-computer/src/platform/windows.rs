@@ -769,10 +769,25 @@ fn accepted_invoke_result(unreadable_subtrees: usize) -> DispatchResult {
     }
 }
 
+#[cfg(all(windows, feature = "test-support"))]
+type FixtureDispatch = dyn Fn(GlobalDispatchRequest, u32, Option<GlobalScrollGuard>) -> Result<DispatchResult, DriverError>
+    + Send
+    + Sync;
+
+#[cfg(all(windows, feature = "test-support"))]
+#[derive(Clone)]
+struct PointerDispatchFixture(std::sync::Arc<FixtureDispatch>);
+
+#[cfg(all(windows, feature = "test-support"))]
+impl std::fmt::Debug for PointerDispatchFixture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PointerDispatchFixture")
+    }
+}
+
 /// Windows UI Automation implementation of `PlatformDriver`.
 ///
-/// Accessibility reads and Invoke-pattern actions are implemented; capture and
-/// synthetic input remain unavailable.
+/// Implementing a driver entry point does not advertise it to callers.
 #[derive(Debug, Clone)]
 pub struct WindowsPlatformDriver {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -780,6 +795,12 @@ pub struct WindowsPlatformDriver {
     expected_post_condition_available: bool,
     #[cfg(windows)]
     fronted_hooks: fronting::FrontedHookSlot,
+    #[cfg(windows)]
+    scroll_guard: Option<GlobalScrollGuard>,
+    #[cfg(windows)]
+    pointer_window: Option<u32>,
+    #[cfg(all(windows, feature = "test-support"))]
+    pointer_fixture: Option<PointerDispatchFixture>,
 }
 
 impl Default for WindowsPlatformDriver {
@@ -789,11 +810,34 @@ impl Default for WindowsPlatformDriver {
             expected_post_condition_available: true,
             #[cfg(windows)]
             fronted_hooks: Default::default(),
+            #[cfg(windows)]
+            scroll_guard: None,
+            #[cfg(windows)]
+            pointer_window: None,
+            #[cfg(all(windows, feature = "test-support"))]
+            pointer_fixture: None,
         }
     }
 }
 
 impl WindowsPlatformDriver {
+    #[cfg(all(windows, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_pointer_dispatch_fixture(
+        mut self,
+        dispatch: impl Fn(
+                GlobalDispatchRequest,
+                u32,
+                Option<GlobalScrollGuard>,
+            ) -> Result<DispatchResult, DriverError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.pointer_fixture = Some(PointerDispatchFixture(std::sync::Arc::new(dispatch)));
+        self
+    }
+
     pub fn without_expected_post_condition(mut self) -> Self {
         self.expected_post_condition_available = false;
         self
@@ -859,6 +903,23 @@ impl WindowsPlatformDriver {
 }
 
 impl PlatformDriver for WindowsPlatformDriver {
+    #[cfg(windows)]
+    fn uses_windows_pointer_dispatch() -> bool {
+        true
+    }
+
+    #[cfg(windows)]
+    fn accept_global_scroll_guard(&mut self, guard: GlobalScrollGuard) -> bool {
+        self.scroll_guard = Some(guard);
+        true
+    }
+
+    #[cfg(windows)]
+    fn accept_windows_pointer_window(&mut self, window: u32) -> bool {
+        self.pointer_window = (window != 0).then_some(window);
+        self.pointer_window.is_some()
+    }
+
     #[cfg(windows)]
     fn uses_windows_input_bracket() -> bool {
         true
@@ -1126,6 +1187,36 @@ impl PlatformDriver for WindowsPlatformDriver {
         ))
     }
 
+    #[cfg(windows)]
+    fn dispatch_global(
+        &mut self,
+        request: GlobalDispatchRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<DispatchResult, DriverError> {
+        #[cfg(feature = "test-support")]
+        if let Some(fixture) = &self.pointer_fixture {
+            if !request.action_is_admitted() {
+                return Err(DriverError::InvalidRequest(
+                    "takeover token does not admit this action",
+                ));
+            }
+            let window = self
+                .pointer_window
+                .take()
+                .ok_or(DriverError::InvalidRequest(
+                    "no addressed Windows pointer window",
+                ))?;
+            return (fixture.0)(request, window, self.scroll_guard.take());
+        }
+        fronting::dispatch_takeover(
+            request,
+            self.pointer_window.take(),
+            self.scroll_guard.take(),
+            cancelled,
+        )
+    }
+
+    #[cfg(not(windows))]
     fn dispatch_global(
         &mut self,
         _request: GlobalDispatchRequest,

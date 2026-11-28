@@ -462,7 +462,8 @@ impl cerebellum_computer::dispatch::EscalationConsent for RecordingConsent {
 }
 
 fn once_dispatch_token() -> cerebellum_core::consent::OnceDispatchToken {
-    cerebellum_core::consent::OnceDispatchToken::admitted_by_takeover_grant()
+    use cerebellum_core::consent::{OnceDispatchToken, TakeoverAction};
+    OnceDispatchToken::admitted_by_takeover_grant(TakeoverAction::Move)
 }
 
 fn background_attendance() -> AttendanceContext {
@@ -844,7 +845,7 @@ fn seized_input_aborts_sequence_and_cancels_every_queued_post() {
         }),
         ..RecordingDriver::default()
     };
-    let row = FrozenDispatchRow::for_capability("computer.type").unwrap();
+    let row = FrozenDispatchRow::for_capability("computer.takeover_move").unwrap();
     let request = DispatchRequest::new(
         row,
         DispatchMode::Observed,
@@ -859,7 +860,10 @@ fn seized_input_aborts_sequence_and_cancels_every_queued_post() {
         AttendanceContext::observed("conversation-1", target(), "process-1", 0, 0, true),
         0,
     )
-    .with_synthetic(SyntheticAction::type_text("x"))
+    .with_synthetic(SyntheticAction::move_pointer(SyntheticPoint {
+        x: 10.0,
+        y: 20.0,
+    }))
     .with_focus_plan(FocusCheckPlan::immediate(0))
     .with_once_dispatch_token(once_dispatch_token());
     let mut dispatcher = Dispatcher::new(
@@ -910,6 +914,46 @@ fn seized_input_aborts_sequence_and_cancels_every_queued_post() {
     watcher.abort(AbortReason::UserSeizedControl, 1, Some(2));
     assert_eq!(watcher.abort_decision().unwrap().queued_posts_cancelled, 2);
     assert!(!watcher.take_post_slot());
+}
+
+#[test]
+fn observed_takeover_never_posts_without_a_matching_once_token() {
+    use cerebellum_core::consent::{OnceDispatchToken, TakeoverAction};
+    for bad_token in [
+        None,
+        Some(OnceDispatchToken::admitted_by_takeover_grant(
+            TakeoverAction::Scroll,
+        )),
+    ] {
+        let row = FrozenDispatchRow::for_capability("computer.takeover_move").unwrap();
+        let mut request = DispatchRequest::new(
+            row,
+            DispatchMode::Observed,
+            target(),
+            ExpectedPostCondition::new(
+                "effect-v1",
+                PostCondition::ElementEnabledIs {
+                    element: AccessibilityElementName::identifier("element-1"),
+                    expected: true,
+                },
+            ),
+            AttendanceContext::observed("conversation-1", target(), "process-1", 0, 0, true),
+            0,
+        )
+        .with_synthetic(SyntheticAction::move_pointer(SyntheticPoint {
+            x: 10.0,
+            y: 20.0,
+        }));
+        if let Some(token) = bad_token {
+            request = request.with_once_dispatch_token(token);
+        }
+        let mut dispatcher = Dispatcher::new(RecordingDriver::default(), &|| false);
+        assert_eq!(
+            dispatcher.dispatch(&mut audit(), audit_identity(), request),
+            Err(DispatchError::AttendanceUnavailable)
+        );
+        assert_eq!(dispatcher.driver().global_calls, 0);
+    }
 }
 
 /// An observed abort leaves its numbers in the journal, and only there.
@@ -1519,7 +1563,7 @@ fn permitted_escalation_requests_consent_and_records_a_distinct_attempt() {
 
 #[test]
 fn seize_latency_must_fit_between_observed_posts() {
-    let row = FrozenDispatchRow::for_capability("computer.type").unwrap();
+    let row = FrozenDispatchRow::for_capability("computer.takeover_move").unwrap();
     let first = DispatchRequest::new(
         row.clone(),
         DispatchMode::Observed,
@@ -1534,7 +1578,10 @@ fn seize_latency_must_fit_between_observed_posts() {
         AttendanceContext::observed("conversation-1", target(), "process-1", 0, 0, true),
         0,
     )
-    .with_synthetic(SyntheticAction::type_text("x"))
+    .with_synthetic(SyntheticAction::move_pointer(SyntheticPoint {
+        x: 10.0,
+        y: 20.0,
+    }))
     .with_focus_plan(FocusCheckPlan::immediate(0))
     .with_once_dispatch_token(once_dispatch_token());
     let second = DispatchRequest::new(
@@ -1551,7 +1598,10 @@ fn seize_latency_must_fit_between_observed_posts() {
         AttendanceContext::observed("conversation-1", target(), "process-1", 1, 1, true),
         1,
     )
-    .with_synthetic(SyntheticAction::type_text("x"))
+    .with_synthetic(SyntheticAction::move_pointer(SyntheticPoint {
+        x: 10.0,
+        y: 20.0,
+    }))
     .with_focus_plan(FocusCheckPlan::immediate(1))
     .with_once_dispatch_token(once_dispatch_token());
     let mut dispatcher = Dispatcher::new(
@@ -1621,7 +1671,7 @@ fn observed_focus_mismatch_prevents_the_global_post() {
         ..RecordingDriver::default()
     };
     let request = DispatchRequest::new(
-        FrozenDispatchRow::for_capability("computer.type").unwrap(),
+        FrozenDispatchRow::for_capability("computer.takeover_move").unwrap(),
         DispatchMode::Observed,
         target(),
         ExpectedPostCondition::new(
@@ -1634,7 +1684,10 @@ fn observed_focus_mismatch_prevents_the_global_post() {
         AttendanceContext::observed("conversation-1", target(), "process-1", 0, 0, true),
         0,
     )
-    .with_synthetic(SyntheticAction::type_text("x"))
+    .with_synthetic(SyntheticAction::move_pointer(SyntheticPoint {
+        x: 10.0,
+        y: 20.0,
+    }))
     .with_focus_plan(FocusCheckPlan::immediate(0))
     .with_once_dispatch_token(once_dispatch_token());
     let mut dispatcher = Dispatcher::new(

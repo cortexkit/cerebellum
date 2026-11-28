@@ -1276,6 +1276,13 @@ impl<D: PlatformDriver> Dispatcher<'_, D> {
                     return Err(DispatchError::AttendanceUnavailable);
                 }
                 let token = once_dispatch_token.ok_or(DispatchError::AttendanceUnavailable)?;
+                if !synthetic
+                    .action
+                    .takeover_action()
+                    .is_some_and(|action| token.admits(action))
+                {
+                    return Err(DispatchError::AttendanceUnavailable);
+                }
                 let state = audit_state.ok_or(DispatchError::AuditUnavailable)?;
                 Self::commit_audit_intent(audit, state, &intent)?;
                 let cancelled = self.cancelled;

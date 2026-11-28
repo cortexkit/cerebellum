@@ -201,6 +201,55 @@ pub(super) fn input_focus(
     })
 }
 
+/// Check both paths in one bounded live UIA read, never from a prior image or
+/// the pressable ancestor substituted by the background press hit test.
+pub(super) fn pointer_safe(
+    target: &ProcessGrant,
+    hwnd: u32,
+    proof: FrameProof,
+    point: (i32, i32),
+    end: Instant,
+) -> ReadResult<()> {
+    let (pid, generation) = (target.pid, grant_generation(target)?);
+    operation(pid, generation, end, move |uia, process| {
+        let reading = windows(process, pid, end)?;
+        if reading.unreadable != 0 {
+            return Err(ReadError::Unreadable);
+        }
+        let window = reading
+            .eligible
+            .iter()
+            .find(|w| w.root.number == hwnd && w.proof == proof)
+            .ok_or(ReadError::Gone)?;
+        let point = (f64::from(point.0), f64::from(point.1));
+        if !contains(window.state.bounds, point) {
+            return Err(ReadError::Unreadable);
+        }
+        let scope = UiWindow::new(uia, process, pid, generation, window)?;
+        let hit = scope.deepest_at(point)?.ok_or(ReadError::Unreadable)?;
+        if !scope.safe_path(&hit)? {
+            return Err(ReadError::Unsupported);
+        }
+        let active = active_window(&reading)?;
+        if let Some((window, native)) = active {
+            let focused_scope = UiWindow::new(uia, process, pid, generation, window)?;
+            if let Some(element) = focused_scope.focused(native.focus)? {
+                let found = focused_scope.find(&element_token(&element)?.key)?;
+                if !focused_scope.safe_path(&found)? {
+                    return Err(ReadError::Unsupported);
+                }
+            }
+            focused_scope.confirm()?;
+        }
+        if active_window(&reading)?.map(|(w, info)| (w.root.number, info))
+            != active.map(|(w, info)| (w.root.number, info))
+        {
+            return Err(ReadError::Unreadable);
+        }
+        scope.confirm()
+    })
+}
+
 #[derive(Clone)]
 pub struct WindowsAppStateSource {
     cache: Arc<Mutex<WindowCache>>,
@@ -600,6 +649,27 @@ impl AppStateSource for WindowsAppStateSource {
         point: (f64, f64),
     ) -> Result<Option<(ElementHandle, Option<u32>)>, ElementActionError> {
         Ok(bound_hit(target.pid, grant_generation(target)?, point)?)
+    }
+
+    fn cursor_position(&self) -> Option<(f64, f64)> {
+        if !is_default_desktop() {
+            return None;
+        }
+        cerebellum_windows::cursor_position()
+            .ok()
+            .map(|(x, y)| (f64::from(x), f64::from(y)))
+    }
+
+    fn topmost_window_at(&self, point: (f64, f64)) -> Option<u32> {
+        if !is_default_desktop() {
+            return None;
+        }
+        let point = super::fronting::physical_pointer_pixel(point)?;
+        cerebellum_windows::window_at_point(point).and_then(cerebellum_windows::root_window_number)
+    }
+
+    fn pointer_window_at(&self, point: (f64, f64)) -> Option<u32> {
+        self.topmost_window_at(point)
     }
 
     fn visible_window_numbers(&self, target: &ProcessGrant) -> Option<Vec<u32>> {

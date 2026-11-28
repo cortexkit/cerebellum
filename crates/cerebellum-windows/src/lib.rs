@@ -42,6 +42,8 @@ mod named_pipe_server;
 #[cfg(any(windows, test))]
 mod pe_product;
 #[cfg(windows)]
+mod pointer_facts;
+#[cfg(windows)]
 pub mod process;
 #[cfg(windows)]
 mod process_readings;
@@ -120,6 +122,10 @@ pub use named_pipe::{
 };
 #[cfg(windows)]
 pub use named_pipe_server::create_named_pipe_instance;
+#[cfg(windows)]
+pub use pointer_facts::{
+    cursor_position, gui_thread_capture, mouse_wheel_routing, virtual_screen, window_at_point,
+};
 #[cfg(windows)]
 pub use process_readings::system_time_100ns;
 #[cfg(windows)]

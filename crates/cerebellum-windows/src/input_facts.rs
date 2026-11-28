@@ -14,8 +14,9 @@ use windows_sys::Win32::{
         Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK},
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-            KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_MOVE,
-            MOUSEINPUT,
+            KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE,
+            MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
+            MOUSEEVENTF_MOVE_NOCOALESCE, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT,
         },
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, PeekMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
@@ -39,6 +40,7 @@ pub enum RawInputEvent {
     Mouse {
         tag: usize,
         message: u32,
+        point: (i32, i32),
         flags: u32,
         injected: bool,
         event_tick: u32,
@@ -90,6 +92,7 @@ unsafe extern "system" fn mouse(code: i32, message: WPARAM, data: LPARAM) -> LRE
         if dispatch(RawInputEvent::Mouse {
             tag: event.dwExtraInfo,
             message: message as u32,
+            point: (event.pt.x, event.pt.y),
             flags: event.flags,
             injected: event.flags & 1 != 0,
             event_tick: event.time,
@@ -211,6 +214,9 @@ pub enum RawInputPost {
     VirtualKey { key: u16, up: bool, extended: bool },
     Unicode { unit: u16, up: bool },
     RelativeMouseMove { x: i32, y: i32 },
+    AbsoluteMouseMove { x: u16, y: u16 },
+    LeftMouseButton { up: bool },
+    MouseWheel { delta: i32, horizontal: bool },
 }
 
 pub fn post_input(tag: usize, events: &[RawInputPost]) -> usize {
@@ -229,6 +235,19 @@ pub fn post_input(tag: usize, events: &[RawInputPost]) -> usize {
                     },
                 },
             };
+            let mouse = |dx, dy, mouse_data, flags| INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx,
+                        dy,
+                        mouseData: mouse_data,
+                        dwFlags: flags,
+                        time: 0,
+                        dwExtraInfo: tag,
+                    },
+                },
+            };
             let released = |up| if up { KEYEVENTF_KEYUP } else { 0 };
             match *event {
                 RawInputPost::VirtualKey { key, up, extended } => keyboard(
@@ -239,19 +258,36 @@ pub fn post_input(tag: usize, events: &[RawInputPost]) -> usize {
                 RawInputPost::Unicode { unit, up } => {
                     keyboard(0, unit, released(up) | KEYEVENTF_UNICODE)
                 }
-                RawInputPost::RelativeMouseMove { x, y } => INPUT {
-                    r#type: INPUT_MOUSE,
-                    Anonymous: INPUT_0 {
-                        mi: MOUSEINPUT {
-                            dx: x,
-                            dy: y,
-                            mouseData: 0,
-                            dwFlags: MOUSEEVENTF_MOVE,
-                            time: 0,
-                            dwExtraInfo: tag,
-                        },
+                RawInputPost::RelativeMouseMove { x, y } => mouse(x, y, 0, MOUSEEVENTF_MOVE),
+                RawInputPost::AbsoluteMouseMove { x, y } => mouse(
+                    i32::from(x),
+                    i32::from(y),
+                    0,
+                    MOUSEEVENTF_MOVE
+                        | MOUSEEVENTF_ABSOLUTE
+                        | MOUSEEVENTF_VIRTUALDESK
+                        | MOUSEEVENTF_MOVE_NOCOALESCE,
+                ),
+                RawInputPost::LeftMouseButton { up } => mouse(
+                    0,
+                    0,
+                    0,
+                    if up {
+                        MOUSEEVENTF_LEFTUP
+                    } else {
+                        MOUSEEVENTF_LEFTDOWN
                     },
-                },
+                ),
+                RawInputPost::MouseWheel { delta, horizontal } => mouse(
+                    0,
+                    0,
+                    delta as u32,
+                    if horizontal {
+                        MOUSEEVENTF_HWHEEL
+                    } else {
+                        MOUSEEVENTF_WHEEL
+                    },
+                ),
             }
         })
         .collect();
