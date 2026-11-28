@@ -2073,6 +2073,11 @@ impl PlatformDriver for MacOs26PlatformDriver {
         request: GlobalDispatchRequest,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<DispatchResult, DriverError> {
+        if !request.action_is_admitted() {
+            return Err(DriverError::InvalidRequest(
+                "takeover token does not admit this action",
+            ));
+        }
         if self
             .global_dispatch_review_revision
             .as_deref()
@@ -2709,7 +2714,9 @@ mod tests {
                         action: action.clone(),
                     },
                     once_dispatch_token:
-                        cerebellum_core::consent::OnceDispatchToken::admitted_by_takeover_grant(),
+                        cerebellum_core::consent::OnceDispatchToken::admitted_by_takeover_grant(
+                            action.takeover_action().unwrap(),
+                        ),
                     maximum_seize_detection_latency_ms: 50,
                     minimum_inter_post_interval_ms: 50,
                 },
@@ -3859,13 +3866,43 @@ mod cached_element_tests {
         }
 
         fn global_request(action: SyntheticAction) -> GlobalDispatchRequest {
+            let token = cerebellum_core::consent::OnceDispatchToken::admitted_by_takeover_grant(
+                action.takeover_action().unwrap(),
+            );
             GlobalDispatchRequest {
                 synthetic: request(action),
-                once_dispatch_token:
-                    cerebellum_core::consent::OnceDispatchToken::admitted_by_takeover_grant(),
+                once_dispatch_token: token,
                 maximum_seize_detection_latency_ms: 50,
                 minimum_inter_post_interval_ms: 50,
             }
+        }
+
+        #[test]
+        fn wrong_action_takeover_token_stops_before_macos_input_or_containment() {
+            use cerebellum_core::consent::{OnceDispatchToken, TakeoverAction};
+            let mut request = global_request(SyntheticAction::move_pointer(SyntheticPoint {
+                x: 1.0,
+                y: 1.0,
+            }));
+            request.once_dispatch_token =
+                OnceDispatchToken::admitted_by_takeover_grant(TakeoverAction::Scroll);
+            let mut driver = MacOs26PlatformDriver::default()
+                .with_global_dispatch_review_revision(Some("fixture-global".into()))
+                .with_takeover_dispatch_review_revision(Some("fixture-takeover".into()))
+                .with_takeover_pointer_fronting_review_revision(Some("fixture-pointer".into()));
+            assert!(
+                driver.accept_pointer_fronting(super::super::super::GlobalPointerGuard(Arc::new(
+                    |_| panic!("mismatched authority cannot reach containment")
+                )))
+            );
+            assert_eq!(
+                driver.dispatch_global(request, &|| panic!(
+                    "mismatched authority cannot start posting"
+                )),
+                Err(DriverError::InvalidRequest(
+                    "takeover token does not admit this action"
+                ))
+            );
         }
 
         fn dispatch(

@@ -16,12 +16,15 @@ mod background;
 mod bracket;
 mod observer;
 mod pieces;
+mod takeover;
 pub use background::{BackgroundForeground, BackgroundRestore};
 use bracket::Observer;
 pub(super) use bracket::{query_focus, run_native, FrontedHookSlot, NativeWork};
 pub(super) use observer::trial_install;
 use observer::NativeObserver;
 pub use pieces::chord_supported;
+pub use takeover::WINDOWS_DOWN_GESTURE_RECOVERY_MEASURED;
+pub(super) use takeover::{dispatch_takeover, physical_pointer_pixel};
 
 pub fn background_restore_admitted(
     inputs: &ImmutableReleaseInputs,

@@ -7,6 +7,15 @@
 //! value the global dispatch path demands before it will post: a token minted
 //! for exactly one dispatch.
 
+/// The kind of global pointer action admitted by the takeover grant check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeoverAction {
+    Move,
+    Click,
+    Drag,
+    Scroll,
+}
+
 /// Proof that one global pointer dispatch was admitted.
 ///
 /// The global pointer stream reaches every application on the screen, so the
@@ -17,9 +26,17 @@
 ///
 /// No `Default` and no `Clone`: one admission yields one token, and a token
 /// cannot be duplicated to cover a second dispatch nobody admitted.
+///
+/// ```compile_fail
+/// use cerebellum_core::consent::{OnceDispatchToken, TakeoverAction};
+/// fn dispatch(_token: OnceDispatchToken) {}
+/// let token = OnceDispatchToken::admitted_by_takeover_grant(TakeoverAction::Move);
+/// dispatch(token);
+/// dispatch(token); // A consumed token cannot authorize a second call.
+/// ```
 #[derive(Debug, PartialEq, Eq)]
 pub struct OnceDispatchToken {
-    _private: (),
+    action: TakeoverAction,
 }
 
 impl OnceDispatchToken {
@@ -45,7 +62,11 @@ impl OnceDispatchToken {
     /// before building the dispatch it is for: a token minted earlier and held
     /// is a standing permission, which is what the type exists to prevent.
     #[doc(hidden)]
-    pub fn admitted_by_takeover_grant() -> Self {
-        Self { _private: () }
+    pub fn admitted_by_takeover_grant(action: TakeoverAction) -> Self {
+        Self { action }
+    }
+
+    pub fn admits(&self, action: TakeoverAction) -> bool {
+        self.action == action
     }
 }

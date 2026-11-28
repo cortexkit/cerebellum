@@ -1561,13 +1561,14 @@ impl ComputerGrants {
     /// answer admits it; an app grant never does.
     pub async fn require_takeover_dispatch(
         self: &Arc<Self>,
+        action: cerebellum_core::consent::TakeoverAction,
         context: &ConsentContext,
         cancel: &CancelHandle,
     ) -> Result<TakeoverDispatch, ConsentRefusal> {
         let admission = self.require(&GrantNeed::Takeover, context, cancel).await?;
         Ok(TakeoverDispatch {
             admission,
-            token: OnceDispatchToken::admitted_by_takeover_grant(),
+            token: OnceDispatchToken::admitted_by_takeover_grant(action),
         })
     }
 

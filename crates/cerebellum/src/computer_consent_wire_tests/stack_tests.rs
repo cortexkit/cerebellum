@@ -62,7 +62,11 @@ pub(crate) fn future_sizes() -> Vec<(&'static str, usize)> {
                 &planes
                     .management
                     .computer_grants()
-                    .require_takeover_dispatch(&context.consent, &cancel),
+                    .require_takeover_dispatch(
+                        cerebellum_core::consent::TakeoverAction::Move,
+                        &context.consent,
+                        &cancel,
+                    ),
             ),
         ),
     ];

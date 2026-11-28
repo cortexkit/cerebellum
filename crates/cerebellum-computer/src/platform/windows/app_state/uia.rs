@@ -183,7 +183,7 @@ impl<'a> UiWindow<'a> {
         Ok(Some(self.node(&parent)?.handle()))
     }
 
-    fn safe_path(&self, element: &UiaElementRef) -> ReadResult<bool> {
+    pub(super) fn safe_path(&self, element: &UiaElementRef) -> ReadResult<bool> {
         if self.node(element)?.hazard() {
             return Ok(false);
         }
@@ -440,14 +440,7 @@ impl<'a> UiWindow<'a> {
     }
 
     pub fn hit(&self, point: (f64, f64)) -> ReadResult<Option<ElementHandle>> {
-        let mut budget = crate::app_state::source::READ_BOUND_ELEMENTS;
-        let Some(mut hit) = self.deepest(
-            self.uia.at_window(self.window.content())?,
-            point,
-            MAX_PATH - 1,
-            &mut budget,
-        )?
-        else {
+        let Some(mut hit) = self.deepest_at(point)? else {
             return Ok(None);
         };
         let deepest = self.node(&hit)?;
@@ -462,6 +455,16 @@ impl<'a> UiWindow<'a> {
             hit = self.uia.parent(&hit)?.ok_or(ReadError::Unreadable)?;
         }
         Err(ReadError::Bound)
+    }
+
+    pub(super) fn deepest_at(&self, point: (f64, f64)) -> ReadResult<Option<UiaElementRef>> {
+        let mut budget = crate::app_state::source::READ_BOUND_ELEMENTS;
+        self.deepest(
+            self.uia.at_window(self.window.content())?,
+            point,
+            MAX_PATH - 1,
+            &mut budget,
+        )
     }
 
     fn deepest(

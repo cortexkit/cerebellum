@@ -1321,6 +1321,15 @@ pub struct GlobalDispatchRequest {
     pub minimum_inter_post_interval_ms: u32,
 }
 
+impl GlobalDispatchRequest {
+    pub fn action_is_admitted(&self) -> bool {
+        self.synthetic
+            .action
+            .takeover_action()
+            .is_some_and(|action| self.once_dispatch_token.admits(action))
+    }
+}
+
 /// Revalidate the real wheel recipient before a non-fronting scroll post.
 /// This callback may only inspect state; it must not front an app or move the pointer.
 #[derive(Clone)]
@@ -1728,6 +1737,19 @@ pub trait PlatformDriver {
     /// Install containment for a non-fronting wheel dispatch. A driver that
     /// cannot check it at the post must refuse, not silently ignore the guard.
     fn accept_global_scroll_guard(&mut self, _guard: GlobalScrollGuard) -> bool {
+        false
+    }
+    #[cfg(windows)]
+    fn uses_windows_pointer_dispatch() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+    /// Pin the exact native HWND selected at placement; a newly covered point
+    /// must not be rebound to another window even within the same process.
+    #[cfg(windows)]
+    fn accept_windows_pointer_window(&mut self, _window: u32) -> bool {
         false
     }
     /// Install one separately admitted pointer-fronting unit. Unsupported

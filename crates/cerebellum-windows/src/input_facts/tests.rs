@@ -148,7 +148,7 @@ fn report_observed(event: RawInputEvent) {
     match event {
         RawInputEvent::Keyboard { tag, key, flags, up, injected, event_tick } => writeln!(out,
             "S9 keyboard vk={key:#04x} flags={flags:#04x} up={up} injected={injected} time={event_tick} tag={tag:#x}"),
-        RawInputEvent::Mouse { tag, message, flags, injected, event_tick } => writeln!(out,
+        RawInputEvent::Mouse { tag, message, flags, injected, event_tick, .. } => writeln!(out,
             "S9 mouse message={message:#06x} flags={flags:#04x} injected={injected} time={event_tick} tag={tag:#x}"),
         RawInputEvent::Foreground { event_tick } => writeln!(out, "S9 WinEvent foreground time={event_tick}"),
         RawInputEvent::Focus { event_tick } => writeln!(out, "S9 WinEvent focus time={event_tick}"),
@@ -321,4 +321,74 @@ fn github_hosted_zero_move_has_no_echo_but_nonzero_move_reaches_hook() {
         0,
         "no keyboard marker should reach the owned receiver"
     );
+}
+
+#[test]
+fn github_hosted_absolute_move_reports_the_owned_physical_point() {
+    if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
+        || std::env::var("RUNNER_ENVIRONMENT").as_deref() != Ok("github-hosted")
+        || std::env::var("RUNNER_ARCH").as_deref() != Ok("X64")
+    {
+        return;
+    }
+    assert_eq!(crate::input_desktop_name().unwrap(), "Default");
+    let window = Receiver::new();
+    let hwnd = window.0 as usize as u32;
+    let original = cursor_position();
+    let target = POINT {
+        x: original.x + 1,
+        y: original.y,
+    };
+    assert!(window.contains_client_point(target));
+    assert_eq!(
+        crate::window_at_point((target.x, target.y)).and_then(crate::root_window_number),
+        Some(hwnd)
+    );
+    let [left, top, width, height] = crate::virtual_screen();
+    let absolute = |pixel: i32, origin: i32, extent: i32| {
+        let offset = i64::from(pixel) - i64::from(origin);
+        u16::try_from((2 * offset + 1) * 65_536 / (2 * i64::from(extent))).unwrap()
+    };
+    let (report, events) = mpsc::sync_channel(1);
+    let _hooks = InputHooks::start(None, WAIT, move |event| {
+        if let RawInputEvent::Mouse {
+            tag: MOUSE_CONTROL_TAG,
+            message: WM_MOUSEMOVE,
+            point,
+            injected: true,
+            ..
+        } = event
+        {
+            let _ = report.try_send(point);
+            true
+        } else {
+            false
+        }
+    })
+    .expect("hosted desktop input hooks");
+    let restore = RestorePointer(original);
+    assert_eq!(foreground_window_number(), Some(hwnd));
+    assert_eq!(
+        post_input(
+            MOUSE_CONTROL_TAG,
+            &[RawInputPost::AbsoluteMouseMove {
+                x: absolute(target.x, left, width),
+                y: absolute(target.y, top, height),
+            }]
+        ),
+        1
+    );
+    assert_eq!(
+        events
+            .recv_timeout(WAIT)
+            .expect("absolute pointer hook echo"),
+        (target.x, target.y)
+    );
+    let after = cursor_position();
+    assert_eq!(
+        (after.x, after.y),
+        (original.x, original.y),
+        "the hook should swallow the test move"
+    );
+    drop(restore);
 }

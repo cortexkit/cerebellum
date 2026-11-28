@@ -334,6 +334,7 @@ async fn provider_revoke_stopping() {
             .management
             .computer_grants()
             .require_takeover_dispatch(
+                cerebellum_core::consent::TakeoverAction::Move,
                 &crate::computer_grants::ConsentContext::without_carrier(
                     crate::computer_grants::GrantCaller::new(
                         "conversation".into(),

@@ -20,6 +20,7 @@ use subc_protocol::{Flags, Frame, FrameType, Priority};
 mod actions;
 mod launch;
 mod picture;
+mod takeover;
 
 fn app_state_block(context: &CapabilityAdvertisementContext) -> Option<&'static str> {
     if context
@@ -62,6 +63,9 @@ fn rows(context: &CapabilityAdvertisementContext) -> BTreeSet<String> {
     }
     if actions::block(context).is_none() {
         rows.extend(actions::ROWS.map(str::to_owned));
+    }
+    if takeover::block(context).is_none() {
+        rows.extend(takeover::ROWS.map(str::to_owned));
     }
     rows
 }
@@ -213,7 +217,12 @@ fn rig(
             responsible_process: "ck-cerebellum".into(),
             off_main: true,
         }]);
-        let permissions = if context.inputs.windows_capture_review_revision.is_some() {
+        let permissions = if context.inputs.windows_capture_review_revision.is_some()
+            || context
+                .inputs
+                .windows_input_bracket_review_revision
+                .is_some()
+        {
             cerebellum_computer::platform::windows::picture::startup_permissions(
                 &context.inputs,
                 context.startup.windows_elevation,
@@ -281,10 +290,28 @@ async fn wire_with_consent_hook(
 async fn wire_with_decision(
     planes: &crate::Planes,
     action: &str,
+    arguments: Value,
+    decision: &str,
+    on_question: impl FnMut(),
+) -> (Value, usize) {
+    let (frame, questions) =
+        wire_frame_with_decision(planes, action, arguments, decision, on_question).await;
+    assert_eq!(
+        frame.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&frame.body)
+    );
+    (serde_json::from_slice(&frame.body).unwrap(), questions)
+}
+
+async fn wire_frame_with_decision(
+    planes: &crate::Planes,
+    action: &str,
     mut arguments: Value,
     decision: &str,
     mut on_question: impl FnMut(),
-) -> (Value, usize) {
+) -> (Frame, usize) {
     arguments["action"] = json!(action);
     let request = Frame::build(
         FrameType::Request,
@@ -310,9 +337,7 @@ async fn wire_with_decision(
                     assert!(service.answer(question.header.corr, crate::cingulate_client::ScriptedAnswer::Answered(json!({"decision":decision}))));
                 }
                 frame = rx.recv() => {
-                    let frame = frame.unwrap();
-                    assert_eq!(frame.header.ty, FrameType::Response);
-                    return (serde_json::from_slice(&frame.body).unwrap(), questions);
+                    return (frame.unwrap(), questions);
                 }
             }
         }
