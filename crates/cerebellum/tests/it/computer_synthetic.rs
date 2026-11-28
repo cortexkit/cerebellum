@@ -913,7 +913,7 @@ fn the_session_floor_holds_every_chord_this_test_names() {
         SyntheticKeyModifiers,
         SyntheticKey,
         &str,
-    ); 8] = [
+    ); 11] = [
         (
             BlockedChordPlatform::MacOs,
             mods(true, true, false, false, false),
@@ -961,6 +961,24 @@ fn the_session_floor_holds_every_chord_this_test_names() {
             mods(false, false, false, false, true),
             SyntheticKey::L,
             "lock",
+        ),
+        (
+            BlockedChordPlatform::Windows,
+            mods(false, true, true, false, false),
+            SyntheticKey::ForwardDelete,
+            "logout",
+        ),
+        (
+            BlockedChordPlatform::Windows,
+            mods(false, true, true, false, false),
+            SyntheticKey::End,
+            "logout",
+        ),
+        (
+            BlockedChordPlatform::Windows,
+            mods(false, false, false, false, true),
+            SyntheticKey::X,
+            "logout",
         ),
     ];
     for (platform, modifiers, key, reason) in expected {

@@ -1715,6 +1715,16 @@ impl std::error::Error for DriverError {}
 /// The complete bounded surface shared by future Windows, X11, and Wayland
 /// backends. Implementations may refuse an operation, but may not broaden it.
 pub trait PlatformDriver {
+    /// The native Windows driver must use the temporary foreground route:
+    /// bring the target forward for input, then restore the previous window.
+    /// This route also handles a target that is already in the foreground.
+    fn uses_windows_input_bracket() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
     /// Install containment for a non-fronting wheel dispatch. A driver that
     /// cannot check it at the post must refuse, not silently ignore the guard.
     fn accept_global_scroll_guard(&mut self, _guard: GlobalScrollGuard) -> bool {

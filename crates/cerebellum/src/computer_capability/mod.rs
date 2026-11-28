@@ -1600,7 +1600,7 @@ where
                 return unposted(chord_blocked_refusal(&chord, blocked.reason));
             }
             #[cfg(windows)]
-            if let Some(refusal) = keystrokes::windows_chord_refusal(*key, *modifiers) {
+            if let Some(refusal) = keystrokes::windows_chord_refusal::<D>(*key, *modifiers) {
                 return unposted(refusal);
             }
             // The session floor is checked before anything is asked or
@@ -1777,7 +1777,7 @@ where
         let shortcut = matches!(&parsed.action,
             SyntheticAction::KeyCombination { modifiers, .. }
             if modifiers.command || modifiers.control || modifiers.option);
-        let route = keystrokes::application_route(
+        let route = keystrokes::application_route::<D>(
             fronting_admission,
             frontmost == Some(grant.pid),
             shortcut,
@@ -1907,7 +1907,11 @@ where
             let purpose = crate::terminal_arbiter::FrontingPurpose::NeedsFront;
             let prepared = if front_with_app_grant {
                 #[cfg(windows)]
-                let prepared = self.prepare_windows_input_front(call, &admission).await;
+                let prepared = if D::uses_windows_input_bracket() {
+                    self.prepare_windows_input_front(call, &admission).await
+                } else {
+                    self.prepare_temporary_front(call, purpose, true).await
+                };
                 #[cfg(not(windows))]
                 let prepared = self.prepare_temporary_front(call, purpose, true).await;
                 prepared
@@ -1917,8 +1921,11 @@ where
             match prepared {
                 Ok(parts) => {
                     #[cfg(windows)]
-                    let hooks =
-                        fronting::CellHooks::windows_input(parts, self.fronting_lock.clone());
+                    let hooks = if D::uses_windows_input_bracket() {
+                        fronting::CellHooks::windows_input(parts, self.fronting_lock.clone())
+                    } else {
+                        fronting::CellHooks::new(parts)
+                    };
                     #[cfg(not(windows))]
                     let hooks = fronting::CellHooks::new(parts);
                     chord_hooks = Some(hooks);
@@ -2226,7 +2233,7 @@ where
             reply = unposted(reply);
         }
         #[cfg(windows)]
-        let typed_text = keystrokes::windows_input_reply(
+        let typed_text = keystrokes::windows_input_reply::<D>(
             &mut reply,
             chord_hooks.as_ref(),
             bracket.as_ref(),

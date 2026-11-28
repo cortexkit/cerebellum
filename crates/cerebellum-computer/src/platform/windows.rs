@@ -860,6 +860,11 @@ impl WindowsPlatformDriver {
 
 impl PlatformDriver for WindowsPlatformDriver {
     #[cfg(windows)]
+    fn uses_windows_input_bracket() -> bool {
+        true
+    }
+
+    #[cfg(windows)]
     fn accept_fronted_dispatch_hooks(&mut self, hooks: Box<dyn FrontedDispatchHooks>) -> bool {
         self.fronted_hooks.0 = Some(hooks);
         true

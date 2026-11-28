@@ -7,22 +7,22 @@ use cerebellum_computer::app_state::source::{
     AppStateSource, ElementHandle, RawElement, ReadBounds,
 };
 use cerebellum_computer::dispatch::{BracketReport, BracketStop, DispatchError, RestoreStatus};
-use cerebellum_computer::platform::{HeldStateDisposition, ProcessEventRefusal, ProcessGrant};
+use cerebellum_computer::platform::{
+    HeldStateDisposition, PlatformDriver, ProcessEventRefusal, ProcessGrant,
+};
 use serde_json::{json, Value};
 
-pub(super) fn application_route(
+pub(super) fn application_route<D: PlatformDriver>(
     admission: super::fronting::Admission,
     frontmost: bool,
     shortcut: bool,
     system_wide: bool,
 ) -> super::fronting::ChordRoute {
     use super::fronting::chord_route;
-    #[cfg(windows)]
-    {
+    if cfg!(windows) && D::uses_windows_input_bracket() {
         // Windows cannot deliver per process. An attended app grant may
         // use the temporary bracket, never app-use foreground mode.
-        let _ = (frontmost, shortcut);
-        chord_route(
+        return chord_route(
             super::fronting::Admission {
                 app_use_fronting_admitted: admission.bracket_admitted,
                 ..admission
@@ -30,9 +30,8 @@ pub(super) fn application_route(
             false,
             true,
             system_wide,
-        )
+        );
     }
-    #[cfg(not(windows))]
     chord_route(admission, frontmost, shortcut, system_wide)
 }
 
@@ -66,11 +65,11 @@ pub(super) fn windows_input_detail(object: &serde_json::Map<String, Value>) -> b
 }
 
 #[cfg(windows)]
-pub(super) fn windows_chord_refusal(
+pub(super) fn windows_chord_refusal<D: PlatformDriver>(
     key: cerebellum_computer::platform::synthetic::SyntheticKey,
     modifiers: cerebellum_computer::platform::synthetic::SyntheticKeyModifiers,
 ) -> Option<Value> {
-    (!cerebellum_computer::platform::windows::fronting::chord_supported(key, modifiers)).then(|| json!({
+    (D::uses_windows_input_bracket() && !cerebellum_computer::platform::windows::fronting::chord_supported(key, modifiers)).then(|| json!({
         "outcome": "synthetic_unavailable",
         "reason": "key_unsupported",
         "remedy": "Windows app-scoped input cannot deliver this chord. Use an application control instead.",
@@ -78,17 +77,19 @@ pub(super) fn windows_chord_refusal(
 }
 
 #[cfg(windows)]
-pub(super) fn windows_input_reply(
+pub(super) fn windows_input_reply<D: PlatformDriver>(
     reply: &mut Value,
     hooks: Option<&super::fronting::CellHooks>,
     bracket: Option<&BracketReport>,
     typed_text: Option<String>,
 ) -> Option<String> {
-    if apply_windows_input_result(
-        reply,
-        hooks.and_then(super::fronting::CellHooks::input_progress),
-        bracket,
-    ) {
+    if D::uses_windows_input_bracket()
+        && apply_windows_input_result(
+            reply,
+            hooks.and_then(super::fronting::CellHooks::input_progress),
+            bracket,
+        )
+    {
         None
     } else {
         typed_text
@@ -174,6 +175,27 @@ mod windows_result_tests {
     use cerebellum_computer::platform::{
         vocabulary::validate_capability_result, WindowsInputProgress,
     };
+
+    #[test]
+    fn windows_chord_refusal_is_selected_by_the_driver_not_the_host() {
+        use cerebellum_computer::platform::{
+            synthetic::{SyntheticKey, SyntheticKeyModifiers},
+            windows::WindowsPlatformDriver,
+            UnsupportedPlatformDriver,
+        };
+
+        let modifiers = SyntheticKeyModifiers {
+            command: true,
+            ..SyntheticKeyModifiers::NONE
+        };
+        let refusal = windows_chord_refusal::<WindowsPlatformDriver>(SyntheticKey::C, modifiers)
+            .expect("the native driver has no Windows mapping for Command");
+        assert_eq!(refusal["reason"], "key_unsupported");
+        assert!(
+            windows_chord_refusal::<UnsupportedPlatformDriver>(SyntheticKey::C, modifiers)
+                .is_none()
+        );
+    }
 
     #[test]
     fn windows_input_reports_only_confirmed_caret_consumption_as_completed() {
