@@ -7,6 +7,8 @@ use super::support::source_scan;
 use std::path::{Path, PathBuf};
 
 const BRIDGE_PROCESS_TEST: &str = "cerebellum/src/user_browser_bridge/linux/tests/process.rs";
+const WINDOWS_LAUNCH_TEST: &str =
+    "cerebellum/src/computer_capability/windows_app_state_tests/launch.rs";
 
 fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(directory).expect("read browser test sources") {
@@ -71,11 +73,14 @@ fn test_module_files(files: &[PathBuf]) -> Vec<PathBuf> {
     }
 }
 
-fn fixture_binding(path: &str, before: &[Token], name: &str) -> bool {
-    let Some(binding) = before
+fn last_simple_binding(before: &[Token], name: &str) -> Option<usize> {
+    before
         .windows(3)
         .rposition(|words| words[0].text == "let" && words[1].text == name && words[2].text == "=")
-    else {
+}
+
+fn fixture_binding(path: &str, before: &[Token], name: &str) -> bool {
+    let Some(binding) = last_simple_binding(before, name) else {
         return false;
     };
     let expression: Vec<&str> = before[binding + 3..]
@@ -138,6 +143,24 @@ fn fixture_binding(path: &str, before: &[Token], name: &str) -> bool {
         || (path == "cerebellum-macos/src/pinned_executable.rs"
             && name == "launch"
             && pinned_helper_relocation(before, binding, &expression))
+}
+
+// The interactive Windows runner supplies a separate signed GUI fixture to
+// check that an unrelated window isn't granted access. It isn't a browser.
+fn windows_unrelated_fixture_binding(before: &[Token]) -> bool {
+    let Some(binding) = last_simple_binding(before, "executable") else {
+        return false;
+    };
+    before.get(binding + 3..binding + 8).is_some_and(|value| {
+        value[2].kind == TokenKind::Literal
+            && value.iter().map(|token| token.text.as_str()).eq([
+                "required",
+                "(",
+                "CK_WINDOWS_LAUNCH_UNRELATED_EXE",
+                ")",
+                ";",
+            ])
+    })
 }
 
 // The pin regression launches a private copy of its own test binary, not a
@@ -453,7 +476,12 @@ fn violations(path: &str, source: &str) -> Vec<String> {
             name.is_some_and(|name| fixture_binding(path, &tokens[..index], name));
         let bridge_fixture =
             path == BRIDGE_PROCESS_TEST && linux_bridge_fixture_spawn(&tokens, index);
-        if !fixed_cli && !self_reexec && !relocated_fixture && !bridge_fixture {
+        let windows_fixture = path == WINDOWS_LAUNCH_TEST
+            && argument
+                .is_some_and(|arg| arg.kind == TokenKind::Identifier && arg.text == "executable")
+            && at(5) == Some(")")
+            && windows_unrelated_fixture_binding(&tokens[..index]);
+        if !fixed_cli && !self_reexec && !relocated_fixture && !bridge_fixture && !windows_fixture {
             found.push(format!(
                 "{}: Command executable must use a reviewed fixture or test_browser",
                 token.line
@@ -630,6 +658,39 @@ fn only_the_reviewed_preview_skip_self_binary_relocation_is_allowed() {
             1,
             "unreviewed binding escaped: {new}"
         );
+    }
+}
+
+#[test]
+fn only_the_reviewed_windows_unrelated_fixture_spawn_is_allowed() {
+    let path = WINDOWS_LAUNCH_TEST;
+    let source = r#"
+        let executable = required("CK_WINDOWS_LAUNCH_UNRELATED_EXE");
+        std::process::Command::new(executable).spawn();
+    "#;
+    let failures = violations(path, source);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(violations("cerebellum/tests/launch.rs", source).len(), 1);
+
+    for (old, new) in [
+        ("CK_WINDOWS_LAUNCH_UNRELATED_EXE", "BROWSER"),
+        ("executable", "different_executable"),
+        (
+            "\"CK_WINDOWS_LAUNCH_UNRELATED_EXE\"",
+            "CK_WINDOWS_LAUNCH_UNRELATED_EXE",
+        ),
+        (
+            "required(\"CK_WINDOWS_LAUNCH_UNRELATED_EXE\");",
+            "required(\"CK_WINDOWS_LAUNCH_UNRELATED_EXE\").replace(\"fixture\", \"browser\");",
+        ),
+        (
+            "Command::new(executable)",
+            "Command::new(executable.replace(\"fixture\", \"browser\"))",
+        ),
+    ] {
+        let planted = source.replace(old, new);
+        assert_ne!(source, planted, "control did not mutate {old}");
+        assert_eq!(violations(path, &planted).len(), 1, "missed {new}");
     }
 }
 
