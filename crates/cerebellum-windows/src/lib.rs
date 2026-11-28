@@ -77,6 +77,12 @@ pub use image_file_facts::{
     lock_image_file, retain_image_process, ImageMappingReading, LockedImageFile,
     ProcessPackageFields,
 };
+#[cfg(windows)]
+pub use launch_facts::{
+    activate_application, last_input_tick, package_applications, process_parents, read_shortcut,
+    registered_packages, start_menu_directories, suspended_process, PackageApplication,
+    RegisteredPackage, ShortcutFields, SuspendedProcess,
+};
 #[cfg(all(windows, feature = "bridge-test-identities"))]
 pub use named_pipe::create_test_pipe_instance_default_security;
 #[cfg(windows)]
@@ -90,12 +96,6 @@ pub use named_pipe_server::create_named_pipe_instance;
 pub use process_readings::system_time_100ns;
 #[cfg(windows)]
 pub use registry_values::set_current_user_default_string;
-#[cfg(windows)]
-pub use launch_facts::{
-    activate_application, last_input_tick, package_applications, process_parents, read_shortcut,
-    registered_packages, start_menu_directories, suspended_process, PackageApplication,
-    RegisteredPackage, ShortcutFields, SuspendedProcess,
-};
 #[cfg(windows)]
 pub use signer_facts::{AuthenticodeFacts, SignerFields};
 #[cfg(target_os = "windows")]
