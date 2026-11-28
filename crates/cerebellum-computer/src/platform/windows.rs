@@ -111,6 +111,25 @@ impl CaptureBackend for WindowsCaptureBackend {
     }
 }
 
+#[cfg(any(windows, test))]
+fn wgc_failure_reason(
+    hresult: u32,
+    reread_window: impl FnOnce() -> Result<(), crate::app_state::image::ImageUnavailable>,
+) -> crate::app_state::image::ImageUnavailable {
+    use crate::app_state::image::ImageUnavailable;
+
+    // On windows-latest (GitHub Actions run 46094374143), a nonlayered HWND
+    // returned WDA_NONE. A second HWND returned WDA_EXCLUDEFROMCAPTURE, and
+    // Windows Graphics Capture refused it with E_INVALIDARG. The HRESULT is
+    // generic: only a fresh check of the bound HWND can establish exclusion.
+    if hresult == 0x8007_0057 {
+        return reread_window()
+            .err()
+            .unwrap_or(ImageUnavailable::CaptureFailed);
+    }
+    ImageUnavailable::CaptureFailed
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowsSessionProvenance {
@@ -1625,5 +1644,29 @@ mod tests {
                             | "computer.write_text"
                     ) && declaration.advertised)
             ));
+    }
+
+    #[test]
+    fn wgc_invalid_argument_uses_the_bound_windows_current_affinity() {
+        use crate::app_state::image::ImageUnavailable;
+
+        assert_eq!(
+            wgc_failure_reason(0x8007_0057, || Err(ImageUnavailable::CaptureExcluded)),
+            ImageUnavailable::CaptureExcluded,
+        );
+        assert_eq!(
+            wgc_failure_reason(0x8007_0057, || Ok(())),
+            ImageUnavailable::CaptureFailed
+        );
+        assert_eq!(
+            wgc_failure_reason(0x8007_0057, || Err(ImageUnavailable::CaptureUnavailable)),
+            ImageUnavailable::CaptureUnavailable,
+        );
+        assert_eq!(
+            wgc_failure_reason(0x8000_4005, || panic!(
+                "unrelated HRESULT must not trigger a recheck"
+            )),
+            ImageUnavailable::CaptureFailed,
+        );
     }
 }

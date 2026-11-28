@@ -213,7 +213,13 @@ fn capture_on_worker(
         })
         .map_err(|error| match error {
             FrameReadError::CursorPropertyMissing => ImageUnavailable::CaptureUnavailable,
-            FrameReadError::Windows(_) => failed,
+            FrameReadError::Windows(error) => {
+                super::wgc_failure_reason(error.code().0 as u32, || {
+                    check_deadline(deadline, may_acquire)?;
+                    confirm()
+                })
+            }
+            FrameReadError::Encode(_) => failed,
         })?;
     let (captured_px, _) = prepared?;
     let jpeg = jpeg.ok_or(failed)?;

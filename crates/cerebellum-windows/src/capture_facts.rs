@@ -91,6 +91,7 @@ struct DesktopFrame {
 pub enum FrameReadError {
     CursorPropertyMissing,
     Windows(windows::core::Error),
+    Encode(windows::core::Error),
 }
 
 impl From<windows::core::Error> for FrameReadError {
@@ -139,7 +140,7 @@ pub fn first_window_jpeg(
     };
     jpeg::encode(&frame, width, height)
         .map(Some)
-        .map_err(Into::into)
+        .map_err(FrameReadError::Encode)
 }
 
 fn first_window_frame(
