@@ -9,6 +9,7 @@ use cerebellum_computer::dispatch::{
     HeartbeatObservation, HeartbeatProbe, IdleGateRefusal, NotFrontedReason, RestoreStatus,
     SeizeWatcher, SourcedInputEvent, UnitPosted, UserIdleEstimator, OBSERVED_DISPATCH_IDLE_MS,
 };
+use cerebellum_computer::fronting_clock::{self, FakeClock};
 use cerebellum_computer::platform::IdleReading;
 use cerebellum_core::config::AppUse;
 use std::time::Duration;
@@ -489,7 +490,7 @@ struct ScreenState {
     /// thread for this long, as a slow registration would.
     register_blocks_ms: u64,
     /// The request to front the target blocks the bracket's thread for this
-    /// long in real time before it takes effect, logging `front-returned`.
+    /// long on the fake clock before it takes effect, logging `front-returned`.
     /// While the bracket caps its waits on the target, the request gives up
     /// at the cap instead, as an accessibility message to a hung application
     /// does at its messaging timeout, logging `front-timed-out`.
@@ -503,8 +504,8 @@ struct ScreenState {
     /// A chord's post fails with its keys possibly still held.
     post_unknown: bool,
     post_cost_ms: u64,
-    /// A chord's post blocks the bracket's thread for this long in real
-    /// time, logging `post-done` when it returns.
+    /// A chord's post advances the fake clock by this much before logging
+    /// `post-done` and returning.
     post_blocks_ms: u64,
     panic_during_post: bool,
     /// Whether the paired release of held keys returns.
@@ -527,9 +528,7 @@ struct ScreenState {
     release_until_stopped: Option<Arc<crate::TerminalArbiter>>,
     /// The release, once begun, stays in flight until this is set.
     release_until: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// The release logs `released` when it returns, after staying in flight
-    /// a little longer, so a restore made before it returned shows up in
-    /// the log ahead of it.
+    /// Log `released` after the release gate opens, just before returning.
     log_release_end: bool,
     /// The person presses a key, which the run's own observer drains at its
     /// next check.
@@ -552,13 +551,16 @@ struct ScreenState {
     /// The target comes to the front again at each of these instants, as an
     /// activation delivered more than once does.
     landings_at: Vec<u64>,
-    restore_focus_delay_ms: u64,
 }
 
 #[derive(Clone)]
 struct Screen {
     state: Arc<StdMutex<ScreenState>>,
     desk: support::Desk,
+    /// Cutoff tests use one clock for both the platform and restore policy.
+    /// Route tests script the host clock separately to exercise its reports
+    /// and late landings without also expiring the owner's write deadline.
+    advances_cutoff: bool,
 }
 
 impl Screen {
@@ -611,9 +613,9 @@ impl Screen {
                 previous_bind_fails: false,
                 restore_needs_remembered_previous: false,
                 landings_at: Vec::new(),
-                restore_focus_delay_ms: 0,
             })),
             desk: desk.clone(),
+            advances_cutoff: false,
         }
     }
 
@@ -696,7 +698,9 @@ impl Screen {
                 relanded
             }
         };
-        cerebellum_computer::fronting_clock::advance(Duration::from_millis(milliseconds));
+        if self.advances_cutoff {
+            fronting_clock::advance(Duration::from_millis(milliseconds));
+        }
         if landed {
             self.desk.state().frontmost = Some(TARGET);
         }
@@ -729,8 +733,6 @@ impl FrontingRestoreHost for FakeRestore {
         self.0.advance(milliseconds);
     }
     fn frontmost_pid(&mut self) -> Option<u32> {
-        let delay = self.0.state().restore_focus_delay_ms;
-        std::thread::sleep(std::time::Duration::from_millis(delay));
         self.0.frontmost()
     }
     fn request_front(&mut self, pid: u32) -> bool {
@@ -864,11 +866,7 @@ impl RestoreHostSource for FakeBracket {
         // made.
         let blocks = std::mem::take(&mut self.0.state().register_blocks_ms);
         if blocks > 0 {
-            if cerebellum_computer::fronting_clock::FakeClock::current().is_some() {
-                self.0.advance(blocks);
-            } else {
-                std::thread::sleep(Duration::from_millis(blocks));
-            }
+            self.0.advance(blocks);
         }
         Box::new(FakeRestore(self.0.clone()))
     }
@@ -903,14 +901,14 @@ impl FrontingBracketHost for FakeBracket {
         self.0.state().log.push(format!("front:{pid}"));
         let blocks = Duration::from_millis(blocks);
         if let Some(until) = cap {
-            let left = until.saturating_duration_since(std::time::Instant::now());
+            let left = until.saturating_duration_since(fronting_clock::now());
             if left < blocks {
-                std::thread::sleep(left);
+                assert!(fronting_clock::advance(left));
                 self.0.state().log.push("front-timed-out".into());
                 return false;
             }
         }
-        std::thread::sleep(blocks);
+        assert!(fronting_clock::advance(blocks));
         self.0.desk.state().frontmost = Some(pid);
         self.0.state().log.push("front-returned".into());
         true
@@ -995,7 +993,9 @@ impl FrontingBracketHost for FakeBracket {
         };
         self.0.advance(post_cost_ms);
         if post_blocks_ms > 0 {
-            std::thread::sleep(Duration::from_millis(post_blocks_ms));
+            assert!(fronting_clock::advance(Duration::from_millis(
+                post_blocks_ms
+            )));
             self.0.state().log.push("post-done".into());
         }
         if let Some(posting) = posting {
@@ -1113,8 +1113,12 @@ impl PlatformDriver for FakeDriver {
         }
         let give_up = std::time::Instant::now() + crate::test_support::HANG_GUARD;
         if let Some(terminal) = until_stopped {
-            while !terminal.gate.stopped() && std::time::Instant::now() < give_up {
-                std::thread::yield_now();
+            while !terminal.gate.stopped() {
+                assert!(
+                    std::time::Instant::now() < give_up,
+                    "the release was never cancelled"
+                );
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
         if let Some(until) = until {
@@ -1125,7 +1129,6 @@ impl PlatformDriver for FakeDriver {
             }
         }
         if self.screen.state().log_release_end {
-            std::thread::sleep(Duration::from_millis(100));
             self.screen.state().log.push("released".into());
         }
         if ok {
@@ -1147,7 +1150,7 @@ impl PlatformDriver for FakeDriver {
         };
         let mut host = FakeBracket(self.screen.clone());
         let mut estimator = UserIdleEstimator::new();
-        Ok(match self.hooks.take() {
+        Ok(FakeClock::frozen().run(|| match self.hooks.take() {
             Some(mut hooks) => {
                 cerebellum_computer::platform::run_hooked_fronted(
                     &mut host,
@@ -1165,7 +1168,7 @@ impl PlatformDriver for FakeDriver {
                 plan,
                 cancelled,
             ),
-        })
+        }))
     }
     fn read_fronted(
         &mut self,
@@ -1194,7 +1197,7 @@ impl PlatformDriver for FakeDriver {
         };
         let mut host = FakeBracket(self.screen.clone());
         let mut estimator = UserIdleEstimator::new();
-        let report = match self.hooks.take() {
+        let report = FakeClock::frozen().run(|| match self.hooks.take() {
             Some(mut hooks) => {
                 cerebellum_computer::platform::run_hooked_fronted(
                     &mut host,
@@ -1213,7 +1216,7 @@ impl PlatformDriver for FakeDriver {
                 cancelled,
                 &mut logged_read,
             ),
-        };
+        });
         let after = screen.state().after_picture_bracket.take();
         if let Some(after) = after {
             (after.0)();
@@ -2190,19 +2193,21 @@ fn cleanup_before_the_front_leaves_the_worker_unfronted() {
         restore_fallback: true,
     });
     let mut cleanup_first = CleanupFirst(hooks.clone());
-    let outcome = cerebellum_computer::platform::run_hooked_fronted(
-        &mut FakeBracket(screen.clone()),
-        &mut UserIdleEstimator::new(),
-        cerebellum_computer::dispatch::BracketPlan {
-            target_pid: TARGET,
-            units: 1,
-            maximum_interval_ms: 100,
-            maximum_seize_detection_latency_ms: 50,
-        },
-        &|| false,
-        &mut cleanup_first,
-        None,
-    );
+    let outcome = FakeClock::frozen().run(|| {
+        cerebellum_computer::platform::run_hooked_fronted(
+            &mut FakeBracket(screen.clone()),
+            &mut UserIdleEstimator::new(),
+            cerebellum_computer::dispatch::BracketPlan {
+                target_pid: TARGET,
+                units: 1,
+                maximum_interval_ms: 100,
+                maximum_seize_detection_latency_ms: 50,
+            },
+            &|| false,
+            &mut cleanup_first,
+            None,
+        )
+    });
     assert!(screen.log().is_empty(), "{:?}", screen.log());
     assert_eq!(outcome.report.restore, RestoreStatus::NotNeeded);
     assert_eq!(outcome.report.units_posted, 0);

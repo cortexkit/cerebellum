@@ -4,17 +4,17 @@
 use std::time::Instant;
 
 pub fn now() -> Instant {
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(clock) = FakeClock::current() {
         return clock.now();
     }
     Instant::now()
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub use fake::{advance, FakeClock};
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 mod fake {
     use std::cell::RefCell;
     use std::sync::{Arc, Mutex};

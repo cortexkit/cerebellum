@@ -91,20 +91,25 @@ fn cleanup_stops_a_front_not_yet_requested_and_only_closes_one_already_requested
 
 #[test]
 fn ending_the_front_closes_it_and_says_whether_the_cutoff_had_passed() {
-    let early = CutoffGate::new();
-    early.set_bound(
-        Instant::now() + Duration::from_secs(60),
-        Instant::now() + Duration::from_secs(120),
-    );
-    early.end_front();
-    assert!(early.closed());
-    assert!(!early.ended_past_cutoff());
+    use crate::fronting_clock::{advance, FakeClock};
 
-    let late = CutoffGate::new();
-    late.set_bound(Instant::now(), Instant::now() + Duration::from_secs(120));
-    std::thread::sleep(Duration::from_millis(2));
-    late.end_front();
-    assert!(late.ended_past_cutoff());
+    let clock = FakeClock::frozen();
+    clock.run(|| {
+        let early = CutoffGate::new();
+        let start = clock.now();
+        let reserve = start + Duration::from_millis(50);
+        let deadline = start + Duration::from_millis(200);
+        early.set_bound(reserve, deadline);
+        early.end_front();
+        assert!(early.closed());
+        assert!(!early.ended_past_cutoff());
+
+        let late = CutoffGate::new();
+        late.set_bound(reserve, deadline);
+        assert!(advance(Duration::from_millis(52)));
+        late.end_front();
+        assert!(late.ended_past_cutoff());
+    });
 }
 
 #[test]
