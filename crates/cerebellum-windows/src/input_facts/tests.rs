@@ -22,6 +22,18 @@ struct Receiver(HWND);
 
 impl Receiver {
     fn new() -> Self {
+        let owned = Self::create(receiver);
+        // SAFETY: The receiver is an owned window on this thread.
+        assert_ne!(
+            unsafe { SetForegroundWindow(owned.0) },
+            0,
+            "foreground rights for the owned receiver"
+        );
+        assert_eq!(foreground_window_number(), Some(owned.0 as usize as u32));
+        owned
+    }
+
+    fn create(proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT) -> Self {
         let pointer = cursor_position();
         let class: Vec<_> = "STATIC\0".encode_utf16().collect();
         let title: Vec<_> = "Cerebellum input observer fixture\0"
@@ -47,15 +59,9 @@ impl Receiver {
             assert!(!window.is_null());
             let owned = Self(window);
             assert_ne!(
-                SetWindowLongPtrW(window, GWLP_WNDPROC, receiver as *const () as isize),
+                SetWindowLongPtrW(window, GWLP_WNDPROC, proc as *const () as isize),
                 0
             );
-            assert_ne!(
-                SetForegroundWindow(window),
-                0,
-                "foreground rights for the owned receiver"
-            );
-            assert_eq!(foreground_window_number(), Some(window as usize as u32));
             owned
         }
     }
