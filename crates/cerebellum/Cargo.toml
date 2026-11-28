@@ -8,6 +8,8 @@ description = "The ck-cerebellum subc module: Spec A — wire-v2 registration, i
 
 [features]
 default = []
+# Keep Windows browser admission out of default builds until native review is complete.
+windows-browser-release = []
 # Enables the in-memory identity-resolution observer for conformance tests only.
 # Production builds leave this feature disabled, so no observer code is emitted.
 # Forwards to the substrate crate, which owns the observer now that identity

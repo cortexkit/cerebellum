@@ -168,6 +168,7 @@ async fn click(planes: &Planes, snapshot: &Value, reference: &str) -> Value {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn stable_refs_wire_insertions_keep_later_refs_and_old_clicks() {
     let (planes, _, dropdowns) = fixture().await;
     let before = call(&planes, "snapshot", json!({"role_filter":["AXButton"]})).await;
@@ -193,6 +194,7 @@ async fn stable_refs_wire_insertions_keep_later_refs_and_old_clicks() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn stable_refs_wire_zoom_routes_the_retained_identity_to_subtree_capture() {
     let (planes, launcher, _) = fixture().await;
     let before = call(&planes, "snapshot", json!({"role_filter":["button"]})).await;
@@ -207,6 +209,7 @@ async fn stable_refs_wire_zoom_routes_the_retained_identity_to_subtree_capture()
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn stable_refs_wire_removed_zoom_is_brief_and_click_refuses_without_reassignment() {
     let (planes, launcher, dropdowns) = fixture().await;
     let before = call(&planes, "snapshot", json!({"role_filter":["button"]})).await;
@@ -232,6 +235,7 @@ async fn stable_refs_wire_removed_zoom_is_brief_and_click_refuses_without_reassi
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn stable_refs_wire_filters_keep_only_matches_under_ancestors() {
     let (planes, _, _) = fixture().await;
     let filtered = call(
@@ -258,6 +262,7 @@ async fn stable_refs_wire_filters_keep_only_matches_under_ancestors() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn missing_zoom_names_the_numeric_printed_neighbours_in_every_zoom_mode() {
     for mode in ["actionable", "dom_full"] {
         let (planes, _, dropdowns) = fixture().await;
@@ -289,6 +294,7 @@ async fn missing_zoom_names_the_numeric_printed_neighbours_in_every_zoom_mode() 
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn stable_refs_wire_type_uses_named_older_snapshot_and_ledger() {
     let (planes, launcher, dropdowns) = fixture().await;
     let before = call(&planes, "snapshot", json!({"role_filter":["textbox"]})).await;
@@ -320,6 +326,7 @@ async fn stable_refs_wire_type_uses_named_older_snapshot_and_ledger() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn stable_refs_wire_old_refs_survive_views_but_not_snapshot_eviction() {
     let (planes, launcher, _) = fixture().await;
     let before = call(
@@ -377,6 +384,7 @@ async fn stable_refs_wire_old_refs_survive_views_but_not_snapshot_eviction() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn stable_refs_wire_frame_same_document_url_keeps_old_click() {
     let fixture = frame_fixture();
     let launcher = Arc::new(RecordingLauncher {

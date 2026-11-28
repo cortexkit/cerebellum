@@ -8,6 +8,15 @@
 //! Each test builds its own planes over an isolated journal and its own
 //! standing grant store.
 
+#![cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "some browser fixtures require the release key or Windows present/resume"
+    )
+)]
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -893,6 +902,7 @@ const ALL_OPTIONS: [&str; 5] = [
 
 /// Each offered answer writes exactly its named row; an unoffered answer writes none.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn each_answered_option_mints_exactly_its_row() {
     for (index, id) in ALL_OPTIONS
         .into_iter()
@@ -976,6 +986,7 @@ impl Fixture {
 /// Workers receive only thirty-minute choices. All-sites choices are withheld
 /// for tier-four changes, form hazards and non-public addresses.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn the_card_offers_only_what_the_session_and_request_allow() {
     let worker_options = vec!["allow_30m", "allow_all_sites_30m", "deny"];
     let no_all_sites = vec!["allow_30m", "allow_origin_always", "deny"];
@@ -1085,6 +1096,7 @@ async fn the_card_offers_only_what_the_session_and_request_allow() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn own_browser_decline_only_cards_refuse_before_explicit_or_in_call_consent() {
     for no_holder in [true, false] {
         let clock = ManualWallClock::at(1_700_000_000_000);
@@ -1139,6 +1151,7 @@ async fn own_browser_decline_only_cards_refuse_before_explicit_or_in_call_consen
 /// An origin answered "always" in one conversation authorizes the same agent
 /// in a new conversation, and never another agent or an unattested session.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn an_origin_row_authorizes_a_new_conversation_of_its_agent_and_no_other() {
     let mut fixture = Fixture::new();
     let first = fixture
@@ -1181,6 +1194,7 @@ async fn an_origin_row_authorizes_a_new_conversation_of_its_agent_and_no_other()
 /// An all-sites row covers any public website, reads included, and never a
 /// loopback, private-use or localhost address.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn an_all_sites_row_covers_public_origins_and_no_local_or_private_one() {
     let mut fixture = Fixture::new();
     fixture.seed(AGENT, GrantSubject::AllSites, 3, &[]);
@@ -1243,6 +1257,7 @@ fn assert_hazard_refused(reply: &Value, what: &str) {
 /// No all-sites row covers an action carrying a form hazard, and an origin
 /// row covers one only when it lists that very hazard.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn a_standing_row_never_covers_a_hazard_it_does_not_list() {
     async fn point_click(fixture: &Fixture, route: &Route) -> Value {
         let shot = fixture.call(route, "browser.screenshot", json!({})).await;
@@ -1336,6 +1351,7 @@ async fn a_standing_row_never_covers_a_hazard_it_does_not_list() {
 /// The thirty-minute answer covers for thirty minutes of the store's clock and
 /// nothing after.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn the_thirty_minute_all_sites_row_expires() {
     let mut fixture = Fixture::new();
     let asking = fixture
@@ -1371,6 +1387,7 @@ async fn the_thirty_minute_all_sites_row_expires() {
 /// A public page that redirects into a private address is re-authorized
 /// against where it landed, and an all-sites row does not cover that.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn a_redirect_into_a_private_address_is_refused_under_an_all_sites_row() {
     let mut fixture = Fixture::new();
     fixture.seed(AGENT, GrantSubject::AllSites, 3, &[]);
@@ -1396,6 +1413,7 @@ async fn a_redirect_into_a_private_address_is_refused_under_an_all_sites_row() {
 
 /// A broad standing row cannot bypass the requirement to read a target first.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn typing_without_a_snapshot_is_refused_under_any_standing_row() {
     let mut fixture = Fixture::new();
     fixture.seed(AGENT, GrantSubject::AllSites, 3, &[]);
@@ -1444,6 +1462,7 @@ async fn typing_without_a_snapshot_is_refused_under_any_standing_row() {
 /// An agent removes its own standing access, one origin or all of it, and
 /// never another agent's.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn revoke_access_removes_the_calling_agents_rows_only() {
     let mut fixture = Fixture::new();
     fixture.seed(AGENT, GrantSubject::Origin(PUBLIC.into()), 3, &[]);
@@ -1671,6 +1690,7 @@ async fn reanswering_an_origin_keeps_one_row_and_its_original_id() {
 /// A row answered before a restart still authorizes after it, read back
 /// from the file the first module wrote.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn a_standing_row_survives_a_module_restart() {
     let scratch = Scratch::new("restart");
     let clock = ManualWallClock::at(1_700_000_000_000);
@@ -1703,6 +1723,7 @@ async fn a_standing_row_survives_a_module_restart() {
 /// A store restored onto another machine grants nothing there, offers no
 /// standing answer to be written over it, and lists nothing.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn a_row_bound_to_another_machine_grants_nothing() {
     let storage = InMemoryAgentGrantStorage::default();
     let clock = ManualWallClock::at(1_700_000_000_000);
@@ -1732,6 +1753,7 @@ async fn a_row_bound_to_another_machine_grants_nothing() {
 /// A file this build cannot read withholds every standing grant, raises no
 /// unusable consent card, and is left exactly as it was.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn an_unreadable_store_withholds_standing_grants_and_is_not_overwritten() {
     let scratch = Scratch::new("unreadable");
     let path = scratch.0.join("browser_standing_grants.json");
@@ -1765,6 +1787,7 @@ async fn an_unreadable_store_withholds_standing_grants_and_is_not_overwritten() 
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn domain_always_mints_and_authorizes_a_sibling_without_a_card() {
     let mut fixture = Fixture::new();
     let route = fixture
@@ -1799,6 +1822,7 @@ async fn domain_always_mints_and_authorizes_a_sibling_without_a_card() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn suffix_localhost_and_ip_cards_remain_host_only() {
     for (origin, host) in [
         ("https://github.io", "github.io"),
@@ -1826,6 +1850,7 @@ async fn suffix_localhost_and_ip_cards_remain_host_only() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn domain_rows_never_cover_http() {
     let mut fixture = Fixture::new();
     fixture.seed(AGENT, GrantSubject::Domain("ovhcloud.com".into()), 3, &[]);
@@ -1841,6 +1866,7 @@ async fn domain_rows_never_cover_http() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn domain_rows_never_cover_sibling_domains() {
     let mut fixture = Fixture::new();
     fixture.seed(AGENT, GrantSubject::Domain("ovhcloud.com".into()), 3, &[]);
@@ -1856,6 +1882,7 @@ async fn domain_rows_never_cover_sibling_domains() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn domain_rows_are_listed_and_revoked_by_operator_and_agent() {
     let mut fixture = Fixture::new();
     fixture.seed(
@@ -1968,6 +1995,7 @@ async fn observed_fixture_login(
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn baseline_public_reads_and_ordinary_clicks_need_no_card() {
     let mut fixture = Fixture::new();
     let route = fixture
@@ -2011,6 +2039,7 @@ async fn baseline_public_reads_and_ordinary_clicks_need_no_card() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn baseline_form_submit_still_asks() {
     let mut fixture = Fixture::new();
     let route = fixture
@@ -2029,6 +2058,7 @@ async fn baseline_form_submit_still_asks() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows present/resume.
 async fn baseline_signed_in_typing_still_asks() {
     let mut fixture = Fixture::new();
     let route = fixture
@@ -2079,6 +2109,7 @@ async fn baseline_signed_in_typing_still_asks() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn single_label_navigation_requires_a_site_card_even_with_an_all_sites_grant() {
     for all_sites in [false, true] {
         let mut fixture = Fixture::new();
@@ -2120,6 +2151,7 @@ async fn single_label_navigation_requires_a_site_card_even_with_an_all_sites_gra
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn baseline_local_services_still_ask() {
     let mut fixture = Fixture::new();
     let route = fixture
@@ -2158,6 +2190,7 @@ async fn baseline_local_services_still_ask() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn baseline_credential_and_payment_typing_remain_hard_refused() {
     let mut fixture = Fixture::new();
     let route = fixture
@@ -2180,6 +2213,7 @@ async fn baseline_credential_and_payment_typing_remain_hard_refused() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows present/resume.
 async fn baseline_login_record_survives_plane_restart() {
     let scratch = cortexkit_test_support::ScratchDir::new("baseline-login-restart");
     let path = scratch.join("browser/signed-in-domains.json");
@@ -2271,6 +2305,7 @@ async fn baseline_would_ask_answers_yes_for_public_browsing() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn baseline_sensitive_clicks_ask_but_observation_stays_free() {
     let mut fixture = Fixture::new();
     let route = fixture
@@ -2295,6 +2330,7 @@ async fn baseline_sensitive_clicks_ask_but_observation_stays_free() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn baseline_private_frames_are_omitted_until_the_top_page_has_person_permission() {
     let mut fixture = Fixture::new();
     let route = fixture
@@ -2424,6 +2460,7 @@ async fn baseline_private_frames_are_omitted_until_the_top_page_has_person_permi
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows present/resume.
 async fn baseline_seeded_legacy_profiles_require_typing_permission_everywhere() {
     let mut fixture = Fixture::new();
     let route = fixture
@@ -2483,6 +2520,7 @@ async fn baseline_seeded_legacy_profiles_require_typing_permission_everywhere() 
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn codemode_borrows_the_head_browser_and_standing_grants_without_a_card() {
     let mut fixture = Fixture::new();
     fixture.seed(AGENT, GrantSubject::AllSites, 2, &[]);
@@ -2540,6 +2578,7 @@ async fn codemode_borrows_the_head_browser_and_standing_grants_without_a_card() 
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn codemode_missing_browser_grant_refuses_without_elicitation() {
     let mut fixture = Fixture::new();
     fixture
@@ -2568,6 +2607,7 @@ async fn codemode_missing_browser_grant_refuses_without_elicitation() {
 mod worker;
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn basal_run_uses_head_browser_snapshot_and_standing_site_grant() {
     use subc_protocol::scope::{ParentState, ScopeAttributes, ScopeKind, ScopeParent, ScopeStamp};
     let mut fixture = Fixture::new();

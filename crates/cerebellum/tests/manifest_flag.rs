@@ -46,17 +46,21 @@ fn binary() -> &'static Path {
         let binary = cortexkit_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-cerebellum"));
         let binary = support::daemon_binary("ckdev-cerebellum-manifest", binary);
         // Pay macOS's first-execution signature scan before measuring CLI latency.
-        assert!(Command::new(&binary)
-            .arg("--version")
-            .output()
-            .unwrap()
-            .status
-            .success());
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "migrated by the spawn-wrapper slice"
+        )]
+        let output = Command::new(&binary).arg("--version").output().unwrap();
+        assert!(output.status.success());
         binary
     })
 }
 
 fn inspect(home: &Path) -> Value {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let mut child = Command::new(binary())
         .arg("--manifest")
         .env_clear()
@@ -185,7 +189,12 @@ fn browser_advertisement_depends_on_the_build_not_configuration() {
                     })
                 })
             }),
-        cfg!(any(target_os = "macos", target_os = "linux"))
+        cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            all(windows, feature = "windows-browser-release"),
+        )),
+        "browser advertisement follows the build's enabled browser support"
     );
     assert!(manifest.get("browser_surface_refused").is_none());
     assert_eq!(std::fs::read_to_string(&config).unwrap(), text);

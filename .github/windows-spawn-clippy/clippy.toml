@@ -1,0 +1,8 @@
+disallowed-methods = [
+    "std::process::Command::spawn",
+    "std::process::Command::output",
+    "std::process::Command::status",
+    "tokio::process::Command::spawn",
+    "tokio::process::Command::output",
+    "tokio::process::Command::status",
+]

@@ -48,14 +48,17 @@ fn image_mapping_refuses_a_replacement_at_the_same_path() {
     let renamed = fixture.dir.join("original.exe");
     let this_test = std::env::current_exe().unwrap();
     fs::copy(&this_test, &original).unwrap();
-    fixture.child = Some(
-        Command::new(&original)
-            .args(["--exact", "image_mapping_child", "--ignored", "--nocapture"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
+    let child = Command::new(&original)
+        .args(["--exact", "image_mapping_child", "--ignored", "--nocapture"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fixture.child = Some(child);
     let child = fixture.child.as_mut().unwrap();
     let (ready, wait) = std::sync::mpsc::channel();
     let stdout = child.stdout.take().unwrap();

@@ -8,6 +8,15 @@
 //! DOM the driver reads; the owner-document regression also runs the production
 //! AX capture so the fill uses refs printed by a real outline snapshot.
 
+#![cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the fill fixtures need Windows fill_login"
+    )
+)]
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1158,6 +1167,7 @@ fn reason_code(reply: &Value) -> &str {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn real_source_fills_and_handles_golden_approval_and_refusal() {
     use cerebellum::login_capture::secret_use::VaultLoginSource;
     use cerebellum::login_capture::vault::{BoxFuture, CookieVault, VaultReachError, VaultRoute};
@@ -1292,6 +1302,7 @@ async fn real_source_fills_and_handles_golden_approval_and_refusal() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn fresh_outline_refs_fill_when_the_owner_document_has_no_frame_id() {
     for arguments in [json!({}), json!({"role_filter":["textbox"]})] {
         let f = fixture(
@@ -1327,6 +1338,7 @@ async fn fresh_outline_refs_fill_when_the_owner_document_has_no_frame_id() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn an_ableton_django_username_without_autocomplete_fills() {
     let fixture = fixture(
         Page {
@@ -1375,6 +1387,7 @@ fn plain_username_page(attributes: &[&str], another_input: bool) -> Page {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn plain_usernames_use_whole_name_id_or_autocomplete_tokens() {
     for (attribute, hint) in [
         ("name", "USERNAME"),
@@ -1401,6 +1414,7 @@ async fn plain_usernames_use_whole_name_id_or_autocomplete_tokens() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn the_only_preceding_text_input_fills_without_a_username_hint() {
     for postorder in [false, true] {
         let mut page = plain_username_page(&["name", "company"], false);
@@ -1421,6 +1435,7 @@ async fn the_only_preceding_text_input_fills_without_a_username_hint() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn ambiguous_search_hidden_after_password_and_other_form_inputs_refuse() {
     for case in [
         "company",
@@ -1487,6 +1502,7 @@ async fn ambiguous_search_hidden_after_password_and_other_form_inputs_refuse() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn changing_plain_username_context_after_snapshot_aborts_before_insertion() {
     for after_username in [false, true] {
         let mut page = plain_username_page(&["type", "text", "name", "company"], true);
@@ -1526,6 +1542,7 @@ async fn changing_plain_username_context_after_snapshot_aborts_before_insertion(
 /// the page and the scope stamped on the route; the reply names the fields
 /// and the origin and nothing that went into them.
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn a_fill_inserts_the_login_and_replies_with_fields_and_origin_only() {
     let fixture = fixture(
         Page::default(),
@@ -1558,6 +1575,7 @@ async fn a_fill_inserts_the_login_and_replies_with_fields_and_origin_only() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn a_vault_fill_records_login_evidence_without_submitting() {
     let scratch = cortexkit_test_support::ScratchDir::new("fill-login-evidence");
     let path = scratch.join("domains.json");
@@ -1588,6 +1606,7 @@ async fn a_vault_fill_records_login_evidence_without_submitting() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn a_failed_vault_fill_evidence_write_cannot_leave_a_clean_profile() {
     let scratch = cortexkit_test_support::ScratchDir::new("fill-login-evidence-failed");
     let directory = scratch.join("store");
@@ -1619,6 +1638,7 @@ async fn a_failed_vault_fill_evidence_write_cannot_leave_a_clean_profile() {
 /// Every origin refusal is decided from the fields' own frames before the
 /// vault is asked, so a refused fill never brings a secret into memory.
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn origin_refusals_are_decided_before_the_vault_is_asked() {
     let frame = |url: &str, security_origin: Option<&str>| {
         Some(FrameSpec {
@@ -1697,6 +1717,7 @@ async fn origin_refusals_are_decided_before_the_vault_is_asked() {
 
 /// The origin the vault checks is never the caller's to name.
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn an_origin_in_the_arguments_is_refused_before_the_vault_is_asked() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     let mut arguments = fixture.fill_arguments(false).await;
@@ -1712,6 +1733,7 @@ async fn an_origin_in_the_arguments_is_refused_before_the_vault_is_asked() {
 /// the vault is asked for the origin of the fields' frame (an iframe's, not
 /// the tab's) and its refusal says nothing about why.
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn a_login_saved_for_another_origin_is_refused_like_an_unknown_one() {
     let fixture = fixture(
         Page {
@@ -1765,6 +1787,7 @@ fn identity() -> cerebellum_core::identity::RouteIdentity {
 /// The page navigates while the vault is asked: the live check finds another
 /// document and nothing is inserted.
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn a_navigation_between_the_check_and_the_insertion_inserts_nothing() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     let moved = fixture.page.clone();
@@ -1801,6 +1824,7 @@ async fn a_navigation_between_the_check_and_the_insertion_inserts_nothing() {
 /// The document changes after the first field is filled: the second field
 /// is never filled and the first is emptied again.
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn a_change_after_the_first_field_clears_it_and_fills_no_more() {
     let fixture = fixture(
         Page {
@@ -1838,6 +1862,7 @@ async fn a_change_after_the_first_field_clears_it_and_fills_no_more() {
 /// scan is shown to find a planted copy, and each scanned store is shown to
 /// hold this test's records.
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn the_password_never_reaches_the_reply_journal_or_call_record() {
     let mut fixture = fixture(
         Page::default(),
@@ -1911,6 +1936,7 @@ async fn the_password_never_reaches_the_reply_journal_or_call_record() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn screenshots_are_refused_while_the_password_is_on_the_page() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     assert_eq!(fixture.screenshot().await["outcome"], "ok");
@@ -1938,6 +1964,7 @@ async fn screenshots_are_refused_while_the_password_is_on_the_page() {
 
 /// Empty fields do not prove that script copies have disappeared.
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn emptied_fields_keep_the_window() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     assert_eq!(fixture.fill(false).await["outcome"], "ok");
@@ -1954,6 +1981,7 @@ async fn emptied_fields_keep_the_window() {
 /// document loses the password; the filled fields show no value, the
 /// password field included after the page turns it into a text input.
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn text_reads_drop_the_password_and_mask_the_filled_fields() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     assert_eq!(fixture.fill(false).await["outcome"], "ok");
@@ -1992,6 +2020,7 @@ async fn text_reads_drop_the_password_and_mask_the_filled_fields() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn reads_are_refused_after_the_window_runs_out_until_the_page_navigates() {
     let fixture = fixture_with_window(
         Page::default(),
@@ -2020,6 +2049,7 @@ async fn reads_are_refused_after_the_window_runs_out_until_the_page_navigates() 
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn navigation_reply_releases_quarantine_only_after_main_loader_replacement() {
     let fixture = fixture_with_window(
         Page::default(),
@@ -2059,6 +2089,7 @@ async fn navigation_reply_releases_quarantine_only_after_main_loader_replacement
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn adopted_owner_frame_is_refused_before_insertion() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     let page = fixture.page.clone();
@@ -2083,6 +2114,7 @@ async fn adopted_owner_frame_is_refused_before_insertion() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn refused_live_field_checks_never_ask_the_vault_or_protect_the_page() {
     for page in [
         Page {
@@ -2118,6 +2150,7 @@ async fn refused_live_field_checks_never_ask_the_vault_or_protect_the_page() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn an_unattempted_retry_preserves_an_earlier_fills_protection() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     assert_eq!(fixture.fill(false).await["outcome"], "ok");
@@ -2147,6 +2180,7 @@ async fn an_unattempted_retry_preserves_an_earlier_fills_protection() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn insertion_revalidates_on_the_node_without_focus_commands() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     let page = fixture.page.clone();
@@ -2164,6 +2198,7 @@ async fn insertion_revalidates_on_the_node_without_focus_commands() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn partial_fill_with_failed_cleanup_keeps_protection() {
     let fixture = fixture(
         Page {
@@ -2196,6 +2231,7 @@ async fn partial_fill_with_failed_cleanup_keeps_protection() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn successive_fills_keep_every_released_secret() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     assert_eq!(fixture.fill(false).await["outcome"], "ok");
@@ -2212,6 +2248,7 @@ async fn successive_fills_keep_every_released_secret() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn a_capture_crossing_the_cap_refuses_at_retention_and_output() {
     let fixture = fixture_with_window(
         Page::default(),
@@ -2231,6 +2268,7 @@ async fn a_capture_crossing_the_cap_refuses_at_retention_and_output() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn unreadable_or_removed_fields_never_end_protection() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     assert_eq!(fixture.fill(false).await["outcome"], "ok");
@@ -2258,6 +2296,7 @@ async fn unreadable_or_removed_fields_never_end_protection() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn subframe_navigation_keeps_parent_copies_redacted_and_the_tab_quarantined() {
     let fixture = fixture(
         Page {
@@ -2335,6 +2374,7 @@ fn resolve_node_transport_failure_is_indeterminate_not_empty() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn echoes_of_username_totp_and_entity_encoded_password_are_redacted() {
     let password = "entity&<>\"'password";
     let fixture = fixture(
@@ -2366,6 +2406,7 @@ async fn echoes_of_username_totp_and_entity_encoded_password_are_redacted() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn opaque_main_document_refuses_before_vault_access() {
     let fixture = fixture(
         Page {
@@ -2382,11 +2423,13 @@ async fn opaque_main_document_refuses_before_vault_access() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn dom_full_capture_masks_type_mutated_nodes_by_identity() {
     assert_dom_full_capture_masks_type_mutated_nodes(None).await;
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn dom_full_capture_masks_type_mutated_nodes_after_a_cdp_pause() {
     // A descheduled fake browser must not turn this masking check into a
     // one-second performance test. Pause inside capture, after its clock starts.
@@ -2421,6 +2464,7 @@ async fn assert_dom_full_capture_masks_type_mutated_nodes(pause: Option<Duration
 /// statement unchanged; approved while the call waits, the vault is asked
 /// again and the login filled in the same call.
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn an_approval_files_a_card_and_fills_once_approved_in_the_call() {
     let fixture = fixture(
         Page::default(),
@@ -2450,6 +2494,7 @@ async fn an_approval_files_a_card_and_fills_once_approved_in_the_call() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn a_declined_approval_fills_nothing() {
     let fixture = fixture(
         Page::default(),
@@ -2470,6 +2515,7 @@ async fn a_declined_approval_fills_nothing() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn a_changed_owner_after_approval_refuses_before_the_second_vault_request() {
     let fixture = fixture(
         Page::default(),
@@ -2500,6 +2546,7 @@ async fn a_changed_owner_after_approval_refuses_before_the_second_vault_request(
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn dedicated_approval_requires_the_capability_and_maps_filing_refusals() {
     for (code, reason, outcome) in [
         (
@@ -2564,6 +2611,7 @@ async fn dedicated_approval_requires_the_capability_and_maps_filing_refusals() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn a_generic_allow_never_retries_the_vault_or_fills_a_login() {
     let fixture = fixture(
         Page::default(),
@@ -2585,6 +2633,7 @@ async fn a_generic_allow_never_retries_the_vault_or_fills_a_login() {
 }
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn a_dedicated_allow_cannot_fill_unless_the_vault_releases_material() {
     let fixture = fixture(
         Page::default(),
@@ -2611,6 +2660,7 @@ async fn a_dedicated_allow_cannot_fill_unless_the_vault_releases_material() {
 /// An approval given after the call stopped waiting fills nothing; the
 /// agent's next call is what uses it.
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn a_late_approval_fills_nothing_until_the_agent_calls_again() {
     let fixture = fixture(
         Page::default(),
@@ -2664,6 +2714,7 @@ async fn a_late_approval_fills_nothing_until_the_agent_calls_again() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn typing_still_refuses_credential_fields() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     for filled in [false, true] {
@@ -2705,13 +2756,19 @@ async fn test_planes_do_not_serve_fill_login() {
     .await
     .unwrap();
     let refused: Value = serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
-    assert_eq!(refused["code"], "capability_not_admitted", "{refused}");
+    let expected = if cfg!(all(windows, feature = "windows-browser-release")) {
+        "browser_action_not_supported"
+    } else {
+        "capability_not_admitted"
+    };
+    assert_eq!(refused["code"], expected, "{refused}");
 }
 
 /// `browser_use` with `action: "fill_login"` is served by `browser.fill_login`:
 /// the vault is asked once, the fields are filled, and the reply names the
 /// fields and the site, never the values.
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn browser_use_fill_login_reaches_the_fill() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     let mut arguments = fixture.fill_arguments(false).await;
@@ -2734,19 +2791,48 @@ async fn browser_use_fill_login_reaches_the_fill() {
 /// name before the vault or the page is reached.
 #[tokio::test]
 async fn browser_use_fill_login_refuses_the_persons_browser() {
-    let fixture = fixture(Page::default(), VaultState::default()).await;
-    let mut arguments = fixture.fill_arguments(false).await;
-    arguments["action"] = json!("fill_login");
-    arguments["browser"] = json!("user");
-    let frame = fixture
-        .send(json!({"name": "browser_use", "arguments": arguments}), None)
-        .await;
-    let reply = reply_body(&frame);
-    assert_eq!(reply["outcome"], "invalid_request", "{reply}");
-    assert_eq!(reply["detail"]["field"], "browser", "{reply}");
-    assert_eq!(reason_code(&reply), "own_browser_only", "{reply}");
-    assert!(fixture.vault.requests().is_empty());
-    assert_eq!(fixture.page.insertions(), 0);
+    #[cfg(windows)]
+    {
+        let (tx, mut rx) = mpsc::channel(4);
+        cerebellum::handle_tool_request_for_test(
+            tool_frame(
+                1,
+                json!({"name":"browser_use", "arguments":{
+                    "action":"fill_login", "browser":"user", "secret":SECRET,
+                    "username_ref":"e1", "password_ref":"e2", "snapshot_id":"fixture"
+                }}),
+            ),
+            &tx,
+            &Arc::new(HealthState::new()),
+        )
+        .await
+        .unwrap();
+        let reply = rx.recv().await.unwrap();
+        assert_eq!(reply.header.ty, FrameType::Error);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        let expected = if cfg!(feature = "windows-browser-release") {
+            "user_browser_not_supported"
+        } else {
+            "tool_disabled"
+        };
+        assert_eq!(body["code"], expected, "{body}");
+    }
+    #[cfg(not(windows))]
+    {
+        let fixture = fixture(Page::default(), VaultState::default()).await;
+        let mut arguments = fixture.fill_arguments(false).await;
+        arguments["action"] = json!("fill_login");
+        arguments["browser"] = json!("user");
+        let frame = fixture
+            .send(json!({"name": "browser_use", "arguments": arguments}), None)
+            .await;
+        let reply = reply_body(&frame);
+        assert_eq!(reply["outcome"], "invalid_request", "{reply}");
+        assert_eq!(reply["detail"]["field"], "browser", "{reply}");
+        assert_eq!(reason_code(&reply), "own_browser_only", "{reply}");
+        assert!(fixture.vault.requests().is_empty());
+        assert_eq!(fixture.page.insertions(), 0);
+    }
 }
 
 /// A named snapshot chooses which elements the refs name, as it does for
@@ -2754,6 +2840,7 @@ async fn browser_use_fill_login_refuses_the_persons_browser() {
 /// it, a snapshot of another kind is refused, and the snapshot that showed
 /// the fields fills them. Every refusal comes before the vault is asked.
 #[tokio::test]
+#[cfg(not(windows))] // Needs Windows fill_login.
 async fn a_named_snapshot_chooses_the_refs_and_an_unknown_one_refuses_as_type_does() {
     let fixture = fixture(Page::default(), VaultState::default()).await;
     let screenshot = fixture.screenshot().await;

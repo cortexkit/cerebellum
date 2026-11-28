@@ -29,6 +29,7 @@ mod crash_report_health;
 mod disclaimed_binary_paths;
 mod image_resolve_v1;
 mod insulated_health;
+#[cfg(not(windows))] // Needs Windows present/resume for the held handoff fixtures.
 mod late_results;
 mod launch_outcome_vocabulary;
 mod no_reverse_lane;

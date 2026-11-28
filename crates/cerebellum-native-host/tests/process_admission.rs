@@ -51,6 +51,10 @@ fn non_chrome_parent_exits_silently_without_connecting_or_reading_fabricated_fra
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn unsupported_platform_exits_without_stdio_output() {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let output = Command::new(cortexkit_test_support::ckdev_binary(env!(
         "CARGO_BIN_EXE_ck-cerebellum-native-host"
     )))

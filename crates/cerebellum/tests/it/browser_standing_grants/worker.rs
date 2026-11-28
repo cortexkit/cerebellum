@@ -41,6 +41,7 @@ fn worker(conversation: &str) -> Session<'_> {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn worker_website_card_grants_only_the_worker_scope() {
     let mut fixture = Fixture::new();
     let route = fixture.route(worker("worker-granted")).await;
@@ -120,6 +121,7 @@ async fn worker_website_card_grants_only_the_worker_scope() {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn worker_website_cards_never_offer_or_apply_permanent_grants() {
     for in_advance in [false, true] {
         for id in ["allow_origin_always", "allow_all_sites_always"] {

@@ -283,7 +283,11 @@ fn signing_tool_reproduces_the_independent_golden_vectors_byte_for_byte() {
     let golden = golden();
     for vector in golden.vectors {
         let image = TempImage::new(&vector.image());
-        let mut signer = tool("sign")
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "migrated by the spawn-wrapper slice"
+        )]
+        let signer = tool("sign")
             .arg("--test-key")
             .env(PUBLIC_KEY_ENV, golden.public_key_hex.to_ascii_uppercase())
             .arg(image.path())
@@ -292,7 +296,11 @@ fn signing_tool_reproduces_the_independent_golden_vectors_byte_for_byte() {
             .unwrap();
         assert_success(&signer);
         assert_eq!(image.bytes(), vector.signed_image());
-        signer = tool("sign")
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "migrated by the spawn-wrapper slice"
+        )]
+        let signer = tool("sign")
             .arg("--test-key")
             .env(PUBLIC_KEY_ENV, &golden.public_key_hex)
             .arg(image.path())
@@ -315,6 +323,10 @@ fn release_signing_reads_pkcs8_pem_from_stdin_and_verifies_the_pinned_image() {
     let signer = sign_command(image.path(), &public_key_hex, &pin);
     assert_success(&with_stdin(signer, pem.as_bytes()));
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     assert_success(
         &tool("verify")
             .arg(image.path())
@@ -324,6 +336,10 @@ fn release_signing_reads_pkcs8_pem_from_stdin_and_verifies_the_pinned_image() {
             .output()
             .unwrap(),
     );
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     assert_failure(
         &tool("verify")
             .arg(image.path())
@@ -338,11 +354,19 @@ fn release_signing_reads_pkcs8_pem_from_stdin_and_verifies_the_pinned_image() {
 
 #[test]
 fn release_preflight_refuses_test_key_in_either_case_and_invalid_keys() {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     assert_failure(
         &tool("preflight").output().unwrap(),
         "missing CEREBELLUM_BRIDGE_PEER_PUBLIC_KEY",
     );
     for invalid in ["", "bad hex", &"0".repeat(64)] {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "migrated by the spawn-wrapper slice"
+        )]
         assert_failure(
             &tool("preflight")
                 .env(PUBLIC_KEY_ENV, invalid)
@@ -355,6 +379,10 @@ fn release_preflight_refuses_test_key_in_either_case_and_invalid_keys() {
         TEST_PEER_PUBLIC_KEY_HEX,
         &TEST_PEER_PUBLIC_KEY_HEX.to_ascii_uppercase(),
     ] {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "migrated by the spawn-wrapper slice"
+        )]
         assert_failure(
             &tool("preflight")
                 .env(PUBLIC_KEY_ENV, encoded)
@@ -364,6 +392,10 @@ fn release_preflight_refuses_test_key_in_either_case_and_invalid_keys() {
         );
     }
     let key = SigningKey::from_bytes(&[17; 32]).verifying_key();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     assert_success(
         &tool("preflight")
             .env(PUBLIC_KEY_ENV, hex(key.as_bytes()))
@@ -385,6 +417,10 @@ fn release_signing_refuses_without_output_on_bad_pin_or_private_key() {
             "public key fingerprint does not match the pin",
         ),
     ] {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "migrated by the spawn-wrapper slice"
+        )]
         let output = sign_command(image.path(), &public_key_hex, bad_pin)
             .output()
             .unwrap();
@@ -414,6 +450,10 @@ fn release_signing_refuses_without_output_on_bad_pin_or_private_key() {
         );
         assert_eq!(image.bytes(), IMAGE);
     }
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let output = sign_command(image.path(), TEST_PEER_PUBLIC_KEY_HEX, &pin)
         .output()
         .unwrap();
@@ -424,8 +464,16 @@ fn release_signing_refuses_without_output_on_bad_pin_or_private_key() {
 #[test]
 fn assert_unsigned_refuses_even_a_malformed_trailer_marker() {
     let image = TempImage::new(b"MZ");
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     assert_success(&tool("assert-unsigned").arg(image.path()).output().unwrap());
     let image = TempImage::new(b"MZCKPEER01");
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     assert_failure(
         &tool("assert-unsigned").arg(image.path()).output().unwrap(),
         "image ends in peer trailer magic",
@@ -453,6 +501,10 @@ fn sign_command(path: &Path, public_key: &str, pin: &str) -> Command {
 }
 
 fn with_stdin(mut command: Command, bytes: &[u8]) -> Output {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -1,6 +1,15 @@
 //! The published role suite enters the production frame dispatcher with real
 //! route binds. A separate test checks catalog bytes through the real daemon.
 
+#![cfg_attr(
+    all(windows, not(feature = "windows-browser-release")),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "browser test routes need the Windows release key"
+    )
+)]
+
 use super::*;
 use crate::hang_guard::HANG_GUARD;
 use async_trait::async_trait;
@@ -294,6 +303,7 @@ impl ToolProviderSubject for Subject {
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn tool_provider_role_conforms_on_production_handler() {
     let root = live_daemon_directory(0);
     let planes = Subject.spawn(&root).await.unwrap();
@@ -446,9 +456,9 @@ async fn live_daemon_catalog_preserves_registered_flat_definition() {
 
 #[cfg(windows)]
 #[tokio::test]
-async fn live_daemon_catalog_omits_the_agent_browser_on_windows() {
+async fn live_daemon_catalog_admits_the_agent_browser_only_with_the_windows_key() {
     let Some(home) = managed_settings::fenced_home(
-        "tool_provider::live_daemon_catalog_omits_the_agent_browser_on_windows",
+        "tool_provider::live_daemon_catalog_admits_the_agent_browser_only_with_the_windows_key",
         HANG_GUARD,
     )
     .await
@@ -466,18 +476,28 @@ async fn live_daemon_catalog_omits_the_agent_browser_on_windows() {
         .iter()
         .find(|module| module.module_id == MODULE_ID)
         .unwrap();
-    for role in &module.roles {
-        if let ProviderRole::ToolProvider { tools, .. } = role {
-            assert!(tools
-                .iter()
-                .all(|tool| { tool.name != "browser_use" && !tool.name.starts_with("browser.") }));
-        }
-    }
+    let tools = module
+        .roles
+        .iter()
+        .find_map(|role| match role {
+            ProviderRole::ToolProvider { tools, .. } => Some(tools),
+            _ => None,
+        })
+        .expect("the daemon must report the tool provider");
+    assert_eq!(
+        tools.iter().any(|tool| tool.name == "browser_use"),
+        cfg!(feature = "windows-browser-release")
+    );
+    assert_eq!(
+        tools.iter().any(|tool| tool.name.starts_with("browser.")),
+        cfg!(feature = "windows-browser-release")
+    );
     drop(client);
     daemon.stop();
 }
 
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn tool_result_v1_requires_route_reader_declaration() {
     let root = live_daemon_directory(0);
     let planes = Subject.spawn(&root).await.unwrap();

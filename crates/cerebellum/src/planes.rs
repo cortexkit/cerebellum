@@ -5,8 +5,34 @@ impl Planes {
         if self.runtime_browser.is_some() {
             browser_build_admits()
         } else {
-            self.browser_config.is_some()
+            self.browser_config.is_some() && browser_build_admits()
         }
+    }
+
+    pub(super) fn browser_dispatch_admitted(&self) -> bool {
+        #[cfg(test)]
+        if self.synthetic_browser_dispatch {
+            return self.runtime_browser.is_some() || self.browser_config.is_some();
+        }
+        self.browser_admitted()
+    }
+
+    #[cfg(windows)]
+    pub(super) fn enforce_windows_browser_refusals(&self) -> bool {
+        #[cfg(test)]
+        {
+            !self.synthetic_browser_dispatch
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_synthetic_browser_dispatch(mut self) -> Self {
+        self.synthetic_browser_dispatch = true;
+        self
     }
 
     /// Configure how agent calls open Cingulate routes and persist the cards
@@ -400,6 +426,8 @@ impl Planes {
                     .collect(),
             ),
             #[cfg(test)]
+            synthetic_browser_dispatch: false,
+            #[cfg(test)]
             route_test_handler: None,
             #[cfg(test)]
             cursor_for_test: None,
@@ -449,6 +477,8 @@ impl Clone for Planes {
             routes: Arc::clone(&self.routes),
             browser: Arc::clone(&self.browser),
             browser_config: self.browser_config.clone(),
+            #[cfg(test)]
+            synthetic_browser_dispatch: self.synthetic_browser_dispatch,
             runtime_browser: self.runtime_browser.clone(),
             sessions: self.sessions.clone(),
             user_browser: self.user_browser.clone(),

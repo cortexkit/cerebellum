@@ -25,6 +25,10 @@ fn main() {
         // for this process, and nothing else in this process uses it.
         drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) });
     }
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "migrated by the spawn-wrapper slice"
+    )]
     let status = std::process::Command::new(program)
         .args(std::env::args_os().skip(1))
         .env_remove(REGISTRATION_FD_ENV)

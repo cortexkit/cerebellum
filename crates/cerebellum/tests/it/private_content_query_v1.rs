@@ -8,6 +8,15 @@
 //! secret leaves the fixture: only the query request and its answer are
 //! pinned.
 
+#![cfg_attr(
+    all(windows, not(feature = "windows-browser-release")),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "recording the browser mark on the wire needs the Windows release key"
+    )
+)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -210,6 +219,7 @@ impl SessionCleanup for Cleanup {
 /// Drives the real management handler for the three pinned cases and compares
 /// the exact request and reply bytes.
 #[tokio::test]
+#[cfg(any(not(windows), feature = "windows-browser-release"))] // Drives a browser, unavailable without the Windows feature.
 async fn private_content_query_wire_shapes_match_their_goldens() {
     let config = BrowserConfig {
         executable_path: None,

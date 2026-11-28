@@ -292,7 +292,7 @@ fn attach_consent(mut planes: Planes, consent: &tests::ScriptedConsent) -> Plane
             ))),
         ),
     );
-    planes.with_cingulate(
+    planes.with_synthetic_browser_dispatch().with_cingulate(
         Arc::new(Arc::clone(&consent.script)),
         Arc::new(consent.store()),
     )

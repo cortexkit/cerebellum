@@ -167,7 +167,7 @@ fn configured_browser_advertisement_and_dispatch_match_in_both_directions() {
         .chain(browser::ALL_TOOLS)
         .chain(["browser.type"]);
     let dispatchable: std::collections::BTreeSet<&str> = candidates
-        .filter(|name| dispatchable_tool_with_browser(name, true).is_some())
+        .filter(|name| dispatchable_tool_with_browser(name, browser_build_admits()).is_some())
         .collect();
 
     for name in &advertised {
@@ -187,9 +187,12 @@ fn configured_browser_advertisement_and_dispatch_match_in_both_directions() {
     // recorded (600,476) css where the module's mapping predicts 476.75 --
     // page truncation against probe rounding, not a mapping error, and a
     // scale error would have shown as a factor rather than a fraction.
-    assert!(dispatchable.contains(browser::CLICK_POINT));
+    assert_eq!(
+        dispatchable.contains(browser::CLICK_POINT),
+        browser_build_admits()
+    );
     // Ordinary form composition is admitted; credential fields still refuse.
-    assert!(dispatchable.contains(browser::TYPE));
+    assert_eq!(dispatchable.contains(browser::TYPE), browser_build_admits());
 }
 
 #[cfg(target_os = "macos")]
@@ -378,7 +381,10 @@ fn available_browser_surface_advertises_tools_without_refusal_disclosure() {
         &BrowserSurface::Available(browser_surface_config()),
     );
 
-    assert!(browser_tools(&manifest).contains(&"browser.navigate"));
+    assert_eq!(
+        browser_tools(&manifest).contains(&"browser.navigate"),
+        browser_build_admits()
+    );
     assert!(manifest.get("browser_surface_refused").is_none());
 }
 
@@ -488,19 +494,7 @@ fn test_management_plane() -> Arc<ManagementPlane> {
 /// the navigation may use is the answer delivered to the elicitation request.
 #[tokio::test]
 async fn an_elicited_browser_grant_admits_wire_navigation() {
-    let mut planes = Planes::with_browser_config_journaling(
-        Arc::new(HealthState::default()),
-        Some(BrowserConfig {
-            executable_path: None,
-            expected_identity: None,
-            launch_handshake_deadline_ms: 100,
-            termination_grace_period_ms: 100,
-            browser_idle_timeout_ms: 30_000,
-            browser_exit_observation_deadline_ms: 100,
-            navigation_settle_deadline_ms: 100,
-        }),
-        JournalPersistence::Isolated,
-    );
+    let mut planes = isolated_test_planes(&Arc::new(HealthState::default()));
     planes.management = Arc::new(
         ManagementPlane::new(Arc::new(management::PlatformResolver::new())).with_agent_grants(
             Arc::new(agent_grants::AgentGrants::in_memory(Some(
@@ -656,8 +650,7 @@ async fn an_elicited_browser_grant_admits_wire_navigation() {
     handle_route_request(navigation, &writer_tx, &planes)
         .await
         .expect("the navigation reaches the browser wire handler");
-    let navigated: Value =
-        serde_json::from_slice(&writer_rx.recv().await.expect("navigation response").body).unwrap();
+    let navigated: Value = serde_json::from_slice(&next_frame(&mut writer_rx).await.body).unwrap();
     assert_ne!(navigated["outcome"], "authorization_denied", "{navigated}");
     assert_eq!(navigated["outcome"], "no_session", "{navigated}");
 }
@@ -1503,6 +1496,7 @@ async fn an_unsolicited_answer_is_dropped_without_closing_the_route() {
         routes: Arc::new(RouteBindings::new()),
         browser: Arc::new(BrowserPlane::new()),
         browser_config: None,
+        synthetic_browser_dispatch: false,
         runtime_browser: None,
         sessions: browser_session::BrowserSessions::default(),
         user_browser: user_browser_bridge::UserBrowserBridge::new(),
@@ -1761,16 +1755,22 @@ async fn browser_import_login_refuses_without_an_agent_session() {
     );
 }
 
-/// Planes whose management route declares elicitation, with the capture
-/// module running on the fixture's fakes and an in-memory journal.
-pub(super) fn capture_planes(fixture: &login_capture::test_support::Fixture) -> Planes {
+fn capture_fixture_planes(fixture: &login_capture::test_support::Fixture) -> Planes {
     let mut planes = Planes::with_browser_config_journaling(
         Arc::new(HealthState::default()),
         None,
         JournalPersistence::Isolated,
-    );
+    )
+    .with_synthetic_browser_dispatch();
     planes.capture = Arc::clone(&fixture.module);
     planes.browser_config = Some(Planes::short_test_browser_config());
+    planes
+}
+
+/// Planes whose management route declares elicitation, with the capture
+/// module running on the fixture's fakes and an in-memory journal.
+pub(super) fn capture_planes(fixture: &login_capture::test_support::Fixture) -> Planes {
+    let planes = capture_fixture_planes(fixture);
     let admission = json!({
         "agentProjectId": "test-project",
         "sessionKind": "primary",
@@ -1875,13 +1875,7 @@ impl ScriptedConsent {
     /// frame dispatcher, on the route at channel 4. Each call builds them
     /// anew over the same registry.
     fn planes(&self, fixture: &login_capture::test_support::Fixture) -> Planes {
-        let mut planes = Planes::with_browser_config_journaling(
-            Arc::new(HealthState::default()),
-            None,
-            JournalPersistence::Isolated,
-        );
-        planes.capture = Arc::clone(&fixture.module);
-        planes.browser_config = Some(Planes::short_test_browser_config());
+        let planes = capture_fixture_planes(fixture);
         let admission = json!({
             "agentProjectId": "test-project",
             "sessionKind": "primary",
@@ -2819,6 +2813,8 @@ async fn a_cancelled_capture_sends_the_turn_stop_bytes_in_every_ordering() {
     ] {
         let fixture = fixture();
         let cingulate = ScriptedConsent::new();
+        let (await_called, await_started) = tokio::sync::oneshot::channel();
+        let (_await_reply, await_response) = tokio::sync::oneshot::channel();
         let (detach_called, detach_started) = tokio::sync::oneshot::channel();
         let (detach_reply, detach_response) = tokio::sync::oneshot::channel();
         cingulate.raises("el_cap_303");
@@ -2826,7 +2822,10 @@ async fn a_cancelled_capture_sends_the_turn_stop_bytes_in_every_ordering() {
             .script
             .then(
                 cingulate_client::wire::CONSENT_AWAIT,
-                cingulate_client::Reply::Hang,
+                cingulate_client::Reply::Controlled {
+                    called: await_called,
+                    reply: await_response,
+                },
             )
             .then(
                 cingulate_client::wire::CONSENT_DETACH,
@@ -2841,13 +2840,12 @@ async fn a_cancelled_capture_sends_the_turn_stop_bytes_in_every_ordering() {
         handle_frame_for_test(request.clone(), &writer_tx, &planes)
             .await
             .unwrap();
-        tokio::time::timeout(HANG_GUARD, async {
-            while cingulate.methods().len() < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the call waits on its card");
+        // A pending receiver lets paused time advance if capture never reaches
+        // the card. A yield loop would keep the runtime ready forever instead.
+        tokio::time::timeout(HANG_GUARD, await_started)
+            .await
+            .expect("the call waits on its card")
+            .expect("the consent script reached its await step");
         let cancel = crate::turn_stop_vectors::cancel(&request);
         handle_frame_for_test(cancel.clone(), &writer_tx, &planes)
             .await
@@ -2904,7 +2902,7 @@ async fn a_cancelled_capture_sends_the_turn_stop_bytes_in_every_ordering() {
                 if !export.is_empty() {
                     break export;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
@@ -3489,6 +3487,7 @@ async fn an_unsupported_surface_is_refused_by_name() {
         routes: Arc::new(RouteBindings::new()),
         browser: Arc::new(BrowserPlane::new()),
         browser_config: None,
+        synthetic_browser_dispatch: false,
         runtime_browser: None,
         sessions: browser_session::BrowserSessions::default(),
         user_browser: user_browser_bridge::UserBrowserBridge::new(),
@@ -3592,6 +3591,7 @@ pub(super) fn management_bound_planes_with_admission_facts(
         routes: Arc::new(RouteBindings::new()),
         browser: Arc::new(BrowserPlane::new()),
         browser_config: None,
+        synthetic_browser_dispatch: true,
         runtime_browser: None,
         sessions: browser_session::BrowserSessions::default(),
         user_browser: user_browser_bridge::UserBrowserBridge::new(),
