@@ -179,7 +179,11 @@ fn rig(
     .with_session_lock_for_test(Some(false));
     let app_state_admitted = app_state_block(context).is_none();
     let launch_admitted = launch::launch_block(context).is_none();
-    if app_state_admitted || launch_admitted {
+    if let Some(source) = override_source {
+        plane = plane
+            .with_app_state_source(source)
+            .with_permission_liveness(permissions::live_for_test());
+    } else if app_state_admitted || launch_admitted {
         let mut source = WindowsAppStateSource::new(windows_identity::blocked);
         if launch_admitted {
             source = source
@@ -208,9 +212,6 @@ fn rig(
         plane = plane
             .with_app_state_source(Arc::new(source))
             .with_permission_liveness(permissions);
-    }
-    if let Some(source) = override_source {
-        plane = plane.with_app_state_source(source);
     }
     planes.computer = Ok(Arc::new(plane));
     planes.computer_admitted = Arc::new(rows(context));
