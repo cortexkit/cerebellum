@@ -107,6 +107,7 @@ cerebellum-windows = { path = "../cerebellum-windows" }
 [dev-dependencies]
 cerebellum-native-host = { path = "../cerebellum-native-host" }
 cerebellum-core = { path = "../cerebellum-core", features = ["test-support"] }
+cerebellum-computer = { path = "../cerebellum-computer", features = ["test-support"] }
 async-trait = "0.1"
 cortexkit-role-agent-data = { workspace = true, features = ["test-vectors"] }
 cortexkit-role-tool-provider-conformance = "=0.15.12"
@@ -131,9 +132,6 @@ rustix = { version = "1.1.4", features = ["net"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 cortexkit-lease = { version = "=0.1.3", features = ["test-support"] }
-
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-cerebellum-computer = { path = "../cerebellum-computer", features = ["test-support"] }
 
 # Examples carry their own tests, and cargo defaults an example target to
 # test = false -- so `cargo test --workspace` builds them and skips their

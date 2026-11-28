@@ -483,10 +483,10 @@ struct ScreenState {
     /// order.
     log: Vec<String>,
     /// When each request to bring the previous application back was made,
-    /// in real time, for the cutoff's real-time bound.
+    /// on the same clock as the cutoff.
     restore_requested_at: Vec<std::time::Instant>,
     /// Handing the restore host over at registration blocks the bracket's
-    /// thread for this long in real time, as a slow registration would.
+    /// thread for this long, as a slow registration would.
     register_blocks_ms: u64,
     /// The request to front the target blocks the bracket's thread for this
     /// long in real time before it takes effect, logging `front-returned`.
@@ -696,6 +696,7 @@ impl Screen {
                 relanded
             }
         };
+        cerebellum_computer::fronting_clock::advance(Duration::from_millis(milliseconds));
         if landed {
             self.desk.state().frontmost = Some(TARGET);
         }
@@ -750,7 +751,9 @@ impl FrontingRestoreHost for FakeRestore {
         {
             let mut state = self.0.state();
             if pid != TARGET {
-                state.restore_requested_at.push(std::time::Instant::now());
+                state
+                    .restore_requested_at
+                    .push(cerebellum_computer::fronting_clock::now());
             }
             if pid != TARGET
                 && state.restore_needs_remembered_previous
@@ -861,7 +864,11 @@ impl RestoreHostSource for FakeBracket {
         // made.
         let blocks = std::mem::take(&mut self.0.state().register_blocks_ms);
         if blocks > 0 {
-            std::thread::sleep(Duration::from_millis(blocks));
+            if cerebellum_computer::fronting_clock::FakeClock::current().is_some() {
+                self.0.advance(blocks);
+            } else {
+                std::thread::sleep(Duration::from_millis(blocks));
+            }
         }
         Box::new(FakeRestore(self.0.clone()))
     }

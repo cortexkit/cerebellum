@@ -29,6 +29,7 @@
 //! bounded time for the owner's decision.
 
 use super::FrontAttemptState;
+use crate::fronting_clock::now;
 use crate::platform::{FrontedKeyGuard, ProcessEventRefusal};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -205,13 +206,13 @@ impl CutoffGate {
     pub fn time_to_reserve_start(&self) -> Option<Duration> {
         self.state()
             .reserve_start
-            .map(|at| at.saturating_duration_since(Instant::now()))
+            .map(|at| at.saturating_duration_since(now()))
     }
 
     /// Whether nothing new may start: the restore reserve has started, the
     /// owner began ending the front, or terminal cleanup stopped it.
     pub fn closed(&self) -> bool {
-        self.state().closed(Instant::now())
+        self.state().closed(now())
     }
 
     /// A post is about to start. `false` once the gate is closed: the post
@@ -220,7 +221,7 @@ impl CutoffGate {
     /// released once it returns; a `press` only once its release has.
     pub fn begin_post(&self, press: bool) -> bool {
         let mut state = self.state();
-        if state.closed(Instant::now()) {
+        if state.closed(now()) {
             return false;
         }
         let pressed = matches!(state.input, InputHold::Held { press: true });
@@ -235,7 +236,7 @@ impl CutoffGate {
     /// the restore then follows the release without a deadline.
     pub fn all_released(&self) {
         let mut state = self.state();
-        let now = Instant::now();
+        let now = now();
         if state.input == (InputHold::Held { press: true })
             && state.deadline.is_some_and(|deadline| now >= deadline)
         {
@@ -261,7 +262,7 @@ impl CutoffGate {
     /// must not be requested.
     pub fn begin_front_attempt(&self, front_instant_ms: u64) -> bool {
         let mut state = self.state();
-        if state.closed(Instant::now()) || state.attempt != FrontAttemptState::NotStarted {
+        if state.closed(now()) || state.attempt != FrontAttemptState::NotStarted {
             return false;
         }
         state.attempt = FrontAttemptState::Dispatching { front_instant_ms };
@@ -296,7 +297,7 @@ impl CutoffGate {
     pub fn end_front(&self) {
         let mut state = self.state();
         if state.ended_at.is_none() {
-            state.ended_at = Some(Instant::now());
+            state.ended_at = Some(now());
         }
     }
 
