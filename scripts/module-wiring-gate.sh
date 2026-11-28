@@ -23,7 +23,11 @@ cd "$(dirname "$0")/.."
 
 # Modules intentionally excluded from their parent, each with a reason.
 # Format: "<crate>::<path::to::module>"
-EXPECTED_UNWIRED=()
+EXPECTED_UNWIRED=(
+  # Generated browser-journal names, pulled into browser_launch.rs with
+  # include!() so the mint test can compare the checked-in file byte for byte.
+  "cerebellum::browser_launch::journal_vocabulary_generated"
+)
 
 failed=0
 
