@@ -78,7 +78,7 @@ jobs:
 
       - name: Key unbound workspace tests
         run: |
-          cargo test --locked --workspace -- --format=pretty | Tee-Object (Join-Path $env:RUNNER_TEMP 'unbound.log')
+          ./scripts/windows-cargo-test.ps1 -CargoArgs @('--locked', '--workspace') | Tee-Object (Join-Path $env:RUNNER_TEMP 'unbound.log')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Key unbound workspace clippy
@@ -86,7 +86,7 @@ jobs:
 
       - name: Key bound workspace tests
         run: |
-          cargo test --locked --workspace --features cerebellum/windows-browser-release -- --format=pretty | Tee-Object (Join-Path $env:RUNNER_TEMP 'bound.log')
+          ./scripts/windows-cargo-test.ps1 -CargoArgs @('--locked', '--workspace', '--features', 'cerebellum/windows-browser-release') | Tee-Object (Join-Path $env:RUNNER_TEMP 'bound.log')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Check executed Windows browser cases
@@ -120,7 +120,7 @@ jobs:
             if (-not $expected.ContainsKey($phase)) { continue }
             $log = Join-Path $env:RUNNER_TEMP "$phase.log"
             if ($prefixes.ContainsKey($phase)) {
-              cargo test --locked -p cerebellum --lib --features windows-browser-release ($prefixes[$phase]) -- --ignored --format=pretty | Tee-Object $log
+              ./scripts/windows-cargo-test.ps1 -Ignored -CargoArgs @('--locked', '-p', 'cerebellum', '--lib', '--features', 'windows-browser-release', $prefixes[$phase]) | Tee-Object $log
               if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             }
             $passed = @(foreach ($line in Get-Content -LiteralPath $log) {

@@ -88,7 +88,11 @@ fn permission_states_never_change_serialized_tool_definitions() {
         })
     };
     let live = definitions(PermissionLiveness::Live);
-    assert!(live[1].is_some(), "browser_use must be offered");
+    assert_eq!(
+        live[1].is_some(),
+        crate::browser_build_admits(),
+        "configured browser_use is offered exactly when the build admits it"
+    );
     assert_eq!(
         live[0].is_some(),
         !crate::computer_release_evidence(&context(PermissionLiveness::Live))

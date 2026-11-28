@@ -45,11 +45,7 @@ impl Backend for CatalogDouble {
 }
 
 fn planes() -> Planes {
-    Planes::with_browser_config_journaling(
-        Arc::new(cerebellum_core::health::HealthState::new()),
-        Some(Planes::short_test_browser_config()),
-        JournalPersistence::Isolated,
-    )
+    crate::isolated_test_planes(&Arc::new(cerebellum_core::health::HealthState::new()))
 }
 
 fn frame(body: Value) -> Frame {
@@ -1110,7 +1106,13 @@ async fn only_the_single_attested_display_can_read_catalog_and_views() {
                     if name == "tool.views" {
                         assert_eq!(body, json!({"views":{"unpublished":"unknown"}}));
                     } else {
-                        assert!(!body["tools"].as_array().unwrap().is_empty());
+                        let tools = body["tools"]
+                            .as_array()
+                            .expect("the display gets the catalog");
+                        assert_eq!(
+                            tools.iter().any(|tool| tool["name"] == "browser_use"),
+                            crate::browser_build_admits()
+                        );
                     }
                 }
             }

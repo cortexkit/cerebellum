@@ -147,7 +147,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Native Rust workspace tests
-        run: cargo test --locked --workspace --no-fail-fast
+        run: ./scripts/windows-cargo-test.ps1 -CargoArgs @('--locked', '--workspace', '--no-fail-fast')
       - name: Native Windows browser image predicates
         if: ${{ !cancelled() && matrix.runner == 'windows-latest' }}
         timeout-minutes: 8
