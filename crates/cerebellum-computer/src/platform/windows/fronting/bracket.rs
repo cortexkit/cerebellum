@@ -1,8 +1,8 @@
 use super::*;
 use crate::dispatch::{
     BracketPlan, BracketReport, BracketStop, FrontingBracketHost, HardwareInputSnapshot,
-    HeartbeatObservation, HeartbeatProbe, RestoreStatus, SeizeWatcher, SourcedInputEvent,
-    UnitPosted, UserIdleEstimator,
+    HeartbeatObservation, HeartbeatProbe, ObservedUnit, RestoreStatus, SeizeWatcher,
+    SourcedInputEvent, UnitPosted, UserIdleEstimator,
 };
 use crate::platform::process_event::{
     HeldStateDisposition, ProcessEventRefusal, SequencePostFailure,
@@ -25,21 +25,15 @@ impl std::fmt::Debug for FrontedHookSlot {
     }
 }
 
-/// A platform observer must be able to prove coverage on the bracket clock.
-/// The Windows input implementation will supply an armed observer; a slot
-/// with no observer cannot even read the desktop or attempt activation.
-trait Observer: Send + Sync {
+pub(super) trait Observer: Send + Sync {
     fn idle(&self) -> IdleReading;
     fn drain(&self) -> Vec<SourcedInputEvent>;
     fn probe(&self) -> HeartbeatProbe;
     fn echo(&self, probe: HeartbeatProbe, watcher: &mut SeizeWatcher) -> HeartbeatObservation;
     fn snapshot(&self) -> Option<HardwareInputSnapshot>;
-}
-
-fn live_observer() -> Option<Arc<dyn Observer>> {
-    // No observer or probe writes are available until Windows input delivery
-    // supplies both low-level hooks and verifies their echoes.
-    None
+    fn may_front(&self) -> bool {
+        true
+    }
 }
 
 trait Desktop: Send + Sync + 'static {
@@ -70,6 +64,7 @@ struct NativeDesktop {
     // The restore host may outlive the bracket if activation is pending.
     _lane: Option<ForegroundLane>,
     picture: bool,
+    previous: Binding,
 }
 
 impl Desktop for NativeDesktop {
@@ -88,7 +83,8 @@ impl Desktop for NativeDesktop {
         foreground_window_number()
     }
     fn bind(&self, number: u32) -> Option<Self::Window> {
-        Binding::read(number, None)
+        (number == self.previous.number && self.previous.is_foreground())
+            .then(|| self.previous.clone())
     }
     fn number(&self, window: &Binding) -> u32 {
         window.number
@@ -112,13 +108,19 @@ impl Desktop for NativeDesktop {
     }
 }
 
-struct WindowsBracketHost<D: Desktop> {
+type Unit<'a, W> = &'a mut dyn FnMut(
+    &W,
+    ObservedUnit<'_, Arc<dyn Observer>>,
+) -> Result<UnitPosted, SequencePostFailure>;
+
+struct WindowsBracketHost<'a, D: Desktop> {
     desk: Arc<D>,
     target: Arc<D::Window>,
     previous: Arc<D::Window>,
     observer: Arc<dyn Observer>,
     bound_ms: u64,
     denied: bool,
+    unit: Option<Unit<'a, D::Window>>,
 }
 
 fn stop(failure: ProcessEventRefusal) -> SequencePostFailure {
@@ -129,7 +131,7 @@ fn stop(failure: ProcessEventRefusal) -> SequencePostFailure {
     }
 }
 
-impl<D: Desktop> WindowsBracketHost<D> {
+impl<D: Desktop> WindowsBracketHost<'_, D> {
     fn safe_to_start(&self) -> bool {
         self.desk.safe()
             && self.desk.safe_integrity(&self.previous)
@@ -138,7 +140,7 @@ impl<D: Desktop> WindowsBracketHost<D> {
     }
 }
 
-impl<D: Desktop> FrontingBracketHost for WindowsBracketHost<D> {
+impl<D: Desktop> FrontingBracketHost for WindowsBracketHost<'_, D> {
     type Tap = Arc<dyn Observer>;
 
     fn now_ms(&mut self) -> u64 {
@@ -161,7 +163,11 @@ impl<D: Desktop> FrontingBracketHost for WindowsBracketHost<D> {
     }
     fn request_front_while(&mut self, pid: u32, permitted: &mut dyn FnMut() -> bool) -> bool {
         self.denied = false;
-        if pid != self.desk.pid(&self.target) || !self.safe_to_start() || !permitted() {
+        if pid != self.desk.pid(&self.target)
+            || !self.safe_to_start()
+            || !permitted()
+            || !self.observer.may_front()
+        {
             return false;
         }
         let accepted = self.desk.activate(&self.target);
@@ -213,8 +219,20 @@ impl<D: Desktop> FrontingBracketHost for WindowsBracketHost<D> {
         }
     }
     fn post_unit(&mut self, _: usize) -> Result<UnitPosted, SequencePostFailure> {
-        // No keyboard or pointer payload is implemented in this driver.
         Err(stop(ProcessEventRefusal::ProcessNotInspectable))
+    }
+    fn post_observed_unit(
+        &mut self,
+        index: usize,
+        observation: ObservedUnit<'_, Self::Tap>,
+    ) -> Result<UnitPosted, SequencePostFailure> {
+        match self.unit.as_mut() {
+            Some(unit) => unit(&self.target, observation),
+            None => self.post_unit(index),
+        }
+    }
+    fn unit_checks_cutoff(&self) -> bool {
+        self.unit.is_some()
     }
     fn hardware_input_snapshot(&mut self) -> Option<HardwareInputSnapshot> {
         self.observer.snapshot()
@@ -227,7 +245,7 @@ impl<D: Desktop> FrontingBracketHost for WindowsBracketHost<D> {
     fn record_restore_latency_ms(&mut self, _: u64) {}
 }
 
-impl<D: Desktop> RestoreHostSource for WindowsBracketHost<D> {
+impl<D: Desktop> RestoreHostSource for WindowsBracketHost<'_, D> {
     fn restore_host(&self) -> Box<dyn FrontingRestoreHost> {
         Box::new(WindowsRestoreHost {
             desk: Arc::clone(&self.desk),
@@ -322,6 +340,11 @@ fn refusal(stop: BracketStop) -> BracketReport {
 
 type WindowRead<'a, W> = &'a mut dyn FnMut(&W);
 
+enum Work<'a, W> {
+    Read(WindowRead<'a, W>),
+    Dispatch(Unit<'a, W>),
+}
+
 fn run<D: Desktop>(
     desk: Arc<D>,
     target: impl FnOnce() -> Result<D::Window, DriverError>,
@@ -329,7 +352,7 @@ fn run<D: Desktop>(
     plan: BracketPlan,
     hooks: &mut dyn FrontedDispatchHooks,
     cancelled: &dyn Fn() -> bool,
-    read: Option<WindowRead<'_, D::Window>>,
+    work: Work<'_, D::Window>,
 ) -> Result<BracketReport, DriverError> {
     let refused = |hooks: &mut dyn FrontedDispatchHooks, stop| {
         let outcome = crate::dispatch::BracketOutcome {
@@ -361,6 +384,10 @@ fn run<D: Desktop>(
         // exact addressed window is already frontmost.
         return refused(hooks, BracketStop::PreviousUnknown);
     }
+    let (read, unit) = match work {
+        Work::Read(read) => (Some(read), None),
+        Work::Dispatch(unit) => (None, Some(unit)),
+    };
     let mut host = WindowsBracketHost {
         desk: Arc::clone(&desk),
         target: Arc::clone(&target),
@@ -368,6 +395,7 @@ fn run<D: Desktop>(
         observer,
         bound_ms: plan.maximum_interval_ms,
         denied: false,
+        unit,
     };
     let mut read = read.map(|read| {
         let desk = &desk;
@@ -389,60 +417,236 @@ fn run<D: Desktop>(
     Ok(outcome.report)
 }
 
+pub(in crate::platform::windows) enum NativeWork<'a> {
+    Read(&'a mut dyn FnMut()),
+    Dispatch(&'a crate::platform::synthetic::SyntheticAction),
+}
+
 pub(in crate::platform::windows) fn run_native(
     target: &ProcessGrant,
     bound: u64,
     seize_latency: u32,
     hooks: &mut dyn FrontedDispatchHooks,
     cancelled: &dyn Fn() -> bool,
-    read: Option<&mut dyn FnMut()>,
+    work: NativeWork<'_>,
 ) -> Result<BracketReport, DriverError> {
-    let observer = live_observer();
-    // No production action currently has a source of Windows keyboard pieces.
-    // Keep dispatch refused even if the observer is installed independently.
-    let observer = observer.filter(|_| read.is_some());
-    let lane = observer.as_ref().and_then(|_| take_foreground_lane());
-    let observer = observer.filter(|_| lane.is_some());
-    let picture = read.is_some();
-    let select = || {
-        let retained = target_process(target)?;
-        let deadline = Instant::now() + Duration::from_millis(bound);
-        let candidates = windows::windows(&retained, target.pid, deadline)
-            .map_err(|_| DriverError::Unsupported("Windows target windows unreadable"))?;
-        let selected = if picture {
-            windows::image_window(&candidates)
-        } else {
-            windows::active_window(&candidates).map(|window| window.map(|(window, _)| window))
-        };
-        let window = selected
-            .ok()
-            .flatten()
-            .ok_or(DriverError::Unsupported("Windows target window unreadable"))?;
-        let binding = Binding::read(window.root.number, Some(retained))
-            .filter(|binding| binding.proof == window.proof)
-            .ok_or(DriverError::Unsupported("Windows target window changed"))?;
-        Ok(binding)
+    let refuse = |hooks: &mut dyn FrontedDispatchHooks, stop| {
+        let report = refusal(stop);
+        report_finished(hooks, &report, false);
+        Ok(report)
     };
-    let mut read = read.map(|read| {
-        move |binding: &Binding| super::super::picture::with_fronted_window(binding, read)
+    if cancelled() {
+        return refuse(hooks, BracketStop::Cancelled);
+    }
+    let Some(lane) = take_foreground_lane() else {
+        return refuse(hooks, BracketStop::ObserverUnavailable);
+    };
+    // Check the input desktop and the current foreground window before
+    // subscribing to input or sending probes.
+    if !desktop_safe() {
+        return refuse(hooks, BracketStop::ObserverUnavailable);
+    }
+    let Some(previous) = foreground_window_number().and_then(|hwnd| Binding::read(hwnd, None))
+    else {
+        return refuse(hooks, BracketStop::PreviousUnknown);
+    };
+    if !previous.safe_integrity() || !previous.is_foreground() {
+        return refuse(hooks, BracketStop::ObserverUnavailable);
+    }
+    let picture = matches!(&work, NativeWork::Read(_));
+    let retained = target_process(target)?;
+    let end = Instant::now() + Duration::from_millis(bound);
+    let candidates = windows::windows(&retained, target.pid, end)
+        .map_err(|_| DriverError::Unsupported("Windows target windows unreadable"))?;
+    let selected = if picture {
+        windows::image_window(&candidates)
+    } else {
+        windows::active_window(&candidates).map(|window| window.map(|(window, _)| window))
+    };
+    let window = selected
+        .ok()
+        .flatten()
+        .ok_or(DriverError::Unsupported("Windows target window unreadable"))?;
+    let binding = Binding::read(window.root.number, Some(retained))
+        .filter(|binding| binding.proof == window.proof)
+        .ok_or(DriverError::Unsupported("Windows target window changed"))?;
+    let mut sequence = match &work {
+        NativeWork::Read(_) => None,
+        NativeWork::Dispatch(action) => {
+            match super::pieces::Sequence::prepare(action, &binding, end) {
+                Ok(sequence) => Some(sequence),
+                Err(reason) => {
+                    return refuse(
+                        hooks,
+                        BracketStop::PostFailed(super::pieces::failure(reason)),
+                    )
+                }
+            }
+        }
+    };
+    let desk = Arc::new(NativeDesktop {
+        _lane: Some(lane),
+        picture,
+        previous,
     });
-    run(
-        Arc::new(NativeDesktop {
-            _lane: lane,
-            picture,
-        }),
-        select,
-        observer,
-        BracketPlan {
-            target_pid: target.pid,
-            units: 1,
-            maximum_interval_ms: bound,
-            maximum_seize_detection_latency_ms: seize_latency,
-        },
+    let Some(observer) = NativeObserver::start(target.pid, || {
+        !cancelled()
+            && desk.safe()
+            && desk.target_ready(&binding)
+            && desk.previous.safe_integrity()
+            && desk.previous.is_foreground()
+    }) else {
+        return refuse(hooks, BracketStop::ObserverUnavailable);
+    };
+    if observer.held() {
+        return refuse(
+            hooks,
+            BracketStop::PostFailed(super::pieces::failure("held_input_unconfirmed")),
+        );
+    }
+    let plan = BracketPlan {
+        target_pid: target.pid,
+        units: 1,
+        maximum_interval_ms: bound,
+        maximum_seize_detection_latency_ms: seize_latency,
+    };
+    if let NativeWork::Read(read) = work {
+        return run(
+            Arc::clone(&desk),
+            || Ok(binding.clone()),
+            Some(observer.clone()),
+            plan,
+            hooks,
+            cancelled,
+            Work::Read(&mut |binding| {
+                if observer.may_front() {
+                    super::super::picture::with_fronted_window(binding, read);
+                }
+            }),
+        );
+    }
+    let sequence = sequence.as_mut().expect("dispatch has pieces");
+    let report = run_pieces(
+        sequence.len(),
         hooks,
-        cancelled,
-        read.as_mut().map(|read| read as &mut dyn FnMut(&Binding)),
-    )
+        || {
+            if cancelled() {
+                Some(BracketStop::Cancelled)
+            } else if observer.lost() {
+                Some(BracketStop::PostFailed(super::pieces::failure(
+                    "observer_lost",
+                )))
+            } else if observer.person() {
+                Some(BracketStop::PostFailed(super::pieces::failure(
+                    "person_active",
+                )))
+            } else {
+                None
+            }
+        },
+        |index, hooks| {
+            run(
+                Arc::clone(&desk),
+                || Ok(binding.clone()),
+                Some(observer.clone()),
+                plan,
+                hooks,
+                cancelled,
+                Work::Dispatch(&mut |binding, observed| {
+                    sequence.post(
+                        index,
+                        binding,
+                        &observer,
+                        observed.deadline_ms,
+                        observed.cutoff,
+                        observed.cancelled,
+                    )
+                }),
+            )
+        },
+    )?;
+    // Publish sequence-wide counts without replacing the most recent
+    // piece's release or restore decision.
+    hooks.windows_input_progress(WindowsInputProgress {
+        confirmed: sequence.confirmed,
+        unverified: sequence.unverified,
+        uncertain: sequence.uncertain,
+        person_input_swallowed: observer.person() && !observer.lost(),
+    });
+    Ok(report)
+}
+
+fn run_pieces(
+    count: usize,
+    hooks: &mut dyn FrontedDispatchHooks,
+    stop: impl Fn() -> Option<BracketStop>,
+    mut run_one: impl FnMut(usize, &mut dyn FrontedDispatchHooks) -> Result<BracketReport, DriverError>,
+) -> Result<BracketReport, DriverError> {
+    let mut report = refusal(BracketStop::Cancelled);
+    for index in 0..count {
+        if let Some(stop) = stop() {
+            report.stop = Some(stop);
+            break;
+        }
+        if index != 0
+            && report.restore == RestoreStatus::Restored
+            && !hooks.prepare_next_windows_piece()
+        {
+            report.stop = Some(BracketStop::Cancelled);
+            break;
+        }
+        combine(&mut report, run_one(index, hooks)?);
+        if report.stop.is_some() {
+            break;
+        }
+        if !matches!(
+            report.restore,
+            RestoreStatus::Restored | RestoreStatus::NotNeeded
+        ) {
+            report.stop = Some(BracketStop::RestoreFailed);
+            break;
+        }
+    }
+    Ok(report)
+}
+
+fn combine(total: &mut BracketReport, piece: BracketReport) {
+    total.previous_frontmost = total.previous_frontmost.or(piece.previous_frontmost);
+    total.units_posted += piece.units_posted;
+    total.posts_returned += piece.posts_returned;
+    total.generation_verifications += piece.generation_verifications;
+    total.chunks += piece.chunks;
+    total.longest_fronted_interval_ms = total
+        .longest_fronted_interval_ms
+        .max(piece.longest_fronted_interval_ms);
+    total.slowest_unit_ms = total.slowest_unit_ms.max(piece.slowest_unit_ms);
+    total.slowest_restore_ms = total.slowest_restore_ms.max(piece.slowest_restore_ms);
+    total.restore_started_by_cutoff |= piece.restore_started_by_cutoff;
+    if piece.chunks > 0 || total.chunks == 0 {
+        total.restore = piece.restore;
+    }
+    total.stop = piece.stop;
+}
+
+fn report_finished(hooks: &mut dyn FrontedDispatchHooks, report: &BracketReport, person: bool) {
+    hooks.finished(&crate::dispatch::BracketOutcome {
+        report: report.clone(),
+        person_input_during_fronting: person,
+        deferred_restore: None,
+    });
+}
+
+pub(in crate::platform::windows) fn query_focus(
+    target: &ProcessGrant,
+) -> Result<FocusQueryResult, DriverError> {
+    let process = target_process(target)?;
+    let binding = foreground_window_number().and_then(|hwnd| Binding::read(hwnd, Some(process)));
+    Ok(FocusQueryResult {
+        matches_target: binding.is_some_and(|binding| {
+            binding.safe_integrity()
+                && super::pieces::query(&binding, Instant::now() + Duration::from_millis(100))
+        }),
+    })
 }
 
 #[cfg(test)]

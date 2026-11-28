@@ -2107,6 +2107,13 @@ pub struct HookedRestore {
 /// bracket's thread makes that decision; the caller's terminal cleanup can
 /// only stop a front not yet requested, or wait for the decision.
 pub trait FrontedDispatchHooks: Send {
+    #[cfg(windows)]
+    fn prepare_next_windows_piece(&mut self) -> bool {
+        false
+    }
+
+    #[cfg(windows)]
+    fn windows_input_progress(&mut self, _progress: WindowsInputProgress) {}
     /// Opt in only for a needs-front bracket admitted under app-use authority.
     /// Takeover brackets keep their existing, process-only reserve.
     fn uses_needs_front_restore_predictor(&self) -> bool {
@@ -2157,6 +2164,15 @@ pub trait FrontedDispatchHooks: Send {
     /// decision. A `deferred_restore` in it is still owed: the caller settles
     /// the held input first.
     fn finished(&mut self, outcome: &crate::dispatch::BracketOutcome);
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WindowsInputProgress {
+    pub confirmed: usize,
+    pub unverified: usize,
+    pub uncertain: Option<usize>,
+    pub person_input_swallowed: bool,
 }
 
 /// Where the hooked host is with the obligation.

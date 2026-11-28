@@ -139,6 +139,14 @@ struct Hooks {
 }
 
 impl FrontedDispatchHooks for Hooks {
+    fn prepare_next_windows_piece(&mut self) -> bool {
+        self.restore.is_none()
+            && self
+                .finished
+                .as_ref()
+                .is_some_and(|report| report.restore == RestoreStatus::Restored)
+    }
+
     fn register(
         &mut self,
         previous: u32,
@@ -193,6 +201,84 @@ impl FrontedDispatchHooks for Hooks {
     }
 }
 
+fn scripted_pieces(deny_restore: bool, cancel_after_one: bool) -> (BracketReport, Vec<u32>) {
+    crate::fronting_clock::FakeClock::frozen().run(|| {
+        let desk = Arc::new(Desk {
+            screen: Mutex::new(Screen {
+                deny_restore,
+                ..Screen::default()
+            }),
+            start: crate::fronting_clock::now(),
+        });
+        let observer = Arc::new(Echo::default());
+        let sent = std::cell::Cell::new(0);
+        let report = run_pieces(
+            3,
+            &mut Hooks::default(),
+            || (cancel_after_one && sent.get() == 1).then_some(BracketStop::Cancelled),
+            |index, hooks| {
+                assert_eq!(
+                    desk.screen.lock().unwrap().front,
+                    Some(ORIGINAL),
+                    "piece {index} starts after restore"
+                );
+                run(
+                    Arc::clone(&desk),
+                    || Ok(TARGET),
+                    Some(observer.clone()),
+                    BracketPlan {
+                        target_pid: desk.pid(&TARGET),
+                        units: 1,
+                        maximum_interval_ms: 300,
+                        maximum_seize_detection_latency_ms: 50,
+                    },
+                    hooks,
+                    &|| false,
+                    Work::Dispatch(&mut |_, _| {
+                        assert_eq!(desk.screen.lock().unwrap().front, Some(TARGET));
+                        sent.set(sent.get() + 1);
+                        Ok(UnitPosted {
+                            posts_returned: 2,
+                            generation_verifications: 2,
+                        })
+                    }),
+                )
+            },
+        )
+        .unwrap();
+        let writes = desk.screen.lock().unwrap().writes.clone();
+        (report, writes)
+    })
+}
+
+#[test]
+fn windows_each_piece_fronts_only_after_the_previous_piece_restored() {
+    let (report, writes) = scripted_pieces(false, false);
+    assert_eq!(
+        writes,
+        [TARGET, ORIGINAL, TARGET, ORIGINAL, TARGET, ORIGINAL]
+    );
+    assert_eq!(report.units_posted, 3);
+    assert_eq!(report.stop, None);
+}
+
+#[test]
+fn windows_failed_restore_names_the_pieces_sent_and_prevents_another_front() {
+    let (report, writes) = scripted_pieces(true, false);
+    assert_eq!(writes, [TARGET, ORIGINAL]);
+    assert_eq!(report.units_posted, 1);
+    assert_eq!(report.posts_returned, 2);
+    assert_eq!(report.stop, Some(BracketStop::RestoreFailed));
+}
+
+#[test]
+fn windows_cancel_between_pieces_sends_nothing_more() {
+    let (report, writes) = scripted_pieces(false, true);
+    assert_eq!(writes, [TARGET, ORIGINAL]);
+    assert_eq!(report.units_posted, 1);
+    assert_eq!(report.stop, Some(BracketStop::Cancelled));
+}
+
 fn picture(
     screen: Screen,
     observer: Option<Arc<dyn Observer>>,
@@ -217,7 +303,7 @@ fn picture(
             },
             &mut hooks,
             &|| false,
-            Some(&mut |window| {
+            Work::Read(&mut |window| {
                 assert_eq!(*window, TARGET);
                 (read.take().expect("only one picture"))(&desk);
             }),
@@ -229,11 +315,8 @@ fn picture(
 }
 
 #[test]
-fn production_observer_absence_refuses_before_desktop_reads_or_writes() {
-    assert!(live_observer().is_none());
-    let (report, desk) = picture(Screen::default(), live_observer(), |_| {
-        panic!("read without observer")
-    });
+fn observer_absence_refuses_before_desktop_reads_or_writes() {
+    let (report, desk) = picture(Screen::default(), None, |_| panic!("read without observer"));
     assert_eq!(report.stop, Some(BracketStop::ObserverUnavailable));
     let screen = desk.screen.lock().unwrap();
     assert_eq!(screen.foreground_reads, 0);
@@ -492,6 +575,7 @@ fn native_fronting_picture_interval_matches_win_event_clock() {
         Arc::new(NativeDesktop {
             _lane: Some(lane),
             picture: true,
+            previous: Binding::read(original, None).expect("saved foreground binding"),
         }),
         || Ok(bound),
         Some(Arc::new(Echo::default())),
@@ -503,7 +587,7 @@ fn native_fronting_picture_interval_matches_win_event_clock() {
         },
         &mut hooks,
         &|| false,
-        Some(&mut |binding: &Binding| {
+        Work::Read(&mut |binding: &Binding| {
             let binding_for_fence = binding.clone();
             let fence: AcquisitionFence = Arc::new(move || binding_for_fence.is_foreground());
             super::super::super::picture::with_fronted_window(binding, &mut || {

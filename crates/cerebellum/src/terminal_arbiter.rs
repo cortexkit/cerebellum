@@ -457,6 +457,16 @@ impl RestoreCell {
         self.inner().decided
     }
 
+    #[cfg(windows)]
+    pub(crate) fn settled_windows_restore(&self) -> bool {
+        let inner = self.inner();
+        inner.pending_since.is_none()
+            && inner.reads_in_flight == 0
+            && inner.decided.is_some_and(|result| {
+                result.restore == cerebellum_computer::dispatch::RestoreStatus::Restored
+            })
+    }
+
     /// Whether the front is ending: nothing new may start. The restore
     /// reserve started, the owner began its restore, or the call's terminal
     /// cleanup stopped the front.
@@ -1523,6 +1533,35 @@ impl TerminalArbiter {
         {
             drop(state);
             drop(obligation);
+            return Err(RestoreRegistrationRefused);
+        }
+        let cell = Arc::new(RestoreCell::new(
+            obligation,
+            self.fronting_domain
+                .load(std::sync::atomic::Ordering::Acquire),
+            self.route_namespace
+                .load(std::sync::atomic::Ordering::Acquire),
+            request_id(&self.request),
+        ));
+        state.restore = Some(Arc::clone(&cell));
+        Ok(cell)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn replace_windows_restore(
+        &self,
+        previous: &Arc<RestoreCell>,
+        obligation: RestoreObligation,
+    ) -> Result<Arc<RestoreCell>, RestoreRegistrationRefused> {
+        let mut state = self.state.lock().unwrap();
+        if state.chosen.is_some()
+            || state.reply_finalized
+            || !state
+                .restore
+                .as_ref()
+                .is_some_and(|cell| Arc::ptr_eq(cell, previous))
+            || !previous.settled_windows_restore()
+        {
             return Err(RestoreRegistrationRefused);
         }
         let cell = Arc::new(RestoreCell::new(
@@ -3613,6 +3652,38 @@ mod restore_slot_tests {
             state.release.is_some() && state.restore.is_some(),
             "a chord holding Command keeps both obligations"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_piece_rearm_replaces_only_a_confirmed_restore_while_terminal_is_open() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let shared = screen(true);
+        let terminal = TerminalArbiter::new(request());
+        let first = terminal
+            .register_restore(obligation(&shared, &releases))
+            .unwrap();
+        assert!(terminal
+            .replace_windows_restore(&first, obligation(&shared, &releases))
+            .is_err());
+        first.begin_front_attempt(0);
+        first.front_attempt_returned();
+        first.front_confirmed();
+        assert_eq!(first.decide().restore, RestoreStatus::Restored);
+        let next = terminal
+            .replace_windows_restore(&first, obligation(&shared, &releases))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &next));
+        assert!(terminal
+            .replace_windows_restore(&first, obligation(&shared, &releases))
+            .is_err());
+        assert!(terminal
+            .replace_windows_restore(&next, obligation(&shared, &releases))
+            .is_err());
+        terminal.stop(TerminalCause::Cancelled);
+        assert!(terminal
+            .replace_windows_restore(&next, obligation(&shared, &releases))
+            .is_err());
     }
 
     #[test]
