@@ -450,6 +450,8 @@ async fn send_principal_denied(
 ///   cleanup failed to durably close their journal row;
 /// - `lateFrontingJournalFailures`, late focus-cleanup records that could not
 ///   be persisted;
+/// - on Linux, `desktopReaperWaitFailures`, detached desktop child waits that
+///   failed, including failures after the launch reply was sent;
 /// - on macOS, `previewCaptureRequests` and `previewFramesWritten`, how many
 ///   capture requests the background-mode preview has made and how many frame
 ///   lines it has written to the agent-cursor helper since the process
@@ -522,6 +524,11 @@ pub(super) fn with_process_gauges(mut report: ModuleControlResponse) -> ModuleCo
         metrics.insert(
             "lateFrontingJournalFailures".into(),
             json!(computer_capability::late_fronting_journal_failures()),
+        );
+        #[cfg(target_os = "linux")]
+        metrics.insert(
+            "desktopReaperWaitFailures".into(),
+            json!(cerebellum_linux::desktop_reaper_wait_failures()),
         );
         metrics.insert(
             "windowImageWithholding".into(),

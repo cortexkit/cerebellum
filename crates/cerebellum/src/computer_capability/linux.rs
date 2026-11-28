@@ -13,17 +13,23 @@ use cerebellum_computer::capture::*;
 use cerebellum_computer::platform::linux::{self as semantic, Source};
 use cerebellum_computer::platform::*;
 use cerebellum_linux::atspi;
+use cerebellum_linux::desktop_entry::{self, LaunchRefusal};
 use cerebellum_linux::identity::{IdentityReader, Refusal as IdentityRefusal, VerifiedApp};
-use cerebellum_linux::session::{self, AccessibilityBus, DesktopSession, SessionKind};
+use cerebellum_linux::session::{self, AccessibilityBus, DesktopSession, Environment, SessionKind};
+use cerebellum_linux::{place_desktop_scope, DesktopExit, ProcessGeneration};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tokio::time::{timeout_at, Instant};
 
+use super::open_app::OpenRequest;
 use super::{
     computer_audit, permissions, ComputerPlane, ComputerPlaneUnavailable, ResultSchemaEnforcement,
     RunningComputerPlane,
 };
-use crate::computer_grants::{ConsentContext, GrantAdmission, GrantNeed};
+use super::{JournalStorage, MonotonicClock, Redactor, ServeContext, SeverityTaxonomy};
+use crate::computer_grants::{
+    AppCode, AppIdentity, AppIdentityUnreadable, ConsentContext, GrantAdmission, GrantNeed,
+};
 use crate::management::{AppRefusal, ManagementPlane};
 use crate::{CancelHandle, ComputerReleaseInputs, JournalPersistence};
 
@@ -96,6 +102,10 @@ const SESSION_READ_LIMIT: Duration = Duration::from_millis(250);
 
 type ReadResult = Result<SessionReading, session::NoSupportedSession>;
 type SessionReader = dyn Fn() -> Pin<Box<dyn Future<Output = ReadResult> + Send>> + Send + Sync;
+#[cfg(test)]
+type ScopePlacer = dyn Fn(ProcessGeneration) -> Pin<Box<dyn Future<Output = Result<(), &'static str>> + Send>>
+    + Send
+    + Sync;
 
 struct SessionReading {
     desktop: DesktopSession,
@@ -129,6 +139,8 @@ pub(super) struct LinuxSession {
     identity: Option<Arc<IdentityReader>>,
     #[cfg(test)]
     proof_for_test: Option<fn(u32) -> Result<VerifiedApp, IdentityRefusal>>,
+    #[cfg(test)]
+    scope_for_test: Option<Arc<ScopePlacer>>,
 }
 
 impl LinuxSession {
@@ -283,10 +295,20 @@ impl LinuxSession {
             identity: None,
             #[cfg(test)]
             proof_for_test: None,
+            #[cfg(test)]
+            scope_for_test: None,
         }
     }
 
     async fn refresh(&self) -> Result<(Arc<Epoch>, bool), LinuxRefusal> {
+        self.refresh_with_environment()
+            .await
+            .map(|(epoch, locked, _)| (epoch, locked))
+    }
+
+    async fn refresh_with_environment(
+        &self,
+    ) -> Result<(Arc<Epoch>, bool, Environment), LinuxRefusal> {
         let deadline = Instant::now() + SESSION_READ_LIMIT;
         let mut latch = timeout_at(deadline, self.epoch.lock())
             .await
@@ -343,7 +365,28 @@ impl LinuxSession {
                 })
             });
         *latch = Some((epoch.clone(), reading.desktop.locked));
-        Ok((epoch, reading.desktop.locked))
+        Ok((epoch, reading.desktop.locked, reading.desktop.environment))
+    }
+
+    async fn check_launch_session(&self, serial: u64) -> Result<(), &'static str> {
+        let (epoch, locked) = self.refresh().await.map_err(|_| "no_supported_session")?;
+        if locked {
+            return Err("screen_locked");
+        }
+        if epoch.serial != serial {
+            return Err("stale_reference");
+        }
+        Ok(())
+    }
+
+    async fn place_scope(&self, generation: ProcessGeneration) -> Result<(), &'static str> {
+        #[cfg(test)]
+        if let Some(place) = &self.scope_for_test {
+            return place(generation).await;
+        }
+        place_desktop_scope(generation)
+            .await
+            .map_err(|_| "launch_scope_unavailable")
     }
 
     pub(super) async fn refusal(&self, capability: ComputerCapability) -> Option<Value> {
@@ -367,10 +410,11 @@ impl LinuxSession {
                 )
             {
                 LinuxRefusal::WaylandSeatInputUnverifiable
-            } else if matches!(
-                capability,
-                ListApps | Wait | ReadState | PressElement | WriteText
-            ) && epoch.bus.is_some()
+            } else if capability == OpenApp
+                || (matches!(
+                    capability,
+                    ListApps | Wait | ReadState | PressElement | WriteText
+                ) && epoch.bus.is_some())
             {
                 return None;
             } else if epoch.key.kind == SessionKind::X11 && epoch.key.x11_connection.is_none() {
@@ -378,11 +422,206 @@ impl LinuxSession {
             } else if let Some(reply) = permissions::refusal(capability, &epoch.permissions) {
                 return Some(reply);
             } else {
-                // No Linux backend can resolve applications, read their trees,
-                // launch them, or send input. Do not fall through to shared handlers.
+                // Do not fall through to handlers for an unavailable Linux backend.
                 LinuxRefusal::BackendUnavailable
             };
         Some(reason.reply(capability))
+    }
+}
+
+// The launch resolver proved this program before deriving the grant need. No
+// synthetic pid or desktop-file package is used in the grant store. The same
+// snapshot is checked again before spawn and before letting the child run.
+struct LaunchPackageCode(String);
+
+impl AppCode for LaunchPackageCode {
+    fn identity(&self) -> Result<AppIdentity, AppIdentityUnreadable> {
+        Ok(AppIdentity {
+            team_id: None,
+            designated_requirement: self.0.clone(),
+            ad_hoc: false,
+            apple_anchored: false,
+        })
+    }
+
+    fn satisfies(&self, requirement: &str) -> Result<bool, AppIdentityUnreadable> {
+        Ok(self.0 == requirement)
+    }
+}
+
+impl<B, R, T, S, D> ComputerPlane<B, R, T, S, D>
+where
+    B: CaptureBackend + Send + 'static,
+    R: Redactor + Send + 'static,
+    T: SeverityTaxonomy + Send + 'static,
+    S: JournalStorage + Send + 'static,
+    D: PlatformDriver + 'static,
+{
+    pub(super) async fn serve_linux_open_app<C: MonotonicClock>(
+        &self,
+        session: &Arc<LinuxSession>,
+        request: OpenRequest,
+        context: ServeContext<'_, C>,
+    ) -> Value {
+        use cerebellum_computer::audit::{
+            ComputerPlaneDescriptor, ObservationState, TypedCaptureDispatch,
+        };
+        use cerebellum_computer::grounding::ContainmentRung;
+        use cerebellum_computer::platform::linux::launch;
+
+        let (epoch, environment) = match session.refresh_with_environment().await {
+            Ok((_, true, _)) => return super::screen_locked_reply(),
+            Ok((epoch, false, environment)) => (epoch.serial, environment),
+            Err(_) => return launch_failure("no_supported_session"),
+        };
+        let Some(identity) = session.identity.clone() else {
+            return launch_failure("route_not_reviewed");
+        };
+        let target = request.target.clone();
+        let resolve_identity = identity.clone();
+        let resolve_environment = environment.clone();
+        let snapshot = match tokio::task::spawn_blocking(move || {
+            desktop_entry::resolve(&resolve_identity, &resolve_environment, &target)
+        })
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(LaunchRefusal::NotInstalled)) => {
+                return json!({"outcome":"no_installed_app_named", "target":request.target, "remedy":"use an exact desktop file ID, display name, or verified package identity"})
+            }
+            Ok(Err(LaunchRefusal::Ambiguous)) => {
+                return json!({"outcome":"ambiguous_app", "target":request.target, "remedy":"use a unique desktop file ID"})
+            }
+            Ok(Err(LaunchRefusal::Identity(IdentityRefusal::OperatorAppBlocked))) => {
+                return self
+                    .operator_app_refused(context.grantee, &request.target)
+                    .await
+            }
+            Ok(Err(reason)) => return launch_failure(reason.reason()),
+            Err(_) => return launch_failure("backend_unavailable"),
+        };
+        let name = snapshot.name().to_owned();
+        let subject = snapshot.subject().to_owned();
+        if super::operator_apps::title_names_operator_app(&name)
+            || super::operator_apps::identity_blocked(&subject)
+        {
+            return self
+                .operator_app_refused(context.grantee, &request.target)
+                .await;
+        }
+        if request.url.is_some() {
+            return launch_failure("launch_entry_unsupported");
+        }
+        if let Err(reason) = session.check_launch_session(epoch).await {
+            return launch_failure(reason);
+        }
+        let need = GrantNeed::App {
+            bundle_identity: subject.clone(),
+            display_name: name.clone(),
+            code: Arc::new(LaunchPackageCode(subject.clone())),
+        };
+        let grants = context.management.computer_grants();
+        let admission = match grants
+            .require(&need, &context.consent, &context.cancel)
+            .await
+        {
+            Ok(admission) => admission,
+            Err(refusal) => return AppRefusal::Consent(refusal).reply(&subject),
+        };
+        if !grants.holds(&context.consent.caller, &need) {
+            return json!({"outcome":"consent_unavailable", "remedy":"the application grant is no longer held; retry to request approval"});
+        }
+        if context.cancel.is_cancelled() {
+            return launch_failure("cancelled");
+        }
+        let work = super::quarantine::CallWork::current();
+        let token = {
+            let mut audit = cerebellum_computer::audit::lock_audit(&self.audit);
+            let capability = ComputerCapability::OpenApp;
+            let rung = ContainmentRung::GlobalNone;
+            let observation = ObservationState::HumanUnobserved;
+            let descriptor = ComputerPlaneDescriptor::new(capability, rung, observation);
+            let reservation = match audit.reserve(context.identity, descriptor) {
+                Ok(reservation) => reservation,
+                Err(_) => return super::read_audit_unavailable_reply(),
+            };
+            if !work.begin_mutation() {
+                let _ = audit
+                    .finalize_rejected(reservation, br#"{"outcome":"dispatch_stopped"}"#.to_vec());
+                return super::quarantine::stopped_before_dispatch_reply();
+            }
+            let dispatch = TypedCaptureDispatch::new(capability, rung, observation)
+                .dispatch_material(capability.capability_id().as_bytes().to_vec());
+            match audit.commit_dispatched(reservation, &dispatch, b"app_grant".to_vec(), None) {
+                Ok(token) => token,
+                Err(_) => return super::read_audit_unavailable_reply(),
+            }
+        };
+        let session = session.clone();
+        let cancel = context.cancel.clone();
+        let opened = tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Handle::current();
+            launch::release(&snapshot, &identity, &environment,
+                || runtime.block_on(session.check_launch_session(epoch)), || {
+                if cancel.is_cancelled() || work.stopped() { return Err("cancelled"); }
+                Ok(())
+            }, |generation| runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => Err("cancelled"),
+                    result = tokio::time::timeout(Duration::from_secs(3), session.place_scope(generation)) =>
+                        result.unwrap_or(Err("launch_scope_unavailable")),
+                }
+            }))
+        }).await.unwrap_or(Err("backend_unavailable"));
+        let mut reply = match opened {
+            Ok(child) => launch_settle_reply(child.settle().await),
+            Err(reason) => launch_failure(reason),
+        };
+        let summary =
+            json!({"app":{"name":name,"bundle_identity":subject},"outcome":reply["outcome"]});
+        if cerebellum_computer::audit::lock_audit(&self.audit)
+            .finalize_dispatched(
+                token,
+                serde_json::to_vec(&summary).expect("JSON summary"),
+                Vec::new(),
+            )
+            .is_err()
+        {
+            reply = json!({"outcome":"audit_unavailable", "remedy":"the application may have launched, but its outcome could not be journaled; list_apps before retrying"});
+        }
+        admission.decorate(&mut reply);
+        reply
+    }
+}
+
+fn launch_failure(reason: &'static str) -> Value {
+    match reason {
+        "screen_locked" => super::screen_locked_reply(),
+        "cancelled" => json!({"outcome":"cancelled"}),
+        "no_supported_session" => {
+            LinuxRefusal::NoSupportedSession.reply(ComputerCapability::OpenApp)
+        }
+        _ => json!({"outcome":"launch_failed", "reason":reason}),
+    }
+}
+
+fn launch_settle_reply(settle: semantic::launch::Settle) -> Value {
+    use semantic::launch::Settle;
+    match settle {
+        Settle::Running(pid) => {
+            json!({"outcome":"launched_no_window", "pid":pid, "has_window":false, "frontmost":false})
+        }
+        Settle::Exited(exit) => {
+            let detail = match exit {
+                DesktopExit::Code(status) => json!({"exit_status":status}),
+                DesktopExit::Signal(signal) => json!({"signal":signal}),
+            };
+            json!({"outcome":"launch_failed", "reason":"launch_child_exited", "detail":detail,
+                "remedy":"the launched process exited; its activation effect is unknown. Check list_apps before retrying."})
+        }
+        Settle::Unknown => json!({"outcome":"launch_failed", "reason":"launch_status_unknown",
+            "remedy":"the launched process could not be observed; check list_apps before retrying"}),
     }
 }
 
@@ -744,6 +983,10 @@ impl CaptureBackend for LinuxCaptureBackend {
 #[cfg(test)]
 #[path = "linux_semantic_tests.rs"]
 mod semantic_tests;
+
+#[cfg(test)]
+#[path = "linux_launch_tests.rs"]
+mod launch_tests;
 
 #[cfg(test)]
 mod tests {

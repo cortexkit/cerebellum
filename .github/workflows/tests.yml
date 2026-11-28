@@ -147,6 +147,8 @@ jobs:
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT unshare --mount --propagation private --'
           cargo test --locked -p cerebellum-linux --lib identity::tests::native_btrfs_private_namespace_and_package_upgrade -- --ignored --exact
           cargo test --locked -p cerebellum-linux --lib identity::packages::tests::native_rpm_reads_real_file_digests_from_a_system_database -- --ignored --exact
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER env PATH=/mnt/ck-launch-fixture/home/.local/bin:/usr/bin:/bin" \
+            cargo test --locked -p cerebellum --lib computer_capability::linux::launch_tests::native_open_app_checks_package_grant_scope_lock_and_release -- --ignored --exact
 
       - name: Native GTK semantic actions on X11 and Wayland
         if: ${{ !cancelled() }}

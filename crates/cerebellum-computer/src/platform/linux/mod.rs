@@ -15,6 +15,7 @@ use super::{DriverError, ProcessGrant};
 use crate::app_state::source::{ElementHandle, ElementToken, RawAppState, RawElement, ReadBounds};
 
 mod actions;
+pub mod launch;
 mod scoped;
 mod tree;
 

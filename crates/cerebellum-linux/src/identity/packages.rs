@@ -31,17 +31,50 @@ impl Database {
         exe: &mut File,
         digest: impl Fn(&mut File, ImageKey, Algorithm) -> Result<String, Refusal>,
     ) -> Result<Option<String>, Refusal> {
+        self.subject_with(host, target, path, exe, digest, Err(AppIdentityUnproven))
+    }
+
+    /// For a desktop file or an unstarted program, distinguish a missing or
+    /// mismatched package record from a package database we cannot read.
+    pub(super) fn launch_subject(
+        &mut self,
+        host: &File,
+        path: &Path,
+        file: &mut File,
+        digest: impl Fn(&mut File, ImageKey, Algorithm) -> Result<String, Refusal>,
+    ) -> Result<Option<String>, Refusal> {
+        self.subject_with(host, host, path, file, digest, Ok(None))
+    }
+
+    fn subject_with(
+        &mut self,
+        host: &File,
+        target: &File,
+        path: &Path,
+        exe: &mut File,
+        digest: impl Fn(&mut File, ImageKey, Algorithm) -> Result<String, Refusal>,
+        mismatch: Result<Option<String>, Refusal>,
+    ) -> Result<Option<String>, Refusal> {
         let candidates = candidates(path);
         let image = exe.metadata().map_err(|_| AppIdentityUnproven)?;
         let key = image_key(&image);
         if let Some(matched) = self.dpkg_record(host, &candidates)? {
             verify_package_path(host, target, &matched.path, &image)?;
             if digest(exe, key, Algorithm::Md5)? != matched.sum {
-                return Err(AppIdentityUnproven);
+                return mismatch;
             }
             return Ok(Some(format!("dpkg:{}", matched.name)));
         }
         let Some(db) = rpm_database(host)? else {
+            // A readable dpkg inventory can establish that the path is
+            // unowned. An optional rpm executable does not make a dpkg host
+            // an RPM host, even when that executable has no dpkg record.
+            if mismatch.is_ok()
+                && self.dpkg.is_none()
+                && optional_owned(host, Path::new(RPM))?.is_some()
+            {
+                return Err(AppIdentityUnproven);
+            }
             return Ok(None);
         };
         let rpm_paths = self::candidates(Path::new(RPM));
@@ -65,7 +98,7 @@ impl Database {
         };
         verify_package_path(host, target, &matched.path, &image)?;
         if digest(exe, key, matched.algorithm)? != matched.sum {
-            return Err(AppIdentityUnproven);
+            return mismatch;
         }
         Ok(Some(format!("rpm:{}", matched.name)))
     }

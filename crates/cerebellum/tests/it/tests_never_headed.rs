@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 const BRIDGE_PROCESS_TEST: &str = "cerebellum/src/user_browser_bridge/linux/tests/process.rs";
 const WINDOWS_LAUNCH_TEST: &str =
     "cerebellum/src/computer_capability/windows_app_state_tests/launch.rs";
+const LINUX_DESKTOP_LAUNCH_TEST: &str = "cerebellum/src/computer_capability/linux_launch_tests.rs";
 
 fn rust_files(directory: &Path, files: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(directory).expect("read browser test sources") {
@@ -481,7 +482,24 @@ fn violations(path: &str, source: &str) -> Vec<String> {
                 .is_some_and(|arg| arg.kind == TokenKind::Identifier && arg.text == "executable")
             && at(5) == Some(")")
             && windows_unrelated_fixture_binding(&tokens[..index]);
-        if !fixed_cli && !self_reexec && !relocated_fixture && !bridge_fixture && !windows_fixture {
+        // The hosted test compiles one fixture executable, checksums its package
+        // records, and mounts/unmounts its private package database.
+        let desktop_fixture = path == LINUX_DESKTOP_LAUNCH_TEST
+            && at(5) == Some(")")
+            && argument.is_some_and(|arg| {
+                arg.kind == TokenKind::Literal
+                    && matches!(
+                        arg.text.as_str(),
+                        "/usr/bin/cc" | "/usr/bin/md5sum" | "/usr/bin/mount" | "/usr/bin/umount"
+                    )
+            });
+        if !fixed_cli
+            && !self_reexec
+            && !relocated_fixture
+            && !bridge_fixture
+            && !windows_fixture
+            && !desktop_fixture
+        {
             found.push(format!(
                 "{}: Command executable must use a reviewed fixture or test_browser",
                 token.line
@@ -489,6 +507,28 @@ fn violations(path: &str, source: &str) -> Vec<String> {
         }
     }
     found
+}
+
+#[test]
+fn desktop_launch_fixture_approval_covers_only_its_fixed_build_and_mount_commands() {
+    for cli in [
+        "/usr/bin/cc",
+        "/usr/bin/md5sum",
+        "/usr/bin/mount",
+        "/usr/bin/umount",
+    ] {
+        let source = format!("Command::new({cli:?});");
+        assert!(violations(LINUX_DESKTOP_LAUNCH_TEST, &source).is_empty());
+        assert_eq!(violations("cerebellum/tests/other.rs", &source).len(), 1);
+    }
+    for source in [
+        "Command::new(\"/usr/bin/chromium\");",
+        "Command::new(\"mount\");",
+        "Command::new(executable);",
+        "Command::new(\"/usr/bin/cc\".replace(\"cc\", \"chromium\"));",
+    ] {
+        assert_eq!(violations(LINUX_DESKTOP_LAUNCH_TEST, source).len(), 1);
+    }
 }
 
 #[test]
